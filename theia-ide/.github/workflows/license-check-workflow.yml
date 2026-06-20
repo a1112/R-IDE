@@ -1,0 +1,81 @@
+name: 3PP License Check
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - 'yarn.lock'
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - master
+    paths:
+      - 'yarn.lock'
+  schedule:
+    - cron: '0 4 * * *' # Runs every day at 4am: https://docs.github.com/en/actions/reference/events-that-trigger-workflows#scheduled-events-schedule
+
+jobs:
+  License-check:
+    name: 3PP License Check using dash-licenses
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        node: [24]
+        java: [17]
+
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 2
+
+      - name: Use Node.js ${{ matrix.node }}
+        uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6.2.0
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Use Java ${{ matrix.java }}
+        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
+        with:
+          distribution: 'adopt'
+          java-version: ${{ matrix.java }}
+      
+      - name: Run daily dash-licenses check (non-review mode)
+        if: ${{ github.event_name == 'schedule' }}
+        shell: bash
+        run: |
+          yarn --frozen-lockfile --ignore-scripts
+          # Workaround: pre-download dash-licenses JAR (see comments in step below)
+          DASH_JAR="node_modules/@eclipse-dash/nodejs-wrapper/download/dash-licenses.jar"
+          mkdir -p "$(dirname "$DASH_JAR")"
+          SNAP_BASE="https://repo.eclipse.org/repository/dash-maven2-snapshots/org/eclipse/dash/org.eclipse.dash.licenses/1.1.1-SNAPSHOT"
+          SNAP_JAR=$(curl -s "$SNAP_BASE/maven-metadata.xml" | grep -oP '(?<=<value>)1\.1\.1-[^<]+' | tail -1)
+          curl -L "$SNAP_BASE/org.eclipse.dash.licenses-$SNAP_JAR.jar" -o "$DASH_JAR"
+          yarn license:check
+
+      - name: Run dash-licenses check in review mode
+        if: ${{ github.event_name != 'schedule' }}
+        shell: bash
+        run: |
+          yarn --frozen-lockfile --ignore-scripts
+          # Workaround: pre-download dash-licenses JAR since the @eclipse-dash/nodejs-wrapper
+          # uses a broken Nexus 2 URL after the repo.eclipse.org upgrade to Nexus 3.
+          # We use 1.1.1-SNAPSHOT because 1.0.2 and 1.1.0 incorrectly flag internal
+          # workspace packages (link:true with no version) as restricted.
+          # See: https://github.com/eclipse-dash/nodejs-wrapper/issues/7
+          # See: https://github.com/eclipse-dash/dash-licenses/issues/534
+          # TODO: remove this workaround once the nodejs-wrapper is updated (GH-17168)
+          DASH_JAR="node_modules/@eclipse-dash/nodejs-wrapper/download/dash-licenses.jar"
+          mkdir -p "$(dirname "$DASH_JAR")"
+          SNAP_BASE="https://repo.eclipse.org/repository/dash-maven2-snapshots/org/eclipse/dash/org.eclipse.dash.licenses/1.1.1-SNAPSHOT"
+          SNAP_JAR=$(curl -s "$SNAP_BASE/maven-metadata.xml" | grep -oP '(?<=<value>)1\.1\.1-[^<]+' | tail -1)
+          curl -L "$SNAP_BASE/org.eclipse.dash.licenses-$SNAP_JAR.jar" -o "$DASH_JAR"
+          yarn license:check:review
+        env:
+          DASH_TOKEN: ${{ secrets.DASH_LICENSES_PAT }}

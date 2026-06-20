@@ -1,0 +1,39 @@
+{
+  "private": true,
+  "name": "theia-ide-tauri-app",
+  "description": "R-IDE Tauri desktop application",
+  "productName": "R-IDE",
+  "version": "1.72.100",
+  "license": "MIT",
+  "author": "R-IDE contributors",
+  "homepage": "https://github.com/eclipse-theia/theia-ide#readme",
+  "bugs": {
+    "url": "https://github.com/eclipse-theia/theia/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/eclipse-theia/theia-ide.git"
+  },
+  "engines": {
+    "yarn": ">=1.7.0 <2",
+    "node": ">=22"
+  },
+  "scripts": {
+    "clean": "rimraf src-tauri/target dist",
+    "copy:frontend": "node copy-frontend.js",
+    "copy:plugins": "node copy-plugins.js",
+    "copy:all": "npm run copy:frontend && npm run copy:plugins",
+    "dev": "npm run copy:all && tauri dev",
+    "build": "npm run copy:all && tauri build",
+    "build:prod": "npm run copy:all && tauri build",
+    "verify": "node verify-build.js",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.1.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.1.0",
+    "rimraf": "^2.7.1"
+  }
+}

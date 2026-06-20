@@ -1,0 +1,27 @@
+.DS_Store
+**/node_modules
+**/.browser_modules
+**/dist
+**/lib
+**/src-gen
+**/gen-esbuild.*.mjs
+**/plugins
+**/tsconfig.tsbuildinfo
+*.log
+license-check-summary.txt*
+.theia-ide/chatSessions
+.prompts
+**/test-screenshots
+
+# Tauri build artifacts
+**/target/
+**/browser-frontend/
+**/resources/backend/
+**/resources/plugins/
+**/Cargo.lock
+
+# Tauri / dev temp files
+.qa/
+demo-workspace/
+nul
+**/nul

@@ -1,0 +1,28 @@
+[package]
+name = "ride-tauri"
+version = "1.72.100"
+authors = ["R-IDE contributors"]
+license = "MIT"
+repository = "https://github.com/eclipse-theia/theia-ide"
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2.0", features = [] }
+
+[dependencies]
+tauri = { version = "2.1", features = ["protocol-asset", "tray-icon", "devtools", "custom-protocol"] }
+tauri-plugin-shell = "2.0"
+tauri-plugin-fs = "2.0"
+tauri-plugin-process = "2.0"
+tauri-plugin-dialog = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["full"] }
+log = "0.4"
+env_logger = "0.11"
+dirs = "5.0"
+uuid = { version = "1.0", features = ["v4"] }
+regex = "1.10"
+
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-single-instance = "2.0"

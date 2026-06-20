@@ -1,0 +1,81 @@
+name: Build Theia IDE Next Release (Linux)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 2 * * 1-5" # Runs every weekday at 2am UTC
+
+jobs:
+  build:
+    name: Build Next Release (Linux only)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Use Node.js 24
+        uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6.2.0
+        with:
+          node-version: 24.x
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Use Python 3.13
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.13"
+
+      - name: Export build variables
+        shell: bash
+        run: |
+          THEIA_VERSION=next
+          echo "THEIA_VERSION=${THEIA_VERSION}" >> $GITHUB_ENV
+          yarn version --minor --no-git-tag-version
+          IDE_VERSION=$(jq -r .version package.json)
+          echo "THEIA_IDE_VERSION=${IDE_VERSION}-next-$(date +%Y-%m-%d)" >> $GITHUB_ENV
+
+      - name: Build next package
+        shell: bash
+        run: |
+          yarn --skip-integrity-check --network-timeout 100000
+          yarn version --new-version $THEIA_IDE_VERSION --no-git-tag-version
+          yarn lerna version $THEIA_IDE_VERSION --no-push --no-git-tag-version --yes
+          yarn update:theia $THEIA_VERSION && yarn update:theia:children $THEIA_VERSION
+          yarn --skip-integrity-check --network-timeout 100000
+          yarn build:extensions
+          yarn build:applications:next
+          yarn download:plugins
+          yarn package:applications:next
+        env:
+          NODE_OPTIONS: --max_old_space_size=4096
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Test (Linux)
+        run: xvfb-run -a yarn --cwd applications/electron-next test
+
+      - name: Upload Linux Dist Files
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: theia-ide-next-linux
+          path: |
+            applications/electron-next/dist/TheiaIDENext.AppImage
+          retention-days: 7
+
+      - name: Publish to rolling next release
+        shell: bash
+        run: |
+          # Delete existing next release if present
+          gh release delete next --yes --cleanup-tag 2>/dev/null || true
+          # Create a new pre-release with the next tag
+          gh release create next \
+            --title "Next Build - Ubuntu AppImage (${{ env.THEIA_IDE_VERSION }})" \
+            --notes "Automated next build of the Ubuntu AppImage from \`master\` ($(date -u '+%Y-%m-%d %H:%M UTC'))." \
+            --prerelease \
+            --target ${{ github.sha }} \
+            applications/electron-next/dist/TheiaIDENext.AppImage \
+            applications/electron-next/dist/latest-linux.yml
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

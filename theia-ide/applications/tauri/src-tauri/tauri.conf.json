@@ -1,0 +1,78 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "R-IDE",
+  "version": "1.72.100",
+  "identifier": "com.ride.ide",
+  "build": {
+    "beforeDevCommand": "",
+    "beforeBuildCommand": "",
+    "devUrl": "http://localhost:3000",
+    "frontendDist": "../browser-frontend"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "R-IDE",
+        "width": 1440,
+        "height": 1024,
+        "minWidth": 1024,
+        "minHeight": 768,
+        "resizable": true,
+        "fullscreen": false,
+        "center": true,
+        "decorations": true,
+        "transparent": false
+      }
+    ],
+    "security": {
+      "csp": null,
+      "assetProtocol": {
+        "enable": true,
+        "scope": ["**"]
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "publisher": "R-IDE contributors",
+    "copyright": "Copyright © 2026 R-IDE contributors",
+    "category": "Developer Tool",
+    "shortDescription": "R-IDE Desktop Application",
+    "longDescription": "R-IDE is a modern IDE built on Eclipse Theia, now packaged with Tauri for smaller footprint and better performance.",
+    "macOS": {
+      "minimumSystemVersion": "10.13",
+      "entitlements": null,
+      "exceptionDomain": "",
+      "frameworks": [],
+      "providerShortName": null,
+      "signingIdentity": null
+    },
+    "windows": {
+      "certificateThumbprint": null,
+      "digestAlgorithm": "sha256",
+      "timestampUrl": ""
+    },
+    "linux": {
+      "deb": {
+        "depends": []
+      },
+      "appimage": {
+        "bundleMediaFramework": false
+      }
+    },
+    "resources": {
+      "../resources/backend": "resources/backend",
+      "../resources/plugins": "resources/plugins"
+    }
+  },
+  "plugins": {}
+}

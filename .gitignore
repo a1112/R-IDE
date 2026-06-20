@@ -1,0 +1,44 @@
+# Dependencies
+**/node_modules/
+**/.browser_modules/
+
+# Build outputs
+**/dist/
+**/lib/
+**/src-gen/
+**/gen-esbuild.*.mjs
+**/tsconfig.tsbuildinfo
+
+# Rust / Tauri build artifacts
+**/target/
+**/Cargo.lock
+
+# Plugins (built separately, not tracked)
+**/plugins/
+!**/plugins/.gitkeep
+
+# Logs
+*.log
+license-check-summary.txt*
+
+# IDE / Editor
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Theia specific
+.theia-ide/chatSessions
+.prompts/
+**/test-screenshots
+
+# Tauri specific
+**/browser-frontend/
+**/resources/backend/
+**/resources/plugins/
+
+# Environment
+.env
+.env.local
+.env.*.local

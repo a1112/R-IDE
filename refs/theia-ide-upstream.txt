@@ -1,0 +1,27 @@
+# Theia IDE 上游引用信息
+# 这些信息记录了 theia-ide 子目录的原版来源和我们的修改
+
+## 上游仓库 (Upstream Repository)
+- 仓库: https://github.com/eclipse-theia/theia-ide.git
+- 上游 master 分支 commit: a868f5b15f2d4f2598125a4f6a98c0d29990b946
+- 上游 master 最新提交信息: fix(launcher): forward all CLI args and support --help/--version
+
+## R-IDE 的 Tauri 修改 (Our Modifications)
+- 分支: feat/tauri-desktop
+- 修改 commit: daf986adc2925ce5d549ba6ecd8936f87382f717
+- 基于上游: a868f5b15f2d4f2598125a4f6a98c0d29990b946
+
+## 如何获取原始 theia-ide 仓库
+```bash
+git clone https://github.com/eclipse-theia/theia-ide.git
+cd theia-ide
+git checkout a868f5b15f2d4f2598125a4f6a98c0d29990b946
+```
+
+## 修改摘要
+- 在 applications/tauri/ 添加完整的 Tauri 2.x 桌面应用
+- Rust 后端 + Node.js sidecar 进程管理
+- WebView 前端（嵌入 Theia 资源）
+- custom-protocol feature 实现生产资源嵌入
+- 完整的 VSCode 插件支持（97 个插件）
+- 更新 product 扩展，添加 R-IDE 品牌

@@ -1,0 +1,91 @@
+name: Build Theia IDE next version
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * 1" # Runs every monday at 3am
+jobs:
+  build:
+    name: Build ${{ matrix.os }} next
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-15, macos-15-intel, windows-2022] # macos-15-intel is for x64, macOS-15 is for arm64
+
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0 # To fetch all history for all branches and tags. (Will be required for caching with lerna: https://github.com/markuplint/markuplint/pull/111)
+
+      - name: Use Node.js 24
+        uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6.2.0
+        with:
+          node-version: 24.x
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Use Python 3.11
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.13"
+
+      - name: Export build variables
+        shell: bash
+        run: |
+          THEIA_VERSION=next
+          echo "THEIA_VERSION=${THEIA_VERSION}" >> $GITHUB_ENV
+          yarn version --minor --no-git-tag-version
+          echo "THEIA_IDE_VERSION=$(jq -r .version package.json)-${THEIA_VERSION}-$(date +%d-%m-%y)" >> $GITHUB_ENV
+
+      - name: Update electron-builder.yml for macos-15
+        if: matrix.os == 'macos-15'
+        run: |
+          sed -i '' 's|https://download.eclipse.org/theia/ide/latest/macos|https://download.eclipse.org/theia/ide/latest/macos-arm|g' applications/electron/electron-builder.yml
+
+      - name: Build prod package
+        shell: bash
+        run: |
+          yarn --skip-integrity-check --network-timeout 100000
+          yarn version --new-version $THEIA_IDE_VERSION --no-git-tag-version
+          yarn lerna version $THEIA_IDE_VERSION --no-push --no-git-tag-version --yes
+          yarn update:theia $THEIA_VERSION && yarn update:theia:children $THEIA_VERSION
+          yarn --skip-integrity-check --network-timeout 100000
+          yarn build
+          yarn download:plugins
+          yarn package:applications
+        env:
+          NODE_OPTIONS: --max_old_space_size=4096
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # https://github.com/microsoft/vscode-ripgrep/issues/9
+
+      - name: Rename AppImage with version
+        if: runner.os == 'Linux'
+        run: |
+          mv applications/electron/dist/TheiaIDE.AppImage applications/electron/dist/TheiaIDE-$THEIA_IDE_VERSION.AppImage
+
+      - name: Upload Linux Dist Files
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: theia-ide-next-linux
+          path: |
+            applications/electron/dist/TheiaIDE-${{ env.THEIA_IDE_VERSION }}.AppImage
+          retention-days: 7
+
+      - name: Upload Mac Dist Files
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: ${{ matrix.os == 'macos-15-intel' && 'theia-ide-next-mac-x64' || matrix.os == 'macos-15' && 'theia-ide-next-mac-arm64'}}
+          path: applications/electron/dist/*.dmg
+          retention-days: 7
+
+      - name: Upload Windows Dist Files
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: theia-ide-next-windows
+          path: applications/electron/dist/*.exe
+          retention-days: 7
