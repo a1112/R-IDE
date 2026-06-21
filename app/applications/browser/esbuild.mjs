@@ -28,7 +28,6 @@ const leanTauriModulePrefixes = [
     '@theia/property-view/',
     '@theia/scanoss/',
     '@theia/secondary-window/',
-    '@theia/test/',
     '@theia/timeline/',
     '@theia/toolbar/',
     '@theia/typehierarchy/',
@@ -58,7 +57,6 @@ const leanTauriExtensionNames = [
     '@theia/property-view',
     '@theia/scanoss',
     '@theia/secondary-window',
-    '@theia/test',
     '@theia/timeline',
     '@theia/toolbar',
     '@theia/typehierarchy',
@@ -122,6 +120,27 @@ function patchGeneratedFilesForLeanTauri() {
     }
 }
 
+function patchBuiltFilesForLeanTauri() {
+    const enabled = process.env.RIDE_TAURI_LEAN === '1' || process.env.RIDE_TAURI_LEAN === 'true';
+    if (!enabled) {
+        return;
+    }
+
+    const backendBundle = path.join(__dirname, 'lib', 'backend', 'main.js');
+    if (!fs.existsSync(backendBundle)) {
+        return;
+    }
+
+    const source = fs.readFileSync(backendBundle, 'utf8');
+    const filtered = source.replace(
+        /onNotification\((\w+),\.\.\.(\w+)\)\{this\.target&&this\.target\[\1\]\(\.\.\.\2\)\}/,
+        'onNotification($1,...$2){if(!this.target)return;const targetMethod=this.target[$1];typeof targetMethod==="function"?targetMethod.apply(this.target,$2):console.warn(`Ignoring RPC notification without target method: ${$1}`)}'
+    );
+    if (filtered !== source) {
+        fs.writeFileSync(backendBundle, filtered);
+    }
+}
+
 patchGeneratedFilesForLeanTauri();
 
 // serve favicon from root and inject link tag into index.html
@@ -164,6 +183,7 @@ if (watch) {
         await browserContext.dispose();
         await nodeContext.rebuild();
         await nodeContext.dispose();
+        patchBuiltFilesForLeanTauri();
     } catch {
         process.exit(1);
     }

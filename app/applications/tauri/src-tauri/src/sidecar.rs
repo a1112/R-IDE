@@ -12,7 +12,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
 use std::time::Duration;
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter, Manager, Url};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
@@ -295,6 +295,7 @@ fn set_backend_port(app_handle: &AppHandle, port: u16) {
         *state.backend_port.lock().unwrap() = Some(port);
     }
     let _ = app_handle.emit("backend-ready", port);
+    navigate_main_window_to_backend(app_handle, port);
 }
 
 fn set_backend_pid(app_handle: &AppHandle, pid: Option<u32>) {
@@ -303,6 +304,27 @@ fn set_backend_pid(app_handle: &AppHandle, pid: Option<u32>) {
         if pid.is_some() {
             *state.backend_stopping.lock().unwrap() = false;
         }
+    }
+}
+
+fn navigate_main_window_to_backend(app_handle: &AppHandle, port: u16) {
+    let Some(window) = app_handle.get_webview_window("main") else {
+        log::warn!("Main window is not available for backend navigation");
+        return;
+    };
+
+    let url = match Url::parse(&format!("http://127.0.0.1:{}/", port)) {
+        Ok(url) => url,
+        Err(e) => {
+            log::warn!("Failed to build backend frontend URL: {}", e);
+            return;
+        }
+    };
+
+    if let Err(e) = window.navigate(url.clone()) {
+        log::warn!("Failed to navigate main window to {}: {}", url, e);
+    } else {
+        log::info!("Navigated main window to {}", url);
     }
 }
 

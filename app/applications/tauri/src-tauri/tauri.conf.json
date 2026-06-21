@@ -10,7 +10,7 @@
     "frontendDist": "../tauri-frontend"
   },
   "app": {
-    "withGlobalTauri": true,
+    "withGlobalTauri": false,
     "windows": [
       {
         "label": "main",
@@ -70,6 +70,7 @@
     },
     "resources": {
       "../browser-frontend": "lib/frontend",
+      "../package.json": "package.json",
       "../resources/backend": "resources/backend",
       "../resources/plugins": "resources/plugins"
     }
