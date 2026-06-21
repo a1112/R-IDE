@@ -10,6 +10,7 @@
 // Tauri 应用库模块
 
 pub mod commands;
+pub mod download;
 pub mod sidecar;
 
 use std::sync::Mutex;
@@ -20,6 +21,7 @@ pub struct AppState {
     pub backend_port: Mutex<Option<u16>>,
     pub backend_pid: Mutex<Option<u32>>,
     pub backend_stopping: Mutex<bool>,
+    pub downloads: download::DownloadManager,
 }
 
 #[cfg(unix)]
@@ -70,6 +72,7 @@ pub fn run() {
                 backend_port: Mutex::new(None),
                 backend_pid: Mutex::new(None),
                 backend_stopping: Mutex::new(false),
+                downloads: download::DownloadManager::new(),
             });
 
             // 初始化插件目录
@@ -89,6 +92,11 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_backend_port,
+            commands::download_start,
+            commands::download_cancel,
+            commands::download_list,
+            commands::download_plugin,
+            commands::download_configured_plugins,
             commands::open_directory,
             commands::save_file,
             commands::show_in_folder,

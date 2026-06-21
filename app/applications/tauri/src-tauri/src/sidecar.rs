@@ -8,7 +8,9 @@
  ********************************************************************************/
 
 use dirs::home_dir;
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::fs;
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
 use std::time::Duration;
@@ -16,7 +18,7 @@ use tauri::{AppHandle, Emitter, Manager, Url};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
-const BACKEND_STARTUP_TIMEOUT: u64 = 120; // seconds
+const BACKEND_STARTUP_TIMEOUT: u64 = 240; // seconds
 
 fn current_exe_dir() -> PathBuf {
     std::env::current_exe()
@@ -28,14 +30,27 @@ fn current_exe_dir() -> PathBuf {
 fn resource_dir_candidates() -> Vec<PathBuf> {
     let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let exe_dir = current_exe_dir();
-    let mut candidates = vec![
+    let mut candidates = Vec::new();
+
+    for base in [&current_dir, &exe_dir] {
+        for ancestor in base.ancestors().take(10) {
+            candidates.push(
+                ancestor
+                    .join("applications")
+                    .join("tauri")
+                    .join("resources"),
+            );
+        }
+    }
+
+    candidates.extend([
         exe_dir.join("resources"),
         current_dir.join("resources"),
         current_dir
             .join("applications")
             .join("tauri")
             .join("resources"),
-    ];
+    ]);
 
     if let Some(contents_dir) = exe_dir.parent() {
         candidates.push(contents_dir.join("Resources").join("resources"));
@@ -195,6 +210,7 @@ fn get_plugins_dir() -> PathBuf {
 
     // 尝试几个可能的位置
     let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let exe_dir = current_exe_dir();
     let home = home_dir().unwrap_or_else(|| PathBuf::from("."));
 
     let mut possible_locations: Vec<PathBuf> = resource_dir_candidates()
@@ -218,6 +234,14 @@ fn get_plugins_dir() -> PathBuf {
         // 用户配置目录
         home.join(".ride").join("plugins"),
     ]);
+
+    for base in [&current_dir, &exe_dir] {
+        possible_locations.extend(
+            base.ancestors()
+                .take(8)
+                .map(|ancestor| ancestor.join("plugins")),
+        );
+    }
 
     for location in possible_locations {
         if is_plugin_dir_ready(&location) {
@@ -373,6 +397,193 @@ fn backend_use_watcher_process() -> bool {
         .unwrap_or(false)
 }
 
+fn backend_child_path() -> String {
+    let mut paths = std::env::var("PATH").unwrap_or_default();
+    for required in ["/usr/bin", "/bin", "/usr/sbin", "/sbin"] {
+        if !paths.split(':').any(|entry| entry == required) {
+            if !paths.is_empty() {
+                paths.push(':');
+            }
+            paths.push_str(required);
+        }
+    }
+    paths
+}
+
+fn node_pty_platform_tag() -> Option<&'static str> {
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        Some("darwin-arm64")
+    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        Some("darwin-x64")
+    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        Some("linux-arm64")
+    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        Some("linux-x64")
+    } else if cfg!(all(target_os = "windows", target_arch = "aarch64")) {
+        Some("win32-arm64")
+    } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        Some("win32-x64")
+    } else {
+        None
+    }
+}
+
+fn node_pty_prebuild_dir() -> Option<PathBuf> {
+    let tag = node_pty_platform_tag()?;
+    let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let exe_dir = current_exe_dir();
+
+    for base in [&current_dir, &exe_dir] {
+        for ancestor in base.ancestors().take(10) {
+            let candidate = ancestor
+                .join("node_modules")
+                .join("node-pty")
+                .join("prebuilds")
+                .join(tag);
+            if candidate.join("pty.node").is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
+}
+
+async fn start_node_backend_process(
+    app_handle: &AppHandle,
+    config: &BackendConfig,
+    plugins_dir: PathBuf,
+    config_dir: PathBuf,
+) -> Result<(), String> {
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 30,
+            cols: 120,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| format!("Failed to create backend PTY: {}", e))?;
+
+    let mut command = CommandBuilder::new(&config.node_exe);
+    command.arg(&config.script_path);
+    command.arg("--log-level=info");
+    if let Some(backend_dir) = config.script_path.parent() {
+        command.cwd(backend_dir);
+    }
+    if !backend_use_watcher_process() {
+        command.arg("--no-cluster");
+    }
+    if let Some(node_options) = backend_node_options() {
+        command.env("NODE_OPTIONS", node_options);
+    }
+    command.env("PATH", backend_child_path());
+    if let Ok(user) = std::env::var("USER") {
+        command.env("LOGNAME", std::env::var("LOGNAME").unwrap_or(user));
+    }
+    command.env(
+        "TERM",
+        std::env::var("TERM").unwrap_or_else(|_| "dumb".to_string()),
+    );
+    command.env("NODE_ENV", "production");
+    command.env("RIDE_DISABLE_NODE_PTY_NATIVE", "1");
+    if let Some(pty_dir) = node_pty_prebuild_dir() {
+        command.env(
+            "RIDE_NODE_PTY_PREBUILD_DIR",
+            pty_dir.to_string_lossy().to_string(),
+        );
+    }
+    command.env(
+        "THEIA_PLUGINS_DIR",
+        plugins_dir.to_string_lossy().to_string(),
+    );
+    command.env("THEIA_CONFIG_DIR", config_dir.to_string_lossy().to_string());
+
+    let mut child = pair
+        .slave
+        .spawn_command(command)
+        .map_err(|e| format!("Failed to spawn backend in PTY: {}", e))?;
+    drop(pair.slave);
+
+    let child_pid = child.process_id();
+    if let Some(pid) = child_pid {
+        log::info!("Backend process started with pid {}", pid);
+        set_backend_pid(app_handle, Some(pid));
+        #[cfg(unix)]
+        {
+            send_signal(pid, "-CONT");
+            std::thread::spawn(move || {
+                for delay in [250_u64, 1000] {
+                    std::thread::sleep(Duration::from_millis(delay));
+                    send_signal(pid, "-CONT");
+                }
+            });
+        }
+    }
+
+    let reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|e| format!("Failed to clone backend PTY reader: {}", e))?;
+    let (line_tx, mut line_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    std::thread::spawn(move || {
+        let reader = std::io::BufReader::new(reader);
+        for line in reader.lines().map_while(Result::ok) {
+            let _ = line_tx.send(line);
+        }
+    });
+
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+
+    let startup_timeout = tokio::time::sleep(Duration::from_secs(BACKEND_STARTUP_TIMEOUT));
+    tokio::pin!(startup_timeout);
+    let mut backend_ready = false;
+
+    loop {
+        tokio::select! {
+            line = line_rx.recv() => {
+                let Some(line) = line else {
+                    break;
+                };
+                log::info!("Backend stdout: {}", line);
+                if !backend_ready && (line.contains("port") || line.contains("listening") || line.contains("localhost")) {
+                    if let Some(port) =
+                        extract_port_from_line(&line).and_then(|value| value.parse::<u16>().ok())
+                    {
+                        log::info!("Backend ready on port {}", port);
+                        set_backend_port(app_handle, port);
+                        backend_ready = true;
+                        break;
+                    }
+                }
+            }
+            _ = &mut startup_timeout => {
+                if let Some(pid) = child_pid {
+                    let _ = terminate_process_tree(pid);
+                }
+                clear_backend_state(app_handle);
+                return Err("Backend startup timeout".to_string());
+            }
+        }
+    }
+
+    if !backend_ready {
+        return Err("Backend process exited before ready".to_string());
+    }
+
+    let app_handle_logs = app_handle.clone();
+    tokio::spawn(async move {
+        while let Some(line) = line_rx.recv().await {
+            log::info!("Backend stdout: {}", line);
+            let _ = app_handle_logs.emit("backend-log", line);
+        }
+    });
+
+    Ok(())
+}
+
 /// 启动 Node.js 后端进程并保持进程生命周期
 pub async fn start_backend_process(app_handle: &AppHandle) -> Result<(), String> {
     let config = get_backend_config();
@@ -406,20 +617,12 @@ pub async fn start_backend_process(app_handle: &AppHandle) -> Result<(), String>
     let plugins_dir = get_plugins_dir();
     let config_dir = get_config_dir();
 
+    if config.use_node {
+        return start_node_backend_process(app_handle, &config, plugins_dir, config_dir).await;
+    }
+
     // 设置命令
-    let mut cmd = if config.use_node {
-        let mut c = Command::new(&config.node_exe);
-        c.arg(&config.script_path).arg("--log-level=info");
-        if !backend_use_watcher_process() {
-            c.arg("--no-cluster");
-        }
-        if let Some(node_options) = backend_node_options() {
-            c.env("NODE_OPTIONS", node_options);
-        }
-        c
-    } else {
-        Command::new(&config.script_path)
-    };
+    let mut cmd = Command::new(&config.script_path);
 
     cmd.env("NODE_ENV", "production");
 
@@ -565,22 +768,28 @@ fn collect_descendant_pids(pid: u32) -> Vec<u32> {
 
 #[cfg(unix)]
 fn is_process_alive(pid: u32) -> bool {
-    StdCommand::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
 #[cfg(unix)]
 fn send_signal(pid: u32, signal: &str) {
-    let _ = StdCommand::new("kill")
-        .args([signal, &pid.to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    let Some(signal) = signal_number(signal) else {
+        return;
+    };
+    unsafe {
+        let _ = libc::kill(pid as libc::pid_t, signal);
+    }
+}
+
+#[cfg(unix)]
+fn signal_number(signal: &str) -> Option<i32> {
+    match signal.trim_start_matches('-') {
+        "0" => Some(0),
+        "CONT" => Some(libc::SIGCONT),
+        "TERM" => Some(libc::SIGTERM),
+        "KILL" => Some(libc::SIGKILL),
+        _ => None,
+    }
 }
 
 #[cfg(unix)]

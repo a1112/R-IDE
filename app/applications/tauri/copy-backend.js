@@ -74,6 +74,40 @@ function copyDirectory(source, target) {
   }
 }
 
+function patchNodePtyNativeLookup() {
+  const mainPath = path.join(targetDir, 'main.js');
+  if (!fs.existsSync(mainPath)) {
+    return;
+  }
+
+  let content = fs.readFileSync(mainPath, 'utf8');
+  if (content.includes('node-pty native module is disabled in the R-IDE Tauri backend runtime')) {
+    return;
+  }
+
+  const marker = 'for(var e=["build/Release","build/Debug","prebuilds/"+process.platform+"-"+process.arch],n=["..","."],';
+  const markerIndex = content.indexOf(marker);
+  if (markerIndex === -1) {
+    console.warn('node-pty native lookup was not found in backend bundle; startup may require bundled pty.node to load directly.');
+    return;
+  }
+
+  const functionStart = content.lastIndexOf('function ', markerIndex);
+  const functionBrace = content.indexOf('{', functionStart);
+  const prefix = content.slice(Math.max(0, functionStart - 800), functionStart);
+  const requireMatch = prefix.match(/var ([A-Za-z_$][\w$]*)=require;/);
+  if (functionStart === -1 || functionBrace === -1 || !requireMatch) {
+    console.warn('Could not patch node-pty native lookup in backend bundle.');
+    return;
+  }
+
+  const requireAlias = requireMatch[1];
+  const injection = `if(t==="pty"){var ridePtyDisabled=function(){throw new Error("node-pty native module is disabled in the R-IDE Tauri backend runtime")};return{dir:"",module:{fork:ridePtyDisabled,open:ridePtyDisabled}}}if(t==="pty"&&process.env.RIDE_NODE_PTY_PREBUILD_DIR){var ridePtyDir=process.env.RIDE_NODE_PTY_PREBUILD_DIR;try{return{dir:ridePtyDir,module:${requireAlias}(ridePtyDir+"/"+t+".node")}}catch(ridePtyError){}}`;
+  content = `${content.slice(0, functionBrace + 1)}${injection}${content.slice(functionBrace + 1)}`;
+  fs.writeFileSync(mainPath, content);
+  console.log('Patched node-pty native lookup for R-IDE desktop runtime.');
+}
+
 if (!fs.existsSync(sourceDir)) {
   console.error('Theia backend build directory is missing:');
   console.error(`  - ${sourceDir}`);
@@ -93,6 +127,7 @@ if (missingRequired.length > 0) {
 
 fs.rmSync(targetDir, { recursive: true, force: true });
 copyDirectory(sourceDir, targetDir);
+patchNodePtyNativeLookup();
 copyBundledNodeRuntime();
 
 for (const resource of extraNativeResources) {
