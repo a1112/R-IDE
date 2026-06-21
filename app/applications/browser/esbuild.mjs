@@ -10,6 +10,46 @@ import path from 'node:path';
 
 import esbuild from 'esbuild';
 
+const leanTauriModulePrefixes = [
+    '@theia/ai-',
+    '@theia/collaboration/',
+    '@theia/getting-started/',
+    '@theia/memory-inspector/',
+    '@theia/metrics/',
+    '@theia/mini-browser/',
+    '@theia/notebook/',
+    '@theia/plugin-dev/',
+    '@theia/preview/',
+    '@theia/property-view/',
+    '@theia/scanoss/',
+    '@theia/test/',
+    '@theia/vsx-registry/'
+];
+
+const leanTauriExtensionNames = [
+    '@theia/ai-',
+    '@theia/collaboration',
+    '@theia/getting-started',
+    '@theia/memory-inspector',
+    '@theia/metrics',
+    '@theia/mini-browser',
+    '@theia/notebook',
+    '@theia/plugin-dev',
+    '@theia/preview',
+    '@theia/property-view',
+    '@theia/scanoss',
+    '@theia/test',
+    '@theia/vsx-registry'
+];
+
+function shouldFilterLeanTauriRequire(line) {
+    return leanTauriModulePrefixes.some(prefix => line.includes(`require('${prefix}`));
+}
+
+function shouldFilterLeanTauriExtension(name) {
+    return leanTauriExtensionNames.some(prefix => name.startsWith(prefix));
+}
+
 function patchGeneratedFilesForLeanTauri() {
     const enabled = process.env.RIDE_TAURI_LEAN === '1' || process.env.RIDE_TAURI_LEAN === 'true';
     if (!enabled) {
@@ -29,7 +69,7 @@ function patchGeneratedFilesForLeanTauri() {
         const source = fs.readFileSync(file, 'utf8');
         const filtered = source
             .split('\n')
-            .filter(line => !line.includes("require('@theia/ai-"))
+            .filter(line => !shouldFilterLeanTauriRequire(line))
             .join('\n');
         if (filtered !== source) {
             fs.writeFileSync(file, filtered);
@@ -40,7 +80,7 @@ function patchGeneratedFilesForLeanTauri() {
     if (fs.existsSync(backendMain)) {
         const source = fs.readFileSync(backendMain, 'utf8');
         const filtered = source
-            .replace(/    \{\n        "name": "@theia\/ai-[^"]+",\n        "version": "[^"]+"\n    \},?\n/g, '')
+            .replace(/    \{\n        "name": "([^"]+)",\n        "version": "[^"]+"\n    \},?\n/g, (entry, name) => shouldFilterLeanTauriExtension(name) ? '' : entry)
             .replace(/,\n\];/g, '\n];');
         if (filtered !== source) {
             fs.writeFileSync(backendMain, filtered);

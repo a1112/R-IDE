@@ -11,8 +11,9 @@ import { ApplicationShell, FrontendApplicationContribution, open, OpenerService 
 import { FrontendApplicationStateService } from '@theia/core/lib/browser/frontend-application-state';
 import { CommandService } from '@theia/core/lib/common';
 import { inject, injectable } from '@theia/core/shared/inversify';
-import { GettingStartedWidget } from '@theia/getting-started/lib/browser/getting-started-widget';
 import { WorkspaceService } from '@theia/workspace/lib/browser';
+
+const GETTING_STARTED_WIDGET_ID = 'getting.started.widget';
 
 @injectable()
 export class RideWorkbenchContribution implements FrontendApplicationContribution {
@@ -157,7 +158,7 @@ export class RideWorkbenchContribution implements FrontendApplicationContributio
 
     protected async configureLeanStartup(): Promise<void> {
         await this.ensureNavigatorVisible();
-        await this.shell.closeWidget(GettingStartedWidget.ID, { save: false }).catch(() => undefined);
+        await this.shell.closeWidget(GETTING_STARTED_WIDGET_ID, { save: false }).catch(() => undefined);
         await this.shell.collapsePanel('bottom').catch(() => undefined);
         await this.shell.collapsePanel('right').catch(() => undefined);
         this.localizeSidePanelTitles();

@@ -19,13 +19,73 @@ const path = require('path');
 // 源插件目录（相对于项目根目录）
 const sourcePluginsDir = path.resolve(__dirname, '../../plugins');
 const shouldCopyPlugins = process.env.RIDE_COPY_PLUGINS === '1' || process.env.RIDE_COPY_PLUGINS === 'true';
+const pluginProfile = (process.env.RIDE_PLUGIN_PROFILE || 'lean').trim().toLowerCase();
 
 // 目标插件目录
 const targetPluginsDir = path.resolve(__dirname, 'resources/plugins');
 
-// 确保目标目录存在
-if (!fs.existsSync(targetPluginsDir)) {
-  fs.mkdirSync(targetPluginsDir, { recursive: true });
+const leanPluginAllowList = new Set([
+  'ms-vscode.js-debug',
+  'ms-vscode.vscode-js-profile-table',
+  'vscode.bat',
+  'vscode.builtin-notebook-renderers',
+  'vscode.coffeescript',
+  'vscode.configuration-editing',
+  'vscode.cpp',
+  'vscode.css',
+  'vscode.debug-auto-launch',
+  'vscode.debug-server-ready',
+  'vscode.diff',
+  'vscode.docker',
+  'vscode.dotenv',
+  'vscode.emmet',
+  'vscode.git',
+  'vscode.git-base',
+  'vscode.github',
+  'vscode.github-authentication',
+  'vscode.go',
+  'vscode.html',
+  'vscode.ini',
+  'vscode.ipynb',
+  'vscode.java',
+  'vscode.javascript',
+  'vscode.json',
+  'vscode.log',
+  'vscode.make',
+  'vscode.markdown',
+  'vscode.markdown-math',
+  'vscode.merge-conflict',
+  'vscode.npm',
+  'vscode.php',
+  'vscode.python',
+  'vscode.r',
+  'vscode.references-view',
+  'vscode.rust',
+  'vscode.search-result',
+  'vscode.shellscript',
+  'vscode.simple-browser',
+  'vscode.sql',
+  'vscode.swift',
+  'vscode.terminal-suggest',
+  'vscode.theme-defaults',
+  'vscode.typescript',
+  'vscode.vscode-theme-seti',
+  'vscode.xml',
+  'vscode.yaml',
+]);
+
+function parsePluginList(value) {
+  return new Set((value || '')
+    .split(',')
+    .map(item => item.trim())
+    .filter(Boolean));
+}
+
+const forcedIncludes = parsePluginList(process.env.RIDE_PLUGIN_INCLUDE);
+const forcedExcludes = parsePluginList(process.env.RIDE_PLUGIN_EXCLUDE);
+
+function writeGitKeep() {
+  fs.writeFileSync(path.join(targetPluginsDir, '.gitkeep'), '\n');
 }
 
 // 检查源目录是否存在
@@ -37,6 +97,9 @@ if (!fs.existsSync(sourcePluginsDir)) {
 }
 
 if (!shouldCopyPlugins) {
+  fs.rmSync(targetPluginsDir, { recursive: true, force: true });
+  fs.mkdirSync(targetPluginsDir, { recursive: true });
+  writeGitKeep();
   console.log('Skipping plugin copy for faster Tauri runs.');
   console.log('Source:', sourcePluginsDir);
   console.log('Target:', targetPluginsDir);
@@ -64,6 +127,32 @@ function copyDirectory(source, target) {
   }
 }
 
+function listSourcePlugins() {
+  return fs.readdirSync(sourcePluginsDir, { withFileTypes: true })
+    .filter(entry => entry.isDirectory() && !entry.name.startsWith('.'))
+    .map(entry => entry.name)
+    .sort();
+}
+
+function selectPlugins() {
+  const plugins = listSourcePlugins();
+  if (pluginProfile === 'full') {
+    return plugins.filter(plugin => !forcedExcludes.has(plugin));
+  }
+  if (pluginProfile !== 'lean') {
+    console.error(`Unsupported RIDE_PLUGIN_PROFILE: ${pluginProfile}`);
+    console.error('Supported profiles: lean, full');
+    process.exit(1);
+  }
+
+  return plugins.filter(plugin => {
+    if (forcedExcludes.has(plugin)) {
+      return false;
+    }
+    return leanPluginAllowList.has(plugin) || forcedIncludes.has(plugin);
+  });
+}
+
 // 统计插件信息
 function countPlugins(dir) {
   let count = 0;
@@ -82,9 +171,17 @@ function countPlugins(dir) {
 console.log('Copying VSCode plugins...');
 console.log('Source:', sourcePluginsDir);
 console.log('Target:', targetPluginsDir);
+console.log('Profile:', pluginProfile);
 
 try {
-  copyDirectory(sourcePluginsDir, targetPluginsDir);
+  fs.rmSync(targetPluginsDir, { recursive: true, force: true });
+  fs.mkdirSync(targetPluginsDir, { recursive: true });
+
+  const selectedPlugins = selectPlugins();
+  for (const plugin of selectedPlugins) {
+    copyDirectory(path.join(sourcePluginsDir, plugin), path.join(targetPluginsDir, plugin));
+  }
+  writeGitKeep();
 
   const pluginCount = countPlugins(targetPluginsDir);
 
@@ -113,6 +210,9 @@ try {
   console.log(`  - ${pluginCount} plugins`);
   console.log(`  - ${sizeMB} MB`);
   console.log(`  - Target: ${targetPluginsDir}`);
+  if (pluginProfile === 'lean') {
+    console.log('  - Set RIDE_PLUGIN_PROFILE=full to include every downloaded plugin.');
+  }
 
 } catch (error) {
   console.error('✗ Failed to copy plugins:', error.message);
