@@ -26,8 +26,8 @@
     "copy:plugins:bundle": "RIDE_COPY_PLUGINS=1 node copy-plugins.js",
     "copy:all": "npm run copy:frontend && npm run copy:backend && npm run copy:plugins",
     "dev": "npm run copy:all && npm run tauri -- dev",
-    "build": "npm run copy:frontend && npm run copy:backend && npm run copy:plugins:bundle && npm run tauri -- build",
-    "build:prod": "npm run copy:frontend && npm run copy:backend && npm run copy:plugins:bundle && npm run tauri -- build",
+    "build": "npm run copy:frontend && npm run copy:backend && npm run copy:plugins && npm run tauri -- build",
+    "build:prod": "npm run copy:frontend && npm run copy:backend && npm run copy:plugins && npm run tauri -- build",
     "verify": "node verify-build.js",
     "tauri": "tauri"
   },

@@ -103,7 +103,7 @@ if (!shouldCopyPlugins) {
   console.log('Skipping plugin copy for faster Tauri runs.');
   console.log('Source:', sourcePluginsDir);
   console.log('Target:', targetPluginsDir);
-  console.log('Set RIDE_COPY_PLUGINS=1 when creating a distributable build that should bundle plugins.');
+  console.log('Set RIDE_TAURI_ENABLE_PLUGINS=1 and RIDE_COPY_PLUGINS=1 when building with VS Code plugin support.');
   process.exit(0);
 }
 
@@ -213,6 +213,7 @@ try {
   if (pluginProfile === 'lean') {
     console.log('  - Set RIDE_PLUGIN_PROFILE=full to include every downloaded plugin.');
   }
+  console.log('  - Build the browser bundle with RIDE_TAURI_ENABLE_PLUGINS=1 to enable these plugins at runtime.');
 
 } catch (error) {
   console.error('✗ Failed to copy plugins:', error.message);

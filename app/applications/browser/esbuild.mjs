@@ -12,8 +12,13 @@ import esbuild from 'esbuild';
 
 const leanTauriModulePrefixes = [
     '@theia/ai-',
+    '@theia/bulk-edit/',
+    '@theia/callhierarchy/',
+    '@theia/console/',
     '@theia/collaboration/',
+    '@theia/editor-preview/',
     '@theia/getting-started/',
+    '@theia/keymaps/',
     '@theia/memory-inspector/',
     '@theia/metrics/',
     '@theia/mini-browser/',
@@ -22,14 +27,28 @@ const leanTauriModulePrefixes = [
     '@theia/preview/',
     '@theia/property-view/',
     '@theia/scanoss/',
+    '@theia/secondary-window/',
     '@theia/test/',
+    '@theia/timeline/',
+    '@theia/toolbar/',
+    '@theia/typehierarchy/',
     '@theia/vsx-registry/'
+];
+
+const leanTauriPluginModulePrefixes = [
+    '@theia/plugin-ext/',
+    '@theia/plugin-ext-vscode/'
 ];
 
 const leanTauriExtensionNames = [
     '@theia/ai-',
+    '@theia/bulk-edit',
+    '@theia/callhierarchy',
+    '@theia/console',
     '@theia/collaboration',
+    '@theia/editor-preview',
     '@theia/getting-started',
+    '@theia/keymaps',
     '@theia/memory-inspector',
     '@theia/metrics',
     '@theia/mini-browser',
@@ -38,16 +57,31 @@ const leanTauriExtensionNames = [
     '@theia/preview',
     '@theia/property-view',
     '@theia/scanoss',
+    '@theia/secondary-window',
     '@theia/test',
+    '@theia/timeline',
+    '@theia/toolbar',
+    '@theia/typehierarchy',
     '@theia/vsx-registry'
 ];
 
+const leanTauriPluginExtensionNames = [
+    '@theia/plugin-ext',
+    '@theia/plugin-ext-vscode'
+];
+
+function shouldKeepTauriPlugins() {
+    return process.env.RIDE_TAURI_ENABLE_PLUGINS === '1' || process.env.RIDE_TAURI_ENABLE_PLUGINS === 'true';
+}
+
 function shouldFilterLeanTauriRequire(line) {
-    return leanTauriModulePrefixes.some(prefix => line.includes(`require('${prefix}`));
+    return leanTauriModulePrefixes.some(prefix => line.includes(`require('${prefix}`))
+        || (!shouldKeepTauriPlugins() && leanTauriPluginModulePrefixes.some(prefix => line.includes(`require('${prefix}`)));
 }
 
 function shouldFilterLeanTauriExtension(name) {
-    return leanTauriExtensionNames.some(prefix => name.startsWith(prefix));
+    return leanTauriExtensionNames.some(prefix => name.startsWith(prefix))
+        || (!shouldKeepTauriPlugins() && leanTauriPluginExtensionNames.some(prefix => name.startsWith(prefix)));
 }
 
 function patchGeneratedFilesForLeanTauri() {
