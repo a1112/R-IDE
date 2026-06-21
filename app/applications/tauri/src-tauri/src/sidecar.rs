@@ -7,14 +7,14 @@
  * SPDX-License-Identifier: MIT
  ********************************************************************************/
 
-use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use std::time::Duration;
+use dirs::home_dir;
 use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command as StdCommand, Stdio};
+use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
-use dirs::home_dir;
 
 const BACKEND_STARTUP_TIMEOUT: u64 = 120; // seconds
 
@@ -30,7 +30,7 @@ fn find_node_executable() -> Option<PathBuf> {
     let probe_command = if cfg!(windows) { "where" } else { "which" };
     let probe_args: &[&str] = &["node"];
 
-    if let Ok(output) = std::process::Command::new(probe_command).args(probe_args).output() {
+    if let Ok(output) = StdCommand::new(probe_command).args(probe_args).output() {
         if output.status.success() {
             if let Some(path) = String::from_utf8_lossy(&output.stdout).lines().next() {
                 return Some(PathBuf::from(path.trim()));
@@ -75,13 +75,22 @@ fn get_backend_script() -> PathBuf {
         // Tauri 资源目录（打包时复制）- 标准路径
         exe_dir.join("resources").join("backend").join("main.js"),
         // Tauri 资源目录 - 嵌套路径（resources 映射可能导致嵌套）
-        exe_dir.join("resources").join("backend").join("backend").join("main.js"),
+        exe_dir
+            .join("resources")
+            .join("backend")
+            .join("backend")
+            .join("main.js"),
         // 开发环境：从 Tauri 应用目录运行
         current_dir.join("../browser/lib/backend/main.js"),
         // 开发环境：从 src-tauri 目录运行
         current_dir.join("../../browser/lib/backend/main.js"),
         // 开发环境：browser 应用的构建目录
-        current_dir.join("applications").join("browser").join("lib").join("backend").join("main.js"),
+        current_dir
+            .join("applications")
+            .join("browser")
+            .join("lib")
+            .join("backend")
+            .join("main.js"),
         // 相对于当前目录
         current_dir.join("lib").join("backend").join("main.js"),
     ];
@@ -109,7 +118,11 @@ fn get_backend_config() -> BackendConfig {
     // 首先尝试找到 Node.js
     if let Some(node_exe) = find_node_executable() {
         let script_path = get_backend_script();
-        log::info!("Using Node.js to run backend: {:?} {:?}", node_exe, script_path);
+        log::info!(
+            "Using Node.js to run backend: {:?} {:?}",
+            node_exe,
+            script_path
+        );
         return BackendConfig {
             node_exe,
             script_path,
@@ -154,7 +167,11 @@ fn get_plugins_dir() -> PathBuf {
         // Tauri 资源目录（优先使用打包的插件）
         exe_dir.join("resources").join("plugins"),
         // 当前工作目录
-        current_dir.join("applications").join("tauri").join("resources").join("plugins"),
+        current_dir
+            .join("applications")
+            .join("tauri")
+            .join("resources")
+            .join("plugins"),
         // 开发环境：从 Tauri 应用目录运行
         current_dir.join("../../plugins"),
         // 开发环境：从 src-tauri 目录运行
@@ -173,10 +190,7 @@ fn get_plugins_dir() -> PathBuf {
     }
 
     // 默认：使用用户配置目录
-    let default_plugins = home_dir()
-        .unwrap_or_default()
-        .join(".ride")
-        .join("plugins");
+    let default_plugins = home_dir().unwrap_or_default().join(".ride").join("plugins");
 
     log::info!("Creating default plugins directory: {:?}", default_plugins);
     fs::create_dir_all(&default_plugins).unwrap_or_else(|e| {
@@ -217,7 +231,8 @@ pub fn initialize_plugins() -> Result<(), String> {
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".ride")
         .join("plugins");
-    fs::create_dir_all(&user_plugins).map_err(|e| format!("Failed to create plugins directory: {}", e))?;
+    fs::create_dir_all(&user_plugins)
+        .map_err(|e| format!("Failed to create plugins directory: {}", e))?;
     Ok(())
 }
 
@@ -244,6 +259,43 @@ fn set_backend_port(app_handle: &AppHandle, port: u16) {
     let _ = app_handle.emit("backend-ready", port);
 }
 
+fn set_backend_pid(app_handle: &AppHandle, pid: Option<u32>) {
+    if let Some(state) = app_handle.try_state::<crate::AppState>() {
+        *state.backend_pid.lock().unwrap() = pid;
+    }
+}
+
+fn clear_backend_state(app_handle: &AppHandle) {
+    if let Some(state) = app_handle.try_state::<crate::AppState>() {
+        *state.backend_pid.lock().unwrap() = None;
+        *state.backend_port.lock().unwrap() = None;
+    }
+}
+
+fn backend_node_options() -> Option<String> {
+    let existing = std::env::var("NODE_OPTIONS").unwrap_or_default();
+    if existing.contains("--max-old-space-size") {
+        return if existing.trim().is_empty() {
+            None
+        } else {
+            Some(existing)
+        };
+    }
+
+    let heap_limit_mb = std::env::var("RIDE_NODE_MAX_OLD_SPACE_MB")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|value| *value >= 256)
+        .unwrap_or(768);
+    let mut options = format!("--max-old-space-size={}", heap_limit_mb);
+    if !existing.trim().is_empty() {
+        options.push(' ');
+        options.push_str(existing.trim());
+    }
+
+    Some(options)
+}
+
 /// 启动 Node.js 后端进程并保持进程生命周期
 pub async fn start_backend_process(app_handle: &AppHandle) -> Result<(), String> {
     let config = get_backend_config();
@@ -253,16 +305,26 @@ pub async fn start_backend_process(app_handle: &AppHandle) -> Result<(), String>
             return Err(format!("Node.js not found at: {:?}", config.node_exe));
         }
         if !config.script_path.exists() {
-            return Err(format!("Backend script not found at: {:?}", config.script_path));
+            return Err(format!(
+                "Backend script not found at: {:?}",
+                config.script_path
+            ));
         }
     } else {
         if !config.script_path.exists() {
-            return Err(format!("Backend binary not found at: {:?}", config.script_path));
+            return Err(format!(
+                "Backend binary not found at: {:?}",
+                config.script_path
+            ));
         }
     }
 
-    log::info!("Starting backend with config: use_node={}, node_exe={:?}, script={:?}",
-               config.use_node, config.node_exe, config.script_path);
+    log::info!(
+        "Starting backend with config: use_node={}, node_exe={:?}, script={:?}",
+        config.use_node,
+        config.node_exe,
+        config.script_path
+    );
 
     let plugins_dir = get_plugins_dir();
     let config_dir = get_config_dir();
@@ -271,6 +333,9 @@ pub async fn start_backend_process(app_handle: &AppHandle) -> Result<(), String>
     let mut cmd = if config.use_node {
         let mut c = Command::new(&config.node_exe);
         c.arg(&config.script_path).arg("--log-level=info");
+        if let Some(node_options) = backend_node_options() {
+            c.env("NODE_OPTIONS", node_options);
+        }
         c
     } else {
         Command::new(&config.script_path)
@@ -279,8 +344,11 @@ pub async fn start_backend_process(app_handle: &AppHandle) -> Result<(), String>
     cmd.env("NODE_ENV", "production");
 
     // 设置插件路径
-    cmd.env("THEIA_PLUGINS_DIR", plugins_dir.to_string_lossy().to_string())
-       .env("THEIA_CONFIG_DIR", config_dir.to_string_lossy().to_string());
+    cmd.env(
+        "THEIA_PLUGINS_DIR",
+        plugins_dir.to_string_lossy().to_string(),
+    )
+    .env("THEIA_CONFIG_DIR", config_dir.to_string_lossy().to_string());
 
     // Theia 后端会尝试查找并启动在可用端口上
     // 我们需要捕获它的输出来获取实际使用的端口
@@ -290,6 +358,11 @@ pub async fn start_backend_process(app_handle: &AppHandle) -> Result<(), String>
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("Failed to spawn backend: {}", e))?;
+
+    if let Some(pid) = child.id() {
+        log::info!("Backend process started with pid {}", pid);
+        set_backend_pid(app_handle, Some(pid));
+    }
 
     let stdout = child.stdout.take().ok_or("Failed to capture stdout")?;
     let stderr = child.stderr.take().ok_or("Failed to capture stderr")?;
@@ -326,13 +399,18 @@ pub async fn start_backend_process(app_handle: &AppHandle) -> Result<(), String>
                     }
                     Ok(None) => {
                         let status = child.wait().await.map_err(|e| format!("Failed to wait for backend: {}", e))?;
+                        clear_backend_state(app_handle);
                         return Err(format!("Backend exited unexpectedly: {}", status));
                     }
-                    Err(e) => return Err(format!("Failed to read backend output: {}", e)),
+                    Err(e) => {
+                        clear_backend_state(app_handle);
+                        return Err(format!("Failed to read backend output: {}", e));
+                    }
                 }
             }
             status = child.wait() => {
                 let status = status.map_err(|e| format!("Failed to wait for backend: {}", e))?;
+                clear_backend_state(app_handle);
                 if status.success() {
                     return Ok(());
                 }
@@ -354,11 +432,7 @@ fn extract_port_from_line(line: &str) -> Option<String> {
     // "Server started on port 3000"
     // "Listening on *:3000"
     // "http://localhost:3000"
-    let patterns = vec![
-        r"port (\d{4,5})",
-        r":(\d{4,5})",
-        r"(\d{4,5})",
-    ];
+    let patterns = vec![r"port (\d{4,5})", r":(\d{4,5})", r"(\d{4,5})"];
 
     for pattern in patterns {
         if let Ok(re) = regex::Regex::new(pattern) {
@@ -371,6 +445,82 @@ fn extract_port_from_line(line: &str) -> Option<String> {
     }
 
     None
+}
+
+#[cfg(unix)]
+fn child_pids(pid: u32) -> Vec<u32> {
+    let output = StdCommand::new("pgrep")
+        .args(["-P", &pid.to_string()])
+        .output();
+
+    output
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter_map(|line| line.trim().parse::<u32>().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(unix)]
+fn collect_descendant_pids(pid: u32) -> Vec<u32> {
+    let mut descendants = Vec::new();
+    for child in child_pids(pid) {
+        descendants.extend(collect_descendant_pids(child));
+        descendants.push(child);
+    }
+    descendants
+}
+
+#[cfg(unix)]
+fn is_process_alive(pid: u32) -> bool {
+    StdCommand::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn send_signal(pid: u32, signal: &str) {
+    let _ = StdCommand::new("kill")
+        .args([signal, &pid.to_string()])
+        .status();
+}
+
+#[cfg(unix)]
+fn terminate_process_tree(pid: u32) -> Result<(), String> {
+    let mut pids = collect_descendant_pids(pid);
+    pids.push(pid);
+
+    for target in &pids {
+        send_signal(*target, "-TERM");
+    }
+
+    std::thread::sleep(Duration::from_millis(500));
+
+    for target in pids.iter().copied().filter(|pid| is_process_alive(*pid)) {
+        send_signal(target, "-KILL");
+    }
+
+    Ok(())
+}
+
+#[cfg(windows)]
+fn terminate_process_tree(pid: u32) -> Result<(), String> {
+    let status = StdCommand::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .status()
+        .map_err(|e| format!("Failed to run taskkill: {}", e))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("taskkill exited with status: {}", status))
+    }
 }
 
 /// 启动后端的主函数（在独立线程中运行）
@@ -393,8 +543,18 @@ pub fn start_backend(app_handle: &AppHandle) -> Result<(), String> {
 }
 
 /// 停止后端进程
-pub fn stop_backend(_app_handle: &AppHandle) -> Result<(), String> {
-    // TODO: 实现优雅关闭逻辑
-    log::info!("Stopping backend...");
+pub fn stop_backend(app_handle: &AppHandle) -> Result<(), String> {
+    let pid = app_handle.try_state::<crate::AppState>().and_then(|state| {
+        *state.backend_port.lock().unwrap() = None;
+        state.backend_pid.lock().unwrap().take()
+    });
+
+    if let Some(pid) = pid {
+        log::info!("Stopping backend process tree rooted at pid {}", pid);
+        terminate_process_tree(pid)?;
+    } else {
+        log::info!("No backend process is registered; nothing to stop");
+    }
+
     Ok(())
 }

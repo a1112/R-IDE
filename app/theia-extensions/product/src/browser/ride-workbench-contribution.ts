@@ -11,6 +11,7 @@ import { ApplicationShell, FrontendApplicationContribution, open, OpenerService 
 import { FrontendApplicationStateService } from '@theia/core/lib/browser/frontend-application-state';
 import { CommandService } from '@theia/core/lib/common';
 import { inject, injectable } from '@theia/core/shared/inversify';
+import { GettingStartedWidget } from '@theia/getting-started/lib/browser/getting-started-widget';
 import { WorkspaceService } from '@theia/workspace/lib/browser';
 
 @injectable()
@@ -36,8 +37,12 @@ export class RideWorkbenchContribution implements FrontendApplicationContributio
         this.installTopChromeWhenReady();
         this.applicationState.reachedState('ready').then(() => {
             this.installTopChromeWhenReady();
-            this.restoreDemoWorkbench().catch(console.warn);
-            window.setTimeout(() => this.restoreDemoWorkbench().catch(console.warn), 1500);
+            if (this.shouldRestoreDemoWorkbench()) {
+                this.restoreDemoWorkbench().catch(console.warn);
+                window.setTimeout(() => this.restoreDemoWorkbench().catch(console.warn), 1500);
+            } else {
+                this.configureLeanStartup().catch(console.warn);
+            }
         });
     }
 
@@ -136,6 +141,25 @@ export class RideWorkbenchContribution implements FrontendApplicationContributio
         this.shell.expandPanel('right');
         this.shell.resize(330, 'right');
         this.installRightStack();
+        this.localizeSidePanelTitles();
+    }
+
+    protected shouldRestoreDemoWorkbench(): boolean {
+        const flags = window as Window & { RIDE_RESTORE_DEMO_WORKBENCH?: boolean };
+        if (flags.RIDE_RESTORE_DEMO_WORKBENCH) {
+            return true;
+        }
+
+        const searchParams = new URLSearchParams(window.location.search);
+        return searchParams.get('rideDemoWorkbench') === '1'
+            || window.localStorage?.getItem('ride.restoreDemoWorkbench') === '1';
+    }
+
+    protected async configureLeanStartup(): Promise<void> {
+        await this.ensureNavigatorVisible();
+        await this.shell.closeWidget(GettingStartedWidget.ID, { save: false }).catch(() => undefined);
+        await this.shell.collapsePanel('bottom').catch(() => undefined);
+        await this.shell.collapsePanel('right').catch(() => undefined);
         this.localizeSidePanelTitles();
     }
 

@@ -19,10 +19,15 @@ const path = require('path');
 const sourceDir = path.resolve(__dirname, '../browser/lib/backend');
 const targetDir = path.resolve(__dirname, 'resources/backend');
 const requiredFiles = ['main.js'];
+
+function nodePtyPlatformTag() {
+  return `${process.platform}-${process.arch}`;
+}
+
 const extraNativeResources = [
   {
-    source: path.resolve(__dirname, '../../node_modules/node-pty/prebuilds'),
-    target: path.join(targetDir, 'prebuilds'),
+    source: path.resolve(__dirname, '../../node_modules/node-pty/prebuilds', nodePtyPlatformTag()),
+    target: path.join(targetDir, 'prebuilds', nodePtyPlatformTag()),
     required: true,
   },
   {

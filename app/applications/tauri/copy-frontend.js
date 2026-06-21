@@ -20,35 +20,39 @@ const sourceDir = path.resolve(__dirname, '../browser/lib/frontend');
 const targetDir = path.resolve(__dirname, './browser-frontend');
 const tauriFrontendDir = path.resolve(__dirname, './tauri-frontend');
 
-// 确保目标目录存在
-if (!fs.existsSync(targetDir)) {
-  fs.mkdirSync(targetDir, { recursive: true });
-}
-if (!fs.existsSync(tauriFrontendDir)) {
-  fs.mkdirSync(tauriFrontendDir, { recursive: true });
-}
-
 const requiredFiles = [
   'index.html',
   'bundle.js',
   'bundle.css',
 ];
 
+fs.rmSync(targetDir, { recursive: true, force: true });
+fs.rmSync(tauriFrontendDir, { recursive: true, force: true });
+fs.mkdirSync(targetDir, { recursive: true });
+fs.mkdirSync(tauriFrontendDir, { recursive: true });
+
 // 要复制的文件列表
 const filesToCopy = [
   ...requiredFiles,
-  'bundle.js.map',
-  'bundle.css.map',
   'plugin-worker.js',
-  'plugin-worker.js.map',
   'editor.worker.js',
-  'editor.worker.js.map',
   'secondary-window.js',
-  'secondary-window.js.map',
   'secondary-window.css',
-  'secondary-window.css.map',
   'favicon.ico',
 ];
+
+const sourceMapFiles = [
+  'bundle.js.map',
+  'bundle.css.map',
+  'plugin-worker.js.map',
+  'editor.worker.js.map',
+  'secondary-window.js.map',
+  'secondary-window.css.map',
+];
+
+if (process.env.RIDE_COPY_SOURCEMAPS === '1') {
+  filesToCopy.push(...sourceMapFiles);
+}
 
 const missingRequired = requiredFiles.filter(file => !fs.existsSync(path.join(sourceDir, file)));
 if (missingRequired.length > 0) {
@@ -190,15 +194,39 @@ const bootstrapHtml = `<!DOCTYPE html>
     window.RIDE_TAURI = true;
 
     const DEFAULT_BACKEND_PORT = 3000;
+    const PORT_POLL_INTERVAL_MS = 750;
+    const FALLBACK_REDIRECT_MS = 120000;
     let redirected = false;
+    let portPollTimer = null;
+    let fallbackTimer = null;
 
     function redirectToBackend(port) {
       if (redirected) {
         return;
       }
       redirected = true;
+      if (portPollTimer) {
+        window.clearInterval(portPollTimer);
+      }
+      if (fallbackTimer) {
+        window.clearTimeout(fallbackTimer);
+      }
       const backendPort = port || DEFAULT_BACKEND_PORT;
       window.location.replace('http://127.0.0.1:' + backendPort + '/');
+    }
+
+    async function queryBackendPort(tauri) {
+      if (!tauri || !tauri.core || !tauri.core.invoke) {
+        return null;
+      }
+      return tauri.core.invoke('get_backend_port').catch(() => null);
+    }
+
+    async function pollBackendPort(tauri) {
+      const port = await queryBackendPort(tauri);
+      if (port) {
+        redirectToBackend(port);
+      }
     }
 
     async function init() {
@@ -207,19 +235,15 @@ const bootstrapHtml = `<!DOCTYPE html>
         await tauri.event.listen('backend-ready', event => redirectToBackend(event.payload));
       }
 
-      if (tauri && tauri.core && tauri.core.invoke) {
-        const port = await tauri.core.invoke('get_backend_port').catch(() => null);
-        if (port) {
-          redirectToBackend(port);
-        }
-      }
+      await pollBackendPort(tauri);
+      portPollTimer = window.setInterval(() => pollBackendPort(tauri), PORT_POLL_INTERVAL_MS);
+      fallbackTimer = window.setTimeout(() => redirectToBackend(DEFAULT_BACKEND_PORT), FALLBACK_REDIRECT_MS);
     }
 
     window.addEventListener('DOMContentLoaded', () => {
       init().catch(error => console.error('[R-IDE] Bootstrap failed:', error));
     });
 
-    window.setTimeout(() => redirectToBackend(DEFAULT_BACKEND_PORT), 15000);
   </script>
 </body>
 </html>`;

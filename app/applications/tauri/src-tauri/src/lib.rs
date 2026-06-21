@@ -9,8 +9,8 @@
 
 // Tauri 应用库模块
 
-pub mod sidecar;
 pub mod commands;
+pub mod sidecar;
 
 use std::sync::Mutex;
 use tauri::Manager;
@@ -18,6 +18,7 @@ use tauri::Manager;
 // 全局状态：存储 Node.js 后端的端口号
 pub struct AppState {
     pub backend_port: Mutex<Option<u16>>,
+    pub backend_pid: Mutex<Option<u32>>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -40,6 +41,7 @@ pub fn run() {
             // 初始化全局状态
             app.manage(AppState {
                 backend_port: Mutex::new(None),
+                backend_pid: Mutex::new(None),
             });
 
             // 初始化插件目录
@@ -63,6 +65,14 @@ pub fn run() {
             commands::save_file,
             commands::show_in_folder,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| match event {
+            tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
+                if let Err(e) = sidecar::stop_backend(app_handle) {
+                    log::warn!("Failed to stop backend during shutdown: {}", e);
+                }
+            }
+            _ => {}
+        });
 }
