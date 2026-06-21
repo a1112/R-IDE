@@ -89,6 +89,7 @@ if (fs.existsSync(htmlSource)) {
   <script>
     // R-IDE Tauri 前端配置
     window.RIDE_TAURI = true;
+    window.RIDE_DISABLE_DEFAULT_TERMINAL = true;
     window.RIDE_BACKEND_PORT = null; // 将由 Tauri 设置
 
     // 监听来自 Tauri 的后端就绪事件

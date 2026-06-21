@@ -15,8 +15,10 @@ import { applyBranding } from './theia-ide-config';
 import { CommandContribution } from '@theia/core/lib/common/command';
 import { ContainerModule } from '@theia/core/shared/inversify';
 import { MenuContribution } from '@theia/core/lib/common/menu';
+import { TerminalFrontendContribution } from '@theia/terminal/lib/browser/terminal-frontend-contribution';
 import { TheiaIDEAboutDialog } from './theia-ide-about-dialog';
 import { TheiaIDEContribution } from './theia-ide-contribution';
+import { RideTerminalFrontendContribution } from './ride-terminal-frontend-contribution';
 import { RideWorkbenchContribution } from './ride-workbench-contribution';
 
 export default new ContainerModule((bind, _unbind, isBound, rebind) => {
@@ -35,4 +37,8 @@ export default new ContainerModule((bind, _unbind, isBound, rebind) => {
 
     bind(RideWorkbenchContribution).toSelf().inSingletonScope();
     bind(FrontendApplicationContribution).toService(RideWorkbenchContribution);
+
+    if (isBound(TerminalFrontendContribution)) {
+        rebind(TerminalFrontendContribution).to(RideTerminalFrontendContribution).inSingletonScope();
+    }
 });

@@ -7,6 +7,7 @@
     "@theia/ai-registry": "1.73.0-next.2",
     "@theia/core": "1.73.0-next.2",
     "@theia/getting-started": "1.73.0-next.2",
+    "@theia/terminal": "1.73.0-next.2",
     "@theia/vsx-registry": "1.73.0-next.2",
     "@theia/workspace": "1.73.0-next.2",
     "inversify": "^6.2.2"
