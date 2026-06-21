@@ -136,13 +136,13 @@
   },
   "scripts": {
     "clean": "theia clean && rimraf node_modules",
-    "build": "yarn -s rebuild && theia build --app-target=\"browser\" --mode development",
-    "build:prod": "yarn -s rebuild && theia  build --app-target=\"browser\"",
-    "build:tauri-backend": "yarn -s rebuild && theia build --app-target=\"browser\" && yarn pkg:compile",
+    "build": "npm run rebuild --silent && theia build --app-target=\"browser\" --mode development",
+    "build:prod": "npm run rebuild --silent && theia build --app-target=\"browser\"",
+    "build:tauri-backend": "npm run rebuild --silent && theia build --app-target=\"browser\"",
     "pkg:compile": "pkg lib/backend/main.js --targets node22-win-x64,node22-linux-x64,node22-macos-x64 --output dist/theia-backend",
     "rebuild": "theia rebuild:browser --cacheRoot ../..",
     "start": "theia start --plugins=local-dir:../../plugins",
-    "watch": "concurrently --kill-others -n tsc,build -c red,yellow \"tsc -b -w --preserveWatchOutput\" \"yarn -s watch:bundle\"",
+    "watch": "concurrently --kill-others -n tsc,build -c red,yellow \"tsc -b -w --preserveWatchOutput\" \"npm run watch:bundle --silent\"",
     "update:theia": "ts-node ../../scripts/update-theia-version.ts",
     "update:next": "ts-node ../../scripts/update-theia-version.ts next"
   }

@@ -35,8 +35,14 @@ license-check-summary.txt*
 
 # Tauri specific
 **/browser-frontend/
-**/resources/backend/
-**/resources/plugins/
+**/tauri-frontend/
+**/resources/backend/*
+**/resources/plugins/*
+!**/resources/backend/
+!**/resources/plugins/
+!**/resources/backend/.gitkeep
+!**/resources/plugins/.gitkeep
+**/src-tauri/gen/schemas/macOS-schema.json
 
 # Environment
 .env

@@ -7,7 +7,7 @@
  * SPDX-License-Identifier: MIT
  ********************************************************************************/
 
-use tauri::{AppHandle, State, Emitter};
+use tauri::State;
 use crate::AppState;
 
 /// 获取后端服务的端口号
@@ -19,7 +19,6 @@ pub fn get_backend_port(state: State<AppState>) -> Result<Option<u16>, String> {
 /// 打开目录选择器
 #[tauri::command]
 pub fn open_directory() -> Result<Option<String>, String> {
-    use tauri_plugin_dialog::DialogExt;
     // TODO: 实现目录选择逻辑
     Ok(None)
 }
@@ -27,7 +26,6 @@ pub fn open_directory() -> Result<Option<String>, String> {
 /// 保存文件对话框
 #[tauri::command]
 pub fn save_file() -> Result<Option<String>, String> {
-    use tauri_plugin_dialog::DialogExt;
     // TODO: 实现保存文件逻辑
     Ok(None)
 }

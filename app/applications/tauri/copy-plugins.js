@@ -18,6 +18,7 @@ const path = require('path');
 
 // 源插件目录（相对于项目根目录）
 const sourcePluginsDir = path.resolve(__dirname, '../../plugins');
+const shouldCopyPlugins = process.env.RIDE_COPY_PLUGINS === '1' || process.env.RIDE_COPY_PLUGINS === 'true';
 
 // 目标插件目录
 const targetPluginsDir = path.resolve(__dirname, 'resources/plugins');
@@ -32,6 +33,14 @@ if (!fs.existsSync(sourcePluginsDir)) {
   console.warn('⚠ Source plugins directory not found:', sourcePluginsDir);
   console.warn('Plugins will not be included in the Tauri build.');
   console.warn('Make sure to run "yarn download:plugins" from the project root first.');
+  process.exit(0);
+}
+
+if (!shouldCopyPlugins) {
+  console.log('Skipping plugin copy for faster Tauri runs.');
+  console.log('Source:', sourcePluginsDir);
+  console.log('Target:', targetPluginsDir);
+  console.log('Set RIDE_COPY_PLUGINS=1 when creating a distributable build that should bundle plugins.');
   process.exit(0);
 }
 

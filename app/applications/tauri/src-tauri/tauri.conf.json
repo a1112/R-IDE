@@ -7,9 +7,10 @@
     "beforeDevCommand": "",
     "beforeBuildCommand": "",
     "devUrl": "http://localhost:3000",
-    "frontendDist": "../browser-frontend"
+    "frontendDist": "../tauri-frontend"
   },
   "app": {
+    "withGlobalTauri": true,
     "windows": [
       {
         "label": "main",
@@ -37,11 +38,9 @@
     "active": true,
     "targets": "all",
     "icon": [
-      "icons/32x32.png",
-      "icons/128x128.png",
-      "icons/128x128@2x.png",
       "icons/icon.icns",
-      "icons/icon.ico"
+      "icons/icon.ico",
+      "icons/512x512.png"
     ],
     "publisher": "R-IDE contributors",
     "copyright": "Copyright © 2026 R-IDE contributors",
@@ -70,6 +69,7 @@
       }
     },
     "resources": {
+      "../browser-frontend": "lib/frontend",
       "../resources/backend": "resources/backend",
       "../resources/plugins": "resources/plugins"
     }
