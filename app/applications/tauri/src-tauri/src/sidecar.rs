@@ -18,12 +18,48 @@ use tokio::process::Command;
 
 const BACKEND_STARTUP_TIMEOUT: u64 = 120; // seconds
 
+fn current_exe_dir() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn resource_dir_candidates() -> Vec<PathBuf> {
+    let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let exe_dir = current_exe_dir();
+    let mut candidates = vec![
+        exe_dir.join("resources"),
+        current_dir.join("resources"),
+        current_dir
+            .join("applications")
+            .join("tauri")
+            .join("resources"),
+    ];
+
+    if let Some(contents_dir) = exe_dir.parent() {
+        candidates.push(contents_dir.join("Resources").join("resources"));
+    }
+
+    candidates
+}
+
 /// 查找 Node.js 可执行文件
 fn find_node_executable() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("RIDE_NODE_PATH") {
         let node_path = PathBuf::from(path);
         if node_path.exists() {
             return Some(node_path);
+        }
+    }
+
+    for resources_dir in resource_dir_candidates() {
+        let bundled_node = resources_dir
+            .join("backend")
+            .join("runtime")
+            .join(if cfg!(windows) { "node.exe" } else { "node" });
+        if bundled_node.exists() {
+            return Some(bundled_node);
         }
     }
 
@@ -68,18 +104,21 @@ fn get_backend_script() -> PathBuf {
 
     // 尝试几个可能的位置
     let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let exe_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
-    let exe_dir = exe_path.parent().unwrap_or(&Path::new("."));
 
-    let possible_locations = vec![
-        // Tauri 资源目录（打包时复制）- 标准路径
-        exe_dir.join("resources").join("backend").join("main.js"),
-        // Tauri 资源目录 - 嵌套路径（resources 映射可能导致嵌套）
-        exe_dir
-            .join("resources")
-            .join("backend")
-            .join("backend")
-            .join("main.js"),
+    let mut possible_locations: Vec<PathBuf> = resource_dir_candidates()
+        .into_iter()
+        .flat_map(|resources_dir| {
+            [
+                resources_dir.join("backend").join("main.js"),
+                resources_dir
+                    .join("backend")
+                    .join("backend")
+                    .join("main.js"),
+            ]
+        })
+        .collect();
+
+    possible_locations.extend([
         // 开发环境：从 Tauri 应用目录运行
         current_dir.join("../browser/lib/backend/main.js"),
         // 开发环境：从 src-tauri 目录运行
@@ -93,7 +132,7 @@ fn get_backend_script() -> PathBuf {
             .join("main.js"),
         // 相对于当前目录
         current_dir.join("lib").join("backend").join("main.js"),
-    ];
+    ]);
 
     for location in &possible_locations {
         if location.exists() {
@@ -131,8 +170,7 @@ fn get_backend_config() -> BackendConfig {
     }
 
     // 回退到 pkg 编译的二进制
-    let exe_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
-    let exe_dir = exe_path.parent().unwrap_or(&Path::new("."));
+    let exe_dir = current_exe_dir();
     let mut sidecar_path = exe_dir.join("theia-backend");
 
     if cfg!(windows) && !sidecar_path.extension().is_some_and(|e| e == "exe") {
@@ -157,15 +195,14 @@ fn get_plugins_dir() -> PathBuf {
 
     // 尝试几个可能的位置
     let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-        .unwrap_or_else(|| PathBuf::from("."));
     let home = home_dir().unwrap_or_else(|| PathBuf::from("."));
 
-    let possible_locations = vec![
-        // Tauri 资源目录（优先使用打包的插件）
-        exe_dir.join("resources").join("plugins"),
+    let mut possible_locations: Vec<PathBuf> = resource_dir_candidates()
+        .into_iter()
+        .map(|resources_dir| resources_dir.join("plugins"))
+        .collect();
+
+    possible_locations.extend([
         // 当前工作目录
         current_dir
             .join("applications")
@@ -180,7 +217,7 @@ fn get_plugins_dir() -> PathBuf {
         current_dir.join("plugins"),
         // 用户配置目录
         home.join(".ride").join("plugins"),
-    ];
+    ]);
 
     for location in possible_locations {
         if is_plugin_dir_ready(&location) {
@@ -218,13 +255,14 @@ fn is_plugin_dir_ready(location: &Path) -> bool {
 /// 性能说明：启动时不再把打包插件复制到用户目录。大插件目录会显著拖慢冷启动；
 /// 运行时直接使用打包资源目录，只有不存在打包目录时才创建用户插件目录作为回退。
 pub fn initialize_plugins() -> Result<(), String> {
-    let exe_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
-    let exe_dir = exe_path.parent().unwrap_or(&Path::new("."));
-    let bundled_plugins = exe_dir.join("resources").join("plugins");
-
-    if is_plugin_dir_ready(&bundled_plugins) {
-        log::info!("Using bundled plugins in place: {:?}", bundled_plugins);
-        return Ok(());
+    for bundled_plugins in resource_dir_candidates()
+        .into_iter()
+        .map(|resources_dir| resources_dir.join("plugins"))
+    {
+        if is_plugin_dir_ready(&bundled_plugins) {
+            log::info!("Using bundled plugins in place: {:?}", bundled_plugins);
+            return Ok(());
+        }
     }
 
     let user_plugins = home_dir()
@@ -262,6 +300,9 @@ fn set_backend_port(app_handle: &AppHandle, port: u16) {
 fn set_backend_pid(app_handle: &AppHandle, pid: Option<u32>) {
     if let Some(state) = app_handle.try_state::<crate::AppState>() {
         *state.backend_pid.lock().unwrap() = pid;
+        if pid.is_some() {
+            *state.backend_stopping.lock().unwrap() = false;
+        }
     }
 }
 
@@ -269,7 +310,15 @@ fn clear_backend_state(app_handle: &AppHandle) {
     if let Some(state) = app_handle.try_state::<crate::AppState>() {
         *state.backend_pid.lock().unwrap() = None;
         *state.backend_port.lock().unwrap() = None;
+        *state.backend_stopping.lock().unwrap() = false;
     }
+}
+
+fn is_backend_stopping(app_handle: &AppHandle) -> bool {
+    app_handle
+        .try_state::<crate::AppState>()
+        .map(|state| *state.backend_stopping.lock().unwrap())
+        .unwrap_or(false)
 }
 
 fn backend_node_options() -> Option<String> {
@@ -399,6 +448,10 @@ pub async fn start_backend_process(app_handle: &AppHandle) -> Result<(), String>
                     }
                     Ok(None) => {
                         let status = child.wait().await.map_err(|e| format!("Failed to wait for backend: {}", e))?;
+                        if is_backend_stopping(app_handle) {
+                            clear_backend_state(app_handle);
+                            return Ok(());
+                        }
                         clear_backend_state(app_handle);
                         return Err(format!("Backend exited unexpectedly: {}", status));
                     }
@@ -410,6 +463,10 @@ pub async fn start_backend_process(app_handle: &AppHandle) -> Result<(), String>
             }
             status = child.wait() => {
                 let status = status.map_err(|e| format!("Failed to wait for backend: {}", e))?;
+                if is_backend_stopping(app_handle) {
+                    clear_backend_state(app_handle);
+                    return Ok(());
+                }
                 clear_backend_state(app_handle);
                 if status.success() {
                     return Ok(());
@@ -479,6 +536,8 @@ fn collect_descendant_pids(pid: u32) -> Vec<u32> {
 fn is_process_alive(pid: u32) -> bool {
     StdCommand::new("kill")
         .args(["-0", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
@@ -488,6 +547,8 @@ fn is_process_alive(pid: u32) -> bool {
 fn send_signal(pid: u32, signal: &str) {
     let _ = StdCommand::new("kill")
         .args([signal, &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status();
 }
 
@@ -546,6 +607,7 @@ pub fn start_backend(app_handle: &AppHandle) -> Result<(), String> {
 pub fn stop_backend(app_handle: &AppHandle) -> Result<(), String> {
     let pid = app_handle.try_state::<crate::AppState>().and_then(|state| {
         *state.backend_port.lock().unwrap() = None;
+        *state.backend_stopping.lock().unwrap() = true;
         state.backend_pid.lock().unwrap().take()
     });
 
@@ -553,7 +615,7 @@ pub fn stop_backend(app_handle: &AppHandle) -> Result<(), String> {
         log::info!("Stopping backend process tree rooted at pid {}", pid);
         terminate_process_tree(pid)?;
     } else {
-        log::info!("No backend process is registered; nothing to stop");
+        log::debug!("No backend process is registered; nothing to stop");
     }
 
     Ok(())

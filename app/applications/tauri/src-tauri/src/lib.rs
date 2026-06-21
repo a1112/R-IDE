@@ -19,13 +19,40 @@ use tauri::Manager;
 pub struct AppState {
     pub backend_port: Mutex<Option<u16>>,
     pub backend_pid: Mutex<Option<u32>>,
+    pub backend_stopping: Mutex<bool>,
 }
+
+#[cfg(unix)]
+fn install_shutdown_signal_handlers(app_handle: tauri::AppHandle) {
+    use signal_hook::consts::signal::{SIGINT, SIGTERM};
+    use signal_hook::iterator::Signals;
+
+    let mut signals = match Signals::new([SIGINT, SIGTERM]) {
+        Ok(signals) => signals,
+        Err(e) => {
+            log::warn!("Failed to install shutdown signal handlers: {}", e);
+            return;
+        }
+    };
+
+    std::thread::spawn(move || {
+        if signals.forever().next().is_some() {
+            if let Err(e) = sidecar::stop_backend(&app_handle) {
+                log::warn!("Failed to stop backend after shutdown signal: {}", e);
+            }
+            app_handle.exit(0);
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn install_shutdown_signal_handlers(_app_handle: tauri::AppHandle) {}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let _ = env_logger::try_init();
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_process::init())
@@ -42,6 +69,7 @@ pub fn run() {
             app.manage(AppState {
                 backend_port: Mutex::new(None),
                 backend_pid: Mutex::new(None),
+                backend_stopping: Mutex::new(false),
             });
 
             // 初始化插件目录
@@ -66,13 +94,16 @@ pub fn run() {
             commands::show_in_folder,
         ])
         .build(tauri::generate_context!())
-        .expect("error while building tauri application")
-        .run(|app_handle, event| match event {
-            tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
-                if let Err(e) = sidecar::stop_backend(app_handle) {
-                    log::warn!("Failed to stop backend during shutdown: {}", e);
-                }
+        .expect("error while building tauri application");
+
+    install_shutdown_signal_handlers(app.handle().clone());
+
+    app.run(|app_handle, event| match event {
+        tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
+            if let Err(e) = sidecar::stop_backend(app_handle) {
+                log::warn!("Failed to stop backend during shutdown: {}", e);
             }
-            _ => {}
-        });
+        }
+        _ => {}
+    });
 }

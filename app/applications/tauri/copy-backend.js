@@ -24,6 +24,27 @@ function nodePtyPlatformTag() {
   return `${process.platform}-${process.arch}`;
 }
 
+function bundledNodeName() {
+  return process.platform === 'win32' ? 'node.exe' : 'node';
+}
+
+function copyBundledNodeRuntime() {
+  const source = process.execPath;
+  const target = path.join(targetDir, 'runtime', bundledNodeName());
+
+  if (!source || !fs.existsSync(source)) {
+    console.warn('Current Node.js executable was not found; desktop launches may require RIDE_NODE_PATH.');
+    return;
+  }
+
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.copyFileSync(source, target);
+  if (process.platform !== 'win32') {
+    fs.chmodSync(target, 0o755);
+  }
+  console.log(`Copied Node.js runtime: ${source} -> ${target}`);
+}
+
 const extraNativeResources = [
   {
     source: path.resolve(__dirname, '../../node_modules/node-pty/prebuilds', nodePtyPlatformTag()),
@@ -72,6 +93,7 @@ if (missingRequired.length > 0) {
 
 fs.rmSync(targetDir, { recursive: true, force: true });
 copyDirectory(sourceDir, targetDir);
+copyBundledNodeRuntime();
 
 for (const resource of extraNativeResources) {
   if (fs.existsSync(resource.source)) {
