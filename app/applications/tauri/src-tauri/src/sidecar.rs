@@ -345,6 +345,12 @@ fn backend_node_options() -> Option<String> {
     Some(options)
 }
 
+fn backend_use_watcher_process() -> bool {
+    std::env::var("RIDE_BACKEND_WATCHER_PROCESS")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 /// 启动 Node.js 后端进程并保持进程生命周期
 pub async fn start_backend_process(app_handle: &AppHandle) -> Result<(), String> {
     let config = get_backend_config();
@@ -382,6 +388,9 @@ pub async fn start_backend_process(app_handle: &AppHandle) -> Result<(), String>
     let mut cmd = if config.use_node {
         let mut c = Command::new(&config.node_exe);
         c.arg(&config.script_path).arg("--log-level=info");
+        if !backend_use_watcher_process() {
+            c.arg("--no-cluster");
+        }
         if let Some(node_options) = backend_node_options() {
             c.env("NODE_OPTIONS", node_options);
         }
