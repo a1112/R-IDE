@@ -74,38 +74,27 @@ function copyDirectory(source, target) {
   }
 }
 
-function patchNodePtyNativeLookup() {
+function patchFrontendStaticPath() {
   const mainPath = path.join(targetDir, 'main.js');
   if (!fs.existsSync(mainPath)) {
     return;
   }
 
   let content = fs.readFileSync(mainPath, 'utf8');
-  if (content.includes('node-pty native module is disabled in the R-IDE Tauri backend runtime')) {
+  if (content.includes('process.env.RIDE_FRONTEND_DIR')) {
     return;
   }
 
-  const marker = 'for(var e=["build/Release","build/Debug","prebuilds/"+process.platform+"-"+process.arch],n=["..","."],';
-  const markerIndex = content.indexOf(marker);
-  if (markerIndex === -1) {
-    console.warn('node-pty native lookup was not found in backend bundle; startup may require bundled pty.node to load directly.');
+  const frontendPathPattern = /([A-Za-z_$][\w$]*)\.resolve\(\s*__dirname\s*,\s*["']\.\.\/\.\.\/lib\/frontend["']\s*\)/;
+  const match = content.match(frontendPathPattern);
+  if (!match) {
+    console.warn('Theia static frontend path was not found in backend bundle; desktop debug launch may not serve the copied frontend.');
     return;
   }
 
-  const functionStart = content.lastIndexOf('function ', markerIndex);
-  const functionBrace = content.indexOf('{', functionStart);
-  const prefix = content.slice(Math.max(0, functionStart - 800), functionStart);
-  const requireMatch = prefix.match(/var ([A-Za-z_$][\w$]*)=require;/);
-  if (functionStart === -1 || functionBrace === -1 || !requireMatch) {
-    console.warn('Could not patch node-pty native lookup in backend bundle.');
-    return;
-  }
-
-  const requireAlias = requireMatch[1];
-  const injection = `if(t==="pty"){var ridePtyDisabled=function(){throw new Error("node-pty native module is disabled in the R-IDE Tauri backend runtime")};return{dir:"",module:{fork:ridePtyDisabled,open:ridePtyDisabled}}}if(t==="pty"&&process.env.RIDE_NODE_PTY_PREBUILD_DIR){var ridePtyDir=process.env.RIDE_NODE_PTY_PREBUILD_DIR;try{return{dir:ridePtyDir,module:${requireAlias}(ridePtyDir+"/"+t+".node")}}catch(ridePtyError){}}`;
-  content = `${content.slice(0, functionBrace + 1)}${injection}${content.slice(functionBrace + 1)}`;
+  content = content.replace(match[0], `(process.env.RIDE_FRONTEND_DIR||${match[0]})`);
   fs.writeFileSync(mainPath, content);
-  console.log('Patched node-pty native lookup for R-IDE desktop runtime.');
+  console.log('Patched backend static frontend path for R-IDE desktop runtime.');
 }
 
 if (!fs.existsSync(sourceDir)) {
@@ -127,7 +116,7 @@ if (missingRequired.length > 0) {
 
 fs.rmSync(targetDir, { recursive: true, force: true });
 copyDirectory(sourceDir, targetDir);
-patchNodePtyNativeLookup();
+patchFrontendStaticPath();
 copyBundledNodeRuntime();
 
 for (const resource of extraNativeResources) {

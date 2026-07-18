@@ -1,0 +1,87 @@
+name: Tauri verification
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/tauri.yml'
+      - '.gitignore'
+      - 'app/**'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/tauri.yml'
+      - '.gitignore'
+      - 'app/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tauri-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: macos-15
+    timeout-minutes: 60
+
+    defaults:
+      run:
+        working-directory: app
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Use Node.js 24
+        uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238
+        with:
+          node-version: 24
+          cache: yarn
+          cache-dependency-path: app/yarn.lock
+
+      - name: Install Yarn
+        run: npm install --global yarn@1.22.22
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile --network-timeout 100000
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: 1
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+          PUPPETEER_SKIP_DOWNLOAD: 1
+
+      - name: Download bundled plugins
+        run: yarn download:plugins
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Select stable Rust
+        run: rustup default stable
+
+      - name: Lint product extension
+        run: npm --workspace theia-extensions/product run lint
+
+      - name: Build product extension
+        run: npm --workspace theia-extensions/product run build
+
+      - name: Build Tauri backend
+        run: npm --workspace applications/browser run build:tauri-backend
+        env:
+          NODE_OPTIONS: --max_old_space_size=4096
+
+      - name: Prepare Tauri resources
+        run: npm --workspace applications/tauri run copy:all
+
+      - name: Verify Rust formatting
+        run: cargo fmt --manifest-path applications/tauri/src-tauri/Cargo.toml --all -- --check
+
+      - name: Test Rust
+        run: cargo test --manifest-path applications/tauri/src-tauri/Cargo.toml --locked --all-targets
+
+      - name: Build Tauri debug application
+        run: npm --workspace applications/tauri run tauri -- build --debug --no-bundle

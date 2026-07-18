@@ -3,23 +3,11 @@
   "identifier": "default",
   "description": "Capability for the main window",
   "windows": ["main"],
+  "remote": {
+    "urls": ["http://127.0.0.1:3000"]
+  },
   "permissions": [
-    "core:default",
-    "core:window:default",
-    "core:window:allow-start-dragging",
-    "core:window:allow-minimize",
-    "core:window:allow-maximize",
-    "core:window:allow-unmaximize",
-    "core:window:allow-close",
-    "core:window:allow-set-title",
-    "core:webview:default",
-    "core:app:default",
-    "core:event:default",
-    "core:resources:default",
-    "core:menu:default",
-    "shell:allow-open",
-    "fs:default",
-    "dialog:default",
-    "process:default"
+    "core:event:allow-listen",
+    "core:event:allow-unlisten"
   ]
 }
