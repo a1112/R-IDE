@@ -18,13 +18,15 @@ const path = require('path');
 
 // 源插件目录（相对于项目根目录）
 const sourcePluginsDir = path.resolve(__dirname, '../../plugins');
-const shouldCopyPlugins = process.env.RIDE_COPY_PLUGINS === '1' || process.env.RIDE_COPY_PLUGINS === 'true';
+const copyPluginsValue = (process.env.RIDE_COPY_PLUGINS || '').trim().toLowerCase();
+const shouldCopyPlugins = copyPluginsValue !== '0' && copyPluginsValue !== 'false';
 const pluginProfile = (process.env.RIDE_PLUGIN_PROFILE || 'lean').trim().toLowerCase();
 
 // 目标插件目录
 const targetPluginsDir = path.resolve(__dirname, 'resources/plugins');
 
 const leanPluginAllowList = new Set([
+  'ms-ceintl.vscode-language-pack-zh-hans',
   'ms-vscode.js-debug',
   'ms-vscode.vscode-js-profile-table',
   'vscode.bat',
@@ -33,35 +35,56 @@ const leanPluginAllowList = new Set([
   'vscode.configuration-editing',
   'vscode.cpp',
   'vscode.css',
+  'vscode.csharp',
+  'vscode.clojure',
+  'vscode.dart',
   'vscode.debug-auto-launch',
   'vscode.debug-server-ready',
   'vscode.diff',
   'vscode.docker',
   'vscode.dotenv',
   'vscode.emmet',
+  'vscode.fsharp',
   'vscode.git',
   'vscode.git-base',
   'vscode.github',
   'vscode.github-authentication',
   'vscode.go',
+  'vscode.groovy',
+  'vscode.handlebars',
+  'vscode.hlsl',
   'vscode.html',
   'vscode.ini',
   'vscode.ipynb',
+  'vscode.jake',
   'vscode.java',
   'vscode.javascript',
+  'vscode.julia',
   'vscode.json',
+  'vscode.latex',
+  'vscode.less',
   'vscode.log',
+  'vscode.lua',
   'vscode.make',
   'vscode.markdown',
   'vscode.markdown-math',
   'vscode.merge-conflict',
   'vscode.npm',
+  'vscode.objective-c',
+  'vscode.perl',
   'vscode.php',
+  'vscode.powershell',
+  'vscode.pug',
   'vscode.python',
   'vscode.r',
+  'vscode.razor',
   'vscode.references-view',
+  'vscode.restructuredtext',
+  'vscode.ruby',
   'vscode.rust',
   'vscode.search-result',
+  'vscode.scss',
+  'vscode.shaderlab',
   'vscode.shellscript',
   'vscode.simple-browser',
   'vscode.sql',
@@ -69,6 +92,7 @@ const leanPluginAllowList = new Set([
   'vscode.terminal-suggest',
   'vscode.theme-defaults',
   'vscode.typescript',
+  'vscode.vb',
   'vscode.vscode-theme-seti',
   'vscode.xml',
   'vscode.yaml',
@@ -77,7 +101,7 @@ const leanPluginAllowList = new Set([
 function parsePluginList(value) {
   return new Set((value || '')
     .split(',')
-    .map(item => item.trim())
+    .map(item => item.trim().toLowerCase())
     .filter(Boolean));
 }
 
@@ -103,7 +127,8 @@ if (!shouldCopyPlugins) {
   console.log('Skipping plugin copy for faster Tauri runs.');
   console.log('Source:', sourcePluginsDir);
   console.log('Target:', targetPluginsDir);
-  console.log('Set RIDE_TAURI_ENABLE_PLUGINS=1 and RIDE_COPY_PLUGINS=1 when building with VS Code plugin support.');
+  console.log('Set RIDE_COPY_PLUGINS=1 or leave it unset when building with VS Code plugin support.');
+  console.log('Set RIDE_COPY_PLUGINS=0 only for fast smoke builds without bundled syntax plugins.');
   process.exit(0);
 }
 
@@ -137,7 +162,7 @@ function listSourcePlugins() {
 function selectPlugins() {
   const plugins = listSourcePlugins();
   if (pluginProfile === 'full') {
-    return plugins.filter(plugin => !forcedExcludes.has(plugin));
+    return plugins.filter(plugin => !forcedExcludes.has(plugin.toLowerCase()));
   }
   if (pluginProfile !== 'lean') {
     console.error(`Unsupported RIDE_PLUGIN_PROFILE: ${pluginProfile}`);
@@ -146,10 +171,11 @@ function selectPlugins() {
   }
 
   return plugins.filter(plugin => {
-    if (forcedExcludes.has(plugin)) {
+    const normalizedPlugin = plugin.toLowerCase();
+    if (forcedExcludes.has(normalizedPlugin)) {
       return false;
     }
-    return leanPluginAllowList.has(plugin) || forcedIncludes.has(plugin);
+    return leanPluginAllowList.has(normalizedPlugin) || forcedIncludes.has(normalizedPlugin);
   });
 }
 

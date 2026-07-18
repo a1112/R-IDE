@@ -12,6 +12,7 @@
 # Rust / Tauri build artifacts
 **/target/
 **/Cargo.lock
+!app/applications/tauri/src-tauri/Cargo.lock
 
 # Plugins (built separately, not tracked)
 **/plugins/
