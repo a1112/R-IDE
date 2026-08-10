@@ -48,7 +48,7 @@ function isValidRepository(value) {
     try {
       const parsed = new URL(value);
       if (parsed.protocol === 'file:') {
-        return parsed.pathname.length > 0;
+        return parsed.pathname.length > 1 && parsed.pathname !== '/';
       }
       return parsed.hostname.length > 0 && parsed.pathname.length > 0;
     } catch {
