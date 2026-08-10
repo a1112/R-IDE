@@ -122,6 +122,36 @@ test('refresh-patches is reproducible', async t => {
   assert.equal(await fs.readFile(patchPath, 'utf8'), contents);
 });
 
+test('refresh-patches preserves an existing ordered patch stack', async t => {
+  const f = await fixture(t);
+  await write(path.join(f.app, 'hello.txt'), 'patched product\n');
+  const patchRoot = path.join(f.root, '.upstream', 'patches');
+  await write(path.join(patchRoot, '0001-first.patch'), [
+    'diff --git a/hello.txt b/hello.txt',
+    '--- a/hello.txt',
+    '+++ b/hello.txt',
+    '@@ -1 +1 @@',
+    '-hello baseline',
+    '+patched product',
+    '',
+  ].join('\n'));
+  await write(path.join(patchRoot, '0002-stale.patch'), [
+    'diff --git a/removed.txt b/removed.txt',
+    '--- a/removed.txt',
+    '+++ b/removed.txt',
+    '@@ -1 +1 @@',
+    '-old',
+    '+new',
+    '',
+  ].join('\n'));
+  const result = await runCli(f, ['refresh-patches', '--json']);
+  assert.equal(result.code, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout).patches, ['0001-first.patch']);
+  assert.match(await fs.readFile(path.join(patchRoot, '0001-first.patch'), 'utf8'), /diff --git a\/hello\.txt/);
+  await assert.rejects(fs.access(path.join(patchRoot, '0001-upstream.patch')));
+  await assert.rejects(fs.access(path.join(patchRoot, '0002-stale.patch')));
+});
+
 test('refresh-patches reports false when an already-empty patch remains empty', async t => {
   const f = await fixture(t);
   const patchPath = path.join(f.root, '.upstream', 'patches', '0001-upstream.patch');

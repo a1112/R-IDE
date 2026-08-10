@@ -88,6 +88,28 @@ function isOwned(relative, ownedPaths) {
   });
 }
 
+function patchPathToken(token, prefix) {
+  let value = token;
+  if (value.startsWith('"') && value.endsWith('"')) value = value.slice(1, -1);
+  if (value.startsWith(prefix)) value = value.slice(prefix.length);
+  return value;
+}
+
+function patchPaths(contents) {
+  const paths = new Set();
+  for (const line of contents.toString('utf8').split(/\r?\n/u)) {
+    if (!line.startsWith('diff --git ')) continue;
+    const value = line.slice('diff --git '.length).trim();
+    const match = /^([^\s]+)\s+([^\s]+)$/u.exec(value);
+    if (!match) continue;
+    const left = patchPathToken(match[1], 'a/');
+    const right = patchPathToken(match[2], 'b/');
+    if (left !== '/dev/null') paths.add(left);
+    if (right !== '/dev/null') paths.add(right);
+  }
+  return [...paths].sort();
+}
+
 async function copyProductFile(product, checkout, relative) {
   const source = path.join(product, ...relative.split('/'));
   const destination = path.join(checkout, ...relative.split('/'));
@@ -136,21 +158,32 @@ async function refreshPatches(root, config) {
     }
     for (const relative of productSet) await copyProductFile(product, checkout, relative);
     await runCommand('git', ['-C', checkout, 'add', '-A']);
-    const patch = (await runCommand('git', ['-C', checkout, 'diff', '--cached', '--binary', '--no-ext-diff'])).stdout;
     const patchRoot = path.join(root, '.upstream', 'patches');
     await fs.mkdir(patchRoot, { recursive: true });
-    const patchPath = path.join(patchRoot, '0001-upstream.patch');
-    let previousPatch;
-    try { previousPatch = await fs.readFile(patchPath, 'utf8'); }
-    catch (error) { if (error?.code !== 'ENOENT') throw error; }
-    const changed = patch.length > 0
-      ? patch !== previousPatch
-      : previousPatch !== undefined && previousPatch.length > 0;
-    if (patch.length > 0) await fs.writeFile(patchPath, patch, 'utf8');
-    else {
-      await fs.rm(patchPath, { force: true });
+    const existing = (await fs.readdir(patchRoot)).filter(name => name.endsWith('.patch')).sort();
+    const names = existing.length > 0 ? existing : ['0001-upstream.patch'];
+    let changed = false;
+    const generated = [];
+    for (const name of names) {
+      const patchPath = path.join(patchRoot, name);
+      let previousPatch;
+      if (existing.includes(name)) previousPatch = await fs.readFile(patchPath, 'utf8');
+      const paths = previousPatch === undefined ? [] : patchPaths(previousPatch);
+      const args = ['-C', checkout, 'diff', '--cached', '--binary', '--no-ext-diff'];
+      if (paths.length > 0) args.push('--', ...paths);
+      const patch = (await runCommand('git', args)).stdout;
+      const nextChanged = patch.length > 0
+        ? patch !== previousPatch
+        : previousPatch !== undefined && previousPatch.length > 0;
+      changed ||= nextChanged;
+      if (patch.length > 0) {
+        await fs.writeFile(patchPath, patch, 'utf8');
+        generated.push(name);
+      } else {
+        await fs.rm(patchPath, { force: true });
+      }
     }
-    return { changed, patches: patch.length > 0 ? ['0001-upstream.patch'] : [] };
+    return { changed, patches: generated };
   } finally {
     await fs.rm(temporary, { recursive: true, force: true });
   }
