@@ -39,6 +39,9 @@ function isValidRepository(value) {
       return false;
     }
     if (NETWORK_REPOSITORY_PROTOCOLS.has(protocol)) {
+      if (value.includes('\\')) {
+        return false;
+      }
       const authority = value.slice(protocol.length + 2);
       if (authority.length === 0 || /^[/?#]/u.test(authority)) {
         return false;
@@ -48,7 +51,7 @@ function isValidRepository(value) {
     try {
       const parsed = new URL(value);
       if (parsed.protocol === 'file:') {
-        return parsed.pathname.length > 1 && parsed.pathname !== '/';
+        return parsed.pathname.length > 1 && /[^/]/u.test(parsed.pathname);
       }
       return parsed.hostname.length > 0 && parsed.pathname.length > 0;
     } catch {

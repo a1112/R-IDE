@@ -110,6 +110,32 @@ test('rejects file repository URLs without a non-root pathname', () => {
   }
 });
 
+test('rejects repeated-slash file roots and UNC paths', () => {
+  for (const repository of ['file:////', 'file://///', 'file://server//', 'file://server///']) {
+    assert.throws(
+      () => validateSource({ ...validSource, repository }),
+      /repository/i,
+      `expected repository ${repository} to be rejected`,
+    );
+  }
+  for (const repository of ['file://server/share/repo.git', 'file:///tmp/repo.git']) {
+    assert.equal(validateSource({ ...validSource, repository }).repository, repository);
+  }
+});
+
+test('rejects backslashes in network repository URI forms', () => {
+  for (const repository of ['https:\\example.com\\repo.git', 'https://example.com\\repo.git']) {
+    assert.throws(
+      () => validateSource({ ...validSource, repository }),
+      /repository/i,
+      `expected repository ${repository} to be rejected`,
+    );
+  }
+  for (const repository of ['C:\\fixtures\\repo.git', '\\\\server\\share\\repo.git']) {
+    assert.equal(validateSource({ ...validSource, repository }).repository, repository);
+  }
+});
+
 test('rejects repository schemes unsupported by git clone', () => {
   for (const repository of ['git+https://example.com/theia-ide.git', 'git+ssh://example.com/theia-ide.git']) {
     assert.throws(
