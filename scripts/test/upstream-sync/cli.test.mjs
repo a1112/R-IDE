@@ -121,3 +121,32 @@ test('refresh-patches is reproducible', async t => {
   assert.equal(second.code, 0, second.stderr);
   assert.equal(await fs.readFile(patchPath, 'utf8'), contents);
 });
+
+test('refresh-patches reports false when an already-empty patch remains empty', async t => {
+  const f = await fixture(t);
+  const patchPath = path.join(f.root, '.upstream', 'patches', '0001-upstream.patch');
+  await fs.mkdir(path.dirname(patchPath), { recursive: true });
+  await fs.writeFile(patchPath, '');
+  const result = await runCli(f, ['refresh-patches', '--json']);
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).changed, false);
+  await assert.rejects(fs.access(patchPath));
+});
+
+test('refresh-patches rejects a symlinked repository root', async t => {
+  const f = await fixture(t);
+  const link = path.join(path.dirname(f.root), 'ride-cli-root-link');
+  try {
+    await fs.symlink(f.root, link, 'junction');
+  } catch (error) {
+    if (process.platform === 'win32' && ['EACCES', 'EPERM', 'ENOTSUP'].includes(error?.code)) {
+      t.skip(`symlinks unavailable on this Windows host: ${error.code}`);
+      return;
+    }
+    throw error;
+  }
+  t.after(() => fs.rm(link, { recursive: true, force: true }));
+  const result = await runCli({ ...f, root: link }, ['refresh-patches']);
+  assert.notEqual(result.code, 0);
+  assert.match(result.stderr, /symlink|symbolic link|real directory|repository root/i);
+});

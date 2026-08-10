@@ -6,11 +6,18 @@ import os from 'node:os';
 
 import { loadSourceConfig } from './lib/upstream-sync/config.mjs';
 import { synchronize } from './lib/upstream-sync/engine.mjs';
-import { checkoutDetached, cloneRepository, resolveCommit } from './lib/upstream-sync/git.mjs';
+import { checkoutDetached, cloneRepository, fetchRepository, resolveCommit } from './lib/upstream-sync/git.mjs';
 import { runCommand } from './lib/upstream-sync/command.mjs';
 import { compareProductTrees, makeReport, trackedProductPaths } from './lib/upstream-sync/report.mjs';
+import { assertNoSymlinkAncestors } from './lib/upstream-sync/filesystem.mjs';
 
 const SCRIPT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+function samePath(left, right) {
+  return process.platform === 'win32'
+    ? left.toLowerCase() === right.toLowerCase()
+    : left === right;
+}
 
 function usageError(message) {
   throw new TypeError(message);
@@ -48,7 +55,29 @@ async function loadPatchFiles(root) {
 
 async function writeSource(root, source, commit) {
   const file = path.join(root, '.upstream', 'source.json');
-  await fs.writeFile(file, `${JSON.stringify({ ...source, commit }, null, 2)}\n`, 'utf8');
+  const temporary = `${file}.tmp-${process.pid}-${Date.now()}`;
+  try {
+    await fs.writeFile(temporary, `${JSON.stringify({ ...source, commit }, null, 2)}\n`, 'utf8');
+    await fs.rename(temporary, file);
+  } finally {
+    await fs.rm(temporary, { force: true });
+  }
+}
+
+async function assertRefreshProduct(root) {
+  await assertNoSymlinkAncestors(root, { includeTarget: true });
+  const product = path.join(root, 'app');
+  await assertNoSymlinkAncestors(product, { includeTarget: true });
+  const [rootStat, productStat, rootReal, productReal] = await Promise.all([
+    fs.lstat(root), fs.lstat(product), fs.realpath(root), fs.realpath(product),
+  ]);
+  if (!rootStat.isDirectory() || !productStat.isDirectory() || productStat.isSymbolicLink()) {
+    throw new TypeError(`Repository root and app must be real directories: ${root}`);
+  }
+  if (!samePath(path.resolve(productReal), path.join(path.resolve(rootReal), 'app'))) {
+    throw new TypeError(`Product destination resolves outside repositoryRoot/app: ${product}`);
+  }
+  return product;
 }
 
 function isOwned(relative, ownedPaths) {
@@ -70,6 +99,7 @@ async function copyProductFile(product, checkout, relative) {
 }
 
 async function refreshPatches(root, config) {
+  const product = await assertRefreshProduct(root);
   const temporary = await fs.mkdtemp(path.join(os.tmpdir(), 'ride-refresh-patches-'));
   const checkout = path.join(temporary, 'checkout');
   try {
@@ -77,9 +107,25 @@ async function refreshPatches(root, config) {
       ? config.source.repository
       : path.resolve(root, config.source.repository);
     await cloneRepository(repository, checkout);
-    await resolveCommit(checkout, config.source.commit);
+    // A pinned commit may not be reachable from the clone's default ref (for
+    // example after the upstream branch was force-updated). Resolve the full
+    // clone first, then fetch the exact object and finally its branch as a
+    // portable fallback for servers that disallow SHA wants.
+    try {
+      await resolveCommit(checkout, config.source.commit);
+    } catch (initialError) {
+      try {
+        await fetchRepository(checkout, config.source.commit);
+      } catch {
+        await fetchRepository(checkout, config.source.branch);
+      }
+      try {
+        await resolveCommit(checkout, config.source.commit);
+      } catch (error) {
+        throw new Error(`Pinned upstream commit is unavailable: ${config.source.commit}`, { cause: error ?? initialError });
+      }
+    }
     await checkoutDetached(checkout, config.source.commit);
-    const product = path.join(root, 'app');
     const tracked = await trackedProductPaths(root);
     const productSet = new Set(tracked.filter(relative => !isOwned(relative, config.ownedPaths)));
     const baseline = (await runCommand('git', ['-C', checkout, 'ls-files', '-z'])).stdout.split('\0').filter(Boolean);
@@ -94,12 +140,13 @@ async function refreshPatches(root, config) {
     const patchRoot = path.join(root, '.upstream', 'patches');
     await fs.mkdir(patchRoot, { recursive: true });
     const patchPath = path.join(patchRoot, '0001-upstream.patch');
-    let changed = true;
-    try { changed = patch !== await fs.readFile(patchPath, 'utf8'); } catch (error) { if (error?.code !== 'ENOENT') throw error; }
+    let previousPatch;
+    try { previousPatch = await fs.readFile(patchPath, 'utf8'); }
+    catch (error) { if (error?.code !== 'ENOENT') throw error; }
+    const changed = patch !== previousPatch;
     if (patch.length > 0) await fs.writeFile(patchPath, patch, 'utf8');
     else {
       await fs.rm(patchPath, { force: true });
-      changed = true;
     }
     return { changed, patches: patch.length > 0 ? ['0001-upstream.patch'] : [] };
   } finally {
