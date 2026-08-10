@@ -79,6 +79,19 @@ test('rejects authority-less network repository URLs', () => {
   }
 });
 
+test('rejects network URLs with empty authorities', () => {
+  for (const repository of ['https:///repo.git', 'http:///repo.git', 'https:////repo.git']) {
+    assert.throws(
+      () => validateSource({ ...validSource, repository }),
+      /repository/i,
+      `expected repository ${repository} to be rejected`,
+    );
+  }
+  for (const repository of ['file:///tmp/repo.git', 'file://server/share/repo.git']) {
+    assert.equal(validateSource({ ...validSource, repository }).repository, repository);
+  }
+});
+
 test('rejects repository schemes unsupported by git clone', () => {
   for (const repository of ['git+https://example.com/theia-ide.git', 'git+ssh://example.com/theia-ide.git']) {
     assert.throws(

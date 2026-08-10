@@ -38,6 +38,12 @@ function isValidRepository(value) {
     ) {
       return false;
     }
+    if (NETWORK_REPOSITORY_PROTOCOLS.has(protocol)) {
+      const authority = value.slice(protocol.length + 2);
+      if (authority.length === 0 || /^[/?#]/u.test(authority)) {
+        return false;
+      }
+    }
 
     try {
       const parsed = new URL(value);
