@@ -136,6 +136,16 @@ test('rejects backslashes in network repository URI forms', () => {
   }
 });
 
+test('rejects backslashes in file repository URI forms', () => {
+  assert.throws(
+    () => validateSource({ ...validSource, repository: 'file:///tmp\\repo.git' }),
+    /repository/i,
+  );
+  for (const repository of ['C:\\repo', '\\\\server\\share\\repo']) {
+    assert.equal(validateSource({ ...validSource, repository }).repository, repository);
+  }
+});
+
 test('rejects repository schemes unsupported by git clone', () => {
   for (const repository of ['git+https://example.com/theia-ide.git', 'git+ssh://example.com/theia-ide.git']) {
     assert.throws(

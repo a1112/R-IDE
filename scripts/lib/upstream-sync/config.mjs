@@ -32,6 +32,9 @@ function isValidRepository(value) {
     if (!REPOSITORY_PROTOCOLS.has(protocol)) {
       return false;
     }
+    if (protocol === 'file:' && value.includes('\\')) {
+      return false;
+    }
     if (
       NETWORK_REPOSITORY_PROTOCOLS.has(protocol) &&
       !value.slice(protocol.length).startsWith('//')
