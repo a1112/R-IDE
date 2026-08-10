@@ -93,9 +93,11 @@ export async function resolveCommit(repositoryPath, ref) {
 }
 
 export async function isAncestor(repositoryPath, ancestor, descendant) {
+  requireRef(ancestor);
+  requireRef(descendant);
   const result = await runCommand(
     'git',
-    ['merge-base', '--is-ancestor', ancestor, descendant],
+    ['merge-base', '--is-ancestor', '--', ancestor, descendant],
     { cwd: repositoryPath },
   ).then(() => true).catch(error => {
     if (error instanceof CommandError && error.exitCode === 1) {

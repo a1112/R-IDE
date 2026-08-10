@@ -7,10 +7,12 @@ import test from 'node:test';
 
 import { atomicReplace, restoreOwnedPaths, synchronize } from '../../lib/upstream-sync/engine.mjs';
 import {
+  assertAncestor,
   checkoutDetached,
   cloneRepository,
   compareTrackedTrees,
   generateBinaryDiff,
+  isAncestor,
 } from '../../lib/upstream-sync/git.mjs';
 import { runCommand } from '../../lib/upstream-sync/command.mjs';
 
@@ -461,6 +463,18 @@ test('generates binary-capable diffs and compares tracked working trees', async 
   await writeFile(path.join(mirror, 'keep.txt'), 'working tree drift\n');
   const drift = await compareTrackedTrees(fixture.repository, mirror);
   assert.deepEqual(drift.modified, ['keep.txt']);
+});
+
+test('rejects option and revision-expression inputs to ancestry wrappers', async t => {
+  const fixture = await createFixture(t);
+  await assert.rejects(
+    isAncestor(fixture.repository, '--fork-point', fixture.target),
+    error => error instanceof TypeError && /ref/i.test(error.message),
+  );
+  await assert.rejects(
+    assertAncestor(fixture.repository, `${fixture.baseline}~1`, fixture.target),
+    error => error instanceof TypeError && /ref/i.test(error.message),
+  );
 });
 
 test('rejects owned paths that normalize to the product root', async t => {
