@@ -1,0 +1,187 @@
+name: Upstream synchronization
+
+on:
+  schedule:
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+    inputs:
+      target_commit:
+        description: Optional 40-character upstream commit SHA
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-sync-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    name: Synchronize upstream
+    if: ${{ github.event_name != 'pull_request' && github.repository == github.event.repository.full_name }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TARGET_INPUT: ${{ inputs.target_commit }}
+      UPSTREAM_REPOSITORY: https://github.com/eclipse-theia/theia-ide.git
+      UPSTREAM_SYNC_FAILURE_MARKER: '<!-- upstream-sync-failure -->'
+    steps:
+      - name: Check out full history
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238
+        with:
+          node-version: 22
+
+      - name: Resolve and validate target commit
+        id: target
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          const input = (process.env.TARGET_INPUT ?? '').trim();
+          if (input && !/^[0-9a-f]{40}$/u.test(input)) {
+            throw new Error('target_commit must be exactly 40 lowercase hexadecimal characters');
+          }
+          NODE
+          if [[ -n "${TARGET_INPUT:-}" ]]; then
+            target="${TARGET_INPUT}"
+          else
+            target="$(git ls-remote "$UPSTREAM_REPOSITORY" refs/heads/master | awk 'NF { print $1; exit }')"
+          fi
+          if [[ ! "$target" =~ ^[0-9a-f]{40}$ ]]; then
+            echo 'upstream master did not resolve to a 40-character commit SHA' >&2
+            exit 1
+          fi
+          printf 'TARGET_COMMIT=%s\n' "$target" >> "$GITHUB_ENV"
+          printf 'target=%s\n' "$target" >> "$GITHUB_OUTPUT"
+
+      - name: Synchronize the product tree
+        run: node scripts/sync-upstream.mjs sync --target "$TARGET_COMMIT" --report upstream-sync-report.json
+
+      - name: Install dependencies and run fast checks
+        working-directory: app
+        run: |
+          corepack enable
+          yarn --frozen-lockfile --network-timeout 100000
+          yarn build:extensions
+          yarn browser build
+          node --test ../scripts/test/upstream-sync/*.test.mjs
+
+      - name: Render pull request body
+        run: node scripts/render-upstream-pr.mjs --report upstream-sync-report.json --output upstream-sync-pr.md --mode pr
+
+      - name: Configure synchronization bot
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+      - name: Check synchronization scope and commit
+        id: commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import { execFileSync } from 'node:child_process';
+          const changed = execFileSync('git', ['status', '--short', '--untracked-files=all'], { encoding: 'utf8' })
+            .split(/\r?\n/u).filter(Boolean).map(line => line.slice(3));
+          const allowed = [/^\.upstream\//u, /^app\//u, /^refs\/theia-ide-upstream\.txt$/u, /^upstream-sync-report\.json$/u, /^upstream-sync-pr\.md$/u];
+          const unexpected = changed.filter(file => !allowed.some(pattern => pattern.test(file)));
+          if (unexpected.length) throw new Error(`unexpected synchronization files: ${unexpected.join(', ')}`);
+          if (!changed.some(file => file.startsWith('.upstream/') || file.startsWith('app/') || file === 'refs/theia-ide-upstream.txt')) {
+            if (process.env.GITHUB_OUTPUT) {
+              const { appendFileSync } = await import('node:fs');
+              appendFileSync(process.env.GITHUB_OUTPUT, 'changed=false\n');
+            }
+            process.exit(0);
+          }
+          execFileSync('git', ['add', '--', '.upstream', 'app', 'refs/theia-ide-upstream.txt'], { stdio: 'inherit' });
+          execFileSync('git', ['commit', '-m', 'chore: synchronize upstream'], { stdio: 'inherit' });
+          if (process.env.GITHUB_OUTPUT) {
+            const { appendFileSync } = await import('node:fs');
+            appendFileSync(process.env.GITHUB_OUTPUT, 'changed=true\n');
+          }
+          NODE
+
+      - name: Push bot synchronization branch
+        if: steps.commit.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin automation/upstream-sync || true
+          remote_sha="$(git rev-parse --verify refs/remotes/origin/automation/upstream-sync 2>/dev/null || true)"
+          git push --force-with-lease="refs/heads/automation/upstream-sync:${remote_sha}" origin HEAD:refs/heads/automation/upstream-sync
+
+      - name: Create or update synchronization pull request
+        if: steps.commit.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          pr_number="$(gh pr list --head automation/upstream-sync --state open --json number --jq '.[0].number // empty')"
+          if [[ -n "$pr_number" ]]; then
+            gh pr edit "$pr_number" --title 'chore: synchronize upstream' --body-file upstream-sync-pr.md
+          else
+            gh pr create --base main --head automation/upstream-sync --title 'chore: synchronize upstream' --body-file upstream-sync-pr.md
+          fi
+
+      - name: Capture failure context
+        if: ${{ failure() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! -f upstream-sync-report.json ]]; then
+            node --input-type=module <<'NODE'
+            const target = process.env.TARGET_COMMIT ?? process.env.TARGET_INPUT ?? '';
+            const report = { previousCommit: '0000000000000000000000000000000000000000', targetCommit: /^[0-9a-f]{40}$/u.test(target) ? target : '0000000000000000000000000000000000000000', counts: { added: 0, modified: 0, deleted: 0, renamed: 0 }, ownedPaths: [], patches: [], failedStage: 'workflow', stderr: 'Synchronization failed before a report was written.', artifactName: 'upstream-sync-diagnostics' };
+            await import('node:fs/promises').then(fs => fs.writeFile('upstream-sync-report.json', `${JSON.stringify(report, null, 2)}\n`));
+            NODE
+          fi
+          git status --short > upstream-sync-status.txt || true
+          git diff --check > upstream-sync-diff-check.txt || true
+
+      - name: Upload synchronization diagnostics
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: upstream-sync-diagnostics
+          path: |
+            upstream-sync-report.json
+            upstream-sync-pr.md
+            upstream-sync-status.txt
+            upstream-sync-diff-check.txt
+            .upstream/patches/*.rej
+          if-no-files-found: warn
+
+      - name: Render failure issue body
+        if: ${{ failure() }}
+        run: node scripts/render-upstream-pr.mjs --report upstream-sync-report.json --output upstream-sync-issue.md --mode issue
+
+      - name: Create or update bot-authored failure issue
+        if: ${{ failure() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          issue_number="$(gh issue list --state open --search 'in:body "<!-- upstream-sync-failure -->"' --json number,author --jq '.[] | select(.author.login == "github-actions[bot]") | .number' | head -n 1)"
+          if [[ -n "$issue_number" ]]; then
+            gh issue edit "$issue_number" --title 'upstream synchronization failed' --body-file upstream-sync-issue.md
+          else
+            gh issue create --label upstream-sync --title 'upstream synchronization failed' --body-file upstream-sync-issue.md
+          fi
+
+      - name: Close matching bot-authored failure issue after success
+        if: ${{ success() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          issue_number="$(gh issue list --state open --search 'in:body "<!-- upstream-sync-failure -->"' --json number,author --jq '.[] | select(.author.login == "github-actions[bot]") | .number' | head -n 1)"
+          if [[ -n "$issue_number" ]]; then gh issue close "$issue_number"; fi
