@@ -133,6 +133,14 @@ test('refresh-patches reports false when an already-empty patch remains empty', 
   await assert.rejects(fs.access(patchPath));
 });
 
+test('refresh-patches reports false on the first empty patch with no patch file', async t => {
+  const f = await fixture(t);
+  const result = await runCli(f, ['refresh-patches', '--json']);
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).changed, false);
+  await assert.rejects(fs.access(path.join(f.root, '.upstream', 'patches', '0001-upstream.patch')));
+});
+
 test('refresh-patches rejects a symlinked repository root', async t => {
   const f = await fixture(t);
   const link = path.join(path.dirname(f.root), 'ride-cli-root-link');

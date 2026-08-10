@@ -143,7 +143,9 @@ async function refreshPatches(root, config) {
     let previousPatch;
     try { previousPatch = await fs.readFile(patchPath, 'utf8'); }
     catch (error) { if (error?.code !== 'ENOENT') throw error; }
-    const changed = patch !== previousPatch;
+    const changed = patch.length > 0
+      ? patch !== previousPatch
+      : previousPatch !== undefined && previousPatch.length > 0;
     if (patch.length > 0) await fs.writeFile(patchPath, patch, 'utf8');
     else {
       await fs.rm(patchPath, { force: true });
