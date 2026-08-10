@@ -25,6 +25,7 @@ license-check-summary.txt*
 !**/resources/plugins/.gitkeep
 **/src-tauri/gen/schemas/macOS-schema.json
 **/Cargo.lock
+!applications/tauri/src-tauri/Cargo.lock
 
 # Tauri / dev temp files
 .qa/

@@ -139,7 +139,7 @@
     "clean": "theia clean && rimraf node_modules",
     "build": "npm run rebuild --silent && theia build --app-target=\"browser\" --mode development",
     "build:prod": "npm run rebuild --silent && theia build --app-target=\"browser\"",
-    "build:tauri-backend": "npm run rebuild --silent && RIDE_TAURI_LEAN=1 theia build --app-target=\"browser\"",
+    "build:tauri-backend": "node ../../scripts/build-tauri-backend.js",
     "pkg:compile": "pkg lib/backend/main.js --targets node22-win-x64,node22-linux-x64,node22-macos-x64 --output dist/theia-backend",
     "rebuild": "theia rebuild:browser --cacheRoot ../..",
     "start": "theia start --plugins=local-dir:../../plugins",

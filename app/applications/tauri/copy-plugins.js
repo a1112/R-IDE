@@ -18,7 +18,7 @@ const path = require('path');
 
 // 源插件目录（相对于项目根目录）
 const sourcePluginsDir = path.resolve(__dirname, '../../plugins');
-const shouldCopyPlugins = process.env.RIDE_COPY_PLUGINS === '1' || process.env.RIDE_COPY_PLUGINS === 'true';
+const shouldCopyPlugins = process.argv.includes('--bundle') || process.env.RIDE_COPY_PLUGINS === '1' || process.env.RIDE_COPY_PLUGINS === 'true';
 const pluginProfile = (process.env.RIDE_PLUGIN_PROFILE || 'lean').trim().toLowerCase();
 
 // 目标插件目录
