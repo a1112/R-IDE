@@ -3,19 +3,19 @@
 
 ## 上游仓库 (Upstream Repository)
 - 仓库: https://github.com/eclipse-theia/theia-ide.git
-- 上游 master 分支 commit: a868f5b15f2d4f2598125a4f6a98c0d29990b946
-- 上游 master 最新提交信息: fix(launcher): forward all CLI args and support --help/--version
+- 上游 master 分支 commit: 208ea0ec23bc738801d57c890bf21cd278f77896
+- 上游 master 最新提交信息: Add appUserModelId to Electron applications
 
 ## R-IDE 的 Tauri 修改 (Our Modifications)
 - 分支: feat/tauri-desktop
 - 修改 commit: daf986adc2925ce5d549ba6ecd8936f87382f717
-- 基于上游: a868f5b15f2d4f2598125a4f6a98c0d29990b946
+- 基于上游: 208ea0ec23bc738801d57c890bf21cd278f77896
 
 ## 如何获取原始 theia-ide 仓库
 ```bash
 git clone https://github.com/eclipse-theia/theia-ide.git
 cd theia-ide
-git checkout a868f5b15f2d4f2598125a4f6a98c0d29990b946
+git checkout 208ea0ec23bc738801d57c890bf21cd278f77896
 ```
 
 ## 修改摘要

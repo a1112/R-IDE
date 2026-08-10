@@ -1,25 +1,44 @@
 diff --git a/theia-extensions/product/package.json b/theia-extensions/product/package.json
-index 3675ca7..dace600 100644
+index a4e00d2..dace600 100644
 --- a/theia-extensions/product/package.json
 +++ b/theia-extensions/product/package.json
-@@ -7,6 +7,7 @@
-     "@theia/ai-registry": "1.73.0-next.2",
-     "@theia/core": "1.73.0-next.2",
-     "@theia/getting-started": "1.73.0-next.2",
+@@ -1,20 +1,21 @@
+ {
+   "private": true,
+   "name": "theia-ide-product-ext",
+-  "version": "1.74.0",
++  "version": "1.72.100",
+   "description": "Eclipse Theia IDE Product Branding",
+   "dependencies": {
+-    "@theia/ai-registry": "1.74.0",
+-    "@theia/core": "1.74.0",
+-    "@theia/getting-started": "1.74.0",
+-    "@theia/vsx-registry": "1.74.0",
+-    "@theia/workspace": "1.74.0",
++    "@theia/ai-registry": "1.73.0-next.2",
++    "@theia/core": "1.73.0-next.2",
++    "@theia/getting-started": "1.73.0-next.2",
 +    "@theia/terminal": "1.73.0-next.2",
-     "@theia/vsx-registry": "1.73.0-next.2",
-     "@theia/workspace": "1.73.0-next.2",
++    "@theia/vsx-registry": "1.73.0-next.2",
++    "@theia/workspace": "1.73.0-next.2",
      "inversify": "^6.2.2"
+   },
+   "devDependencies": {
+     "rimraf": "^2.7.1",
+     "tslint": "^5.20.1",
+-    "typescript": "~5.9.3"
++    "typescript": "^4.9.5"
+   },
+   "theiaExtensions": [
+     {
 @@ -47,6 +48,6 @@
      "update:next": "ts-node ../../scripts/update-theia-version.ts next"
    },
    "peerDependencies": {
--    "react": "^16.8.0"
+-    "react": "^18.3.1"
 +    "react": "^18.3.1 || ^19.0.0"
    }
--}
-\ No newline at end of file
-+}
+ }
 diff --git a/theia-extensions/product/src/browser/style/index.css b/theia-extensions/product/src/browser/style/index.css
 index e5373f6..770a81c 100644
 --- a/theia-extensions/product/src/browser/style/index.css
