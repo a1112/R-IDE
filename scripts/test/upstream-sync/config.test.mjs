@@ -54,7 +54,7 @@ test('accepts explicit local Git paths used by fixture repositories', () => {
   }
 });
 
-test('rejects malformed Git branch refs', () => {
+test('rejects malformed and ambiguous Git branch refs', () => {
   for (const branch of ['foo//bar', '.', 'foo.', 'foo.lock', '@']) {
     assert.throws(
       () => validateSource({ ...validSource, branch }),
@@ -62,6 +62,14 @@ test('rejects malformed Git branch refs', () => {
       `expected branch ${branch} to be rejected`,
     );
   }
+});
+
+test('rejects HEAD as an ambiguous branch ref', () => {
+  assert.throws(() => validateSource({ ...validSource, branch: 'HEAD' }), /branch/i);
+});
+
+test('rejects branch refs beginning with a dash', () => {
+  assert.throws(() => validateSource({ ...validSource, branch: '-foo' }), /branch/i);
 });
 
 test('rejects forbidden suffixes and control characters in every ref component', () => {
@@ -73,6 +81,17 @@ test('rejects forbidden suffixes and control characters in every ref component',
     );
   }
   assert.equal(validateSource({ ...validSource, branch: 'release/1.2' }).branch, 'release/1.2');
+});
+
+test('rejects owned path segments ending in a dot or whitespace', () => {
+  for (const ownedPath of ['docs/readme.', 'docs/trailing-space ', 'docs/trailing-space /readme']) {
+    assert.throws(
+      () => parseOwnedPaths(ownedPath),
+      /path segment|owned path/i,
+      `expected owned path ${JSON.stringify(ownedPath)} to be rejected`,
+    );
+  }
+  assert.deepEqual(parseOwnedPaths('docs/readme.md\n'), ['docs/readme.md']);
 });
 
 test('normalizes owned paths and removes comments and blank lines', () => {

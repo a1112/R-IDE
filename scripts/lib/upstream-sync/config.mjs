@@ -71,6 +71,8 @@ function isValidRepository(value) {
 function isValidBranch(value) {
   if (
     value === '@' ||
+    value === 'HEAD' ||
+    value.startsWith('-') ||
     value.startsWith('/') ||
     value.endsWith('/') ||
     value.includes('//') ||
@@ -196,15 +198,21 @@ export function parseOwnedPaths(contents) {
 
   for (let lineNumber = 0; lineNumber < lines.length; lineNumber += 1) {
     const original = lines[lineNumber];
-    let entry = original.trim();
-    if (entry.length === 0 || entry.startsWith('#')) {
+    // Ignore indentation around manifest entries, but retain trailing
+    // whitespace so Windows-incompatible names cannot be silently normalized.
+    const line = original.replace(/^\s+/u, '');
+    if (line.length === 0 || line.startsWith('#')) {
       continue;
     }
 
-    entry = stripInlineComment(entry);
-    if (entry.length === 0) {
+    const rawEntry = stripInlineComment(line);
+    if (rawEntry.length === 0) {
       continue;
     }
+    if (/\s$/u.test(rawEntry)) {
+      throw pathError(rawEntry.trim(), 'path segments must not end in a dot or whitespace');
+    }
+    const entry = rawEntry.trim();
     if (/\0/.test(entry)) {
       throw pathError(entry, 'must not contain NUL characters');
     }
@@ -218,6 +226,19 @@ export function parseOwnedPaths(contents) {
     const segments = posixEntry.split('/');
     if (segments.some(segment => segment === '..')) {
       throw pathError(entry);
+    }
+    if (
+      segments.some((segment, index) => {
+        // A leading `.` is the harmless relative-path marker that is removed
+        // during normalization; every other dot-terminated segment is unsafe
+        // on Windows.
+        if (index === 0 && segment === '.') {
+          return false;
+        }
+        return segment.endsWith('.') || /\s$/u.test(segment);
+      })
+    ) {
+      throw pathError(entry, 'path segments must not end in a dot or whitespace');
     }
 
     let normalized = path.posix.normalize(posixEntry);
