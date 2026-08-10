@@ -11,6 +11,7 @@ const REPOSITORY_PROTOCOLS = new Set([
   'ssh:',
 ]);
 const WINDOWS_INVALID_PATH_CHARS = /[<>:"|?*\x00-\x1f\x7f]/u;
+const WINDOWS_RESERVED_DEVICE_NAME = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/iu;
 
 function isRecord(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -242,6 +243,11 @@ export function parseOwnedPaths(contents) {
       segments.some(segment => segment !== '.' && WINDOWS_INVALID_PATH_CHARS.test(segment))
     ) {
       throw pathError(entry, 'path segments contain characters invalid on Windows');
+    }
+    if (
+      segments.some(segment => segment !== '.' && WINDOWS_RESERVED_DEVICE_NAME.test(segment))
+    ) {
+      throw pathError(entry, 'path segments use Windows reserved device names');
     }
 
     let normalized = path.posix.normalize(posixEntry);

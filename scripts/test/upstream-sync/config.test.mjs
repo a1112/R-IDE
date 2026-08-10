@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 import {
   loadSourceConfig,
@@ -142,6 +143,29 @@ test('rejects Windows-invalid characters inside owned path segments', () => {
   assert.deepEqual(parseOwnedPaths('foo/./bar'), ['foo/bar']);
 });
 
+test('rejects Windows reserved device-name segments, including extensions', () => {
+  for (const deviceName of [
+    'CON',
+    'PRN',
+    'AUX',
+    'NUL',
+    'COM1',
+    'COM9',
+    'LPT1',
+    'LPT9',
+    'con.txt',
+    'COM1.log',
+    'lpt9.data',
+  ]) {
+    assert.throws(
+      () => parseOwnedPaths(`docs/${deviceName}/`),
+      /reserved|Windows|invalid|owned path/i,
+      `expected reserved device name ${deviceName} to be rejected`,
+    );
+  }
+  assert.deepEqual(parseOwnedPaths('.vscode/'), ['.vscode/']);
+});
+
 test('normalizes owned paths and removes comments and blank lines', () => {
   assert.deepEqual(
     parseOwnedPaths(`
@@ -236,4 +260,10 @@ test('reports a useful error when source metadata is missing', () => {
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('declares the intentionally absent .vscode directory in the real manifest', () => {
+  const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
+  const manifest = fs.readFileSync(path.join(repositoryRoot, '.upstream', 'owned-paths.txt'), 'utf8');
+  assert.ok(parseOwnedPaths(manifest).includes('.vscode/'));
 });

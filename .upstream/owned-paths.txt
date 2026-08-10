@@ -1,4 +1,5 @@
 # R-IDE/Tauri files that are copied from the product tree during sync.
+.vscode/
 applications/tauri/
 applications/browser/pkg.config.js
 patches/@theia+terminal+1.72.1.patch
