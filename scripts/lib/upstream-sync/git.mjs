@@ -7,15 +7,49 @@ import { CommandError, runCommand } from './command.mjs';
 const OBJECT_ID = /^[0-9a-f]{40}$/iu;
 
 function requireRepository(repository) {
-  if (typeof repository !== 'string' || repository.length === 0) {
+  if (
+    typeof repository !== 'string' ||
+    repository.length === 0 ||
+    repository.startsWith('-') ||
+    /[\0\r\n]/u.test(repository)
+  ) {
     throw new TypeError('Git repository path or URL must be a non-empty string');
   }
 }
 
-function requireRef(ref) {
-  if (typeof ref !== 'string' || ref.length === 0 || /\0/u.test(ref)) {
-    throw new TypeError('Git ref must be a non-empty string without NUL characters');
+export function validateGitRef(ref, { allowHead = true } = {}) {
+  if (typeof ref !== 'string' || ref.length === 0 || /[\0\r\n\x00-\x20\x7f]/u.test(ref)) {
+    throw new TypeError('Git ref must be a non-empty ref without whitespace or NUL characters');
   }
+  if (
+    ref.startsWith('-') ||
+    ref.startsWith('/') ||
+    ref.endsWith('/') ||
+    ref.includes('//') ||
+    ref.includes('..') ||
+    ref.includes('@{') ||
+    /[~^:?*\[\\]/u.test(ref) ||
+    (!allowHead && (ref === 'HEAD' || ref === '@'))
+  ) {
+    throw new TypeError(`Invalid Git ref: ${ref}`);
+  }
+  for (const component of ref.split('/')) {
+    if (
+      component.length === 0 ||
+      component === '.' ||
+      component === '..' ||
+      component.startsWith('.') ||
+      component.endsWith('.') ||
+      component.endsWith('.lock')
+    ) {
+      throw new TypeError(`Invalid Git ref: ${ref}`);
+    }
+  }
+  return ref;
+}
+
+function requireRef(ref, options) {
+  return validateGitRef(ref, options);
 }
 
 /** Clone a repository without checking out its default branch. */
@@ -30,6 +64,7 @@ export async function cloneRepository(repository, destination) {
     '--no-tags',
     '--origin',
     'origin',
+    '--',
     repository,
     destination,
   ]);
@@ -38,8 +73,8 @@ export async function cloneRepository(repository, destination) {
 
 /** Fetch a branch, tag, or exact object from the cloned origin. */
 export async function fetchRepository(repositoryPath, ref) {
-  requireRef(ref);
-  await runCommand('git', ['fetch', '--no-tags', 'origin', ref], { cwd: repositoryPath });
+  requireRef(ref, { allowHead: false });
+  await runCommand('git', ['fetch', '--no-tags', 'origin', '--', ref], { cwd: repositoryPath });
 }
 
 /** Resolve a ref to an unambiguous 40-character commit ID. */
@@ -86,13 +121,13 @@ export async function checkoutDetached(repositoryPath, commit) {
 }
 
 export async function applyPatchCheck(repositoryPath, patchPath) {
-  await runCommand('git', ['apply', '--check', '--binary', '--whitespace=nowarn', patchPath], {
+  await runCommand('git', ['apply', '--check', '--binary', '--whitespace=nowarn', '--', patchPath], {
     cwd: repositoryPath,
   });
 }
 
 export async function applyPatch(repositoryPath, patchPath) {
-  await runCommand('git', ['apply', '--binary', '--whitespace=nowarn', patchPath], {
+  await runCommand('git', ['apply', '--binary', '--whitespace=nowarn', '--', patchPath], {
     cwd: repositoryPath,
   });
 }

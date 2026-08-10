@@ -14,8 +14,45 @@ export async function pathExists(target) {
   }
 }
 
+/**
+ * Reject paths that traverse a symbolic link before reaching their final
+ * entry. The final entry itself is allowed to be a link so callers can remove
+ * or copy a link without following it; all parent components must be ordinary
+ * directories. Set `includeTarget` when the target itself must also be a real
+ * directory (for example a staging root or product root).
+ */
+export async function assertNoSymlinkAncestors(target, { includeTarget = false } = {}) {
+  if (typeof target !== 'string' || target.length === 0) {
+    throw new TypeError('A path is required for symlink validation');
+  }
+  const resolved = path.resolve(target);
+  const parsed = path.parse(resolved);
+  const segments = resolved.slice(parsed.root.length).split(path.sep).filter(Boolean);
+  let current = parsed.root;
+  for (let index = 0; index < segments.length; index += 1) {
+    current = path.join(current, segments[index]);
+    let stat;
+    try {
+      stat = await fs.lstat(current);
+    } catch (error) {
+      if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') {
+        return;
+      }
+      throw error;
+    }
+    const isTarget = index === segments.length - 1;
+    if (stat.isSymbolicLink() && (includeTarget || !isTarget)) {
+      throw new TypeError(`Refusing path through symbolic link: ${current}`);
+    }
+    if (!isTarget && !stat.isDirectory()) {
+      throw new TypeError(`Path ancestor is not a directory: ${current}`);
+    }
+  }
+}
+
 /** Remove a path after callers have resolved and validated its scope. */
 export async function removePath(target) {
+  await assertNoSymlinkAncestors(target);
   await fs.rm(target, { recursive: true, force: true });
 }
 
@@ -85,6 +122,8 @@ async function copyEntry(source, destination) {
  * express intentionally absent paths without a special sentinel file.
  */
 export async function copyPath(source, destination) {
+  await assertNoSymlinkAncestors(source);
+  await assertNoSymlinkAncestors(destination);
   if (!(await pathExists(source))) {
     return false;
   }

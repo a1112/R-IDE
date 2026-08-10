@@ -2,19 +2,27 @@ import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
-import { applyPatch, applyPatchCheck, assertAncestor, cloneRepository, fetchRepository, resolveCommit, checkoutDetached } from './git.mjs';
-import { copyPath, pathExists, removePath, resolveWithin } from './filesystem.mjs';
+import { validateSource } from './config.mjs';
+import { applyPatch, applyPatchCheck, assertAncestor, cloneRepository, fetchRepository, resolveCommit, checkoutDetached, validateGitRef } from './git.mjs';
+import { assertNoSymlinkAncestors, copyPath, pathExists, removePath, resolveWithin } from './filesystem.mjs';
 
-function assertProductDirectory(product) {
+function samePath(left, right) {
+  return process.platform === 'win32'
+    ? left.toLowerCase() === right.toLowerCase()
+    : left === right;
+}
+
+function assertProductDirectory(product, repositoryRoot) {
   if (typeof product !== 'string' || product.length === 0) {
     throw new TypeError('A product destination is required');
   }
+  if (typeof repositoryRoot !== 'string' || repositoryRoot.length === 0) {
+    throw new TypeError('A repositoryRoot is required to guard the app destination');
+  }
   const resolved = path.resolve(product);
-  // The synchronizer is intentionally scoped to the repository's app/ tree.
-  // This guards callers against accidentally replacing a workspace root or a
-  // similarly named arbitrary directory.
-  if (path.basename(resolved) !== 'app') {
-    throw new TypeError(`Refusing to replace destination outside an app directory: ${resolved}`);
+  const expected = path.join(path.resolve(repositoryRoot), 'app');
+  if (!samePath(resolved, expected)) {
+    throw new TypeError(`Refusing to replace destination outside the repository app directory: ${resolved}`);
   }
   return resolved;
 }
@@ -23,7 +31,12 @@ function isWithin(parent, candidate) {
   const resolvedParent = path.resolve(parent);
   const resolvedCandidate = path.resolve(candidate);
   const prefix = resolvedParent.endsWith(path.sep) ? resolvedParent : `${resolvedParent}${path.sep}`;
-  return resolvedCandidate === resolvedParent || resolvedCandidate.startsWith(prefix);
+  if (samePath(resolvedCandidate, resolvedParent)) {
+    return true;
+  }
+  return process.platform === 'win32'
+    ? resolvedCandidate.toLowerCase().startsWith(prefix.toLowerCase())
+    : resolvedCandidate.startsWith(prefix);
 }
 
 function sourceFromOptions(options) {
@@ -35,12 +48,11 @@ function sourceFromOptions(options) {
   if (source === null || typeof source !== 'object') {
     throw new TypeError('Upstream source metadata must be an object');
   }
-  for (const field of ['repository', 'branch', 'commit']) {
-    if (typeof source[field] !== 'string' || source[field].length === 0) {
-      throw new TypeError(`Upstream source is missing ${field}`);
-    }
+  try {
+    return validateSource(source);
+  } catch (error) {
+    throw new TypeError(`Invalid upstream source: ${error.message}`, { cause: error });
   }
-  return source;
 }
 
 function normalizeOwnedPath(entry) {
@@ -119,6 +131,8 @@ async function restoreOwnedPaths(product, staged, ownedPaths) {
     // ownership manifests from escaping either the product or checkout root.
     const source = resolveWithin(product, relativePath);
     const destination = resolveWithin(staged, relativePath);
+    await assertNoSymlinkAncestors(source);
+    await assertNoSymlinkAncestors(destination);
     if (await pathExists(source)) {
       await copyPath(source, destination);
     } else {
@@ -152,9 +166,35 @@ async function applyPatches(staged, patches, temporaryRoot) {
   return entries.map(entry => entry.label);
 }
 
-async function atomicReplace(destination, staged, { rename = (source, target) => fs.rename(source, target) } = {}) {
+async function assertRealProduct(product, repositoryRoot) {
+  await assertNoSymlinkAncestors(repositoryRoot, { includeTarget: true });
+  await assertNoSymlinkAncestors(product, { includeTarget: true });
+  const [rootStat, productStat] = await Promise.all([fs.lstat(repositoryRoot), fs.lstat(product)]);
+  if (!rootStat.isDirectory() || productStat.isSymbolicLink() || !productStat.isDirectory()) {
+    throw new TypeError(`Product destination must be a real directory under repositoryRoot: ${product}`);
+  }
+  const [rootReal, productReal] = await Promise.all([fs.realpath(repositoryRoot), fs.realpath(product)]);
+  const expectedReal = path.join(rootReal, 'app');
+  if (!samePath(productReal, expectedReal)) {
+    throw new TypeError(`Product destination resolves outside repositoryRoot/app: ${product}`);
+  }
+  return { rootReal, productReal };
+}
+
+async function atomicReplace(
+  destination,
+  staged,
+  { rename = (source, target) => fs.rename(source, target), repositoryRoot } = {},
+) {
   if (typeof rename !== 'function') {
     throw new TypeError('atomic replacement rename must be a function');
+  }
+  assertProductDirectory(destination, repositoryRoot);
+  await assertRealProduct(destination, repositoryRoot);
+  await assertNoSymlinkAncestors(staged, { includeTarget: true });
+  const stagedStat = await fs.lstat(staged);
+  if (stagedStat.isSymbolicLink() || !stagedStat.isDirectory()) {
+    throw new TypeError(`Staged replacement must be a real directory: ${staged}`);
   }
   const parent = path.dirname(destination);
   const backup = path.join(parent, `.app-backup-${crypto.randomBytes(12).toString('hex')}`);
@@ -167,14 +207,35 @@ async function atomicReplace(destination, staged, { rename = (source, target) =>
     installed = true;
     await removePath(backup);
   } catch (error) {
-    // If installation partially succeeded, remove it before restoring the old
-    // tree. If it did not, the staged directory remains under temporaryRoot
-    // and the outer finally block removes it.
+    const restoreFailures = [];
     if (installed) {
-      await removePath(destination).catch(() => {});
+      try {
+        await removePath(destination);
+      } catch (restoreError) {
+        restoreFailures.push(restoreError);
+      }
     }
-    if (movedOld && !(await pathExists(destination))) {
-      await rename(backup, destination).catch(() => {});
+    if (movedOld) {
+      let destinationExists = false;
+      try {
+        destinationExists = await pathExists(destination);
+      } catch (restoreError) {
+        restoreFailures.push(restoreError);
+      }
+      if (!destinationExists) {
+        try {
+          await rename(backup, destination);
+        } catch (restoreError) {
+          restoreFailures.push(restoreError);
+        }
+      }
+    }
+    if (restoreFailures.length > 0) {
+      throw new AggregateError(
+        [error, ...restoreFailures],
+        `Atomic replacement failed; backup path: ${backup}`,
+        { cause: error },
+      );
     }
     throw error;
   }
@@ -189,6 +250,7 @@ export async function synchronize(options = {}) {
   if (options === null || typeof options !== 'object') {
     throw new TypeError('Synchronization options must be an object');
   }
+  const repositoryRoot = options.repositoryRoot ?? options.root ?? options.workspaceRoot;
   const product = assertProductDirectory(
     options.product ??
       options.productDir ??
@@ -198,36 +260,43 @@ export async function synchronize(options = {}) {
       options.appDir ??
       options.appPath ??
       options.appDirectory ??
-      options.destination,
+    options.destination,
+    repositoryRoot,
   );
   const source = sourceFromOptions(options);
   const targetRef = options.target ?? options.targetCommit ?? source.branch;
   if (typeof targetRef !== 'string' || targetRef.length === 0) {
     throw new TypeError('A target branch or commit is required');
   }
+  if (!/^[0-9a-f]{40}$/iu.test(targetRef)) {
+    try {
+      validateGitRef(targetRef, { allowHead: false });
+    } catch (error) {
+      throw new TypeError(`Invalid target ref: ${targetRef}`, { cause: error });
+    }
+  }
   // Keep the default staging root beside app/ so the final directory renames
   // stay on one volume (Windows rename cannot atomically move across drives).
   // Callers may provide a different explicit root when they know it shares the
   // destination volume.
   const temporaryBase = path.resolve(options.tempRoot ?? path.dirname(product));
-  if (isWithin(product, temporaryBase)) {
-    throw new TypeError(`Staging root must not be inside the product directory: ${temporaryBase}`);
-  }
-  const productStat = await fs.lstat(product).catch(error => {
-    if (error?.code === 'ENOENT') return null;
-    throw error;
-  });
-  if (productStat && !productStat.isDirectory()) {
-    throw new TypeError(`Product destination must be a directory: ${product}`);
-  }
-  if (!productStat) {
-    throw new TypeError(`Product destination does not exist: ${product}`);
-  }
+  const { productReal } = await assertRealProduct(product, repositoryRoot);
+  await assertNoSymlinkAncestors(temporaryBase, { includeTarget: true });
   await fs.mkdir(temporaryBase, { recursive: true });
+  await assertNoSymlinkAncestors(temporaryBase, { includeTarget: true });
+  const temporaryBaseReal = await fs.realpath(temporaryBase);
+  if (isWithin(productReal, temporaryBaseReal)) {
+    throw new TypeError(`Staging root must not resolve inside the product directory: ${temporaryBase}`);
+  }
+  if (typeof options.cleanup !== 'undefined' && typeof options.cleanup !== 'function') {
+    throw new TypeError('cleanup must be a function');
+  }
+  const cleanup = options.cleanup ?? removePath;
   const temporaryRoot = await fs.mkdtemp(path.join(temporaryBase, 'ride-upstream-sync-'));
   const checkout = path.join(temporaryRoot, 'checkout');
   let target;
   let baseline;
+  let operationError;
   try {
     await cloneRepository(source.repository, checkout);
     // A branch may move after clone, while a full object ID is already present
@@ -286,13 +355,27 @@ export async function synchronize(options = {}) {
       throw new TypeError('replaceDestination must be a function');
     }
     if (replace === atomicReplace) {
-      await atomicReplace(product, checkout);
+      await atomicReplace(product, checkout, { repositoryRoot });
     } else {
       await replace(product, checkout, { baseline, target });
     }
     return { product, baseline, target, appliedPatches };
+  } catch (error) {
+    operationError = error;
+    throw error;
   } finally {
-    await removePath(temporaryRoot).catch(() => {});
+    try {
+      await cleanup(temporaryRoot);
+    } catch (cleanupError) {
+      if (operationError) {
+        throw new AggregateError(
+          [operationError, cleanupError],
+          `Synchronization and temporary cleanup both failed: ${temporaryRoot}`,
+          { cause: operationError },
+        );
+      }
+      throw cleanupError;
+    }
   }
 }
 

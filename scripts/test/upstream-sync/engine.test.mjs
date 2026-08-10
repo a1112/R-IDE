@@ -5,7 +5,13 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { atomicReplace, synchronize } from '../../lib/upstream-sync/engine.mjs';
+import { atomicReplace, restoreOwnedPaths, synchronize } from '../../lib/upstream-sync/engine.mjs';
+import {
+  checkoutDetached,
+  cloneRepository,
+  compareTrackedTrees,
+  generateBinaryDiff,
+} from '../../lib/upstream-sync/git.mjs';
 import { runCommand } from '../../lib/upstream-sync/command.mjs';
 
 async function writeFile(file, contents) {
@@ -29,6 +35,19 @@ async function createGitRepository(root) {
   await git(repository, ['config', 'user.email', 'fixture@example.invalid']);
   await git(repository, ['config', 'user.name', 'Fixture']);
   return repository;
+}
+
+async function createSymlinkOrSkip(t, target, link, type = undefined) {
+  try {
+    await fs.symlink(target, link, type);
+    return true;
+  } catch (error) {
+    if (process.platform === 'win32' && ['EACCES', 'EPERM', 'ENOTSUP'].includes(error?.code)) {
+      t.skip(`symlinks unavailable on this Windows host: ${error.code}`);
+      return false;
+    }
+    throw error;
+  }
 }
 
 async function createFixture(t) {
@@ -69,6 +88,7 @@ async function createFixture(t) {
 
   const options = {
     product,
+    repositoryRoot: root,
     source: { repository, branch: 'master', commit: baseline },
     target,
     ownedPaths: ['owned/', 'absent-owned.txt'],
@@ -191,9 +211,17 @@ test('replays a source patch after the upstream snapshot is staged', async t => 
 
 test('resolves a non-default target branch to an exact fetched commit', async t => {
   const fixture = await createFixture(t);
-  await git(fixture.repository, ['branch', 'feature', fixture.target]);
-  await synchronize({ ...fixture.options, target: 'feature' });
-  assert.equal(await fs.readFile(path.join(fixture.product, 'add.txt'), 'utf8').then(value => value.replaceAll('\r\n', '\n')), 'new upstream file\n');
+  await git(fixture.repository, ['checkout', '-b', 'feature', fixture.target]);
+  await writeFile(path.join(fixture.repository, 'feature-only.txt'), 'feature branch\n');
+  await git(fixture.repository, ['add', 'feature-only.txt']);
+  await git(fixture.repository, ['commit', '-m', 'feature-only']);
+  const featureTarget = await gitOutput(fixture.repository, ['rev-parse', 'HEAD']);
+  const result = await synchronize({ ...fixture.options, target: 'feature' });
+  assert.equal(result.target, featureTarget);
+  assert.equal(
+    await fs.readFile(path.join(fixture.product, 'feature-only.txt'), 'utf8').then(value => value.replaceAll('\r\n', '\n')),
+    'feature branch\n',
+  );
 });
 
 test('does not modify the product when a patch conflicts', async t => {
@@ -266,10 +294,36 @@ test('restores the old destination when the final replacement rename fails', asy
   };
 
   await assert.rejects(
-    atomicReplace(fixture.product, staged, { rename }),
+    atomicReplace(fixture.product, staged, { rename, repositoryRoot: fixture.root }),
     /injected final rename failure/,
   );
   assert.equal(await treeDigest(fixture.product), before);
+});
+
+test('reports replacement and restore failures with the backup path', async t => {
+  const fixture = await createFixture(t);
+  const staged = path.join(fixture.root, 'staged-app');
+  await fs.mkdir(staged, { recursive: true });
+  await writeFile(path.join(staged, 'new.txt'), 'staged\n');
+  let renameCount = 0;
+  const rename = async (source, destination) => {
+    renameCount += 1;
+    if (renameCount >= 2) {
+      throw new Error(`injected rename failure ${renameCount}`);
+    }
+    return fs.rename(source, destination);
+  };
+
+  await assert.rejects(
+    atomicReplace(fixture.product, staged, { rename, repositoryRoot: fixture.root }),
+    error => {
+      assert.equal(error.constructor, AggregateError);
+      assert.match(error.message, /backup/i);
+      assert.match(error.message, /app-backup-/);
+      assert.ok(error.errors.some(entry => /injected rename failure/.test(entry.message)));
+      return true;
+    },
+  );
 });
 
 test('rejects replacement targets that are not an app directory', async t => {
@@ -280,6 +334,133 @@ test('rejects replacement targets that are not an app directory', async t => {
     synchronize({ ...fixture.options, product: unsafeProduct }),
     /app directory|destination/i,
   );
+});
+
+test('rejects an app directory outside the declared repository root', async t => {
+  const fixture = await createFixture(t);
+  const unsafeProduct = path.join(fixture.root, 'evil', 'app');
+  await fs.mkdir(unsafeProduct, { recursive: true });
+  await assert.rejects(
+    synchronize({ ...fixture.options, product: unsafeProduct }),
+    /repository root|app directory|destination/i,
+  );
+});
+
+test('rejects symlinked repository roots and staging roots', async t => {
+  const fixture = await createFixture(t);
+  const outsideRoot = path.join(fixture.root, 'outside-root');
+  const linkedRoot = path.join(fixture.root, 'linked-root');
+  await fs.mkdir(path.join(outsideRoot, 'app'), { recursive: true });
+  await fs.cp(fixture.product, path.join(outsideRoot, 'app'), { recursive: true });
+  if (!(await createSymlinkOrSkip(t, outsideRoot, linkedRoot, process.platform === 'win32' ? 'junction' : undefined))) {
+    return;
+  }
+  await assert.rejects(
+    synchronize({
+      ...fixture.options,
+      product: path.join(linkedRoot, 'app'),
+      repositoryRoot: linkedRoot,
+    }),
+    /symlink|symbolic|repository root|destination/i,
+  );
+
+  const stagingOutside = path.join(fixture.root, 'staging-outside');
+  const stagingLink = path.join(fixture.root, 'staging-link');
+  await fs.mkdir(stagingOutside, { recursive: true });
+  if (!(await createSymlinkOrSkip(t, stagingOutside, stagingLink, process.platform === 'win32' ? 'junction' : undefined))) {
+    return;
+  }
+  await assert.rejects(
+    synchronize({ ...fixture.options, tempRoot: stagingLink }),
+    /symlink|symbolic|staging root/i,
+  );
+});
+
+test('rejects product and staging paths that traverse symlink ancestors', async t => {
+  const fixture = await createFixture(t);
+  const outside = path.join(fixture.root, 'outside');
+  await fs.mkdir(outside, { recursive: true });
+  const outsideVictim = path.join(outside, 'victim.txt');
+  await writeFile(outsideVictim, 'outside original\n');
+
+  const staged = path.join(fixture.root, 'staged');
+  await fs.mkdir(staged, { recursive: true });
+  await writeFile(path.join(fixture.product, 'owned', 'victim.txt'), 'product victim\n');
+  if (!(await createSymlinkOrSkip(t, outside, path.join(staged, 'owned'), process.platform === 'win32' ? 'junction' : undefined))) {
+    return;
+  }
+  await assert.rejects(
+    restoreOwnedPaths(fixture.product, staged, ['owned/victim.txt']),
+    /symlink|symbolic|unsafe/i,
+  );
+  assert.equal(await fs.readFile(outsideVictim, 'utf8'), 'outside original\n');
+
+  await fs.rm(path.join(staged, 'owned'), { recursive: true, force: true });
+  await fs.rm(path.join(fixture.product, 'owned'), { recursive: true, force: true });
+  if (!(await createSymlinkOrSkip(t, outside, path.join(fixture.product, 'owned'), process.platform === 'win32' ? 'junction' : undefined))) {
+    return;
+  }
+  await fs.mkdir(path.join(staged, 'owned'), { recursive: true });
+  await assert.rejects(
+    restoreOwnedPaths(fixture.product, staged, ['owned/victim.txt']),
+    /symlink|symbolic|unsafe/i,
+  );
+  assert.equal(await fs.readFile(outsideVictim, 'utf8'), 'outside original\n');
+});
+
+test('rejects Git repository and target refs that begin with options', async t => {
+  const fixture = await createFixture(t);
+  await assert.rejects(
+    synchronize({
+      ...fixture.options,
+      source: { ...fixture.options.source, repository: '--upload-pack=echo' },
+    }),
+    error => error instanceof TypeError && /repository/i.test(error.message),
+  );
+  await assert.rejects(
+    synchronize({ ...fixture.options, target: '--upload-pack=echo' }),
+    error => error instanceof TypeError && /target|ref/i.test(error.message),
+  );
+});
+
+test('surfaces cleanup failures together with the synchronization failure', async t => {
+  const fixture = await createFixture(t);
+  await assert.rejects(
+    synchronize({
+      ...fixture.options,
+      verifier: async () => {
+        throw new Error('injected verifier failure');
+      },
+      cleanup: async () => {
+        throw new Error('injected cleanup failure');
+      },
+    }),
+    error => {
+      assert.equal(error.constructor, AggregateError);
+      assert.ok(error.errors.some(entry => /injected verifier failure/.test(entry.message)));
+      assert.ok(error.errors.some(entry => /injected cleanup failure/.test(entry.message)));
+      return true;
+    },
+  );
+});
+
+test('generates binary-capable diffs and compares tracked working trees', async t => {
+  const fixture = await createFixture(t);
+  const diff = await generateBinaryDiff(fixture.repository, {
+    from: fixture.baseline,
+    to: fixture.target,
+  });
+  assert.match(diff, /GIT binary patch/);
+  assert.match(diff, /binary\.dat/);
+
+  const mirror = path.join(fixture.root, 'mirror');
+  await cloneRepository(fixture.repository, mirror);
+  await git(mirror, ['config', 'core.autocrlf', 'false']);
+  await checkoutDetached(mirror, fixture.target);
+  assert.equal((await compareTrackedTrees(fixture.repository, mirror)).equal, true);
+  await writeFile(path.join(mirror, 'keep.txt'), 'working tree drift\n');
+  const drift = await compareTrackedTrees(fixture.repository, mirror);
+  assert.deepEqual(drift.modified, ['keep.txt']);
 });
 
 test('rejects owned paths that normalize to the product root', async t => {
