@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { setTimeout as wait } from 'node:timers/promises';
 
 import { validateSource } from './config.mjs';
 import { applyPatch, applyPatchCheck, assertAncestor, cloneRepository, fetchRepository, resolveCommit, checkoutDetached, validateGitRef } from './git.mjs';
@@ -181,14 +182,48 @@ async function assertRealProduct(product, repositoryRoot) {
   return { rootReal, productReal };
 }
 
+function assertRenameRetryOptions(renameRetries, renameRetryDelayMs) {
+  if (!Number.isInteger(renameRetries) || renameRetries < 0 || renameRetries > 10) {
+    throw new TypeError('renameRetries must be an integer between 0 and 10');
+  }
+  if (!Number.isFinite(renameRetryDelayMs) || renameRetryDelayMs < 0 || renameRetryDelayMs > 5000) {
+    throw new TypeError('renameRetryDelayMs must be between 0 and 5000 milliseconds');
+  }
+}
+
+function isTransientRenameError(error) {
+  return error?.code === 'EPERM' || error?.code === 'EBUSY';
+}
+
+async function renameWithRetry(rename, source, destination, renameRetries, renameRetryDelayMs) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await rename(source, destination);
+    } catch (error) {
+      if (!isTransientRenameError(error) || attempt >= renameRetries) {
+        throw error;
+      }
+      if (renameRetryDelayMs > 0) {
+        await wait(renameRetryDelayMs);
+      }
+    }
+  }
+}
+
 async function atomicReplace(
   destination,
   staged,
-  { rename = (source, target) => fs.rename(source, target), repositoryRoot } = {},
+  {
+    rename = (source, target) => fs.rename(source, target),
+    repositoryRoot,
+    renameRetries = 3,
+    renameRetryDelayMs = 25,
+  } = {},
 ) {
   if (typeof rename !== 'function') {
     throw new TypeError('atomic replacement rename must be a function');
   }
+  assertRenameRetryOptions(renameRetries, renameRetryDelayMs);
   assertProductDirectory(destination, repositoryRoot);
   await assertRealProduct(destination, repositoryRoot);
   await assertNoSymlinkAncestors(staged, { includeTarget: true });
@@ -201,9 +236,9 @@ async function atomicReplace(
   let movedOld = false;
   let installed = false;
   try {
-    await rename(destination, backup);
+    await renameWithRetry(rename, destination, backup, renameRetries, renameRetryDelayMs);
     movedOld = true;
-    await rename(staged, destination);
+    await renameWithRetry(rename, staged, destination, renameRetries, renameRetryDelayMs);
     installed = true;
     await removePath(backup);
   } catch (error) {
@@ -224,7 +259,7 @@ async function atomicReplace(
       }
       if (!destinationExists) {
         try {
-          await rename(backup, destination);
+          await renameWithRetry(rename, backup, destination, renameRetries, renameRetryDelayMs);
         } catch (restoreError) {
           restoreFailures.push(restoreError);
         }
@@ -358,7 +393,11 @@ export async function synchronize(options = {}) {
       throw new TypeError('replaceDestination must be a function');
     }
     if (replace === atomicReplace) {
-      await atomicReplace(product, checkout, { repositoryRoot });
+      await atomicReplace(product, checkout, {
+        repositoryRoot,
+        renameRetries: options.renameRetries,
+        renameRetryDelayMs: options.renameRetryDelayMs,
+      });
     } else {
       await replace(product, checkout, { baseline, target });
     }

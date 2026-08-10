@@ -313,6 +313,32 @@ test('restores the old destination when the final replacement rename fails', asy
   assert.equal(await treeDigest(fixture.product), before);
 });
 
+test('retries transient final replacement rename failures', async t => {
+  const fixture = await createFixture(t);
+  const staged = path.join(fixture.root, 'staged-app');
+  await fs.mkdir(staged, { recursive: true });
+  await writeFile(path.join(staged, 'new.txt'), 'staged\n');
+  let renameCount = 0;
+  const rename = async (source, destination) => {
+    renameCount += 1;
+    if (renameCount === 2) {
+      const error = new Error('injected transient rename lock');
+      error.code = 'EPERM';
+      throw error;
+    }
+    return fs.rename(source, destination);
+  };
+
+  await atomicReplace(fixture.product, staged, {
+    rename,
+    repositoryRoot: fixture.root,
+    renameRetries: 1,
+    renameRetryDelayMs: 1,
+  });
+  assert.equal(renameCount, 3);
+  assert.equal(await fs.readFile(path.join(fixture.product, 'new.txt'), 'utf8'), 'staged\n');
+});
+
 test('reports replacement and restore failures with the backup path', async t => {
   const fixture = await createFixture(t);
   const staged = path.join(fixture.root, 'staged-app');
