@@ -211,6 +211,17 @@ test('replays a source patch after the upstream snapshot is staged', async t => 
   );
 });
 
+test('applies patches when repositoryRoot is itself a parent Git repository', async t => {
+  const fixture = await createFixture(t);
+  await git(fixture.root, ['init']);
+  await synchronize({ ...fixture.options, patches: [fixture.successfulPatch] });
+
+  assert.equal(
+    (await fs.readFile(path.join(fixture.product, 'keep.txt'), 'utf8')).replaceAll('\r\n', '\n'),
+    'patched target\n',
+  );
+});
+
 test('resolves a non-default target branch to an exact fetched commit', async t => {
   const fixture = await createFixture(t);
   await git(fixture.repository, ['checkout', '-b', 'feature', fixture.target]);

@@ -325,12 +325,15 @@ export async function synchronize(options = {}) {
     await assertAncestor(checkout, baseline, target);
     await checkoutDetached(checkout, target);
 
-    // The checkout is now an ordinary product tree. Removing Git metadata
-    // before ownership/patch operations prevents repository internals from
-    // accidentally becoming product content.
-    await removePath(path.join(checkout, '.git'));
+    // Keep checkout metadata until Git-owned operations finish. If the product
+    // repository itself is a parent of this temporary directory, `git apply`
+    // would otherwise discover that parent .git and apply relative to the
+    // wrong worktree.
     await restoreOwnedPaths(product, checkout, options.ownedPaths ?? []);
     const appliedPatches = await applyPatches(checkout, options.patches ?? [], temporaryRoot);
+    // The prepared checkout is now an ordinary product tree; never expose its
+    // temporary Git metadata to verification or the final replacement.
+    await removePath(path.join(checkout, '.git'));
 
     if (options.verifier !== undefined) {
       if (typeof options.verifier !== 'function') {
