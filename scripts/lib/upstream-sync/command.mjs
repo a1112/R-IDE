@@ -1,5 +1,21 @@
 import { execFile as execFileCallback } from 'node:child_process';
 
+function normalizeStream(value) {
+  if (typeof value === 'string') {
+    return value;
+  }
+  if (value === undefined || value === null) {
+    return '';
+  }
+  if (Buffer.isBuffer(value)) {
+    return value.toString('utf8');
+  }
+  if (value instanceof Uint8Array) {
+    return Buffer.from(value).toString('utf8');
+  }
+  return String(value);
+}
+
 /**
  * Error raised when a child process cannot be started or exits unsuccessfully.
  * Keeping the invocation details on the error makes CI failures actionable
@@ -7,9 +23,11 @@ import { execFile as execFileCallback } from 'node:child_process';
  */
 export class CommandError extends Error {
   constructor({ executable, args, exitCode = null, signal = null, stdout = '', stderr = '', cause }) {
+    const normalizedStdout = normalizeStream(stdout);
+    const normalizedStderr = normalizeStream(stderr);
     const renderedArgs = args.map(argument => JSON.stringify(String(argument))).join(' ');
     const codeText = exitCode === null || exitCode === undefined ? 'unknown' : String(exitCode);
-    const detail = stderr.trim();
+    const detail = normalizedStderr.trim();
     super(
       `Command failed: ${executable}${renderedArgs ? ` ${renderedArgs}` : ''} `
         + `(exit code ${codeText})${detail ? `: ${detail}` : ''}`,
@@ -20,8 +38,8 @@ export class CommandError extends Error {
     this.args = [...args];
     this.exitCode = typeof exitCode === 'number' ? exitCode : null;
     this.signal = signal ?? null;
-    this.stdout = stdout;
-    this.stderr = stderr;
+    this.stdout = normalizedStdout;
+    this.stderr = normalizedStderr;
     this.code = cause && typeof cause.code === 'string' ? cause.code : undefined;
   }
 }

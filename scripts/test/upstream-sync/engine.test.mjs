@@ -145,6 +145,18 @@ test('captures command details when an external process fails', async () => {
   );
 });
 
+test('normalizes buffered command failure streams into a CommandError', async () => {
+  await assert.rejects(
+    runCommand(process.execPath, ['-e', 'process.exit(2)'], { encoding: null }),
+    error => {
+      assert.equal(error.name, 'CommandError');
+      assert.equal(typeof error.stderr, 'string');
+      assert.equal(typeof error.stdout, 'string');
+      return true;
+    },
+  );
+});
+
 test('rebuilds upstream additions, edits, deletes, renames, and binary files', async t => {
   const fixture = await createFixture(t);
   await synchronize(fixture.options);
