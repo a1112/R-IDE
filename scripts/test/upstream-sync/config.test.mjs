@@ -61,9 +61,21 @@ test('accepts supported Git repository schemes and scp fixture paths', () => {
     'ssh://git@example.com/theia-ide.git',
     'git://example.com/theia-ide.git',
     'file:///tmp/theia-ide.git',
+    'file:/tmp/theia-ide.git',
+    'file://server/share/theia-ide.git',
     'git@example.com:eclipse/theia-ide.git',
   ]) {
     assert.equal(validateSource({ ...validSource, repository }).repository, repository);
+  }
+});
+
+test('rejects authority-less network repository URLs', () => {
+  for (const repository of ['https:foo/repo.git', 'ssh:foo/repo.git', 'git:foo/repo.git']) {
+    assert.throws(
+      () => validateSource({ ...validSource, repository }),
+      /repository/i,
+      `expected repository ${repository} to be rejected`,
+    );
   }
 });
 

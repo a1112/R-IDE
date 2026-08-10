@@ -10,6 +10,7 @@ const REPOSITORY_PROTOCOLS = new Set([
   'https:',
   'ssh:',
 ]);
+const NETWORK_REPOSITORY_PROTOCOLS = new Set(['git:', 'http:', 'https:', 'ssh:']);
 const WINDOWS_INVALID_PATH_CHARS = /[<>:"|?*\x00-\x1f\x7f]/u;
 const WINDOWS_RESERVED_DEVICE_NAME = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/iu;
 
@@ -29,6 +30,12 @@ function isValidRepository(value) {
   const protocol = /^([A-Za-z][A-Za-z0-9+.-]*:)/.exec(value)?.[1]?.toLowerCase();
   if (protocol && !windowsDrivePath) {
     if (!REPOSITORY_PROTOCOLS.has(protocol)) {
+      return false;
+    }
+    if (
+      NETWORK_REPOSITORY_PROTOCOLS.has(protocol) &&
+      !value.slice(protocol.length).startsWith('//')
+    ) {
       return false;
     }
 
