@@ -33,3 +33,4 @@ git checkout a868f5b15f2d4f2598125a4f6a98c0d29990b946
 - `.upstream/patches/0003-product-branding.patch`：R-IDE 产品品牌与工作台 UI 调整。
 - `.upstream/patches/0004-lockfile.patch`：`yarn.lock` 依赖锁定差异。
 - `node scripts/sync-upstream.mjs check --json` 在 CI 中验证 pinned upstream、owned 路径及上述 patch stack 可重放且无 drift。
+- `scripts/test/upstream-sync/real-tree.test.mjs` 默认按 `source.json` clone 并 checkout pinned commit；本地可设置 `RIDE_PINNED_UPSTREAM` 指向同一 commit 的只读 checkout，路径不存在或 commit 不匹配会 fail-fast，绝不跳过测试。
