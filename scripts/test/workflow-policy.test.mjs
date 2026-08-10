@@ -1,0 +1,96 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import test from 'node:test';
+import { fileURLToPath } from 'node:url';
+
+const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+const workflowPath = path.join(repositoryRoot, '.github', 'workflows', 'ci.yml');
+
+function readWorkflow() {
+  assert.ok(fs.existsSync(workflowPath), `expected workflow at ${workflowPath}`);
+  return fs.readFileSync(workflowPath, 'utf8');
+}
+
+function jobBlocks(workflow) {
+  const jobsSection = workflow.split(/^jobs:\s*$/m)[1];
+  assert.ok(jobsSection, 'workflow must define jobs');
+  return [...jobsSection.matchAll(/^  ([A-Za-z0-9_-]+):\s*$/gm)].map((match, index, jobs) => {
+    const start = match.index;
+    const end = jobs[index + 1]?.index ?? jobsSection.length;
+    return { name: match[1], text: jobsSection.slice(start, end) };
+  });
+}
+
+test('CI workflow has least-privilege triggers and concurrency controls', () => {
+  const workflow = readWorkflow();
+  assert.match(workflow, /^permissions:\s*\n\s+contents:\s*read\s*$/m);
+  assert.match(workflow, /^on:\s*$/m);
+  assert.match(workflow, /^\s+push:\s*$/m);
+  assert.match(workflow, /^\s+pull_request:\s*$/m);
+  assert.match(workflow, /^\s+workflow_dispatch:\s*$/m);
+  assert.match(workflow, /^concurrency:\s*\n\s+group:/m);
+  assert.match(workflow, /cancel-in-progress:\s*true/);
+});
+
+test('every CI job has an explicit timeout and required quality jobs exist', () => {
+  const workflow = readWorkflow();
+  const jobs = jobBlocks(workflow);
+  assert.ok(jobs.length >= 3, 'expected quality, compatibility, and package jobs');
+  for (const job of jobs) {
+    assert.match(job.text, /timeout-minutes:\s*\d+/);
+  }
+  assert.ok(jobs.some(({ name }) => name === 'quality'));
+  assert.ok(jobs.some(({ name }) => name === 'upstream-compatibility'));
+  assert.ok(jobs.some(({ name }) => name === 'package'));
+});
+
+test('package matrix covers all supported desktop runners and Node 22', () => {
+  const workflow = readWorkflow();
+  const packageJob = jobBlocks(workflow).find(({ name }) => name === 'package');
+  assert.ok(packageJob, 'package job is required');
+  for (const runner of ['windows-2022', 'ubuntu-22.04', 'macos-15', 'macos-15-intel']) {
+    assert.match(packageJob.text, new RegExp(`os:\\s*${runner.replace('.', '\\.')}`));
+  }
+  assert.match(packageJob.text, /node-version:\s*['"]?22(?:\.x)?['"]?/);
+  assert.match(packageJob.text, /rustup\s+toolchain\s+install\s+stable/);
+  assert.match(packageJob.text, /npm --workspace applications\/tauri run verify/);
+});
+
+test('quality and compatibility jobs run the required Node builds and Rust checks', () => {
+  const workflow = readWorkflow();
+  const jobs = Object.fromEntries(jobBlocks(workflow).map(({ name, text }) => [name, text]));
+  assert.match(jobs.quality, /node --test scripts\/test\/upstream-sync\/\*\.test\.mjs scripts\/test\/workflow-policy\.test\.mjs/);
+  assert.match(jobs.quality, /yarn lint/);
+  assert.match(jobs.quality, /yarn build:extensions/);
+  assert.match(jobs.quality, /yarn browser build/);
+  assert.match(jobs.quality, /cargo fmt --manifest-path applications\/tauri\/src-tauri\/Cargo\.toml --check/);
+  assert.match(jobs.quality, /cargo clippy --manifest-path applications\/tauri\/src-tauri\/Cargo\.toml --all-targets -- -D warnings/);
+  assert.match(jobs.quality, /cargo test --manifest-path applications\/tauri\/src-tauri\/Cargo\.toml/);
+  assert.match(jobs['upstream-compatibility'], /node-version:\s*['"]?24(?:\.x)?['"]?/);
+  assert.match(jobs['upstream-compatibility'], /yarn build:extensions/);
+  assert.match(jobs['upstream-compatibility'], /yarn browser build/);
+});
+
+test('all third-party actions are pinned to approved full commit SHAs', () => {
+  const workflow = readWorkflow();
+  const uses = [...workflow.matchAll(/^\s+uses:\s*([^\s#]+)\s*$/gm)].map((match) => match[1]);
+  assert.ok(uses.length > 0, 'workflow should use pinned official actions');
+  const allowed = new Set([
+    'actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd',
+    'actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238',
+    'actions/cache@caa296126883cff596d87d8935842f9db880ef25',
+    'actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f',
+  ]);
+  for (const action of uses) {
+    assert.ok(allowed.has(action), `unexpected or unpinned action ${action}`);
+    assert.match(action, /@[0-9a-f]{40}$/);
+  }
+});
+
+test('CI only validates and packages unsigned bundles without release automation', () => {
+  const workflow = readWorkflow();
+  assert.doesNotMatch(workflow, /(?:^|\n)\s*(?:release|signing):|gh\s+release|codesign|signtool|auto[- ]?merge/i);
+  assert.match(workflow, /app\/applications\/tauri\/src-tauri\/target\/release\/bundle\/\*\*/);
+  assert.match(workflow, /name:\s*tauri-\$\{\{\s*matrix\.platform\s*\}\}-\$\{\{\s*matrix\.arch\s*\}\}/);
+});
