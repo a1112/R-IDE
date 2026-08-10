@@ -151,7 +151,7 @@ index 29de656..395f72c 100644
          process.exit(1);
      }
 diff --git a/applications/browser/package.json b/applications/browser/package.json
-index 334f2af..7b479d4 100644
+index 334f2af..05fa56f 100644
 --- a/applications/browser/package.json
 +++ b/applications/browser/package.json
 @@ -2,7 +2,7 @@
@@ -199,7 +199,7 @@ index 334f2af..7b479d4 100644
 -    "build:prod": "yarn -s rebuild && theia  build --app-target=\"browser\"",
 +    "build": "npm run rebuild --silent && theia build --app-target=\"browser\" --mode development",
 +    "build:prod": "npm run rebuild --silent && theia build --app-target=\"browser\"",
-+    "build:tauri-backend": "npm run rebuild --silent && RIDE_TAURI_LEAN=1 theia build --app-target=\"browser\"",
++    "build:tauri-backend": "node ../../scripts/build-tauri-backend.js",
 +    "pkg:compile": "pkg lib/backend/main.js --targets node22-win-x64,node22-linux-x64,node22-macos-x64 --output dist/theia-backend",
      "rebuild": "theia rebuild:browser --cacheRoot ../..",
      "start": "theia start --plugins=local-dir:../../plugins",

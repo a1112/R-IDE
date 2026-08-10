@@ -33,9 +33,28 @@ function createBuildPlan(platform = process.platform) {
   ];
 }
 
-function runBuild(platform = process.platform) {
+function quoteCmdArg(value) {
+  const stringValue = String(value);
+  if (/^[A-Za-z0-9_@%+=:,./-]+$/.test(stringValue)) {
+    return stringValue;
+  }
+  return `"${stringValue.replace(/["^&|<>!]/g, character => `^${character}`).replace(/%/g, '^%')}"`;
+}
+
+function createSpawnInvocation(step, platform) {
+  if (platform !== 'win32') {
+    return { command: step.command, args: step.args };
+  }
+
+  const comspec = step.env.ComSpec || step.env.COMSPEC || process.env.ComSpec || process.env.COMSPEC || 'cmd.exe';
+  const commandLine = [step.command, ...step.args].map(quoteCmdArg).join(' ');
+  return { command: comspec, args: ['/d', '/s', '/c', commandLine] };
+}
+
+function runBuild(platform = process.platform, spawn = spawnSync) {
   for (const step of createBuildPlan(platform)) {
-    const result = spawnSync(step.command, step.args, {
+    const invocation = createSpawnInvocation(step, platform);
+    const result = spawn(invocation.command, invocation.args, {
       cwd: step.cwd,
       env: step.env,
       shell: step.shell,
@@ -62,4 +81,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { browserDirectory, createBuildPlan, runBuild };
+module.exports = { browserDirectory, createBuildPlan, createSpawnInvocation, runBuild };
