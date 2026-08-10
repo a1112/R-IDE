@@ -76,8 +76,7 @@ function isValidBranch(value) {
     value.includes('//') ||
     value.includes('..') ||
     value.includes('@{') ||
-    value.endsWith('.lock') ||
-    /[~^:?*\[\\\x00-\x20]/.test(value)
+    /[~^:?*\[\\\x00-\x20\x7f]/.test(value)
   ) {
     return false;
   }
@@ -90,7 +89,8 @@ function isValidBranch(value) {
       component !== '.' &&
       component !== '..' &&
       !component.startsWith('.') &&
-      !component.endsWith('.')
+      !component.endsWith('.') &&
+      !component.endsWith('.lock')
     );
   });
 }

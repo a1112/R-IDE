@@ -64,6 +64,17 @@ test('rejects malformed Git branch refs', () => {
   }
 });
 
+test('rejects forbidden suffixes and control characters in every ref component', () => {
+  for (const branch of ['foo.lock/bar', 'foo/bar.lock/baz', 'foo\u007fbar']) {
+    assert.throws(
+      () => validateSource({ ...validSource, branch }),
+      /branch/i,
+      `expected branch ${JSON.stringify(branch)} to be rejected`,
+    );
+  }
+  assert.equal(validateSource({ ...validSource, branch: 'release/1.2' }).branch, 'release/1.2');
+});
+
 test('normalizes owned paths and removes comments and blank lines', () => {
   assert.deepEqual(
     parseOwnedPaths(`
