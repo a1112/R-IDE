@@ -1,0 +1,85 @@
+diff --git a/.gitignore b/.gitignore
+index 7e83a50..10dbdc9 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -11,4 +11,23 @@
+ license-check-summary.txt*
+ .theia-ide/chatSessions
+ .prompts
+-**/test-screenshots
+\ No newline at end of file
++**/test-screenshots
++
++# Tauri build artifacts
++**/target/
++**/browser-frontend/
++**/tauri-frontend/
++**/resources/backend/*
++**/resources/plugins/*
++!**/resources/backend/
++!**/resources/plugins/
++!**/resources/backend/.gitkeep
++!**/resources/plugins/.gitkeep
++**/src-tauri/gen/schemas/macOS-schema.json
++**/Cargo.lock
++
++# Tauri / dev temp files
++.qa/
++demo-workspace/
++nul
++**/nul
+diff --git a/lerna.json b/lerna.json
+index 868b796..7573561 100644
+--- a/lerna.json
++++ b/lerna.json
+@@ -1,9 +1,10 @@
+ {
+   "$schema": "node_modules/lerna/schemas/lerna-schema.json",
+   "version": "1.72.100",
++  "npmClient": "npm",
+   "command": {
+     "run": {
+       "stream": true
+     }
+   }
+-}
+\ No newline at end of file
++}
+diff --git a/package.json b/package.json
+index f45a526..f40df93 100644
+--- a/package.json
++++ b/package.json
+@@ -43,8 +43,9 @@
+     "build:applications:dev": "lerna run --scope=\"theia-ide*app\" --ignore=\"theia-ide-next*\" build --concurrency 1",
+     "build:applications:next": "lerna run --scope=\"theia-ide-next*\" build:prod --concurrency 1",
+     "build:applications:next:dev": "lerna run --scope=\"theia-ide-next*\" build --concurrency 1",
+-    "build:extensions": "lerna run --scope=\"theia-ide*ext\" build",
+-    "download:plugins": "theia download:plugins --rate-limit=15 --parallel=false && yarn permissions:writeable",
++    "build:extensions": "npm --workspace theia-extensions/product run build && npm --workspace theia-extensions/launcher run build && npm --workspace theia-extensions/updater run build",
++    "build:tauri": "npm run build:extensions && npm --workspace applications/browser run build:tauri-backend && npm --workspace applications/tauri run build:prod",
++    "download:plugins": "theia download:plugins --rate-limit=15 --parallel=false && npm run permissions:writeable",
+     "package:applications": "lerna run --scope=\"theia-ide*app\" --ignore=\"theia-ide-next*\" package --concurrency 1",
+     "package:applications:preview": "lerna run --scope=\"theia-ide*app\" --ignore=\"theia-ide-next*\" package:preview --concurrency 1",
+     "package:applications:prod": "lerna run --scope=\"theia-ide*app\" --ignore=\"theia-ide-next*\" package:prod --concurrency 1",
+@@ -55,6 +56,9 @@
+     "electron": "yarn --cwd applications/electron",
+     "electron-next": "yarn --cwd applications/electron-next",
+     "browser": "yarn --cwd applications/browser",
++    "tauri": "npm --workspace applications/tauri",
++    "tauri:dev": "npm --workspace applications/tauri run dev",
++    "tauri:build": "npm --workspace applications/tauri run build",
+     "update:theia": "ts-node scripts/update-theia-version.ts",
+     "update:theia:children": "lerna run update:theia -- ",
+     "update:next": "ts-node scripts/update-theia-version.ts next && lerna run update:next",
+@@ -88,5 +92,9 @@
+     "**/perfect-scrollbar": "1.5.5",
+     "**/node-abi": "4.14.0",
+     "**/yauzl": "^3.3.1"
++  },
++  "optionalDependencies": {
++    "@parcel/watcher-darwin-arm64": "^2.5.6",
++    "@vscode/ripgrep-darwin-arm64": "^1.18.0"
+   }
+-}
+\ No newline at end of file
++}

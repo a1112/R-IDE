@@ -1,0 +1,213 @@
+diff --git a/applications/browser/esbuild.mjs b/applications/browser/esbuild.mjs
+index 29de656..395f72c 100644
+--- a/applications/browser/esbuild.mjs
++++ b/applications/browser/esbuild.mjs
+@@ -10,6 +10,139 @@ import path from 'node:path';
+ 
+ import esbuild from 'esbuild';
+ 
++const leanTauriModulePrefixes = [
++    '@theia/ai-',
++    '@theia/bulk-edit/',
++    '@theia/callhierarchy/',
++    '@theia/console/',
++    '@theia/collaboration/',
++    '@theia/editor-preview/',
++    '@theia/getting-started/',
++    '@theia/keymaps/',
++    '@theia/memory-inspector/',
++    '@theia/metrics/',
++    '@theia/mini-browser/',
++    '@theia/notebook/',
++    '@theia/plugin-dev/',
++    '@theia/preview/',
++    '@theia/property-view/',
++    '@theia/scanoss/',
++    '@theia/secondary-window/',
++    '@theia/timeline/',
++    '@theia/toolbar/',
++    '@theia/typehierarchy/',
++    '@theia/vsx-registry/'
++];
++
++const leanTauriPluginModulePrefixes = [
++    '@theia/plugin-ext/',
++    '@theia/plugin-ext-vscode/'
++];
++
++const leanTauriExtensionNames = [
++    '@theia/ai-',
++    '@theia/bulk-edit',
++    '@theia/callhierarchy',
++    '@theia/console',
++    '@theia/collaboration',
++    '@theia/editor-preview',
++    '@theia/getting-started',
++    '@theia/keymaps',
++    '@theia/memory-inspector',
++    '@theia/metrics',
++    '@theia/mini-browser',
++    '@theia/notebook',
++    '@theia/plugin-dev',
++    '@theia/preview',
++    '@theia/property-view',
++    '@theia/scanoss',
++    '@theia/secondary-window',
++    '@theia/timeline',
++    '@theia/toolbar',
++    '@theia/typehierarchy',
++    '@theia/vsx-registry'
++];
++
++const leanTauriPluginExtensionNames = [
++    '@theia/plugin-ext',
++    '@theia/plugin-ext-vscode'
++];
++
++function shouldKeepTauriPlugins() {
++    return process.env.RIDE_TAURI_ENABLE_PLUGINS === '1' || process.env.RIDE_TAURI_ENABLE_PLUGINS === 'true';
++}
++
++function shouldFilterLeanTauriRequire(line) {
++    return leanTauriModulePrefixes.some(prefix => line.includes(`require('${prefix}`))
++        || (!shouldKeepTauriPlugins() && leanTauriPluginModulePrefixes.some(prefix => line.includes(`require('${prefix}`)));
++}
++
++function shouldFilterLeanTauriExtension(name) {
++    return leanTauriExtensionNames.some(prefix => name.startsWith(prefix))
++        || (!shouldKeepTauriPlugins() && leanTauriPluginExtensionNames.some(prefix => name.startsWith(prefix)));
++}
++
++function patchGeneratedFilesForLeanTauri() {
++    const enabled = process.env.RIDE_TAURI_LEAN === '1' || process.env.RIDE_TAURI_LEAN === 'true';
++    if (!enabled) {
++        return;
++    }
++
++    const generatedFiles = [
++        path.join(__dirname, 'src-gen', 'frontend', 'index.js'),
++        path.join(__dirname, 'src-gen', 'frontend', 'secondary-index.js'),
++        path.join(__dirname, 'src-gen', 'backend', 'server.js')
++    ];
++
++    for (const file of generatedFiles) {
++        if (!fs.existsSync(file)) {
++            continue;
++        }
++        const source = fs.readFileSync(file, 'utf8');
++        const filtered = source
++            .split('\n')
++            .filter(line => !shouldFilterLeanTauriRequire(line))
++            .join('\n');
++        if (filtered !== source) {
++            fs.writeFileSync(file, filtered);
++        }
++    }
++
++    const backendMain = path.join(__dirname, 'src-gen', 'backend', 'main.js');
++    if (fs.existsSync(backendMain)) {
++        const source = fs.readFileSync(backendMain, 'utf8');
++        const filtered = source
++            .replace(/    \{\n        "name": "([^"]+)",\n        "version": "[^"]+"\n    \},?\n/g, (entry, name) => shouldFilterLeanTauriExtension(name) ? '' : entry)
++            .replace(/,\n\];/g, '\n];');
++        if (filtered !== source) {
++            fs.writeFileSync(backendMain, filtered);
++        }
++    }
++}
++
++function patchBuiltFilesForLeanTauri() {
++    const enabled = process.env.RIDE_TAURI_LEAN === '1' || process.env.RIDE_TAURI_LEAN === 'true';
++    if (!enabled) {
++        return;
++    }
++
++    const backendBundle = path.join(__dirname, 'lib', 'backend', 'main.js');
++    if (!fs.existsSync(backendBundle)) {
++        return;
++    }
++
++    const source = fs.readFileSync(backendBundle, 'utf8');
++    const filtered = source.replace(
++        /onNotification\((\w+),\.\.\.(\w+)\)\{this\.target&&this\.target\[\1\]\(\.\.\.\2\)\}/,
++        'onNotification($1,...$2){if(!this.target)return;const targetMethod=this.target[$1];typeof targetMethod==="function"?targetMethod.apply(this.target,$2):console.warn(`Ignoring RPC notification without target method: ${$1}`)}'
++    );
++    if (filtered !== source) {
++        fs.writeFileSync(backendBundle, filtered);
++    }
++}
++
++patchGeneratedFilesForLeanTauri();
++
+ // serve favicon from root and inject link tag into index.html
+ browserOptions.plugins.push(
+     copy({
+@@ -50,6 +183,7 @@ if (watch) {
+         await browserContext.dispose();
+         await nodeContext.rebuild();
+         await nodeContext.dispose();
++        patchBuiltFilesForLeanTauri();
+     } catch {
+         process.exit(1);
+     }
+diff --git a/applications/browser/package.json b/applications/browser/package.json
+index 334f2af..7b479d4 100644
+--- a/applications/browser/package.json
++++ b/applications/browser/package.json
+@@ -2,7 +2,7 @@
+   "private": true,
+   "name": "theia-ide-browser-app",
+   "description": "Eclipse Theia IDE browser product",
+-  "productName": "Theia IDE",
++  "productName": "R-IDE",
+   "version": "1.72.100",
+   "license": "MIT",
+   "author": "Eclipse Theia <theia-dev@eclipse.org>",
+@@ -21,10 +21,19 @@
+   "theia": {
+     "frontend": {
+       "config": {
+-        "applicationName": "Theia IDE",
++        "applicationName": "R-IDE",
+         "warnOnPotentiallyInsecureHostPattern": false,
+         "preferences": {
+-          "toolbar.showToolbar": true,
++          "toolbar.showToolbar": false,
++          "workbench.startupEditor": "none",
++          "workbench.colorTheme": "dark",
++          "editor.fontFamily": "'JetBrains Mono', Consolas, 'Courier New', monospace",
++          "editor.fontSize": 15,
++          "editor.lineHeight": 24,
++          "editor.minimap.enabled": false,
++          "editor.renderLineHighlight": "line",
++          "terminal.integrated.fontFamily": "Cascadia Mono, Consolas, monospace",
++          "terminal.integrated.fontSize": 13,
+           "files.enableTrash": false,
+           "security.workspace.trust.enabled": false
+         },
+@@ -123,16 +132,19 @@
+   },
+   "devDependencies": {
+     "@theia/bundle-plugin": "1.73.0-next.2",
+-    "@theia/cli": "1.73.0-next.2"
++    "@theia/cli": "1.73.0-next.2",
++    "pkg": "^5.8.1"
+   },
+   "scripts": {
+     "clean": "theia clean && rimraf node_modules",
+-    "build": "yarn -s rebuild && theia build --app-target=\"browser\" --mode development",
+-    "build:prod": "yarn -s rebuild && theia  build --app-target=\"browser\"",
++    "build": "npm run rebuild --silent && theia build --app-target=\"browser\" --mode development",
++    "build:prod": "npm run rebuild --silent && theia build --app-target=\"browser\"",
++    "build:tauri-backend": "npm run rebuild --silent && RIDE_TAURI_LEAN=1 theia build --app-target=\"browser\"",
++    "pkg:compile": "pkg lib/backend/main.js --targets node22-win-x64,node22-linux-x64,node22-macos-x64 --output dist/theia-backend",
+     "rebuild": "theia rebuild:browser --cacheRoot ../..",
+     "start": "theia start --plugins=local-dir:../../plugins",
+-    "watch": "concurrently --kill-others -n tsc,build -c red,yellow \"tsc -b -w --preserveWatchOutput\" \"yarn -s watch:bundle\"",
++    "watch": "concurrently --kill-others -n tsc,build -c red,yellow \"tsc -b -w --preserveWatchOutput\" \"npm run watch:bundle --silent\"",
+     "update:theia": "ts-node ../../scripts/update-theia-version.ts",
+     "update:next": "ts-node ../../scripts/update-theia-version.ts next"
+   }
+-}
+\ No newline at end of file
++}

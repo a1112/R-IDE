@@ -25,3 +25,11 @@ git checkout a868f5b15f2d4f2598125a4f6a98c0d29990b946
 - custom-protocol feature 实现生产资源嵌入
 - 完整的 VSCode 插件支持（97 个插件）
 - 更新 product 扩展，添加 R-IDE 品牌
+
+## 可重放同步层
+- `.upstream/source.json` 固定上述 commit；`.upstream/owned-paths.txt` 声明 R-IDE/Tauri 独有文件及上游保留目录。
+- `.upstream/patches/0001-workspace-and-build.patch`：工作区与构建脚本调整。
+- `.upstream/patches/0002-browser-tauri-backend.patch`：Browser/Tauri 后端构建调整。
+- `.upstream/patches/0003-product-branding.patch`：R-IDE 产品品牌与工作台 UI 调整。
+- `.upstream/patches/0004-lockfile.patch`：`yarn.lock` 依赖锁定差异。
+- `node scripts/sync-upstream.mjs check --json` 在 CI 中验证 pinned upstream、owned 路径及上述 patch stack 可重放且无 drift。
