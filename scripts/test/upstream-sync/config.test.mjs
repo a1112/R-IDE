@@ -20,6 +20,50 @@ test('accepts a complete pinned source and preserves its fields', () => {
   assert.deepEqual(validateSource(validSource), validSource);
 });
 
+test('accepts configured HTTPS repositories and ordinary release refs', () => {
+  const value = validateSource({ ...validSource, branch: 'release/1.2' });
+  assert.equal(value.repository, validSource.repository);
+  assert.equal(value.branch, 'release/1.2');
+});
+
+test('rejects bare repository names', () => {
+  assert.throws(
+    () => validateSource({ ...validSource, repository: 'foo' }),
+    /repository/i,
+  );
+});
+
+test('rejects malformed or unsupported repository URLs', () => {
+  for (const repository of ['https://', 'https://?invalid', 'ftp://example.com/repo.git']) {
+    assert.throws(
+      () => validateSource({ ...validSource, repository }),
+      /repository/i,
+      `expected repository ${repository} to be rejected`,
+    );
+  }
+});
+
+test('accepts explicit local Git paths used by fixture repositories', () => {
+  for (const repository of [
+    './fixtures/upstream.git',
+    '../fixtures/upstream.git',
+    'C:\\fixtures\\upstream.git',
+    '/tmp/upstream.git',
+  ]) {
+    assert.equal(validateSource({ ...validSource, repository }).repository, repository);
+  }
+});
+
+test('rejects malformed Git branch refs', () => {
+  for (const branch of ['foo//bar', '.', 'foo.', 'foo.lock', '@']) {
+    assert.throws(
+      () => validateSource({ ...validSource, branch }),
+      /branch/i,
+      `expected branch ${branch} to be rejected`,
+    );
+  }
+});
+
 test('normalizes owned paths and removes comments and blank lines', () => {
   assert.deepEqual(
     parseOwnedPaths(`

@@ -3,6 +3,16 @@ import path from 'node:path';
 
 const SOURCE_FIELDS = ['repository', 'branch', 'commit'];
 const COMMIT_PATTERN = /^[0-9a-f]{40}$/i;
+const REPOSITORY_PROTOCOLS = new Set([
+  'file:',
+  'git:',
+  'git+http:',
+  'git+https:',
+  'git+ssh:',
+  'http:',
+  'https:',
+  'ssh:',
+]);
 
 function isRecord(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -10,6 +20,79 @@ function isRecord(value) {
 
 function sourceError(message) {
   return new TypeError(`Invalid upstream source metadata: ${message}`);
+}
+
+function isValidRepository(value) {
+  // Validate URI-looking values before local-path checks. Otherwise malformed
+  // strings such as "https://" would be accepted merely because they contain
+  // a slash.
+  const windowsDrivePath = /^[A-Za-z]:[\\/]/.test(value);
+  const protocol = /^([A-Za-z][A-Za-z0-9+.-]*:)/.exec(value)?.[1]?.toLowerCase();
+  if (protocol && !windowsDrivePath) {
+    if (!REPOSITORY_PROTOCOLS.has(protocol)) {
+      return false;
+    }
+
+    try {
+      const parsed = new URL(value);
+      if (parsed.protocol === 'file:') {
+        return parsed.pathname.length > 0;
+      }
+      return parsed.hostname.length > 0 && parsed.pathname.length > 0;
+    } catch {
+      return false;
+    }
+  }
+
+  // Keep local fixture repositories usable, but require an unambiguous path
+  // rather than treating every bare token as a repository name. Absolute paths,
+  // dot-relative paths, paths with a separator, and explicit .git paths are
+  // all unambiguous local Git locations.
+  if (
+    windowsDrivePath ||
+    value.startsWith('/') ||
+    value.startsWith('./') ||
+    value.startsWith('../') ||
+    value.includes('/') ||
+    value.includes('\\') ||
+    /\.git$/i.test(value)
+  ) {
+    return true;
+  }
+
+  // Accept common scp-like Git URLs such as git@github.com:org/repository.git.
+  if (/^[^/\s@]+@[^:/\s]+:.+/.test(value)) {
+    return true;
+  }
+
+  return false;
+}
+
+function isValidBranch(value) {
+  if (
+    value === '@' ||
+    value.startsWith('/') ||
+    value.endsWith('/') ||
+    value.includes('//') ||
+    value.includes('..') ||
+    value.includes('@{') ||
+    value.endsWith('.lock') ||
+    /[~^:?*\[\\\x00-\x20]/.test(value)
+  ) {
+    return false;
+  }
+
+  // Git rejects components beginning or ending with a dot. Checking each
+  // component also catches the single-dot ref and refs such as foo/.bar.
+  return value.split('/').every(component => {
+    return (
+      component.length > 0 &&
+      component !== '.' &&
+      component !== '..' &&
+      !component.startsWith('.') &&
+      !component.endsWith('.')
+    );
+  });
 }
 
 /**
@@ -44,17 +127,14 @@ export function validateSource(value) {
   if (/\s/.test(repository)) {
     throw sourceError('repository must not contain whitespace');
   }
+  if (!isValidRepository(repository)) {
+    throw sourceError('repository must be a valid URL or an explicit local Git path');
+  }
 
   const branch = value.branch;
-  // Keep branch validation intentionally close to Git's ref rules while still
-  // allowing ordinary names such as master, release/1.2, and feature/foo.
-  if (
-    branch.startsWith('/') ||
-    branch.endsWith('/') ||
-    branch.includes('..') ||
-    branch.includes('@{') ||
-    /[~^:?*\[\\\x00-\x20]/.test(branch)
-  ) {
+  // Keep branch validation close to Git's ref rules while still allowing
+  // ordinary names such as master, release/1.2, and feature/foo.
+  if (!isValidBranch(branch)) {
     throw sourceError('branch is not a valid Git ref');
   }
 
@@ -218,4 +298,3 @@ export function loadSourceConfig(repositoryRoot = process.cwd()) {
     ownedPaths: parseOwnedPaths(ownedPathsContents),
   };
 }
-
