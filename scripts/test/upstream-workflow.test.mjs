@@ -44,7 +44,8 @@ test('upstream write job uses the narrow write permissions and skips pull reques
   const workflow = readWorkflow();
   assert.match(workflow, /^permissions:\s*\n\s+contents:\s*read\s*$/m);
   const sync = jobBlock(workflow, 'sync');
-  assert.match(sync, /if:\s*!?\s*\$\{\{\s*github\.event_name\s*!=\s*['"]pull_request['"]\s*&&\s*github\.repository\s*==\s*github\.event\.repository\.full_name\s*\}\}/);
+  assert.match(sync, /if:\s*!?\s*\$\{\{\s*github\.event_name\s*!=\s*['"]pull_request['"]\s*&&\s*github\.repository\s*==\s*github\.event\.repository\.full_name(?:\s*&&[^}]*)?\s*\}\}/);
+  assert.match(sync, /github\.event\.repository\.fork\s*==\s*false/);
   assert.match(sync, /permissions:\s*\n\s+contents:\s*write\s*\n\s+pull-requests:\s*write\s*\n\s+issues:\s*write/);
   assert.doesNotMatch(sync, /actions:\s*write|id-token:\s*write|packages:\s*write/);
 });

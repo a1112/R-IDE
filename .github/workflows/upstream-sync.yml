@@ -20,7 +20,7 @@ concurrency:
 jobs:
   sync:
     name: Synchronize upstream
-    if: ${{ github.event_name != 'pull_request' && github.repository == github.event.repository.full_name }}
+    if: ${{ github.event_name != 'pull_request' && github.repository == github.event.repository.full_name && github.event.repository.fork == false }}
     runs-on: ubuntu-22.04
     timeout-minutes: 45
     permissions:
