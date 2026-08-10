@@ -28,7 +28,6 @@ jobs:
       pull-requests: write
       issues: write
     env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       TARGET_INPUT: ${{ inputs.target_commit }}
       UPSTREAM_REPOSITORY: https://github.com/eclipse-theia/theia-ide.git
       UPSTREAM_SYNC_FAILURE_MARKER: '<!-- upstream-sync-failure -->'
@@ -37,6 +36,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Node.js 22
         uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238
@@ -113,6 +113,12 @@ jobs:
           }
           NODE
 
+      - name: Configure Git credentials for synchronization push
+        if: steps.commit.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh auth setup-git
+
       - name: Push bot synchronization branch
         if: steps.commit.outputs.changed == 'true'
         shell: bash
@@ -125,6 +131,8 @@ jobs:
       - name: Create or update synchronization pull request
         if: steps.commit.outputs.changed == 'true'
         shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           pr_number="$(gh pr list --head automation/upstream-sync --state open --json number --jq '.[0].number // empty')"
@@ -169,6 +177,8 @@ jobs:
       - name: Create or update bot-authored failure issue
         if: ${{ failure() }}
         shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           issue_number="$(gh issue list --state open --search 'in:body "<!-- upstream-sync-failure -->"' --json number,author --jq '.[] | select(.author.login == "github-actions[bot]") | .number' | head -n 1)"

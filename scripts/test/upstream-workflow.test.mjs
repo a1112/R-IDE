@@ -50,6 +50,40 @@ test('upstream write job uses the narrow write permissions and skips pull reques
   assert.doesNotMatch(sync, /actions:\s*write|id-token:\s*write|packages:\s*write/);
 });
 
+test('upstream-controlled build steps cannot access a write token', () => {
+  const sync = jobBlock(readWorkflow(), 'sync');
+  const checkoutStart = sync.indexOf('- name: Check out full history');
+  const checkoutEnd = sync.indexOf('- name: Set up Node.js 22', checkoutStart);
+  assert.ok(checkoutStart >= 0 && checkoutEnd > checkoutStart, 'expected checkout and Node setup steps');
+  assert.match(sync.slice(checkoutStart, checkoutEnd), /persist-credentials:\s*false/);
+
+  const jobEnvStart = sync.indexOf('    env:\n');
+  const jobEnvEnd = sync.indexOf('    steps:\n', jobEnvStart);
+  assert.ok(jobEnvStart >= 0 && jobEnvEnd > jobEnvStart, 'expected a job environment block');
+  assert.doesNotMatch(sync.slice(jobEnvStart, jobEnvEnd), /GH_TOKEN:/);
+
+  const buildStart = sync.indexOf('- name: Install dependencies and run fast checks');
+  const buildEnd = sync.indexOf('- name: Render pull request body', buildStart);
+  assert.ok(buildStart >= 0 && buildEnd > buildStart, 'expected upstream build steps');
+  assert.doesNotMatch(sync.slice(buildStart, buildEnd), /GH_TOKEN/);
+
+  const writeSteps = [
+    'Configure Git credentials for synchronization push',
+    'Create or update synchronization pull request',
+    'Create or update bot-authored failure issue',
+  ];
+  for (const name of writeSteps) {
+    const start = sync.indexOf(`- name: ${name}`);
+    const next = sync.indexOf('\n      - name:', start + 1);
+    assert.ok(start >= 0, `expected ${name} step`);
+    const block = sync.slice(start, next >= 0 ? next : sync.length);
+    assert.match(block, /GH_TOKEN:\s*\$\{\{\s*secrets\.GITHUB_TOKEN\s*\}\}/);
+    if (name === 'Configure Git credentials for synchronization push') {
+      assert.match(block, /gh\s+auth\s+setup-git/);
+    }
+  }
+});
+
 test('sync runs before push, uses bot branch, gh PR commands, and no merge automation', () => {
   const workflow = readWorkflow();
   const sync = jobBlock(workflow, 'sync');
