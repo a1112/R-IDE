@@ -152,15 +152,18 @@ async function applyPatches(staged, patches, temporaryRoot) {
   return entries.map(entry => entry.label);
 }
 
-async function atomicReplace(destination, staged) {
+async function atomicReplace(destination, staged, { rename = (source, target) => fs.rename(source, target) } = {}) {
+  if (typeof rename !== 'function') {
+    throw new TypeError('atomic replacement rename must be a function');
+  }
   const parent = path.dirname(destination);
   const backup = path.join(parent, `.app-backup-${crypto.randomBytes(12).toString('hex')}`);
   let movedOld = false;
   let installed = false;
   try {
-    await fs.rename(destination, backup);
+    await rename(destination, backup);
     movedOld = true;
-    await fs.rename(staged, destination);
+    await rename(staged, destination);
     installed = true;
     await removePath(backup);
   } catch (error) {
@@ -171,7 +174,7 @@ async function atomicReplace(destination, staged) {
       await removePath(destination).catch(() => {});
     }
     if (movedOld && !(await pathExists(destination))) {
-      await fs.rename(backup, destination).catch(() => {});
+      await rename(backup, destination).catch(() => {});
     }
     throw error;
   }

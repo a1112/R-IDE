@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { synchronize } from '../../lib/upstream-sync/engine.mjs';
+import { atomicReplace, synchronize } from '../../lib/upstream-sync/engine.mjs';
 import { runCommand } from '../../lib/upstream-sync/command.mjs';
 
 async function writeFile(file, contents) {
@@ -229,12 +229,35 @@ test('does not touch the destination until staging and verification succeed', as
   let observedDuringVerification;
   await synchronize({
     ...fixture.options,
-    verifier: async () => {
+    verifier: async staged => {
       observedDuringVerification = await treeDigest(fixture.product);
+      await assert.rejects(fs.access(path.join(staged, '.git')));
     },
   });
   assert.equal(observedDuringVerification, before);
   assert.notEqual(await treeDigest(fixture.product), before);
+});
+
+test('restores the old destination when the final replacement rename fails', async t => {
+  const fixture = await createFixture(t);
+  const staged = path.join(fixture.root, 'staged-app');
+  await fs.mkdir(staged, { recursive: true });
+  await writeFile(path.join(staged, 'new.txt'), 'staged\n');
+  const before = await treeDigest(fixture.product);
+  let renameCount = 0;
+  const rename = async (source, destination) => {
+    renameCount += 1;
+    if (renameCount === 2) {
+      throw new Error('injected final rename failure');
+    }
+    return fs.rename(source, destination);
+  };
+
+  await assert.rejects(
+    atomicReplace(fixture.product, staged, { rename }),
+    /injected final rename failure/,
+  );
+  assert.equal(await treeDigest(fixture.product), before);
 });
 
 test('rejects replacement targets that are not an app directory', async t => {
