@@ -6,13 +6,11 @@ const COMMIT_PATTERN = /^[0-9a-f]{40}$/i;
 const REPOSITORY_PROTOCOLS = new Set([
   'file:',
   'git:',
-  'git+http:',
-  'git+https:',
-  'git+ssh:',
   'http:',
   'https:',
   'ssh:',
 ]);
+const WINDOWS_INVALID_PATH_CHARS = /[<>:"|?*\x00-\x1f\x7f]/u;
 
 function isRecord(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -232,13 +230,18 @@ export function parseOwnedPaths(contents) {
         // A leading `.` is the harmless relative-path marker that is removed
         // during normalization; every other dot-terminated segment is unsafe
         // on Windows.
-        if (index === 0 && segment === '.') {
+        if (segment === '.') {
           return false;
         }
         return segment.endsWith('.') || /\s$/u.test(segment);
       })
     ) {
       throw pathError(entry, 'path segments must not end in a dot or whitespace');
+    }
+    if (
+      segments.some(segment => segment !== '.' && WINDOWS_INVALID_PATH_CHARS.test(segment))
+    ) {
+      throw pathError(entry, 'path segments contain characters invalid on Windows');
     }
 
     let normalized = path.posix.normalize(posixEntry);

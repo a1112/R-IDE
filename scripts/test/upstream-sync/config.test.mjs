@@ -54,6 +54,28 @@ test('accepts explicit local Git paths used by fixture repositories', () => {
   }
 });
 
+test('accepts supported Git repository schemes and scp fixture paths', () => {
+  for (const repository of [
+    'http://example.com/theia-ide.git',
+    'ssh://git@example.com/theia-ide.git',
+    'git://example.com/theia-ide.git',
+    'file:///tmp/theia-ide.git',
+    'git@example.com:eclipse/theia-ide.git',
+  ]) {
+    assert.equal(validateSource({ ...validSource, repository }).repository, repository);
+  }
+});
+
+test('rejects repository schemes unsupported by git clone', () => {
+  for (const repository of ['git+https://example.com/theia-ide.git', 'git+ssh://example.com/theia-ide.git']) {
+    assert.throws(
+      () => validateSource({ ...validSource, repository }),
+      /repository/i,
+      `expected repository ${repository} to be rejected`,
+    );
+  }
+});
+
 test('rejects malformed and ambiguous Git branch refs', () => {
   for (const branch of ['foo//bar', '.', 'foo.', 'foo.lock', '@']) {
     assert.throws(
@@ -92,6 +114,32 @@ test('rejects owned path segments ending in a dot or whitespace', () => {
     );
   }
   assert.deepEqual(parseOwnedPaths('docs/readme.md\n'), ['docs/readme.md']);
+});
+
+test('normalizes dot segments anywhere and preserves directory markers', () => {
+  assert.deepEqual(parseOwnedPaths('foo/./bar\n'), ['foo/bar']);
+  assert.deepEqual(parseOwnedPaths('./foo/./bar/\n'), ['foo/bar/']);
+  assert.throws(() => parseOwnedPaths('foo/../bar\n'), /must stay inside app\//);
+});
+
+test('rejects Windows-invalid characters inside owned path segments', () => {
+  for (const ownedPath of [
+    'docs/name:bad',
+    'docs/name<bad',
+    'docs/name>bad',
+    'docs/name"bad',
+    'docs/name|bad',
+    'docs/name?bad',
+    'docs/name*bad',
+    'docs/name\u007fbad',
+  ]) {
+    assert.throws(
+      () => parseOwnedPaths(ownedPath),
+      /owned path|Windows|invalid/i,
+      `expected owned path ${JSON.stringify(ownedPath)} to be rejected`,
+    );
+  }
+  assert.deepEqual(parseOwnedPaths('foo/./bar'), ['foo/bar']);
 });
 
 test('normalizes owned paths and removes comments and blank lines', () => {
@@ -141,6 +189,12 @@ test('rejects source metadata with missing fields', () => {
   }
 });
 
+test('rejects non-object source metadata and unknown fields', () => {
+  assert.throws(() => validateSource(null), /object/i);
+  assert.throws(() => validateSource(['repository', 'branch', 'commit']), /object/i);
+  assert.throws(() => validateSource({ ...validSource, extra: true }), /unknown/i);
+});
+
 test('rejects malformed commit IDs', () => {
   for (const commit of [
     '',
@@ -169,6 +223,16 @@ test('loads and validates source metadata and ownership entries from a repositor
       source: validSource,
       ownedPaths: ['applications/tauri/'],
     });
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('reports a useful error when source metadata is missing', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ride-config-missing-'));
+  try {
+    fs.mkdirSync(path.join(root, '.upstream'));
+    assert.throws(() => loadSourceConfig(root), /source metadata/i);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
