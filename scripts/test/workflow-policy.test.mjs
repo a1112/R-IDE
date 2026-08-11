@@ -57,6 +57,17 @@ test('package matrix covers all supported desktop runners and Node 22', () => {
   assert.match(packageJob.text, /npm --workspace applications\/tauri run verify/);
 });
 
+test('package jobs download VS Code plugins before building the verified bundle', () => {
+  const workflow = readWorkflow();
+  const packageJob = jobBlocks(workflow).find(({ name }) => name === 'package');
+  assert.ok(packageJob, 'package job is required');
+  assert.match(packageJob.text, /app\/plugins/);
+  const downloadIndex = packageJob.text.indexOf('yarn download:plugins');
+  const buildIndex = packageJob.text.indexOf('run: yarn build:tauri');
+  assert.ok(downloadIndex >= 0, 'package job must download plugins');
+  assert.ok(buildIndex > downloadIndex, 'plugins must be available before the Tauri build');
+});
+
 test('quality and compatibility jobs run the required Node builds and Rust checks', () => {
   const workflow = readWorkflow();
   const jobs = Object.fromEntries(jobBlocks(workflow).map(({ name, text }) => [name, text]));

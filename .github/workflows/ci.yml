@@ -152,6 +152,7 @@ jobs:
             ~/.cache/yarn
             ~/.cargo/registry
             ~/.cargo/git
+            app/plugins
             app/applications/tauri/src-tauri/target
           key: package-${{ matrix.platform }}-${{ matrix.arch }}-${{ hashFiles('app/yarn.lock', 'app/applications/tauri/src-tauri/Cargo.lock') }}
           restore-keys: |
@@ -184,6 +185,11 @@ jobs:
         run: |
           corepack enable
           yarn --frozen-lockfile --network-timeout 100000
+      - name: Download VS Code plugins
+        working-directory: app
+        run: yarn download:plugins
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Build the unsigned Tauri application
         working-directory: app
         run: yarn build:tauri
