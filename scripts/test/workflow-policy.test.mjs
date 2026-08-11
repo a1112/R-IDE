@@ -141,6 +141,22 @@ test('Linux Tauri prerequisites avoid conflicting AppIndicator development packa
   assert.doesNotMatch(workflow, /(?:^|\n)\s*libappindicator3-dev\s*\\/m);
 });
 
+test('quality job installs Linux Tauri prerequisites before Rust checks', () => {
+  const workflow = readWorkflow();
+  const quality = jobBlocks(workflow).find(({ name }) => name === 'quality');
+  assert.ok(quality, 'quality job is required');
+  const prerequisiteIndex = quality.text.indexOf('- name: Install Linux Tauri prerequisites');
+  const rustIndex = quality.text.indexOf('- name: Install Rust stable toolchain');
+  assert.ok(prerequisiteIndex >= 0, 'quality job must install Linux Tauri prerequisites');
+  assert.ok(rustIndex > prerequisiteIndex, 'Linux prerequisites must be installed before Rust checks');
+  const prerequisites = quality.text.slice(prerequisiteIndex, rustIndex);
+  assert.match(prerequisites, /if:\s*runner\.os\s*==\s*['"]?Linux['"]?/);
+  assert.match(prerequisites, /libwebkit2gtk-4\.1-dev/);
+  assert.match(prerequisites, /libwebkit2gtk-4\.0-dev/);
+  assert.match(prerequisites, /libgtk-3-dev/);
+  assert.match(prerequisites, /libayatana-appindicator3-dev/);
+});
+
 test('product extension compiler supports the locked d3 type declarations', () => {
   const packageFile = path.join(repositoryRoot, 'app', 'theia-extensions', 'product', 'package.json');
   const packageJson = JSON.parse(fs.readFileSync(packageFile, 'utf8'));
