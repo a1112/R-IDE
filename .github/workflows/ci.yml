@@ -51,6 +51,14 @@ jobs:
       - name: Copy browser frontend for Tauri checks
         working-directory: app
         run: npm --workspace applications/tauri run copy:frontend
+      - name: Free JavaScript build space
+        working-directory: app
+        shell: bash
+        run: |
+          rm -rf node_modules
+          rm -rf "$HOME/.cache/yarn"
+          test -f applications/tauri/browser-frontend/index.html
+          test -f applications/tauri/tauri-frontend/index.html
       - name: Install Linux Tauri prerequisites
         if: runner.os == 'Linux'
         shell: bash

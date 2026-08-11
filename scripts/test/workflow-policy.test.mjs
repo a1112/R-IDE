@@ -169,6 +169,23 @@ test('quality job copies the browser frontend before Rust checks', () => {
   assert.ok(rustIndex > copyIndex, 'quality job must copy the browser frontend before Rust checks');
 });
 
+test('quality job frees JavaScript build space while preserving Tauri frontend resources', () => {
+  const workflow = readWorkflow();
+  const quality = jobBlocks(workflow).find(({ name }) => name === 'quality');
+  assert.ok(quality, 'quality job is required');
+  const copyIndex = quality.text.indexOf('npm --workspace applications/tauri run copy:frontend');
+  const cleanupIndex = quality.text.indexOf('- name: Free JavaScript build space');
+  const rustIndex = quality.text.indexOf('- name: Install Rust stable toolchain');
+  assert.ok(copyIndex >= 0, 'quality job must copy the browser frontend before cleanup');
+  assert.ok(cleanupIndex > copyIndex, 'quality job must clean JavaScript artifacts after the frontend copy');
+  assert.ok(rustIndex > cleanupIndex, 'quality job must clean JavaScript artifacts before Rust checks');
+  const cleanup = quality.text.slice(cleanupIndex, rustIndex);
+  assert.match(cleanup, /rm -rf node_modules/);
+  assert.match(cleanup, /rm -rf ["']?\$HOME\/\.cache\/yarn/);
+  assert.match(cleanup, /test -f applications\/tauri\/browser-frontend\/index\.html/);
+  assert.match(cleanup, /test -f applications\/tauri\/tauri-frontend\/index\.html/);
+});
+
 test('product extension compiler supports the locked d3 type declarations', () => {
   const packageFile = path.join(repositoryRoot, 'app', 'theia-extensions', 'product', 'package.json');
   const packageJson = JSON.parse(fs.readFileSync(packageFile, 'utf8'));
