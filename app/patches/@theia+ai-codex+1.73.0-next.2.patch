@@ -1,0 +1,112 @@
+diff --git a/node_modules/@theia/ai-codex/lib/node/codex-service-impl.d.ts b/node_modules/@theia/ai-codex/lib/node/codex-service-impl.d.ts
+index 1111111..2222222 100644
+--- a/node_modules/@theia/ai-codex/lib/node/codex-service-impl.d.ts
++++ b/node_modules/@theia/ai-codex/lib/node/codex-service-impl.d.ts
+@@ -8,5 +8,7 @@ export declare class CodexServiceImpl implements CodexService {
+     send(request: CodexBackendRequest, streamId: string): Promise<void>;
+     protected sendMessages(streamId: string, request: CodexBackendRequest): Promise<void>;
+     cancel(streamId: string): void;
+     protected cleanup(streamId: string): void;
++    protected createCodexOptions(): import("@openai/codex-sdk").CodexOptions;
++    protected resolveCodexPathOverride(): string | undefined;
+ }
+diff --git a/node_modules/@theia/ai-codex/lib/node/codex-service-impl.js b/node_modules/@theia/ai-codex/lib/node/codex-service-impl.js
+index 3333333..4444444 100644
+--- a/node_modules/@theia/ai-codex/lib/node/codex-service-impl.js
++++ b/node_modules/@theia/ai-codex/lib/node/codex-service-impl.js
+@@ -18,6 +18,7 @@ exports.CodexServiceImpl = void 0;
+ const tslib_1 = require("tslib");
+ const core_1 = require("@theia/core");
+ const inversify_1 = require("@theia/core/shared/inversify");
++const fs_1 = require("fs");
+ let CodexServiceImpl = class CodexServiceImpl {
+     constructor() {
+         this.sessionThreads = new Map();
+@@ -35,7 +36,7 @@ let CodexServiceImpl = class CodexServiceImpl {
+         try {
+             const dynamicImport = new Function('specifier', 'return import(specifier)');
+             const { Codex } = await dynamicImport('@openai/codex-sdk');
+-            const codex = new Codex();
++            const codex = new Codex(this.createCodexOptions());
+             const sessionId = request.sessionId || streamId;
+             let thread = this.sessionThreads.get(sessionId);
+             if (!thread) {
+@@ -78,6 +79,26 @@ let CodexServiceImpl = class CodexServiceImpl {
+     cleanup(streamId) {
+         this.abortControllers.delete(streamId);
+     }
++    createCodexOptions() {
++        const codexPathOverride = this.resolveCodexPathOverride();
++        return codexPathOverride ? { codexPathOverride } : {};
++    }
++    resolveCodexPathOverride() {
++        const configuredPath = process.env.RIDE_CODEX_PATH || process.env.CODEX_PATH;
++        if (configuredPath) {
++            if ((0, fs_1.existsSync)(configuredPath)) {
++                return configuredPath;
++            }
++            this.logger.warn(`Configured Codex path does not exist: ${configuredPath}`);
++        }
++        if (process.platform === 'darwin' && process.arch === 'arm64') {
++            const appBundlePath = '/Applications/Codex.app/Contents/Resources/codex';
++            if ((0, fs_1.existsSync)(appBundlePath)) {
++                return appBundlePath;
++            }
++        }
++        return undefined;
++    }
+ };
+ exports.CodexServiceImpl = CodexServiceImpl;
+ tslib_1.__decorate([
+diff --git a/node_modules/@theia/ai-codex/src/node/codex-service-impl.ts b/node_modules/@theia/ai-codex/src/node/codex-service-impl.ts
+index 5555555..6666666 100644
+--- a/node_modules/@theia/ai-codex/src/node/codex-service-impl.ts
++++ b/node_modules/@theia/ai-codex/src/node/codex-service-impl.ts
+@@ -14,7 +14,8 @@
+ 
+ import { ILogger } from '@theia/core';
+ import { inject, injectable, named } from '@theia/core/shared/inversify';
+-import type { Thread } from '@openai/codex-sdk';
++import { existsSync } from 'fs';
++import type { CodexOptions, Thread } from '@openai/codex-sdk';
+ import {
+     CodexBackendRequest,
+     CodexClient,
+@@ -41,7 +42,7 @@ export class CodexServiceImpl implements CodexService {
+         try {
+             const dynamicImport = new Function('specifier', 'return import(specifier)') as (specifier: string) => Promise<typeof import('@openai/codex-sdk')>;
+             const { Codex } = await dynamicImport('@openai/codex-sdk');
+-            const codex = new Codex();
++            const codex = new Codex(this.createCodexOptions());
+ 
+             const sessionId = request.sessionId || streamId;
+             let thread = this.sessionThreads.get(sessionId);
+@@ -89,4 +90,28 @@ export class CodexServiceImpl implements CodexService {
+     protected cleanup(streamId: string): void {
+         this.abortControllers.delete(streamId);
+     }
++
++    protected createCodexOptions(): CodexOptions {
++        const codexPathOverride = this.resolveCodexPathOverride();
++        return codexPathOverride ? { codexPathOverride } : {};
++    }
++
++    protected resolveCodexPathOverride(): string | undefined {
++        const configuredPath = process.env.RIDE_CODEX_PATH || process.env.CODEX_PATH;
++        if (configuredPath) {
++            if (existsSync(configuredPath)) {
++                return configuredPath;
++            }
++            this.logger.warn(`Configured Codex path does not exist: ${configuredPath}`);
++        }
++
++        if (process.platform === 'darwin' && process.arch === 'arm64') {
++            const appBundlePath = '/Applications/Codex.app/Contents/Resources/codex';
++            if (existsSync(appBundlePath)) {
++                return appBundlePath;
++            }
++        }
++
++        return undefined;
++    }
+ }

@@ -74,6 +74,7 @@
   "theiaPluginsDir": "plugins",
   "theiaPlugins": {
     "vscode-builtin-extensions": "https://github.com/eclipse-theia/vscode-builtin-extensions/releases/download/1.108.2/vscode-builtin-extensions-1.108.2.tar.gz",
+    "MS-CEINTL.vscode-language-pack-zh-hans": "https://open-vsx.org/api/MS-CEINTL/vscode-language-pack-zh-hans/1.108.0/file/MS-CEINTL.vscode-language-pack-zh-hans-1.108.0.vsix",
     "vscjava.vscode-java-pack": "https://open-vsx.org/api/vscjava/vscode-java-pack/0.30.5/file/vscjava.vscode-java-pack-0.30.5.vsix",
     "vscjava.vscode-java-dependency": "https://open-vsx.org/api/vscjava/vscode-java-dependency/0.27.0/file/vscjava.vscode-java-dependency-0.27.0.vsix"
   },
@@ -87,9 +88,12 @@
     "theia-extensions/*"
   ],
   "resolutions": {
+    "**/@electron/node-gyp": "10.2.0-electron.1",
     "@types/puppeteer": "^5.4.7",
     "@yarnpkg/parsers": "3.0.0-rc.44",
-    "**/multer": "1.4.4-lts.1",
+    "**/dompurify": "3.4.11",
+    "**/jsondiffpatch": "0.7.2",
+    "**/multer": "2.2.0",
     "**/nan": "2.25.0",
     "**/cpu-features": "0.0.9",
     "**/perfect-scrollbar": "1.5.5",

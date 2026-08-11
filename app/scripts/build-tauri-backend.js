@@ -27,7 +27,11 @@ function createBuildPlan(platform = process.platform) {
       command: yarn,
       args: ['theia', 'build', '--app-target=browser'],
       cwd: browserDirectory,
-      env: { ...inheritedEnvironment, RIDE_TAURI_LEAN: '1' },
+      env: {
+        ...inheritedEnvironment,
+        RIDE_TAURI_ENABLE_PLUGINS: '1',
+        RIDE_TAURI_LEAN: '1',
+      },
       shell: false,
     },
   ];

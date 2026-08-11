@@ -78,11 +78,13 @@ console.log('3. Checking Tauri project structure...');
 
 const requiredFiles = [
   'src-tauri/Cargo.toml',
+  'src-tauri/Cargo.lock',
   'src-tauri/tauri.conf.json',
   'src-tauri/src/main.rs',
   'src-tauri/src/lib.rs',
   'src-tauri/src/sidecar.rs',
   'src-tauri/src/commands.rs',
+  'src-tauri/src/download.rs',
   'copy-frontend.js',
   'copy-backend.js',
   'copy-plugins.js',
@@ -154,6 +156,16 @@ if (fs.existsSync(pluginsDir)) {
 } else {
   logWarning('Plugins directory not found. Run from app/: yarn download:plugins');
 }
+
+const bundledLanguagePack = path.join(
+  __dirname,
+  'resources/plugins/MS-CEINTL.vscode-language-pack-zh-hans/extension/package.json'
+);
+if (fs.existsSync(bundledLanguagePack)) {
+  logSuccess('Simplified Chinese language pack is included in the desktop plugin profile');
+} else {
+  logError('Simplified Chinese language pack is missing from the desktop plugin profile');
+}
 console.log();
 
 // 7. 检查 Cargo 配置
@@ -169,6 +181,17 @@ if (fs.existsSync(cargoPath)) {
     } else {
       logError(`Missing Cargo dependency: ${dep}`);
     }
+  }
+
+  try {
+    execSync('cargo fmt --all -- --check', {
+      cwd: path.join(__dirname, 'src-tauri'),
+      encoding: 'utf8',
+      stdio: 'pipe',
+    });
+    logSuccess('Rust formatting is clean');
+  } catch (e) {
+    logError('Rust formatting check failed. Run cargo fmt --all from src-tauri/.');
   }
 }
 console.log();
@@ -198,6 +221,60 @@ if (fs.existsSync(tauriConfigPath)) {
       logSuccess(`Frontend dist: ${tauriConfig.build.frontendDist}`);
     }
 
+    const bundledResources = tauriConfig.bundle?.resources ?? {};
+    if (bundledResources['../../../package.json'] === 'package.json') {
+      logSuccess('Theia runtime package manifest is bundled at Resources/package.json');
+    } else {
+      logError('The root package manifest must be bundled as Resources/package.json');
+    }
+
+    if (tauriConfig.app?.withGlobalTauri === false) {
+      logSuccess('Global Tauri JavaScript API is disabled');
+    } else {
+      logError('app.withGlobalTauri must remain false');
+    }
+
+    const security = tauriConfig.app?.security ?? {};
+    if (typeof security.csp === 'string' && security.csp.includes("default-src 'self'")) {
+      logSuccess('Bootstrap content security policy is configured');
+    } else {
+      logError('A restrictive bootstrap content security policy is required');
+    }
+
+    if (security.assetProtocol?.enable === true) {
+      logError('Global asset protocol access must remain disabled');
+    } else {
+      logSuccess('Global asset protocol access is disabled');
+    }
+
+    if (tauriConfig.build?.devUrl) {
+      logError('build.devUrl reintroduces the Tauri/backend circular startup dependency');
+    } else {
+      logSuccess('Tauri development starts from the local bootstrap');
+    }
+
+    const capabilityPath = path.join(__dirname, 'src-tauri/capabilities/default.json');
+    const capability = JSON.parse(fs.readFileSync(capabilityPath, 'utf8'));
+    const remoteUrls = capability.remote?.urls ?? [];
+    if (remoteUrls.length === 1 && remoteUrls[0] === 'http://127.0.0.1:3000') {
+      logSuccess('Remote capability is restricted to the local backend');
+    } else {
+      logError('Remote capability must only allow http://127.0.0.1:3000');
+    }
+
+    const forbiddenPermissions = ['fs:', 'shell:', 'process:', 'dialog:', 'core:window:', 'core:menu:'];
+    const permissions = capability.permissions ?? [];
+    const broadPermissions = permissions.filter(permission =>
+      forbiddenPermissions.some(prefix => permission.startsWith(prefix))
+    );
+    if (broadPermissions.length === 0) {
+      logSuccess('No broad filesystem, process, shell, dialog, window, or menu permissions');
+    } else {
+      for (const permission of broadPermissions) {
+        logError(`Forbidden broad capability: ${permission}`);
+      }
+    }
+
     const workspaceTauriBin = path.join(__dirname, '../../node_modules/.bin/tauri');
     if (commandExists('tauri')) {
       logSuccess('Tauri CLI available on PATH');
@@ -214,7 +291,7 @@ if (fs.existsSync(tauriConfigPath)) {
 }
 console.log();
 
-// 8. 总结
+// 9. 总结
 console.log('====================================');
 console.log('Summary');
 console.log('====================================');

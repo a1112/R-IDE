@@ -274,27 +274,26 @@ fn is_plugin_dir_ready(location: &Path) -> bool {
     })
 }
 
-/// 初始化插件目录。
-///
-/// 性能说明：启动时不再把打包插件复制到用户目录。大插件目录会显著拖慢冷启动；
-/// 运行时直接使用打包资源目录，只有不存在打包目录时才创建用户插件目录作为回退。
+/// Initialize the user plugin directory while keeping bundled plugins in place.
 pub fn initialize_plugins() -> Result<(), String> {
-    for bundled_plugins in resource_dir_candidates()
-        .into_iter()
-        .map(|resources_dir| resources_dir.join("plugins"))
-    {
-        if is_plugin_dir_ready(&bundled_plugins) {
-            log::info!("Using bundled plugins in place: {:?}", bundled_plugins);
-            return Ok(());
-        }
-    }
-
     let user_plugins = home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".ride")
         .join("plugins");
     fs::create_dir_all(&user_plugins)
         .map_err(|e| format!("Failed to create plugins directory: {}", e))?;
+    log::info!("User plugins directory: {:?}", user_plugins);
+
+    for bundled_plugins in resource_dir_candidates()
+        .into_iter()
+        .map(|resources_dir| resources_dir.join("plugins"))
+    {
+        if is_plugin_dir_ready(&bundled_plugins) {
+            log::info!("Using bundled plugins in place: {:?}", bundled_plugins);
+            break;
+        }
+    }
+
     Ok(())
 }
 
@@ -312,6 +311,76 @@ fn get_config_dir() -> PathBuf {
     });
 
     config_dir
+}
+
+fn is_frontend_dir_ready(location: &Path) -> bool {
+    location.join("index.html").is_file()
+}
+
+fn get_frontend_dir() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("RIDE_FRONTEND_DIR") {
+        let frontend_dir = PathBuf::from(path);
+        if is_frontend_dir_ready(&frontend_dir) {
+            return Some(frontend_dir);
+        }
+    }
+
+    let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let exe_dir = current_exe_dir();
+    let mut candidates = Vec::new();
+
+    for resources_dir in resource_dir_candidates() {
+        if let Some(resource_parent) = resources_dir.parent() {
+            candidates.push(resource_parent.join("browser-frontend"));
+            candidates.push(resource_parent.join("lib").join("frontend"));
+        }
+    }
+
+    for base in [&current_dir, &exe_dir] {
+        for ancestor in base.ancestors().take(10) {
+            candidates.push(
+                ancestor
+                    .join("applications")
+                    .join("tauri")
+                    .join("browser-frontend"),
+            );
+            candidates.push(
+                ancestor
+                    .join("applications")
+                    .join("browser")
+                    .join("lib")
+                    .join("frontend"),
+            );
+        }
+    }
+
+    candidates.extend([
+        current_dir.join("../browser/lib/frontend"),
+        current_dir.join("../../browser/lib/frontend"),
+        current_dir
+            .join("applications")
+            .join("tauri")
+            .join("browser-frontend"),
+        current_dir
+            .join("applications")
+            .join("browser")
+            .join("lib")
+            .join("frontend"),
+        current_dir.join("browser-frontend"),
+        current_dir.join("lib").join("frontend"),
+    ]);
+
+    for location in candidates {
+        if is_frontend_dir_ready(&location) {
+            log::info!("Using frontend directory: {:?}", location);
+            return Some(location);
+        }
+    }
+
+    log::warn!(
+        "Copied frontend directory was not found; backend static root will use its default path"
+    );
+    None
 }
 
 fn set_backend_port(app_handle: &AppHandle, port: u16) {
@@ -337,19 +406,59 @@ fn navigate_main_window_to_backend(app_handle: &AppHandle, port: u16) {
         return;
     };
 
-    let url = match Url::parse(&format!("http://127.0.0.1:{}/", port)) {
+    let mut url = match Url::parse(&format!("http://127.0.0.1:{}/", port)) {
         Ok(url) => url,
         Err(e) => {
             log::warn!("Failed to build backend frontend URL: {}", e);
             return;
         }
     };
-
-    if let Err(e) = window.navigate(url.clone()) {
-        log::warn!("Failed to navigate main window to {}: {}", url, e);
-    } else {
-        log::info!("Navigated main window to {}", url);
+    if let Some(locale) = system_locale() {
+        url.query_pairs_mut().append_pair("ride_locale", &locale);
     }
+
+    let target = url.clone();
+    if let Err(e) = app_handle.run_on_main_thread(move || {
+        if let Err(e) = window.navigate(target.clone()) {
+            log::warn!("Failed to navigate main window to {}: {}", target, e);
+        } else {
+            log::info!("Navigated main window to {}", target);
+        }
+    }) {
+        log::warn!("Failed to schedule backend navigation to {}: {}", url, e);
+    }
+}
+
+fn system_locale() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(output) = StdCommand::new("defaults")
+            .args(["read", "-g", "AppleLanguages"])
+            .output()
+        {
+            let output = String::from_utf8_lossy(&output.stdout);
+            if let Some(locale) = output
+                .lines()
+                .find_map(|line| line.split('"').nth(1))
+                .map(str::trim)
+                .filter(|locale| !locale.is_empty())
+            {
+                return Some(locale.to_string());
+            }
+        }
+    }
+
+    ["LC_ALL", "LC_MESSAGES", "LANG"]
+        .into_iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .map(|locale| {
+            locale
+                .split('.')
+                .next()
+                .unwrap_or(&locale)
+                .replace('_', "-")
+        })
+        .find(|locale| !locale.is_empty() && locale != "C" && locale != "POSIX")
 }
 
 fn clear_backend_state(app_handle: &AppHandle) {
@@ -410,45 +519,6 @@ fn backend_child_path() -> String {
     paths
 }
 
-fn node_pty_platform_tag() -> Option<&'static str> {
-    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        Some("darwin-arm64")
-    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
-        Some("darwin-x64")
-    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
-        Some("linux-arm64")
-    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        Some("linux-x64")
-    } else if cfg!(all(target_os = "windows", target_arch = "aarch64")) {
-        Some("win32-arm64")
-    } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
-        Some("win32-x64")
-    } else {
-        None
-    }
-}
-
-fn node_pty_prebuild_dir() -> Option<PathBuf> {
-    let tag = node_pty_platform_tag()?;
-    let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let exe_dir = current_exe_dir();
-
-    for base in [&current_dir, &exe_dir] {
-        for ancestor in base.ancestors().take(10) {
-            let candidate = ancestor
-                .join("node_modules")
-                .join("node-pty")
-                .join("prebuilds")
-                .join(tag);
-            if candidate.join("pty.node").is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-
-    None
-}
-
 async fn start_node_backend_process(
     app_handle: &AppHandle,
     config: &BackendConfig,
@@ -468,6 +538,11 @@ async fn start_node_backend_process(
     let mut command = CommandBuilder::new(&config.node_exe);
     command.arg(&config.script_path);
     command.arg("--log-level=info");
+    command.arg("--port=3000");
+    command.arg("--hostname=127.0.0.1");
+    if is_plugin_dir_ready(&plugins_dir) {
+        command.arg(format!("--plugins=local-dir:{}", plugins_dir.display()));
+    }
     if let Some(backend_dir) = config.script_path.parent() {
         command.cwd(backend_dir);
     }
@@ -478,6 +553,12 @@ async fn start_node_backend_process(
         command.env("NODE_OPTIONS", node_options);
     }
     command.env("PATH", backend_child_path());
+    if let Some(frontend_dir) = get_frontend_dir() {
+        command.env(
+            "RIDE_FRONTEND_DIR",
+            frontend_dir.to_string_lossy().to_string(),
+        );
+    }
     if let Ok(user) = std::env::var("USER") {
         command.env("LOGNAME", std::env::var("LOGNAME").unwrap_or(user));
     }
@@ -486,17 +567,6 @@ async fn start_node_backend_process(
         std::env::var("TERM").unwrap_or_else(|_| "dumb".to_string()),
     );
     command.env("NODE_ENV", "production");
-    command.env("RIDE_DISABLE_NODE_PTY_NATIVE", "1");
-    if let Some(pty_dir) = node_pty_prebuild_dir() {
-        command.env(
-            "RIDE_NODE_PTY_PREBUILD_DIR",
-            pty_dir.to_string_lossy().to_string(),
-        );
-    }
-    command.env(
-        "THEIA_PLUGINS_DIR",
-        plugins_dir.to_string_lossy().to_string(),
-    );
     command.env("THEIA_CONFIG_DIR", config_dir.to_string_lossy().to_string());
 
     let mut child = pair
@@ -623,15 +693,20 @@ pub async fn start_backend_process(app_handle: &AppHandle) -> Result<(), String>
 
     // 设置命令
     let mut cmd = Command::new(&config.script_path);
+    cmd.arg("--port=3000").arg("--hostname=127.0.0.1");
+    if is_plugin_dir_ready(&plugins_dir) {
+        cmd.arg(format!("--plugins=local-dir:{}", plugins_dir.display()));
+    }
 
     cmd.env("NODE_ENV", "production");
+    if let Some(frontend_dir) = get_frontend_dir() {
+        cmd.env(
+            "RIDE_FRONTEND_DIR",
+            frontend_dir.to_string_lossy().to_string(),
+        );
+    }
 
-    // 设置插件路径
-    cmd.env(
-        "THEIA_PLUGINS_DIR",
-        plugins_dir.to_string_lossy().to_string(),
-    )
-    .env("THEIA_CONFIG_DIR", config_dir.to_string_lossy().to_string());
+    cmd.env("THEIA_CONFIG_DIR", config_dir.to_string_lossy().to_string());
 
     // Theia 后端会尝试查找并启动在可用端口上
     // 我们需要捕获它的输出来获取实际使用的端口

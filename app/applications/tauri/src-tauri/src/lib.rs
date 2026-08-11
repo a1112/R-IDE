@@ -11,10 +11,31 @@
 
 pub mod commands;
 pub mod download;
+pub mod native_chrome;
 pub mod sidecar;
 
 use std::sync::Mutex;
 use tauri::Manager;
+
+fn configure_local_proxy_bypass() {
+    for name in ["NO_PROXY", "no_proxy"] {
+        let mut entries = std::env::var(name)
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+
+        for local in ["127.0.0.1", "localhost", "::1"] {
+            if !entries.iter().any(|entry| entry == local) {
+                entries.push(local.to_string());
+            }
+        }
+
+        std::env::set_var(name, entries.join(","));
+    }
+}
 
 // 全局状态：存储 Node.js 后端的端口号
 pub struct AppState {
@@ -52,13 +73,10 @@ fn install_shutdown_signal_handlers(_app_handle: tauri::AppHandle) {}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    configure_local_proxy_bypass();
     let _ = env_logger::try_init();
 
     let app = tauri::Builder::default()
-        .plugin(tauri_plugin_shell::init())
-        .plugin(tauri_plugin_fs::init())
-        .plugin(tauri_plugin_process::init())
-        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             // 单实例：聚焦已存在的窗口
             let window = app.get_webview_window("main").unwrap();
@@ -74,6 +92,11 @@ pub fn run() {
                 backend_stopping: Mutex::new(false),
                 downloads: download::DownloadManager::new(),
             });
+
+            if let Some(window) = app.get_webview_window("main") {
+                native_chrome::configure_native_window(&window);
+            }
+            native_chrome::install_menu_event_bridge(app.handle());
 
             // 初始化插件目录
             if let Err(e) = sidecar::initialize_plugins() {
@@ -97,6 +120,10 @@ pub fn run() {
             commands::download_list,
             commands::download_plugin,
             commands::download_configured_plugins,
+            native_chrome::ride_show_main_menu,
+            native_chrome::ride_start_window_drag,
+            native_chrome::ride_window_control,
+            native_chrome::ride_frontend_ready,
             commands::open_directory,
             commands::save_file,
             commands::show_in_folder,

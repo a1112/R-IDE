@@ -77,67 +77,67 @@ filesToCopy.forEach(file => {
   }
 });
 
-// 创建修改后的 index.html
+// Create the desktop-served frontend with an early locale bootstrap and CSP.
 const htmlSource = path.join(sourceDir, 'index.html');
 const htmlTarget = path.join(targetDir, 'index.html');
 
 if (fs.existsSync(htmlSource)) {
   let html = fs.readFileSync(htmlSource, 'utf-8');
+  const csp = [
+    "default-src 'self'",
+    "script-src 'self' 'unsafe-eval'",
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data: blob: https:",
+    "font-src 'self' data:",
+    "connect-src 'self' http: https: ws: wss:",
+    "worker-src 'self' blob:",
+    "frame-src 'self' http: https:",
+    "object-src 'none'",
+    "base-uri 'self'",
+    "frame-ancestors 'none'",
+  ].join('; ');
+  const cspMeta = `  <meta http-equiv="Content-Security-Policy" content="${csp}">\n`;
+  const localeScript = '    <script type="text/javascript" src="./ride-bootstrap.js" charset="utf-8"></script>\n';
 
-  // 注入 Tauri 配置脚本
-  const tauriScript = `
-  <script>
-    // R-IDE Tauri 前端配置
-    window.RIDE_TAURI = true;
-    window.RIDE_DISABLE_DEFAULT_TERMINAL = true;
-    window.RIDE_BACKEND_PORT = null; // 将由 Tauri 设置
-
-    // 监听来自 Tauri 的后端就绪事件
-    window.addEventListener('DOMContentLoaded', () => {
-      // 如果在 Tauri 环境中，请求后端端口
-      if (window.__TAURI__) {
-        window.__TAURI__.core.invoke('get_backend_port')
-          .then(port => {
-            if (port) {
-              window.RIDE_BACKEND_PORT = port;
-              console.log('[R-IDE] Backend port:', port);
-              // 这里可以配置 API 基础路径
-              // 例如：window.API_BASE = \`http://localhost:\${port}\`;
-            }
-          })
-          .catch(err => console.error('[R-IDE] Failed to get backend port:', err));
-      }
-    });
-
-    // 监听后端日志事件（用于调试）
-    if (window.__TAURI__) {
-      window.__TAURI__.event.listen('backend-log', (event) => {
-        console.log('[Backend]', event.payload);
-      });
-
-      window.__TAURI__.event.listen('backend-error', (event) => {
-        console.error('[Backend Error]', event.payload);
-      });
-
-      window.__TAURI__.event.listen('backend-ready', (event) => {
-        console.log('[Backend Ready on port]', event.payload);
-        window.RIDE_BACKEND_PORT = event.payload;
-        // 可以在这里重新加载或通知应用
-        window.dispatchEvent(new CustomEvent('backend-ready', {
-          detail: { port: event.payload }
-        }));
-      });
-    }
-  </script>
-  </head>`;
-
-  html = html.replace('</head>', tauriScript);
+  // The preload template contains a redundant inline favicon script. Removing it
+  // lets the desktop frontend enforce script-src without unsafe-inline.
+  html = html.replace(
+    /\s*<script>\s*if \(document\.head\)[\s\S]*?<\/script>/,
+    ''
+  );
+  html = html.replace('</head>', `${cspMeta}</head>`);
+  html = html.replace(
+    '    <script type="text/javascript" src="./bundle.js" charset="utf-8"></script>',
+    `${localeScript}    <script type="text/javascript" src="./bundle.js" charset="utf-8"></script>`
+  );
 
   fs.writeFileSync(htmlTarget, html);
-  console.log('✓ Modified index.html for Tauri');
+  console.log('✓ Added desktop CSP and locale bootstrap');
 } else {
   console.warn('✗ Source index.html not found');
 }
+
+const frontendBootstrap = `(() => {
+  'use strict';
+
+  if (window.localStorage.getItem('localeId')) {
+    return;
+  }
+
+  const requestedLocale = new URLSearchParams(window.location.search).get('ride_locale');
+  const languages = [
+    requestedLocale,
+    ...(Array.isArray(window.navigator.languages) ? window.navigator.languages : []),
+    window.navigator.language
+  ];
+  const language = languages.find(candidate => typeof candidate === 'string' && /^(zh|en)([-_]|$)/i.test(candidate));
+  if (language) {
+    window.localStorage.setItem('localeId', /^zh/i.test(language) ? 'zh-cn' : 'en');
+  }
+})();
+`;
+
+fs.writeFileSync(path.join(targetDir, 'ride-bootstrap.js'), frontendBootstrap);
 
 const bootstrapHtml = `<!DOCTYPE html>
 <html lang="en">
@@ -151,7 +151,7 @@ const bootstrapHtml = `<!DOCTYPE html>
       width: 100%;
       height: 100%;
       margin: 0;
-      background: #fff;
+      background: transparent;
       overflow: hidden;
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
@@ -161,7 +161,15 @@ const bootstrapHtml = `<!DOCTYPE html>
       inset: 0;
       display: grid;
       place-items: center;
-      background: #fff;
+      border-radius: 10px;
+      background:
+        radial-gradient(circle at 22% 0%, rgba(255, 255, 255, 0.16), transparent 34%),
+        linear-gradient(180deg, rgba(34, 37, 42, 0.58), rgba(16, 18, 21, 0.72));
+      box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, 0.16),
+        inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+      backdrop-filter: blur(30px) saturate(1.22);
+      -webkit-backdrop-filter: blur(30px) saturate(1.22);
     }
 
     .ride-bootstrap svg {
@@ -169,7 +177,9 @@ const bootstrapHtml = `<!DOCTYPE html>
       min-width: 150px;
       height: auto;
       animation: ride-pulse 1.8s ease-in-out infinite;
-      filter: invert(49%) sepia(71%) saturate(5980%) hue-rotate(199deg) brightness(103%) contrast(101%);
+      filter:
+        drop-shadow(0 22px 42px rgba(0, 0, 0, 0.24))
+        invert(49%) sepia(71%) saturate(5980%) hue-rotate(199deg) brightness(103%) contrast(101%);
     }
 
     @keyframes ride-pulse {
@@ -191,65 +201,40 @@ const bootstrapHtml = `<!DOCTYPE html>
       </g>
     </svg>
   </main>
-  <script>
-    window.RIDE_TAURI = true;
-
-    const DEFAULT_BACKEND_PORT = 3000;
-    const PORT_POLL_INTERVAL_MS = 750;
-    const FALLBACK_REDIRECT_MS = 120000;
-    let redirected = false;
-    let portPollTimer = null;
-    let fallbackTimer = null;
-
-    function redirectToBackend(port) {
-      if (redirected) {
-        return;
-      }
-      redirected = true;
-      if (portPollTimer) {
-        window.clearInterval(portPollTimer);
-      }
-      if (fallbackTimer) {
-        window.clearTimeout(fallbackTimer);
-      }
-      const backendPort = port || DEFAULT_BACKEND_PORT;
-      window.location.replace('http://127.0.0.1:' + backendPort + '/');
-    }
-
-    async function queryBackendPort(tauri) {
-      if (!tauri || !tauri.core || !tauri.core.invoke) {
-        return null;
-      }
-      return tauri.core.invoke('get_backend_port').catch(() => null);
-    }
-
-    async function pollBackendPort(tauri) {
-      const port = await queryBackendPort(tauri);
-      if (port) {
-        redirectToBackend(port);
-      }
-    }
-
-    async function init() {
-      const tauri = window.__TAURI__;
-      if (tauri && tauri.event && tauri.event.listen) {
-        await tauri.event.listen('backend-ready', event => redirectToBackend(event.payload));
-      }
-
-      await pollBackendPort(tauri);
-      portPollTimer = window.setInterval(() => pollBackendPort(tauri), PORT_POLL_INTERVAL_MS);
-      fallbackTimer = window.setTimeout(() => redirectToBackend(DEFAULT_BACKEND_PORT), FALLBACK_REDIRECT_MS);
-    }
-
-    window.addEventListener('DOMContentLoaded', () => {
-      init().catch(error => console.error('[R-IDE] Bootstrap failed:', error));
-    });
-
-  </script>
+  <script src="./bootstrap.js"></script>
 </body>
 </html>`;
 
 fs.writeFileSync(path.join(tauriFrontendDir, 'index.html'), bootstrapHtml);
+const tauriBootstrapScript = `(() => {
+  'use strict';
+
+  const target = new URL('http://127.0.0.1:3000/');
+  const languages = Array.isArray(window.navigator.languages)
+    ? window.navigator.languages
+    : [window.navigator.language];
+  const language = languages.find(candidate => typeof candidate === 'string' && candidate.length > 0);
+  if (language) {
+    target.searchParams.set('ride_locale', language);
+  }
+
+  const openBackend = async () => {
+    try {
+      await fetch(target.origin, {
+        cache: 'no-store',
+        mode: 'no-cors'
+      });
+      window.location.replace(target.href);
+    } catch {
+      window.setTimeout(openBackend, 250);
+    }
+  };
+
+  window.setTimeout(openBackend, 100);
+})();
+`;
+
+fs.writeFileSync(path.join(tauriFrontendDir, 'bootstrap.js'), tauriBootstrapScript);
 console.log('✓ Created Tauri bootstrap frontend');
 
 console.log('Frontend resources copied successfully!');

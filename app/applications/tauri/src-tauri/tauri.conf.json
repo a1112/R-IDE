@@ -4,13 +4,12 @@
   "version": "1.72.100",
   "identifier": "com.ride.ide",
   "build": {
-    "beforeDevCommand": "",
     "beforeBuildCommand": "",
-    "devUrl": "http://localhost:3000",
     "frontendDist": "../tauri-frontend"
   },
   "app": {
     "withGlobalTauri": false,
+    "macOSPrivateApi": true,
     "windows": [
       {
         "label": "main",
@@ -23,15 +22,19 @@
         "fullscreen": false,
         "center": true,
         "decorations": true,
-        "transparent": false
+        "titleBarStyle": "Overlay",
+        "trafficLightPosition": {
+          "x": 18,
+          "y": 12
+        },
+        "hiddenTitle": true,
+        "transparent": true,
+        "shadow": true,
+        "backgroundColor": "#00000000"
       }
     ],
     "security": {
-      "csp": null,
-      "assetProtocol": {
-        "enable": true,
-        "scope": ["**"]
-      }
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self' http://127.0.0.1:3000; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
     }
   },
   "bundle": {
@@ -70,7 +73,7 @@
     },
     "resources": {
       "../browser-frontend": "lib/frontend",
-      "../package.json": "package.json",
+      "../../../package.json": "package.json",
       "../resources/backend": "resources/backend",
       "../resources/plugins": "resources/plugins"
     }

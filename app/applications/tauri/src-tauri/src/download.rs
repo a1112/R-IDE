@@ -10,7 +10,7 @@
 use std::{
     collections::HashMap,
     fs::{self, File as StdFile},
-    io,
+    io::{self, Read},
     path::{Component, Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -23,8 +23,17 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::{fs as tokio_fs, io::AsyncWriteExt};
+use tokio::{fs as tokio_fs, io::AsyncWriteExt, sync::Semaphore};
 use uuid::Uuid;
+
+const DEFAULT_MAX_DOWNLOAD_BYTES: u64 = 1024 * 1024 * 1024;
+const DEFAULT_MAX_PLUGIN_DOWNLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_ARCHIVE_ENTRIES: usize = 100_000;
+const MAX_EXTRACTED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const MAX_REDIRECTS: usize = 5;
+const MAX_CONCURRENT_DOWNLOADS: usize = 3;
+const CONNECT_TIMEOUT_SECONDS: u64 = 30;
+const REQUEST_TIMEOUT_SECONDS: u64 = 30 * 60;
 
 const STATUS_QUEUED: &str = "queued";
 const STATUS_RUNNING: &str = "running";
@@ -36,6 +45,7 @@ const STATUS_CANCELED: &str = "canceled";
 #[derive(Clone)]
 pub struct DownloadManager {
     records: Arc<Mutex<HashMap<String, DownloadRecord>>>,
+    concurrency: Arc<Semaphore>,
 }
 
 struct DownloadRecord {
@@ -130,6 +140,7 @@ impl DownloadManager {
     pub fn new() -> Self {
         Self {
             records: Arc::new(Mutex::new(HashMap::new())),
+            concurrency: Arc::new(Semaphore::new(MAX_CONCURRENT_DOWNLOADS)),
         }
     }
 
@@ -159,7 +170,12 @@ impl DownloadManager {
         }
 
         record.cancel.store(true, Ordering::SeqCst);
-        record.task.status = STATUS_CANCELING.to_string();
+        record.task.status = if record.task.status == STATUS_QUEUED {
+            STATUS_CANCELED.to_string()
+        } else {
+            STATUS_CANCELING.to_string()
+        };
+        record.task.error = Some("Download cancelled".to_string());
         true
     }
 
@@ -169,8 +185,9 @@ impl DownloadManager {
         request: DownloadStartRequest,
     ) -> Result<DownloadTask, String> {
         let parsed_url = parse_http_url(&request.url)?;
+        validate_initial_url_policy(&parsed_url)?;
         let target_path = resolve_download_target(&parsed_url, &request)?;
-        let (task, cancel) = self.insert_task(&request, target_path.clone());
+        let (task, cancel) = self.insert_task(&request, target_path.clone())?;
         let manager = self.clone();
         let task_id = task.id.clone();
         let request_url = request.url.clone();
@@ -186,7 +203,7 @@ impl DownloadManager {
                 )
                 .await
             {
-                manager.fail_task(Some(&app), &task_id, error);
+                manager.fail_task_unless_canceled(Some(&app), &task_id, error);
             }
         });
 
@@ -200,6 +217,7 @@ impl DownloadManager {
     ) -> Result<PluginDownloadResult, String> {
         let (plugin_key, url) = self.resolve_plugin_request(&app, request)?;
         let parsed_url = parse_http_url(&url)?;
+        validate_initial_url_policy(&parsed_url)?;
         let extension = archive_extension_from_url(&parsed_url)
             .ok_or_else(|| "Plugin URL must end with .vsix or .tar.gz".to_string())?;
         let filename = format!("{}.{}", sanitize_path_segment(&plugin_key)?, extension);
@@ -211,7 +229,7 @@ impl DownloadManager {
             kind: Some("plugin".to_string()),
         };
         let target_path = resolve_download_target(&parsed_url, &download_request)?;
-        let (task, cancel) = self.insert_task(&download_request, target_path.clone());
+        let (task, cancel) = self.insert_task(&download_request, target_path.clone())?;
         let completed = match self
             .run_download(
                 Some(app.clone()),
@@ -224,7 +242,7 @@ impl DownloadManager {
         {
             Ok(completed) => completed,
             Err(error) => {
-                self.fail_task(Some(&app), &task.id, error.clone());
+                self.fail_task_unless_canceled(Some(&app), &task.id, error.clone());
                 return Err(error);
             }
         };
@@ -232,7 +250,7 @@ impl DownloadManager {
         let installed_plugins = install_plugin_archive(&completed.target_path, Some(&plugin_key))
             .map_err(|error| {
             let message = format!("Failed to install plugin archive: {}", error);
-            self.fail_task(Some(&app), &completed.id, message.clone());
+            self.fail_task_unless_canceled(Some(&app), &completed.id, message.clone());
             message
         })?;
 
@@ -289,10 +307,26 @@ impl DownloadManager {
         app: &AppHandle,
         request: PluginDownloadRequest,
     ) -> Result<(String, String), String> {
+        let configured_plugins = read_configured_plugins(app)?;
+        let allow_untrusted = allow_untrusted_plugin_downloads();
+
         match (request.id, request.url) {
-            (Some(id), Some(url)) => Ok((id, url)),
+            (Some(id), Some(url)) => {
+                let id = sanitize_path_segment(&id)?;
+                if !allow_untrusted
+                    && configured_plugins
+                        .get(&id)
+                        .map(|configured_url| configured_url != &url)
+                        .unwrap_or(true)
+                {
+                    return Err(format!(
+                        "Plugin URL is not allowlisted for {id}; use a configured plugin id"
+                    ));
+                }
+                Ok((id, url))
+            }
             (Some(id), None) => {
-                let configured_plugins = read_configured_plugins(app)?;
+                let id = sanitize_path_segment(&id)?;
                 let url = configured_plugins
                     .get(&id)
                     .ok_or_else(|| format!("Configured plugin not found: {}", id))?
@@ -300,6 +334,12 @@ impl DownloadManager {
                 Ok((id, url))
             }
             (None, Some(url)) => {
+                if !allow_untrusted {
+                    return Err(
+                        "Arbitrary plugin URLs are disabled; use a configured plugin id"
+                            .to_string(),
+                    );
+                }
                 let parsed_url = parse_http_url(&url)?;
                 let key = filename_from_url(&parsed_url)
                     .and_then(|filename| {
@@ -319,7 +359,7 @@ impl DownloadManager {
         &self,
         request: &DownloadStartRequest,
         target_path: PathBuf,
-    ) -> (DownloadTask, Arc<AtomicBool>) {
+    ) -> Result<(DownloadTask, Arc<AtomicBool>), String> {
         let id = Uuid::new_v4().to_string();
         let cancel = Arc::new(AtomicBool::new(false));
         let task = DownloadTask {
@@ -335,7 +375,23 @@ impl DownloadManager {
             error: None,
         };
 
-        self.records.lock().unwrap().insert(
+        let mut records = self.records.lock().unwrap();
+        let target = task.target_path.as_deref();
+        let target_in_use = records.values().any(|record| {
+            record.task.target_path.as_deref() == target
+                && !matches!(
+                    record.task.status.as_str(),
+                    STATUS_COMPLETED | STATUS_FAILED | STATUS_CANCELED
+                )
+        });
+        if target_in_use {
+            return Err(format!(
+                "Another download is already writing {}",
+                target_path.display()
+            ));
+        }
+
+        records.insert(
             id,
             DownloadRecord {
                 task: task.clone(),
@@ -343,7 +399,7 @@ impl DownloadManager {
             },
         );
 
-        (task, cancel)
+        Ok((task, cancel))
     }
 
     async fn run_download(
@@ -354,24 +410,33 @@ impl DownloadManager {
         target_path: PathBuf,
         cancel: Arc<AtomicBool>,
     ) -> Result<CompletedDownload, String> {
+        let _permit = self
+            .concurrency
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| "Download manager is shutting down".to_string())?;
+
         if cancel.load(Ordering::SeqCst) {
             self.cancel_task(app.as_ref(), &id, None);
             return Err("Download cancelled".to_string());
         }
 
         let parsed_url = parse_http_url(&url)?;
-        let client = download_client_for_url(&parsed_url)?;
-        let response = client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|error| format!("Failed to start download: {}", error))?;
+        let response = send_download_request(parsed_url).await?;
 
         if !response.status().is_success() {
             return Err(format!("Download failed with HTTP {}", response.status()));
         }
 
         let total_bytes = response.content_length();
+        let max_bytes = self.max_bytes_for_task(&id);
+        if total_bytes.is_some_and(|total| total > max_bytes) {
+            return Err(format!(
+                "Download exceeds the {} byte size limit",
+                max_bytes
+            ));
+        }
         self.update_task(&id, |task| {
             task.status = STATUS_RUNNING.to_string();
             task.total_bytes = total_bytes;
@@ -384,7 +449,7 @@ impl DownloadManager {
                 .map_err(|error| format!("Failed to create target directory: {}", error))?;
         }
 
-        let part_path = part_path_for(&target_path)?;
+        let part_path = part_path_for(&target_path, &id)?;
         let mut file = tokio_fs::File::create(&part_path)
             .await
             .map_err(|error| format!("Failed to create temporary download file: {}", error))?;
@@ -405,6 +470,13 @@ impl DownloadManager {
                     return Err(format!("Failed to read download stream: {}", error));
                 }
             };
+            if downloaded.saturating_add(chunk.len() as u64) > max_bytes {
+                let _ = tokio_fs::remove_file(&part_path).await;
+                return Err(format!(
+                    "Download exceeds the {} byte size limit",
+                    max_bytes
+                ));
+            }
             if let Err(error) = file.write_all(&chunk).await {
                 let _ = tokio_fs::remove_file(&part_path).await;
                 return Err(format!("Failed to write download file: {}", error));
@@ -489,6 +561,35 @@ impl DownloadManager {
         }
     }
 
+    fn fail_task_unless_canceled(&self, app: Option<&AppHandle>, id: &str, message: String) {
+        let canceled = self
+            .records
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|record| {
+                matches!(
+                    record.task.status.as_str(),
+                    STATUS_CANCELING | STATUS_CANCELED
+                ) || record.cancel.load(Ordering::SeqCst)
+            })
+            .unwrap_or(false);
+        if !canceled {
+            self.fail_task(app, id, message);
+        }
+    }
+
+    fn max_bytes_for_task(&self, id: &str) -> u64 {
+        let plugin_download = self
+            .records
+            .lock()
+            .unwrap()
+            .get(id)
+            .and_then(|record| record.task.kind.as_deref())
+            == Some("plugin");
+        max_download_bytes(plugin_download)
+    }
+
     fn update_task<F>(&self, id: &str, update: F)
     where
         F: FnOnce(&mut DownloadTask),
@@ -526,14 +627,104 @@ fn parse_http_url(url: &str) -> Result<reqwest::Url, String> {
     }
 }
 
-fn download_client_for_url(url: &reqwest::Url) -> Result<reqwest::Client, String> {
-    let mut builder = reqwest::Client::builder();
-    if is_loopback_url(url) {
+fn validate_initial_url_policy(url: &reqwest::Url) -> Result<(), String> {
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("Download URLs cannot contain credentials".to_string());
+    }
+
+    if url.scheme() == "http" && !allow_insecure_downloads() {
+        return Err(
+            "Plain HTTP downloads are disabled; use HTTPS or set RIDE_ALLOW_INSECURE_DOWNLOADS=1"
+                .to_string(),
+        );
+    }
+
+    if !allow_private_downloads() && is_obviously_private_url(url) {
+        return Err(
+            "Downloads from loopback or private network addresses are disabled".to_string(),
+        );
+    }
+
+    Ok(())
+}
+
+async fn send_download_request(initial_url: reqwest::Url) -> Result<reqwest::Response, String> {
+    let mut builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(CONNECT_TIMEOUT_SECONDS))
+        .timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECONDS));
+    if is_loopback_url(&initial_url) {
         builder = builder.no_proxy();
     }
-    builder
+    let client = builder
         .build()
-        .map_err(|error| format!("Failed to create download client: {}", error))
+        .map_err(|error| format!("Failed to create download client: {}", error))?;
+
+    let mut url = initial_url;
+    for redirect_count in 0..=MAX_REDIRECTS {
+        validate_initial_url_policy(&url)?;
+        validate_resolved_destination(&url).await?;
+
+        let response = client
+            .get(url.clone())
+            .send()
+            .await
+            .map_err(|error| format!("Failed to start download: {}", error))?;
+
+        if !response.status().is_redirection() {
+            return Ok(response);
+        }
+        if redirect_count == MAX_REDIRECTS {
+            return Err(format!("Download exceeded {} redirects", MAX_REDIRECTS));
+        }
+
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .ok_or_else(|| "Download redirect is missing a Location header".to_string())?
+            .to_str()
+            .map_err(|_| "Download redirect contains an invalid Location header".to_string())?;
+        url = url
+            .join(location)
+            .map_err(|error| format!("Invalid download redirect: {}", error))?;
+    }
+
+    Err("Download redirect limit reached".to_string())
+}
+
+async fn validate_resolved_destination(url: &reqwest::Url) -> Result<(), String> {
+    if allow_private_downloads() {
+        return Ok(());
+    }
+
+    let host = url
+        .host_str()
+        .ok_or_else(|| "Download URL is missing a host".to_string())?;
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| "Download URL is missing a port".to_string())?;
+    let addresses = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::net::lookup_host((host, port)),
+    )
+    .await
+    .map_err(|_| "Timed out resolving download host".to_string())?
+    .map_err(|error| format!("Failed to resolve download host: {}", error))?;
+
+    let mut resolved = false;
+    for address in addresses {
+        resolved = true;
+        if !is_public_ip(address.ip()) {
+            return Err(format!(
+                "Download host resolved to blocked address {}",
+                address.ip()
+            ));
+        }
+    }
+    if !resolved {
+        return Err("Download host did not resolve to an address".to_string());
+    }
+    Ok(())
 }
 
 fn is_loopback_url(url: &reqwest::Url) -> bool {
@@ -548,17 +739,146 @@ fn is_loopback_url(url: &reqwest::Url) -> bool {
             .unwrap_or(false)
 }
 
+fn is_obviously_private_url(url: &reqwest::Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return true;
+    };
+    let normalized = host.trim_end_matches('.').to_ascii_lowercase();
+    if normalized == "localhost"
+        || normalized.ends_with(".localhost")
+        || normalized.ends_with(".local")
+    {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| !is_public_ip(ip))
+        .unwrap_or(false)
+}
+
+fn is_public_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            !ip.is_private()
+                && !ip.is_loopback()
+                && !ip.is_link_local()
+                && !ip.is_multicast()
+                && !ip.is_broadcast()
+                && !ip.is_documentation()
+                && !ip.is_unspecified()
+                && octets[0] != 0
+                && !(octets[0] == 100 && (64..=127).contains(&octets[1]))
+                && !(octets[0] == 198 && (18..=19).contains(&octets[1]))
+        }
+        std::net::IpAddr::V6(ip) => {
+            !ip.is_loopback()
+                && !ip.is_unspecified()
+                && !ip.is_multicast()
+                && !ip.is_unique_local()
+                && !ip.is_unicast_link_local()
+        }
+    }
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn allow_insecure_downloads() -> bool {
+    cfg!(test) || env_flag("RIDE_ALLOW_INSECURE_DOWNLOADS")
+}
+
+fn allow_private_downloads() -> bool {
+    cfg!(test) || env_flag("RIDE_ALLOW_PRIVATE_DOWNLOADS")
+}
+
+fn allow_untrusted_plugin_downloads() -> bool {
+    cfg!(test) || env_flag("RIDE_ALLOW_UNTRUSTED_PLUGIN_DOWNLOADS")
+}
+
+fn max_download_bytes(plugin_download: bool) -> u64 {
+    let variable = if plugin_download {
+        "RIDE_MAX_PLUGIN_DOWNLOAD_BYTES"
+    } else {
+        "RIDE_MAX_DOWNLOAD_BYTES"
+    };
+    std::env::var(variable)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(if plugin_download {
+            DEFAULT_MAX_PLUGIN_DOWNLOAD_BYTES
+        } else {
+            DEFAULT_MAX_DOWNLOAD_BYTES
+        })
+}
+
 fn resolve_download_target(
     parsed_url: &reqwest::Url,
     request: &DownloadStartRequest,
 ) -> Result<PathBuf, String> {
-    let target_dir = request
+    let downloads_dir = normalize_absolute_path(&ride_downloads_dir()?)?;
+    let requested_dir = request
         .target_dir
         .as_ref()
         .map(PathBuf::from)
-        .unwrap_or(ride_downloads_dir()?);
+        .unwrap_or_else(|| downloads_dir.clone());
+    let target_dir = normalize_absolute_path(&requested_dir)?;
+    if target_dir.strip_prefix(&downloads_dir).is_err() {
+        return Err(format!(
+            "Download target must stay inside {}",
+            downloads_dir.display()
+        ));
+    }
+    reject_symlinked_path(&downloads_dir, &target_dir)?;
+
     let filename = infer_filename(parsed_url, request.filename.as_deref())?;
     Ok(target_dir.join(filename))
+}
+
+fn normalize_absolute_path(path: &Path) -> Result<PathBuf, String> {
+    if !path.is_absolute() {
+        return Err("Download target directory must be absolute".to_string());
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::Normal(segment) => normalized.push(segment),
+            Component::ParentDir => {
+                return Err("Download target directory cannot contain '..'".to_string())
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+fn reject_symlinked_path(base: &Path, target: &Path) -> Result<(), String> {
+    let mut current = base.to_path_buf();
+    for component in target
+        .strip_prefix(base)
+        .map_err(|_| "Download target escaped the downloads directory".to_string())?
+        .components()
+    {
+        current.push(component.as_os_str());
+        if current.exists()
+            && fs::symlink_metadata(&current)
+                .map_err(|error| format!("Failed to inspect download target: {}", error))?
+                .file_type()
+                .is_symlink()
+        {
+            return Err(format!(
+                "Download target cannot traverse symlink {}",
+                current.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn infer_filename(parsed_url: &reqwest::Url, explicit: Option<&str>) -> Result<String, String> {
@@ -605,12 +925,12 @@ fn sanitize_path_segment(value: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
-fn part_path_for(target_path: &Path) -> Result<PathBuf, String> {
+fn part_path_for(target_path: &Path, download_id: &str) -> Result<PathBuf, String> {
     let filename = target_path
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| "Target path must include a filename".to_string())?;
-    Ok(target_path.with_file_name(format!("{}.part", filename)))
+    Ok(target_path.with_file_name(format!("{}.{}.part", filename, download_id)))
 }
 
 async fn replace_completed_download(part_path: &Path, target_path: &Path) -> Result<(), String> {
@@ -671,6 +991,7 @@ fn read_configured_plugins(app: &AppHandle) -> Result<HashMap<String, String>, S
 fn package_json_candidates(app: &AppHandle) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     if let Ok(resource_dir) = app.path().resource_dir() {
+        candidates.push(resource_dir.join("plugin-manifest.json"));
         candidates.push(resource_dir.join("package.json"));
     }
     if let Ok(current_dir) = std::env::current_dir() {
@@ -759,9 +1080,16 @@ fn extract_zip_archive(archive_path: &Path, target_dir: &Path) -> Result<(), Str
         .map_err(|error| format!("Failed to open zip archive: {}", error))?;
     let mut archive = zip::ZipArchive::new(archive_file)
         .map_err(|error| format!("Failed to read zip archive: {}", error))?;
+    if archive.len() > MAX_ARCHIVE_ENTRIES {
+        return Err(format!(
+            "Plugin archive contains more than {} entries",
+            MAX_ARCHIVE_ENTRIES
+        ));
+    }
+    let mut extracted_bytes = 0u64;
 
     for index in 0..archive.len() {
-        let mut entry = archive
+        let entry = archive
             .by_index(index)
             .map_err(|error| format!("Failed to read zip entry: {}", error))?;
         let Some(relative_path) = entry.enclosed_name().map(|path| path.to_owned()) else {
@@ -781,8 +1109,15 @@ fn extract_zip_archive(archive_path: &Path, target_dir: &Path) -> Result<(), Str
         }
         let mut output = StdFile::create(&output_path)
             .map_err(|error| format!("Failed to create extracted zip file: {}", error))?;
-        io::copy(&mut entry, &mut output)
+        let copied = io::copy(&mut entry.take(MAX_EXTRACTED_BYTES + 1), &mut output)
             .map_err(|error| format!("Failed to extract zip file: {}", error))?;
+        extracted_bytes = extracted_bytes.saturating_add(copied);
+        if extracted_bytes > MAX_EXTRACTED_BYTES {
+            return Err(format!(
+                "Plugin archive expands beyond {} bytes",
+                MAX_EXTRACTED_BYTES
+            ));
+        }
     }
 
     Ok(())
@@ -795,11 +1130,20 @@ fn extract_tar_gz_archive(archive_path: &Path, target_dir: &Path) -> Result<(), 
         .map_err(|error| format!("Failed to open tar archive: {}", error))?;
     let decoder = GzDecoder::new(archive_file);
     let mut archive = tar::Archive::new(decoder);
+    let mut entry_count = 0usize;
+    let mut extracted_bytes = 0u64;
 
     for entry in archive
         .entries()
         .map_err(|error| format!("Failed to read tar entries: {}", error))?
     {
+        entry_count += 1;
+        if entry_count > MAX_ARCHIVE_ENTRIES {
+            return Err(format!(
+                "Plugin archive contains more than {} entries",
+                MAX_ARCHIVE_ENTRIES
+            ));
+        }
         let mut entry = entry.map_err(|error| format!("Failed to read tar entry: {}", error))?;
         let entry_type = entry.header().entry_type();
         if entry_type.is_symlink() || entry_type.is_hard_link() {
@@ -816,6 +1160,14 @@ fn extract_tar_gz_archive(archive_path: &Path, target_dir: &Path) -> Result<(), 
             fs::create_dir_all(&output_path)
                 .map_err(|error| format!("Failed to create tar directory: {}", error))?;
         } else {
+            let entry_size = entry.size();
+            extracted_bytes = extracted_bytes.saturating_add(entry_size);
+            if extracted_bytes > MAX_EXTRACTED_BYTES {
+                return Err(format!(
+                    "Plugin archive expands beyond {} bytes",
+                    MAX_EXTRACTED_BYTES
+                ));
+            }
             if let Some(parent) = output_path.parent() {
                 fs::create_dir_all(parent)
                     .map_err(|error| format!("Failed to create tar parent directory: {}", error))?;
@@ -893,12 +1245,30 @@ fn install_plugin_root(source_root: &Path, target_dir: &Path) -> Result<(), Stri
     copy_dir_recursive(source_root, &installing_dir)
         .map_err(|error| format!("Failed to stage plugin install: {}", error))?;
 
+    let backup_dir = target_dir.with_file_name(format!(
+        ".{}.backup-{}",
+        target_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("plugin"),
+        Uuid::new_v4()
+    ));
     if target_dir.exists() {
-        fs::remove_dir_all(target_dir)
-            .map_err(|error| format!("Failed to replace existing plugin: {}", error))?;
+        fs::rename(target_dir, &backup_dir).map_err(|error| {
+            format!("Failed to stage existing plugin for replacement: {}", error)
+        })?;
     }
-    fs::rename(&installing_dir, target_dir)
-        .map_err(|error| format!("Failed to finalize plugin install: {}", error))?;
+
+    if let Err(error) = fs::rename(&installing_dir, target_dir) {
+        if backup_dir.exists() {
+            let _ = fs::rename(&backup_dir, target_dir);
+        }
+        let _ = fs::remove_dir_all(&installing_dir);
+        return Err(format!("Failed to finalize plugin install: {}", error));
+    }
+    if backup_dir.exists() {
+        let _ = fs::remove_dir_all(backup_dir);
+    }
 
     Ok(())
 }
@@ -971,15 +1341,29 @@ mod tests {
         let manager = DownloadManager::new();
         let request = DownloadStartRequest {
             url: "https://example.com/file.txt".to_string(),
-            target_dir: Some(temp_test_dir("cancel").to_string_lossy().to_string()),
+            target_dir: None,
             filename: Some("file.txt".to_string()),
             kind: None,
         };
-        let target = PathBuf::from(request.target_dir.as_ref().unwrap()).join("file.txt");
-        let (task, cancel) = manager.insert_task(&request, target);
+        let target = temp_test_dir("cancel").join("file.txt");
+        let (task, cancel) = manager.insert_task(&request, target).unwrap();
         assert!(manager.cancel(&task.id));
         assert!(cancel.load(Ordering::SeqCst));
-        assert_eq!(manager.list()[0].status, STATUS_CANCELING);
+        assert_eq!(manager.list()[0].status, STATUS_CANCELED);
+        manager.fail_task_unless_canceled(None, &task.id, "late failure".to_string());
+        assert_eq!(manager.list()[0].status, STATUS_CANCELED);
+    }
+
+    #[test]
+    fn rejects_download_targets_outside_ride_downloads() {
+        let url = parse_http_url("https://example.com/file.txt").unwrap();
+        let request = DownloadStartRequest {
+            url: url.to_string(),
+            target_dir: Some(temp_test_dir("outside").to_string_lossy().to_string()),
+            filename: Some("file.txt".to_string()),
+            kind: None,
+        };
+        assert!(resolve_download_target(&url, &request).is_err());
     }
 
     #[test]
@@ -1033,13 +1417,12 @@ mod tests {
         let target_dir = temp_test_dir("http");
         let request = DownloadStartRequest {
             url: format!("http://{}/sample.bin", addr),
-            target_dir: Some(target_dir.to_string_lossy().to_string()),
+            target_dir: None,
             filename: None,
             kind: None,
         };
-        let parsed_url = parse_http_url(&request.url).unwrap();
-        let target_path = resolve_download_target(&parsed_url, &request).unwrap();
-        let (task, cancel) = manager.insert_task(&request, target_path.clone());
+        let target_path = target_dir.join("sample.bin");
+        let (task, cancel) = manager.insert_task(&request, target_path.clone()).unwrap();
         let completed = manager
             .run_download(
                 None,
@@ -1081,7 +1464,7 @@ mod tests {
             };
             let parsed_url = parse_http_url(&request.url)?;
             let target_path = resolve_download_target(&parsed_url, &request)?;
-            let (task, cancel) = manager.insert_task(&request, target_path.clone());
+            let (task, cancel) = manager.insert_task(&request, target_path.clone())?;
             let completed = manager
                 .run_download(None, task.id.clone(), request.url.clone(), target_path, cancel)
                 .await?;
