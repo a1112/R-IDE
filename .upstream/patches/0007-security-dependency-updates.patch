@@ -1,0 +1,26 @@
+diff --git a/theia-extensions/launcher/package.json b/theia-extensions/launcher/package.json
+index 5341e4d..40b807d 100644
+--- a/theia-extensions/launcher/package.json
++++ b/theia-extensions/launcher/package.json
+@@ -20,7 +20,7 @@
+   "dependencies": {
+     "@theia/core": "1.74.0",
+     "@vscode/sudo-prompt": "9.3.2",
+-    "body-parser": "^1.20.5",
++    "body-parser": "^1.20.6",
+     "fs-extra": "^4.0.3"
+   },
+   "devDependencies": {
+diff --git a/theia-extensions/updater/package.json b/theia-extensions/updater/package.json
+index 96ecf90..8cd4409 100644
+--- a/theia-extensions/updater/package.json
++++ b/theia-extensions/updater/package.json
+@@ -7,7 +7,7 @@
+     "@theia/core": "1.74.0",
+     "@theia/output": "1.74.0",
+     "@theia/preferences": "1.74.0",
+-    "builder-util-runtime": "9.3.1",
++    "builder-util-runtime": "9.7.0",
+     "electron-log": "^4.4.8",
+     "electron-updater": "6.6.2",
+     "fs-extra": "^10.1.0",
