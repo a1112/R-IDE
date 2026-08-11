@@ -48,6 +48,9 @@ jobs:
           yarn lint
           yarn build:extensions
           yarn browser build
+      - name: Copy browser frontend for Tauri checks
+        working-directory: app
+        run: npm --workspace applications/tauri run copy:frontend
       - name: Install Linux Tauri prerequisites
         if: runner.os == 'Linux'
         shell: bash

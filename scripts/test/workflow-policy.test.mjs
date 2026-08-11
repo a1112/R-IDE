@@ -157,6 +157,18 @@ test('quality job installs Linux Tauri prerequisites before Rust checks', () => 
   assert.match(prerequisites, /libayatana-appindicator3-dev/);
 });
 
+test('quality job copies the browser frontend before Rust checks', () => {
+  const workflow = readWorkflow();
+  const quality = jobBlocks(workflow).find(({ name }) => name === 'quality');
+  assert.ok(quality, 'quality job is required');
+  const browserIndex = quality.text.indexOf('yarn browser build');
+  const copyIndex = quality.text.indexOf('npm --workspace applications/tauri run copy:frontend');
+  const rustIndex = quality.text.indexOf('- name: Check Rust formatting, lint, and tests');
+  assert.ok(browserIndex >= 0, 'quality job must build the browser frontend');
+  assert.ok(copyIndex > browserIndex, 'quality job must copy the browser frontend after its build');
+  assert.ok(rustIndex > copyIndex, 'quality job must copy the browser frontend before Rust checks');
+});
+
 test('product extension compiler supports the locked d3 type declarations', () => {
   const packageFile = path.join(repositoryRoot, 'app', 'theia-extensions', 'product', 'package.json');
   const packageJson = JSON.parse(fs.readFileSync(packageFile, 'utf8'));
