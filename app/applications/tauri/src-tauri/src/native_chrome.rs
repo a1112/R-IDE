@@ -219,6 +219,9 @@ pub fn install_menu_event_bridge(app: &AppHandle) {
 }
 
 pub fn configure_native_window(window: &WebviewWindow) {
+    #[cfg(not(target_os = "macos"))]
+    let _ = window;
+
     #[cfg(target_os = "macos")]
     configure_macos_window(window);
 

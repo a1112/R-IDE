@@ -23,7 +23,7 @@
     "copy:frontend": "node copy-frontend.js",
     "copy:backend": "node copy-backend.js",
     "copy:plugins": "node copy-plugins.js",
-    "copy:plugins:bundle": "RIDE_COPY_PLUGINS=1 node copy-plugins.js",
+    "copy:plugins:bundle": "node copy-plugins.js --bundle",
     "copy:all": "npm run copy:frontend && npm run copy:backend && npm run copy:plugins",
     "dev": "npm run copy:all && npm run tauri -- dev",
     "build": "npm run copy:frontend && npm run copy:backend && npm run copy:plugins && npm run tauri -- build",

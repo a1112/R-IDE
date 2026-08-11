@@ -613,6 +613,12 @@ impl DownloadManager {
     }
 }
 
+impl Default for DownloadManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn parse_http_url(url: &str) -> Result<reqwest::Url, String> {
     let parsed = reqwest::Url::parse(url).map_err(|error| format!("Invalid URL: {}", error))?;
     match parsed.scheme() {

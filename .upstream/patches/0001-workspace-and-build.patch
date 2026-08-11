@@ -1,0 +1,164 @@
+diff --git a/.gitignore b/.gitignore
+index 7e83a50..a8cddf2 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -11,4 +11,24 @@
+ license-check-summary.txt*
+ .theia-ide/chatSessions
+ .prompts
+-**/test-screenshots
+\ No newline at end of file
++**/test-screenshots
++
++# Tauri build artifacts
++**/target/
++**/browser-frontend/
++**/tauri-frontend/
++**/resources/backend/*
++**/resources/plugins/*
++!**/resources/backend/
++!**/resources/plugins/
++!**/resources/backend/.gitkeep
++!**/resources/plugins/.gitkeep
++**/src-tauri/gen/schemas/macOS-schema.json
++**/Cargo.lock
++!applications/tauri/src-tauri/Cargo.lock
++
++# Tauri / dev temp files
++.qa/
++demo-workspace/
++nul
++**/nul
+diff --git a/lerna.json b/lerna.json
+index 882bfac..7573561 100644
+--- a/lerna.json
++++ b/lerna.json
+@@ -1,9 +1,10 @@
+ {
+   "$schema": "node_modules/lerna/schemas/lerna-schema.json",
+-  "version": "1.74.0",
++  "version": "1.72.100",
++  "npmClient": "npm",
+   "command": {
+     "run": {
+       "stream": true
+     }
+   }
+-}
+\ No newline at end of file
++}
+diff --git a/package.json b/package.json
+index 95188d1..ddc56d8 100644
+--- a/package.json
++++ b/package.json
+@@ -1,6 +1,6 @@
+ {
+   "private": true,
+-  "version": "1.74.0",
++  "version": "1.72.100",
+   "license": "MIT",
+   "author": "Rob Moran <github@thegecko.org>",
+   "homepage": "https://github.com/eclipse-theia/theia-ide#readme",
+@@ -17,7 +17,7 @@
+   },
+   "devDependencies": {
+     "@eclipse-dash/nodejs-wrapper": "^0.0.1",
+-    "@theia/cli": "1.74.0",
++    "@theia/cli": "1.73.0-next.2",
+     "@types/yargs": "^17",
+     "@typescript-eslint/eslint-plugin": "^4.33.0",
+     "@typescript-eslint/eslint-plugin-tslint": "^4.33.0",
+@@ -33,7 +33,7 @@
+     "rimraf": "^2.7.1",
+     "ts-node": "^10.9.2",
+     "type-fest": "^0.20.2",
+-    "yargs": "^17.7.3"
++    "yargs": "^17.7.2"
+   },
+   "scripts": {
+     "clean": "lerna run clean && rimraf node_modules",
+@@ -43,9 +43,9 @@
+     "build:applications:dev": "lerna run --scope=\"theia-ide*app\" --ignore=\"theia-ide-next*\" build --concurrency 1",
+     "build:applications:next": "lerna run --scope=\"theia-ide-next*\" build:prod --concurrency 1",
+     "build:applications:next:dev": "lerna run --scope=\"theia-ide-next*\" build --concurrency 1",
+-    "build:extensions": "lerna run --scope=\"theia-ide*ext\" build",
+-    "build:local-theia": "node scripts/build-with-local-theia.js",
+-    "download:plugins": "theia download:plugins --rate-limit=15 --parallel=false && yarn permissions:writeable",
++    "build:extensions": "npm --workspace theia-extensions/product run build && npm --workspace theia-extensions/launcher run build && npm --workspace theia-extensions/updater run build",
++    "build:tauri": "npm run build:extensions && npm --workspace applications/browser run build:tauri-backend && npm --workspace applications/tauri run build:prod",
++    "download:plugins": "theia download:plugins --rate-limit=15 --parallel=false && npm run permissions:writeable",
+     "package:applications": "lerna run --scope=\"theia-ide*app\" --ignore=\"theia-ide-next*\" package --concurrency 1",
+     "package:applications:preview": "lerna run --scope=\"theia-ide*app\" --ignore=\"theia-ide-next*\" package:preview --concurrency 1",
+     "package:applications:prod": "lerna run --scope=\"theia-ide*app\" --ignore=\"theia-ide-next*\" package:prod --concurrency 1",
+@@ -53,22 +53,28 @@
+     "permissions:writeable": "ts-node scripts/make-files-writeable.ts plugins",
+     "watch": "lerna run --parallel watch",
+     "test": "lerna run test",
++    "test:sync": "node --test ../scripts/test/upstream-sync/*.test.mjs",
++    "check:sync": "node ../scripts/sync-upstream.mjs check",
++    "check:rust": "node scripts/check-rust.js",
+     "electron": "yarn --cwd applications/electron",
+     "electron-next": "yarn --cwd applications/electron-next",
+     "browser": "yarn --cwd applications/browser",
++    "tauri": "npm --workspace applications/tauri",
++    "tauri:dev": "npm --workspace applications/tauri run dev",
++    "tauri:build": "npm --workspace applications/tauri run build",
+     "update:theia": "ts-node scripts/update-theia-version.ts",
+     "update:theia:children": "lerna run update:theia -- ",
+     "update:next": "ts-node scripts/update-theia-version.ts next && lerna run update:next",
+     "lint": "eslint --ext js,jsx,ts,tsx scripts && lerna run lint",
+     "lint:fix": "eslint --ext js,jsx,ts,tsx scripts --fix && lerna run lint:fix",
+-    "license:check:fetch-jar": "node scripts/fetch-dash-licenses-jar.js",
+-    "license:check": "yarn license:check:fetch-jar && npx dash-licenses-wrapper  --configFile=./configs/license-check-config.json",
+-    "license:check:review": "yarn license:check:fetch-jar && npx dash-licenses-wrapper  --configFile=./configs/license-check-config.json --review",
++    "license:check": "npx dash-licenses-wrapper  --configFile=./configs/license-check-config.json",
++    "license:check:review": "npx dash-licenses-wrapper  --configFile=./configs/license-check-config.json --review",
+     "postinstall": "theia-patch && npx patch-package --patch-dir patches"
+   },
+   "theiaPluginsDir": "plugins",
+   "theiaPlugins": {
+     "vscode-builtin-extensions": "https://github.com/eclipse-theia/vscode-builtin-extensions/releases/download/1.108.2/vscode-builtin-extensions-1.108.2.tar.gz",
++    "MS-CEINTL.vscode-language-pack-zh-hans": "https://open-vsx.org/api/MS-CEINTL/vscode-language-pack-zh-hans/1.108.0/file/MS-CEINTL.vscode-language-pack-zh-hans-1.108.0.vsix",
+     "vscjava.vscode-java-pack": "https://open-vsx.org/api/vscjava/vscode-java-pack/0.30.5/file/vscjava.vscode-java-pack-0.30.5.vsix",
+     "vscjava.vscode-java-dependency": "https://open-vsx.org/api/vscjava/vscode-java-dependency/0.27.0/file/vscjava.vscode-java-dependency-0.27.0.vsix"
+   },
+@@ -82,25 +88,20 @@
+     "theia-extensions/*"
+   ],
+   "resolutions": {
++    "**/@electron/node-gyp": "10.2.0-electron.1",
+     "@types/puppeteer": "^5.4.7",
+     "@yarnpkg/parsers": "3.0.0-rc.44",
++    "**/dompurify": "3.4.11",
++    "**/jsondiffpatch": "0.7.2",
++    "**/multer": "2.2.0",
++    "**/nan": "2.25.0",
++    "**/cpu-features": "0.0.9",
+     "**/perfect-scrollbar": "1.5.5",
+-    "**/node-abi": "4.33.0",
+-    "**/yauzl": "^3.3.1",
+-    "**/serialize-javascript": "^7.0.3",
+-    "**/compression-webpack-plugin": "^12.0.0",
+-    "**/copy-webpack-plugin": "^14.0.0",
+-    "**/esbuild": "^0.28.0",
+-    "**/scanoss": "^0.40.2",
+-    "scanoss/tar": "^7.5.19",
+-    "lerna/tar": "^7.5.19",
+-    "**/pacote/tar": "^7.5.19",
+-    "lerna/js-yaml": "^4.2.0",
+-    "terser/js-yaml": "^4.2.0",
+-    "eslint/js-yaml": "^3.15.0",
+-    "tslint/js-yaml": "^3.15.0",
+-    "**/@yarnpkg/parsers/js-yaml": "^3.15.0",
+-    "**/mocha": "^11.0.0",
+-    "**/dockerode": "^5.0.1"
++    "**/node-abi": "4.14.0",
++    "**/yauzl": "^3.3.1"
++  },
++  "optionalDependencies": {
++    "@parcel/watcher-darwin-arm64": "^2.5.6",
++    "@vscode/ripgrep-darwin-arm64": "^1.18.0"
+   }
+-}
+\ No newline at end of file
++}

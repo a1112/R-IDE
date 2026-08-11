@@ -1,0 +1,14 @@
+# R-IDE/Tauri files that are copied from the product tree during sync.
+.vscode/
+applications/tauri/
+applications/browser/pkg.config.js
+patches/@theia+terminal+1.72.1.patch
+theia-extensions/product/src/browser/ride-terminal-frontend-contribution.ts
+theia-extensions/product/src/browser/ride-workbench-contribution.ts
+package-lock.json
+scripts/build-tauri-backend.js
+scripts/check-rust.js
+scripts/test/build-tauri-backend.test.js
+TAURI-BUILD-GUIDE.md
+TAURI-IMPLEMENTATION-STATUS.md
+design-qa.md

@@ -188,7 +188,7 @@ fn get_backend_config() -> BackendConfig {
     let exe_dir = current_exe_dir();
     let mut sidecar_path = exe_dir.join("theia-backend");
 
-    if cfg!(windows) && !sidecar_path.extension().is_some_and(|e| e == "exe") {
+    if cfg!(windows) && sidecar_path.extension().is_none_or(|e| e != "exe") {
         sidecar_path.set_extension("exe");
     }
 
@@ -266,9 +266,9 @@ fn is_plugin_dir_ready(location: &Path) -> bool {
         return false;
     }
 
-    location.read_dir().map_or(false, |entries| {
+    location.read_dir().is_ok_and(|entries| {
         entries.flatten().any(|entry| {
-            entry.file_type().map_or(false, |ty| ty.is_dir())
+            entry.file_type().is_ok_and(|ty| ty.is_dir())
                 && !entry.file_name().to_string_lossy().starts_with('.')
         })
     })

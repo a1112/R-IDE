@@ -3,19 +3,19 @@
 
 ## 上游仓库 (Upstream Repository)
 - 仓库: https://github.com/eclipse-theia/theia-ide.git
-- 上游 master 分支 commit: a868f5b15f2d4f2598125a4f6a98c0d29990b946
-- 上游 master 最新提交信息: fix(launcher): forward all CLI args and support --help/--version
+- 上游 master 分支 commit: 208ea0ec23bc738801d57c890bf21cd278f77896
+- 上游 master 最新提交信息: Add appUserModelId to Electron applications
 
 ## R-IDE 的 Tauri 修改 (Our Modifications)
 - 分支: feat/tauri-desktop
 - 修改 commit: daf986adc2925ce5d549ba6ecd8936f87382f717
-- 基于上游: a868f5b15f2d4f2598125a4f6a98c0d29990b946
+- 基于上游: 208ea0ec23bc738801d57c890bf21cd278f77896
 
 ## 如何获取原始 theia-ide 仓库
 ```bash
 git clone https://github.com/eclipse-theia/theia-ide.git
 cd theia-ide
-git checkout a868f5b15f2d4f2598125a4f6a98c0d29990b946
+git checkout 208ea0ec23bc738801d57c890bf21cd278f77896
 ```
 
 ## 修改摘要
@@ -25,3 +25,12 @@ git checkout a868f5b15f2d4f2598125a4f6a98c0d29990b946
 - custom-protocol feature 实现生产资源嵌入
 - 完整的 VSCode 插件支持（97 个插件）
 - 更新 product 扩展，添加 R-IDE 品牌
+
+## 可重放同步层
+- `.upstream/source.json` 固定上述 commit；`.upstream/owned-paths.txt` 声明 R-IDE/Tauri 独有文件及上游保留目录。
+- `.upstream/patches/0001-workspace-and-build.patch`：工作区与构建脚本调整。
+- `.upstream/patches/0002-browser-tauri-backend.patch`：Browser/Tauri 后端构建调整。
+- `.upstream/patches/0003-product-branding.patch`：R-IDE 产品品牌与工作台 UI 调整。
+- `.upstream/patches/0004-lockfile.patch`：`yarn.lock` 依赖锁定差异。
+- `node scripts/sync-upstream.mjs check --json` 在 CI 中验证 pinned upstream、owned 路径及上述 patch stack 可重放且无 drift。
+- `scripts/test/upstream-sync/real-tree.test.mjs` 默认按 `source.json` clone 并 checkout pinned commit；本地可设置 `RIDE_PINNED_UPSTREAM` 指向同一 commit 的只读 checkout，路径不存在或 commit 不匹配会 fail-fast，绝不跳过测试。

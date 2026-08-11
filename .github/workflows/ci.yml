@@ -1,0 +1,223 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Quality
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - name: Set up Node.js 22
+        uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238
+        with:
+          node-version: 22
+      - name: Cache JavaScript and Rust dependencies
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25
+        with:
+          path: |
+            ~/.cache/yarn
+            ~/.cargo/registry
+            ~/.cargo/git
+            app/applications/tauri/src-tauri/target
+          key: quality-${{ runner.os }}-${{ hashFiles('app/yarn.lock', 'app/applications/tauri/src-tauri/Cargo.lock') }}
+          restore-keys: |
+            quality-${{ runner.os }}-
+      - name: Run synchronization and policy tests
+        run: node --test scripts/test/upstream-sync/*.test.mjs scripts/test/workflow-policy.test.mjs
+      - name: Install JavaScript dependencies
+        working-directory: app
+        run: |
+          corepack enable
+          yarn --frozen-lockfile --network-timeout 100000
+      - name: Lint and build browser compatibility targets
+        working-directory: app
+        run: |
+          yarn lint
+          yarn build:extensions
+          yarn browser build
+      - name: Copy browser frontend for Tauri checks
+        working-directory: app
+        run: npm --workspace applications/tauri run copy:frontend
+      - name: Free JavaScript build space
+        working-directory: app
+        shell: bash
+        run: |
+          rm -rf node_modules
+          rm -rf "$HOME/.cache/yarn"
+          test -f applications/tauri/browser-frontend/index.html
+          test -f applications/tauri/tauri-frontend/index.html
+      - name: Install Linux Tauri prerequisites
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          if ! sudo apt-get install -y libwebkit2gtk-4.1-dev; then
+            sudo apt-get install -y libwebkit2gtk-4.0-dev
+          fi
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libgtk-3-dev \
+            patchelf \
+            wget
+      - name: Install Rust stable toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup component add rustfmt clippy
+      - name: Check Rust formatting, lint, and tests
+        working-directory: app
+        run: |
+          cargo fmt --manifest-path applications/tauri/src-tauri/Cargo.toml --check
+          cargo clippy --manifest-path applications/tauri/src-tauri/Cargo.toml --all-targets -- -D warnings
+          cargo test --manifest-path applications/tauri/src-tauri/Cargo.toml
+
+  upstream-compatibility:
+    name: Upstream compatibility (Node 24)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - name: Set up Node.js 24
+        uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238
+        with:
+          node-version: 24
+      - name: Cache JavaScript dependencies
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25
+        with:
+          path: ~/.cache/yarn
+          key: compatibility-${{ runner.os }}-${{ hashFiles('app/yarn.lock') }}
+          restore-keys: |
+            compatibility-${{ runner.os }}-
+      - name: Install JavaScript dependencies
+        working-directory: app
+        run: |
+          corepack enable
+          yarn --frozen-lockfile --network-timeout 100000
+      - name: Build extensions and browser compatibility target
+        working-directory: app
+        run: |
+          yarn build:extensions
+          yarn browser build
+
+  package:
+    name: Package Tauri (${{ matrix.platform }} ${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows
+            arch: x64
+            os: windows-2022
+          - platform: linux
+            arch: x64
+            os: ubuntu-22.04
+          - platform: macos
+            arch: arm64
+            os: macos-15
+          - platform: macos
+            arch: x64
+            os: macos-15-intel
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - name: Set up Node.js 22
+        uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238
+        with:
+          node-version: 22
+      - name: Cache JavaScript and Rust dependencies
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25
+        with:
+          path: |
+            ~/.cache/yarn
+            ~/.cargo/registry
+            ~/.cargo/git
+            app/plugins
+            app/applications/tauri/src-tauri/target
+          key: package-${{ matrix.platform }}-${{ matrix.arch }}-${{ hashFiles('app/yarn.lock', 'app/applications/tauri/src-tauri/Cargo.lock') }}
+          restore-keys: |
+            package-${{ matrix.platform }}-${{ matrix.arch }}-
+      - name: Install Linux Tauri prerequisites
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          if ! sudo apt-get install -y libwebkit2gtk-4.1-dev; then
+            sudo apt-get install -y libwebkit2gtk-4.0-dev
+          fi
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libgtk-3-dev \
+            patchelf \
+            wget
+      - name: Install Rust stable toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Install JavaScript dependencies
+        working-directory: app
+        run: |
+          corepack enable
+          yarn --frozen-lockfile --network-timeout 100000
+      - name: Download VS Code plugins
+        working-directory: app
+        run: yarn download:plugins
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build the unsigned Tauri application (macOS retry)
+        if: runner.os == 'macOS'
+        working-directory: app
+        shell: bash
+        run: |
+          set -o pipefail
+          log="$(mktemp)"
+          trap 'rm -f "$log"' EXIT
+          if yarn build:tauri 2>&1 | tee "$log"; then
+            exit 0
+          fi
+          if ! grep -Eqi 'hdiutil|bundle_dmg\.sh' "$log"; then
+            echo 'Tauri build failed for a non-transient reason; refusing to retry.'
+            exit 1
+          fi
+          echo 'Initial macOS Tauri bundle failed in hdiutil; retrying once.'
+          yarn build:tauri
+      - name: Build the unsigned Tauri application
+        if: runner.os != 'macOS'
+        working-directory: app
+        run: yarn build:tauri
+      - name: Verify the packaged Tauri application
+        working-directory: app
+        run: npm --workspace applications/tauri run verify
+      - name: Upload unsigned native bundles
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: tauri-${{ matrix.platform }}-${{ matrix.arch }}
+          path: app/applications/tauri/src-tauri/target/release/bundle/**
+          if-no-files-found: error
+          retention-days: ${{ github.ref == 'refs/heads/main' && 14 || 7 }}
