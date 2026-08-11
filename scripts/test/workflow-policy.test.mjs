@@ -94,3 +94,49 @@ test('CI only validates and packages unsigned bundles without release automation
   assert.match(workflow, /app\/applications\/tauri\/src-tauri\/target\/release\/bundle\/\*\*/);
   assert.match(workflow, /name:\s*tauri-\$\{\{\s*matrix\.platform\s*\}\}-\$\{\{\s*matrix\.arch\s*\}\}/);
 });
+
+test('workspace dependencies resolve to the local workspace version', () => {
+  const workspaceRoot = path.join(repositoryRoot, 'app');
+  const packageDirectories = [
+    path.join(workspaceRoot, 'applications'),
+    path.join(workspaceRoot, 'theia-extensions'),
+  ];
+  const packages = new Map();
+  const packageFiles = [];
+  for (const directory of packageDirectories) {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      if (!entry.isDirectory()) {
+        continue;
+      }
+      const packageFile = path.join(directory, entry.name, 'package.json');
+      if (!fs.existsSync(packageFile)) {
+        continue;
+      }
+      const packageJson = JSON.parse(fs.readFileSync(packageFile, 'utf8'));
+      packageFiles.push({ packageFile, packageJson });
+      packages.set(packageJson.name, packageJson.version);
+    }
+  }
+
+  for (const { packageFile, packageJson } of packageFiles) {
+    for (const field of ['dependencies', 'devDependencies', 'optionalDependencies']) {
+      for (const [dependency, declaredVersion] of Object.entries(packageJson[field] ?? {})) {
+        const workspaceVersion = packages.get(dependency);
+        if (workspaceVersion === undefined) {
+          continue;
+        }
+        assert.equal(
+          declaredVersion,
+          workspaceVersion,
+          `${packageJson.name} declares ${dependency}@${declaredVersion}, but the local workspace is ${workspaceVersion} (${packageFile})`,
+        );
+      }
+    }
+  }
+});
+
+test('Linux Tauri prerequisites avoid conflicting AppIndicator development packages', () => {
+  const workflow = readWorkflow();
+  assert.match(workflow, /\blibayatana-appindicator3-dev\b/);
+  assert.doesNotMatch(workflow, /(?:^|\n)\s*libappindicator3-dev\s*\\/m);
+});
