@@ -1,5 +1,5 @@
 diff --git a/theia-extensions/product/package.json b/theia-extensions/product/package.json
-index a4e00d2..dace600 100644
+index a4e00d2..42de259 100644
 --- a/theia-extensions/product/package.json
 +++ b/theia-extensions/product/package.json
 @@ -1,20 +1,21 @@
@@ -26,12 +26,17 @@ index a4e00d2..dace600 100644
    "devDependencies": {
      "rimraf": "^2.7.1",
      "tslint": "^5.20.1",
--    "typescript": "~5.9.3"
-+    "typescript": "^4.9.5"
+     "typescript": "~5.9.3"
    },
    "theiaExtensions": [
      {
-@@ -47,6 +48,6 @@
+@@ -41,12 +42,12 @@
+   "scripts": {
+     "clean": "rimraf lib *.tsbuildinfo",
+     "build": "tsc -b",
+     "lint": "eslint --ext js,jsx,ts,tsx src",
+     "lint:fix": "eslint --ext js,jsx,ts,tsx src --fix",
+     "update:theia": "ts-node ../../scripts/update-theia-version.ts",
      "update:next": "ts-node ../../scripts/update-theia-version.ts next"
    },
    "peerDependencies": {
@@ -43,7 +48,13 @@ diff --git a/theia-extensions/product/src/browser/style/index.css b/theia-extens
 index e5373f6..770a81c 100644
 --- a/theia-extensions/product/src/browser/style/index.css
 +++ b/theia-extensions/product/src/browser/style/index.css
-@@ -82,4 +82,752 @@ ul.theia-aboutExtensions {
+@@ -76,10 +76,758 @@ body[data-theia-branding="next"] .theia-icon {
+ }
+ 
+ ul.theia-aboutExtensions {
+     height: 450px;
+     overflow: hidden;
+     overflow-y: scroll;
      list-style-type: none;
      padding: 0;
      margin-left: 10px;
@@ -802,7 +813,13 @@ diff --git a/theia-extensions/product/src/browser/theia-ide-about-dialog.tsx b/t
 index 388697a..dec36d4 100644
 --- a/theia-extensions/product/src/browser/theia-ide-about-dialog.tsx
 +++ b/theia-extensions/product/src/browser/theia-ide-about-dialog.tsx
-@@ -11,30 +11,19 @@ import * as React from 'react';
+@@ -5,42 +5,31 @@
+  * terms of the MIT License, which is available in the project root.
+  *
+  * SPDX-License-Identifier: MIT
+  ********************************************************************************/
+ 
+ import * as React from 'react';
  import { AboutDialog, AboutDialogProps, ABOUT_CONTENT_CLASS } from '@theia/core/lib/browser/about-dialog';
  import { injectable, inject } from '@theia/core/shared/inversify';
  import { renderDocumentation, renderDownloads, renderProductName, renderSourceCode, renderSupport, renderTickets, renderWhatIs } from './branding-util';
@@ -833,7 +850,19 @@ index 388697a..dec36d4 100644
      protected render(): React.ReactNode {
          return <div className={ABOUT_CONTENT_CLASS}>
              {this.renderContent()}
-@@ -96,10 +85,6 @@ export class TheiaIDEAboutDialog extends AboutDialog {
+         </div>;
+     }
+ 
+     protected renderContent(): React.ReactNode {
+         return <div className='ad-container'>
+             <div className='ad-float'>
+@@ -90,16 +79,12 @@ export class TheiaIDEAboutDialog extends AboutDialog {
+             {this.renderVersion()}
+         </div>;
+     }
+ 
+     protected renderVersion(): React.ReactNode {
+         return <div>
              <p className='gs-sub-header' >
                  {this.applicationInfo ? 'Version ' + this.applicationInfo.version : '-'}
              </p>
@@ -848,7 +877,13 @@ diff --git a/theia-extensions/product/src/browser/theia-ide-frontend-module.ts b
 index d3c3ed3..b1f0f71 100644
 --- a/theia-extensions/product/src/browser/theia-ide-frontend-module.ts
 +++ b/theia-extensions/product/src/browser/theia-ide-frontend-module.ts
-@@ -9,27 +9,21 @@
+@@ -3,47 +3,42 @@
+  *
+  * This program and the accompanying materials are made available under the
+  * terms of the MIT License, which is available in the project root.
+  *
+  * SPDX-License-Identifier: MIT
+  ********************************************************************************/
  
  import '../../src/browser/style/index.css';
  
@@ -880,7 +915,11 @@ index d3c3ed3..b1f0f71 100644
      if (isBound(AboutDialog)) {
          rebind(AboutDialog).to(TheiaIDEAboutDialog).inSingletonScope();
      } else {
-@@ -41,9 +35,10 @@ export default new ContainerModule((bind, _unbind, isBound, rebind) => {
+         bind(AboutDialog).to(TheiaIDEAboutDialog).inSingletonScope();
+     }
+ 
+     bind(TheiaIDEContribution).toSelf().inSingletonScope();
+     [CommandContribution, MenuContribution].forEach(serviceIdentifier =>
          bind(serviceIdentifier).toService(TheiaIDEContribution)
      );
  

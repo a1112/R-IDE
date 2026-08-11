@@ -140,3 +140,14 @@ test('Linux Tauri prerequisites avoid conflicting AppIndicator development packa
   assert.match(workflow, /\blibayatana-appindicator3-dev\b/);
   assert.doesNotMatch(workflow, /(?:^|\n)\s*libappindicator3-dev\s*\\/m);
 });
+
+test('product extension compiler supports the locked d3 type declarations', () => {
+  const packageFile = path.join(repositoryRoot, 'app', 'theia-extensions', 'product', 'package.json');
+  const packageJson = JSON.parse(fs.readFileSync(packageFile, 'utf8'));
+  const typescript = packageJson.devDependencies?.typescript;
+  assert.match(
+    typescript ?? '',
+    /(?:^|[~^>=])5(?:\.\d+)*(?:$|\s)/,
+    `${packageFile} must use TypeScript 5.x for the locked @types/d3-dispatch declarations`,
+  );
+});
