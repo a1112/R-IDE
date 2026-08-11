@@ -68,6 +68,23 @@ test('package jobs download VS Code plugins before building the verified bundle'
   assert.ok(buildIndex > downloadIndex, 'plugins must be available before the Tauri build');
 });
 
+test('macOS package builds retry transient DMG bundling failures once', () => {
+  const workflow = readWorkflow();
+  const packageJob = jobBlocks(workflow).find(({ name }) => name === 'package');
+  assert.ok(packageJob, 'package job is required');
+  const retryIndex = packageJob.text.indexOf("if: runner.os == 'macOS'");
+  const verifyIndex = packageJob.text.indexOf('- name: Verify the packaged Tauri application');
+  assert.ok(retryIndex >= 0, 'package job must define a macOS build step');
+  assert.ok(verifyIndex > retryIndex, 'macOS build must complete before verification');
+  const macBuild = packageJob.text.slice(retryIndex, verifyIndex);
+  assert.match(macBuild, /yarn build:tauri[\s\S]*yarn build:tauri/);
+  assert.match(macBuild, /set -o pipefail/);
+  assert.match(macBuild, /mktemp/);
+  assert.match(macBuild, /grep -Eqi ['"]hdiutil\|bundle_dmg\\\.sh['"]/);
+  assert.match(macBuild, /non-transient reason/i);
+  assert.match(macBuild, /retrying once/i);
+});
+
 test('quality and compatibility jobs run the required Node builds and Rust checks', () => {
   const workflow = readWorkflow();
   const jobs = Object.fromEntries(jobBlocks(workflow).map(({ name, text }) => [name, text]));

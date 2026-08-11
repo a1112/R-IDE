@@ -190,7 +190,25 @@ jobs:
         run: yarn download:plugins
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build the unsigned Tauri application (macOS retry)
+        if: runner.os == 'macOS'
+        working-directory: app
+        shell: bash
+        run: |
+          set -o pipefail
+          log="$(mktemp)"
+          trap 'rm -f "$log"' EXIT
+          if yarn build:tauri 2>&1 | tee "$log"; then
+            exit 0
+          fi
+          if ! grep -Eqi 'hdiutil|bundle_dmg\.sh' "$log"; then
+            echo 'Tauri build failed for a non-transient reason; refusing to retry.'
+            exit 1
+          fi
+          echo 'Initial macOS Tauri bundle failed in hdiutil; retrying once.'
+          yarn build:tauri
       - name: Build the unsigned Tauri application
+        if: runner.os != 'macOS'
         working-directory: app
         run: yarn build:tauri
       - name: Verify the packaged Tauri application
