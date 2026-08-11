@@ -1,7 +1,8 @@
-diff --git a/applications/electron/package.json b/applications/electron/package.json
---- a/applications/electron/package.json
-+++ b/applications/electron/package.json
-@@ -128,7 +128,7 @@
+diff --git a/applications/electron-next/package.json b/applications/electron-next/package.json
+index f9221dd..3a0d5f8 100644
+--- a/applications/electron-next/package.json
++++ b/applications/electron-next/package.json
+@@ -135,7 +135,7 @@
      "react": "^18.3.1",
      "react-dom": "^18.3.1",
      "theia-ide-launcher-ext": "1.74.0",
@@ -10,10 +11,11 @@ diff --git a/applications/electron/package.json b/applications/electron/package.
      "theia-ide-updater-ext": "1.74.0"
    },
    "devDependencies": {
-diff --git a/applications/electron-next/package.json b/applications/electron-next/package.json
---- a/applications/electron-next/package.json
-+++ b/applications/electron-next/package.json
-@@ -135,7 +135,7 @@
+diff --git a/applications/electron/package.json b/applications/electron/package.json
+index 3492885..8944beb 100644
+--- a/applications/electron/package.json
++++ b/applications/electron/package.json
+@@ -128,7 +128,7 @@
      "react": "^18.3.1",
      "react-dom": "^18.3.1",
      "theia-ide-launcher-ext": "1.74.0",

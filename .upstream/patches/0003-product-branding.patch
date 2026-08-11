@@ -1,8 +1,8 @@
 diff --git a/theia-extensions/product/package.json b/theia-extensions/product/package.json
-index a4e00d2..42de259 100644
+index a4e00d2..ebbe0e6 100644
 --- a/theia-extensions/product/package.json
 +++ b/theia-extensions/product/package.json
-@@ -1,20 +1,21 @@
+@@ -1,14 +1,16 @@
  {
    "private": true,
    "name": "theia-ide-product-ext",
@@ -15,6 +15,7 @@ index a4e00d2..42de259 100644
 -    "@theia/getting-started": "1.74.0",
 -    "@theia/vsx-registry": "1.74.0",
 -    "@theia/workspace": "1.74.0",
++    "@tauri-apps/api": "^2.1.0",
 +    "@theia/ai-registry": "1.73.0-next.2",
 +    "@theia/core": "1.73.0-next.2",
 +    "@theia/getting-started": "1.73.0-next.2",
@@ -24,19 +25,7 @@ index a4e00d2..42de259 100644
      "inversify": "^6.2.2"
    },
    "devDependencies": {
-     "rimraf": "^2.7.1",
-     "tslint": "^5.20.1",
-     "typescript": "~5.9.3"
-   },
-   "theiaExtensions": [
-     {
-@@ -41,12 +42,12 @@
-   "scripts": {
-     "clean": "rimraf lib *.tsbuildinfo",
-     "build": "tsc -b",
-     "lint": "eslint --ext js,jsx,ts,tsx src",
-     "lint:fix": "eslint --ext js,jsx,ts,tsx src --fix",
-     "update:theia": "ts-node ../../scripts/update-theia-version.ts",
+@@ -47,6 +49,6 @@
      "update:next": "ts-node ../../scripts/update-theia-version.ts next"
    },
    "peerDependencies": {
@@ -45,16 +34,10 @@ index a4e00d2..42de259 100644
    }
  }
 diff --git a/theia-extensions/product/src/browser/style/index.css b/theia-extensions/product/src/browser/style/index.css
-index e5373f6..770a81c 100644
+index e5373f6..6888432 100644
 --- a/theia-extensions/product/src/browser/style/index.css
 +++ b/theia-extensions/product/src/browser/style/index.css
-@@ -76,10 +76,758 @@ body[data-theia-branding="next"] .theia-icon {
- }
- 
- ul.theia-aboutExtensions {
-     height: 450px;
-     overflow: hidden;
-     overflow-y: scroll;
+@@ -82,4 +82,1517 @@ ul.theia-aboutExtensions {
      list-style-type: none;
      padding: 0;
      margin-left: 10px;
@@ -809,17 +792,776 @@ index e5373f6..770a81c 100644
 +        justify-content: center;
 +    }
 +}
++
++/* R-IDE native macOS chrome refresh. Keep IDE density while letting the Tauri
++   window material show through the outer shell. */
++body[data-product-shell="r-ide"] {
++    --ride-bg: transparent;
++    --ride-window-tint: rgba(16, 18, 21, 0.72);
++    --ride-top-glass: rgba(34, 37, 42, 0.58);
++    --ride-side-glass: rgba(31, 34, 39, 0.54);
++    --ride-panel-solid: rgba(20, 23, 27, 0.96);
++    --ride-editor-solid: #111418;
++    --ride-menu-glass: rgba(246, 247, 249, 0.9);
++    --ride-menu-border: rgba(255, 255, 255, 0.72);
++    --ride-menu-text: #27292d;
++    --ride-menu-muted: rgba(39, 41, 45, 0.54);
++    --ride-menu-hover: rgba(0, 122, 255, 0.14);
++    --ride-control-glass: rgba(255, 255, 255, 0.09);
++    --ride-control-border: rgba(255, 255, 255, 0.16);
++    --ride-border: rgba(255, 255, 255, 0.12);
++    --ride-border-soft: rgba(255, 255, 255, 0.08);
++    --theia-titleBar-activeBackground: transparent;
++    --theia-editor-background: var(--ride-editor-solid);
++    --theia-sideBar-background: rgba(20, 23, 27, 0.72);
++    --theia-activityBar-background: transparent;
++    --theia-statusBar-background: rgba(20, 23, 27, 0.72);
++}
++
++body[data-product-shell="r-ide"],
++body[data-product-shell="r-ide"] #theia-app-shell,
++body[data-product-shell="r-ide"] .theia-preload {
++    background: transparent !important;
++}
++
++body[data-product-shell="r-ide"].ride-shell-interactive .theia-preload,
++body[data-product-shell="r-ide"].ride-shell-interactive .spinner-container {
++    pointer-events: none !important;
++    opacity: 0 !important;
++    visibility: hidden !important;
++}
++
++body[data-product-shell="r-ide"] #theia-app-shell {
++    overflow: hidden;
++    border-radius: 10px;
++    box-shadow:
++        inset 0 1px 0 rgba(255, 255, 255, 0.16),
++        inset 0 0 0 1px rgba(255, 255, 255, 0.08);
++}
++
++body[data-product-shell="r-ide"] #theia-top-panel {
++    min-height: 44px;
++    height: 44px;
++    padding: 0 10px 0 10px;
++    gap: 8px;
++    background:
++        linear-gradient(180deg, rgba(255, 255, 255, 0.08), transparent 72%),
++        var(--ride-top-glass);
++    border-bottom: 1px solid var(--ride-border);
++    box-shadow:
++        inset 0 1px 0 rgba(255, 255, 255, 0.16),
++        0 1px 0 rgba(0, 0, 0, 0.18);
++    backdrop-filter: blur(30px) saturate(1.25);
++    -webkit-backdrop-filter: blur(30px) saturate(1.25);
++}
++
++body[data-product-shell="r-ide"] #theia-top-panel .lm-Widget.lm-MenuBar {
++    position: absolute;
++    width: 0 !important;
++    min-width: 0 !important;
++    height: 0 !important;
++    min-height: 0 !important;
++    margin: 0;
++    padding: 0;
++    overflow: hidden;
++    opacity: 0;
++    pointer-events: none;
++}
++
++body[data-product-shell="r-ide"] .ride-window-controls {
++    display: none !important;
++    align-items: center;
++    gap: 8px;
++    height: 100%;
++    padding: 0 5px 0 4px;
++}
++
++body[data-product-shell="r-ide"][data-ride-runtime="tauri"] .ride-window-controls {
++    display: none !important;
++}
++
++body[data-product-shell="r-ide"] .ride-native-window-spacer {
++    display: none;
++    flex: 0 0 auto;
++    height: 100%;
++}
++
++body[data-product-shell="r-ide"][data-ride-runtime="tauri"][data-ride-platform="macos"] .ride-native-window-spacer {
++    display: block;
++    width: 78px;
++}
++
++body[data-product-shell="r-ide"] .ride-window-control {
++    position: relative;
++    width: 13px;
++    height: 13px;
++    padding: 0;
++    border: 1px solid rgba(0, 0, 0, 0.18);
++    border-radius: 50%;
++    background: #8f98a3;
++    cursor: default;
++}
++
++body[data-product-shell="r-ide"] .ride-window-control.close {
++    background: #ff5f57;
++}
++
++body[data-product-shell="r-ide"] .ride-window-control.minimize {
++    background: #ffbd2e;
++}
++
++body[data-product-shell="r-ide"] .ride-window-control.toggleMaximize {
++    background: #28c840;
++}
++
++body[data-product-shell="r-ide"] .ride-window-controls:hover .ride-window-control::before {
++    opacity: 1;
++}
++
++body[data-product-shell="r-ide"] .ride-window-control::before {
++    position: absolute;
++    inset: 0;
++    display: grid;
++    place-items: center;
++    color: rgba(47, 31, 31, 0.76);
++    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
++    font-size: 9px;
++    font-weight: 800;
++    line-height: 1;
++    opacity: 0;
++}
++
++body[data-product-shell="r-ide"] .ride-window-control.close::before {
++    content: "×";
++}
++
++body[data-product-shell="r-ide"] .ride-window-control.minimize::before {
++    content: "−";
++    color: rgba(91, 57, 8, 0.78);
++    transform: translateY(-1px);
++}
++
++body[data-product-shell="r-ide"] .ride-window-control.toggleMaximize::before {
++    content: "+";
++    color: rgba(18, 73, 27, 0.78);
++    transform: translateY(-0.5px);
++}
++
++body[data-product-shell="r-ide"] .ride-brand,
++body[data-product-shell="r-ide"] .ride-command-center,
++body[data-product-shell="r-ide"] .ride-run-button,
++body[data-product-shell="r-ide"] .ride-icon-button {
++    color: #eef2f8;
++    background:
++        linear-gradient(180deg, rgba(255, 255, 255, 0.08), transparent),
++        var(--ride-control-glass);
++    border: 1px solid var(--ride-control-border);
++    border-radius: 7px;
++    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
++}
++
++body[data-product-shell="r-ide"] .ride-brand {
++    gap: 8px;
++    height: 30px;
++    padding: 0 11px 0 10px;
++    font: 650 13px var(--theia-ui-font-family);
++    cursor: default;
++}
++
++body[data-product-shell="r-ide"] .ride-brand .codicon {
++    color: #d8dee7;
++    font-size: 16px;
++}
++
++body[data-product-shell="r-ide"] .ride-brand:hover,
++body[data-product-shell="r-ide"] .ride-brand[aria-expanded="true"],
++body[data-product-shell="r-ide"] .ride-command-center:hover,
++body[data-product-shell="r-ide"] .ride-command-center:focus-visible,
++body[data-product-shell="r-ide"] .ride-run-button:hover,
++body[data-product-shell="r-ide"] .ride-icon-button:hover {
++    color: #ffffff;
++    border-color: rgba(255, 255, 255, 0.27);
++    background:
++        linear-gradient(180deg, rgba(255, 255, 255, 0.12), transparent),
++        rgba(255, 255, 255, 0.13);
++    outline: none;
++}
++
++body[data-product-shell="r-ide"] .ride-command-center {
++    width: min(430px, 30vw);
++    height: 30px;
++    margin-left: auto;
++    color: #c6cfdb;
++}
++
++body[data-product-shell="r-ide"] .ride-command-center kbd {
++    margin-left: auto;
++    padding: 1px 6px 2px;
++    color: #9aa5b4;
++    background: rgba(0, 0, 0, 0.22);
++    border: 1px solid rgba(255, 255, 255, 0.12);
++    border-radius: 5px;
++    font: 11px var(--theia-ui-font-family);
++}
++
++body[data-product-shell="r-ide"] .ride-run-button {
++    height: 30px;
++}
++
++body[data-product-shell="r-ide"] .ride-icon-button {
++    width: 30px;
++    height: 30px;
++}
++
++body[data-product-shell="r-ide"] .theia-app-sidebar-container {
++    display: flex;
++    flex-direction: column;
++    justify-content: flex-end;
++    min-width: 50px;
++    max-width: 50px;
++    padding: 8px 0 10px;
++    background:
++        linear-gradient(180deg, rgba(255, 255, 255, 0.06), transparent 46%),
++        var(--ride-side-glass);
++    border-right: 1px solid var(--ride-border);
++    box-shadow: inset -1px 0 0 rgba(255, 255, 255, 0.05);
++    backdrop-filter: blur(28px) saturate(1.22);
++    -webkit-backdrop-filter: blur(28px) saturate(1.22);
++}
++
++body[data-product-shell="r-ide"] .lm-TabBar.theia-app-sides {
++    min-width: 50px;
++    max-width: 50px;
++    padding-top: 0;
++}
++
++body[data-product-shell="r-ide"] .lm-TabBar.theia-app-left {
++    margin-top: auto;
++}
++
++body[data-product-shell="r-ide"] .lm-TabBar.theia-app-sides .lm-TabBar-tab {
++    width: 50px;
++    min-height: 42px;
++    height: 42px;
++    margin: 2px 0;
++    border-radius: 0;
++}
++
++body[data-product-shell="r-ide"] .lm-TabBar.theia-app-sides .lm-TabBar-tab.lm-mod-current {
++    background: rgba(255, 255, 255, 0.1);
++}
++
++body[data-product-shell="r-ide"] #theia-left-content-panel,
++body[data-product-shell="r-ide"] #theia-right-content-panel {
++    background: rgba(20, 23, 27, 0.78);
++    backdrop-filter: blur(18px) saturate(1.12);
++    -webkit-backdrop-filter: blur(18px) saturate(1.12);
++}
++
++body[data-product-shell="r-ide"] .theia-side-panel,
++body[data-product-shell="r-ide"] .theia-sidepanel-toolbar {
++    background: rgba(20, 23, 27, 0.82);
++}
++
++body[data-product-shell="r-ide"] .lm-TabBar.theia-app-centers,
++body[data-product-shell="r-ide"] #theia-main-content-panel .lm-DockPanel-widget,
++body[data-product-shell="r-ide"] .monaco-editor,
++body[data-product-shell="r-ide"] .monaco-editor-background,
++body[data-product-shell="r-ide"] .monaco-editor .margin {
++    background-color: var(--ride-editor-solid) !important;
++}
++
++body[data-product-shell="r-ide"] #theia-bottom-content-panel,
++body[data-product-shell="r-ide"] #theia-statusBar {
++    background: rgba(20, 23, 27, 0.78);
++    backdrop-filter: blur(18px) saturate(1.12);
++    -webkit-backdrop-filter: blur(18px) saturate(1.12);
++}
++
++body[data-product-shell="r-ide"] .ride-fallback-menu,
++body[data-product-shell="r-ide"] .lm-Menu,
++body[data-product-shell="r-ide"] .monaco-menu .monaco-action-bar.vertical {
++    overflow: hidden;
++    min-width: 250px;
++    padding: 8px;
++    color: var(--ride-menu-text);
++    background:
++        linear-gradient(180deg, rgba(255, 255, 255, 0.82), rgba(244, 246, 248, 0.86)),
++        var(--ride-menu-glass);
++    border: 1px solid var(--ride-menu-border);
++    border-radius: 16px;
++    box-shadow:
++        0 24px 58px rgba(0, 0, 0, 0.22),
++        0 8px 20px rgba(0, 0, 0, 0.12),
++        inset 0 1px 0 rgba(255, 255, 255, 0.68);
++    backdrop-filter: blur(30px) saturate(1.28);
++    -webkit-backdrop-filter: blur(30px) saturate(1.28);
++}
++
++body[data-product-shell="r-ide"] .ride-fallback-menu {
++    position: fixed;
++    z-index: 10000;
++    display: grid;
++    grid-template-columns: repeat(2, minmax(210px, 1fr));
++    gap: 6px 10px;
++    max-width: min(520px, calc(100vw - 28px));
++}
++
++body[data-product-shell="r-ide"] .ride-switch-menu {
++    grid-template-columns: minmax(214px, 1fr);
++    width: 238px;
++    min-width: 238px;
++    max-width: min(238px, calc(100vw - 28px));
++}
++
++body[data-product-shell="r-ide"] .ride-fallback-menu-section {
++    min-width: 0;
++    padding: 3px;
++}
++
++body[data-product-shell="r-ide"] .ride-fallback-menu-heading {
++    padding: 5px 10px 4px;
++    color: var(--ride-menu-muted);
++    font: 650 11px var(--theia-ui-font-family);
++}
++
++body[data-product-shell="r-ide"] .ride-fallback-menu-item {
++    display: flex;
++    align-items: center;
++    gap: 9px;
++    width: 100%;
++    min-height: 30px;
++    padding: 0 10px;
++    color: var(--ride-menu-text);
++    background: transparent;
++    border: 0;
++    border-radius: 9px;
++    font: 13px var(--theia-ui-font-family);
++    text-align: left;
++}
++
++body[data-product-shell="r-ide"] .ride-switch-menu-item .codicon {
++    width: 16px;
++    color: var(--ride-menu-muted);
++    font-size: 15px;
++    text-align: center;
++}
++
++body[data-product-shell="r-ide"] .ride-switch-menu-item:hover .codicon,
++body[data-product-shell="r-ide"] .ride-switch-menu-item:focus-visible .codicon {
++    color: var(--ride-menu-text);
++}
++
++body[data-product-shell="r-ide"] .ride-fallback-menu-item:hover,
++body[data-product-shell="r-ide"] .ride-fallback-menu-item:focus-visible {
++    background: var(--ride-menu-hover);
++    outline: none;
++}
++
++body[data-product-shell="r-ide"] .lm-Menu-content {
++    padding: 0;
++}
++
++body[data-product-shell="r-ide"] .lm-Menu-item {
++    min-height: 30px;
++    color: var(--ride-menu-text);
++    font: 13px var(--theia-ui-font-family);
++    border-radius: 9px;
++}
++
++body[data-product-shell="r-ide"] .lm-Menu-item.lm-mod-active,
++body[data-product-shell="r-ide"] .monaco-menu .monaco-action-bar.vertical .action-item.focused,
++body[data-product-shell="r-ide"] .monaco-menu .monaco-action-bar.vertical .action-item:hover {
++    color: var(--ride-menu-text);
++    background: var(--ride-menu-hover);
++}
++
++body[data-product-shell="r-ide"] .lm-Menu-itemIcon,
++body[data-product-shell="r-ide"] .lm-Menu-itemShortcut,
++body[data-product-shell="r-ide"] .lm-Menu-itemSubmenuIcon {
++    color: var(--ride-menu-muted);
++}
++
++body[data-product-shell="r-ide"] .lm-Menu-item[data-type="separator"] > div::after,
++body[data-product-shell="r-ide"] .monaco-menu .monaco-action-bar.vertical .action-label.separator {
++    border-color: rgba(0, 0, 0, 0.12);
++}
++
++@media (prefers-color-scheme: dark) {
++    body[data-product-shell="r-ide"] {
++        --ride-menu-glass: rgba(42, 45, 51, 0.88);
++        --ride-menu-border: rgba(255, 255, 255, 0.15);
++        --ride-menu-text: #f3f5f8;
++        --ride-menu-muted: rgba(243, 245, 248, 0.52);
++        --ride-menu-hover: rgba(76, 154, 255, 0.22);
++    }
++
++    body[data-product-shell="r-ide"] .ride-fallback-menu,
++    body[data-product-shell="r-ide"] .lm-Menu,
++    body[data-product-shell="r-ide"] .monaco-menu .monaco-action-bar.vertical {
++        background:
++            linear-gradient(180deg, rgba(255, 255, 255, 0.08), transparent),
++            var(--ride-menu-glass);
++        box-shadow:
++            0 24px 58px rgba(0, 0, 0, 0.36),
++            0 8px 20px rgba(0, 0, 0, 0.22),
++            inset 0 1px 0 rgba(255, 255, 255, 0.12);
++    }
++}
++
++/* Final native-chrome compaction: keep Theia commands registered, but remove the legacy menu row. */
++body[data-product-shell="r-ide"] #theia-top-panel {
++    display: flex !important;
++    align-items: center !important;
++}
++
++body[data-product-shell="r-ide"] #theia-top-panel > #theia\:menubar,
++body[data-product-shell="r-ide"] #theia-top-panel .lm-MenuBar,
++body[data-product-shell="r-ide"] #theia-top-panel .p-MenuBar {
++    display: none !important;
++    visibility: hidden !important;
++    width: 0 !important;
++    min-width: 0 !important;
++    max-width: 0 !important;
++    height: 0 !important;
++    min-height: 0 !important;
++    margin: 0 !important;
++    padding: 0 !important;
++    overflow: hidden !important;
++    opacity: 0 !important;
++    pointer-events: none !important;
++}
++
++body[data-product-shell="r-ide"] .theia-app-sidebar-container .theia-app-sides,
++body[data-product-shell="r-ide"] .theia-app-sidebar-container .lm-TabBar.theia-app-left {
++    flex: 0 0 auto !important;
++    flex-grow: 0 !important;
++}
++
++body[data-product-shell="r-ide"] .theia-app-sidebar-container .lm-TabBar.theia-app-left {
++    margin-top: auto !important;
++}
++
++/* R-IDE glass shell v2. The outer IDE chrome uses frosted material, while code
++   surfaces stay dark enough for syntax readability. */
++body[data-product-shell="r-ide"] {
++    --ride-titlebar-height: 36px;
++    --ride-footer-height: 24px;
++    --ride-glass-surface: rgba(21, 24, 29, 0.62);
++    --ride-glass-surface-strong: rgba(16, 19, 24, 0.76);
++    --ride-glass-surface-soft: rgba(34, 38, 45, 0.44);
++    --ride-editor-glass: rgba(12, 15, 19, 0.9);
++    --ride-glass-border: rgba(255, 255, 255, 0.13);
++    --ride-glass-highlight: rgba(255, 255, 255, 0.1);
++    --theia-private-menubar-height: var(--ride-titlebar-height);
++    --theia-horizontal-toolbar-height: 32px;
++    --theia-private-horizontal-tab-height: 32px;
++    --theia-activityBar-background: transparent;
++    --theia-sideBar-background: transparent;
++    --theia-panel-background: transparent;
++    --theia-statusBar-background: transparent;
++}
++
++body[data-product-shell="r-ide"] #theia-app-shell {
++    background:
++        linear-gradient(180deg, rgba(255, 255, 255, 0.05), transparent 38%),
++        rgba(14, 16, 20, 0.45) !important;
++    backdrop-filter: blur(34px) saturate(1.25);
++    -webkit-backdrop-filter: blur(34px) saturate(1.25);
++}
++
++body[data-product-shell="r-ide"] #theia-top-panel {
++    position: relative !important;
++    z-index: 1000 !important;
++    isolation: isolate;
++    pointer-events: auto !important;
++    min-height: var(--ride-titlebar-height) !important;
++    height: var(--ride-titlebar-height) !important;
++    padding: 0 8px !important;
++    gap: 6px !important;
++    background:
++        linear-gradient(180deg, rgba(255, 255, 255, 0.1), transparent 78%),
++        rgba(88, 92, 98, 0.42) !important;
++    border-bottom: 1px solid var(--ride-glass-border) !important;
++    box-shadow:
++        inset 0 1px 0 var(--ride-glass-highlight),
++        0 1px 0 rgba(0, 0, 0, 0.2) !important;
++    backdrop-filter: blur(36px) saturate(1.35) !important;
++    -webkit-backdrop-filter: blur(36px) saturate(1.35) !important;
++}
++
++body[data-product-shell="r-ide"][data-ride-runtime="tauri"][data-ride-platform="macos"] .ride-native-window-spacer {
++    width: 76px;
++}
++
++body[data-product-shell="r-ide"] .ride-brand,
++body[data-product-shell="r-ide"] .ride-command-center,
++body[data-product-shell="r-ide"] .ride-run-button,
++body[data-product-shell="r-ide"] .ride-icon-button {
++    height: 26px !important;
++    min-height: 26px !important;
++    border-radius: 7px;
++    background:
++        linear-gradient(180deg, rgba(255, 255, 255, 0.14), transparent),
++        rgba(255, 255, 255, 0.08) !important;
++    border-color: rgba(255, 255, 255, 0.18) !important;
++    box-shadow:
++        inset 0 1px 0 rgba(255, 255, 255, 0.1),
++        0 1px 0 rgba(0, 0, 0, 0.12);
++}
++
++body[data-product-shell="r-ide"] .ride-brand {
++    padding: 0;
++}
++
++body[data-product-shell="r-ide"] .ride-brand.ride-menu-button {
++    flex: 0 0 26px;
++    width: 26px !important;
++    min-width: 26px !important;
++    max-width: 26px !important;
++    justify-content: center !important;
++    gap: 0 !important;
++    padding: 0 !important;
++}
++
++body[data-product-shell="r-ide"] .ride-brand.ride-menu-button > :not(.codicon-menu) {
++    display: none !important;
++}
++
++body[data-product-shell="r-ide"] .ride-brand.ride-menu-button .codicon-menu {
++    font-size: 15px;
++}
++
++body[data-product-shell="r-ide"] .ride-brand strong,
++body[data-product-shell="r-ide"] .ride-run-button,
++body[data-product-shell="r-ide"] .ride-command-center {
++    font-size: 12px;
++}
++
++body[data-product-shell="r-ide"] .ride-command-center {
++    flex: 0 0 26px;
++    width: 26px !important;
++    min-width: 26px !important;
++    max-width: 26px !important;
++    justify-content: center !important;
++    gap: 0 !important;
++    padding: 0 !important;
++}
++
++body[data-product-shell="r-ide"] .ride-command-center > :not(.codicon) {
++    display: none !important;
++}
++
++body[data-product-shell="r-ide"] .ride-command-center .codicon {
++    font-size: 15px;
++}
++
++body[data-product-shell="r-ide"] .ride-run-button {
++    padding: 0 9px;
++}
++
++body[data-product-shell="r-ide"] .ride-icon-button {
++    width: 26px !important;
++    margin-left: 3px;
++    font-size: 15px;
++}
++
++body[data-product-shell="r-ide"] .ride-layout-actions {
++    gap: 3px;
++}
++
++body[data-product-shell="r-ide"] .theia-app-sidebar-container,
++body[data-product-shell="r-ide"] #theia-left-content-panel,
++body[data-product-shell="r-ide"] #theia-right-content-panel,
++body[data-product-shell="r-ide"] #theia-bottom-content-panel,
++body[data-product-shell="r-ide"] #theia-statusBar,
++body[data-product-shell="r-ide"] .theia-side-panel,
++body[data-product-shell="r-ide"] .theia-sidepanel-toolbar,
++body[data-product-shell="r-ide"] .lm-TabBar.theia-app-centers,
++body[data-product-shell="r-ide"] #theia-main-content-panel .lm-TabBar,
++body[data-product-shell="r-ide"] .ride-right-stack,
++body[data-product-shell="r-ide"] .ride-stack-section,
++body[data-product-shell="r-ide"] .ride-stack-header {
++    background:
++        linear-gradient(180deg, rgba(255, 255, 255, 0.045), transparent 64%),
++        var(--ride-glass-surface) !important;
++    border-color: var(--ride-glass-border) !important;
++    backdrop-filter: blur(24px) saturate(1.24);
++    -webkit-backdrop-filter: blur(24px) saturate(1.24);
++}
++
++body[data-product-shell="r-ide"] .theia-app-sidebar-container {
++    justify-content: flex-end !important;
++    padding: 0 0 8px !important;
++    box-shadow:
++        inset -1px 0 0 rgba(255, 255, 255, 0.05),
++        inset 1px 0 0 rgba(255, 255, 255, 0.04);
++}
++
++body[data-product-shell="r-ide"] .lm-TabBar.theia-app-left,
++body[data-product-shell="r-ide"] .lm-TabBar.theia-app-right {
++    margin-top: auto !important;
++    margin-bottom: 0 !important;
++    padding-top: 0 !important;
++}
++
++body[data-product-shell="r-ide"] .lm-TabBar.theia-app-sides .lm-TabBar-tab {
++    margin: 1px 0;
++    min-height: 40px;
++    height: 40px;
++}
++
++body[data-product-shell="r-ide"] .lm-TabBar.theia-app-sides .lm-TabBar-tabIcon {
++    height: 40px;
++    color: rgba(218, 226, 238, 0.72);
++}
++
++body[data-product-shell="r-ide"] .lm-TabBar.theia-app-sides .lm-TabBar-tab.lm-mod-current,
++body[data-product-shell="r-ide"] .lm-TabBar.theia-app-sides .lm-TabBar-tab:hover {
++    background: rgba(255, 255, 255, 0.1) !important;
++}
++
++body[data-product-shell="r-ide"] .theia-sidepanel-toolbar {
++    min-height: 34px;
++    box-shadow: inset 0 -1px 0 rgba(255, 255, 255, 0.05);
++}
++
++body[data-product-shell="r-ide"] #theia-main-content-panel .lm-DockPanel-widget,
++body[data-product-shell="r-ide"] .monaco-editor,
++body[data-product-shell="r-ide"] .monaco-editor-background,
++body[data-product-shell="r-ide"] .monaco-editor .margin,
++body[data-product-shell="r-ide"] .monaco-editor .inputarea.ime-input {
++    background-color: var(--ride-editor-glass) !important;
++}
++
++body[data-product-shell="r-ide"] #theia-main-content-panel .lm-TabBar .lm-TabBar-tab {
++    min-height: 32px;
++    background: rgba(18, 21, 26, 0.7) !important;
++    border-color: rgba(255, 255, 255, 0.08) !important;
++}
++
++body[data-product-shell="r-ide"] #theia-main-content-panel .lm-TabBar .lm-TabBar-tab.lm-mod-current {
++    background: rgba(31, 36, 44, 0.82) !important;
++}
++
++body[data-product-shell="r-ide"] .theia-TreeNode:hover {
++    background: rgba(255, 255, 255, 0.08) !important;
++}
++
++body[data-product-shell="r-ide"] .theia-TreeNode.theia-mod-selected {
++    background: rgba(47, 156, 255, 0.26) !important;
++}
++
++body[data-product-shell="r-ide"] .ride-ai-prompt,
++body[data-product-shell="r-ide"] .ride-ai-answer,
++body[data-product-shell="r-ide"] .ride-chat-input,
++body[data-product-shell="r-ide"] .theia-input,
++body[data-product-shell="r-ide"] input,
++body[data-product-shell="r-ide"] textarea {
++    background:
++        linear-gradient(180deg, rgba(255, 255, 255, 0.055), transparent),
++        rgba(11, 14, 18, 0.48) !important;
++    border-color: rgba(255, 255, 255, 0.12) !important;
++    backdrop-filter: blur(18px) saturate(1.18);
++    -webkit-backdrop-filter: blur(18px) saturate(1.18);
++}
++
++body[data-product-shell="r-ide"] #theia-statusBar {
++    min-height: var(--ride-footer-height);
++    height: var(--ride-footer-height);
++    border-top: 1px solid rgba(255, 255, 255, 0.1) !important;
++}
++
++@media (max-width: 980px) {
++    body[data-product-shell="r-ide"] .ride-command-center {
++        width: 26px !important;
++    }
++}
++
++/* Panel switchers live in the compact titlebar now. Hide legacy activity/tab
++   rails so the same function list does not appear twice. */
++body[data-product-shell="r-ide"] .ride-split-control {
++    display: inline-flex;
++    align-items: center;
++    flex: 0 0 auto;
++    height: 26px;
++    margin-left: 3px;
++    overflow: hidden;
++    border-radius: 7px;
++}
++
++body[data-product-shell="r-ide"] .ride-split-control .ride-icon-button {
++    width: 26px !important;
++    min-width: 26px !important;
++    max-width: 26px !important;
++    margin-left: 0 !important;
++    border-radius: 0 !important;
++}
++
++body[data-product-shell="r-ide"] .ride-split-control .ride-split-main {
++    border-top-left-radius: 7px !important;
++    border-bottom-left-radius: 7px !important;
++    border-top-right-radius: 0 !important;
++    border-bottom-right-radius: 0 !important;
++}
++
++body[data-product-shell="r-ide"] .ride-split-control .ride-split-menu {
++    width: 18px !important;
++    min-width: 18px !important;
++    max-width: 18px !important;
++    border-left-width: 0 !important;
++    border-top-left-radius: 0 !important;
++    border-bottom-left-radius: 0 !important;
++    border-top-right-radius: 7px !important;
++    border-bottom-right-radius: 7px !important;
++}
++
++body[data-product-shell="r-ide"] .ride-split-control .ride-split-menu .codicon {
++    font-size: 12px;
++}
++
++body[data-product-shell="r-ide"] .ride-left-sidebar-control {
++    margin-left: 3px;
++    margin-right: 2px;
++}
++
++body[data-product-shell="r-ide"] .ride-layout-actions {
++    display: inline-flex;
++    align-items: center;
++}
++
++body[data-product-shell="r-ide"] .theia-app-sidebar-container,
++body[data-product-shell="r-ide"] .lm-TabBar.theia-app-left,
++body[data-product-shell="r-ide"] .lm-TabBar.theia-app-right {
++    display: none !important;
++    visibility: hidden !important;
++    width: 0 !important;
++    min-width: 0 !important;
++    max-width: 0 !important;
++    margin: 0 !important;
++    padding: 0 !important;
++    overflow: hidden !important;
++    pointer-events: none !important;
++}
++
++body[data-product-shell="r-ide"] #theia-bottom-content-panel .lm-TabBar {
++    display: none !important;
++    min-height: 0 !important;
++    height: 0 !important;
++    border: 0 !important;
++    overflow: hidden !important;
++}
++
++body[data-product-shell="r-ide"] #theia-left-content-panel,
++body[data-product-shell="r-ide"] #theia-right-content-panel {
++    border-left: 1px solid var(--ride-glass-border) !important;
++    border-right: 1px solid var(--ride-glass-border) !important;
++}
 diff --git a/theia-extensions/product/src/browser/theia-ide-about-dialog.tsx b/theia-extensions/product/src/browser/theia-ide-about-dialog.tsx
 index 388697a..dec36d4 100644
 --- a/theia-extensions/product/src/browser/theia-ide-about-dialog.tsx
 +++ b/theia-extensions/product/src/browser/theia-ide-about-dialog.tsx
-@@ -5,42 +5,31 @@
-  * terms of the MIT License, which is available in the project root.
-  *
-  * SPDX-License-Identifier: MIT
-  ********************************************************************************/
- 
- import * as React from 'react';
+@@ -11,30 +11,19 @@ import * as React from 'react';
  import { AboutDialog, AboutDialogProps, ABOUT_CONTENT_CLASS } from '@theia/core/lib/browser/about-dialog';
  import { injectable, inject } from '@theia/core/shared/inversify';
  import { renderDocumentation, renderDownloads, renderProductName, renderSourceCode, renderSupport, renderTickets, renderWhatIs } from './branding-util';
@@ -850,19 +1592,7 @@ index 388697a..dec36d4 100644
      protected render(): React.ReactNode {
          return <div className={ABOUT_CONTENT_CLASS}>
              {this.renderContent()}
-         </div>;
-     }
- 
-     protected renderContent(): React.ReactNode {
-         return <div className='ad-container'>
-             <div className='ad-float'>
-@@ -90,16 +79,12 @@ export class TheiaIDEAboutDialog extends AboutDialog {
-             {this.renderVersion()}
-         </div>;
-     }
- 
-     protected renderVersion(): React.ReactNode {
-         return <div>
+@@ -96,10 +85,6 @@ export class TheiaIDEAboutDialog extends AboutDialog {
              <p className='gs-sub-header' >
                  {this.applicationInfo ? 'Version ' + this.applicationInfo.version : '-'}
              </p>
@@ -874,34 +1604,26 @@ index 388697a..dec36d4 100644
      }
  }
 diff --git a/theia-extensions/product/src/browser/theia-ide-frontend-module.ts b/theia-extensions/product/src/browser/theia-ide-frontend-module.ts
-index d3c3ed3..b1f0f71 100644
+index d3c3ed3..c9a8687 100644
 --- a/theia-extensions/product/src/browser/theia-ide-frontend-module.ts
 +++ b/theia-extensions/product/src/browser/theia-ide-frontend-module.ts
-@@ -3,47 +3,42 @@
-  *
-  * This program and the accompanying materials are made available under the
-  * terms of the MIT License, which is available in the project root.
-  *
-  * SPDX-License-Identifier: MIT
-  ********************************************************************************/
+@@ -9,27 +9,19 @@
  
  import '../../src/browser/style/index.css';
  
 -import { AIRegistryConfiguration } from '@theia/ai-registry/lib/common/ai-registry-configuration';
 -import { WidgetFactory } from '@theia/core/lib/browser';
-+import { FrontendApplicationContribution } from '@theia/core/lib/browser';
++import { FrontendApplicationContribution } from '@theia/core/lib/browser/frontend-application-contribution';
  import { AboutDialog } from '@theia/core/lib/browser/about-dialog';
  import { applyBranding } from './theia-ide-config';
  import { CommandContribution } from '@theia/core/lib/common/command';
  import { ContainerModule } from '@theia/core/shared/inversify';
 -import { GettingStartedWidget } from '@theia/getting-started/lib/browser/getting-started-widget';
  import { MenuContribution } from '@theia/core/lib/common/menu';
-+import { TerminalFrontendContribution } from '@theia/terminal/lib/browser/terminal-frontend-contribution';
  import { TheiaIDEAboutDialog } from './theia-ide-about-dialog';
 -import { TheiaIDEAIRegistryConfiguration } from './theia-ide-ai-registry-configuration';
  import { TheiaIDEContribution } from './theia-ide-contribution';
 -import { TheiaIDEGettingStartedWidget } from './theia-ide-getting-started-widget';
-+import { RideTerminalFrontendContribution } from './ride-terminal-frontend-contribution';
 +import { RideWorkbenchContribution } from './ride-workbench-contribution';
  
  export default new ContainerModule((bind, _unbind, isBound, rebind) => {
@@ -915,11 +1637,7 @@ index d3c3ed3..b1f0f71 100644
      if (isBound(AboutDialog)) {
          rebind(AboutDialog).to(TheiaIDEAboutDialog).inSingletonScope();
      } else {
-         bind(AboutDialog).to(TheiaIDEAboutDialog).inSingletonScope();
-     }
- 
-     bind(TheiaIDEContribution).toSelf().inSingletonScope();
-     [CommandContribution, MenuContribution].forEach(serviceIdentifier =>
+@@ -41,9 +33,7 @@ export default new ContainerModule((bind, _unbind, isBound, rebind) => {
          bind(serviceIdentifier).toService(TheiaIDEContribution)
      );
  
@@ -927,10 +1645,8 @@ index d3c3ed3..b1f0f71 100644
 -        rebind(AIRegistryConfiguration).to(TheiaIDEAIRegistryConfiguration).inSingletonScope();
 -    } else {
 -        bind(AIRegistryConfiguration).to(TheiaIDEAIRegistryConfiguration).inSingletonScope();
+-    }
 +    bind(RideWorkbenchContribution).toSelf().inSingletonScope();
 +    bind(FrontendApplicationContribution).toService(RideWorkbenchContribution);
-+
-+    if (isBound(TerminalFrontendContribution)) {
-+        rebind(TerminalFrontendContribution).to(RideTerminalFrontendContribution).inSingletonScope();
-     }
++    bind(CommandContribution).toService(RideWorkbenchContribution);
  });

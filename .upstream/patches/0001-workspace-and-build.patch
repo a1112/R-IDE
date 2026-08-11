@@ -48,7 +48,7 @@ index 882bfac..7573561 100644
 \ No newline at end of file
 +}
 diff --git a/package.json b/package.json
-index 95188d1..c03188b 100644
+index 95188d1..ddc56d8 100644
 --- a/package.json
 +++ b/package.json
 @@ -1,6 +1,6 @@
@@ -90,7 +90,7 @@ index 95188d1..c03188b 100644
      "package:applications": "lerna run --scope=\"theia-ide*app\" --ignore=\"theia-ide-next*\" package --concurrency 1",
      "package:applications:preview": "lerna run --scope=\"theia-ide*app\" --ignore=\"theia-ide-next*\" package:preview --concurrency 1",
      "package:applications:prod": "lerna run --scope=\"theia-ide*app\" --ignore=\"theia-ide-next*\" package:prod --concurrency 1",
-@@ -53,17 +53,22 @@
+@@ -53,22 +53,28 @@
      "permissions:writeable": "ts-node scripts/make-files-writeable.ts plugins",
      "watch": "lerna run --parallel watch",
      "test": "lerna run test",
@@ -116,11 +116,22 @@ index 95188d1..c03188b 100644
      "postinstall": "theia-patch && npx patch-package --patch-dir patches"
    },
    "theiaPluginsDir": "plugins",
-@@ -84,23 +89,15 @@
+   "theiaPlugins": {
+     "vscode-builtin-extensions": "https://github.com/eclipse-theia/vscode-builtin-extensions/releases/download/1.108.2/vscode-builtin-extensions-1.108.2.tar.gz",
++    "MS-CEINTL.vscode-language-pack-zh-hans": "https://open-vsx.org/api/MS-CEINTL/vscode-language-pack-zh-hans/1.108.0/file/MS-CEINTL.vscode-language-pack-zh-hans-1.108.0.vsix",
+     "vscjava.vscode-java-pack": "https://open-vsx.org/api/vscjava/vscode-java-pack/0.30.5/file/vscjava.vscode-java-pack-0.30.5.vsix",
+     "vscjava.vscode-java-dependency": "https://open-vsx.org/api/vscjava/vscode-java-dependency/0.27.0/file/vscjava.vscode-java-dependency-0.27.0.vsix"
+   },
+@@ -82,25 +88,20 @@
+     "theia-extensions/*"
+   ],
    "resolutions": {
++    "**/@electron/node-gyp": "10.2.0-electron.1",
      "@types/puppeteer": "^5.4.7",
      "@yarnpkg/parsers": "3.0.0-rc.44",
-+    "**/multer": "1.4.4-lts.1",
++    "**/dompurify": "3.4.11",
++    "**/jsondiffpatch": "0.7.2",
++    "**/multer": "2.2.0",
 +    "**/nan": "2.25.0",
 +    "**/cpu-features": "0.0.9",
      "**/perfect-scrollbar": "1.5.5",
