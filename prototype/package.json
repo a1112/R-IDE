@@ -13,6 +13,6 @@
     "@vscode/codicons": "^0.0.45",
     "react": "19.2.0",
     "react-dom": "19.2.0",
-    "vite": "6.4.2"
+    "vite": "6.4.3"
   }
 }
