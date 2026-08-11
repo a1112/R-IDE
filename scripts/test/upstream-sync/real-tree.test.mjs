@@ -16,6 +16,42 @@ async function git(cwd, args) {
   return execFileAsync('git', ['-C', cwd, ...args], { encoding: 'utf8' });
 }
 
+/**
+ * Copy the checked-in app files into a fixture without pulling generated
+ * workspaces (for example, Rust's target directory) along with them.
+ *
+ * Git's NUL-delimited output keeps paths containing whitespace/newlines safe,
+ * while explicitly handling symlinks keeps the fixture equivalent to a
+ * checkout rather than dereferencing them.
+ */
+async function copyTrackedApp(sourceRoot, destinationApp) {
+  const { stdout } = await git(sourceRoot, ['ls-files', '-z', '--', 'app']);
+  await fs.mkdir(destinationApp, { recursive: true });
+
+  for (const trackedPath of stdout.split('\0').filter(Boolean)) {
+    if (!trackedPath.startsWith('app/')) {
+      throw new Error(`Unexpected tracked path outside app/: ${trackedPath}`);
+    }
+    const relativePath = trackedPath.slice('app/'.length);
+    const sourcePath = path.join(sourceRoot, ...trackedPath.split('/'));
+    const destinationPath = path.join(destinationApp, ...relativePath.split('/'));
+    const stat = await fs.lstat(sourcePath);
+    await fs.mkdir(path.dirname(destinationPath), { recursive: true });
+
+    if (stat.isSymbolicLink()) {
+      await fs.symlink(await fs.readlink(sourcePath), destinationPath);
+      continue;
+    }
+    if (!stat.isFile()) {
+      throw new Error(`Tracked app path is not a file or symlink: ${trackedPath}`);
+    }
+    await fs.copyFile(sourcePath, destinationPath);
+    // Preserve executable bits on platforms that expose them.  This keeps
+    // git's mode checks stable while remaining a no-op on Windows filesystems.
+    await fs.chmod(destinationPath, stat.mode & 0o777);
+  }
+}
+
 async function resolvePinnedCheckout(source, override = process.env.RIDE_PINNED_UPSTREAM) {
   if (override) {
     let stat;
@@ -55,6 +91,41 @@ test('fails when the explicit pinned upstream override is missing', async t => {
   );
 });
 
+test('real-tree fixture excludes untracked generated target files', async t => {
+  const source = await fs.mkdtemp(path.join(os.tmpdir(), 'ride-tracked-app-'));
+  const destination = await fs.mkdtemp(path.join(os.tmpdir(), 'ride-tracked-copy-'));
+  t.after(() => Promise.all([
+    fs.rm(source, { recursive: true, force: true }),
+    fs.rm(destination, { recursive: true, force: true }),
+  ]));
+
+  const trackedFile = path.join(source, 'app', 'tracked.txt');
+  await fs.mkdir(path.dirname(trackedFile), { recursive: true });
+  await fs.writeFile(trackedFile, 'tracked\n');
+  await git(source, ['init', '-b', 'master']);
+  await git(source, ['config', 'user.name', 'RIDE test']);
+  await git(source, ['config', 'user.email', 'ride-test@example.invalid']);
+  await git(source, ['add', 'app']);
+  await git(source, ['commit', '-m', 'tracked app fixture']);
+
+  const generatedFile = path.join(
+    source,
+    'app',
+    'applications',
+    'tauri',
+    'src-tauri',
+    'target',
+    'debug',
+    'generated.rmeta',
+  );
+  await fs.mkdir(path.dirname(generatedFile), { recursive: true });
+  await fs.writeFile(generatedFile, 'generated\n');
+
+  await copyTrackedApp(source, destination);
+  assert.equal(await fs.readFile(path.join(destination, 'tracked.txt'), 'utf8'), 'tracked\n');
+  await assert.rejects(fs.access(path.join(destination, 'applications', 'tauri', 'src-tauri', 'target')));
+});
+
 test('real product tree has zero drift against pinned upstream plus owned paths and patches', async t => {
   let upstreamHandle;
   try {
@@ -67,7 +138,7 @@ test('real product tree has zero drift against pinned upstream plus owned paths 
 
   const fixture = await fs.mkdtemp(path.join(os.tmpdir(), 'ride-real-tree-'));
   t.after(() => fs.rm(fixture, { recursive: true, force: true }));
-  await fs.cp(path.join(repositoryRoot, 'app'), path.join(fixture, 'app'), { recursive: true });
+  await copyTrackedApp(repositoryRoot, path.join(fixture, 'app'));
   await fs.cp(path.join(repositoryRoot, '.upstream'), path.join(fixture, '.upstream'), { recursive: true });
   const sourceFile = path.join(fixture, '.upstream', 'source.json');
   const source = JSON.parse(await fs.readFile(sourceFile, 'utf8'));
