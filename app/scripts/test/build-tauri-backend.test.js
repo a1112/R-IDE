@@ -37,7 +37,7 @@ test('invokes Windows yarn.cmd through ComSpec without shell prefixes', () => {
   const comspec = process.env.ComSpec || process.env.COMSPEC || 'cmd.exe';
   assert.equal(calls.length, 2);
   assert.equal(calls[0].command, comspec);
-  assert.deepEqual(calls[0].args, ['/d', '/s', '/c', 'yarn.cmd run rebuild --silent']);
+  assert.deepEqual(calls[0].args, ['/d', '/s', '/c', 'yarn.cmd run rebuild']);
   assert.equal(calls[1].command, comspec);
   assert.deepEqual(calls[1].args, ['/d', '/s', '/c', 'yarn.cmd theia build --app-target=browser']);
   assert.equal(calls[1].options.shell, false);

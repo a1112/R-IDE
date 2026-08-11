@@ -18,7 +18,7 @@ function createBuildPlan(platform = process.platform) {
   return [
     {
       command: yarn,
-      args: ['run', 'rebuild', '--silent'],
+      args: ['run', 'rebuild'],
       cwd: browserDirectory,
       env: inheritedEnvironment,
       shell: false,
