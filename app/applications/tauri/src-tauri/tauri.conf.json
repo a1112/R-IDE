@@ -49,7 +49,7 @@
     "fileAssociations": [
       {
         "ext": ["bash", "sh", "zsh"],
-        "mimeType": "text/x-shellscript",
+        "mimeType": "application/x-shellscript",
         "name": "Shell Script",
         "description": "Shell script source file",
         "role": "Editor",

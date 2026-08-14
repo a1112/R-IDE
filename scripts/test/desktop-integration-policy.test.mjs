@@ -26,7 +26,7 @@ const linuxMimeUpdateScriptPath = path.join(tauriDirectory, 'linux', 'update-mim
 
 const editorAssociation = { role: 'Editor', rank: 'Alternate' };
 const approvedAssociations = [
-  { ext: ['bash', 'sh', 'zsh'], mimeType: 'text/x-shellscript', name: 'Shell Script', description: 'Shell script source file', ...editorAssociation },
+  { ext: ['bash', 'sh', 'zsh'], mimeType: 'application/x-shellscript', name: 'Shell Script', description: 'Shell script source file', ...editorAssociation },
   { ext: ['fish'], mimeType: 'application/x-fishscript', name: 'Fish Shell Script', description: 'Fish shell script source file', ...editorAssociation },
   { ext: ['bat', 'cmd'], mimeType: 'application/x-bat', name: 'Windows Command Script', description: 'Windows command script source file', ...editorAssociation },
   { ext: ['ps1', 'psm1'], mimeType: 'application/x-powershell', name: 'PowerShell Script', description: 'PowerShell script source file', ...editorAssociation },
@@ -65,6 +65,38 @@ const approvedAssociations = [
   { ext: ['markdown', 'md'], mimeType: 'text/markdown', name: 'Markdown Document', description: 'Markdown document', ...editorAssociation },
 ];
 const approvedExtensions = approvedAssociations.flatMap(({ ext }) => ext).sort();
+const ubuntuSharedMimeInfo24Globs = new Map([
+  ['bat', 'application/x-bat'],
+  ['c', 'text/x-csrc'],
+  ['cc', 'text/x-c++src'],
+  ['cpp', 'text/x-c++src'],
+  ['cs', 'text/x-csharp'],
+  ['css', 'text/css'],
+  ['cxx', 'text/x-c++src'],
+  ['fish', 'application/x-fishscript'],
+  ['go', 'text/x-go'],
+  ['h', 'text/x-chdr'],
+  ['hpp', 'text/x-c++hdr'],
+  ['htm', 'text/html'],
+  ['html', 'text/html'],
+  ['java', 'text/x-java'],
+  ['js', 'text/javascript'],
+  ['json', 'application/json'],
+  ['kt', 'text/x-kotlin'],
+  ['markdown', 'text/markdown'],
+  ['md', 'text/markdown'],
+  ['mjs', 'text/javascript'],
+  ['ps1', 'application/x-powershell'],
+  ['py', 'text/x-python'],
+  ['rs', 'text/rust'],
+  ['scss', 'text/x-scss'],
+  ['sh', 'application/x-shellscript'],
+  ['sql', 'application/sql'],
+  ['toml', 'application/toml'],
+  ['xml', 'application/xml'],
+  ['yaml', 'application/yaml'],
+  ['yml', 'application/yaml'],
+]);
 
 test('Tauri registers the approved code and workspace file associations', () => {
   const associations = config.bundle.fileAssociations ?? [];
@@ -92,6 +124,66 @@ test('the main Tauri window suspends background throttling', () => {
 function readRequiredText(filePath, description) {
   assert.ok(fs.existsSync(filePath), `expected ${description} at ${filePath}`);
   return fs.readFileSync(filePath, 'utf8');
+}
+
+function readNsisMacro(source, name) {
+  const block = source.match(
+    new RegExp(`!macro ${name}(?: [^\\r\\n]*)?\\r?\\n([\\s\\S]*?)!macroend`),
+  )?.[1];
+  assert.ok(block, `expected NSIS macro ${name}`);
+  return block;
+}
+
+function assertNsisOwnRegistryCleanup(hooks) {
+  const extensionCleanup = readNsisMacro(hooks, 'RIDE_UNREGISTER_EXTENSION');
+  const uninstallCleanup = readNsisMacro(hooks, 'NSIS_HOOK_PREUNINSTALL');
+  const requiredExtensionCleanup = [
+    'DeleteRegValue SHCTX "Software\\Classes\\.${EXT}\\OpenWithProgids" "${RIDE_PROGID}"',
+    'DeleteRegValue SHCTX "Software\\Classes\\Applications\\${MAINBINARYNAME}.exe\\SupportedTypes" ".${EXT}"',
+    'DeleteRegValue SHCTX "Software\\R-IDE\\Capabilities\\FileAssociations" ".${EXT}"',
+  ];
+  const requiredApplicationCleanup = [
+    'DeleteRegValue SHCTX "Software\\RegisteredApplications" "R-IDE"',
+    'DeleteRegKey SHCTX "Software\\R-IDE\\Capabilities"',
+    'DeleteRegKey SHCTX "Software\\Classes\\Applications\\${MAINBINARYNAME}.exe"',
+    'DeleteRegKey SHCTX "Software\\Classes\\${RIDE_PROGID}"',
+  ];
+
+  for (const line of requiredExtensionCleanup) {
+    assert.ok(extensionCleanup.includes(line), `NSIS extension cleanup must contain: ${line}`);
+  }
+  for (const line of requiredApplicationCleanup) {
+    assert.ok(uninstallCleanup.includes(line), `NSIS uninstall cleanup must contain: ${line}`);
+  }
+}
+
+function parseSharedMimeGlobs(mimePackage) {
+  const globs = new Map();
+
+  for (const mimeMatch of mimePackage.matchAll(
+    /<mime-type type="([^"]+)">([\s\S]*?)<\/mime-type>/g,
+  )) {
+    const [, mimeType, body] = mimeMatch;
+    for (const globMatch of body.matchAll(/<glob\s+([^>]*?)\/>/g)) {
+      const attributes = globMatch[1];
+      const extension = attributes.match(/pattern="\*\.([^"]+)"/)?.[1];
+      if (!extension) {
+        continue;
+      }
+      assert.ok(!globs.has(extension), `shared MIME package must not duplicate .${extension}`);
+      globs.set(extension, {
+        mimeType,
+        weight: Number(attributes.match(/weight="(\d+)"/)?.[1] ?? 50),
+      });
+    }
+  }
+
+  return globs;
+}
+
+function assertNoLinuxDefaultHandlerWrites(source) {
+  assert.doesNotMatch(source, /\bxdg-mime\s+default\b/i);
+  assert.doesNotMatch(source, /mimeapps\.list/i);
 }
 
 test('Windows packaging replaces unsafe built-in associations for both installer targets', () => {
@@ -128,6 +220,14 @@ test('NSIS registers R-IDE as an alternate editor without changing extension def
   assert.doesNotMatch(hooks, /UserChoice/);
   assert.doesNotMatch(hooks, /WriteRegStr[^\r\n]*Software\\Classes\\\.\$\{EXT\}"\s+""/);
   assert.doesNotMatch(hooks, /DeleteRegKey[^\r\n]*Software\\Classes\\\.\$\{EXT\}/);
+  assert.throws(
+    () => assertNsisOwnRegistryCleanup(hooks.replace(
+      'DeleteRegValue SHCTX "Software\\R-IDE\\Capabilities\\FileAssociations" ".${EXT}"',
+      '',
+    )),
+    /Capabilities\\FileAssociations/,
+  );
+  assertNsisOwnRegistryCleanup(hooks);
 });
 
 test('WiX registers the same R-IDE-owned Open With contract without default associations', () => {
@@ -195,38 +295,49 @@ test('Linux desktop sources pass multiple files without unsafe URI interpretatio
   assert.doesNotMatch(appImageDesktop, /^Exec=.*%[fuU]$/m);
 });
 
-test('R-IDE shared MIME metadata only fills extension gaps in the system database', () => {
-  const mimePackage = readRequiredText(linuxMimePackagePath, 'R-IDE shared MIME package');
-  const expectedSupplementalGlobs = new Map([
-    ['text/x-shellscript', ['bash', 'zsh']],
-    ['application/x-powershell', ['psm1']],
-    ['text/x-kotlin', ['kts']],
-    ['text/x-python', ['pyw']],
-    ['text/x-r-source', ['r']],
-    ['text/x-r-ide-r-markdown', ['rmd']],
-    ['text/x-r-ide-quarto', ['qmd']],
-    ['text/x-r-ide-less', ['less']],
-    ['text/x-r-ide-jsx', ['jsx']],
-    ['text/x-r-ide-typescript-jsx', ['tsx']],
-    ['text/x-r-ide-svelte', ['svelte']],
-    ['text/x-r-ide-vue', ['vue']],
-    ['application/x-r-ide-jsonc', ['jsonc']],
-    ['application/x-r-ide-workspace', ['code-workspace', 'theia-workspace']],
-    ['text/x-r-ide-ini', ['ini']],
-    ['text/x-r-ide-properties', ['properties']],
-  ]);
+test('Linux packaging never writes a default MIME handler', () => {
+  const linuxSources = [
+    readRequiredText(linuxConfigPath, 'Linux Tauri config'),
+    readRequiredText(linuxDesktopTemplatePath, 'Linux desktop template'),
+    readRequiredText(appImageDesktopPath, 'AppImage desktop entry'),
+    readRequiredText(linuxMimePackagePath, 'R-IDE shared MIME package'),
+    readRequiredText(linuxMimeUpdateScriptPath, 'shared MIME cache update script'),
+  ].join('\n');
 
-  for (const [mimeType, extensions] of expectedSupplementalGlobs) {
-    const escapedMimeType = mimeType.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const block = mimePackage.match(
-      new RegExp(`<mime-type type="${escapedMimeType}">([\\s\\S]*?)<\\/mime-type>`),
-    )?.[1];
-    assert.ok(block, `shared MIME package must declare ${mimeType}`);
-    assert.deepEqual(
-      [...block.matchAll(/<glob pattern="\*\.([^"]+)"/g)].map((match) => match[1]).sort(),
-      [...extensions].sort(),
-    );
+  assert.throws(
+    () => assertNoLinuxDefaultHandlerWrites(`${linuxSources}\nxdg-mime default R-IDE.desktop text/plain`),
+    /xdg-mime/,
+  );
+  assert.throws(
+    () => assertNoLinuxDefaultHandlerWrites(`${linuxSources}\nmimeapps.list`),
+    /mimeapps/,
+  );
+  assertNoLinuxDefaultHandlerWrites(linuxSources);
+});
+
+test('R-IDE shared MIME metadata covers every Ubuntu 2.4 mapping gap', () => {
+  const mimePackage = readRequiredText(linuxMimePackagePath, 'R-IDE shared MIME package');
+  const supplementalGlobs = parseSharedMimeGlobs(mimePackage);
+  const expectedSupplementalExtensions = [];
+
+  for (const { ext: extensions, mimeType } of approvedAssociations) {
+    for (const extension of extensions) {
+      if (ubuntuSharedMimeInfo24Globs.get(extension) === mimeType) {
+        assert.ok(
+          !supplementalGlobs.has(extension),
+          `.${extension} already has the approved ${mimeType} mapping in Ubuntu 2.4`,
+        );
+      } else {
+        expectedSupplementalExtensions.push(extension);
+        assert.deepEqual(
+          supplementalGlobs.get(extension),
+          { mimeType, weight: 80 },
+          `.${extension} must override the Ubuntu 2.4 mapping with ${mimeType}`,
+        );
+      }
+    }
   }
+  assert.deepEqual([...supplementalGlobs.keys()].sort(), expectedSupplementalExtensions.sort());
   assert.doesNotMatch(mimePackage, /<mime-type type="text\/plain"/);
 
   const updateScript = readRequiredText(linuxMimeUpdateScriptPath, 'shared MIME cache update script');
