@@ -12,6 +12,7 @@ use std::collections::{HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -127,6 +128,150 @@ impl LaunchIntentQueue {
         }
 
         self.consumed_ids.contains(&id)
+    }
+
+    pub fn is_acknowledged(&self, id: u64) -> bool {
+        self.consumed_ids.contains(&id)
+    }
+}
+
+#[derive(Debug)]
+pub struct LaunchIntentDeliveryFailure<E> {
+    pub intent: LaunchIntent,
+    pub error: E,
+}
+
+#[derive(Debug)]
+pub struct LaunchIntentDeliveryReport<E> {
+    pub delivered_ids: Vec<u64>,
+    pub failures: Vec<LaunchIntentDeliveryFailure<E>>,
+}
+
+impl<E> LaunchIntentDeliveryReport<E> {
+    fn empty() -> Self {
+        Self {
+            delivered_ids: Vec::new(),
+            failures: Vec::new(),
+        }
+    }
+}
+
+/// Routes desktop activations while keeping all UI and emit callbacks outside
+/// the queue mutex. Failed deliveries remain terminally in flight: they are
+/// reported to the caller, are not acknowledged, and are never emitted twice.
+#[derive(Debug)]
+pub struct LaunchIntentRouter {
+    id_source: Option<LaunchIntentIdSource>,
+    queue: Mutex<LaunchIntentQueue>,
+}
+
+impl LaunchIntentRouter {
+    pub fn new(maximum_length: usize, initial: Option<LaunchIntent>) -> Self {
+        let next_id = initial
+            .as_ref()
+            .map_or(Some(1), |intent| intent.id.checked_add(1));
+        let mut queue = LaunchIntentQueue::new(maximum_length);
+        if let Some(intent) = initial {
+            queue.enqueue(intent);
+        }
+
+        Self {
+            id_source: next_id.and_then(LaunchIntentIdSource::new),
+            queue: Mutex::new(queue),
+        }
+    }
+
+    pub fn next_id(&self) -> Option<u64> {
+        self.id_source.as_ref().and_then(LaunchIntentIdSource::next)
+    }
+
+    pub fn route_forwarded_args<I, F, D, E>(
+        &self,
+        args: I,
+        cwd: &Path,
+        focus: F,
+        emit: D,
+    ) -> LaunchIntentDeliveryReport<E>
+    where
+        I: IntoIterator<Item = OsString>,
+        F: FnOnce(),
+        D: FnMut(&LaunchIntent) -> Result<(), E>,
+    {
+        let deliveries = self
+            .next_id()
+            .and_then(|id| parse_args(args, cwd, LaunchSource::SingleInstance, id))
+            .map_or_else(Vec::new, |intent| self.enqueue(intent));
+
+        focus();
+        self.deliver(deliveries, emit)
+    }
+
+    pub fn route_opened_urls<F, D, E>(
+        &self,
+        urls: &[tauri::Url],
+        focus: F,
+        emit: D,
+    ) -> LaunchIntentDeliveryReport<E>
+    where
+        F: FnOnce(),
+        D: FnMut(&LaunchIntent) -> Result<(), E>,
+    {
+        let deliveries = self
+            .next_id()
+            .and_then(|id| parse_opened_urls(urls, LaunchSource::OpenedUrl, id))
+            .map_or_else(Vec::new, |intent| self.enqueue(intent));
+
+        focus();
+        self.deliver(deliveries, emit)
+    }
+
+    pub fn frontend_ready<D, E>(&self, emit: D) -> LaunchIntentDeliveryReport<E>
+    where
+        D: FnMut(&LaunchIntent) -> Result<(), E>,
+    {
+        let deliveries = self.lock_queue().mark_ready();
+        self.deliver(deliveries, emit)
+    }
+
+    pub fn acknowledge(&self, id: u64) -> bool {
+        self.lock_queue().acknowledge(id)
+    }
+
+    pub fn is_acknowledged(&self, id: u64) -> bool {
+        self.lock_queue().is_acknowledged(id)
+    }
+
+    fn enqueue(&self, intent: LaunchIntent) -> Vec<LaunchIntent> {
+        self.lock_queue().enqueue(intent)
+    }
+
+    fn deliver<D, E>(
+        &self,
+        deliveries: Vec<LaunchIntent>,
+        mut emit: D,
+    ) -> LaunchIntentDeliveryReport<E>
+    where
+        D: FnMut(&LaunchIntent) -> Result<(), E>,
+    {
+        let mut report = LaunchIntentDeliveryReport::empty();
+        for intent in deliveries {
+            match emit(&intent) {
+                Ok(()) => {
+                    self.acknowledge(intent.id);
+                    report.delivered_ids.push(intent.id);
+                }
+                Err(error) => report
+                    .failures
+                    .push(LaunchIntentDeliveryFailure { intent, error }),
+            }
+        }
+        report
+    }
+
+    fn lock_queue(&self) -> MutexGuard<'_, LaunchIntentQueue> {
+        self.queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 

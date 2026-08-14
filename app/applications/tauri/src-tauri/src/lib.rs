@@ -15,8 +15,10 @@ pub mod launch_intent;
 pub mod native_chrome;
 pub mod sidecar;
 
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 const MAX_PENDING_LAUNCH_INTENTS: usize = 64;
 
@@ -46,15 +48,60 @@ pub struct AppState {
     pub backend_pid: Mutex<Option<u32>>,
     pub backend_stopping: Mutex<bool>,
     pub downloads: download::DownloadManager,
-    pub launch_intents: Mutex<launch_intent::LaunchIntentQueue>,
-    #[allow(dead_code)] // Reserved for Task 4 activation routing.
-    launch_intent_id_source: launch_intent::LaunchIntentIdSource,
+    pub launch_intent_router: launch_intent::LaunchIntentRouter,
 }
 
 impl AppState {
-    #[allow(dead_code)] // Reserved for Task 4 activation routing.
+    fn new(initial_launch_intent: Option<launch_intent::LaunchIntent>) -> Self {
+        Self {
+            backend_port: Mutex::new(None),
+            backend_pid: Mutex::new(None),
+            backend_stopping: Mutex::new(false),
+            downloads: download::DownloadManager::new(),
+            launch_intent_router: launch_intent::LaunchIntentRouter::new(
+                MAX_PENDING_LAUNCH_INTENTS,
+                initial_launch_intent,
+            ),
+        }
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn next_launch_intent_id(&self) -> Option<u64> {
-        self.launch_intent_id_source.next()
+        self.launch_intent_router.next_id()
+    }
+}
+
+fn restore_main_window(app: &tauri::AppHandle) {
+    let Some(window) = app.get_webview_window("main") else {
+        log::warn!("Cannot restore main window for desktop activation: window is unavailable");
+        return;
+    };
+
+    for (operation, result) in [
+        (
+            "enable cursor events",
+            window.set_ignore_cursor_events(false),
+        ),
+        ("unminimize", window.unminimize()),
+        ("show", window.show()),
+        ("focus", window.set_focus()),
+    ] {
+        if let Err(error) = result {
+            log::warn!("Failed to {operation} main window: {error}");
+        }
+    }
+}
+
+fn log_launch_intent_delivery_failures<E: std::fmt::Display>(
+    context: &str,
+    failures: Vec<launch_intent::LaunchIntentDeliveryFailure<E>>,
+) {
+    for failure in failures {
+        log::warn!(
+            "Failed to emit {context} launch intent {}: {}",
+            failure.intent.id,
+            failure.error
+        );
     }
 }
 
@@ -89,27 +136,31 @@ pub fn run() {
     configure_local_proxy_bypass();
     let _ = env_logger::try_init();
 
+    let initial_cwd = std::env::current_dir().unwrap_or_else(|error| {
+        log::warn!("Failed to read initial launch cwd: {error}");
+        PathBuf::new()
+    });
+    let initial_launch_intent = launch_intent::parse_args(
+        std::env::args_os(),
+        &initial_cwd,
+        launch_intent::LaunchSource::Initial,
+        1,
+    );
+
     let app = tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            // 单实例：聚焦已存在的窗口
-            let window = app.get_webview_window("main").unwrap();
-            let _ = window.set_ignore_cursor_events(false);
-            let _ = window.set_focus();
-            let _ = window.unminimize();
+        .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
+            let state = app.state::<AppState>();
+            let report = state.launch_intent_router.route_forwarded_args(
+                args.into_iter().map(OsString::from),
+                Path::new(&cwd),
+                || restore_main_window(app),
+                |intent| app.emit_to("main", "ride-open-request", intent),
+            );
+            log_launch_intent_delivery_failures("single-instance", report.failures);
         }))
-        .setup(|app| {
+        .setup(move |app| {
             // 初始化全局状态
-            app.manage(AppState {
-                backend_port: Mutex::new(None),
-                backend_pid: Mutex::new(None),
-                backend_stopping: Mutex::new(false),
-                downloads: download::DownloadManager::new(),
-                launch_intents: Mutex::new(launch_intent::LaunchIntentQueue::new(
-                    MAX_PENDING_LAUNCH_INTENTS,
-                )),
-                launch_intent_id_source: launch_intent::LaunchIntentIdSource::new(1)
-                    .expect("launch intent IDs start at one"),
-            });
+            app.manage(AppState::new(initial_launch_intent));
 
             if let Some(window) = app.get_webview_window("main") {
                 native_chrome::configure_native_window(&window);
@@ -152,6 +203,16 @@ pub fn run() {
     install_shutdown_signal_handlers(app.handle().clone());
 
     app.run(|app_handle, event| match event {
+        #[cfg(target_os = "macos")]
+        tauri::RunEvent::Opened { urls } => {
+            let state = app_handle.state::<AppState>();
+            let report = state.launch_intent_router.route_opened_urls(
+                &urls,
+                || restore_main_window(app_handle),
+                |intent| app_handle.emit_to("main", "ride-open-request", intent),
+            );
+            log_launch_intent_delivery_failures("macOS opened URL", report.failures);
+        }
         tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
             if let Err(e) = sidecar::stop_backend(app_handle) {
                 log::warn!("Failed to stop backend during shutdown: {}", e);
@@ -166,18 +227,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn allocates_monotonically_increasing_launch_intent_ids() {
-        let state = AppState {
-            backend_port: Mutex::new(None),
-            backend_pid: Mutex::new(None),
-            backend_stopping: Mutex::new(false),
-            downloads: download::DownloadManager::new(),
-            launch_intents: Mutex::new(launch_intent::LaunchIntentQueue::new(4)),
-            launch_intent_id_source: launch_intent::LaunchIntentIdSource::new(41)
-                .expect("nonzero ID source"),
+    fn app_state_seeds_initial_intent_before_allocating_later_ids() {
+        let initial = launch_intent::LaunchIntent {
+            id: 1,
+            source: launch_intent::LaunchSource::Initial,
+            workspace: "workspace".into(),
+            files: vec!["workspace/initial.R".into()],
         };
+        let state = AppState::new(Some(initial.clone()));
 
-        assert_eq!(state.next_launch_intent_id(), Some(41));
-        assert_eq!(state.next_launch_intent_id(), Some(42));
+        assert_eq!(state.next_launch_intent_id(), Some(2));
+
+        let mut delivered = Vec::new();
+        state.launch_intent_router.frontend_ready(|intent| {
+            delivered.push(intent.clone());
+            Ok::<_, ()>(())
+        });
+        assert_eq!(delivered, vec![initial]);
+
+        let state_without_initial = AppState::new(None);
+        assert_eq!(state_without_initial.next_launch_intent_id(), Some(1));
     }
 }

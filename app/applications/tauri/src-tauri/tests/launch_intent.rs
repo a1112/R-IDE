@@ -1,6 +1,6 @@
 use ride_tauri::launch_intent::{
     parse_args, parse_opened_urls, LaunchIntent, LaunchIntentIdSource, LaunchIntentQueue,
-    LaunchSource,
+    LaunchIntentRouter, LaunchSource,
 };
 use std::ffi::OsString;
 use std::fs;
@@ -257,6 +257,244 @@ fn owned_deliveries_allow_the_mutex_to_be_relocked_inside_the_callback() {
         .collect::<Vec<_>>();
 
     assert_eq!(delivered_ids, vec![intent.id]);
+}
+
+#[test]
+fn router_seeds_initial_intent_and_advances_without_id_collisions() {
+    let file = Fixture::file("initial-router.R");
+    let initial = parse_args(
+        args([OsString::from(file.path())]),
+        Path::new("cwd-is-unused-for-absolute-input"),
+        LaunchSource::Initial,
+        1,
+    )
+    .expect("valid initial launch intent");
+    let router = LaunchIntentRouter::new(4, Some(initial.clone()));
+
+    assert_eq!(router.next_id(), Some(2));
+
+    let mut delivered = Vec::new();
+    let report = router.frontend_ready(|intent| {
+        delivered.push(intent.clone());
+        Ok::<_, &'static str>(())
+    });
+
+    assert_eq!(delivered, vec![initial]);
+    assert_eq!(report.delivered_ids, vec![1]);
+    assert!(report.failures.is_empty());
+    assert!(router.is_acknowledged(1));
+
+    let invalid_initial = parse_args(
+        args([OsString::from("definitely-missing-initial.R")]),
+        Path::new("definitely-missing-cwd"),
+        LaunchSource::Initial,
+        1,
+    );
+    assert!(invalid_initial.is_none());
+    let router_without_initial = LaunchIntentRouter::new(4, invalid_initial);
+    assert_eq!(router_without_initial.next_id(), Some(1));
+
+    let exhausted = LaunchIntentRouter::new(4, Some(queue_intent(u64::MAX)));
+    assert_eq!(exhausted.next_id(), None);
+    assert_eq!(exhausted.next_id(), None);
+}
+
+#[test]
+fn forwarded_args_resolve_strictly_against_the_callback_cwd() {
+    let file = Fixture::nested_file("callback-cwd.R");
+    let callback_cwd = file.path().parent().expect("callback cwd");
+    let relative = file.path().file_name().expect("fixture file name");
+    let router = LaunchIntentRouter::new(4, None);
+
+    let route_report = router.route_forwarded_args(
+        args([OsString::from(relative)]),
+        callback_cwd,
+        || {},
+        |_| -> Result<(), &'static str> { panic!("frontend is not ready") },
+    );
+    assert!(route_report.delivered_ids.is_empty());
+    assert!(route_report.failures.is_empty());
+
+    let mut delivered = Vec::new();
+    router.frontend_ready(|intent| {
+        delivered.push(intent.clone());
+        Ok::<_, &'static str>(())
+    });
+
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(delivered[0].source, LaunchSource::SingleInstance);
+    assert_eq!(delivered[0].files, vec![canonical(file.path())]);
+}
+
+#[test]
+fn forwarded_activation_enqueues_unlocked_then_focuses_then_emits() {
+    let file = Fixture::file("ordered-forward.R");
+    let router = LaunchIntentRouter::new(4, None);
+    router.frontend_ready(|_| Ok::<_, &'static str>(()));
+    let events = Mutex::new(Vec::new());
+
+    let report = router.route_forwarded_args(
+        args([OsString::from(file.path())]),
+        Path::new("cwd-is-unused-for-absolute-input"),
+        || {
+            assert!(
+                router.acknowledge(1),
+                "intent must already be in flight and the queue mutex unlocked"
+            );
+            events.lock().expect("events mutex").push("focus");
+        },
+        |intent| {
+            assert!(!router.acknowledge(u64::MAX));
+            assert_eq!(intent.id, 1);
+            events.lock().expect("events mutex").push("emit");
+            Ok::<_, &'static str>(())
+        },
+    );
+
+    assert_eq!(*events.lock().expect("events mutex"), ["focus", "emit"]);
+    assert_eq!(report.delivered_ids, vec![1]);
+    assert!(report.failures.is_empty());
+}
+
+#[test]
+fn invalid_forwarded_activation_still_focuses_without_emitting() {
+    let router = LaunchIntentRouter::new(4, None);
+    router.frontend_ready(|_| Ok::<_, &'static str>(()));
+    let events = Mutex::new(Vec::new());
+
+    let report = router.route_forwarded_args(
+        args([OsString::from("definitely-missing.R")]),
+        Path::new("definitely-missing-cwd"),
+        || events.lock().expect("events mutex").push("focus"),
+        |_| {
+            events.lock().expect("events mutex").push("emit");
+            Ok::<_, &'static str>(())
+        },
+    );
+
+    assert_eq!(*events.lock().expect("events mutex"), ["focus"]);
+    assert!(report.delivered_ids.is_empty());
+    assert!(report.failures.is_empty());
+}
+
+#[test]
+fn frontend_readiness_drains_forwarded_activations_once_in_order() {
+    let first = Fixture::file("first-forward.R");
+    let second = Fixture::file("second-forward.R");
+    let router = LaunchIntentRouter::new(4, None);
+    let early_emits = Mutex::new(Vec::new());
+
+    for file in [&first, &second] {
+        router.route_forwarded_args(
+            args([OsString::from(file.path())]),
+            Path::new("cwd-is-unused-for-absolute-input"),
+            || {},
+            |intent| {
+                early_emits
+                    .lock()
+                    .expect("early emits mutex")
+                    .push(intent.id);
+                Ok::<_, &'static str>(())
+            },
+        );
+    }
+    assert!(early_emits.lock().expect("early emits mutex").is_empty());
+
+    let delivered = Mutex::new(Vec::new());
+    let first_report = router.frontend_ready(|intent| {
+        assert!(!router.acknowledge(u64::MAX));
+        delivered.lock().expect("delivered mutex").push(intent.id);
+        Ok::<_, &'static str>(())
+    });
+    let repeated_report = router.frontend_ready(|intent| {
+        delivered.lock().expect("delivered mutex").push(intent.id);
+        Ok::<_, &'static str>(())
+    });
+
+    assert_eq!(*delivered.lock().expect("delivered mutex"), [1, 2]);
+    assert_eq!(first_report.delivered_ids, vec![1, 2]);
+    assert!(first_report.failures.is_empty());
+    assert!(repeated_report.delivered_ids.is_empty());
+    assert!(repeated_report.failures.is_empty());
+    assert!(router.is_acknowledged(1));
+    assert!(router.is_acknowledged(2));
+}
+
+#[test]
+fn opened_urls_use_the_same_router_rules_on_every_platform() {
+    let file = Fixture::file("opened-router.R");
+    let url = tauri::Url::from_file_path(file.path()).expect("fixture file URL");
+    let router = LaunchIntentRouter::new(4, None);
+    let focus_count = Mutex::new(0);
+
+    let route_report = router.route_opened_urls(
+        &[url],
+        || *focus_count.lock().expect("focus count mutex") += 1,
+        |_| -> Result<(), &'static str> { panic!("frontend is not ready") },
+    );
+    assert!(route_report.delivered_ids.is_empty());
+    assert!(route_report.failures.is_empty());
+
+    let mut delivered = Vec::new();
+    router.frontend_ready(|intent| {
+        delivered.push(intent.clone());
+        Ok::<_, &'static str>(())
+    });
+
+    assert_eq!(*focus_count.lock().expect("focus count mutex"), 1);
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(delivered[0].source, LaunchSource::OpenedUrl);
+    assert_eq!(delivered[0].files, vec![canonical(file.path())]);
+}
+
+#[test]
+fn emit_failure_is_reported_unlocked_and_never_redelivered() {
+    let mut initial = queue_intent(1);
+    initial.source = LaunchSource::Initial;
+    let router = LaunchIntentRouter::new(4, Some(initial));
+    let attempts = Mutex::new(Vec::new());
+
+    let report = router.frontend_ready(|intent| {
+        assert!(!router.acknowledge(u64::MAX));
+        attempts.lock().expect("attempts mutex").push(intent.id);
+        Err("emit failed")
+    });
+    let repeated = router.frontend_ready(|intent| {
+        attempts.lock().expect("attempts mutex").push(intent.id);
+        Ok::<_, &'static str>(())
+    });
+
+    assert!(report.delivered_ids.is_empty());
+    assert_eq!(report.failures.len(), 1);
+    assert_eq!(report.failures[0].intent.id, 1);
+    assert_eq!(report.failures[0].error, "emit failed");
+    assert!(!router.is_acknowledged(1));
+    assert!(repeated.delivered_ids.is_empty());
+    assert!(repeated.failures.is_empty());
+    assert_eq!(*attempts.lock().expect("attempts mutex"), [1]);
+}
+
+#[test]
+fn exhausted_id_source_still_focuses_forwarded_activation_without_emitting() {
+    let initial = queue_intent(u64::MAX);
+    let router = LaunchIntentRouter::new(4, Some(initial));
+    router.frontend_ready(|_| Ok::<_, &'static str>(()));
+    let events = Mutex::new(Vec::new());
+    let file = Fixture::file("exhausted-forward.R");
+
+    let report = router.route_forwarded_args(
+        args([OsString::from(file.path())]),
+        Path::new("cwd-is-unused-for-absolute-input"),
+        || events.lock().expect("events mutex").push("focus"),
+        |_| {
+            events.lock().expect("events mutex").push("emit");
+            Ok::<_, &'static str>(())
+        },
+    );
+
+    assert_eq!(*events.lock().expect("events mutex"), ["focus"]);
+    assert!(report.delivered_ids.is_empty());
+    assert!(report.failures.is_empty());
 }
 
 #[test]

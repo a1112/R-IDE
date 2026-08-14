@@ -9,7 +9,9 @@
 
 use serde::{Deserialize, Serialize};
 use tauri::menu::{MenuBuilder, SubmenuBuilder};
-use tauri::{AppHandle, Emitter, LogicalPosition, WebviewWindow};
+use tauri::{AppHandle, Emitter, LogicalPosition, Manager, WebviewWindow};
+
+use crate::AppState;
 
 #[derive(Debug, Deserialize)]
 pub struct MenuPopupRequest {
@@ -46,12 +48,28 @@ pub fn ride_window_control(window: WebviewWindow, action: String) -> Result<(), 
 }
 
 #[tauri::command]
-pub fn ride_frontend_ready(window: WebviewWindow, locale: Option<String>) -> Result<(), String> {
+pub fn ride_frontend_ready(
+    app: AppHandle,
+    window: WebviewWindow,
+    locale: Option<String>,
+) -> Result<(), String> {
     window.show().map_err(|error| error.to_string())?;
     log::info!(
         "Frontend ready (locale={})",
         locale.as_deref().unwrap_or("unknown")
     );
+
+    let state = app.state::<AppState>();
+    let report = state
+        .launch_intent_router
+        .frontend_ready(|intent| app.emit_to("main", "ride-open-request", intent));
+    for failure in report.failures {
+        log::warn!(
+            "Failed to emit frontend-ready launch intent {}: {}",
+            failure.intent.id,
+            failure.error
+        );
+    }
     Ok(())
 }
 
