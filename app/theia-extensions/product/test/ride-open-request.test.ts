@@ -15,11 +15,15 @@ import { FileUri } from '@theia/core/lib/common/file-uri';
 import URI from '@theia/core/lib/common/uri';
 import { RideNativeChrome } from '../src/browser/ride-native-chrome';
 import {
-    RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY,
-    RIDE_OPEN_REQUEST_PENDING_KEY,
+    RIDE_OPEN_REQUEST_STATE_KEY,
     RideOpenRequest,
     RideOpenRequestContribution
 } from '../src/browser/ride-open-request';
+
+const LEGACY_PENDING_KEY = 'r-ide.open-request.pending.v1';
+const LEGACY_LAST_CONSUMED_KEY = 'r-ide.open-request.last-consumed.v1';
+const MAX_PENDING_REQUESTS = 64;
+const MAX_STATE_CHARS = 262_144;
 
 class MemoryStorage implements Storage {
     protected readonly values = new Map<string, string>();
@@ -46,6 +50,27 @@ class MemoryStorage implements Storage {
 
     setItem(key: string, value: string): void {
         this.values.set(key, value);
+    }
+}
+
+class FaultyStorage extends MemoryStorage {
+    failNextSet = false;
+    failNextRemove = false;
+
+    override removeItem(key: string): void {
+        if (this.failNextRemove) {
+            this.failNextRemove = false;
+            throw new DOMException('storage remove failed', 'QuotaExceededError');
+        }
+        super.removeItem(key);
+    }
+
+    override setItem(key: string, value: string): void {
+        if (this.failNextSet) {
+            this.failNextSet = false;
+            throw new DOMException('storage commit failed', 'QuotaExceededError');
+        }
+        super.setItem(key, value);
     }
 }
 
@@ -133,8 +158,13 @@ class FakeNativeChrome {
     }
 }
 
-function pendingEnvelope(...requests: object[]): object {
-    return { version: 1, requests };
+function stateEnvelope(lastConsumed: string, ...requests: object[]): object {
+    return { version: 2, lastConsumed, requests };
+}
+
+function readState(storage: Storage): { version: 2; lastConsumed: string; requests: RideOpenRequest[] } | undefined {
+    const serialized = storage.getItem(RIDE_OPEN_REQUEST_STATE_KEY);
+    return serialized === null ? undefined : JSON.parse(serialized);
 }
 
 async function flushRequestChain(): Promise<void> {
@@ -222,7 +252,7 @@ test('different-workspace requests persist only the typed handoff and switch wit
     await contribution.handleOpenRequest(request);
 
     assert.deepEqual(openers.opened, []);
-    assert.deepEqual(JSON.parse(storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY)!), pendingEnvelope({
+    assert.deepEqual(readState(storage), stateEnvelope('2', {
         ...request,
         workspace: 'D:/new-project',
         files: ['D:/new-project/analysis.R']
@@ -231,6 +261,178 @@ test('different-workspace requests persist only the typed handoff and switch wit
     assert.equal(FileUri.fsPath(workspace.opened[0].uri).toLowerCase(), String.raw`d:\new-project`);
     assert.deepEqual(workspace.opened[0].options, { preserveWindow: true });
     assert.deepEqual(messages.errors, []);
+});
+
+test('an initial state commit failure consumes nothing and performs no open or switch', async () => {
+    const storage = new FaultyStorage();
+    storage.failNextSet = true;
+    const context = createContribution('/project', storage);
+    const request: RideOpenRequest = {
+        id: '1', source: 'initial', workspace: '/project', files: ['/project/file.R']
+    };
+
+    await context.contribution.handleOpenRequest(request);
+
+    assert.equal(storage.getItem(RIDE_OPEN_REQUEST_STATE_KEY), null);
+    assert.deepEqual(context.openers.opened, []);
+    assert.deepEqual(context.workspace.opened, []);
+    assert.equal(context.messages.errors.length, 1);
+
+    const retry = createContribution('/project', storage);
+    await retry.contribution.handleOpenRequest(request);
+    assert.deepEqual(readState(storage), stateEnvelope('1'));
+    assert.equal(retry.openers.opened.length, 1);
+});
+
+test('an append commit failure preserves the previous state byte-for-byte and remains retryable', async () => {
+    const storage = new FaultyStorage();
+    const requestA: RideOpenRequest = {
+        id: '1', source: 'singleInstance', workspace: '/workspace-a', files: ['/workspace-a/a.R']
+    };
+    const requestB: RideOpenRequest = {
+        id: '2', source: 'singleInstance', workspace: '/workspace-b', files: ['/workspace-b/b.R']
+    };
+    const original = JSON.stringify(stateEnvelope('1', requestA));
+    storage.setItem(RIDE_OPEN_REQUEST_STATE_KEY, original);
+    storage.failNextSet = true;
+    const context = createContribution('/workspace-x', storage);
+
+    await context.contribution.handleOpenRequest(requestB);
+
+    assert.equal(storage.getItem(RIDE_OPEN_REQUEST_STATE_KEY), original);
+    assert.deepEqual(context.openers.opened, []);
+    assert.deepEqual(context.workspace.opened, []);
+    assert.equal(context.messages.errors.length, 1);
+
+    const retry = createContribution('/workspace-x', storage);
+    await retry.contribution.handleOpenRequest(requestB);
+    assert.deepEqual(readState(storage), stateEnvelope('2', requestA, requestB));
+    assert.deepEqual(retry.workspace.opened, []);
+});
+
+test('a remainder commit failure leaves the head intact and prevents premature open or switch', async () => {
+    const storage = new FaultyStorage();
+    const requestA: RideOpenRequest = {
+        id: '1', source: 'singleInstance', workspace: '/workspace-a', files: ['/workspace-a/a.R']
+    };
+    const requestB: RideOpenRequest = {
+        id: '2', source: 'singleInstance', workspace: '/workspace-b', files: ['/workspace-b/b.R']
+    };
+    const original = JSON.stringify(stateEnvelope('2', requestA, requestB));
+    storage.setItem(RIDE_OPEN_REQUEST_STATE_KEY, original);
+    storage.failNextSet = true;
+    const context = createContribution('/workspace-a', storage);
+
+    await context.contribution.restorePendingRequest();
+
+    assert.equal(storage.getItem(RIDE_OPEN_REQUEST_STATE_KEY), original);
+    assert.deepEqual(context.openers.opened, []);
+    assert.deepEqual(context.workspace.opened, []);
+    assert.equal(context.messages.errors.length, 1);
+
+    const retry = createContribution('/workspace-a', storage);
+    await retry.contribution.restorePendingRequest();
+    assert.deepEqual(retry.openers.opened.map(entry => entry.uri.toString()), ['file:///workspace-a/a.R']);
+    assert.deepEqual(retry.workspace.opened.map(entry => entry.uri.toString()), ['file:///workspace-b']);
+    assert.deepEqual(readState(storage), stateEnvelope('2', requestB));
+});
+
+test('an invalid-state removal failure reports the fault without executing or changing stored bytes', async () => {
+    const storage = new FaultyStorage();
+    const invalid = '{not-json';
+    storage.setItem(RIDE_OPEN_REQUEST_STATE_KEY, invalid);
+    storage.failNextRemove = true;
+    const context = createContribution('/project', storage);
+
+    await context.contribution.restorePendingRequest();
+
+    assert.equal(storage.getItem(RIDE_OPEN_REQUEST_STATE_KEY), invalid);
+    assert.deepEqual(context.openers.opened, []);
+    assert.deepEqual(context.workspace.opened, []);
+    assert.equal(context.messages.errors.length, 1);
+
+    const retry = createContribution('/project', storage);
+    await retry.contribution.restorePendingRequest();
+    assert.equal(storage.getItem(RIDE_OPEN_REQUEST_STATE_KEY), null);
+    assert.equal(retry.messages.errors.length, 1);
+});
+
+test('pending state accepts item 64 but rejects item 65 without consuming its ID', async () => {
+    const storage = new MemoryStorage();
+    const request = (id: number): RideOpenRequest => ({
+        id: String(id), source: 'singleInstance', workspace: '/queue', files: [`/queue/file-${id}.R`]
+    });
+    const first63 = Array.from({ length: 63 }, (_, index) => request(index + 1));
+    storage.setItem(RIDE_OPEN_REQUEST_STATE_KEY, JSON.stringify(stateEnvelope('63', ...first63)));
+    const context = createContribution('/elsewhere', storage);
+
+    await context.contribution.handleOpenRequest(request(64));
+
+    assert.deepEqual(readState(storage), stateEnvelope('64', ...first63, request(64)));
+    assert.equal(readState(storage)!.requests.length, MAX_PENDING_REQUESTS);
+    const stateAt64 = storage.getItem(RIDE_OPEN_REQUEST_STATE_KEY);
+
+    await context.contribution.handleOpenRequest(request(65));
+
+    assert.equal(storage.getItem(RIDE_OPEN_REQUEST_STATE_KEY), stateAt64);
+    assert.equal(readState(storage)!.lastConsumed, '64');
+    assert.deepEqual(context.openers.opened, []);
+    assert.deepEqual(context.workspace.opened, []);
+    assert.equal(context.messages.errors.length, 1);
+});
+
+test('reload rejects a stored queue with 65 requests before switching workspaces', async () => {
+    const storage = new MemoryStorage();
+    const requests = Array.from({ length: 65 }, (_, index): RideOpenRequest => ({
+        id: String(index + 1), source: 'singleInstance', workspace: '/queue', files: [`/queue/file-${index + 1}.R`]
+    }));
+    storage.setItem(RIDE_OPEN_REQUEST_STATE_KEY, JSON.stringify(stateEnvelope('65', ...requests)));
+    const context = createContribution('/elsewhere', storage);
+
+    await context.contribution.restorePendingRequest();
+
+    assert.equal(storage.getItem(RIDE_OPEN_REQUEST_STATE_KEY), null);
+    assert.deepEqual(context.openers.opened, []);
+    assert.deepEqual(context.workspace.opened, []);
+    assert.equal(context.messages.errors.length, 1);
+});
+
+test('oversized append and stored state are rejected without replacing valid bytes or executing requests', async () => {
+    const requestA: RideOpenRequest = {
+        id: '1', source: 'singleInstance', workspace: '/queue', files: ['/queue/a.R']
+    };
+    const storage = new MemoryStorage();
+    const original = JSON.stringify(stateEnvelope('1', requestA));
+    storage.setItem(RIDE_OPEN_REQUEST_STATE_KEY, original);
+    const context = createContribution('/elsewhere', storage);
+
+    await context.contribution.handleOpenRequest({
+        id: '2',
+        source: 'singleInstance',
+        workspace: '/queue',
+        files: [`/queue/${'x'.repeat(MAX_STATE_CHARS)}.R`]
+    });
+
+    assert.ok(storage.getItem(RIDE_OPEN_REQUEST_STATE_KEY) === original, 'oversized append must preserve exact state bytes');
+    assert.deepEqual(context.openers.opened, []);
+    assert.deepEqual(context.workspace.opened, []);
+    assert.equal(context.messages.errors.length, 1);
+
+    const oversizedStorage = new MemoryStorage();
+    const oversizedStoredState = JSON.stringify({
+        ...stateEnvelope('1'),
+        padding: 'x'.repeat(MAX_STATE_CHARS)
+    });
+    assert.ok(oversizedStoredState.length > MAX_STATE_CHARS);
+    oversizedStorage.setItem(RIDE_OPEN_REQUEST_STATE_KEY, oversizedStoredState);
+    const reload = createContribution('/project', oversizedStorage);
+
+    await reload.contribution.restorePendingRequest();
+
+    assert.equal(oversizedStorage.getItem(RIDE_OPEN_REQUEST_STATE_KEY), null);
+    assert.deepEqual(reload.openers.opened, []);
+    assert.deepEqual(reload.workspace.opened, []);
+    assert.equal(reload.messages.errors.length, 1);
 });
 
 test('reload restores a removed pending request exactly once, including the maximum u64 ID', async () => {
@@ -243,17 +445,21 @@ test('reload restores a removed pending request exactly once, including the maxi
     };
     const firstWindow = createContribution(String.raw`C:\old-project`, storage);
     await firstWindow.contribution.handleOpenRequest(request);
-    assert.notEqual(storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY), null);
+    assert.deepEqual(readState(storage), stateEnvelope(request.id, {
+        ...request,
+        workspace: 'D:/new-project',
+        files: ['D:/new-project/analysis.R']
+    }));
 
     const reloadedWindow = createContribution(request.workspace, storage, () => {
-        assert.equal(storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY), null);
+        assert.deepEqual(readState(storage), stateEnvelope(request.id));
     });
     await reloadedWindow.contribution.restorePendingRequest();
     await reloadedWindow.contribution.restorePendingRequest();
 
     assert.equal(reloadedWindow.openers.opened.length, 1);
     assert.deepEqual(reloadedWindow.shell.activated, ['editor-1']);
-    assert.equal(storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY), null);
+    assert.deepEqual(readState(storage), stateEnvelope(request.id));
 
     const restartedContribution = createContribution(request.workspace, storage);
     await restartedContribution.contribution.restorePendingRequest();
@@ -287,64 +493,60 @@ test('native listener preserves consecutive cross-workspace requests across orde
     assert.equal(firstWindow.workspace.opened.length, 1);
     assert.equal(firstWindow.workspace.opened[0].uri.toString(), 'file:///workspace-a');
     assert.deepEqual(firstWindow.openers.opened, []);
-    assert.deepEqual(JSON.parse(storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY)!), pendingEnvelope(requestA, requestB, requestC));
-    assert.equal(storage.getItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY), '22');
+    assert.deepEqual(readState(storage), stateEnvelope('22', requestA, requestB, requestC));
     assert.equal(firstWindow.messages.errors.length, 1);
 
     const windowA = createContribution('/workspace-a', storage, () => {
-        assert.deepEqual(JSON.parse(storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY)!), pendingEnvelope(requestB, requestC));
+        assert.deepEqual(readState(storage), stateEnvelope('22', requestB, requestC));
     });
     await windowA.contribution.restorePendingRequest();
     assert.deepEqual(windowA.openers.opened.map(entry => entry.uri.toString()), ['file:///workspace-a/a.R']);
     assert.deepEqual(windowA.workspace.opened.map(entry => entry.uri.toString()), ['file:///workspace-b']);
-    assert.deepEqual(JSON.parse(storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY)!), pendingEnvelope(requestB, requestC));
+    assert.deepEqual(readState(storage), stateEnvelope('22', requestB, requestC));
 
     const windowB = createContribution('/workspace-b', storage, () => {
-        assert.deepEqual(JSON.parse(storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY)!), pendingEnvelope(requestC));
+        assert.deepEqual(readState(storage), stateEnvelope('22', requestC));
     });
     await windowB.contribution.restorePendingRequest();
     assert.deepEqual(windowB.openers.opened.map(entry => entry.uri.toString()), ['file:///workspace-b/b.R']);
     assert.deepEqual(windowB.workspace.opened.map(entry => entry.uri.toString()), ['file:///workspace-c']);
-    assert.deepEqual(JSON.parse(storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY)!), pendingEnvelope(requestC));
+    assert.deepEqual(readState(storage), stateEnvelope('22', requestC));
 
     const windowC = createContribution('/workspace-c', storage, () => {
-        assert.equal(storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY), null);
+        assert.deepEqual(readState(storage), stateEnvelope('22'));
     });
     await windowC.contribution.restorePendingRequest();
     assert.deepEqual(windowC.openers.opened.map(entry => entry.uri.toString()), ['file:///workspace-c/c.R']);
     assert.deepEqual(windowC.workspace.opened, []);
-    assert.equal(storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY), null);
-    assert.equal(storage.getItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY), '22');
+    assert.deepEqual(readState(storage), stateEnvelope('22'));
 });
 
-test('reload rejects corrupt, non-increasing, invalid, or tail-unauthorized pending queues atomically', async () => {
+test('reload removes corrupt, non-increasing, invalid, or tail-unauthorized state without executing it', async () => {
     const request = (id: string, file: string): RideOpenRequest => ({
         id, source: 'singleInstance', workspace: '/project', files: [`/project/${file}`]
     });
     const cases = [
-        { serialized: '{not-json', last: '30' },
-        { serialized: JSON.stringify(pendingEnvelope(request('31', 'a.R'), request('30', 'b.R'))), last: '30' },
-        { serialized: JSON.stringify(pendingEnvelope(request('18446744073709551616', 'overflow.R'))), last: '18446744073709551616' },
-        { serialized: JSON.stringify(pendingEnvelope(request('31', 'a.R'))), last: '32' }
+        '{not-json',
+        JSON.stringify(stateEnvelope('30', request('31', 'a.R'), request('30', 'b.R'))),
+        JSON.stringify(stateEnvelope('18446744073709551616', request('18446744073709551616', 'overflow.R'))),
+        JSON.stringify(stateEnvelope('32', request('31', 'a.R')))
     ];
 
-    for (const { serialized, last } of cases) {
+    for (const serialized of cases) {
         const storage = new MemoryStorage();
-        storage.setItem(RIDE_OPEN_REQUEST_PENDING_KEY, serialized);
-        storage.setItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY, last);
+        storage.setItem(RIDE_OPEN_REQUEST_STATE_KEY, serialized);
         const context = createContribution('/project', storage);
 
         await context.contribution.restorePendingRequest();
 
-        assert.equal(storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY), null);
-        assert.equal(storage.getItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY), last);
+        assert.equal(storage.getItem(RIDE_OPEN_REQUEST_STATE_KEY), null);
         assert.deepEqual(context.openers.opened, []);
         assert.deepEqual(context.workspace.opened, []);
         assert.equal(context.messages.errors.length, 1);
     }
 });
 
-test('reload rejects pending requests that are not exactly authorized by last-consumed', async () => {
+test('reload rejects request queues that are not exactly authorized by their embedded last-consumed ID', async () => {
     const pending = {
         id: '99',
         source: 'singleInstance',
@@ -352,24 +554,20 @@ test('reload rejects pending requests that are not exactly authorized by last-co
         files: ['/project/analysis.R']
     };
     const cases = [
-        { lastConsumed: undefined, expectedLast: null },
-        { lastConsumed: 'not-an-id', expectedLast: 'not-an-id' },
-        { lastConsumed: '98', expectedLast: '98' },
-        { lastConsumed: '100', expectedLast: '100' }
+        { version: 2, requests: [pending] },
+        stateEnvelope('not-an-id', pending),
+        stateEnvelope('98', pending),
+        stateEnvelope('100', pending)
     ];
 
-    for (const { lastConsumed, expectedLast } of cases) {
+    for (const state of cases) {
         const storage = new MemoryStorage();
-        storage.setItem(RIDE_OPEN_REQUEST_PENDING_KEY, JSON.stringify(pendingEnvelope(pending)));
-        if (lastConsumed) {
-            storage.setItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY, lastConsumed);
-        }
+        storage.setItem(RIDE_OPEN_REQUEST_STATE_KEY, JSON.stringify(state));
         const context = createContribution('/project', storage);
 
         await context.contribution.restorePendingRequest();
 
-        assert.equal(storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY), null);
-        assert.equal(storage.getItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY), expectedLast);
+        assert.equal(storage.getItem(RIDE_OPEN_REQUEST_STATE_KEY), null);
         assert.deepEqual(context.openers.opened, []);
         assert.equal(context.messages.errors.length, 1);
     }
@@ -422,10 +620,9 @@ test('an observable workspace switch failure retains the ordered handoff without
         files: [String.raw`D:\other\file.R`]
     });
 
-    assert.deepEqual(JSON.parse(context.storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY)!), pendingEnvelope({
+    assert.deepEqual(readState(context.storage), stateEnvelope('5', {
         id: '5', source: 'singleInstance', workspace: 'D:/other', files: ['D:/other/file.R']
     }));
-    assert.equal(context.storage.getItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY), '5');
     assert.deepEqual(context.workspace.opened, []);
     assert.equal(context.messages.errors.length, 1);
     assert.match(context.messages.errors[0], /window switch failed/);
@@ -439,18 +636,17 @@ test('an observable workspace switch failure retains the ordered handoff without
     });
     assert.equal(context.openers.opened.length, 1);
     assert.deepEqual(context.workspace.opened, []);
-    assert.deepEqual(JSON.parse(context.storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY)!), pendingEnvelope(
+    assert.deepEqual(readState(context.storage), stateEnvelope('6',
         { id: '5', source: 'singleInstance', workspace: 'D:/other', files: ['D:/other/file.R'] },
         { id: '6', source: 'singleInstance', workspace: 'C:/project', files: ['C:/project/later.R'] }
     ));
-    assert.equal(context.storage.getItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY), '6');
 
     const restarted = createContribution(String.raw`D:\other`, context.storage);
     await restarted.contribution.restorePendingRequest();
     assert.deepEqual(restarted.openers.opened.map(entry => FileUri.fsPath(entry.uri).toLowerCase()), [String.raw`d:\other\file.r`]);
     assert.equal(restarted.workspace.opened.length, 1);
     assert.equal(FileUri.fsPath(restarted.workspace.opened[0].uri).toLowerCase(), String.raw`c:\project`);
-    assert.deepEqual(JSON.parse(context.storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY)!), pendingEnvelope(
+    assert.deepEqual(readState(context.storage), stateEnvelope('6',
         { id: '6', source: 'singleInstance', workspace: 'C:/project', files: ['C:/project/later.R'] }
     ));
 });
@@ -466,16 +662,14 @@ test('a queued workspace switch failure keeps the failed head and tail for a lat
     const requestC: RideOpenRequest = {
         id: '42', source: 'singleInstance', workspace: '/workspace-c', files: ['/workspace-c/c.R']
     };
-    storage.setItem(RIDE_OPEN_REQUEST_PENDING_KEY, JSON.stringify(pendingEnvelope(requestA, requestB, requestC)));
-    storage.setItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY, requestC.id);
+    storage.setItem(RIDE_OPEN_REQUEST_STATE_KEY, JSON.stringify(stateEnvelope(requestC.id, requestA, requestB, requestC)));
     const windowA = createContribution(requestA.workspace, storage);
     windowA.workspace.openError = new Error('queued switch failed');
 
     await windowA.contribution.restorePendingRequest();
 
     assert.deepEqual(windowA.openers.opened.map(entry => entry.uri.toString()), ['file:///workspace-a/a.R']);
-    assert.deepEqual(JSON.parse(storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY)!), pendingEnvelope(requestB, requestC));
-    assert.equal(storage.getItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY), requestC.id);
+    assert.deepEqual(readState(storage), stateEnvelope(requestC.id, requestB, requestC));
     assert.equal(windowA.workspace.opened.length, 0);
     assert.match(windowA.messages.errors[0], /queued switch failed/);
 
@@ -483,7 +677,7 @@ test('a queued workspace switch failure keeps the failed head and tail for a lat
     await windowB.contribution.restorePendingRequest();
     assert.deepEqual(windowB.openers.opened.map(entry => entry.uri.toString()), ['file:///workspace-b/b.R']);
     assert.deepEqual(windowB.workspace.opened.map(entry => entry.uri.toString()), ['file:///workspace-c']);
-    assert.deepEqual(JSON.parse(storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY)!), pendingEnvelope(requestC));
+    assert.deepEqual(readState(storage), stateEnvelope(requestC.id, requestC));
 });
 
 test('invalid payloads never consume IDs, write storage, open files, or switch workspaces', async () => {
@@ -515,31 +709,32 @@ test('invalid payloads never consume IDs, write storage, open files, or switch w
 
     assert.deepEqual(context.openers.opened, []);
     assert.deepEqual(context.workspace.opened, []);
-    assert.equal(context.storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY), null);
-    assert.equal(context.storage.getItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY), null);
+    assert.equal(context.storage.getItem(RIDE_OPEN_REQUEST_STATE_KEY), null);
     assert.equal(context.messages.errors.length, invalidPayloads.length);
 });
 
-test('corrupt or legacy pending JSON is removed and cannot trigger a restore loop', async () => {
+test('corrupt v2 state and unpublished v1 keys are removed without triggering a restore loop', async () => {
     const corruptStorage = new MemoryStorage();
-    corruptStorage.setItem(RIDE_OPEN_REQUEST_PENDING_KEY, '{not-json');
+    corruptStorage.setItem(RIDE_OPEN_REQUEST_STATE_KEY, '{not-json');
     const corrupt = createContribution('/project', corruptStorage);
     await corrupt.contribution.restorePendingRequest();
-    assert.equal(corruptStorage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY), null);
+    assert.equal(corruptStorage.getItem(RIDE_OPEN_REQUEST_STATE_KEY), null);
     assert.equal(corrupt.messages.errors.length, 1);
 
     const legacyStorage = new MemoryStorage();
-    legacyStorage.setItem(RIDE_OPEN_REQUEST_PENDING_KEY, JSON.stringify({
+    legacyStorage.setItem(LEGACY_PENDING_KEY, JSON.stringify({
         id: '8',
         source: 'singleInstance',
         workspace: '/other',
         files: ['/other/file.R']
     }));
-    legacyStorage.setItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY, '8');
+    legacyStorage.setItem(LEGACY_LAST_CONSUMED_KEY, '8');
     const legacy = createContribution('/project', legacyStorage);
     await legacy.contribution.restorePendingRequest();
 
-    assert.equal(legacyStorage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY), null);
+    assert.equal(legacyStorage.getItem(LEGACY_PENDING_KEY), null);
+    assert.equal(legacyStorage.getItem(LEGACY_LAST_CONSUMED_KEY), null);
+    assert.equal(legacyStorage.getItem(RIDE_OPEN_REQUEST_STATE_KEY), null);
     assert.deepEqual(legacy.openers.opened, []);
     assert.deepEqual(legacy.workspace.opened, []);
     assert.equal(legacy.messages.errors.length, 1);
@@ -555,7 +750,7 @@ test('last-consumed decimal IDs are monotonic without Number conversion', async 
     });
 
     assert.equal(context.openers.opened.length, 1);
-    assert.equal(context.storage.getItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY), '10');
+    assert.deepEqual(readState(context.storage), stateEnvelope('10'));
 });
 
 test('Unix root is a valid workspace boundary without weakening descendant checks', async () => {
@@ -578,13 +773,13 @@ test('Unix file components preserve legal leading and trailing spaces', async ()
     });
 
     assert.deepEqual(context.openers.opened.map(entry => entry.uri.path.toString()), ['/project/ report .R ']);
-    assert.equal(context.storage.getItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY), '11');
+    assert.deepEqual(readState(context.storage), stateEnvelope('11'));
     assert.deepEqual(context.messages.errors, []);
 
     await context.contribution.handleOpenRequest({
         id: '12', source: 'initial', workspace: '/project', files: ['']
     });
-    assert.equal(context.storage.getItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY), '11');
+    assert.deepEqual(readState(context.storage), stateEnvelope('11'));
     assert.equal(context.openers.opened.length, 1);
     assert.equal(context.messages.errors.length, 1);
 });
@@ -611,7 +806,7 @@ test('Windows drive roots with redundant separators remain same-workspace reques
 
         assert.deepEqual(context.openers.opened.map(entry => FileUri.fsPath(entry.uri).toLowerCase()), [String.raw`c:\root.r`]);
         assert.deepEqual(context.workspace.opened, []);
-        assert.equal(context.storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY), null);
+        assert.deepEqual(readState(context.storage), stateEnvelope('12'));
         assert.deepEqual(context.messages.errors, []);
     }
 });
@@ -624,10 +819,9 @@ test('redundant drive-root separators are canonical across handoff and reload', 
         id: '13', source: 'singleInstance', workspace: 'C:////', files: [String.raw`C:\root.R`]
     });
 
-    assert.deepEqual(JSON.parse(storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY)!), pendingEnvelope({
+    assert.deepEqual(readState(storage), stateEnvelope('13', {
         id: '13', source: 'singleInstance', workspace: 'C:/', files: ['C:/root.R']
     }));
-    assert.equal(storage.getItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY), '13');
     assert.equal(FileUri.fsPath(firstWindow.workspace.opened[0].uri).toLowerCase(), 'c:\\');
     assert.deepEqual(firstWindow.workspace.opened[0].options, { preserveWindow: true });
     assert.deepEqual(firstWindow.openers.opened, []);
@@ -636,7 +830,7 @@ test('redundant drive-root separators are canonical across handoff and reload', 
     await reloadedWindow.contribution.restorePendingRequest();
 
     assert.deepEqual(reloadedWindow.openers.opened.map(entry => FileUri.fsPath(entry.uri).toLowerCase()), [String.raw`c:\root.r`]);
-    assert.equal(storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY), null);
+    assert.deepEqual(readState(storage), stateEnvelope('13'));
 });
 
 test('drive-relative and malformed Windows paths remain rejected without consuming the request ID', async () => {
@@ -658,9 +852,87 @@ test('drive-relative and malformed Windows paths remain rejected without consumi
 
     assert.deepEqual(context.openers.opened, []);
     assert.deepEqual(context.workspace.opened, []);
-    assert.equal(context.storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY), null);
-    assert.equal(context.storage.getItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY), null);
+    assert.equal(context.storage.getItem(RIDE_OPEN_REQUEST_STATE_KEY), null);
     assert.equal(context.messages.errors.length, invalidRequests.length);
+});
+
+test('Windows current-drive-rooted workspace and file paths are rejected without state or side effects', async () => {
+    const cases = [
+        {
+            current: String.raw`C:\project`,
+            workspace: String.raw`\project`,
+            files: [String.raw`\project\file.R`]
+        },
+        {
+            current: String.raw`D:\elsewhere`,
+            workspace: String.raw`\project`,
+            files: [String.raw`\project\file.R`]
+        },
+        {
+            current: String.raw`C:\project`,
+            workspace: String.raw`C:\project`,
+            files: [String.raw`\project\file.R`]
+        }
+    ];
+
+    for (const { current, workspace, files } of cases) {
+        const context = createContribution(current);
+        await context.contribution.handleOpenRequest({
+            id: '15', source: 'initial', workspace, files
+        });
+
+        assert.equal(context.storage.getItem(RIDE_OPEN_REQUEST_STATE_KEY), null);
+        assert.deepEqual(context.openers.opened, []);
+        assert.deepEqual(context.workspace.opened, []);
+        assert.equal(context.messages.errors.length, 1);
+    }
+});
+
+test('reload removes a current-drive-rooted request without navigating or looping', async () => {
+    const storage = new MemoryStorage();
+    storage.setItem(RIDE_OPEN_REQUEST_STATE_KEY, JSON.stringify(stateEnvelope('15', {
+        id: '15',
+        source: 'singleInstance',
+        workspace: String.raw`\project`,
+        files: [String.raw`\project\file.R`]
+    })));
+    const first = createContribution(String.raw`C:\project`, storage);
+
+    await first.contribution.restorePendingRequest();
+
+    assert.equal(storage.getItem(RIDE_OPEN_REQUEST_STATE_KEY), null);
+    assert.deepEqual(first.openers.opened, []);
+    assert.deepEqual(first.workspace.opened, []);
+    assert.equal(first.messages.errors.length, 1);
+
+    const restarted = createContribution(String.raw`C:\project`, storage);
+    await restarted.contribution.restorePendingRequest();
+    assert.deepEqual(restarted.openers.opened, []);
+    assert.deepEqual(restarted.workspace.opened, []);
+    assert.deepEqual(restarted.messages.errors, []);
+});
+
+test('Unix absolute paths preserve backslashes as literal filename characters', async () => {
+    const context = createContribution('/project');
+    const file = String.raw`/project/name\part.R`;
+
+    await context.contribution.handleOpenRequest({
+        id: '16', source: 'initial', workspace: '/project', files: [file]
+    });
+
+    assert.equal(context.openers.opened.length, 1);
+    assert.deepEqual(context.workspace.opened, []);
+    assert.deepEqual(readState(context.storage), stateEnvelope('16'));
+    assert.deepEqual(context.messages.errors, []);
+
+    const handoff = createContribution('/elsewhere');
+    await handoff.contribution.handleOpenRequest({
+        id: '17', source: 'singleInstance', workspace: '/project', files: [file]
+    });
+    assert.deepEqual(readState(handoff.storage), stateEnvelope('17', {
+        id: '17', source: 'singleInstance', workspace: '/project', files: [file]
+    }));
+    assert.equal(handoff.workspace.opened.length, 1);
 });
 
 test('UNC share root is valid while empty segments and traversal remain rejected', async () => {
@@ -683,7 +955,7 @@ test('UNC share root is valid while empty segments and traversal remain rejected
     });
 
     assert.deepEqual(invalid.openers.opened, []);
-    assert.equal(invalid.storage.getItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY), null);
+    assert.equal(invalid.storage.getItem(RIDE_OPEN_REQUEST_STATE_KEY), null);
     assert.equal(invalid.messages.errors.length, 2);
 });
 
@@ -738,13 +1010,12 @@ test('browser-preview open-request listener is a no-op', async () => {
 
 test('frontend lifecycle restores and registers once, then unlistens once on cleanup', async () => {
     const storage = new MemoryStorage();
-    storage.setItem(RIDE_OPEN_REQUEST_PENDING_KEY, JSON.stringify(pendingEnvelope({
+    storage.setItem(RIDE_OPEN_REQUEST_STATE_KEY, JSON.stringify(stateEnvelope('12', {
         id: '12',
         source: 'initial',
         workspace: '/project',
         files: ['/project/startup.R']
     })));
-    storage.setItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY, '12');
     const context = createContribution('/project', storage);
 
     await context.contribution.onStart();
@@ -760,13 +1031,12 @@ test('frontend lifecycle restores and registers once, then unlistens once on cle
 
 test('frontend startup waits for the workspace before restoring pending files', async () => {
     const storage = new MemoryStorage();
-    storage.setItem(RIDE_OPEN_REQUEST_PENDING_KEY, JSON.stringify(pendingEnvelope({
+    storage.setItem(RIDE_OPEN_REQUEST_STATE_KEY, JSON.stringify(stateEnvelope('14', {
         id: '14',
         source: 'initial',
         workspace: '/project',
         files: ['/project/ready.R']
     })));
-    storage.setItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY, '14');
     const context = createContribution('/project', storage);
     const readyWorkspace = context.workspace.workspace;
     context.workspace.workspace = undefined;
@@ -780,11 +1050,13 @@ test('frontend startup waits for the workspace before restoring pending files', 
 
     const started = context.contribution.onStart();
     await Promise.resolve();
-    assert.notEqual(storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY), null);
+    assert.deepEqual(readState(storage), stateEnvelope('14', {
+        id: '14', source: 'initial', workspace: '/project', files: ['/project/ready.R']
+    }));
     assert.deepEqual(context.openers.opened, []);
 
     markReady!();
     await started;
-    assert.equal(storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY), null);
+    assert.deepEqual(readState(storage), stateEnvelope('14'));
     assert.equal(context.openers.opened.length, 1);
 });

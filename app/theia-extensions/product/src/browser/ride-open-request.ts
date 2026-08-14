@@ -19,9 +19,12 @@ import type { WorkspaceService } from '@theia/workspace/lib/browser';
 import type { RideNativeChrome } from './ride-native-chrome';
 
 const MAX_U64_ID = '18446744073709551615';
+const MAX_PENDING_REQUESTS = 64;
+const MAX_STATE_CHARS = 262_144;
 
-export const RIDE_OPEN_REQUEST_PENDING_KEY = 'r-ide.open-request.pending.v1';
-export const RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY = 'r-ide.open-request.last-consumed.v1';
+export const RIDE_OPEN_REQUEST_STATE_KEY = 'r-ide.open-request.state.v2';
+const LEGACY_PENDING_KEY = 'r-ide.open-request.pending.v1';
+const LEGACY_LAST_CONSUMED_KEY = 'r-ide.open-request.last-consumed.v1';
 
 export type RideOpenRequestSource = 'initial' | 'singleInstance' | 'openedUrl';
 
@@ -32,10 +35,16 @@ export interface RideOpenRequest {
     files: string[];
 }
 
-interface RideOpenRequestQueue {
-    readonly version: 1;
+interface RideOpenRequestState {
+    readonly version: 2;
+    readonly lastConsumed: string;
     readonly requests: RideOpenRequest[];
 }
+
+type RideOpenRequestStateRead =
+    | { readonly kind: 'missing' }
+    | { readonly kind: 'invalid' }
+    | { readonly kind: 'valid'; readonly state: RideOpenRequestState };
 
 interface NormalizedNativePath {
     readonly comparisonPath: string;
@@ -108,25 +117,35 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
             return;
         }
 
-        const pendingRequests = await this.readPendingRequests();
-        if (pendingRequests) {
-            const tail = pendingRequests[pendingRequests.length - 1];
-            if (compareDecimalIds(request.id, tail.id) <= 0) {
-                return;
-            }
-            this.writePendingRequests([...pendingRequests, request]);
-            this.storage.setItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY, request.id);
+        const stateRead = await this.readState();
+        if (stateRead.kind === 'invalid') {
+            return;
+        }
+        const state = stateRead.kind === 'valid' ? stateRead.state : undefined;
+        if (state && compareDecimalIds(request.id, state.lastConsumed) <= 0) {
             return;
         }
 
-        const previousId = this.readLastConsumedId();
-        if (previousId && compareDecimalIds(request.id, previousId) <= 0) {
+        if (state && state.requests.length > 0) {
+            await this.commitState({
+                version: 2,
+                lastConsumed: request.id,
+                requests: [...state.requests, request]
+            });
             return;
         }
-        this.storage.setItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY, request.id);
 
-        if (!this.isCurrentWorkspace(request.workspace)) {
-            this.writePendingRequests([request]);
+        const currentWorkspace = this.isCurrentWorkspace(request.workspace);
+        const nextState: RideOpenRequestState = {
+            version: 2,
+            lastConsumed: request.id,
+            requests: currentWorkspace ? [] : [request]
+        };
+        if (!await this.commitState(nextState)) {
+            return;
+        }
+
+        if (!currentWorkspace) {
             try {
                 this.workspaceService.open(FileUri.create(request.workspace), { preserveWindow: true });
             } catch (error) {
@@ -144,18 +163,11 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
         }
         this.restoreAttempted = true;
 
-        const serialized = this.storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY) ?? undefined;
-        if (serialized === undefined) {
+        const stateRead = await this.readState();
+        if (stateRead.kind !== 'valid' || stateRead.state.requests.length === 0) {
             return;
         }
-        this.storage.removeItem(RIDE_OPEN_REQUEST_PENDING_KEY);
-
-        const pendingRequests = await this.deserializePendingRequests(serialized);
-        if (!pendingRequests) {
-            return;
-        }
-
-        await this.dispatchPendingRequests(pendingRequests);
+        await this.dispatchPendingRequests(stateRead.state);
     }
 
     protected enqueueOpenRequest(request: RideOpenRequest): void {
@@ -184,29 +196,27 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
         }
     }
 
-    protected async readPendingRequests(): Promise<RideOpenRequest[] | undefined> {
-        const serialized = this.storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY) ?? undefined;
+    protected async readState(): Promise<RideOpenRequestStateRead> {
+        const serialized = this.storage.getItem(RIDE_OPEN_REQUEST_STATE_KEY) ?? undefined;
         if (serialized === undefined) {
-            return undefined;
+            return this.clearLegacyState();
         }
-        const requests = await this.deserializePendingRequests(serialized);
-        if (!requests) {
-            this.storage.removeItem(RIDE_OPEN_REQUEST_PENDING_KEY);
+        if (serialized.length > MAX_STATE_CHARS) {
+            return this.rejectInvalidState('R-IDE discarded an oversized file-open state.');
         }
-        return requests;
-    }
 
-    protected async deserializePendingRequests(serialized: string): Promise<RideOpenRequest[] | undefined> {
         let payload: unknown;
         try {
             payload = JSON.parse(serialized);
         } catch {
-            await this.messageService.error('R-IDE discarded a corrupt pending file-open queue.');
-            return undefined;
+            return this.rejectInvalidState('R-IDE discarded a corrupt file-open state.');
         }
-        if (!isRecord(payload) || payload.version !== 1 || !Array.isArray(payload.requests) || payload.requests.length === 0) {
-            await this.messageService.error('R-IDE discarded an invalid pending file-open queue.');
-            return undefined;
+        if (!isRecord(payload)
+            || payload.version !== 2
+            || !isCanonicalU64(payload.lastConsumed)
+            || !Array.isArray(payload.requests)
+            || payload.requests.length > MAX_PENDING_REQUESTS) {
+            return this.rejectInvalidState('R-IDE discarded an invalid file-open state.');
         }
 
         const requests: RideOpenRequest[] = [];
@@ -214,26 +224,77 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
             const request = this.validateRequest(candidate);
             const previous = requests[requests.length - 1];
             if (!request || previous && compareDecimalIds(request.id, previous.id) <= 0) {
-                await this.messageService.error('R-IDE discarded an invalid pending file-open queue.');
-                return undefined;
+                return this.rejectInvalidState('R-IDE discarded an invalid file-open state.');
             }
             requests.push(request);
         }
-
-        const lastId = this.storage.getItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY) ?? undefined;
-        if (!isCanonicalU64(lastId) || lastId !== requests[requests.length - 1].id) {
-            await this.messageService.error('R-IDE discarded an unauthorized pending file-open queue.');
-            return undefined;
+        if (requests.length > 0 && requests[requests.length - 1].id !== payload.lastConsumed) {
+            return this.rejectInvalidState('R-IDE discarded an unauthorized file-open state.');
         }
-        return requests;
+        return {
+            kind: 'valid',
+            state: { version: 2, lastConsumed: payload.lastConsumed, requests }
+        };
     }
 
-    protected async dispatchPendingRequests(requests: RideOpenRequest[]): Promise<void> {
-        let remaining = requests;
-        while (remaining.length > 0) {
-            const request = remaining[0];
+    protected async clearLegacyState(): Promise<RideOpenRequestStateRead> {
+        const legacyPending = this.storage.getItem(LEGACY_PENDING_KEY) ?? undefined;
+        const legacyLastConsumed = this.storage.getItem(LEGACY_LAST_CONSUMED_KEY) ?? undefined;
+        if (legacyPending === undefined && legacyLastConsumed === undefined) {
+            return { kind: 'missing' };
+        }
+        try {
+            this.storage.removeItem(LEGACY_PENDING_KEY);
+            this.storage.removeItem(LEGACY_LAST_CONSUMED_KEY);
+        } catch (error) {
+            await this.messageService.error(`R-IDE could not clear legacy file-open state: ${errorMessage(error)}`);
+            return { kind: 'invalid' };
+        }
+        await this.messageService.error('R-IDE discarded unpublished legacy file-open state.');
+        return { kind: 'invalid' };
+    }
+
+    protected async rejectInvalidState(message: string): Promise<RideOpenRequestStateRead> {
+        try {
+            this.storage.removeItem(RIDE_OPEN_REQUEST_STATE_KEY);
+        } catch (error) {
+            await this.messageService.error(`R-IDE could not clear invalid file-open state: ${errorMessage(error)}`);
+            return { kind: 'invalid' };
+        }
+        await this.messageService.error(message);
+        return { kind: 'invalid' };
+    }
+
+    protected async commitState(state: RideOpenRequestState): Promise<boolean> {
+        if (state.requests.length > MAX_PENDING_REQUESTS) {
+            await this.messageService.error(`R-IDE cannot queue more than ${MAX_PENDING_REQUESTS} file-open requests.`);
+            return false;
+        }
+        let serialized: string;
+        try {
+            serialized = JSON.stringify(state);
+        } catch (error) {
+            await this.messageService.error(`R-IDE could not serialize file-open state: ${errorMessage(error)}`);
+            return false;
+        }
+        if (serialized.length > MAX_STATE_CHARS) {
+            await this.messageService.error('R-IDE could not save an oversized file-open state.');
+            return false;
+        }
+        try {
+            this.storage.setItem(RIDE_OPEN_REQUEST_STATE_KEY, serialized);
+        } catch (error) {
+            await this.messageService.error(`R-IDE could not save file-open state: ${errorMessage(error)}`);
+            return false;
+        }
+        return true;
+    }
+
+    protected async dispatchPendingRequests(initialState: RideOpenRequestState): Promise<void> {
+        let state = initialState;
+        while (state.requests.length > 0) {
+            const request = state.requests[0];
             if (!this.isCurrentWorkspace(request.workspace)) {
-                this.writePendingRequests(remaining);
                 try {
                     this.workspaceService.open(FileUri.create(request.workspace), { preserveWindow: true });
                 } catch (error) {
@@ -242,19 +303,16 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
                 return;
             }
 
-            remaining = remaining.slice(1);
-            if (remaining.length > 0) {
-                this.writePendingRequests(remaining);
-            } else {
-                this.storage.removeItem(RIDE_OPEN_REQUEST_PENDING_KEY);
+            const nextState: RideOpenRequestState = {
+                ...state,
+                requests: state.requests.slice(1)
+            };
+            if (!await this.commitState(nextState)) {
+                return;
             }
             await this.openFiles(request);
+            state = nextState;
         }
-    }
-
-    protected writePendingRequests(requests: RideOpenRequest[]): void {
-        const queue: RideOpenRequestQueue = { version: 1, requests };
-        this.storage.setItem(RIDE_OPEN_REQUEST_PENDING_KEY, JSON.stringify(queue));
     }
 
     protected validateRequest(payload: unknown): RideOpenRequest | undefined {
@@ -282,24 +340,15 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
         };
     }
 
-    protected readLastConsumedId(): string | undefined {
-        const id = this.storage.getItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY) ?? undefined;
-        if (isCanonicalU64(id)) {
-            return id;
-        }
-        if (id !== undefined) {
-            this.storage.removeItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY);
-        }
-        return undefined;
-    }
-
     protected isCurrentWorkspace(workspacePath: string): boolean {
         const current = this.workspaceService.workspace?.resource;
         if (!current || current.scheme !== 'file') {
             return false;
         }
         const requestedWorkspace = normalizeNativePath(workspacePath);
-        const currentWorkspace = normalizeNativePath(FileUri.fsPath(current));
+        const currentWorkspace = requestedWorkspace
+            ? normalizeNativePath(requestedWorkspace.windows ? FileUri.fsPath(current) : current.path.toString())
+            : undefined;
         return !!requestedWorkspace
             && !!currentWorkspace
             && requestedWorkspace.windows === currentWorkspace.windows
@@ -342,8 +391,14 @@ function normalizeNativePath(value: string): NormalizedNativePath | undefined {
     if (!value || /[\0-\x1f]/.test(value)) {
         return undefined;
     }
+    if (/^\\(?!\\)/.test(value)) {
+        return undefined;
+    }
 
-    let normalized = value.replace(/\\/g, '/');
+    const windows = /^[A-Za-z]:[\\/]/.test(value)
+        || /^\\\\/.test(value)
+        || /^\/\/(?:\?\/|[^/]+\/[^/]+(?:\/|$))/.test(value);
+    let normalized = windows ? value.replace(/\\/g, '/') : value;
     if (/^\/\/\?\/UNC\//i.test(normalized)) {
         normalized = `//${normalized.slice(8)}`;
     } else if (/^\/\/\?\/[A-Za-z]:\//.test(normalized)) {
@@ -353,11 +408,10 @@ function normalizeNativePath(value: string): NormalizedNativePath | undefined {
         normalized = `${normalized.slice(0, 2)}/`;
     }
 
-    let windows = false;
-    if (/^[A-Za-z]:\//.test(normalized)) {
-        windows = true;
-    } else if (/^\/\/[^/]+\/[^/]+(?:\/|$)/.test(normalized)) {
-        windows = true;
+    if (windows) {
+        if (!/^[A-Za-z]:\//.test(normalized) && !/^\/\/[^/]+\/[^/]+(?:\/|$)/.test(normalized)) {
+            return undefined;
+        }
     } else if (!normalized.startsWith('/') || normalized.startsWith('//')) {
         return undefined;
     }
