@@ -68,7 +68,7 @@ impl AppState {
 
 /// Registers the activation plugin first, then injects its state before the
 /// returned builder can initialize plugins.
-pub fn configure_activation_builder<B, P, RegisterPlugin, ManageState>(
+fn configure_activation_builder<B, P, RegisterPlugin, ManageState>(
     builder: B,
     activation_plugin: P,
     initial_launch_intent: Option<launch_intent::LaunchIntent>,
@@ -236,4 +236,81 @@ pub fn run() {
         }
         _ => {}
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    struct ProbePlugin {
+        setup: Box<dyn FnOnce(&AppState)>,
+    }
+
+    struct ProbeBuilder {
+        plugin: Option<ProbePlugin>,
+        state: Option<AppState>,
+        assembly_order: Vec<&'static str>,
+    }
+
+    impl ProbeBuilder {
+        fn build(mut self) -> AppState {
+            assert_eq!(self.assembly_order, ["plugin", "state"]);
+            let state = self.state.take().expect("managed AppState");
+            let plugin = self.plugin.take().expect("registered activation plugin");
+            (plugin.setup)(&state);
+            state
+        }
+    }
+
+    #[test]
+    fn app_state_is_available_during_first_plugin_setup() {
+        let initial = launch_intent::LaunchIntent {
+            id: 1,
+            source: launch_intent::LaunchSource::Initial,
+            workspace: "workspace".into(),
+            files: vec!["workspace/initial.R".into()],
+        };
+        let setup_next_id = Arc::new(Mutex::new(None));
+        let observed_setup_next_id = Arc::clone(&setup_next_id);
+        let probe = ProbePlugin {
+            setup: Box::new(move |state| {
+                *observed_setup_next_id
+                    .lock()
+                    .expect("setup observation mutex") = state.launch_intent_router.next_id();
+            }),
+        };
+
+        let app = configure_activation_builder(
+            ProbeBuilder {
+                plugin: None,
+                state: None,
+                assembly_order: Vec::new(),
+            },
+            probe,
+            Some(initial.clone()),
+            |mut builder, plugin| {
+                builder.assembly_order.push("plugin");
+                builder.plugin = Some(plugin);
+                builder
+            },
+            |mut builder, state| {
+                builder.assembly_order.push("state");
+                builder.state = Some(state);
+                builder
+            },
+        )
+        .build();
+
+        assert_eq!(
+            *setup_next_id.lock().expect("setup observation mutex"),
+            Some(2)
+        );
+        let mut delivered = Vec::new();
+        app.launch_intent_router.frontend_ready(|intent| {
+            delivered.push(intent.clone());
+            Ok::<_, ()>(())
+        });
+        assert_eq!(delivered, vec![initial]);
+    }
 }
