@@ -11,6 +11,7 @@
 
 pub mod commands;
 pub mod download;
+pub mod launch_intent;
 pub mod native_chrome;
 pub mod sidecar;
 
