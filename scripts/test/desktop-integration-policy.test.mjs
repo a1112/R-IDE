@@ -23,6 +23,12 @@ const linuxDesktopTemplatePath = path.join(tauriDirectory, 'linux', 'r-ide.deskt
 const appImageDesktopPath = path.join(tauriDirectory, 'linux', 'r-ide-appimage.desktop');
 const linuxMimePackagePath = path.join(tauriDirectory, 'linux', 'r-ide-mime.xml');
 const linuxMimeUpdateScriptPath = path.join(tauriDirectory, 'linux', 'update-mime-database.sh');
+const appImageIntegrationScriptPath = path.join(
+  tauriDirectory,
+  'linux',
+  'appimage-integration.sh',
+);
+const cargoManifestPath = path.join(tauriDirectory, 'Cargo.toml');
 
 const editorAssociation = { role: 'Editor', rank: 'Alternate' };
 const approvedAssociations = [
@@ -65,6 +71,34 @@ const approvedAssociations = [
   { ext: ['markdown', 'md'], mimeType: 'text/markdown', name: 'Markdown Document', description: 'Markdown document', ...editorAssociation },
 ];
 const approvedExtensions = approvedAssociations.flatMap(({ ext }) => ext).sort();
+const ubuntuSharedMimeInfo21Globs = new Map([
+  ['c', 'text/x-csrc'],
+  ['cc', 'text/x-c++src'],
+  ['cpp', 'text/x-c++src'],
+  ['cs', 'text/x-csharp'],
+  ['css', 'text/css'],
+  ['cxx', 'text/x-c++src'],
+  ['go', 'text/x-go'],
+  ['h', 'text/x-chdr'],
+  ['hpp', 'text/x-c++hdr'],
+  ['htm', 'text/html'],
+  ['html', 'text/html'],
+  ['java', 'text/x-java'],
+  ['js', 'application/javascript'],
+  ['json', 'application/json'],
+  ['kt', 'text/x-kotlin'],
+  ['markdown', 'text/markdown'],
+  ['md', 'text/markdown'],
+  ['mjs', 'application/javascript'],
+  ['py', 'text/x-python'],
+  ['rs', 'text/rust'],
+  ['scss', 'text/x-scss'],
+  ['sh', 'application/x-shellscript'],
+  ['sql', 'application/sql'],
+  ['xml', 'application/xml'],
+  ['yaml', 'application/x-yaml'],
+  ['yml', 'application/x-yaml'],
+]);
 const ubuntuSharedMimeInfo24Globs = new Map([
   ['bat', 'application/x-bat'],
   ['c', 'text/x-csrc'],
@@ -86,6 +120,7 @@ const ubuntuSharedMimeInfo24Globs = new Map([
   ['markdown', 'text/markdown'],
   ['md', 'text/markdown'],
   ['mjs', 'text/javascript'],
+  ['mts', 'video/mp2t'],
   ['ps1', 'application/x-powershell'],
   ['py', 'text/x-python'],
   ['rs', 'text/rust'],
@@ -93,9 +128,14 @@ const ubuntuSharedMimeInfo24Globs = new Map([
   ['sh', 'application/x-shellscript'],
   ['sql', 'application/sql'],
   ['toml', 'application/toml'],
+  ['ts', 'video/mp2t'],
   ['xml', 'application/xml'],
   ['yaml', 'application/yaml'],
   ['yml', 'application/yaml'],
+]);
+const ubuntuSharedMimeInfoFixtures = new Map([
+  ['Ubuntu 22.04 / shared-mime-info 2.1', ubuntuSharedMimeInfo21Globs],
+  ['Ubuntu 24.04 / shared-mime-info 2.4', ubuntuSharedMimeInfo24Globs],
 ]);
 
 test('Tauri registers the approved code and workspace file associations', () => {
@@ -124,6 +164,22 @@ test('the main Tauri window suspends background throttling', () => {
 function readRequiredText(filePath, description) {
   assert.ok(fs.existsSync(filePath), `expected ${description} at ${filePath}`);
   return fs.readFileSync(filePath, 'utf8');
+}
+
+function cargoMainBinaryName(manifest) {
+  const packageBlock = manifest.match(/^\[package\]\r?\n([\s\S]*?)(?=^\[|\s*$)/m)?.[1];
+  assert.ok(packageBlock, 'Cargo manifest must contain a [package] table');
+  const packageName = packageBlock.match(/^name\s*=\s*"([^"]+)"/m)?.[1];
+  const defaultRun = packageBlock.match(/^default-run\s*=\s*"([^"]+)"/m)?.[1];
+  assert.ok(packageName, 'Cargo [package] table must declare name');
+  if (defaultRun) {
+    return defaultRun;
+  }
+
+  const binaryNames = [...manifest.matchAll(/^\[\[bin\]\]\r?\n([\s\S]*?)(?=^\[|\s*$)/gm)]
+    .map((match) => match[1].match(/^name\s*=\s*"([^"]+)"/m)?.[1])
+    .filter(Boolean);
+  return binaryNames.length === 1 ? binaryNames[0] : packageName;
 }
 
 function readNsisMacro(source, name) {
@@ -232,18 +288,28 @@ test('NSIS registers R-IDE as an alternate editor without changing extension def
 
 test('WiX registers the same R-IDE-owned Open With contract without default associations', () => {
   const fragment = readRequiredText(wixFragmentPath, 'WiX file-association fragment');
+  const mainBinaryName = cargoMainBinaryName(
+    readRequiredText(cargoManifestPath, 'Tauri Cargo manifest'),
+  );
+  const wixMainBinaryName = fragment.match(
+    /<\?define RIDEMainBinaryName = "([^"]+)\.exe" \?>/,
+  )?.[1];
   const openWithExtensions = [
     ...fragment.matchAll(/Key="Software\\Classes\\\.([^\\"]+)\\OpenWithProgids"/g),
   ].map((match) => match[1]).sort();
   const supportedTypesBlock = fragment.match(
-    /<RegistryKey Root="HKLM" Key="Software\\Classes\\Applications\\ride-tauri\.exe\\SupportedTypes">([\s\S]*?)<\/RegistryKey>/,
+    new RegExp(`<RegistryKey Root="HKLM" Key="Software\\\\Classes\\\\Applications\\\\\\$\\(var\\.RIDEMainBinaryName\\)\\\\SupportedTypes">([\\s\\S]*?)<\\/RegistryKey>`),
   )?.[1];
   const capabilitiesBlock = fragment.match(
     /<RegistryKey Root="HKLM" Key="Software\\R-IDE\\Capabilities\\FileAssociations">([\s\S]*?)<\/RegistryKey>/,
   )?.[1];
 
   assert.deepEqual(openWithExtensions, approvedExtensions);
-  assert.ok(supportedTypesBlock, 'WiX must declare Applications/ride-tauri.exe/SupportedTypes');
+  assert.equal(wixMainBinaryName, mainBinaryName);
+  assert.ok(
+    supportedTypesBlock,
+    `WiX must declare Applications/${mainBinaryName}.exe/SupportedTypes through RIDEMainBinaryName`,
+  );
   assert.ok(capabilitiesBlock, 'WiX must declare R-IDE Capabilities/FileAssociations');
   assert.deepEqual(
     [...supportedTypesBlock.matchAll(/<RegistryValue Name="\.([^"]+)"/g)].map((match) => match[1]).sort(),
@@ -302,6 +368,7 @@ test('Linux packaging never writes a default MIME handler', () => {
     readRequiredText(appImageDesktopPath, 'AppImage desktop entry'),
     readRequiredText(linuxMimePackagePath, 'R-IDE shared MIME package'),
     readRequiredText(linuxMimeUpdateScriptPath, 'shared MIME cache update script'),
+    readRequiredText(appImageIntegrationScriptPath, 'AppImage integration script'),
   ].join('\n');
 
   assert.throws(
@@ -315,24 +382,27 @@ test('Linux packaging never writes a default MIME handler', () => {
   assertNoLinuxDefaultHandlerWrites(linuxSources);
 });
 
-test('R-IDE shared MIME metadata covers every Ubuntu 2.4 mapping gap', () => {
+test('R-IDE shared MIME metadata covers every Ubuntu 2.1 and 2.4 mapping gap', () => {
   const mimePackage = readRequiredText(linuxMimePackagePath, 'R-IDE shared MIME package');
   const supplementalGlobs = parseSharedMimeGlobs(mimePackage);
   const expectedSupplementalExtensions = [];
 
   for (const { ext: extensions, mimeType } of approvedAssociations) {
     for (const extension of extensions) {
-      if (ubuntuSharedMimeInfo24Globs.get(extension) === mimeType) {
+      const incompatibleFixtures = [...ubuntuSharedMimeInfoFixtures]
+        .filter(([, globs]) => globs.get(extension) !== mimeType)
+        .map(([name]) => name);
+      if (incompatibleFixtures.length === 0) {
         assert.ok(
           !supplementalGlobs.has(extension),
-          `.${extension} already has the approved ${mimeType} mapping in Ubuntu 2.4`,
+          `.${extension} already has the approved ${mimeType} mapping in every Ubuntu fixture`,
         );
       } else {
         expectedSupplementalExtensions.push(extension);
         assert.deepEqual(
           supplementalGlobs.get(extension),
           { mimeType, weight: 80 },
-          `.${extension} must override the Ubuntu 2.4 mapping with ${mimeType}`,
+          `.${extension} must provide ${mimeType} for ${incompatibleFixtures.join(', ')}`,
         );
       }
     }

@@ -1,4 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
+<?define RIDEMainBinaryName = "ride-tauri.exe" ?>
 <?if $(sys.BUILDARCH)="x86"?>
   <?define RIDEWin64 = "no" ?>
 <?else?>
@@ -75,7 +76,7 @@
         <RegistryKey Root="HKLM" Key="Software\Classes\.yml\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
         <RegistryKey Root="HKLM" Key="Software\Classes\.zsh\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
 
-        <RegistryKey Root="HKLM" Key="Software\Classes\Applications\ride-tauri.exe\SupportedTypes">
+        <RegistryKey Root="HKLM" Key="Software\Classes\Applications\$(var.RIDEMainBinaryName)\SupportedTypes">
           <RegistryValue Name=".bash" Type="string" Value="" />
           <RegistryValue Name=".bat" Type="string" Value="" />
           <RegistryValue Name=".c" Type="string" Value="" />

@@ -22,7 +22,9 @@
       "appimage": {
         "files": {
           "/usr/share/mime/packages/r-ide.xml": "linux/r-ide-mime.xml",
-          "/usr/share/applications/R-IDE.desktop": "linux/r-ide-appimage.desktop"
+          "/usr/share/applications/R-IDE.desktop": "linux/r-ide-appimage.desktop",
+          "/usr/lib/R-IDE/appimage-integration.sh": "linux/appimage-integration.sh",
+          "/usr/lib/R-IDE/r-ide-mime.xml": "linux/r-ide-mime.xml"
         }
       }
     }

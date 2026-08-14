@@ -6,10 +6,22 @@
     <glob pattern="*.zsh" weight="80"/>
   </mime-type>
   <mime-type type="application/x-bat">
+    <glob pattern="*.bat" weight="80"/>
     <glob pattern="*.cmd" weight="80"/>
   </mime-type>
+  <mime-type type="application/x-fishscript">
+    <glob pattern="*.fish" weight="80"/>
+  </mime-type>
   <mime-type type="application/x-powershell">
+    <glob pattern="*.ps1" weight="80"/>
     <glob pattern="*.psm1" weight="80"/>
+  </mime-type>
+  <mime-type type="application/toml">
+    <glob pattern="*.toml" weight="80"/>
+  </mime-type>
+  <mime-type type="application/yaml">
+    <glob pattern="*.yaml" weight="80"/>
+    <glob pattern="*.yml" weight="80"/>
   </mime-type>
   <mime-type type="text/x-kotlin">
     <glob pattern="*.kts" weight="80"/>
@@ -19,6 +31,8 @@
   </mime-type>
   <mime-type type="text/javascript">
     <glob pattern="*.cjs" weight="80"/>
+    <glob pattern="*.js" weight="80"/>
+    <glob pattern="*.mjs" weight="80"/>
   </mime-type>
   <mime-type type="application/typescript">
     <comment>TypeScript source file</comment>

@@ -90,6 +90,7 @@ test('quality and compatibility jobs run the required Node builds and Rust check
   const jobs = Object.fromEntries(jobBlocks(workflow).map(({ name, text }) => [name, text]));
   assert.match(jobs.quality, /node --test scripts\/test\/upstream-sync\/\*\.test\.mjs scripts\/test\/workflow-policy\.test\.mjs/);
   assert.match(jobs.quality, /node --test[^\n]*scripts\/test\/desktop-integration-policy\.test\.mjs/);
+  assert.match(jobs.quality, /node --test[^\n]*scripts\/test\/appimage-integration\.test\.mjs/);
   assert.match(jobs.quality, /yarn lint/);
   assert.match(jobs.quality, /yarn build:extensions/);
   assert.match(jobs.quality, /yarn browser build/);
