@@ -410,7 +410,7 @@ impl LaunchIntentRouter {
         self.deliver_after(deliveries, || {}, emit)
     }
 
-    pub fn frontend_ready_after_show<S, W, D, ShowError, EmitError>(
+    pub(crate) fn frontend_ready_after_show<S, W, D, ShowError, EmitError>(
         &self,
         show: S,
         warn_show_error: W,
@@ -693,7 +693,48 @@ fn contains_nul(value: &OsStr) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::has_local_file_host;
+    use super::*;
+
+    fn test_intent(id: u64) -> LaunchIntent {
+        LaunchIntent {
+            id,
+            source: LaunchSource::Initial,
+            workspace: PathBuf::from(format!("workspace-{id}")),
+            files: vec![PathBuf::from(format!("file-{id}.R"))],
+        }
+    }
+
+    #[test]
+    fn show_failure_does_not_prevent_ready_drain_or_acknowledgement() {
+        let router = LaunchIntentRouter::new(4, Some(test_intent(1)));
+        assert!(router.enqueue(test_intent(2)).is_empty());
+
+        let delivered = Mutex::new(Vec::new());
+        let show_errors = Mutex::new(Vec::new());
+        let report = router.frontend_ready_after_show(
+            || Err("show failed"),
+            |error| show_errors.lock().expect("show errors mutex").push(error),
+            |intent| {
+                delivered.lock().expect("delivered mutex").push(intent.id);
+                Ok::<_, &'static str>(())
+            },
+        );
+        let repeated = router.frontend_ready(|_| -> Result<(), &'static str> {
+            panic!("ready drain must not require a frontend retry")
+        });
+
+        assert_eq!(
+            *show_errors.lock().expect("show errors mutex"),
+            ["show failed"]
+        );
+        assert_eq!(*delivered.lock().expect("delivered mutex"), [1, 2]);
+        assert_eq!(report.delivered_ids, [1, 2]);
+        assert!(report.failures.is_empty());
+        assert!(router.is_acknowledged(1));
+        assert!(router.is_acknowledged(2));
+        assert!(repeated.delivered_ids.is_empty());
+        assert!(repeated.failures.is_empty());
+    }
 
     #[test]
     fn local_file_host_policy_is_independent_of_filesystem_access() {

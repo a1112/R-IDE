@@ -422,45 +422,6 @@ fn frontend_readiness_drains_forwarded_activations_once_in_order() {
 }
 
 #[test]
-fn show_failure_does_not_prevent_ready_drain_or_acknowledgement() {
-    let initial = queue_intent(1);
-    let forwarded = Fixture::file("show-failure-forwarded.R");
-    let router = LaunchIntentRouter::new(4, Some(initial));
-    router.route_forwarded_args(
-        args([OsString::from(forwarded.path())]),
-        Path::new("cwd-is-unused-for-absolute-input"),
-        || {},
-        |_| -> Result<(), &'static str> { panic!("frontend is not ready") },
-    );
-
-    let delivered = Mutex::new(Vec::new());
-    let show_errors = Mutex::new(Vec::new());
-    let report = router.frontend_ready_after_show(
-        || Err("show failed"),
-        |error| show_errors.lock().expect("show errors mutex").push(error),
-        |intent| {
-            delivered.lock().expect("delivered mutex").push(intent.id);
-            Ok::<_, &'static str>(())
-        },
-    );
-    let repeated = router.frontend_ready(|_| -> Result<(), &'static str> {
-        panic!("ready drain must not require a frontend retry")
-    });
-
-    assert_eq!(
-        *show_errors.lock().expect("show errors mutex"),
-        ["show failed"]
-    );
-    assert_eq!(*delivered.lock().expect("delivered mutex"), [1, 2]);
-    assert_eq!(report.delivered_ids, [1, 2]);
-    assert!(report.failures.is_empty());
-    assert!(router.is_acknowledged(1));
-    assert!(router.is_acknowledged(2));
-    assert!(repeated.delivered_ids.is_empty());
-    assert!(repeated.failures.is_empty());
-}
-
-#[test]
 fn concurrent_ready_and_forwarded_delivery_preserve_global_arrival_order() {
     let router = Arc::new(LaunchIntentRouter::new(4, Some(queue_intent(1))));
     let forwarded = Fixture::file("concurrent-forwarded.R");
