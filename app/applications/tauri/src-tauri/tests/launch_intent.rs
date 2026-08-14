@@ -40,6 +40,17 @@ impl Fixture {
         }
     }
 
+    #[cfg(unix)]
+    fn named_file(file_name: OsString) -> Self {
+        let path = std::env::temp_dir().join(file_name);
+        fs::write(&path, b"fixture").expect("create named fixture file");
+        Self {
+            path,
+            kind: FixtureKind::File,
+            empty_parent: None,
+        }
+    }
+
     fn directory() -> Self {
         let path = std::env::temp_dir().join(Uuid::new_v4().to_string());
         fs::create_dir(&path).expect("create fixture directory");
@@ -77,6 +88,10 @@ fn args(paths: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
         .collect()
 }
 
+fn canonical(path: &Path) -> PathBuf {
+    fs::canonicalize(path).expect("canonical fixture path")
+}
+
 fn expected(id: u64, source: LaunchSource, workspace: &Path, files: Vec<PathBuf>) -> LaunchIntent {
     LaunchIntent {
         id,
@@ -109,8 +124,10 @@ fn ignores_executable_argv_zero() {
         Some(expected(
             7,
             LaunchSource::Initial,
-            file.path().parent().expect("fixture parent"),
-            vec![file.path().to_path_buf()],
+            canonical(file.path())
+                .parent()
+                .expect("canonical fixture parent"),
+            vec![canonical(file.path())],
         ))
     );
 }
@@ -133,8 +150,10 @@ fn resolves_relative_files_against_the_provided_cwd() {
         Some(expected(
             11,
             LaunchSource::SingleInstance,
-            cwd,
-            vec![file.path().to_path_buf()],
+            canonical(file.path())
+                .parent()
+                .expect("canonical fixture parent"),
+            vec![canonical(file.path())],
         ))
     );
 }
@@ -151,7 +170,59 @@ fn preserves_spaces_and_unicode_in_file_paths() {
     )
     .expect("valid launch intent");
 
-    assert_eq!(actual.files, vec![file.path().to_path_buf()]);
+    assert_eq!(actual.files, vec![canonical(file.path())]);
+}
+
+#[test]
+fn returns_canonical_paths_and_uses_the_canonical_parent_as_workspace() {
+    let file = Fixture::file("canonical-output.rs");
+    let expected_file = canonical(file.path());
+
+    let actual = parse_args(
+        args([OsString::from(file.path())]),
+        Path::new("."),
+        LaunchSource::Initial,
+        14,
+    )
+    .expect("valid launch intent");
+
+    assert_eq!(actual.files, vec![expected_file.clone()]);
+    assert_eq!(
+        actual.workspace,
+        expected_file.parent().expect("canonical fixture parent")
+    );
+}
+
+#[test]
+fn serializes_the_complete_launch_intent_to_the_frontend_json_shape() {
+    let file = Fixture::file("serialized-intent.R");
+    let canonical_file = canonical(file.path());
+    let canonical_workspace = canonical_file
+        .parent()
+        .expect("canonical fixture parent")
+        .to_str()
+        .expect("UTF-8 canonical workspace");
+    let canonical_file_string = canonical_file.to_str().expect("UTF-8 canonical file");
+    let frontend_file_uri =
+        tauri::Url::from_file_path(&canonical_file).expect("canonical frontend file URI");
+    let intent = parse_args(
+        args([OsString::from(file.path())]),
+        Path::new("."),
+        LaunchSource::SingleInstance,
+        15,
+    )
+    .expect("valid launch intent");
+
+    assert_eq!(frontend_file_uri.scheme(), "file");
+    assert_eq!(
+        serde_json::to_value(&intent).expect("serialize complete launch intent"),
+        serde_json::json!({
+            "id": 15,
+            "source": "singleInstance",
+            "workspace": canonical_workspace,
+            "files": [canonical_file_string],
+        })
+    );
 }
 
 #[test]
@@ -176,8 +247,33 @@ fn collapses_duplicate_paths_without_reordering_first_occurrences() {
 
     assert_eq!(
         actual.files,
-        vec![first.path().to_path_buf(), second.path().to_path_buf()]
+        vec![canonical(first.path()), canonical(second.path())]
     );
+}
+
+#[test]
+fn deduplicates_a_large_canonical_batch_without_changing_order() {
+    let fixtures = (0..128)
+        .map(|index| Fixture::file(&format!("batch-{index}.rs")))
+        .collect::<Vec<_>>();
+    let candidates = fixtures
+        .iter()
+        .flat_map(|fixture| {
+            [
+                OsString::from(fixture.path()),
+                OsString::from(fixture.path()),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let expected_files = fixtures
+        .iter()
+        .map(|fixture| canonical(fixture.path()))
+        .collect::<Vec<_>>();
+
+    let actual = parse_args(args(candidates), Path::new("."), LaunchSource::Initial, 18)
+        .expect("large launch intent");
+
+    assert_eq!(actual.files, expected_files);
 }
 
 #[test]
@@ -195,11 +291,13 @@ fn uses_the_first_file_parent_as_workspace_and_preserves_file_order() {
 
     assert_eq!(
         actual.workspace,
-        second.path().parent().expect("fixture parent")
+        canonical(second.path())
+            .parent()
+            .expect("canonical fixture parent")
     );
     assert_eq!(
         actual.files,
-        vec![second.path().to_path_buf(), first.path().to_path_buf()]
+        vec![canonical(second.path()), canonical(first.path())]
     );
 }
 
@@ -227,11 +325,13 @@ fn rejects_invalid_candidates_without_discarding_valid_files() {
 
     assert_eq!(
         actual.workspace,
-        first.path().parent().expect("fixture parent")
+        canonical(first.path())
+            .parent()
+            .expect("canonical fixture parent")
     );
     assert_eq!(
         actual.files,
-        vec![first.path().to_path_buf(), second.path().to_path_buf()]
+        vec![canonical(first.path()), canonical(second.path())]
     );
 }
 
@@ -274,8 +374,10 @@ fn accepts_local_file_urls_and_rejects_non_file_urls() {
         Some(expected(
             29,
             LaunchSource::OpenedUrl,
-            file.path().parent().expect("fixture parent"),
-            vec![file.path().to_path_buf()],
+            canonical(file.path())
+                .parent()
+                .expect("canonical fixture parent"),
+            vec![canonical(file.path())],
         ))
     );
     assert_eq!(
@@ -287,8 +389,10 @@ fn accepts_local_file_urls_and_rejects_non_file_urls() {
         Some(expected(
             29,
             LaunchSource::OpenedUrl,
-            file.path().parent().expect("fixture parent"),
-            vec![file.path().to_path_buf()],
+            canonical(file.path())
+                .parent()
+                .expect("canonical fixture parent"),
+            vec![canonical(file.path())],
         ))
     );
     assert_eq!(
@@ -301,8 +405,10 @@ fn accepts_local_file_urls_and_rejects_non_file_urls() {
         Some(expected(
             30,
             LaunchSource::Initial,
-            file.path().parent().expect("fixture parent"),
-            vec![file.path().to_path_buf()],
+            canonical(file.path())
+                .parent()
+                .expect("canonical fixture parent"),
+            vec![canonical(file.path())],
         ))
     );
     assert_eq!(
@@ -330,6 +436,181 @@ fn launch_sources_serialize_with_clear_camel_case_names() {
     assert_eq!(
         serde_json::to_value(LaunchSource::OpenedUrl).expect("serialize opened-URL source"),
         "openedUrl"
+    );
+}
+
+#[test]
+fn rejects_remote_file_url_hosts_even_when_the_remote_path_is_missing() {
+    let remote_url = tauri::Url::parse(&format!("file://remote-host/share/{}.R", Uuid::new_v4()))
+        .expect("remote file URL");
+
+    assert_eq!(
+        parse_args(
+            args([OsString::from(remote_url.as_str())]),
+            Path::new("."),
+            LaunchSource::Initial,
+            39,
+        ),
+        None
+    );
+    assert_eq!(
+        parse_opened_urls(
+            std::slice::from_ref(&remote_url),
+            LaunchSource::OpenedUrl,
+            40,
+        ),
+        None
+    );
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct ExactUnixCleanup {
+    files: Vec<PathBuf>,
+    directories_deepest_first: Vec<PathBuf>,
+}
+
+#[cfg(unix)]
+impl Drop for ExactUnixCleanup {
+    fn drop(&mut self) {
+        for file in &self.files {
+            let _ = fs::remove_file(file);
+        }
+        for directory in &self.directories_deepest_first {
+            let _ = fs::remove_dir(directory);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_parent_traversal_through_a_regular_file() {
+    let base = std::env::temp_dir().join(Uuid::new_v4().to_string());
+    fs::create_dir(&base).expect("create traversal fixture root");
+    let regular_file = base.join(Uuid::new_v4().to_string());
+    let target_name = Uuid::new_v4().to_string();
+    let target = base.join(&target_name);
+    fs::write(&regular_file, b"regular").expect("create regular-file traversal component");
+    fs::write(&target, b"target").expect("create traversal target");
+    let _cleanup = ExactUnixCleanup {
+        files: vec![regular_file.clone(), target],
+        directories_deepest_first: vec![base],
+    };
+    let input = regular_file.join("..").join(target_name);
+
+    assert_eq!(
+        parse_args(
+            args([input.into_os_string()]),
+            Path::new("."),
+            LaunchSource::Initial,
+            51,
+        ),
+        None
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn resolves_parent_components_after_following_symlink_os_semantics() {
+    use std::os::unix::fs::symlink;
+
+    let base = std::env::temp_dir().join(Uuid::new_v4().to_string());
+    let lexical_parent = base.join(Uuid::new_v4().to_string());
+    let real_parent = base.join(Uuid::new_v4().to_string());
+    let linked_directory = real_parent.join(Uuid::new_v4().to_string());
+    fs::create_dir(&base).expect("create symlink traversal root");
+    fs::create_dir(&lexical_parent).expect("create lexical parent");
+    fs::create_dir(&real_parent).expect("create real parent");
+    fs::create_dir(&linked_directory).expect("create linked directory");
+
+    let target_name = Uuid::new_v4().to_string();
+    let lexical_target = lexical_parent.join(&target_name);
+    let real_target = real_parent.join(&target_name);
+    fs::write(&lexical_target, b"lexical").expect("create lexical target");
+    fs::write(&real_target, b"real").expect("create real target");
+    let link = lexical_parent.join(Uuid::new_v4().to_string());
+    symlink(&linked_directory, &link).expect("create directory symlink");
+    let _cleanup = ExactUnixCleanup {
+        files: vec![link.clone(), lexical_target, real_target.clone()],
+        directories_deepest_first: vec![linked_directory, lexical_parent, real_parent, base],
+    };
+    let input = link.join("..").join(target_name);
+
+    let actual = parse_args(
+        args([input.into_os_string()]),
+        Path::new("."),
+        LaunchSource::Initial,
+        53,
+    )
+    .expect("OS-resolved symlink traversal");
+
+    assert_eq!(actual.files, vec![canonical(&real_target)]);
+}
+
+#[cfg(unix)]
+#[test]
+fn deduplicates_a_symlink_alias_to_its_canonical_target() {
+    use std::os::unix::fs::symlink;
+
+    let base = std::env::temp_dir().join(Uuid::new_v4().to_string());
+    fs::create_dir(&base).expect("create symlink alias root");
+    let target = base.join(Uuid::new_v4().to_string());
+    let alias = base.join(Uuid::new_v4().to_string());
+    fs::write(&target, b"target").expect("create symlink target");
+    symlink(&target, &alias).expect("create file symlink");
+    let _cleanup = ExactUnixCleanup {
+        files: vec![alias.clone(), target.clone()],
+        directories_deepest_first: vec![base],
+    };
+
+    let actual = parse_args(
+        args([
+            alias.as_os_str().to_os_string(),
+            target.as_os_str().to_os_string(),
+        ]),
+        Path::new("."),
+        LaunchSource::Initial,
+        55,
+    )
+    .expect("canonical symlink launch intent");
+
+    assert_eq!(actual.files, vec![canonical(&target)]);
+}
+
+#[cfg(unix)]
+#[test]
+fn accepts_an_existing_relative_native_path_containing_a_colon() {
+    let file_name = OsString::from(format!("report:{}.R", Uuid::new_v4()));
+    let file = Fixture::named_file(file_name.clone());
+
+    let actual = parse_args(
+        args([file_name]),
+        &std::env::temp_dir(),
+        LaunchSource::Initial,
+        57,
+    )
+    .expect("existing colon path is a native file");
+
+    assert_eq!(actual.files, vec![canonical(file.path())]);
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_an_existing_non_utf8_filename_before_building_an_intent() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let mut file_name = Uuid::new_v4().to_string().into_bytes();
+    file_name.extend_from_slice(b"-non-utf8-\xff.R");
+    let file = Fixture::named_file(OsString::from_vec(file_name));
+
+    assert_eq!(
+        parse_args(
+            args([OsString::from(file.path())]),
+            Path::new("."),
+            LaunchSource::Initial,
+            59,
+        ),
+        None
     );
 }
 
@@ -470,7 +751,7 @@ fn collapses_unicode_case_variants_that_resolve_to_the_same_windows_file() {
     )
     .expect("Unicode case variants resolve to a launch intent");
 
-    assert_eq!(actual.files, vec![file.path().to_path_buf()]);
+    assert_eq!(actual.files, vec![canonical(file.path())]);
 }
 
 #[cfg(windows)]
@@ -505,7 +786,7 @@ fn accepts_existing_drive_paths_and_safely_rejects_missing_unc_paths() {
         31,
     )
     .expect("case-insensitive Windows paths");
-    assert_eq!(deduplicated.files, vec![file.path().to_path_buf()]);
+    assert_eq!(deduplicated.files, vec![canonical(file.path())]);
 
     let missing_unc = format!(r"\\server\share\{}", Uuid::new_v4());
     assert_eq!(

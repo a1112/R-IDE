@@ -8,8 +8,9 @@
  ********************************************************************************/
 
 use serde::Serialize;
+use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -67,23 +68,22 @@ fn path_from_argument(argument: &OsStr, cwd: &Path) -> Option<PathBuf> {
         return None;
     }
 
+    let native_path = cwd.join(path);
+    if std::fs::metadata(&native_path).is_ok() {
+        return resolve_existing_file(native_path);
+    }
+
     if let Some(argument) = argument.to_str() {
         if let Ok(url) = tauri::Url::parse(argument) {
             return path_from_file_url(&url);
         }
     }
 
-    resolve_existing_file(cwd.join(path))
+    None
 }
 
 fn path_from_file_url(url: &tauri::Url) -> Option<PathBuf> {
-    if url.scheme() != "file" {
-        return None;
-    }
-    if url
-        .host_str()
-        .is_some_and(|host| !host.is_empty() && !host.eq_ignore_ascii_case("localhost"))
-    {
+    if !has_local_file_host(url) {
         return None;
     }
 
@@ -94,22 +94,30 @@ fn path_from_file_url(url: &tauri::Url) -> Option<PathBuf> {
     resolve_existing_file(path)
 }
 
+fn has_local_file_host(url: &tauri::Url) -> bool {
+    url.scheme() == "file"
+        && url
+            .host_str()
+            .is_none_or(|host| host.is_empty() || host.eq_ignore_ascii_case("localhost"))
+}
+
 fn resolve_existing_file(path: PathBuf) -> Option<PathBuf> {
     if contains_nul(path.as_os_str()) {
         return None;
     }
 
-    let path = lexical_normalize(&path);
-    path.is_file().then_some(path)
+    let canonical = std::fs::canonicalize(path).ok()?;
+    if !canonical.is_file() || canonical.to_str().is_none() {
+        return None;
+    }
+    Some(canonical)
 }
 
 fn build_intent(paths: Vec<PathBuf>, source: LaunchSource, next_id: u64) -> Option<LaunchIntent> {
     let mut files: Vec<PathBuf> = Vec::with_capacity(paths.len());
+    let mut seen = HashSet::with_capacity(paths.len());
     for path in paths {
-        if !files
-            .iter()
-            .any(|existing| paths_are_equivalent(existing, &path))
-        {
+        if seen.insert(path.clone()) {
             files.push(path);
         }
     }
@@ -121,27 +129,6 @@ fn build_intent(paths: Vec<PathBuf>, source: LaunchSource, next_id: u64) -> Opti
         workspace,
         files,
     })
-}
-
-fn lexical_normalize(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => match normalized.components().next_back() {
-                Some(Component::Normal(_)) => {
-                    normalized.pop();
-                }
-                Some(Component::ParentDir) | None => normalized.push(component.as_os_str()),
-                Some(Component::Prefix(_)) | Some(Component::RootDir) => {}
-                Some(Component::CurDir) => unreachable!("current-directory components are removed"),
-            },
-            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
-                normalized.push(component.as_os_str());
-            }
-        }
-    }
-    normalized
 }
 
 fn is_flag(argument: &OsStr) -> bool {
@@ -156,19 +143,6 @@ fn is_flag(argument: &OsStr) -> bool {
     }
 
     false
-}
-
-#[cfg(windows)]
-fn paths_are_equivalent(left: &Path, right: &Path) -> bool {
-    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
-        (Ok(left), Ok(right)) => left == right,
-        _ => left == right,
-    }
-}
-
-#[cfg(not(windows))]
-fn paths_are_equivalent(left: &Path, right: &Path) -> bool {
-    left == right
 }
 
 #[cfg(unix)]
