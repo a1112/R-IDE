@@ -14,6 +14,7 @@ pub mod download;
 pub mod launch_intent;
 pub mod native_chrome;
 pub mod sidecar;
+pub mod startup;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -158,6 +159,9 @@ pub fn run() {
         launch_intent::LaunchSource::Initial,
         1,
     );
+    let initial_workspace = initial_launch_intent
+        .as_ref()
+        .map(|intent| intent.workspace.clone());
 
     let builder = configure_activation_builder(
         tauri::Builder::default(),
@@ -177,7 +181,7 @@ pub fn run() {
     );
 
     let app = builder
-        .setup(|app| {
+        .setup(move |app| {
             if let Some(window) = app.get_webview_window("main") {
                 native_chrome::configure_native_window(&window);
             }
@@ -191,7 +195,7 @@ pub fn run() {
             // 初始化 sidecar 进程
             let app_handle = app.handle().clone();
             std::thread::spawn(move || {
-                if let Err(e) = sidecar::start_backend(&app_handle) {
+                if let Err(e) = sidecar::start_backend(&app_handle, initial_workspace) {
                     eprintln!("Failed to start backend: {}", e);
                 }
             });

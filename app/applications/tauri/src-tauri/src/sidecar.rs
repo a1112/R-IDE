@@ -7,6 +7,7 @@
  * SPDX-License-Identifier: MIT
  ********************************************************************************/
 
+use crate::startup::BackendLaunchPlan;
 use dirs::home_dir;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::fs;
@@ -524,6 +525,7 @@ async fn start_node_backend_process(
     config: &BackendConfig,
     plugins_dir: PathBuf,
     config_dir: PathBuf,
+    launch_plan: &BackendLaunchPlan,
 ) -> Result<(), String> {
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -549,6 +551,7 @@ async fn start_node_backend_process(
     if !backend_use_watcher_process() {
         command.arg("--no-cluster");
     }
+    command.args(launch_plan.arguments());
     if let Some(node_options) = backend_node_options() {
         command.env("NODE_OPTIONS", node_options);
     }
@@ -655,7 +658,10 @@ async fn start_node_backend_process(
 }
 
 /// 启动 Node.js 后端进程并保持进程生命周期
-pub async fn start_backend_process(app_handle: &AppHandle) -> Result<(), String> {
+pub async fn start_backend_process(
+    app_handle: &AppHandle,
+    launch_plan: &BackendLaunchPlan,
+) -> Result<(), String> {
     let config = get_backend_config();
 
     if config.use_node {
@@ -688,7 +694,14 @@ pub async fn start_backend_process(app_handle: &AppHandle) -> Result<(), String>
     let config_dir = get_config_dir();
 
     if config.use_node {
-        return start_node_backend_process(app_handle, &config, plugins_dir, config_dir).await;
+        return start_node_backend_process(
+            app_handle,
+            &config,
+            plugins_dir,
+            config_dir,
+            launch_plan,
+        )
+        .await;
     }
 
     // 设置命令
@@ -697,6 +710,7 @@ pub async fn start_backend_process(app_handle: &AppHandle) -> Result<(), String>
     if is_plugin_dir_ready(&plugins_dir) {
         cmd.arg(format!("--plugins=local-dir:{}", plugins_dir.display()));
     }
+    cmd.args(launch_plan.arguments());
 
     cmd.env("NODE_ENV", "production");
     if let Some(frontend_dir) = get_frontend_dir() {
@@ -900,14 +914,15 @@ fn terminate_process_tree(pid: u32) -> Result<(), String> {
 }
 
 /// 启动后端的主函数（在独立线程中运行）
-pub fn start_backend(app_handle: &AppHandle) -> Result<(), String> {
+pub fn start_backend(app_handle: &AppHandle, workspace: Option<PathBuf>) -> Result<(), String> {
     let rt = tokio::runtime::Runtime::new()
         .map_err(|e| format!("Failed to create async runtime: {}", e))?;
 
     let app_handle = app_handle.clone();
+    let launch_plan = BackendLaunchPlan::new(workspace);
 
     rt.block_on(async {
-        match start_backend_process(&app_handle).await {
+        match start_backend_process(&app_handle, &launch_plan).await {
             Ok(()) => Ok(()),
             Err(e) => {
                 log::error!("Failed to start backend: {}", e);
