@@ -40,7 +40,6 @@ impl Fixture {
         }
     }
 
-    #[cfg(unix)]
     fn named_file(file_name: OsString) -> Self {
         let path = std::env::temp_dir().join(file_name);
         fs::write(&path, b"fixture").expect("create named fixture file");
@@ -355,6 +354,22 @@ fn rejects_missing_paths_directories_embedded_nul_and_flags() {
 }
 
 #[test]
+fn accepts_an_existing_relative_dash_filename_before_flag_classification() {
+    let file_name = OsString::from(format!("-report-{}.R", Uuid::new_v4()));
+    let file = Fixture::named_file(file_name.clone());
+
+    let actual = parse_args(
+        args([file_name]),
+        &std::env::temp_dir(),
+        LaunchSource::Initial,
+        25,
+    )
+    .expect("existing dash filename is a native file");
+
+    assert_eq!(actual.files, vec![canonical(file.path())]);
+}
+
+#[test]
 fn accepts_local_file_urls_and_rejects_non_file_urls() {
     let file = Fixture::file("opened-url.R");
     let file_url = tauri::Url::from_file_path(file.path()).expect("fixture file URL");
@@ -615,23 +630,121 @@ fn rejects_an_existing_non_utf8_filename_before_building_an_intent() {
 }
 
 #[cfg(windows)]
-fn accessible_remote_url(file: &Path) -> Option<tauri::Url> {
+fn disk_drive(path: &Path) -> Option<u8> {
     use std::path::Prefix;
 
+    match path.components().next()? {
+        std::path::Component::Prefix(prefix) => match prefix.kind() {
+            Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => Some(drive),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+fn drive_relative_argument(drive: u8, file_name: &std::ffi::OsStr) -> OsString {
+    let mut argument = OsString::from(format!("{}:", char::from(drive)));
+    argument.push(file_name);
+    argument
+}
+
+#[cfg(windows)]
+#[test]
+fn resolves_same_drive_relative_paths_against_supplied_raw_and_verbatim_cwds() {
+    let file = Fixture::nested_file("drive-relative.R");
+    let raw_cwd = file.path().parent().expect("fixture parent");
+    let verbatim_cwd = canonical(raw_cwd);
+    let drive = disk_drive(raw_cwd).expect("fixture disk drive");
+    let argument = drive_relative_argument(
+        drive.to_ascii_lowercase(),
+        file.path().file_name().expect("fixture file name"),
+    );
+
+    for supplied_cwd in [raw_cwd, verbatim_cwd.as_path()] {
+        let actual = parse_args(
+            args([argument.clone()]),
+            supplied_cwd,
+            LaunchSource::SingleInstance,
+            61,
+        )
+        .expect("same-drive relative file");
+        assert_eq!(actual.files, vec![canonical(file.path())]);
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn rejects_drive_relative_paths_for_a_different_drive_or_non_absolute_cwd() {
+    let file = Fixture::nested_file("cross-drive-relative.R");
+    let cwd = file.path().parent().expect("fixture parent");
+    let drive = disk_drive(cwd).expect("fixture disk drive");
+    let other_drive = if drive.eq_ignore_ascii_case(&b'C') {
+        b'D'
+    } else {
+        b'C'
+    };
+    let file_name = file.path().file_name().expect("fixture file name");
+
+    assert_eq!(
+        parse_args(
+            args([drive_relative_argument(other_drive, file_name)]),
+            cwd,
+            LaunchSource::SingleInstance,
+            63,
+        ),
+        None
+    );
+    assert_eq!(
+        parse_args(
+            args([drive_relative_argument(drive, file_name)]),
+            Path::new("relative-cwd"),
+            LaunchSource::SingleInstance,
+            65,
+        ),
+        None
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn accepts_an_existing_current_drive_rooted_path_before_flag_classification() {
+    let file = Fixture::file("current-drive-rooted.R");
+    let mut components = file.path().components();
+    assert!(matches!(
+        components.next(),
+        Some(std::path::Component::Prefix(_))
+    ));
+    let rooted_argument = components
+        .as_path()
+        .to_str()
+        .expect("UTF-8 rooted fixture path")
+        .replace('\\', "/");
+    assert!(rooted_argument.starts_with('/'));
+    assert!(!Path::new(&rooted_argument).is_absolute());
+
+    let actual = parse_args(
+        args([OsString::from(rooted_argument)]),
+        file.path().parent().expect("fixture parent"),
+        LaunchSource::Initial,
+        67,
+    )
+    .expect("existing current-drive-rooted file");
+
+    assert_eq!(actual.files, vec![canonical(file.path())]);
+}
+
+#[cfg(windows)]
+fn accessible_remote_url(file: &Path) -> Option<tauri::Url> {
     let host = std::env::var("COMPUTERNAME").ok()?;
     if host.eq_ignore_ascii_case("localhost") {
         eprintln!("skipping remote-host regression: COMPUTERNAME is localhost");
         return None;
     }
 
+    let drive = disk_drive(file)?;
     let mut components = file.components();
-    let drive = match components.next()? {
-        std::path::Component::Prefix(prefix) => match prefix.kind() {
-            Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => drive,
-            _ => return None,
-        },
-        _ => return None,
-    };
+    components.next();
     if matches!(
         components.clone().next(),
         Some(std::path::Component::RootDir)
@@ -693,6 +806,35 @@ fn rejects_an_accessible_remote_host_file_url_from_opened_urls() {
         ),
         None
     );
+}
+
+#[cfg(windows)]
+#[test]
+fn accepts_an_accessible_raw_unc_file_path() {
+    let file = Fixture::file("raw-unc.R");
+    let Some(remote_url) = accessible_remote_url(file.path()) else {
+        return;
+    };
+    let raw_unc = remote_url
+        .to_file_path()
+        .expect("accessible raw UNC fixture path");
+    if !raw_unc.is_file() {
+        eprintln!(
+            "skipping accessible raw UNC regression: {} is unavailable",
+            raw_unc.display()
+        );
+        return;
+    }
+
+    let actual = parse_args(
+        args([raw_unc.as_os_str().to_os_string()]),
+        Path::new(r"C:\this-cwd-must-not-be-used"),
+        LaunchSource::Initial,
+        48,
+    )
+    .expect("accessible raw UNC file path");
+
+    assert_eq!(actual.files, vec![canonical(&raw_unc)]);
 }
 
 #[cfg(windows)]
