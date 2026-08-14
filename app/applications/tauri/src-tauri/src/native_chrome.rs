@@ -53,16 +53,17 @@ pub fn ride_frontend_ready(
     window: WebviewWindow,
     locale: Option<String>,
 ) -> Result<(), String> {
-    window.show().map_err(|error| error.to_string())?;
     log::info!(
         "Frontend ready (locale={})",
         locale.as_deref().unwrap_or("unknown")
     );
 
     let state = app.state::<AppState>();
-    let report = state
-        .launch_intent_router
-        .frontend_ready(|intent| app.emit_to("main", "ride-open-request", intent));
+    let report = state.launch_intent_router.frontend_ready_after_show(
+        || window.show(),
+        |error| log::warn!("Failed to show main window after frontend ready: {error}"),
+        |intent| app.emit_to("main", "ride-open-request", intent),
+    );
     for failure in report.failures {
         log::warn!(
             "Failed to emit frontend-ready launch intent {}: {}",

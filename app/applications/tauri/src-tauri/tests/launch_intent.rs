@@ -5,7 +5,8 @@ use ride_tauri::launch_intent::{
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Barrier, Mutex};
+use std::time::Duration;
 use uuid::Uuid;
 
 #[derive(Debug)]
@@ -421,6 +422,119 @@ fn frontend_readiness_drains_forwarded_activations_once_in_order() {
 }
 
 #[test]
+fn show_failure_does_not_prevent_ready_drain_or_acknowledgement() {
+    let initial = queue_intent(1);
+    let forwarded = Fixture::file("show-failure-forwarded.R");
+    let router = LaunchIntentRouter::new(4, Some(initial));
+    router.route_forwarded_args(
+        args([OsString::from(forwarded.path())]),
+        Path::new("cwd-is-unused-for-absolute-input"),
+        || {},
+        |_| -> Result<(), &'static str> { panic!("frontend is not ready") },
+    );
+
+    let delivered = Mutex::new(Vec::new());
+    let show_errors = Mutex::new(Vec::new());
+    let report = router.frontend_ready_after_show(
+        || Err("show failed"),
+        |error| show_errors.lock().expect("show errors mutex").push(error),
+        |intent| {
+            delivered.lock().expect("delivered mutex").push(intent.id);
+            Ok::<_, &'static str>(())
+        },
+    );
+    let repeated = router.frontend_ready(|_| -> Result<(), &'static str> {
+        panic!("ready drain must not require a frontend retry")
+    });
+
+    assert_eq!(
+        *show_errors.lock().expect("show errors mutex"),
+        ["show failed"]
+    );
+    assert_eq!(*delivered.lock().expect("delivered mutex"), [1, 2]);
+    assert_eq!(report.delivered_ids, [1, 2]);
+    assert!(report.failures.is_empty());
+    assert!(router.is_acknowledged(1));
+    assert!(router.is_acknowledged(2));
+    assert!(repeated.delivered_ids.is_empty());
+    assert!(repeated.failures.is_empty());
+}
+
+#[test]
+fn concurrent_ready_and_forwarded_delivery_preserve_global_arrival_order() {
+    let router = Arc::new(LaunchIntentRouter::new(4, Some(queue_intent(1))));
+    let forwarded = Fixture::file("concurrent-forwarded.R");
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let release_first_emit = Arc::new(Barrier::new(2));
+    let (first_emit_started_tx, first_emit_started_rx) = mpsc::channel();
+
+    let ready_router = Arc::clone(&router);
+    let ready_events = Arc::clone(&events);
+    let ready_release = Arc::clone(&release_first_emit);
+    let ready_thread = std::thread::spawn(move || {
+        ready_router.frontend_ready(|intent| {
+            first_emit_started_tx
+                .send(())
+                .expect("signal first emit started");
+            ready_release.wait();
+            ready_events.lock().expect("events mutex").push(intent.id);
+            Ok::<_, &'static str>(())
+        })
+    });
+
+    first_emit_started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("first emit must reach the controlled barrier");
+
+    let forwarded_router = Arc::clone(&router);
+    let forwarded_events = Arc::clone(&events);
+    let forwarded_path = forwarded.path().to_path_buf();
+    let (forwarded_focused_tx, forwarded_focused_rx) = mpsc::channel();
+    let (second_emit_tx, second_emit_rx) = mpsc::channel();
+    let forwarded_thread = std::thread::spawn(move || {
+        forwarded_router.route_forwarded_args(
+            args([forwarded_path.into_os_string()]),
+            Path::new("cwd-is-unused-for-absolute-input"),
+            || {
+                forwarded_focused_tx
+                    .send(())
+                    .expect("signal forwarded focus");
+            },
+            |intent| {
+                forwarded_events
+                    .lock()
+                    .expect("events mutex")
+                    .push(intent.id);
+                second_emit_tx.send(()).expect("signal second emit");
+                Ok::<_, &'static str>(())
+            },
+        )
+    });
+
+    forwarded_focused_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("forwarded activation must enqueue and focus");
+    let second_emit_before_release = second_emit_rx.recv_timeout(Duration::from_millis(250));
+
+    release_first_emit.wait();
+    let ready_report = ready_thread.join().expect("ready thread");
+    let forwarded_report = forwarded_thread.join().expect("forwarded thread");
+
+    assert!(
+        matches!(
+            second_emit_before_release,
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ),
+        "id 2 emitted before the older id 1 delivery was released"
+    );
+    assert_eq!(*events.lock().expect("events mutex"), [1, 2]);
+    assert_eq!(ready_report.delivered_ids, [1]);
+    assert_eq!(forwarded_report.delivered_ids, [2]);
+    assert!(ready_report.failures.is_empty());
+    assert!(forwarded_report.failures.is_empty());
+}
+
+#[test]
 fn opened_urls_use_the_same_router_rules_on_every_platform() {
     let file = Fixture::file("opened-router.R");
     let url = tauri::Url::from_file_path(file.path()).expect("fixture file URL");
@@ -472,6 +586,36 @@ fn emit_failure_is_reported_unlocked_and_never_redelivered() {
     assert!(repeated.delivered_ids.is_empty());
     assert!(repeated.failures.is_empty());
     assert_eq!(*attempts.lock().expect("attempts mutex"), [1]);
+}
+
+#[test]
+fn emit_failure_advances_the_dispatcher_for_the_next_delivery() {
+    let router = LaunchIntentRouter::new(4, Some(queue_intent(1)));
+    let forwarded = Fixture::file("after-failed-emit.R");
+    router.route_forwarded_args(
+        args([OsString::from(forwarded.path())]),
+        Path::new("cwd-is-unused-for-absolute-input"),
+        || {},
+        |_| -> Result<(), &'static str> { panic!("frontend is not ready") },
+    );
+    let attempts = Mutex::new(Vec::new());
+
+    let report = router.frontend_ready(|intent| {
+        assert!(!router.acknowledge(u64::MAX));
+        attempts.lock().expect("attempts mutex").push(intent.id);
+        if intent.id == 1 {
+            Err("first emit failed")
+        } else {
+            Ok(())
+        }
+    });
+
+    assert_eq!(*attempts.lock().expect("attempts mutex"), [1, 2]);
+    assert_eq!(report.delivered_ids, [2]);
+    assert_eq!(report.failures.len(), 1);
+    assert_eq!(report.failures[0].intent.id, 1);
+    assert!(!router.is_acknowledged(1));
+    assert!(router.is_acknowledged(2));
 }
 
 #[test]

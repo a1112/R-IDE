@@ -12,7 +12,7 @@ use std::collections::{HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Condvar, Mutex, MutexGuard};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -156,13 +156,184 @@ impl<E> LaunchIntentDeliveryReport<E> {
     }
 }
 
+#[derive(Debug)]
+struct ScheduledLaunchIntent {
+    ticket: u64,
+    intent: LaunchIntent,
+}
+
+#[derive(Debug)]
+struct LaunchIntentRouterState {
+    queue: LaunchIntentQueue,
+    next_dispatch_ticket: Option<u64>,
+}
+
+impl LaunchIntentRouterState {
+    fn schedule(&mut self, intents: Vec<LaunchIntent>) -> Vec<ScheduledLaunchIntent> {
+        intents
+            .into_iter()
+            .filter_map(|intent| {
+                let Some(ticket) = self.next_dispatch_ticket else {
+                    self.queue.acknowledge(intent.id);
+                    log::error!(
+                        "Dropping launch intent {} after dispatch ticket exhaustion",
+                        intent.id
+                    );
+                    return None;
+                };
+
+                self.next_dispatch_ticket = ticket.checked_add(1);
+                Some(ScheduledLaunchIntent { ticket, intent })
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug)]
+struct DeliveryTurnState {
+    current: Option<u64>,
+    cancelled: HashSet<u64>,
+}
+
+#[derive(Debug)]
+struct DeliveryDispatcher {
+    state: Mutex<DeliveryTurnState>,
+    ready: Condvar,
+}
+
+impl DeliveryDispatcher {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(DeliveryTurnState {
+                current: Some(1),
+                cancelled: HashSet::new(),
+            }),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn wait_for_turn(&self, ticket: u64) -> Option<DeliveryTurnGuard<'_>> {
+        let mut state = self.lock_state();
+        loop {
+            match state.current {
+                Some(current) if current == ticket => {
+                    drop(state);
+                    return Some(DeliveryTurnGuard {
+                        dispatcher: self,
+                        ticket,
+                    });
+                }
+                Some(current) if current < ticket => {
+                    state = self
+                        .ready
+                        .wait(state)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                }
+                current => {
+                    log::error!(
+                        "Dropping stale launch delivery ticket {ticket}; current turn is {current:?}"
+                    );
+                    return None;
+                }
+            }
+        }
+    }
+
+    fn cancel(&self, ticket: u64) {
+        let mut state = self.lock_state();
+        if state.current.is_some_and(|current| ticket >= current) {
+            state.cancelled.insert(ticket);
+            Self::skip_cancelled(&mut state);
+        }
+        drop(state);
+        self.ready.notify_all();
+    }
+
+    fn complete(&self, ticket: u64) {
+        let mut state = self.lock_state();
+        match state.current {
+            Some(current) if current == ticket => {
+                state.current = ticket.checked_add(1);
+                Self::skip_cancelled(&mut state);
+            }
+            current => {
+                log::error!(
+                    "Ignoring completed launch delivery ticket {ticket}; current turn is {current:?}"
+                );
+            }
+        }
+        drop(state);
+        self.ready.notify_all();
+    }
+
+    fn skip_cancelled(state: &mut DeliveryTurnState) {
+        while let Some(current) = state.current {
+            if !state.cancelled.remove(&current) {
+                break;
+            }
+            state.current = current.checked_add(1);
+        }
+    }
+
+    fn lock_state(&self) -> MutexGuard<'_, DeliveryTurnState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+struct DeliveryTurnGuard<'a> {
+    dispatcher: &'a DeliveryDispatcher,
+    ticket: u64,
+}
+
+impl Drop for DeliveryTurnGuard<'_> {
+    fn drop(&mut self) {
+        self.dispatcher.complete(self.ticket);
+    }
+}
+
+struct DeliveryBatchGuard<'a> {
+    dispatcher: &'a DeliveryDispatcher,
+    pending: VecDeque<u64>,
+}
+
+impl<'a> DeliveryBatchGuard<'a> {
+    fn new(dispatcher: &'a DeliveryDispatcher, deliveries: &[ScheduledLaunchIntent]) -> Self {
+        Self {
+            dispatcher,
+            pending: deliveries.iter().map(|delivery| delivery.ticket).collect(),
+        }
+    }
+
+    fn release(&mut self, ticket: u64) {
+        if self.pending.front() == Some(&ticket) {
+            self.pending.pop_front();
+            return;
+        }
+
+        if let Some(position) = self.pending.iter().position(|pending| *pending == ticket) {
+            self.pending.remove(position);
+        }
+    }
+}
+
+impl Drop for DeliveryBatchGuard<'_> {
+    fn drop(&mut self) {
+        while let Some(ticket) = self.pending.pop_front() {
+            self.dispatcher.cancel(ticket);
+        }
+    }
+}
+
 /// Routes desktop activations while keeping all UI and emit callbacks outside
 /// the queue mutex. Failed deliveries remain terminally in flight: they are
 /// reported to the caller, are not acknowledged, and are never emitted twice.
 #[derive(Debug)]
 pub struct LaunchIntentRouter {
     id_source: Option<LaunchIntentIdSource>,
-    queue: Mutex<LaunchIntentQueue>,
+    state: Mutex<LaunchIntentRouterState>,
+    dispatcher: DeliveryDispatcher,
 }
 
 impl LaunchIntentRouter {
@@ -177,7 +348,11 @@ impl LaunchIntentRouter {
 
         Self {
             id_source: next_id.and_then(LaunchIntentIdSource::new),
-            queue: Mutex::new(queue),
+            state: Mutex::new(LaunchIntentRouterState {
+                queue,
+                next_dispatch_ticket: Some(1),
+            }),
+            dispatcher: DeliveryDispatcher::new(),
         }
     }
 
@@ -202,8 +377,7 @@ impl LaunchIntentRouter {
             .and_then(|id| parse_args(args, cwd, LaunchSource::SingleInstance, id))
             .map_or_else(Vec::new, |intent| self.enqueue(intent));
 
-        focus();
-        self.deliver(deliveries, emit)
+        self.deliver_after(deliveries, focus, emit)
     }
 
     pub fn route_opened_urls<F, D, E>(
@@ -221,55 +395,91 @@ impl LaunchIntentRouter {
             .and_then(|id| parse_opened_urls(urls, LaunchSource::OpenedUrl, id))
             .map_or_else(Vec::new, |intent| self.enqueue(intent));
 
-        focus();
-        self.deliver(deliveries, emit)
+        self.deliver_after(deliveries, focus, emit)
     }
 
     pub fn frontend_ready<D, E>(&self, emit: D) -> LaunchIntentDeliveryReport<E>
     where
         D: FnMut(&LaunchIntent) -> Result<(), E>,
     {
-        let deliveries = self.lock_queue().mark_ready();
-        self.deliver(deliveries, emit)
+        let deliveries = {
+            let mut state = self.lock_state();
+            let intents = state.queue.mark_ready();
+            state.schedule(intents)
+        };
+        self.deliver_after(deliveries, || {}, emit)
+    }
+
+    pub fn frontend_ready_after_show<S, W, D, ShowError, EmitError>(
+        &self,
+        show: S,
+        warn_show_error: W,
+        emit: D,
+    ) -> LaunchIntentDeliveryReport<EmitError>
+    where
+        S: FnOnce() -> Result<(), ShowError>,
+        W: FnOnce(ShowError),
+        D: FnMut(&LaunchIntent) -> Result<(), EmitError>,
+    {
+        if let Err(error) = show() {
+            warn_show_error(error);
+        }
+        self.frontend_ready(emit)
     }
 
     pub fn acknowledge(&self, id: u64) -> bool {
-        self.lock_queue().acknowledge(id)
+        self.lock_state().queue.acknowledge(id)
     }
 
     pub fn is_acknowledged(&self, id: u64) -> bool {
-        self.lock_queue().is_acknowledged(id)
+        self.lock_state().queue.is_acknowledged(id)
     }
 
-    fn enqueue(&self, intent: LaunchIntent) -> Vec<LaunchIntent> {
-        self.lock_queue().enqueue(intent)
+    fn enqueue(&self, intent: LaunchIntent) -> Vec<ScheduledLaunchIntent> {
+        let mut state = self.lock_state();
+        let intents = state.queue.enqueue(intent);
+        state.schedule(intents)
     }
 
-    fn deliver<D, E>(
+    fn deliver_after<F, D, E>(
         &self,
-        deliveries: Vec<LaunchIntent>,
+        deliveries: Vec<ScheduledLaunchIntent>,
+        before_delivery: F,
         mut emit: D,
     ) -> LaunchIntentDeliveryReport<E>
     where
+        F: FnOnce(),
         D: FnMut(&LaunchIntent) -> Result<(), E>,
     {
+        let mut batch_guard = DeliveryBatchGuard::new(&self.dispatcher, &deliveries);
+        before_delivery();
+
         let mut report = LaunchIntentDeliveryReport::empty();
-        for intent in deliveries {
-            match emit(&intent) {
+        for delivery in deliveries {
+            let Some(turn_guard) = self.dispatcher.wait_for_turn(delivery.ticket) else {
+                batch_guard.release(delivery.ticket);
+                self.acknowledge(delivery.intent.id);
+                continue;
+            };
+            batch_guard.release(delivery.ticket);
+
+            match emit(&delivery.intent) {
                 Ok(()) => {
-                    self.acknowledge(intent.id);
-                    report.delivered_ids.push(intent.id);
+                    self.acknowledge(delivery.intent.id);
+                    report.delivered_ids.push(delivery.intent.id);
                 }
-                Err(error) => report
-                    .failures
-                    .push(LaunchIntentDeliveryFailure { intent, error }),
+                Err(error) => report.failures.push(LaunchIntentDeliveryFailure {
+                    intent: delivery.intent,
+                    error,
+                }),
             }
+            drop(turn_guard);
         }
         report
     }
 
-    fn lock_queue(&self) -> MutexGuard<'_, LaunchIntentQueue> {
-        self.queue
+    fn lock_state(&self) -> MutexGuard<'_, LaunchIntentRouterState> {
+        self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
