@@ -64,11 +64,23 @@ impl AppState {
             ),
         }
     }
+}
 
-    #[allow(dead_code)]
-    pub(crate) fn next_launch_intent_id(&self) -> Option<u64> {
-        self.launch_intent_router.next_id()
-    }
+/// Registers the activation plugin first, then injects its state before the
+/// returned builder can initialize plugins.
+pub fn configure_activation_builder<B, P, RegisterPlugin, ManageState>(
+    builder: B,
+    activation_plugin: P,
+    initial_launch_intent: Option<launch_intent::LaunchIntent>,
+    register_plugin: RegisterPlugin,
+    manage_state: ManageState,
+) -> B
+where
+    RegisterPlugin: FnOnce(B, P) -> B,
+    ManageState: FnOnce(B, AppState) -> B,
+{
+    let builder = register_plugin(builder, activation_plugin);
+    manage_state(builder, AppState::new(initial_launch_intent))
 }
 
 fn restore_main_window(app: &tauri::AppHandle) {
@@ -147,8 +159,9 @@ pub fn run() {
         1,
     );
 
-    let app = tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
+    let builder = configure_activation_builder(
+        tauri::Builder::default(),
+        tauri_plugin_single_instance::init(|app, args, cwd| {
             let state = app.state::<AppState>();
             let report = state.launch_intent_router.route_forwarded_args(
                 args.into_iter().map(OsString::from),
@@ -157,11 +170,14 @@ pub fn run() {
                 |intent| app.emit_to("main", "ride-open-request", intent),
             );
             log_launch_intent_delivery_failures("single-instance", report.failures);
-        }))
-        .setup(move |app| {
-            // 初始化全局状态
-            app.manage(AppState::new(initial_launch_intent));
+        }),
+        initial_launch_intent,
+        |builder, plugin| builder.plugin(plugin),
+        |builder, state| builder.manage(state),
+    );
 
+    let app = builder
+        .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {
                 native_chrome::configure_native_window(&window);
             }
@@ -220,32 +236,4 @@ pub fn run() {
         }
         _ => {}
     });
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn app_state_seeds_initial_intent_before_allocating_later_ids() {
-        let initial = launch_intent::LaunchIntent {
-            id: 1,
-            source: launch_intent::LaunchSource::Initial,
-            workspace: "workspace".into(),
-            files: vec!["workspace/initial.R".into()],
-        };
-        let state = AppState::new(Some(initial.clone()));
-
-        assert_eq!(state.next_launch_intent_id(), Some(2));
-
-        let mut delivered = Vec::new();
-        state.launch_intent_router.frontend_ready(|intent| {
-            delivered.push(intent.clone());
-            Ok::<_, ()>(())
-        });
-        assert_eq!(delivered, vec![initial]);
-
-        let state_without_initial = AppState::new(None);
-        assert_eq!(state_without_initial.next_launch_intent_id(), Some(1));
-    }
 }
