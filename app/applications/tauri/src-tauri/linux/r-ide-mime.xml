@@ -20,6 +20,7 @@
     <glob pattern="*.toml" weight="80"/>
   </mime-type>
   <mime-type type="application/yaml">
+    <sub-class-of type="text/plain"/>
     <glob pattern="*.yaml" weight="80"/>
     <glob pattern="*.yml" weight="80"/>
   </mime-type>

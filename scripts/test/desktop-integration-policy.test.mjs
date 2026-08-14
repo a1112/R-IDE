@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -29,6 +31,7 @@ const appImageIntegrationScriptPath = path.join(
   'appimage-integration.sh',
 );
 const cargoManifestPath = path.join(tauriDirectory, 'Cargo.toml');
+const isWindows = process.platform === 'win32';
 
 const editorAssociation = { role: 'Editor', rank: 'Alternate' };
 const approvedAssociations = [
@@ -137,6 +140,21 @@ const ubuntuSharedMimeInfoFixtures = new Map([
   ['Ubuntu 22.04 / shared-mime-info 2.1', ubuntuSharedMimeInfo21Globs],
   ['Ubuntu 24.04 / shared-mime-info 2.4', ubuntuSharedMimeInfo24Globs],
 ]);
+const ubuntuSharedMimeInfo21YamlFixture = `<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-yaml">
+    <comment>YAML document</comment>
+    <sub-class-of type="text/plain"/>
+    <magic>
+      <match type="string" value="%YAML" offset="0"/>
+    </magic>
+    <glob pattern="*.yaml"/>
+    <glob pattern="*.yml"/>
+    <alias type="text/yaml"/>
+    <alias type="text/x-yaml"/>
+  </mime-type>
+</mime-info>
+`;
 
 test('Tauri registers the approved code and workspace file associations', () => {
   const associations = config.bundle.fileAssociations ?? [];
@@ -164,6 +182,40 @@ test('the main Tauri window suspends background throttling', () => {
 function readRequiredText(filePath, description) {
   assert.ok(fs.existsSync(filePath), `expected ${description} at ${filePath}`);
   return fs.readFileSync(filePath, 'utf8');
+}
+
+function toLinuxPath(filePath) {
+  if (!isWindows) {
+    return filePath;
+  }
+  const result = spawnSync('wsl.exe', ['-e', 'wslpath', '-a', filePath], { encoding: 'utf8' });
+  assert.equal(result.status, 0, result.stderr);
+  return result.stdout.replaceAll('\0', '').trim();
+}
+
+function runLinuxCommand(command, args, environment) {
+  const linuxArgs = args.map((argument) => (
+    path.isAbsolute(argument) ? toLinuxPath(argument) : argument
+  ));
+  if (isWindows) {
+    return spawnSync(
+      'wsl.exe',
+      ['-e', 'env', ...Object.entries(environment).map(([key, value]) => `${key}=${value}`), command, ...linuxArgs],
+      { encoding: 'utf8' },
+    );
+  }
+  return spawnSync(command, linuxArgs, {
+    encoding: 'utf8',
+    env: { ...process.env, ...environment },
+  });
+}
+
+function assertLinuxCommandSucceeded(result) {
+  assert.equal(
+    result.status,
+    0,
+    `command failed\nstdout: ${result.stdout}\nstderr: ${result.stderr}`,
+  );
 }
 
 function cargoMainBinaryName(manifest) {
@@ -414,4 +466,47 @@ test('R-IDE shared MIME metadata covers every Ubuntu 2.1 and 2.4 mapping gap', (
   assert.match(updateScript, /command -v update-mime-database/);
   assert.match(updateScript, /update-mime-database \/usr\/share\/mime/);
   assert.doesNotMatch(updateScript, /sudo/);
+});
+
+test('Ubuntu 22.04 resolves non-empty YAML files to the approved application/yaml type', (context) => {
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'r-ide ubuntu-22.04-yaml '));
+  context.after(() => fs.rmSync(sandbox, { recursive: true, force: true }));
+  const dataHome = path.join(sandbox, 'data-home');
+  const dataDirectories = path.join(sandbox, 'data-directories');
+  const mimeDirectory = path.join(dataHome, 'mime');
+  const packagesDirectory = path.join(mimeDirectory, 'packages');
+  fs.mkdirSync(packagesDirectory, { recursive: true });
+  fs.mkdirSync(dataDirectories, { recursive: true });
+  fs.writeFileSync(
+    path.join(packagesDirectory, 'ubuntu-shared-mime-info-2.1-yaml.xml'),
+    ubuntuSharedMimeInfo21YamlFixture,
+  );
+  fs.copyFileSync(linuxMimePackagePath, path.join(packagesDirectory, 'r-ide.xml'));
+  const environment = {
+    HOME: toLinuxPath(sandbox),
+    XDG_DATA_HOME: toLinuxPath(dataHome),
+    XDG_DATA_DIRS: toLinuxPath(dataDirectories),
+    LC_ALL: 'C',
+  };
+
+  assertLinuxCommandSucceeded(runLinuxCommand(
+    'update-mime-database',
+    [mimeDirectory],
+    environment,
+  ));
+  for (const extension of ['yaml', 'yml']) {
+    const documentPath = path.join(sandbox, `non-empty.${extension}`);
+    fs.writeFileSync(documentPath, 'project: R-IDE\n');
+    const result = runLinuxCommand(
+      'gio',
+      ['info', '--attributes=standard::content-type', documentPath],
+      environment,
+    );
+    assertLinuxCommandSucceeded(result);
+    assert.match(
+      result.stdout.replaceAll('\0', ''),
+      /standard::content-type: application\/yaml\b/,
+      `.${extension} must resolve to application/yaml with Ubuntu shared-mime-info 2.1 rules`,
+    );
+  }
 });
