@@ -30,7 +30,8 @@
         "hiddenTitle": true,
         "transparent": true,
         "shadow": true,
-        "backgroundColor": "#00000000"
+        "backgroundColor": "#00000000",
+        "backgroundThrottling": "suspend"
       }
     ],
     "security": {
@@ -44,6 +45,296 @@
       "icons/icon.icns",
       "icons/icon.ico",
       "icons/512x512.png"
+    ],
+    "fileAssociations": [
+      {
+        "ext": ["bash", "sh", "zsh"],
+        "mimeType": "application/x-sh",
+        "name": "Shell Script",
+        "description": "Shell script source file",
+        "role": "Editor",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["fish"],
+        "mimeType": "application/x-fish",
+        "name": "Fish Shell Script",
+        "description": "Fish shell script source file",
+        "role": "Editor",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["bat", "cmd"],
+        "mimeType": "application/x-msdos-program",
+        "name": "Windows Command Script",
+        "description": "Windows command script source file",
+        "role": "Editor",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["ps1", "psm1"],
+        "mimeType": "application/x-powershell",
+        "name": "PowerShell Script",
+        "description": "PowerShell script source file",
+        "role": "Editor",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["c"],
+        "mimeType": "text/x-c",
+        "name": "C Source",
+        "description": "C source file",
+        "role": "Editor",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["h"],
+        "mimeType": "text/x-chdr",
+        "name": "C Header",
+        "description": "C header file",
+        "role": "Editor",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["cc", "cpp", "cxx"],
+        "mimeType": "text/x-c++",
+        "name": "C++ Source",
+        "description": "C++ source file",
+        "role": "Editor",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["hpp"],
+        "mimeType": "text/x-c++hdr",
+        "name": "C++ Header",
+        "description": "C++ header file",
+        "role": "Editor",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["cs"],
+        "mimeType": "text/x-csharp",
+        "name": "C# Source",
+        "description": "C# source file",
+        "role": "Editor",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["go"],
+        "mimeType": "text/x-go",
+        "name": "Go Source",
+        "description": "Go source file",
+        "role": "Editor",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["java"],
+        "mimeType": "text/x-java-source",
+        "name": "Java Source",
+        "description": "Java source file",
+        "role": "Editor",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["kt", "kts"],
+        "mimeType": "text/x-kotlin",
+        "name": "Kotlin Source",
+        "description": "Kotlin source file",
+        "role": "Editor",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["rs"],
+        "mimeType": "text/x-rust",
+        "name": "Rust Source",
+        "description": "Rust source file",
+        "role": "Editor",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["py", "pyw"],
+        "mimeType": "text/x-python",
+        "name": "Python Source",
+        "description": "Python source file",
+        "role": "Editor",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["r"],
+        "mimeType": "text/x-r-source",
+        "name": "R Source",
+        "description": "R source file",
+        "role": "Editor",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["rmd"],
+        "mimeType": "text/x-r-markdown",
+        "name": "R Markdown",
+        "description": "R Markdown document",
+        "role": "Editor",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["qmd"],
+        "mimeType": "text/x-quarto",
+        "name": "Quarto Markdown",
+        "description": "Quarto Markdown document",
+        "role": "Editor",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["sql"],
+        "mimeType": "application/sql",
+        "name": "SQL Source",
+        "description": "SQL source file",
+        "role": "Editor",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["htm", "html"],
+        "mimeType": "text/html",
+        "name": "HTML Document",
+        "description": "HTML source file",
+        "role": "Editor",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["css"],
+        "mimeType": "text/css",
+        "name": "CSS Stylesheet",
+        "description": "CSS stylesheet source file",
+        "role": "Editor",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["scss"],
+        "mimeType": "text/x-scss",
+        "name": "SCSS Stylesheet",
+        "description": "SCSS stylesheet source file",
+        "role": "Editor",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["less"],
+        "mimeType": "text/x-less",
+        "name": "Less Stylesheet",
+        "description": "Less stylesheet source file",
+        "role": "Editor",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["cjs", "js", "mjs"],
+        "mimeType": "text/javascript",
+        "name": "JavaScript Source",
+        "description": "JavaScript source file",
+        "role": "Editor",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["jsx"],
+        "mimeType": "text/jsx",
+        "name": "JavaScript JSX Source",
+        "description": "JavaScript JSX source file",
+        "role": "Editor",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["cts", "mts", "ts"],
+        "mimeType": "application/typescript",
+        "name": "TypeScript Source",
+        "description": "TypeScript source file",
+        "role": "Editor",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["tsx"],
+        "mimeType": "text/tsx",
+        "name": "TypeScript TSX Source",
+        "description": "TypeScript TSX source file",
+        "role": "Editor",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["svelte"],
+        "mimeType": "text/x-svelte",
+        "name": "Svelte Component",
+        "description": "Svelte component source file",
+        "role": "Editor",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["vue"],
+        "mimeType": "text/x-vue",
+        "name": "Vue Component",
+        "description": "Vue component source file",
+        "role": "Editor",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["json", "jsonc"],
+        "mimeType": "application/json",
+        "name": "JSON Document",
+        "description": "JSON configuration file",
+        "role": "Editor",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["code-workspace", "theia-workspace"],
+        "mimeType": "application/json",
+        "name": "IDE Workspace",
+        "description": "IDE workspace configuration file",
+        "role": "Editor",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["xml"],
+        "mimeType": "application/xml",
+        "name": "XML Document",
+        "description": "XML document",
+        "role": "Editor",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["yaml", "yml"],
+        "mimeType": "application/yaml",
+        "name": "YAML Document",
+        "description": "YAML configuration file",
+        "role": "Editor",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["toml"],
+        "mimeType": "application/toml",
+        "name": "TOML Document",
+        "description": "TOML configuration file",
+        "role": "Editor",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["ini"],
+        "mimeType": "text/x-ini",
+        "name": "INI Document",
+        "description": "INI configuration file",
+        "role": "Editor",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["properties"],
+        "mimeType": "text/x-java-properties",
+        "name": "Properties Document",
+        "description": "Properties configuration file",
+        "role": "Editor",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["markdown", "md"],
+        "mimeType": "text/markdown",
+        "name": "Markdown Document",
+        "description": "Markdown document",
+        "role": "Editor",
+        "rank": "Alternate"
+      }
     ],
     "publisher": "R-IDE contributors",
     "copyright": "Copyright © 2026 R-IDE contributors",

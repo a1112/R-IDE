@@ -36,7 +36,7 @@ jobs:
           restore-keys: |
             quality-${{ runner.os }}-
       - name: Run synchronization and policy tests
-        run: node --test scripts/test/upstream-sync/*.test.mjs scripts/test/workflow-policy.test.mjs
+        run: node --test scripts/test/upstream-sync/*.test.mjs scripts/test/workflow-policy.test.mjs scripts/test/desktop-integration-policy.test.mjs
       - name: Install JavaScript dependencies
         working-directory: app
         run: |
