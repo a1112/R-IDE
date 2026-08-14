@@ -11,6 +11,7 @@ use serde::Serialize;
 use std::collections::{HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -27,6 +28,39 @@ pub struct LaunchIntent {
     pub source: LaunchSource,
     pub workspace: PathBuf,
     pub files: Vec<PathBuf>,
+}
+
+#[derive(Debug)]
+pub struct LaunchIntentIdSource {
+    next: AtomicU64,
+}
+
+impl LaunchIntentIdSource {
+    pub fn new(first: u64) -> Option<Self> {
+        (first != 0).then(|| Self {
+            next: AtomicU64::new(first),
+        })
+    }
+
+    pub fn next(&self) -> Option<u64> {
+        let mut current = self.next.load(Ordering::Relaxed);
+        loop {
+            if current == 0 {
+                return None;
+            }
+
+            let following = current.checked_add(1).unwrap_or(0);
+            match self.next.compare_exchange_weak(
+                current,
+                following,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(current),
+                Err(actual) => current = actual,
+            }
+        }
+    }
 }
 
 #[derive(Debug)]

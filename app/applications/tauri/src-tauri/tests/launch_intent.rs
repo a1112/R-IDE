@@ -1,10 +1,11 @@
 use ride_tauri::launch_intent::{
-    parse_args, parse_opened_urls, LaunchIntent, LaunchIntentQueue, LaunchSource,
+    parse_args, parse_opened_urls, LaunchIntent, LaunchIntentIdSource, LaunchIntentQueue,
+    LaunchSource,
 };
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 #[derive(Debug)]
@@ -110,6 +111,51 @@ fn queue_intent(id: u64) -> LaunchIntent {
         workspace: PathBuf::from(format!("workspace-{id}")),
         files: vec![PathBuf::from(format!("file-{id}.R"))],
     }
+}
+
+#[test]
+fn launch_intent_ids_start_at_the_configured_nonzero_value() {
+    let source = LaunchIntentIdSource::new(1).expect("nonzero ID source");
+
+    assert_eq!(source.next(), Some(1));
+    assert_eq!(source.next(), Some(2));
+}
+
+#[test]
+fn launch_intent_ids_stop_after_u64_max_without_wrapping() {
+    let source = LaunchIntentIdSource::new(u64::MAX - 1).expect("nonzero ID source");
+
+    assert_eq!(source.next(), Some(u64::MAX - 1));
+    assert_eq!(source.next(), Some(u64::MAX));
+    assert_eq!(source.next(), None);
+    assert_eq!(source.next(), None);
+}
+
+#[test]
+fn launch_intent_id_source_rejects_zero_as_an_ambiguous_start() {
+    assert!(LaunchIntentIdSource::new(0).is_none());
+}
+
+#[test]
+fn concurrent_launch_intent_ids_are_unique() {
+    let source = Arc::new(LaunchIntentIdSource::new(1).expect("nonzero ID source"));
+    let workers = (0..4)
+        .map(|_| {
+            let source = Arc::clone(&source);
+            std::thread::spawn(move || {
+                (0..64)
+                    .map(|_| source.next().expect("ID space remains available"))
+                    .collect::<Vec<_>>()
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut ids = workers
+        .into_iter()
+        .flat_map(|worker| worker.join().expect("ID worker"))
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+
+    assert_eq!(ids, (1..=256).collect::<Vec<_>>());
 }
 
 #[test]

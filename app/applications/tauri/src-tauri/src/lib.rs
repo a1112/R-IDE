@@ -15,10 +15,7 @@ pub mod launch_intent;
 pub mod native_chrome;
 pub mod sidecar;
 
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Mutex,
-};
+use std::sync::Mutex;
 use tauri::Manager;
 
 const MAX_PENDING_LAUNCH_INTENTS: usize = 64;
@@ -51,13 +48,13 @@ pub struct AppState {
     pub downloads: download::DownloadManager,
     pub launch_intents: Mutex<launch_intent::LaunchIntentQueue>,
     #[allow(dead_code)] // Reserved for Task 4 activation routing.
-    launch_intent_id_source: AtomicU64,
+    launch_intent_id_source: launch_intent::LaunchIntentIdSource,
 }
 
 impl AppState {
     #[allow(dead_code)] // Reserved for Task 4 activation routing.
-    pub(crate) fn next_launch_intent_id(&self) -> u64 {
-        self.launch_intent_id_source.fetch_add(1, Ordering::Relaxed)
+    pub(crate) fn next_launch_intent_id(&self) -> Option<u64> {
+        self.launch_intent_id_source.next()
     }
 }
 
@@ -110,7 +107,8 @@ pub fn run() {
                 launch_intents: Mutex::new(launch_intent::LaunchIntentQueue::new(
                     MAX_PENDING_LAUNCH_INTENTS,
                 )),
-                launch_intent_id_source: AtomicU64::new(1),
+                launch_intent_id_source: launch_intent::LaunchIntentIdSource::new(1)
+                    .expect("launch intent IDs start at one"),
             });
 
             if let Some(window) = app.get_webview_window("main") {
@@ -175,10 +173,11 @@ mod tests {
             backend_stopping: Mutex::new(false),
             downloads: download::DownloadManager::new(),
             launch_intents: Mutex::new(launch_intent::LaunchIntentQueue::new(4)),
-            launch_intent_id_source: std::sync::atomic::AtomicU64::new(41),
+            launch_intent_id_source: launch_intent::LaunchIntentIdSource::new(41)
+                .expect("nonzero ID source"),
         };
 
-        assert_eq!(state.next_launch_intent_id(), 41);
-        assert_eq!(state.next_launch_intent_id(), 42);
+        assert_eq!(state.next_launch_intent_id(), Some(41));
+        assert_eq!(state.next_launch_intent_id(), Some(42));
     }
 }
