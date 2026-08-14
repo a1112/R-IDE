@@ -36,6 +36,11 @@ fn serialize_launch_intent_id<S>(id: &u64, serializer: S) -> Result<S::Ok, S::Er
 where
     S: serde::Serializer,
 {
+    if *id == 0 {
+        return Err(serde::ser::Error::custom(
+            "launch intent IDs must be nonzero",
+        ));
+    }
     serializer.serialize_str(&id.to_string())
 }
 
@@ -499,6 +504,9 @@ pub fn parse_args(
     source: LaunchSource,
     next_id: u64,
 ) -> Option<LaunchIntent> {
+    if next_id == 0 {
+        return None;
+    }
     let mut args = args.into_iter();
     args.next()?;
 
@@ -514,6 +522,9 @@ pub fn parse_opened_urls(
     source: LaunchSource,
     next_id: u64,
 ) -> Option<LaunchIntent> {
+    if next_id == 0 {
+        return None;
+    }
     let files = urls.iter().filter_map(path_from_file_url).collect();
 
     build_intent(files, source, next_id)

@@ -147,6 +147,35 @@ fn serializes_launch_intent_ids_as_canonical_decimal_strings() {
 }
 
 #[test]
+fn rejects_serializing_a_zero_launch_intent_id() {
+    assert!(serde_json::to_value(queue_intent(0)).is_err());
+}
+
+#[test]
+fn parse_args_rejects_zero_id_before_inspecting_file_arguments() {
+    let arguments =
+        std::iter::once(OsString::from("ignored-executable")).chain(std::iter::from_fn(
+            || -> Option<OsString> { panic!("zero-ID parsing must not inspect file arguments") },
+        ));
+
+    assert_eq!(
+        parse_args(arguments, Path::new("."), LaunchSource::Initial, 0),
+        None
+    );
+}
+
+#[test]
+fn parse_opened_urls_rejects_a_zero_id() {
+    let file = Fixture::file("zero-id-opened-url.R");
+    let file_url = tauri::Url::from_file_path(file.path()).expect("fixture file URL");
+
+    assert_eq!(
+        parse_opened_urls(&[file_url], LaunchSource::OpenedUrl, 0),
+        None
+    );
+}
+
+#[test]
 fn concurrent_launch_intent_ids_are_unique() {
     let source = Arc::new(LaunchIntentIdSource::new(1).expect("nonzero ID source"));
     let workers = (0..4)

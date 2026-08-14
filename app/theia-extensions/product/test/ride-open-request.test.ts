@@ -239,6 +239,37 @@ test('reload restores a removed pending request exactly once, including the maxi
     assert.deepEqual(restartedContribution.openers.opened, []);
 });
 
+test('reload rejects pending requests that are not exactly authorized by last-consumed', async () => {
+    const pending = {
+        id: '99',
+        source: 'singleInstance',
+        workspace: '/project',
+        files: ['/project/analysis.R']
+    };
+    const cases = [
+        { lastConsumed: undefined, expectedLast: null },
+        { lastConsumed: 'not-an-id', expectedLast: 'not-an-id' },
+        { lastConsumed: '98', expectedLast: '98' },
+        { lastConsumed: '100', expectedLast: '100' }
+    ];
+
+    for (const { lastConsumed, expectedLast } of cases) {
+        const storage = new MemoryStorage();
+        storage.setItem(RIDE_OPEN_REQUEST_PENDING_KEY, JSON.stringify(pending));
+        if (lastConsumed) {
+            storage.setItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY, lastConsumed);
+        }
+        const context = createContribution('/project', storage);
+
+        await context.contribution.restorePendingRequest();
+
+        assert.equal(storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY), null);
+        assert.equal(storage.getItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY), expectedLast);
+        assert.deepEqual(context.openers.opened, []);
+        assert.equal(context.messages.errors.length, 1);
+    }
+});
+
 test('a failed file reports an error, continues opening, and does not poison later requests', async () => {
     const context = createContribution(String.raw`C:\project`, new MemoryStorage(), uri => {
         if (FileUri.fsPath(uri).toLowerCase().endsWith('broken.r')) {
@@ -270,6 +301,12 @@ test('a failed file reports an error, continues opening, and does not poison lat
 
 test('an observable workspace switch failure clears the handoff, reports it, and leaves later requests usable', async () => {
     const context = createContribution(String.raw`C:\project`);
+    await context.contribution.handleOpenRequest({
+        id: '4',
+        source: 'singleInstance',
+        workspace: String.raw`C:\project`,
+        files: [String.raw`C:\project\before.R`]
+    });
     context.workspace.openError = new Error('window switch failed');
 
     await context.contribution.handleOpenRequest({
@@ -280,19 +317,19 @@ test('an observable workspace switch failure clears the handoff, reports it, and
     });
 
     assert.equal(context.storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY), null);
-    assert.equal(context.storage.getItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY), '5');
+    assert.equal(context.storage.getItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY), '4');
     assert.deepEqual(context.workspace.opened, []);
     assert.equal(context.messages.errors.length, 1);
     assert.match(context.messages.errors[0], /window switch failed/);
 
     context.workspace.openError = undefined;
     await context.contribution.handleOpenRequest({
-        id: '6',
+        id: '5',
         source: 'singleInstance',
         workspace: String.raw`C:\project`,
         files: [String.raw`C:\project\later.R`]
     });
-    assert.equal(context.openers.opened.length, 1);
+    assert.equal(context.openers.opened.length, 2);
 });
 
 test('invalid payloads never consume IDs, write storage, open files, or switch workspaces', async () => {
@@ -378,6 +415,42 @@ test('Unix root is a valid workspace boundary without weakening descendant check
     assert.deepEqual(context.messages.errors, []);
 });
 
+test('Windows drive root is a valid workspace for a root-level file', async () => {
+    const context = createContribution('C:\\');
+
+    await context.contribution.handleOpenRequest({
+        id: '11', source: 'initial', workspace: 'C:/', files: [String.raw`C:\root.R`]
+    });
+
+    assert.deepEqual(context.openers.opened.map(entry => FileUri.fsPath(entry.uri).toLowerCase()), [String.raw`c:\root.r`]);
+    assert.deepEqual(context.workspace.opened, []);
+    assert.deepEqual(context.messages.errors, []);
+});
+
+test('UNC share root is valid while empty segments and traversal remain rejected', async () => {
+    const workspace = String.raw`\\server\share`;
+    const valid = createContribution(workspace);
+
+    await valid.contribution.handleOpenRequest({
+        id: '11', source: 'initial', workspace: String.raw`\\SERVER\SHARE`, files: [String.raw`\\server\share\root.R`]
+    });
+
+    assert.deepEqual(valid.openers.opened.map(entry => FileUri.fsPath(entry.uri).toLowerCase()), [String.raw`\\server\share\root.r`]);
+    assert.deepEqual(valid.workspace.opened, []);
+
+    const invalid = createContribution(workspace);
+    await invalid.contribution.handleOpenRequest({
+        id: '12', source: 'initial', workspace, files: [String.raw`\\server\\share\root.R`]
+    });
+    await invalid.contribution.handleOpenRequest({
+        id: '12', source: 'initial', workspace, files: [String.raw`\\server\share\..\escape.R`]
+    });
+
+    assert.deepEqual(invalid.openers.opened, []);
+    assert.equal(invalid.storage.getItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY), null);
+    assert.equal(invalid.messages.errors.length, 2);
+});
+
 test('native open-request listener delivers the typed payload and returns its unlisten cleanup', async () => {
     let eventName: string | undefined;
     let eventHandler: ((event: { payload: unknown }) => void) | undefined;
@@ -435,6 +508,7 @@ test('frontend lifecycle restores and registers once, then unlistens once on cle
         workspace: '/project',
         files: ['/project/startup.R']
     }));
+    storage.setItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY, '12');
     const context = createContribution('/project', storage);
 
     await context.contribution.onStart();
@@ -456,6 +530,7 @@ test('frontend startup waits for the workspace before restoring pending files', 
         workspace: '/project',
         files: ['/project/ready.R']
     }));
+    storage.setItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY, '14');
     const context = createContribution('/project', storage);
     const readyWorkspace = context.workspace.workspace;
     context.workspace.workspace = undefined;

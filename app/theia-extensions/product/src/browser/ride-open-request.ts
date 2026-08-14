@@ -114,6 +114,11 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
                 this.workspaceService.open(FileUri.create(request.workspace), { preserveWindow: true });
             } catch (error) {
                 this.storage.removeItem(RIDE_OPEN_REQUEST_PENDING_KEY);
+                if (previousId) {
+                    this.storage.setItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY, previousId);
+                } else {
+                    this.storage.removeItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY);
+                }
                 await this.messageService.error(`R-IDE could not switch workspace: ${errorMessage(error)}`);
             }
             return;
@@ -147,13 +152,10 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
             return;
         }
 
-        const previousId = this.readLastConsumedId();
-        if (previousId && compareDecimalIds(request.id, previousId) < 0) {
-            await this.messageService.error('R-IDE discarded an outdated pending file-open request.');
+        const previousId = this.storage.getItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY) ?? undefined;
+        if (!isCanonicalU64(previousId) || previousId !== request.id) {
+            await this.messageService.error('R-IDE discarded an unauthorized pending file-open request.');
             return;
-        }
-        if (!previousId || compareDecimalIds(request.id, previousId) > 0) {
-            this.storage.setItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY, request.id);
         }
         if (!this.isCurrentWorkspace(request.workspace)) {
             await this.messageService.error('R-IDE discarded a pending file-open request for a different workspace.');
@@ -294,11 +296,12 @@ function normalizeNativePath(value: string): NormalizedNativePath | undefined {
         return undefined;
     }
 
-    const rootLength = windows && /^[a-zA-Z]:\/$/.test(normalized) ? 3 : normalized === '/' ? 1 : 0;
+    const isDriveRoot = windows && /^[a-zA-Z]:\/$/.test(normalized);
+    const rootLength = isDriveRoot ? 3 : normalized === '/' ? 1 : 0;
     while (normalized.length > rootLength && normalized.endsWith('/')) {
         normalized = normalized.slice(0, -1);
     }
-    const pathSegments = normalized === '/' ? [] : normalized.replace(/^\/\/?/, '').split('/');
+    const pathSegments = normalized === '/' || isDriveRoot ? [] : normalized.replace(/^\/\/?/, '').split('/');
     if (pathSegments.some(segment => !segment || segment === '.' || segment === '..')) {
         return undefined;
     }
