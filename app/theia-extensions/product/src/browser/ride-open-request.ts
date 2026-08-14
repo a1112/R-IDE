@@ -11,6 +11,7 @@ import type { ApplicationShell } from '@theia/core/lib/browser/shell/application
 import type { FrontendApplicationContribution } from '@theia/core/lib/browser/frontend-application-contribution';
 import { open } from '@theia/core/lib/browser/opener-service';
 import type { OpenerService } from '@theia/core/lib/browser/opener-service';
+import type { WidgetOpenerOptions } from '@theia/core/lib/browser/widget-open-handler';
 import type { Disposable } from '@theia/core/lib/common/disposable';
 import { FileUri } from '@theia/core/lib/common/file-uri';
 import type { MessageService } from '@theia/core/lib/common/message-service';
@@ -29,6 +30,11 @@ export interface RideOpenRequest {
     source: RideOpenRequestSource;
     workspace: string;
     files: string[];
+}
+
+interface RideOpenRequestQueue {
+    readonly version: 1;
+    readonly requests: RideOpenRequest[];
 }
 
 interface NormalizedNativePath {
@@ -102,6 +108,17 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
             return;
         }
 
+        const pendingRequests = await this.readPendingRequests();
+        if (pendingRequests) {
+            const tail = pendingRequests[pendingRequests.length - 1];
+            if (compareDecimalIds(request.id, tail.id) <= 0) {
+                return;
+            }
+            this.writePendingRequests([...pendingRequests, request]);
+            this.storage.setItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY, request.id);
+            return;
+        }
+
         const previousId = this.readLastConsumedId();
         if (previousId && compareDecimalIds(request.id, previousId) <= 0) {
             return;
@@ -109,16 +126,10 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
         this.storage.setItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY, request.id);
 
         if (!this.isCurrentWorkspace(request.workspace)) {
-            this.storage.setItem(RIDE_OPEN_REQUEST_PENDING_KEY, JSON.stringify(request));
+            this.writePendingRequests([request]);
             try {
                 this.workspaceService.open(FileUri.create(request.workspace), { preserveWindow: true });
             } catch (error) {
-                this.storage.removeItem(RIDE_OPEN_REQUEST_PENDING_KEY);
-                if (previousId) {
-                    this.storage.setItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY, previousId);
-                } else {
-                    this.storage.removeItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY);
-                }
                 await this.messageService.error(`R-IDE could not switch workspace: ${errorMessage(error)}`);
             }
             return;
@@ -139,30 +150,12 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
         }
         this.storage.removeItem(RIDE_OPEN_REQUEST_PENDING_KEY);
 
-        let payload: unknown;
-        try {
-            payload = JSON.parse(serialized);
-        } catch {
-            await this.messageService.error('R-IDE discarded a corrupt pending file-open request.');
-            return;
-        }
-        const request = this.validateRequest(payload);
-        if (!request) {
-            await this.messageService.error('R-IDE discarded an invalid pending file-open request.');
+        const pendingRequests = await this.deserializePendingRequests(serialized);
+        if (!pendingRequests) {
             return;
         }
 
-        const previousId = this.storage.getItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY) ?? undefined;
-        if (!isCanonicalU64(previousId) || previousId !== request.id) {
-            await this.messageService.error('R-IDE discarded an unauthorized pending file-open request.');
-            return;
-        }
-        if (!this.isCurrentWorkspace(request.workspace)) {
-            await this.messageService.error('R-IDE discarded a pending file-open request for a different workspace.');
-            return;
-        }
-
-        await this.openFiles(request);
+        await this.dispatchPendingRequests(pendingRequests);
     }
 
     protected enqueueOpenRequest(request: RideOpenRequest): void {
@@ -175,13 +168,10 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
 
     protected async openFiles(request: RideOpenRequest): Promise<void> {
         let targetWidgetId: string | undefined;
-        for (const [index, file] of request.files.entries()) {
+        const options: WidgetOpenerOptions = { mode: 'open' };
+        for (const file of request.files) {
             try {
-                const opened = await open(this.openerService, FileUri.create(file), {
-                    activate: index === request.files.length - 1,
-                    preview: false,
-                    reveal: true
-                } as never);
+                const opened = await open(this.openerService, FileUri.create(file), options);
                 if (hasWidgetId(opened)) {
                     targetWidgetId = opened.id;
                 }
@@ -192,6 +182,79 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
         if (targetWidgetId) {
             await this.shell.activateWidget(targetWidgetId);
         }
+    }
+
+    protected async readPendingRequests(): Promise<RideOpenRequest[] | undefined> {
+        const serialized = this.storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY) ?? undefined;
+        if (serialized === undefined) {
+            return undefined;
+        }
+        const requests = await this.deserializePendingRequests(serialized);
+        if (!requests) {
+            this.storage.removeItem(RIDE_OPEN_REQUEST_PENDING_KEY);
+        }
+        return requests;
+    }
+
+    protected async deserializePendingRequests(serialized: string): Promise<RideOpenRequest[] | undefined> {
+        let payload: unknown;
+        try {
+            payload = JSON.parse(serialized);
+        } catch {
+            await this.messageService.error('R-IDE discarded a corrupt pending file-open queue.');
+            return undefined;
+        }
+        if (!isRecord(payload) || payload.version !== 1 || !Array.isArray(payload.requests) || payload.requests.length === 0) {
+            await this.messageService.error('R-IDE discarded an invalid pending file-open queue.');
+            return undefined;
+        }
+
+        const requests: RideOpenRequest[] = [];
+        for (const candidate of payload.requests) {
+            const request = this.validateRequest(candidate);
+            const previous = requests[requests.length - 1];
+            if (!request || previous && compareDecimalIds(request.id, previous.id) <= 0) {
+                await this.messageService.error('R-IDE discarded an invalid pending file-open queue.');
+                return undefined;
+            }
+            requests.push(request);
+        }
+
+        const lastId = this.storage.getItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY) ?? undefined;
+        if (!isCanonicalU64(lastId) || lastId !== requests[requests.length - 1].id) {
+            await this.messageService.error('R-IDE discarded an unauthorized pending file-open queue.');
+            return undefined;
+        }
+        return requests;
+    }
+
+    protected async dispatchPendingRequests(requests: RideOpenRequest[]): Promise<void> {
+        let remaining = requests;
+        while (remaining.length > 0) {
+            const request = remaining[0];
+            if (!this.isCurrentWorkspace(request.workspace)) {
+                this.writePendingRequests(remaining);
+                try {
+                    this.workspaceService.open(FileUri.create(request.workspace), { preserveWindow: true });
+                } catch (error) {
+                    await this.messageService.error(`R-IDE could not switch workspace: ${errorMessage(error)}`);
+                }
+                return;
+            }
+
+            remaining = remaining.slice(1);
+            if (remaining.length > 0) {
+                this.writePendingRequests(remaining);
+            } else {
+                this.storage.removeItem(RIDE_OPEN_REQUEST_PENDING_KEY);
+            }
+            await this.openFiles(request);
+        }
+    }
+
+    protected writePendingRequests(requests: RideOpenRequest[]): void {
+        const queue: RideOpenRequestQueue = { version: 1, requests };
+        this.storage.setItem(RIDE_OPEN_REQUEST_PENDING_KEY, JSON.stringify(queue));
     }
 
     protected validateRequest(payload: unknown): RideOpenRequest | undefined {
@@ -276,7 +339,7 @@ function compareDecimalIds(left: string, right: string): number {
 }
 
 function normalizeNativePath(value: string): NormalizedNativePath | undefined {
-    if (!value || value !== value.trim() || /[\0-\x1f]/.test(value)) {
+    if (!value || /[\0-\x1f]/.test(value)) {
         return undefined;
     }
 

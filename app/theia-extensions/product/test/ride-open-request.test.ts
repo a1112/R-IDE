@@ -10,12 +10,14 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { OpenerService, OpenHandler, OpenerOptions } from '@theia/core/lib/browser/opener-service';
+import type { WidgetOpenerOptions } from '@theia/core/lib/browser/widget-open-handler';
 import { FileUri } from '@theia/core/lib/common/file-uri';
 import URI from '@theia/core/lib/common/uri';
 import { RideNativeChrome } from '../src/browser/ride-native-chrome';
 import {
     RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY,
     RIDE_OPEN_REQUEST_PENDING_KEY,
+    RideOpenRequest,
     RideOpenRequestContribution
 } from '../src/browser/ride-open-request';
 
@@ -67,6 +69,7 @@ class FakeWorkspaceService {
 
 class FakeOpenerService implements OpenerService {
     readonly opened: Array<{ uri: URI; options: OpenerOptions | undefined }> = [];
+    readonly handlerActivations: string[] = [];
 
     constructor(protected readonly beforeOpen: (uri: URI) => void = () => undefined) { }
 
@@ -81,7 +84,12 @@ class FakeOpenerService implements OpenerService {
             open: async (uri, options) => {
                 this.beforeOpen(uri);
                 this.opened.push({ uri, options });
-                return { id: `editor-${this.opened.length}` };
+                const widget = { id: `editor-${this.opened.length}` };
+                const mode = (options as WidgetOpenerOptions | undefined)?.mode ?? 'activate';
+                if (mode === 'activate') {
+                    this.handlerActivations.push(widget.id);
+                }
+                return widget;
             }
         };
     }
@@ -108,13 +116,29 @@ class FakeShell {
 class FakeNativeChrome {
     registrations = 0;
     unlistenCalls = 0;
+    protected handler: ((request: RideOpenRequest) => void) | undefined;
 
-    async listenForOpenRequests(): Promise<() => void> {
+    async listenForOpenRequests(handler: (request: RideOpenRequest) => void): Promise<() => void> {
         this.registrations++;
+        this.handler = handler;
         return () => {
             this.unlistenCalls++;
+            this.handler = undefined;
         };
     }
+
+    emit(payload: unknown): void {
+        assert.ok(this.handler, 'native listener must be registered before emitting');
+        this.handler(payload as RideOpenRequest);
+    }
+}
+
+function pendingEnvelope(...requests: object[]): object {
+    return { version: 1, requests };
+}
+
+async function flushRequestChain(): Promise<void> {
+    await new Promise<void>(resolve => setImmediate(resolve));
 }
 
 function createContribution(
@@ -162,10 +186,7 @@ test('same-workspace requests open files in order, activate the target editor, a
         String.raw`c:\project\first.r`,
         String.raw`c:\project\second.r`
     ]);
-    assert.deepEqual(openers.opened.map(entry => entry.options), [
-        { activate: false, preview: false, reveal: true },
-        { activate: true, preview: false, reveal: true }
-    ]);
+    assert.deepEqual(openers.handlerActivations, []);
     assert.deepEqual(shell.activated, ['editor-2']);
     assert.deepEqual(workspace.opened, []);
     assert.deepEqual(messages.errors, []);
@@ -201,11 +222,11 @@ test('different-workspace requests persist only the typed handoff and switch wit
     await contribution.handleOpenRequest(request);
 
     assert.deepEqual(openers.opened, []);
-    assert.deepEqual(JSON.parse(storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY)!), {
+    assert.deepEqual(JSON.parse(storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY)!), pendingEnvelope({
         ...request,
         workspace: 'D:/new-project',
         files: ['D:/new-project/analysis.R']
-    });
+    }));
     assert.equal(workspace.opened.length, 1);
     assert.equal(FileUri.fsPath(workspace.opened[0].uri).toLowerCase(), String.raw`d:\new-project`);
     assert.deepEqual(workspace.opened[0].options, { preserveWindow: true });
@@ -239,6 +260,90 @@ test('reload restores a removed pending request exactly once, including the maxi
     assert.deepEqual(restartedContribution.openers.opened, []);
 });
 
+test('native listener preserves consecutive cross-workspace requests across ordered reloads', async () => {
+    const storage = new MemoryStorage();
+    const requestA: RideOpenRequest = {
+        id: '20', source: 'singleInstance', workspace: '/workspace-a', files: ['/workspace-a/a.R']
+    };
+    const requestB: RideOpenRequest = {
+        id: '21', source: 'singleInstance', workspace: '/workspace-b', files: ['/workspace-b/b.R']
+    };
+    const requestC: RideOpenRequest = {
+        id: '22', source: 'singleInstance', workspace: '/workspace-c', files: ['/workspace-c/c.R']
+    };
+    const firstWindow = createContribution('/workspace-x', storage);
+    await firstWindow.contribution.onStart();
+
+    firstWindow.native.emit(requestA);
+    firstWindow.native.emit(requestB);
+    firstWindow.native.emit(requestB);
+    firstWindow.native.emit({
+        ...requestC,
+        id: '18446744073709551616'
+    });
+    firstWindow.native.emit(requestC);
+    await flushRequestChain();
+
+    assert.equal(firstWindow.workspace.opened.length, 1);
+    assert.equal(firstWindow.workspace.opened[0].uri.toString(), 'file:///workspace-a');
+    assert.deepEqual(firstWindow.openers.opened, []);
+    assert.deepEqual(JSON.parse(storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY)!), pendingEnvelope(requestA, requestB, requestC));
+    assert.equal(storage.getItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY), '22');
+    assert.equal(firstWindow.messages.errors.length, 1);
+
+    const windowA = createContribution('/workspace-a', storage, () => {
+        assert.deepEqual(JSON.parse(storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY)!), pendingEnvelope(requestB, requestC));
+    });
+    await windowA.contribution.restorePendingRequest();
+    assert.deepEqual(windowA.openers.opened.map(entry => entry.uri.toString()), ['file:///workspace-a/a.R']);
+    assert.deepEqual(windowA.workspace.opened.map(entry => entry.uri.toString()), ['file:///workspace-b']);
+    assert.deepEqual(JSON.parse(storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY)!), pendingEnvelope(requestB, requestC));
+
+    const windowB = createContribution('/workspace-b', storage, () => {
+        assert.deepEqual(JSON.parse(storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY)!), pendingEnvelope(requestC));
+    });
+    await windowB.contribution.restorePendingRequest();
+    assert.deepEqual(windowB.openers.opened.map(entry => entry.uri.toString()), ['file:///workspace-b/b.R']);
+    assert.deepEqual(windowB.workspace.opened.map(entry => entry.uri.toString()), ['file:///workspace-c']);
+    assert.deepEqual(JSON.parse(storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY)!), pendingEnvelope(requestC));
+
+    const windowC = createContribution('/workspace-c', storage, () => {
+        assert.equal(storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY), null);
+    });
+    await windowC.contribution.restorePendingRequest();
+    assert.deepEqual(windowC.openers.opened.map(entry => entry.uri.toString()), ['file:///workspace-c/c.R']);
+    assert.deepEqual(windowC.workspace.opened, []);
+    assert.equal(storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY), null);
+    assert.equal(storage.getItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY), '22');
+});
+
+test('reload rejects corrupt, non-increasing, invalid, or tail-unauthorized pending queues atomically', async () => {
+    const request = (id: string, file: string): RideOpenRequest => ({
+        id, source: 'singleInstance', workspace: '/project', files: [`/project/${file}`]
+    });
+    const cases = [
+        { serialized: '{not-json', last: '30' },
+        { serialized: JSON.stringify(pendingEnvelope(request('31', 'a.R'), request('30', 'b.R'))), last: '30' },
+        { serialized: JSON.stringify(pendingEnvelope(request('18446744073709551616', 'overflow.R'))), last: '18446744073709551616' },
+        { serialized: JSON.stringify(pendingEnvelope(request('31', 'a.R'))), last: '32' }
+    ];
+
+    for (const { serialized, last } of cases) {
+        const storage = new MemoryStorage();
+        storage.setItem(RIDE_OPEN_REQUEST_PENDING_KEY, serialized);
+        storage.setItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY, last);
+        const context = createContribution('/project', storage);
+
+        await context.contribution.restorePendingRequest();
+
+        assert.equal(storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY), null);
+        assert.equal(storage.getItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY), last);
+        assert.deepEqual(context.openers.opened, []);
+        assert.deepEqual(context.workspace.opened, []);
+        assert.equal(context.messages.errors.length, 1);
+    }
+});
+
 test('reload rejects pending requests that are not exactly authorized by last-consumed', async () => {
     const pending = {
         id: '99',
@@ -255,7 +360,7 @@ test('reload rejects pending requests that are not exactly authorized by last-co
 
     for (const { lastConsumed, expectedLast } of cases) {
         const storage = new MemoryStorage();
-        storage.setItem(RIDE_OPEN_REQUEST_PENDING_KEY, JSON.stringify(pending));
+        storage.setItem(RIDE_OPEN_REQUEST_PENDING_KEY, JSON.stringify(pendingEnvelope(pending)));
         if (lastConsumed) {
             storage.setItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY, lastConsumed);
         }
@@ -281,7 +386,7 @@ test('a failed file reports an error, continues opening, and does not poison lat
         id: '3',
         source: 'singleInstance',
         workspace: String.raw`C:\project`,
-        files: [String.raw`C:\project\broken.R`, String.raw`C:\project\healthy.R`]
+        files: [String.raw`C:\project\healthy.R`, String.raw`C:\project\broken.R`]
     });
     await context.contribution.handleOpenRequest({
         id: '4',
@@ -294,12 +399,13 @@ test('a failed file reports an error, continues opening, and does not poison lat
         String.raw`c:\project\healthy.r`,
         String.raw`c:\project\later.r`
     ]);
+    assert.deepEqual(context.openers.handlerActivations, []);
     assert.deepEqual(context.shell.activated, ['editor-1', 'editor-2']);
     assert.equal(context.messages.errors.length, 1);
     assert.match(context.messages.errors[0], /broken\.R.*editor failed/);
 });
 
-test('an observable workspace switch failure clears the handoff, reports it, and leaves later requests usable', async () => {
+test('an observable workspace switch failure retains the ordered handoff without retrying in the same lifecycle', async () => {
     const context = createContribution(String.raw`C:\project`);
     await context.contribution.handleOpenRequest({
         id: '4',
@@ -316,20 +422,68 @@ test('an observable workspace switch failure clears the handoff, reports it, and
         files: [String.raw`D:\other\file.R`]
     });
 
-    assert.equal(context.storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY), null);
-    assert.equal(context.storage.getItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY), '4');
+    assert.deepEqual(JSON.parse(context.storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY)!), pendingEnvelope({
+        id: '5', source: 'singleInstance', workspace: 'D:/other', files: ['D:/other/file.R']
+    }));
+    assert.equal(context.storage.getItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY), '5');
     assert.deepEqual(context.workspace.opened, []);
     assert.equal(context.messages.errors.length, 1);
     assert.match(context.messages.errors[0], /window switch failed/);
 
     context.workspace.openError = undefined;
     await context.contribution.handleOpenRequest({
-        id: '5',
+        id: '6',
         source: 'singleInstance',
         workspace: String.raw`C:\project`,
         files: [String.raw`C:\project\later.R`]
     });
-    assert.equal(context.openers.opened.length, 2);
+    assert.equal(context.openers.opened.length, 1);
+    assert.deepEqual(context.workspace.opened, []);
+    assert.deepEqual(JSON.parse(context.storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY)!), pendingEnvelope(
+        { id: '5', source: 'singleInstance', workspace: 'D:/other', files: ['D:/other/file.R'] },
+        { id: '6', source: 'singleInstance', workspace: 'C:/project', files: ['C:/project/later.R'] }
+    ));
+    assert.equal(context.storage.getItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY), '6');
+
+    const restarted = createContribution(String.raw`D:\other`, context.storage);
+    await restarted.contribution.restorePendingRequest();
+    assert.deepEqual(restarted.openers.opened.map(entry => FileUri.fsPath(entry.uri).toLowerCase()), [String.raw`d:\other\file.r`]);
+    assert.equal(restarted.workspace.opened.length, 1);
+    assert.equal(FileUri.fsPath(restarted.workspace.opened[0].uri).toLowerCase(), String.raw`c:\project`);
+    assert.deepEqual(JSON.parse(context.storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY)!), pendingEnvelope(
+        { id: '6', source: 'singleInstance', workspace: 'C:/project', files: ['C:/project/later.R'] }
+    ));
+});
+
+test('a queued workspace switch failure keeps the failed head and tail for a later instance', async () => {
+    const storage = new MemoryStorage();
+    const requestA: RideOpenRequest = {
+        id: '40', source: 'singleInstance', workspace: '/workspace-a', files: ['/workspace-a/a.R']
+    };
+    const requestB: RideOpenRequest = {
+        id: '41', source: 'singleInstance', workspace: '/workspace-b', files: ['/workspace-b/b.R']
+    };
+    const requestC: RideOpenRequest = {
+        id: '42', source: 'singleInstance', workspace: '/workspace-c', files: ['/workspace-c/c.R']
+    };
+    storage.setItem(RIDE_OPEN_REQUEST_PENDING_KEY, JSON.stringify(pendingEnvelope(requestA, requestB, requestC)));
+    storage.setItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY, requestC.id);
+    const windowA = createContribution(requestA.workspace, storage);
+    windowA.workspace.openError = new Error('queued switch failed');
+
+    await windowA.contribution.restorePendingRequest();
+
+    assert.deepEqual(windowA.openers.opened.map(entry => entry.uri.toString()), ['file:///workspace-a/a.R']);
+    assert.deepEqual(JSON.parse(storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY)!), pendingEnvelope(requestB, requestC));
+    assert.equal(storage.getItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY), requestC.id);
+    assert.equal(windowA.workspace.opened.length, 0);
+    assert.match(windowA.messages.errors[0], /queued switch failed/);
+
+    const windowB = createContribution(requestB.workspace, storage);
+    await windowB.contribution.restorePendingRequest();
+    assert.deepEqual(windowB.openers.opened.map(entry => entry.uri.toString()), ['file:///workspace-b/b.R']);
+    assert.deepEqual(windowB.workspace.opened.map(entry => entry.uri.toString()), ['file:///workspace-c']);
+    assert.deepEqual(JSON.parse(storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY)!), pendingEnvelope(requestC));
 });
 
 test('invalid payloads never consume IDs, write storage, open files, or switch workspaces', async () => {
@@ -366,7 +520,7 @@ test('invalid payloads never consume IDs, write storage, open files, or switch w
     assert.equal(context.messages.errors.length, invalidPayloads.length);
 });
 
-test('corrupt or wrong-workspace pending JSON is removed and cannot trigger a restore loop', async () => {
+test('corrupt or legacy pending JSON is removed and cannot trigger a restore loop', async () => {
     const corruptStorage = new MemoryStorage();
     corruptStorage.setItem(RIDE_OPEN_REQUEST_PENDING_KEY, '{not-json');
     const corrupt = createContribution('/project', corruptStorage);
@@ -374,20 +528,21 @@ test('corrupt or wrong-workspace pending JSON is removed and cannot trigger a re
     assert.equal(corruptStorage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY), null);
     assert.equal(corrupt.messages.errors.length, 1);
 
-    const staleStorage = new MemoryStorage();
-    staleStorage.setItem(RIDE_OPEN_REQUEST_PENDING_KEY, JSON.stringify({
+    const legacyStorage = new MemoryStorage();
+    legacyStorage.setItem(RIDE_OPEN_REQUEST_PENDING_KEY, JSON.stringify({
         id: '8',
         source: 'singleInstance',
         workspace: '/other',
         files: ['/other/file.R']
     }));
-    const stale = createContribution('/project', staleStorage);
-    await stale.contribution.restorePendingRequest();
+    legacyStorage.setItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY, '8');
+    const legacy = createContribution('/project', legacyStorage);
+    await legacy.contribution.restorePendingRequest();
 
-    assert.equal(staleStorage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY), null);
-    assert.deepEqual(stale.openers.opened, []);
-    assert.deepEqual(stale.workspace.opened, []);
-    assert.equal(stale.messages.errors.length, 1);
+    assert.equal(legacyStorage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY), null);
+    assert.deepEqual(legacy.openers.opened, []);
+    assert.deepEqual(legacy.workspace.opened, []);
+    assert.equal(legacy.messages.errors.length, 1);
 });
 
 test('last-consumed decimal IDs are monotonic without Number conversion', async () => {
@@ -413,6 +568,25 @@ test('Unix root is a valid workspace boundary without weakening descendant check
     assert.deepEqual(context.openers.opened.map(entry => entry.uri.toString()), ['file:///analysis.R']);
     assert.deepEqual(context.workspace.opened, []);
     assert.deepEqual(context.messages.errors, []);
+});
+
+test('Unix file components preserve legal leading and trailing spaces', async () => {
+    const context = createContribution('/project');
+
+    await context.contribution.handleOpenRequest({
+        id: '11', source: 'initial', workspace: '/project', files: ['/project/ report .R ']
+    });
+
+    assert.deepEqual(context.openers.opened.map(entry => entry.uri.path.toString()), ['/project/ report .R ']);
+    assert.equal(context.storage.getItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY), '11');
+    assert.deepEqual(context.messages.errors, []);
+
+    await context.contribution.handleOpenRequest({
+        id: '12', source: 'initial', workspace: '/project', files: ['']
+    });
+    assert.equal(context.storage.getItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY), '11');
+    assert.equal(context.openers.opened.length, 1);
+    assert.equal(context.messages.errors.length, 1);
 });
 
 test('Windows drive root is a valid workspace for a root-level file', async () => {
@@ -450,9 +624,9 @@ test('redundant drive-root separators are canonical across handoff and reload', 
         id: '13', source: 'singleInstance', workspace: 'C:////', files: [String.raw`C:\root.R`]
     });
 
-    assert.deepEqual(JSON.parse(storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY)!), {
+    assert.deepEqual(JSON.parse(storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY)!), pendingEnvelope({
         id: '13', source: 'singleInstance', workspace: 'C:/', files: ['C:/root.R']
-    });
+    }));
     assert.equal(storage.getItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY), '13');
     assert.equal(FileUri.fsPath(firstWindow.workspace.opened[0].uri).toLowerCase(), 'c:\\');
     assert.deepEqual(firstWindow.workspace.opened[0].options, { preserveWindow: true });
@@ -564,12 +738,12 @@ test('browser-preview open-request listener is a no-op', async () => {
 
 test('frontend lifecycle restores and registers once, then unlistens once on cleanup', async () => {
     const storage = new MemoryStorage();
-    storage.setItem(RIDE_OPEN_REQUEST_PENDING_KEY, JSON.stringify({
+    storage.setItem(RIDE_OPEN_REQUEST_PENDING_KEY, JSON.stringify(pendingEnvelope({
         id: '12',
         source: 'initial',
         workspace: '/project',
         files: ['/project/startup.R']
-    }));
+    })));
     storage.setItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY, '12');
     const context = createContribution('/project', storage);
 
@@ -586,12 +760,12 @@ test('frontend lifecycle restores and registers once, then unlistens once on cle
 
 test('frontend startup waits for the workspace before restoring pending files', async () => {
     const storage = new MemoryStorage();
-    storage.setItem(RIDE_OPEN_REQUEST_PENDING_KEY, JSON.stringify({
+    storage.setItem(RIDE_OPEN_REQUEST_PENDING_KEY, JSON.stringify(pendingEnvelope({
         id: '14',
         source: 'initial',
         workspace: '/project',
         files: ['/project/ready.R']
-    }));
+    })));
     storage.setItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY, '14');
     const context = createContribution('/project', storage);
     const readyWorkspace = context.workspace.workspace;
