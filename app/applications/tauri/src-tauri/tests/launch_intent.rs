@@ -138,6 +138,15 @@ fn launch_intent_id_source_rejects_zero_as_an_ambiguous_start() {
 }
 
 #[test]
+fn serializes_launch_intent_ids_as_canonical_decimal_strings() {
+    for (id, expected) in [(1, "1"), (u64::MAX, "18446744073709551615")] {
+        let serialized = serde_json::to_value(queue_intent(id)).expect("serialize launch intent");
+
+        assert_eq!(serialized["id"], expected);
+    }
+}
+
+#[test]
 fn concurrent_launch_intent_ids_are_unique() {
     let source = Arc::new(LaunchIntentIdSource::new(1).expect("nonzero ID source"));
     let workers = (0..4)
@@ -718,7 +727,7 @@ fn serializes_the_complete_launch_intent_to_the_frontend_json_shape() {
     assert_eq!(
         serde_json::to_value(&intent).expect("serialize complete launch intent"),
         serde_json::json!({
-            "id": 15,
+            "id": "15",
             "source": "singleInstance",
             "workspace": canonical_workspace,
             "files": [canonical_file_string],

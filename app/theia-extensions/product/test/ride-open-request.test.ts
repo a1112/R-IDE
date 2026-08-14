@@ -1,0 +1,479 @@
+/********************************************************************************
+ * Copyright (C) 2026 R-IDE contributors.
+ *
+ * This program and the accompanying materials are made available under the
+ * terms of the MIT License, which is available in the project root.
+ *
+ * SPDX-License-Identifier: MIT
+ ********************************************************************************/
+
+import assert from 'node:assert/strict';
+import { test } from 'node:test';
+import { OpenerService, OpenHandler, OpenerOptions } from '@theia/core/lib/browser/opener-service';
+import { FileUri } from '@theia/core/lib/common/file-uri';
+import URI from '@theia/core/lib/common/uri';
+import { RideNativeChrome } from '../src/browser/ride-native-chrome';
+import {
+    RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY,
+    RIDE_OPEN_REQUEST_PENDING_KEY,
+    RideOpenRequestContribution
+} from '../src/browser/ride-open-request';
+
+class MemoryStorage implements Storage {
+    protected readonly values = new Map<string, string>();
+
+    get length(): number {
+        return this.values.size;
+    }
+
+    clear(): void {
+        this.values.clear();
+    }
+
+    getItem(key: string): string | null {
+        return this.values.get(key) ?? null;
+    }
+
+    key(index: number): string | null {
+        return [...this.values.keys()][index] ?? null;
+    }
+
+    removeItem(key: string): void {
+        this.values.delete(key);
+    }
+
+    setItem(key: string, value: string): void {
+        this.values.set(key, value);
+    }
+}
+
+class FakeWorkspaceService {
+    readonly opened: Array<{ uri: URI; options: { preserveWindow?: boolean } | undefined }> = [];
+    openError: Error | undefined;
+    ready: Promise<void> = Promise.resolve();
+    workspace: { resource: URI } | undefined;
+
+    constructor(workspace: { resource: URI } | undefined) {
+        this.workspace = workspace;
+    }
+
+    open(uri: URI, options?: { preserveWindow?: boolean }): void {
+        if (this.openError) {
+            throw this.openError;
+        }
+        this.opened.push({ uri, options });
+    }
+}
+
+class FakeOpenerService implements OpenerService {
+    readonly opened: Array<{ uri: URI; options: OpenerOptions | undefined }> = [];
+
+    constructor(protected readonly beforeOpen: (uri: URI) => void = () => undefined) { }
+
+    async getOpeners(): Promise<OpenHandler[]> {
+        return [await this.getOpener()];
+    }
+
+    async getOpener(): Promise<OpenHandler> {
+        return {
+            id: 'test-editor',
+            canHandle: () => 100,
+            open: async (uri, options) => {
+                this.beforeOpen(uri);
+                this.opened.push({ uri, options });
+                return { id: `editor-${this.opened.length}` };
+            }
+        };
+    }
+}
+
+class FakeMessageService {
+    readonly errors: string[] = [];
+
+    async error(message: string): Promise<undefined> {
+        this.errors.push(message);
+        return undefined;
+    }
+}
+
+class FakeShell {
+    readonly activated: string[] = [];
+
+    async activateWidget(id: string): Promise<undefined> {
+        this.activated.push(id);
+        return undefined;
+    }
+}
+
+class FakeNativeChrome {
+    registrations = 0;
+    unlistenCalls = 0;
+
+    async listenForOpenRequests(): Promise<() => void> {
+        this.registrations++;
+        return () => {
+            this.unlistenCalls++;
+        };
+    }
+}
+
+function createContribution(
+    workspacePath = String.raw`C:\project`,
+    storage = new MemoryStorage(),
+    beforeOpen: (uri: URI) => void = () => undefined
+): {
+    contribution: RideOpenRequestContribution;
+    workspace: FakeWorkspaceService;
+    openers: FakeOpenerService;
+    messages: FakeMessageService;
+    shell: FakeShell;
+    native: FakeNativeChrome;
+    storage: MemoryStorage;
+} {
+    const workspace = new FakeWorkspaceService({ resource: FileUri.create(workspacePath) });
+    const openers = new FakeOpenerService(beforeOpen);
+    const messages = new FakeMessageService();
+    const shell = new FakeShell();
+    const native = new FakeNativeChrome();
+    const contribution = new RideOpenRequestContribution(
+        workspace as never,
+        openers,
+        messages as never,
+        shell as never,
+        native as never,
+        storage
+    );
+    return { contribution, workspace, openers, messages, shell, native, storage };
+}
+
+test('same-workspace requests open files in order, activate the target editor, and consume duplicate IDs once', async () => {
+    const { contribution, workspace, openers, messages, shell } = createContribution();
+    const request = {
+        id: '1',
+        source: 'singleInstance',
+        workspace: 'C:\\PROJECT\\',
+        files: [String.raw`C:\project\first.R`, String.raw`C:/project/second.R`]
+    };
+
+    await contribution.handleOpenRequest(request);
+    await contribution.handleOpenRequest(request);
+
+    assert.deepEqual(openers.opened.map(entry => FileUri.fsPath(entry.uri).toLowerCase()), [
+        String.raw`c:\project\first.r`,
+        String.raw`c:\project\second.r`
+    ]);
+    assert.deepEqual(openers.opened.map(entry => entry.options), [
+        { activate: false, preview: false, reveal: true },
+        { activate: true, preview: false, reveal: true }
+    ]);
+    assert.deepEqual(shell.activated, ['editor-2']);
+    assert.deepEqual(workspace.opened, []);
+    assert.deepEqual(messages.errors, []);
+});
+
+test('same-workspace requests preserve later files from other directories', async () => {
+    const context = createContribution('/first');
+
+    await context.contribution.handleOpenRequest({
+        id: '2',
+        source: 'initial',
+        workspace: '/first',
+        files: ['/first/one.R', '/second/two.R']
+    });
+
+    assert.deepEqual(context.openers.opened.map(entry => entry.uri.toString()), [
+        'file:///first/one.R',
+        'file:///second/two.R'
+    ]);
+    assert.deepEqual(context.shell.activated, ['editor-2']);
+    assert.deepEqual(context.messages.errors, []);
+});
+
+test('different-workspace requests persist only the typed handoff and switch without opening files early', async () => {
+    const { contribution, workspace, openers, messages, storage } = createContribution(String.raw`C:\old-project`);
+    const request = {
+        id: '2',
+        source: 'openedUrl',
+        workspace: String.raw`D:\new-project`,
+        files: [String.raw`D:\new-project\analysis.R`]
+    };
+
+    await contribution.handleOpenRequest(request);
+
+    assert.deepEqual(openers.opened, []);
+    assert.deepEqual(JSON.parse(storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY)!), {
+        ...request,
+        workspace: 'D:/new-project',
+        files: ['D:/new-project/analysis.R']
+    });
+    assert.equal(workspace.opened.length, 1);
+    assert.equal(FileUri.fsPath(workspace.opened[0].uri).toLowerCase(), String.raw`d:\new-project`);
+    assert.deepEqual(workspace.opened[0].options, { preserveWindow: true });
+    assert.deepEqual(messages.errors, []);
+});
+
+test('reload restores a removed pending request exactly once, including the maximum u64 ID', async () => {
+    const storage = new MemoryStorage();
+    const request = {
+        id: '18446744073709551615',
+        source: 'singleInstance',
+        workspace: String.raw`D:\new-project`,
+        files: [String.raw`D:\new-project\analysis.R`]
+    };
+    const firstWindow = createContribution(String.raw`C:\old-project`, storage);
+    await firstWindow.contribution.handleOpenRequest(request);
+    assert.notEqual(storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY), null);
+
+    const reloadedWindow = createContribution(request.workspace, storage, () => {
+        assert.equal(storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY), null);
+    });
+    await reloadedWindow.contribution.restorePendingRequest();
+    await reloadedWindow.contribution.restorePendingRequest();
+
+    assert.equal(reloadedWindow.openers.opened.length, 1);
+    assert.deepEqual(reloadedWindow.shell.activated, ['editor-1']);
+    assert.equal(storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY), null);
+
+    const restartedContribution = createContribution(request.workspace, storage);
+    await restartedContribution.contribution.restorePendingRequest();
+    assert.deepEqual(restartedContribution.openers.opened, []);
+});
+
+test('a failed file reports an error, continues opening, and does not poison later requests', async () => {
+    const context = createContribution(String.raw`C:\project`, new MemoryStorage(), uri => {
+        if (FileUri.fsPath(uri).toLowerCase().endsWith('broken.r')) {
+            throw new Error('editor failed');
+        }
+    });
+
+    await context.contribution.handleOpenRequest({
+        id: '3',
+        source: 'singleInstance',
+        workspace: String.raw`C:\project`,
+        files: [String.raw`C:\project\broken.R`, String.raw`C:\project\healthy.R`]
+    });
+    await context.contribution.handleOpenRequest({
+        id: '4',
+        source: 'singleInstance',
+        workspace: String.raw`C:\project`,
+        files: [String.raw`C:\project\later.R`]
+    });
+
+    assert.deepEqual(context.openers.opened.map(entry => FileUri.fsPath(entry.uri).toLowerCase()), [
+        String.raw`c:\project\healthy.r`,
+        String.raw`c:\project\later.r`
+    ]);
+    assert.deepEqual(context.shell.activated, ['editor-1', 'editor-2']);
+    assert.equal(context.messages.errors.length, 1);
+    assert.match(context.messages.errors[0], /broken\.R.*editor failed/);
+});
+
+test('an observable workspace switch failure clears the handoff, reports it, and leaves later requests usable', async () => {
+    const context = createContribution(String.raw`C:\project`);
+    context.workspace.openError = new Error('window switch failed');
+
+    await context.contribution.handleOpenRequest({
+        id: '5',
+        source: 'singleInstance',
+        workspace: String.raw`D:\other`,
+        files: [String.raw`D:\other\file.R`]
+    });
+
+    assert.equal(context.storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY), null);
+    assert.equal(context.storage.getItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY), '5');
+    assert.deepEqual(context.workspace.opened, []);
+    assert.equal(context.messages.errors.length, 1);
+    assert.match(context.messages.errors[0], /window switch failed/);
+
+    context.workspace.openError = undefined;
+    await context.contribution.handleOpenRequest({
+        id: '6',
+        source: 'singleInstance',
+        workspace: String.raw`C:\project`,
+        files: [String.raw`C:\project\later.R`]
+    });
+    assert.equal(context.openers.opened.length, 1);
+});
+
+test('invalid payloads never consume IDs, write storage, open files, or switch workspaces', async () => {
+    const context = createContribution('/project');
+    const sparseFiles = new Array<string>(1);
+    const invalidPayloads: unknown[] = [
+        undefined,
+        {},
+        { id: '7', source: 'initial', workspace: '/project' },
+        { id: '7', source: 'initial', workspace: '/project', files: [] },
+        { id: '7', source: 'initial', workspace: '/project', files: sparseFiles },
+        { id: 7, source: 'initial', workspace: '/project', files: ['/project/file.R'] },
+        { id: Number.NaN, source: 'initial', workspace: '/project', files: ['/project/file.R'] },
+        { id: Number.MAX_SAFE_INTEGER + 1, source: 'initial', workspace: '/project', files: ['/project/file.R'] },
+        { id: '0', source: 'initial', workspace: '/project', files: ['/project/file.R'] },
+        { id: '01', source: 'initial', workspace: '/project', files: ['/project/file.R'] },
+        { id: '18446744073709551616', source: 'initial', workspace: '/project', files: ['/project/file.R'] },
+        { id: '7', source: 'unknown', workspace: '/project', files: ['/project/file.R'] },
+        { id: '7', source: 'initial', workspace: 'file:///project', files: ['/project/file.R'] },
+        { id: '7', source: 'initial', workspace: '/project', files: ['relative.R'] },
+        { id: '7', source: 'initial', workspace: '/project', files: ['/outside/file.R'] },
+        { id: '7', source: 'initial', workspace: '/project', files: ['/project'] },
+        { id: '7', source: 'initial', workspace: '/project', files: ['/project/folder/'] }
+    ];
+
+    for (const payload of invalidPayloads) {
+        await context.contribution.handleOpenRequest(payload);
+    }
+
+    assert.deepEqual(context.openers.opened, []);
+    assert.deepEqual(context.workspace.opened, []);
+    assert.equal(context.storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY), null);
+    assert.equal(context.storage.getItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY), null);
+    assert.equal(context.messages.errors.length, invalidPayloads.length);
+});
+
+test('corrupt or wrong-workspace pending JSON is removed and cannot trigger a restore loop', async () => {
+    const corruptStorage = new MemoryStorage();
+    corruptStorage.setItem(RIDE_OPEN_REQUEST_PENDING_KEY, '{not-json');
+    const corrupt = createContribution('/project', corruptStorage);
+    await corrupt.contribution.restorePendingRequest();
+    assert.equal(corruptStorage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY), null);
+    assert.equal(corrupt.messages.errors.length, 1);
+
+    const staleStorage = new MemoryStorage();
+    staleStorage.setItem(RIDE_OPEN_REQUEST_PENDING_KEY, JSON.stringify({
+        id: '8',
+        source: 'singleInstance',
+        workspace: '/other',
+        files: ['/other/file.R']
+    }));
+    const stale = createContribution('/project', staleStorage);
+    await stale.contribution.restorePendingRequest();
+
+    assert.equal(staleStorage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY), null);
+    assert.deepEqual(stale.openers.opened, []);
+    assert.deepEqual(stale.workspace.opened, []);
+    assert.equal(stale.messages.errors.length, 1);
+});
+
+test('last-consumed decimal IDs are monotonic without Number conversion', async () => {
+    const context = createContribution('/project');
+    await context.contribution.handleOpenRequest({
+        id: '10', source: 'initial', workspace: '/project', files: ['/project/newer.R']
+    });
+    await context.contribution.handleOpenRequest({
+        id: '9', source: 'initial', workspace: '/project', files: ['/project/older.R']
+    });
+
+    assert.equal(context.openers.opened.length, 1);
+    assert.equal(context.storage.getItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY), '10');
+});
+
+test('Unix root is a valid workspace boundary without weakening descendant checks', async () => {
+    const context = createContribution('/');
+
+    await context.contribution.handleOpenRequest({
+        id: '11', source: 'initial', workspace: '/', files: ['/analysis.R']
+    });
+
+    assert.deepEqual(context.openers.opened.map(entry => entry.uri.toString()), ['file:///analysis.R']);
+    assert.deepEqual(context.workspace.opened, []);
+    assert.deepEqual(context.messages.errors, []);
+});
+
+test('native open-request listener delivers the typed payload and returns its unlisten cleanup', async () => {
+    let eventName: string | undefined;
+    let eventHandler: ((event: { payload: unknown }) => void) | undefined;
+    let unlistenCalls = 0;
+    const native = new RideNativeChrome({
+        isTauri: true,
+        platform: 'windows',
+        listen: async (name, handler) => {
+            eventName = name;
+            eventHandler = handler as (event: { payload: unknown }) => void;
+            return () => {
+                unlistenCalls++;
+            };
+        }
+    });
+    const delivered: unknown[] = [];
+    const request = {
+        id: '13',
+        source: 'openedUrl' as const,
+        workspace: String.raw`C:\project`,
+        files: [String.raw`C:\project\file.R`]
+    };
+
+    const unlisten = await native.listenForOpenRequests(payload => delivered.push(payload));
+    assert.equal(eventName, 'ride-open-request');
+    eventHandler!({ payload: request });
+    assert.deepEqual(delivered, [request]);
+
+    unlisten();
+    assert.equal(unlistenCalls, 1);
+});
+
+test('browser-preview open-request listener is a no-op', async () => {
+    let registrations = 0;
+    const native = new RideNativeChrome({
+        isTauri: false,
+        platform: 'linux',
+        listen: async () => {
+            registrations++;
+            return () => undefined;
+        }
+    });
+
+    const unlisten = await native.listenForOpenRequests(() => assert.fail('browser preview must not deliver native events'));
+    unlisten();
+
+    assert.equal(registrations, 0);
+});
+
+test('frontend lifecycle restores and registers once, then unlistens once on cleanup', async () => {
+    const storage = new MemoryStorage();
+    storage.setItem(RIDE_OPEN_REQUEST_PENDING_KEY, JSON.stringify({
+        id: '12',
+        source: 'initial',
+        workspace: '/project',
+        files: ['/project/startup.R']
+    }));
+    const context = createContribution('/project', storage);
+
+    await context.contribution.onStart();
+    await context.contribution.onStart();
+
+    assert.equal(context.openers.opened.length, 1);
+    assert.equal(context.native.registrations, 1);
+
+    context.contribution.onStop();
+    context.contribution.onStop();
+    assert.equal(context.native.unlistenCalls, 1);
+});
+
+test('frontend startup waits for the workspace before restoring pending files', async () => {
+    const storage = new MemoryStorage();
+    storage.setItem(RIDE_OPEN_REQUEST_PENDING_KEY, JSON.stringify({
+        id: '14',
+        source: 'initial',
+        workspace: '/project',
+        files: ['/project/ready.R']
+    }));
+    const context = createContribution('/project', storage);
+    const readyWorkspace = context.workspace.workspace;
+    context.workspace.workspace = undefined;
+    let markReady: (() => void) | undefined;
+    context.workspace.ready = new Promise(resolve => {
+        markReady = () => {
+            context.workspace.workspace = readyWorkspace;
+            resolve();
+        };
+    });
+
+    const started = context.contribution.onStart();
+    await Promise.resolve();
+    assert.notEqual(storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY), null);
+    assert.deepEqual(context.openers.opened, []);
+
+    markReady!();
+    await started;
+    assert.equal(storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY), null);
+    assert.equal(context.openers.opened.length, 1);
+});

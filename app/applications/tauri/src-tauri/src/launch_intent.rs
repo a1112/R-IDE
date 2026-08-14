@@ -25,10 +25,18 @@ pub enum LaunchSource {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LaunchIntent {
+    #[serde(serialize_with = "serialize_launch_intent_id")]
     pub id: u64,
     pub source: LaunchSource,
     pub workspace: PathBuf,
     pub files: Vec<PathBuf>,
+}
+
+fn serialize_launch_intent_id<S>(id: &u64, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&id.to_string())
 }
 
 #[derive(Debug)]

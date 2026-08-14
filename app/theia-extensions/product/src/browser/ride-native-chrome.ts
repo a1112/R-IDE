@@ -9,6 +9,7 @@
 
 import { invoke, isTauri as isTauriRuntime } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import type { RideOpenRequest } from './ride-open-request';
 
 export interface RideMenuAction {
     label: string;
@@ -24,6 +25,18 @@ export type RideLanguage = 'en' | 'zh-cn';
 
 interface NativeMenuPayload {
     command: string;
+}
+
+type RidePlatform = 'macos' | 'windows' | 'linux' | 'unknown';
+type RideOpenRequestListener = (
+    event: string,
+    handler: (event: { payload: RideOpenRequest }) => void
+) => Promise<() => void>;
+
+export interface RideNativeChromeOptions {
+    isTauri?: boolean;
+    platform?: RidePlatform;
+    listen?: RideOpenRequestListener;
 }
 
 export const RIDE_LANGUAGE_STORAGE_KEY = 'localeId';
@@ -302,8 +315,16 @@ export function getRideMainMenu(language: RideLanguage = getStoredRideLanguage()
 }
 
 export class RideNativeChrome {
-    readonly isTauri = typeof window === 'object' && isTauriRuntime();
-    readonly platform = this.resolvePlatform();
+    readonly isTauri: boolean;
+    readonly platform: RidePlatform;
+
+    protected readonly openRequestListener: RideOpenRequestListener;
+
+    constructor(options: RideNativeChromeOptions = {}) {
+        this.isTauri = options.isTauri ?? typeof window === 'object' && isTauriRuntime();
+        this.platform = options.platform ?? this.resolvePlatform();
+        this.openRequestListener = options.listen ?? ((event, handler) => listen<RideOpenRequest>(event, handler));
+    }
 
     async showNativeMenu(anchor: HTMLElement, language: RideLanguage = getStoredRideLanguage()): Promise<boolean> {
         if (!this.isTauri) {
@@ -376,8 +397,19 @@ export class RideNativeChrome {
         });
     }
 
-    protected resolvePlatform(): 'macos' | 'windows' | 'linux' | 'unknown' {
-        const navigatorWithData = window.navigator as Navigator & {
+    async listenForOpenRequests(handler: (request: RideOpenRequest) => void): Promise<() => void> {
+        if (!this.isTauri) {
+            return () => undefined;
+        }
+
+        return this.openRequestListener('ride-open-request', event => handler(event.payload));
+    }
+
+    protected resolvePlatform(): RidePlatform {
+        if (typeof navigator === 'undefined') {
+            return 'unknown';
+        }
+        const navigatorWithData = navigator as Navigator & {
             userAgentData?: {
                 platform?: string;
             };

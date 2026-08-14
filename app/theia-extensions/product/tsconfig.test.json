@@ -1,0 +1,15 @@
+{
+    "extends": "./tsconfig.json",
+    "compilerOptions": {
+        "composite": false,
+        "rootDir": ".",
+        "outDir": "test/dist",
+        "declaration": false,
+        "declarationMap": false
+    },
+    "include": [
+        "src/browser/ride-open-request.ts",
+        "src/browser/ride-native-chrome.ts",
+        "test/**/*.ts"
+    ]
+}

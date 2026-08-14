@@ -3,8 +3,12 @@
 applications/tauri/
 applications/browser/pkg.config.js
 patches/@theia+terminal+1.72.1.patch
+theia-extensions/product/src/browser/ride-native-chrome.ts
+theia-extensions/product/src/browser/ride-open-request.ts
 theia-extensions/product/src/browser/ride-terminal-frontend-contribution.ts
 theia-extensions/product/src/browser/ride-workbench-contribution.ts
+theia-extensions/product/test/ride-open-request.test.ts
+theia-extensions/product/tsconfig.test.json
 package-lock.json
 scripts/build-tauri-backend.js
 scripts/check-rust.js
