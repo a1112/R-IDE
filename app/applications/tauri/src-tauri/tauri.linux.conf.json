@@ -1,0 +1,30 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "targets": ["deb", "rpm", "appimage"],
+    "linux": {
+      "deb": {
+        "files": {
+          "/usr/share/mime/packages/r-ide.xml": "linux/r-ide-mime.xml"
+        },
+        "desktopTemplate": "linux/r-ide.desktop",
+        "postInstallScript": "linux/update-mime-database.sh",
+        "postRemoveScript": "linux/update-mime-database.sh"
+      },
+      "rpm": {
+        "files": {
+          "/usr/share/mime/packages/r-ide.xml": "linux/r-ide-mime.xml"
+        },
+        "desktopTemplate": "linux/r-ide.desktop",
+        "postInstallScript": "linux/update-mime-database.sh",
+        "postRemoveScript": "linux/update-mime-database.sh"
+      },
+      "appimage": {
+        "files": {
+          "/usr/share/mime/packages/r-ide.xml": "linux/r-ide-mime.xml",
+          "/usr/share/applications/R-IDE.desktop": "linux/r-ide-appimage.desktop"
+        }
+      }
+    }
+  }
+}

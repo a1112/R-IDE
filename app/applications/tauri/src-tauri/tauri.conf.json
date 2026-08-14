@@ -49,7 +49,7 @@
     "fileAssociations": [
       {
         "ext": ["bash", "sh", "zsh"],
-        "mimeType": "application/x-sh",
+        "mimeType": "text/x-shellscript",
         "name": "Shell Script",
         "description": "Shell script source file",
         "role": "Editor",
@@ -57,7 +57,7 @@
       },
       {
         "ext": ["fish"],
-        "mimeType": "application/x-fish",
+        "mimeType": "application/x-fishscript",
         "name": "Fish Shell Script",
         "description": "Fish shell script source file",
         "role": "Editor",
@@ -65,7 +65,7 @@
       },
       {
         "ext": ["bat", "cmd"],
-        "mimeType": "application/x-msdos-program",
+        "mimeType": "application/x-bat",
         "name": "Windows Command Script",
         "description": "Windows command script source file",
         "role": "Editor",
@@ -81,7 +81,7 @@
       },
       {
         "ext": ["c"],
-        "mimeType": "text/x-c",
+        "mimeType": "text/x-csrc",
         "name": "C Source",
         "description": "C source file",
         "role": "Editor",
@@ -97,7 +97,7 @@
       },
       {
         "ext": ["cc", "cpp", "cxx"],
-        "mimeType": "text/x-c++",
+        "mimeType": "text/x-c++src",
         "name": "C++ Source",
         "description": "C++ source file",
         "role": "Editor",
@@ -129,7 +129,7 @@
       },
       {
         "ext": ["java"],
-        "mimeType": "text/x-java-source",
+        "mimeType": "text/x-java",
         "name": "Java Source",
         "description": "Java source file",
         "role": "Editor",
@@ -145,7 +145,7 @@
       },
       {
         "ext": ["rs"],
-        "mimeType": "text/x-rust",
+        "mimeType": "text/rust",
         "name": "Rust Source",
         "description": "Rust source file",
         "role": "Editor",
@@ -169,7 +169,7 @@
       },
       {
         "ext": ["rmd"],
-        "mimeType": "text/x-r-markdown",
+        "mimeType": "text/x-r-ide-r-markdown",
         "name": "R Markdown",
         "description": "R Markdown document",
         "role": "Editor",
@@ -177,7 +177,7 @@
       },
       {
         "ext": ["qmd"],
-        "mimeType": "text/x-quarto",
+        "mimeType": "text/x-r-ide-quarto",
         "name": "Quarto Markdown",
         "description": "Quarto Markdown document",
         "role": "Editor",
@@ -217,7 +217,7 @@
       },
       {
         "ext": ["less"],
-        "mimeType": "text/x-less",
+        "mimeType": "text/x-r-ide-less",
         "name": "Less Stylesheet",
         "description": "Less stylesheet source file",
         "role": "Editor",
@@ -233,7 +233,7 @@
       },
       {
         "ext": ["jsx"],
-        "mimeType": "text/jsx",
+        "mimeType": "text/x-r-ide-jsx",
         "name": "JavaScript JSX Source",
         "description": "JavaScript JSX source file",
         "role": "Editor",
@@ -249,7 +249,7 @@
       },
       {
         "ext": ["tsx"],
-        "mimeType": "text/tsx",
+        "mimeType": "text/x-r-ide-typescript-jsx",
         "name": "TypeScript TSX Source",
         "description": "TypeScript TSX source file",
         "role": "Editor",
@@ -257,7 +257,7 @@
       },
       {
         "ext": ["svelte"],
-        "mimeType": "text/x-svelte",
+        "mimeType": "text/x-r-ide-svelte",
         "name": "Svelte Component",
         "description": "Svelte component source file",
         "role": "Editor",
@@ -265,14 +265,14 @@
       },
       {
         "ext": ["vue"],
-        "mimeType": "text/x-vue",
+        "mimeType": "text/x-r-ide-vue",
         "name": "Vue Component",
         "description": "Vue component source file",
         "role": "Editor",
         "rank": "Alternate"
       },
       {
-        "ext": ["json", "jsonc"],
+        "ext": ["json"],
         "mimeType": "application/json",
         "name": "JSON Document",
         "description": "JSON configuration file",
@@ -280,8 +280,16 @@
         "rank": "Alternate"
       },
       {
+        "ext": ["jsonc"],
+        "mimeType": "application/x-r-ide-jsonc",
+        "name": "JSON with Comments",
+        "description": "JSON with comments configuration file",
+        "role": "Editor",
+        "rank": "Alternate"
+      },
+      {
         "ext": ["code-workspace", "theia-workspace"],
-        "mimeType": "application/json",
+        "mimeType": "application/x-r-ide-workspace",
         "name": "IDE Workspace",
         "description": "IDE workspace configuration file",
         "role": "Editor",
@@ -313,7 +321,7 @@
       },
       {
         "ext": ["ini"],
-        "mimeType": "text/x-ini",
+        "mimeType": "text/x-r-ide-ini",
         "name": "INI Document",
         "description": "INI configuration file",
         "role": "Editor",
@@ -321,7 +329,7 @@
       },
       {
         "ext": ["properties"],
-        "mimeType": "text/x-java-properties",
+        "mimeType": "text/x-r-ide-properties",
         "name": "Properties Document",
         "description": "Properties configuration file",
         "role": "Editor",

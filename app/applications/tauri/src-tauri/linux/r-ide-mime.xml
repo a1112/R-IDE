@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <!-- Extend system MIME types whose standard glob set omits approved editor extensions. -->
+  <mime-type type="text/x-shellscript">
+    <glob pattern="*.bash"/>
+    <glob pattern="*.zsh"/>
+  </mime-type>
+  <mime-type type="application/x-powershell">
+    <glob pattern="*.psm1"/>
+  </mime-type>
+  <mime-type type="text/x-kotlin">
+    <glob pattern="*.kts"/>
+  </mime-type>
+  <mime-type type="text/x-python">
+    <glob pattern="*.pyw"/>
+  </mime-type>
+  <mime-type type="text/x-r-source">
+    <comment>R source file</comment>
+    <sub-class-of type="text/plain"/>
+    <glob pattern="*.r"/>
+  </mime-type>
+
+  <!-- R-IDE-owned MIME types cover formats without a shared-mime-info mapping. -->
+  <mime-type type="text/x-r-ide-r-markdown">
+    <comment>R Markdown document</comment>
+    <sub-class-of type="text/markdown"/>
+    <glob pattern="*.rmd"/>
+  </mime-type>
+  <mime-type type="text/x-r-ide-quarto">
+    <comment>Quarto Markdown document</comment>
+    <sub-class-of type="text/markdown"/>
+    <glob pattern="*.qmd"/>
+  </mime-type>
+  <mime-type type="text/x-r-ide-less">
+    <comment>Less stylesheet source file</comment>
+    <sub-class-of type="text/plain"/>
+    <glob pattern="*.less"/>
+  </mime-type>
+  <mime-type type="text/x-r-ide-jsx">
+    <comment>JavaScript JSX source file</comment>
+    <sub-class-of type="text/javascript"/>
+    <glob pattern="*.jsx"/>
+  </mime-type>
+  <mime-type type="text/x-r-ide-typescript-jsx">
+    <comment>TypeScript TSX source file</comment>
+    <sub-class-of type="application/typescript"/>
+    <glob pattern="*.tsx"/>
+  </mime-type>
+  <mime-type type="text/x-r-ide-svelte">
+    <comment>Svelte component source file</comment>
+    <sub-class-of type="text/plain"/>
+    <glob pattern="*.svelte"/>
+  </mime-type>
+  <mime-type type="text/x-r-ide-vue">
+    <comment>Vue component source file</comment>
+    <sub-class-of type="text/plain"/>
+    <glob pattern="*.vue"/>
+  </mime-type>
+  <mime-type type="application/x-r-ide-jsonc">
+    <comment>JSON with comments configuration file</comment>
+    <sub-class-of type="application/json"/>
+    <glob pattern="*.jsonc"/>
+  </mime-type>
+  <mime-type type="application/x-r-ide-workspace">
+    <comment>IDE workspace configuration file</comment>
+    <sub-class-of type="application/json"/>
+    <glob pattern="*.code-workspace"/>
+    <glob pattern="*.theia-workspace"/>
+  </mime-type>
+  <mime-type type="text/x-r-ide-ini">
+    <comment>INI configuration file</comment>
+    <sub-class-of type="text/plain"/>
+    <glob pattern="*.ini"/>
+  </mime-type>
+  <mime-type type="text/x-r-ide-properties">
+    <comment>Properties configuration file</comment>
+    <sub-class-of type="text/plain"/>
+    <glob pattern="*.properties"/>
+  </mime-type>
+</mime-info>

@@ -1,0 +1,199 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<?if $(sys.BUILDARCH)="x86"?>
+  <?define RIDEWin64 = "no" ?>
+<?else?>
+  <?define RIDEWin64 = "yes" ?>
+<?endif?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Fragment>
+    <DirectoryRef Id="INSTALLDIR">
+      <Component Id="RIDEFileAssociations" Guid="*" Win64="$(var.RIDEWin64)">
+        <RegistryKey Root="HKLM" Key="Software\Classes\R-IDE.CodeFile">
+          <RegistryValue Type="string" Value="R-IDE Code File" KeyPath="yes" />
+          <RegistryKey Key="DefaultIcon">
+            <RegistryValue Type="string" Value="&quot;[!Path]&quot;,0" />
+          </RegistryKey>
+          <RegistryKey Key="shell\open">
+            <RegistryValue Type="string" Value="Open with R-IDE" />
+            <RegistryKey Key="command">
+              <RegistryValue Type="string" Value="&quot;[!Path]&quot; &quot;%1&quot;" />
+            </RegistryKey>
+          </RegistryKey>
+        </RegistryKey>
+
+        <RegistryKey Root="HKLM" Key="Software\Classes\.bash\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.bat\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.c\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.cc\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.cjs\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.cmd\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.code-workspace\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.cpp\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.cs\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.css\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.cts\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.cxx\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.fish\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.go\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.h\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.hpp\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.htm\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.html\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.ini\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.java\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.js\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.json\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.jsonc\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.jsx\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.kt\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.kts\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.less\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.mjs\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.md\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.markdown\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.mts\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.properties\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.ps1\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.psm1\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.py\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.pyw\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.qmd\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.r\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.rmd\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.rs\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.scss\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.sh\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.sql\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.svelte\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.theia-workspace\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.toml\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.ts\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.tsx\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.vue\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.xml\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.yaml\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.yml\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.zsh\OpenWithProgids"><RegistryValue Name="R-IDE.CodeFile" Type="string" Value="" /></RegistryKey>
+
+        <RegistryKey Root="HKLM" Key="Software\Classes\Applications\ride-tauri.exe\SupportedTypes">
+          <RegistryValue Name=".bash" Type="string" Value="" />
+          <RegistryValue Name=".bat" Type="string" Value="" />
+          <RegistryValue Name=".c" Type="string" Value="" />
+          <RegistryValue Name=".cc" Type="string" Value="" />
+          <RegistryValue Name=".cjs" Type="string" Value="" />
+          <RegistryValue Name=".cmd" Type="string" Value="" />
+          <RegistryValue Name=".code-workspace" Type="string" Value="" />
+          <RegistryValue Name=".cpp" Type="string" Value="" />
+          <RegistryValue Name=".cs" Type="string" Value="" />
+          <RegistryValue Name=".css" Type="string" Value="" />
+          <RegistryValue Name=".cts" Type="string" Value="" />
+          <RegistryValue Name=".cxx" Type="string" Value="" />
+          <RegistryValue Name=".fish" Type="string" Value="" />
+          <RegistryValue Name=".go" Type="string" Value="" />
+          <RegistryValue Name=".h" Type="string" Value="" />
+          <RegistryValue Name=".hpp" Type="string" Value="" />
+          <RegistryValue Name=".htm" Type="string" Value="" />
+          <RegistryValue Name=".html" Type="string" Value="" />
+          <RegistryValue Name=".ini" Type="string" Value="" />
+          <RegistryValue Name=".java" Type="string" Value="" />
+          <RegistryValue Name=".js" Type="string" Value="" />
+          <RegistryValue Name=".json" Type="string" Value="" />
+          <RegistryValue Name=".jsonc" Type="string" Value="" />
+          <RegistryValue Name=".jsx" Type="string" Value="" />
+          <RegistryValue Name=".kt" Type="string" Value="" />
+          <RegistryValue Name=".kts" Type="string" Value="" />
+          <RegistryValue Name=".less" Type="string" Value="" />
+          <RegistryValue Name=".mjs" Type="string" Value="" />
+          <RegistryValue Name=".md" Type="string" Value="" />
+          <RegistryValue Name=".markdown" Type="string" Value="" />
+          <RegistryValue Name=".mts" Type="string" Value="" />
+          <RegistryValue Name=".properties" Type="string" Value="" />
+          <RegistryValue Name=".ps1" Type="string" Value="" />
+          <RegistryValue Name=".psm1" Type="string" Value="" />
+          <RegistryValue Name=".py" Type="string" Value="" />
+          <RegistryValue Name=".pyw" Type="string" Value="" />
+          <RegistryValue Name=".qmd" Type="string" Value="" />
+          <RegistryValue Name=".r" Type="string" Value="" />
+          <RegistryValue Name=".rmd" Type="string" Value="" />
+          <RegistryValue Name=".rs" Type="string" Value="" />
+          <RegistryValue Name=".scss" Type="string" Value="" />
+          <RegistryValue Name=".sh" Type="string" Value="" />
+          <RegistryValue Name=".sql" Type="string" Value="" />
+          <RegistryValue Name=".svelte" Type="string" Value="" />
+          <RegistryValue Name=".theia-workspace" Type="string" Value="" />
+          <RegistryValue Name=".toml" Type="string" Value="" />
+          <RegistryValue Name=".ts" Type="string" Value="" />
+          <RegistryValue Name=".tsx" Type="string" Value="" />
+          <RegistryValue Name=".vue" Type="string" Value="" />
+          <RegistryValue Name=".xml" Type="string" Value="" />
+          <RegistryValue Name=".yaml" Type="string" Value="" />
+          <RegistryValue Name=".yml" Type="string" Value="" />
+          <RegistryValue Name=".zsh" Type="string" Value="" />
+        </RegistryKey>
+
+        <RegistryKey Root="HKLM" Key="Software\R-IDE\Capabilities">
+          <RegistryValue Name="ApplicationName" Type="string" Value="R-IDE" />
+          <RegistryValue Name="ApplicationDescription" Type="string" Value="R-IDE code editor" />
+        </RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\R-IDE\Capabilities\FileAssociations">
+          <RegistryValue Name=".bash" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".bat" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".c" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".cc" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".cjs" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".cmd" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".code-workspace" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".cpp" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".cs" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".css" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".cts" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".cxx" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".fish" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".go" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".h" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".hpp" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".htm" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".html" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".ini" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".java" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".js" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".json" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".jsonc" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".jsx" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".kt" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".kts" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".less" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".mjs" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".md" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".markdown" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".mts" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".properties" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".ps1" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".psm1" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".py" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".pyw" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".qmd" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".r" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".rmd" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".rs" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".scss" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".sh" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".sql" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".svelte" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".theia-workspace" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".toml" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".ts" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".tsx" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".vue" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".xml" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".yaml" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".yml" Type="string" Value="R-IDE.CodeFile" />
+          <RegistryValue Name=".zsh" Type="string" Value="R-IDE.CodeFile" />
+        </RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\RegisteredApplications">
+          <RegistryValue Name="R-IDE" Type="string" Value="Software\R-IDE\Capabilities" />
+        </RegistryKey>
+      </Component>
+    </DirectoryRef>
+  </Fragment>
+</Wix>

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Categories=Development;
+Comment=R-IDE Desktop Application
+Exec=ride-tauri %F
+StartupWMClass=ride-tauri
+Icon=ride-tauri
+Name=R-IDE
+Terminal=false
+Type=Application
+MimeType=text/x-shellscript;application/x-fishscript;application/x-bat;application/x-powershell;text/x-csrc;text/x-chdr;text/x-c++src;text/x-c++hdr;text/x-csharp;text/x-go;text/x-java;text/x-kotlin;text/rust;text/x-python;text/x-r-source;text/x-r-ide-r-markdown;text/x-r-ide-quarto;application/sql;text/html;text/css;text/x-scss;text/x-r-ide-less;text/javascript;text/x-r-ide-jsx;application/typescript;text/x-r-ide-typescript-jsx;text/x-r-ide-svelte;text/x-r-ide-vue;application/json;application/x-r-ide-jsonc;application/x-r-ide-workspace;application/xml;application/yaml;application/toml;text/x-r-ide-ini;text/x-r-ide-properties;text/markdown;
