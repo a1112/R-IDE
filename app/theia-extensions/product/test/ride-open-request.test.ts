@@ -935,6 +935,62 @@ test('Unix absolute paths preserve backslashes as literal filename characters', 
     assert.equal(handoff.workspace.opened.length, 1);
 });
 
+test('Unix files may end with a literal backslash across same-workspace open and handoff restore', async () => {
+    const file = '/project/name\\';
+    const sameWorkspace = createContribution('/project');
+
+    await sameWorkspace.contribution.handleOpenRequest({
+        id: '18', source: 'initial', workspace: '/project', files: [file]
+    });
+
+    assert.equal(sameWorkspace.openers.opened.length, 1);
+    assert.deepEqual(sameWorkspace.openers.handlerActivations, []);
+    assert.deepEqual(sameWorkspace.shell.activated, ['editor-1']);
+    assert.deepEqual(readState(sameWorkspace.storage), stateEnvelope('18'));
+    assert.deepEqual(sameWorkspace.messages.errors, []);
+
+    const storage = new MemoryStorage();
+    const handoff = createContribution('/elsewhere', storage);
+    const request: RideOpenRequest = {
+        id: '19', source: 'singleInstance', workspace: '/project', files: [file]
+    };
+
+    await handoff.contribution.handleOpenRequest(request);
+
+    assert.deepEqual(readState(storage), stateEnvelope('19', request));
+    assert.deepEqual(handoff.openers.opened, []);
+    assert.equal(handoff.workspace.opened.length, 1);
+
+    const reloaded = createContribution('/project', storage);
+    await reloaded.contribution.restorePendingRequest();
+
+    assert.equal(reloaded.openers.opened.length, 1);
+    assert.deepEqual(reloaded.openers.handlerActivations, []);
+    assert.deepEqual(reloaded.shell.activated, ['editor-1']);
+    assert.deepEqual(readState(storage), stateEnvelope('19'));
+    assert.deepEqual(reloaded.messages.errors, []);
+});
+
+test('directory-style trailing separators remain invalid for Windows, UNC, and slash paths', async () => {
+    const cases = [
+        { workspace: String.raw`C:\foo`, file: 'C:\\foo\\folder\\' },
+        { workspace: String.raw`\\server\share`, file: String.raw`\\server\share\folder` + '\\' },
+        { workspace: '/project', file: '/project/file/' }
+    ];
+
+    for (const { workspace, file } of cases) {
+        const context = createContribution(workspace);
+        await context.contribution.handleOpenRequest({
+            id: '20', source: 'initial', workspace, files: [file]
+        });
+
+        assert.equal(context.storage.getItem(RIDE_OPEN_REQUEST_STATE_KEY), null);
+        assert.deepEqual(context.openers.opened, []);
+        assert.deepEqual(context.workspace.opened, []);
+        assert.equal(context.messages.errors.length, 1);
+    }
+});
+
 test('UNC share root is valid while empty segments and traversal remain rejected', async () => {
     const workspace = String.raw`\\server\share`;
     const valid = createContribution(workspace);

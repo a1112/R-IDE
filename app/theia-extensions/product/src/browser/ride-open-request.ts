@@ -321,7 +321,7 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
             || !isRideOpenRequestSource(payload.source)
             || typeof payload.workspace !== 'string'
             || !isNonEmptyStringArray(payload.files)
-            || payload.files.some(file => /[\\/]$/.test(file))) {
+            || payload.files.some(hasTrailingDirectorySeparator)) {
             return undefined;
         }
 
@@ -387,6 +387,16 @@ function compareDecimalIds(left: string, right: string): number {
     return left.length === right.length ? left.localeCompare(right) : left.length - right.length;
 }
 
+function hasTrailingDirectorySeparator(value: string): boolean {
+    return value.endsWith('/') || value.endsWith('\\') && isFullyQualifiedWindowsPath(value);
+}
+
+function isFullyQualifiedWindowsPath(value: string): boolean {
+    return /^[A-Za-z]:[\\/]/.test(value)
+        || /^\\\\/.test(value)
+        || /^\/\/(?:\?\/|[^/]+\/[^/]+(?:\/|$))/.test(value);
+}
+
 function normalizeNativePath(value: string): NormalizedNativePath | undefined {
     if (!value || /[\0-\x1f]/.test(value)) {
         return undefined;
@@ -395,9 +405,7 @@ function normalizeNativePath(value: string): NormalizedNativePath | undefined {
         return undefined;
     }
 
-    const windows = /^[A-Za-z]:[\\/]/.test(value)
-        || /^\\\\/.test(value)
-        || /^\/\/(?:\?\/|[^/]+\/[^/]+(?:\/|$))/.test(value);
+    const windows = isFullyQualifiedWindowsPath(value);
     let normalized = windows ? value.replace(/\\/g, '/') : value;
     if (/^\/\/\?\/UNC\//i.test(normalized)) {
         normalized = `//${normalized.slice(8)}`;
