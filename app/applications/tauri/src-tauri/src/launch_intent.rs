@@ -80,6 +80,12 @@ fn path_from_file_url(url: &tauri::Url) -> Option<PathBuf> {
     if url.scheme() != "file" {
         return None;
     }
+    if url
+        .host_str()
+        .is_some_and(|host| !host.is_empty() && !host.eq_ignore_ascii_case("localhost"))
+    {
+        return None;
+    }
 
     let path = url.to_file_path().ok()?;
     if !path.is_absolute() {
@@ -154,20 +160,9 @@ fn is_flag(argument: &OsStr) -> bool {
 
 #[cfg(windows)]
 fn paths_are_equivalent(left: &Path, right: &Path) -> bool {
-    use std::os::windows::ffi::OsStrExt;
-
-    left.as_os_str()
-        .encode_wide()
-        .map(ascii_lowercase)
-        .eq(right.as_os_str().encode_wide().map(ascii_lowercase))
-}
-
-#[cfg(windows)]
-fn ascii_lowercase(value: u16) -> u16 {
-    if (u16::from(b'A')..=u16::from(b'Z')).contains(&value) {
-        value + u16::from(b'a' - b'A')
-    } else {
-        value
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
     }
 }
 

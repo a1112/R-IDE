@@ -334,6 +334,146 @@ fn launch_sources_serialize_with_clear_camel_case_names() {
 }
 
 #[cfg(windows)]
+fn accessible_remote_url(file: &Path) -> Option<tauri::Url> {
+    use std::path::Prefix;
+
+    let host = std::env::var("COMPUTERNAME").ok()?;
+    if host.eq_ignore_ascii_case("localhost") {
+        eprintln!("skipping remote-host regression: COMPUTERNAME is localhost");
+        return None;
+    }
+
+    let mut components = file.components();
+    let drive = match components.next()? {
+        std::path::Component::Prefix(prefix) => match prefix.kind() {
+            Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => drive,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    if matches!(
+        components.clone().next(),
+        Some(std::path::Component::RootDir)
+    ) {
+        components.next();
+    }
+
+    let remote_path = PathBuf::from(format!(r"\\{host}\{}$", char::from(drive)))
+        .join(components.collect::<PathBuf>());
+    if !remote_path.is_file() {
+        eprintln!(
+            "skipping accessible remote-host regression: {} is unavailable",
+            remote_path.display()
+        );
+        return None;
+    }
+
+    tauri::Url::from_file_path(remote_path).ok()
+}
+
+#[cfg(windows)]
+#[test]
+fn rejects_an_accessible_remote_host_file_url_from_args() {
+    let file = Fixture::file("remote-args.R");
+    let Some(remote_url) = accessible_remote_url(file.path()) else {
+        return;
+    };
+    assert!(
+        remote_url
+            .host_str()
+            .is_some_and(|host| !host.eq_ignore_ascii_case("localhost")),
+        "fixture URL must have a non-local host: {remote_url}"
+    );
+
+    assert_eq!(
+        parse_args(
+            args([OsString::from(remote_url.as_str())]),
+            Path::new("."),
+            LaunchSource::Initial,
+            45,
+        ),
+        None
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn rejects_an_accessible_remote_host_file_url_from_opened_urls() {
+    let file = Fixture::file("remote-opened-url.R");
+    let Some(remote_url) = accessible_remote_url(file.path()) else {
+        return;
+    };
+
+    assert_eq!(
+        parse_opened_urls(
+            std::slice::from_ref(&remote_url),
+            LaunchSource::OpenedUrl,
+            47,
+        ),
+        None
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn accepts_localhost_file_urls_when_the_url_maps_to_a_local_file() {
+    let file = Fixture::file("localhost-url.R");
+    let mut localhost_url = tauri::Url::from_file_path(file.path()).expect("fixture file URL");
+    localhost_url
+        .set_host(Some("LOCALHOST"))
+        .expect("set localhost URL host");
+    let Ok(localhost_path) = localhost_url.to_file_path() else {
+        eprintln!("skipping localhost regression: URL crate does not map {localhost_url}");
+        return;
+    };
+    if !localhost_path.is_file() {
+        eprintln!(
+            "skipping localhost regression: {} is unavailable",
+            localhost_path.display()
+        );
+        return;
+    }
+
+    assert!(parse_opened_urls(
+        std::slice::from_ref(&localhost_url),
+        LaunchSource::OpenedUrl,
+        49,
+    )
+    .is_some());
+}
+
+#[cfg(windows)]
+#[test]
+fn collapses_unicode_case_variants_that_resolve_to_the_same_windows_file() {
+    let file = Fixture::file("unicode-é.R");
+    let alternate_name = file
+        .path()
+        .file_name()
+        .expect("fixture file name")
+        .to_string_lossy()
+        .replace('é', "É");
+    let alternate = file.path().with_file_name(alternate_name);
+
+    if !alternate.is_file() {
+        eprintln!(
+            "skipping Unicode case-equivalence regression: filesystem does not resolve {}",
+            alternate.display()
+        );
+        return;
+    }
+
+    let actual = parse_args(
+        args([OsString::from(file.path()), alternate.into_os_string()]),
+        Path::new(r"C:\this-cwd-must-not-be-used"),
+        LaunchSource::Initial,
+        43,
+    )
+    .expect("Unicode case variants resolve to a launch intent");
+
+    assert_eq!(actual.files, vec![file.path().to_path_buf()]);
+}
+
+#[cfg(windows)]
 #[test]
 fn accepts_existing_drive_paths_and_safely_rejects_missing_unc_paths() {
     let file = Fixture::file("drive-path.rs");
