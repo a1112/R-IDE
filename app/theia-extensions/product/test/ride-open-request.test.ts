@@ -427,6 +427,68 @@ test('Windows drive root is a valid workspace for a root-level file', async () =
     assert.deepEqual(context.messages.errors, []);
 });
 
+test('Windows drive roots with redundant separators remain same-workspace requests', async () => {
+    for (const workspace of ['C:////', String.raw`C:\\\\`]) {
+        const context = createContribution('C:\\');
+
+        await context.contribution.handleOpenRequest({
+            id: '12', source: 'initial', workspace, files: [String.raw`C:\root.R`]
+        });
+
+        assert.deepEqual(context.openers.opened.map(entry => FileUri.fsPath(entry.uri).toLowerCase()), [String.raw`c:\root.r`]);
+        assert.deepEqual(context.workspace.opened, []);
+        assert.equal(context.storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY), null);
+        assert.deepEqual(context.messages.errors, []);
+    }
+});
+
+test('redundant drive-root separators are canonical across handoff and reload', async () => {
+    const storage = new MemoryStorage();
+    const firstWindow = createContribution('D:\\', storage);
+
+    await firstWindow.contribution.handleOpenRequest({
+        id: '13', source: 'singleInstance', workspace: 'C:////', files: [String.raw`C:\root.R`]
+    });
+
+    assert.deepEqual(JSON.parse(storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY)!), {
+        id: '13', source: 'singleInstance', workspace: 'C:/', files: ['C:/root.R']
+    });
+    assert.equal(storage.getItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY), '13');
+    assert.equal(FileUri.fsPath(firstWindow.workspace.opened[0].uri).toLowerCase(), 'c:\\');
+    assert.deepEqual(firstWindow.workspace.opened[0].options, { preserveWindow: true });
+    assert.deepEqual(firstWindow.openers.opened, []);
+
+    const reloadedWindow = createContribution('C:\\', storage);
+    await reloadedWindow.contribution.restorePendingRequest();
+
+    assert.deepEqual(reloadedWindow.openers.opened.map(entry => FileUri.fsPath(entry.uri).toLowerCase()), [String.raw`c:\root.r`]);
+    assert.equal(storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY), null);
+});
+
+test('drive-relative and malformed Windows paths remain rejected without consuming the request ID', async () => {
+    const context = createContribution('C:\\');
+    const invalidRequests = [
+        { workspace: 'C:', files: [String.raw`C:\root.R`] },
+        { workspace: 'C:foo', files: [String.raw`C:\root.R`] },
+        { workspace: 'C:/bad//segment', files: ['C:/bad/segment/root.R'] },
+        { workspace: 'C:/bad/../segment', files: ['C:/bad/segment/root.R'] },
+        { workspace: 'C:/', files: ['C://root.R'] },
+        { workspace: 'C:/', files: ['C:/../root.R'] }
+    ];
+
+    for (const { workspace, files } of invalidRequests) {
+        await context.contribution.handleOpenRequest({
+            id: '14', source: 'initial', workspace, files
+        });
+    }
+
+    assert.deepEqual(context.openers.opened, []);
+    assert.deepEqual(context.workspace.opened, []);
+    assert.equal(context.storage.getItem(RIDE_OPEN_REQUEST_PENDING_KEY), null);
+    assert.equal(context.storage.getItem(RIDE_OPEN_REQUEST_LAST_CONSUMED_KEY), null);
+    assert.equal(context.messages.errors.length, invalidRequests.length);
+});
+
 test('UNC share root is valid while empty segments and traversal remain rejected', async () => {
     const workspace = String.raw`\\server\share`;
     const valid = createContribution(workspace);

@@ -286,6 +286,9 @@ function normalizeNativePath(value: string): NormalizedNativePath | undefined {
     } else if (/^\/\/\?\/[A-Za-z]:\//.test(normalized)) {
         normalized = normalized.slice(4);
     }
+    if (/^[A-Za-z]:\/+$/i.test(normalized)) {
+        normalized = `${normalized.slice(0, 2)}/`;
+    }
 
     let windows = false;
     if (/^[A-Za-z]:\//.test(normalized)) {
