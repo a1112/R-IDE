@@ -8,7 +8,7 @@
  ********************************************************************************/
 
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
@@ -27,6 +27,73 @@ pub struct LaunchIntent {
     pub source: LaunchSource,
     pub workspace: PathBuf,
     pub files: Vec<PathBuf>,
+}
+
+#[derive(Debug)]
+pub struct LaunchIntentQueue {
+    ready: bool,
+    maximum_length: usize,
+    pending: VecDeque<LaunchIntent>,
+    seen_ids: HashSet<u64>,
+    in_flight_ids: HashSet<u64>,
+    consumed_ids: HashSet<u64>,
+}
+
+impl LaunchIntentQueue {
+    /// Creates a queue whose pending capacity is at least one.
+    ///
+    /// IDs are remembered for the process lifetime, including IDs evicted from
+    /// `pending`, so an out-of-order retry can never create a second delivery.
+    pub fn new(maximum_length: usize) -> Self {
+        Self {
+            ready: false,
+            maximum_length: maximum_length.max(1),
+            pending: VecDeque::new(),
+            seen_ids: HashSet::new(),
+            in_flight_ids: HashSet::new(),
+            consumed_ids: HashSet::new(),
+        }
+    }
+
+    /// Queues an unseen intent until the frontend is ready, or returns it as an
+    /// owned delivery immediately when ready. Duplicate IDs return no delivery.
+    pub fn enqueue(&mut self, intent: LaunchIntent) -> Vec<LaunchIntent> {
+        if !self.seen_ids.insert(intent.id) {
+            return Vec::new();
+        }
+
+        if self.ready {
+            self.in_flight_ids.insert(intent.id);
+            return vec![intent];
+        }
+
+        if self.pending.len() == self.maximum_length {
+            self.pending.pop_front();
+        }
+        self.pending.push_back(intent);
+        Vec::new()
+    }
+
+    /// Marks the frontend ready and returns queued intents in arrival order.
+    /// Returned deliveries become in-flight until acknowledged.
+    pub fn mark_ready(&mut self) -> Vec<LaunchIntent> {
+        self.ready = true;
+        let deliveries = self.pending.drain(..).collect::<Vec<_>>();
+        self.in_flight_ids
+            .extend(deliveries.iter().map(|intent| intent.id));
+        deliveries
+    }
+
+    /// Acknowledges a delivery. Returns `true` for both the first acknowledgement
+    /// and retries of a consumed delivery, and `false` for IDs never delivered.
+    pub fn acknowledge(&mut self, id: u64) -> bool {
+        if self.in_flight_ids.remove(&id) {
+            self.consumed_ids.insert(id);
+            return true;
+        }
+
+        self.consumed_ids.contains(&id)
+    }
 }
 
 pub fn parse_args(

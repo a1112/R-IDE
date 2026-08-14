@@ -1,7 +1,10 @@
-use ride_tauri::launch_intent::{parse_args, parse_opened_urls, LaunchIntent, LaunchSource};
+use ride_tauri::launch_intent::{
+    parse_args, parse_opened_urls, LaunchIntent, LaunchIntentQueue, LaunchSource,
+};
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use uuid::Uuid;
 
 #[derive(Debug)]
@@ -98,6 +101,116 @@ fn expected(id: u64, source: LaunchSource, workspace: &Path, files: Vec<PathBuf>
         workspace: workspace.to_path_buf(),
         files,
     }
+}
+
+fn queue_intent(id: u64) -> LaunchIntent {
+    LaunchIntent {
+        id,
+        source: LaunchSource::SingleInstance,
+        workspace: PathBuf::from(format!("workspace-{id}")),
+        files: vec![PathBuf::from(format!("file-{id}.R"))],
+    }
+}
+
+#[test]
+fn queues_intents_without_delivering_before_the_frontend_is_ready() {
+    let mut queue = LaunchIntentQueue::new(4);
+
+    assert!(queue.enqueue(queue_intent(1)).is_empty());
+    assert!(queue.enqueue(queue_intent(2)).is_empty());
+}
+
+#[test]
+fn marking_ready_drains_in_order_and_later_enqueues_deliver_immediately() {
+    let mut queue = LaunchIntentQueue::new(4);
+    let first = queue_intent(1);
+    let second = queue_intent(2);
+    let third = queue_intent(3);
+    assert!(queue.enqueue(first.clone()).is_empty());
+    assert!(queue.enqueue(second.clone()).is_empty());
+
+    assert_eq!(queue.mark_ready(), vec![first, second]);
+    assert!(queue.mark_ready().is_empty());
+    assert_eq!(queue.enqueue(third.clone()), vec![third]);
+}
+
+#[test]
+fn duplicate_ids_are_suppressed_while_pending_in_flight_and_acknowledged() {
+    let mut queue = LaunchIntentQueue::new(4);
+    let intent = queue_intent(7);
+
+    assert!(queue.enqueue(intent.clone()).is_empty());
+    assert!(queue.enqueue(intent.clone()).is_empty());
+    assert!(!queue.acknowledge(intent.id));
+    assert_eq!(queue.mark_ready(), vec![intent.clone()]);
+    assert!(queue.enqueue(intent.clone()).is_empty());
+
+    assert!(queue.acknowledge(intent.id));
+    assert!(queue.acknowledge(intent.id));
+    assert!(!queue.acknowledge(999));
+    assert!(queue.enqueue(intent).is_empty());
+}
+
+#[test]
+fn bounded_queue_keeps_newest_intents_and_never_revives_evicted_ids() {
+    let mut queue = LaunchIntentQueue::new(2);
+    let first = queue_intent(1);
+    let second = queue_intent(2);
+    let third = queue_intent(3);
+    assert!(queue.enqueue(first.clone()).is_empty());
+    assert!(queue.enqueue(second.clone()).is_empty());
+    assert!(queue.enqueue(third.clone()).is_empty());
+
+    assert_eq!(queue.mark_ready(), vec![second, third]);
+    assert!(!queue.acknowledge(first.id));
+    assert!(queue.acknowledge(2));
+    assert!(queue.acknowledge(3));
+
+    for id in 4..32 {
+        let intent = queue_intent(id);
+        assert_eq!(queue.enqueue(intent.clone()), vec![intent]);
+        assert!(queue.acknowledge(id));
+    }
+
+    assert!(queue.enqueue(first).is_empty());
+}
+
+#[test]
+fn zero_maximum_length_is_safely_clamped_to_one() {
+    let mut queue = LaunchIntentQueue::new(0);
+    let intent = queue_intent(11);
+
+    assert!(queue.enqueue(intent.clone()).is_empty());
+    assert_eq!(queue.mark_ready(), vec![intent.clone()]);
+    assert!(queue.enqueue(intent).is_empty());
+}
+
+#[test]
+fn owned_deliveries_allow_the_mutex_to_be_relocked_inside_the_callback() {
+    let queue = Mutex::new(LaunchIntentQueue::new(2));
+    let intent = queue_intent(13);
+    assert!(queue
+        .lock()
+        .expect("queue mutex")
+        .enqueue(intent.clone())
+        .is_empty());
+
+    let deliveries = {
+        let mut guard = queue.lock().expect("queue mutex");
+        guard.mark_ready()
+    };
+    let delivered_ids = deliveries
+        .into_iter()
+        .map(|delivery| {
+            let mut callback_guard = queue
+                .try_lock()
+                .expect("delivery callback must run without the queue lock held");
+            assert!(callback_guard.acknowledge(delivery.id));
+            delivery.id
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(delivered_ids, vec![intent.id]);
 }
 
 #[test]
