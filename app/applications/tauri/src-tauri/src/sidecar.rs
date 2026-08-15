@@ -18,9 +18,13 @@ use std::process::{Command as StdCommand, Stdio};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, Url};
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::net::TcpStream;
 use tokio::process::Command;
 
 const BACKEND_STARTUP_TIMEOUT: u64 = 240; // seconds
+const BACKEND_PORT: u16 = 3000;
+const BACKEND_PROBE_INTERVAL: Duration = Duration::from_millis(50);
+const BACKEND_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 
 fn current_exe_dir() -> PathBuf {
     std::env::current_exe()
@@ -538,6 +542,123 @@ fn backend_child_path() -> String {
     paths
 }
 
+fn ensure_backend_port_available(port: u16) -> Result<(), String> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port))
+        .map_err(|error| format!("Backend port {port} is already in use on 127.0.0.1: {error}"))?;
+    drop(listener);
+    Ok(())
+}
+
+async fn backend_port_is_listening(port: u16) -> bool {
+    matches!(
+        tokio::time::timeout(
+            BACKEND_PROBE_TIMEOUT,
+            TcpStream::connect(("127.0.0.1", port)),
+        )
+        .await,
+        Ok(Ok(_))
+    )
+}
+
+fn backend_stdout_confirms_port(line: &str, port: u16) -> bool {
+    line.contains(&format!("Theia app listening on http://127.0.0.1:{port}"))
+}
+
+#[cfg(windows)]
+fn initialize_windows_backend_pty_input(writer: &mut dyn std::io::Write) -> Result<(), String> {
+    // portable-pty creates ConPTY with PSEUDOCONSOLE_INHERIT_CURSOR. Windows
+    // waits for this standard cursor-position response before starting the
+    // attached process; without it the backend remains alive but never runs.
+    writer
+        .write_all(b"\x1b[1;1R")
+        .and_then(|()| writer.flush())
+        .map_err(|error| format!("Failed to initialize backend PTY input: {error}"))
+}
+
+fn wait_with_backend_pty_lifetime<G, T>(guard: G, wait: impl FnOnce() -> T) -> T {
+    let result = wait();
+    drop(guard);
+    result
+}
+
+fn return_post_spawn_setup_or_cleanup<T>(
+    result: Result<T, String>,
+    cleanup: impl FnOnce(),
+) -> Result<T, String> {
+    if result.is_err() {
+        cleanup();
+    }
+    result
+}
+
+fn cleanup_failed_backend_start(app_handle: &AppHandle, child_pid: Option<u32>) {
+    if let Some(pid) = child_pid {
+        let _ = terminate_process_tree(pid);
+    }
+    clear_backend_state(app_handle);
+}
+
+fn handle_backend_process_exit(
+    exit: String,
+    stopping: bool,
+    clear: impl FnOnce(),
+    report_unexpected: impl FnOnce(String),
+) {
+    clear();
+    if !stopping {
+        report_unexpected(format!("Backend exited unexpectedly: {exit}"));
+    }
+}
+
+async fn wait_for_node_backend_readiness(
+    line_rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+    exit_rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+    port: u16,
+    timeout: Duration,
+) -> Result<u16, String> {
+    let startup_timeout = tokio::time::sleep(timeout);
+    tokio::pin!(startup_timeout);
+    let mut probe_interval = tokio::time::interval(BACKEND_PROBE_INTERVAL);
+    probe_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut line_reader_open = true;
+    let mut child_wait_open = true;
+    let mut child_reported_port = false;
+
+    loop {
+        tokio::select! {
+            biased;
+            exit = exit_rx.recv(), if child_wait_open => {
+                match exit {
+                    Some(exit) => {
+                        return Err(format!("Backend process exited before ready: {exit}"));
+                    }
+                    None => child_wait_open = false,
+                }
+            }
+            line = line_rx.recv(), if line_reader_open => {
+                match line {
+                    Some(line) => {
+                        log::info!("Backend stdout: {}", line);
+                        child_reported_port |= backend_stdout_confirms_port(&line, port);
+                    }
+                    None => line_reader_open = false,
+                }
+            }
+            _ = probe_interval.tick(), if child_reported_port => {
+                if backend_port_is_listening(port).await {
+                    return Ok(port);
+                }
+            }
+            _ = &mut startup_timeout => {
+                return Err(format!(
+                    "Backend startup timeout: port {port} did not accept connections within {}s",
+                    timeout.as_secs()
+                ));
+            }
+        }
+    }
+}
+
 async fn start_node_backend_process(
     app_handle: &AppHandle,
     config: &BackendConfig,
@@ -545,6 +666,7 @@ async fn start_node_backend_process(
     config_dir: PathBuf,
     launch_plan: &BackendLaunchPlan,
 ) -> Result<(), String> {
+    ensure_backend_port_available(BACKEND_PORT)?;
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
@@ -558,7 +680,7 @@ async fn start_node_backend_process(
     let mut command = CommandBuilder::new(&config.node_exe);
     command.arg(&config.script_path);
     command.arg("--log-level=info");
-    command.arg("--port=3000");
+    command.arg(format!("--port={BACKEND_PORT}"));
     command.arg("--hostname=127.0.0.1");
     if is_plugin_dir_ready(&plugins_dir) {
         command.arg(format!("--plugins=local-dir:{}", plugins_dir.display()));
@@ -613,10 +735,27 @@ async fn start_node_backend_process(
         }
     }
 
-    let reader = pair
-        .master
-        .try_clone_reader()
-        .map_err(|e| format!("Failed to clone backend PTY reader: {}", e))?;
+    let reader = return_post_spawn_setup_or_cleanup(
+        pair.master
+            .try_clone_reader()
+            .map_err(|e| format!("Failed to clone backend PTY reader: {}", e)),
+        || cleanup_failed_backend_start(app_handle, child_pid),
+    )?;
+    #[cfg(windows)]
+    let backend_pty_writer = {
+        let mut writer = return_post_spawn_setup_or_cleanup(
+            pair.master
+                .take_writer()
+                .map_err(|error| format!("Failed to open backend PTY input: {error}")),
+            || cleanup_failed_backend_start(app_handle, child_pid),
+        )?;
+        return_post_spawn_setup_or_cleanup(
+            initialize_windows_backend_pty_input(writer.as_mut()),
+            || cleanup_failed_backend_start(app_handle, child_pid),
+        )?;
+        writer
+    };
+    let backend_pty_master = pair.master;
     let (line_tx, mut line_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     std::thread::spawn(move || {
         let reader = std::io::BufReader::new(reader);
@@ -625,51 +764,53 @@ async fn start_node_backend_process(
         }
     });
 
+    let (exit_tx, mut exit_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     std::thread::spawn(move || {
-        let _ = child.wait();
+        #[cfg(windows)]
+        let backend_pty_lifetime = (backend_pty_master, backend_pty_writer);
+        #[cfg(not(windows))]
+        let backend_pty_lifetime = backend_pty_master;
+        let exit = wait_with_backend_pty_lifetime(backend_pty_lifetime, || match child.wait() {
+            Ok(status) => format!("{status:?}"),
+            Err(error) => format!("wait failed: {error}"),
+        });
+        let _ = exit_tx.send(exit);
     });
 
-    let startup_timeout = tokio::time::sleep(Duration::from_secs(BACKEND_STARTUP_TIMEOUT));
-    tokio::pin!(startup_timeout);
-    let mut backend_ready = false;
-
-    loop {
-        tokio::select! {
-            line = line_rx.recv() => {
-                let Some(line) = line else {
-                    break;
-                };
-                log::info!("Backend stdout: {}", line);
-                if !backend_ready && (line.contains("port") || line.contains("listening") || line.contains("localhost")) {
-                    if let Some(port) =
-                        extract_port_from_line(&line).and_then(|value| value.parse::<u16>().ok())
-                    {
-                        log::info!("Backend ready on port {}", port);
-                        publish_backend_listening(app_handle, port);
-                        backend_ready = true;
-                        break;
-                    }
-                }
-            }
-            _ = &mut startup_timeout => {
-                if let Some(pid) = child_pid {
-                    let _ = terminate_process_tree(pid);
-                }
-                clear_backend_state(app_handle);
-                return Err("Backend startup timeout".to_string());
-            }
-        }
-    }
-
-    if !backend_ready {
-        return Err("Backend process exited before ready".to_string());
-    }
+    let ready_port = wait_for_node_backend_readiness(
+        &mut line_rx,
+        &mut exit_rx,
+        BACKEND_PORT,
+        Duration::from_secs(BACKEND_STARTUP_TIMEOUT),
+    )
+    .await
+    .inspect_err(|_| cleanup_failed_backend_start(app_handle, child_pid))?;
+    log::info!("Backend ready on port {}", ready_port);
+    publish_backend_listening(app_handle, ready_port);
 
     let app_handle_logs = app_handle.clone();
-    tokio::spawn(async move {
-        while let Some(line) = line_rx.recv().await {
+    std::thread::spawn(move || {
+        while let Some(line) = line_rx.blocking_recv() {
             log::info!("Backend stdout: {}", line);
             let _ = app_handle_logs.emit("backend-log", line);
+        }
+    });
+
+    let app_handle_exit = app_handle.clone();
+    std::thread::spawn(move || {
+        if let Some(exit) = exit_rx.blocking_recv() {
+            let stopping = is_backend_stopping(&app_handle_exit);
+            let clear_handle = app_handle_exit.clone();
+            let report_handle = app_handle_exit.clone();
+            handle_backend_process_exit(
+                exit,
+                stopping,
+                move || clear_backend_state(&clear_handle),
+                move |message| {
+                    log::error!("{message}");
+                    let _ = report_handle.emit("backend-error", message);
+                },
+            );
         }
     });
 
@@ -979,4 +1120,190 @@ pub fn stop_backend(app_handle: &AppHandle) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ensure_backend_port_available, wait_for_node_backend_readiness};
+    use std::net::TcpListener;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    #[test]
+    fn backend_port_preflight_rejects_an_existing_listener() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback listener");
+        let port = listener.local_addr().expect("listener address").port();
+
+        let error = ensure_backend_port_available(port)
+            .expect_err("an occupied backend port must fail before spawn");
+
+        assert!(error.contains(&port.to_string()), "{error}");
+        assert!(error.contains("already in use"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn backend_readiness_requires_child_port_evidence_before_tcp() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind external listener");
+        let port = listener.local_addr().expect("listener address").port();
+        let (_line_tx, mut line_rx) = mpsc::unbounded_channel();
+        let (exit_tx, mut exit_rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let _ = exit_tx.send("child exited".to_string());
+        });
+
+        let error = wait_for_node_backend_readiness(
+            &mut line_rx,
+            &mut exit_rx,
+            port,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("an unrelated listener cannot attest child readiness");
+
+        assert!(error.contains("child exited"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn backend_readiness_requires_child_evidence_and_a_real_loopback_connection() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback listener");
+        let port = listener.local_addr().expect("listener address").port();
+        let (line_tx, mut line_rx) = mpsc::unbounded_channel();
+        let (_exit_tx, mut exit_rx) = mpsc::unbounded_channel();
+        line_tx
+            .send(format!("Theia app listening on http://127.0.0.1:{port}."))
+            .expect("send child readiness evidence");
+
+        let ready_port = wait_for_node_backend_readiness(
+            &mut line_rx,
+            &mut exit_rx,
+            port,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("the listening socket is authoritative readiness");
+
+        assert_eq!(ready_port, port);
+    }
+
+    #[tokio::test]
+    async fn backend_readiness_reports_child_exit_without_waiting_for_timeout() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("reserve unused port");
+        let port = listener.local_addr().expect("listener address").port();
+        drop(listener);
+        let (_line_tx, mut line_rx) = mpsc::unbounded_channel();
+        let (exit_tx, mut exit_rx) = mpsc::unbounded_channel();
+        exit_tx
+            .send("exit status: 17".to_string())
+            .expect("send child exit");
+
+        let started = std::time::Instant::now();
+        let error = wait_for_node_backend_readiness(
+            &mut line_rx,
+            &mut exit_rx,
+            port,
+            Duration::from_secs(30),
+        )
+        .await
+        .expect_err("an exited child cannot become ready");
+
+        assert!(error.contains("exit status: 17"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn backend_stdout_evidence_requires_the_expected_listening_port() {
+        assert!(super::backend_stdout_confirms_port(
+            "Theia app listening on http://127.0.0.1:3000.",
+            3000
+        ));
+        assert!(!super::backend_stdout_confirms_port(
+            "unrelated value 3000",
+            3000
+        ));
+        assert!(!super::backend_stdout_confirms_port(
+            "Theia app listening on http://127.0.0.1:3999.",
+            3000
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_conpty_receives_the_cursor_position_response_needed_to_start() {
+        let mut input = Vec::new();
+
+        super::initialize_windows_backend_pty_input(&mut input).expect("initialize ConPTY input");
+
+        assert_eq!(input, b"\x1b[1;1R");
+    }
+
+    #[test]
+    fn backend_pty_lifetime_is_held_until_child_wait_finishes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        struct DropProbe(Arc<AtomicBool>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = DropProbe(dropped.clone());
+        let result = super::wait_with_backend_pty_lifetime(guard, || {
+            assert!(!dropped.load(Ordering::SeqCst));
+            "child exited"
+        });
+
+        assert_eq!(result, "child exited");
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn post_spawn_setup_error_runs_cleanup_before_returning() {
+        let mut cleaned = false;
+        let result: Result<(), String> =
+            super::return_post_spawn_setup_or_cleanup(Err("PTY setup failed".to_string()), || {
+                cleaned = true
+            });
+
+        assert_eq!(result, Err("PTY setup failed".to_string()));
+        assert!(cleaned);
+    }
+
+    #[test]
+    fn backend_exit_clears_state_and_only_reports_when_unexpected() {
+        let unexpected_events = std::cell::RefCell::new(Vec::new());
+        super::handle_backend_process_exit(
+            "exit status: 17".to_string(),
+            false,
+            || unexpected_events.borrow_mut().push("clear".to_string()),
+            |message| {
+                unexpected_events
+                    .borrow_mut()
+                    .push(format!("error:{message}"))
+            },
+        );
+        assert_eq!(
+            *unexpected_events.borrow(),
+            [
+                "clear",
+                "error:Backend exited unexpectedly: exit status: 17"
+            ]
+        );
+
+        let stopping_events = std::cell::RefCell::new(Vec::new());
+        super::handle_backend_process_exit(
+            "terminated".to_string(),
+            true,
+            || stopping_events.borrow_mut().push("clear".to_string()),
+            |message| {
+                stopping_events
+                    .borrow_mut()
+                    .push(format!("error:{message}"))
+            },
+        );
+        assert_eq!(*stopping_events.borrow(), ["clear"]);
+    }
 }
