@@ -1232,6 +1232,7 @@ export async function terminateMeasuredTree(
     rootPid,
     rootIdentity,
     trackedProcesses = [],
+    containmentVerified = false,
   },
   platform = process.platform,
   {
@@ -1298,6 +1299,10 @@ export async function terminateMeasuredTree(
       }
     }
   };
+  if (platform === 'win32' && containmentVerified !== true) {
+    await terminateControlledChild();
+    return;
+  }
   let trustedRootIdentity;
   if (rootIdentity) {
     try {
@@ -1407,35 +1412,16 @@ export async function terminateMeasuredTree(
     { allowTree },
   );
   if (platform === 'win32') {
-    const terminateExplicit = async processIds => {
-      for (const pid of processIds) {
-        let currentPlan;
-        try {
-          currentPlan = await readPlan(false);
-        } catch {
-          await terminateControlledChild();
-          throw incomplete('process table could not be revalidated before taskkill');
-        }
-        if (currentPlan.processIds.includes(pid)) {
-          recordCommand('taskkill.exe', ['/PID', String(pid), '/F']);
-        }
-      }
-    };
-    if (initialPlan.mode === 'tree') {
-      let currentPlan;
-      try {
-        currentPlan = await readPlan(true);
-      } catch {
-        await terminateControlledChild();
-        throw incomplete('process table could not be revalidated before taskkill');
-      }
-      if (currentPlan.mode === 'tree') {
-        recordCommand('taskkill.exe', ['/PID', String(currentPlan.rootPid), '/T', '/F']);
-      } else {
-        await terminateExplicit(rootFirst(currentPlan.processIds));
-      }
-    } else {
-      await terminateExplicit(rootFirst(initialPlan.processIds));
+    let currentRows;
+    try {
+      currentRows = await readWithRetry();
+      rememberSafeDescendants(currentRows);
+    } catch {
+      await terminateControlledChild();
+      throw incomplete('process table could not be revalidated before taskkill');
+    }
+    if (currentRows.some(row => sameProcessIdentity(row, trustedRootIdentity))) {
+      recordCommand('taskkill.exe', ['/PID', String(verifiedRootPid), '/F']);
     }
   } else {
     const terminateExplicit = async (processIds, signal) => {
@@ -1533,6 +1519,7 @@ export async function measureOnce(options, dependencies = defaultMeasurementDepe
   let metrics;
   let monitor;
   let monitoredProcesses = [];
+  let containmentVerified = false;
   let stopMonitorPromise;
   const stopMonitorOnce = () => {
     if (!stopMonitorPromise) {
@@ -1565,6 +1552,7 @@ export async function measureOnce(options, dependencies = defaultMeasurementDepe
         `startup report pid ${startupReport.pid} does not match spawned root pid ${rootPid}`,
       );
     }
+    containmentVerified = true;
     await stopMonitorOnce();
     await dependencies.delay(options.idleMs);
     metrics = dependencies.sample(rootIdentity);
@@ -1592,6 +1580,7 @@ export async function measureOnce(options, dependencies = defaultMeasurementDepe
           rootPid,
           rootIdentity,
           trackedProcesses,
+          containmentVerified,
         });
       } finally {
         await child.startupLogCapture?.persist();

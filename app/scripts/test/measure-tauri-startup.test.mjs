@@ -1055,7 +1055,7 @@ test('cleanup retries a transient process-table query and verifies exact identit
   let reads = 0;
   const commands = [];
 
-  await terminateMeasuredTree({ rootPid: 100, rootIdentity }, 'win32', {
+  await terminateMeasuredTree({ rootPid: 100, rootIdentity, containmentVerified: true }, 'win32', {
     read: () => {
       reads++;
       if (reads === 1) {
@@ -1072,7 +1072,7 @@ test('cleanup retries a transient process-table query and verifies exact identit
     cleanupReadAttempts: 2,
   });
 
-  assert.deepEqual(commands, [['taskkill.exe', '/PID', '100', '/T', '/F']]);
+  assert.deepEqual(commands, [['taskkill.exe', '/PID', '100', '/F']]);
   assert.ok(reads >= 3, 'cleanup must reread after termination to verify disappearance');
 });
 
@@ -1086,7 +1086,7 @@ test('cleanup rejects a successful command when an exact process identity surviv
   const rows = [{ ...rootIdentity, ppid: 1 }];
 
   await assert.rejects(
-    terminateMeasuredTree({ rootPid: 100, rootIdentity }, 'win32', {
+    terminateMeasuredTree({ rootPid: 100, rootIdentity, containmentVerified: true }, 'win32', {
       read: () => rows,
       run: () => ({ status: 0 }),
       delay: async () => undefined,
@@ -1105,7 +1105,7 @@ test('cleanup accepts a failed command only when posterior identity verification
   };
   let rows = [{ ...rootIdentity, ppid: 1 }];
 
-  await terminateMeasuredTree({ rootPid: 100, rootIdentity }, 'win32', {
+  await terminateMeasuredTree({ rootPid: 100, rootIdentity, containmentVerified: true }, 'win32', {
     read: () => rows,
     run: () => {
       rows = [];
@@ -1134,7 +1134,7 @@ test('cleanup posterior verification includes descendants discovered during acti
   let rows = [{ ...rootIdentity, ppid: 1 }];
 
   await assert.rejects(
-    terminateMeasuredTree({ rootPid: 100, rootIdentity }, 'win32', {
+    terminateMeasuredTree({ rootPid: 100, rootIdentity, containmentVerified: true }, 'win32', {
       read: () => {
         reads++;
         if (reads === 2) {
@@ -1185,7 +1185,7 @@ test('cleanup fails closed when the posterior process-table query cannot be veri
   let reads = 0;
 
   await assert.rejects(
-    terminateMeasuredTree({ rootPid: 100, rootIdentity }, 'win32', {
+    terminateMeasuredTree({ rootPid: 100, rootIdentity, containmentVerified: true }, 'win32', {
       read: () => {
         reads++;
         if (reads >= 3) {
@@ -1409,6 +1409,7 @@ test('explicit cleanup revalidates identity immediately before every kill', asyn
     rootPid: 100,
     rootIdentity,
     trackedProcesses: tracked,
+    containmentVerified: true,
   }, 'win32', {
     read: () => {
       reads++;
@@ -1424,7 +1425,7 @@ test('explicit cleanup revalidates identity immediately before every kill', asyn
   assert.deepEqual(commands, []);
 });
 
-test('tree termination rechecks identity and never targets a reused root or descendant PID', async () => {
+test('Windows Job cleanup never targets a descendant after the measured root PID is reused', async () => {
   const rootIdentity = { pid: 100, pgid: null, creationTime: 'root-start', startedAt: 1_000 };
   const tracked = [
     { pid: 100, ppid: 1, pgid: null, creationTime: 'root-start', startedAt: 1_000, depth: 0 },
@@ -1438,24 +1439,28 @@ test('tree termination rechecks identity and never targets a reused root or desc
     { pid: 101, ppid: 1, pgid: null, creationTime: 'reused-child', startedAt: 4_000 },
     { pid: 102, ppid: 1, pgid: null, creationTime: 'grandchild-start', startedAt: 3_000 },
   ];
-  await terminateMeasuredTree({
-    rootPid: rootIdentity.pid,
-    rootIdentity,
-    trackedProcesses: tracked,
-  }, 'win32', {
-    read: () => rows,
-    run: (command, args) => {
-      commands.push([command, ...args]);
-      rows = rows.filter(row => row.pid !== Number(args[1]));
-      return { status: 0 };
-    },
-    delay: async () => undefined,
-  });
+  await assert.rejects(
+    terminateMeasuredTree({
+      rootPid: rootIdentity.pid,
+      rootIdentity,
+      trackedProcesses: tracked,
+      containmentVerified: true,
+    }, 'win32', {
+      read: () => rows,
+      run: (command, args) => {
+        commands.push([command, ...args]);
+        rows = rows.filter(row => row.pid !== Number(args[1]));
+        return { status: 0 };
+      },
+      delay: async () => undefined,
+    }),
+    /startup cleanup incomplete.*102/,
+  );
 
-  assert.deepEqual(commands, [['taskkill.exe', '/PID', '102', '/F']]);
+  assert.deepEqual(commands, []);
 });
 
-test('tree termination uses whole-tree cleanup when the captured root still matches', async () => {
+test('Windows Job cleanup terminates only the exact measured root', async () => {
   const rootIdentity = { pid: 100, pgid: null, creationTime: 'root-start', startedAt: 1_000 };
   const commands = [];
   let rows = [
@@ -1464,6 +1469,7 @@ test('tree termination uses whole-tree cleanup when the captured root still matc
   await terminateMeasuredTree({
     rootPid: rootIdentity.pid,
     rootIdentity,
+    containmentVerified: true,
   }, 'win32', {
     read: () => rows,
     run: (command, args) => {
@@ -1474,7 +1480,88 @@ test('tree termination uses whole-tree cleanup when the captured root still matc
     delay: async () => undefined,
   });
 
-  assert.deepEqual(commands, [['taskkill.exe', '/PID', '100', '/T', '/F']]);
+  assert.deepEqual(commands, [['taskkill.exe', '/PID', '100', '/F']]);
+});
+
+test('Windows root-only cleanup relies on the measured Job for an unobserved daemon', async () => {
+  const rootIdentity = {
+    pid: 100,
+    pgid: null,
+    creationTime: 'root-start',
+    startedAt: 1_000,
+  };
+  const observedChild = {
+    pid: 101,
+    ppid: 100,
+    pgid: null,
+    creationTime: 'child-start',
+    startedAt: 2_000,
+    depth: 1,
+  };
+  let rows = [{ ...rootIdentity, ppid: 1 }, observedChild];
+  let unobservedDaemonAlive = true;
+  const commands = [];
+
+  await terminateMeasuredTree({
+    rootPid: 100,
+    rootIdentity,
+    trackedProcesses: [observedChild],
+    containmentVerified: true,
+  }, 'win32', {
+    read: () => rows,
+    run: (command, args) => {
+      commands.push([command, ...args]);
+      assert.deepEqual(args, ['/PID', '100', '/F']);
+      rows = [];
+      unobservedDaemonAlive = false;
+      return { status: 0 };
+    },
+    delay: async () => undefined,
+    cleanupReadAttempts: 1,
+  });
+
+  assert.deepEqual(commands, [['taskkill.exe', '/PID', '100', '/F']]);
+  assert.equal(unobservedDaemonAlive, false);
+});
+
+test('Windows cleanup without a verified startup report uses only the owned child handle', async () => {
+  const signals = [];
+  const child = {
+    pid: 100,
+    killed: false,
+    exitCode: null,
+    signalCode: null,
+    kill(signal) {
+      signals.push(signal);
+      this.killed = true;
+      return true;
+    },
+  };
+
+  await terminateMeasuredTree({
+    child,
+    rootPid: 100,
+    rootIdentity: {
+      pid: 100,
+      pgid: null,
+      creationTime: 'root-start',
+      startedAt: 1_000,
+    },
+    containmentVerified: false,
+  }, 'win32', {
+    read: () => {
+      throw new Error('unverified cleanup must not query CIM');
+    },
+    run: () => {
+      throw new Error('unverified cleanup must not invoke taskkill');
+    },
+    kill: () => {
+      throw new Error('unverified cleanup must not signal a bare PID');
+    },
+    delay: async () => undefined,
+  });
+
+  assert.deepEqual(signals, ['SIGTERM', 'SIGKILL']);
 });
 
 test('Windows cleanup never lets taskkill tree expansion reach a child older than the root', async () => {
@@ -1499,11 +1586,12 @@ test('Windows cleanup never lets taskkill tree expansion reach a child older tha
       { ...rows[0], depth: 0 },
       { ...rows[2], depth: 1 },
     ],
+    containmentVerified: true,
   }, 'win32', {
     read: () => rows,
     run: (command, args) => {
       commands.push([command, ...args]);
-      rows = rows.filter(row => row.pid !== Number(args[1]));
+      rows = rows.filter(row => ![100, 102].includes(row.pid));
       return { status: 0 };
     },
     delay: async () => undefined,
@@ -1512,10 +1600,7 @@ test('Windows cleanup never lets taskkill tree expansion reach a child older tha
   assert.equal(commands.some(command => command.includes('/T')), false);
   assert.equal(commands.some(command => command.includes('101')), false);
   assert.equal(commands.some(command => command.includes('103')), false);
-  assert.deepEqual(commands, [
-    ['taskkill.exe', '/PID', '100', '/F'],
-    ['taskkill.exe', '/PID', '102', '/F'],
-  ]);
+  assert.deepEqual(commands, [['taskkill.exe', '/PID', '100', '/F']]);
 });
 
 test('POSIX termination signals the verified process group after each identity read', async () => {
@@ -1679,7 +1764,44 @@ test('measurement timeout always terminates only the process tree it launched', 
     rootPid: 7331,
     rootIdentity,
     trackedProcesses: [monitoredBackend],
+    containmentVerified: false,
   }]);
+});
+
+test('a startup report for another PID never attests Windows Job containment', async () => {
+  const terminated = [];
+  const child = { pid: 7331 };
+  await assert.rejects(
+    measureOnce(
+      {
+        executable: '/fixture/R-IDE',
+        codeFile: '/fixture/startup.R',
+        reportPath: '/fixture/report.json',
+        idleMs: 0,
+        timeoutMs: 1,
+        pollMs: 1,
+        cwd: '/fixture',
+      },
+      {
+        launch: () => child,
+        capture: async () => ({
+          pid: 7331,
+          pgid: null,
+          creationTime: 'root-start',
+        }),
+        startMonitor: () => ({ stop: async () => [] }),
+        waitForReport: async () => ({ pid: 7442 }),
+        delay: async () => undefined,
+        sample: () => {
+          throw new Error('must not sample a mismatched startup report');
+        },
+        terminate: async cleanup => terminated.push(cleanup),
+      },
+    ),
+    /startup report pid 7442 does not match spawned root pid 7331/,
+  );
+  assert.equal(terminated.length, 1);
+  assert.equal(terminated[0].containmentVerified, false);
 });
 
 test('capture failure safely terminates only the controlled child handle', async () => {
@@ -1855,7 +1977,9 @@ test('measurement samples after idle and then rereads the complete final report'
         };
       },
       terminate: async cleanup => {
-        events.push(`terminate:${cleanup.rootIdentity.pid}:${cleanup.trackedProcesses.length}`);
+        events.push(
+          `terminate:${cleanup.rootIdentity.pid}:${cleanup.trackedProcesses.length}:${cleanup.containmentVerified}`,
+        );
       },
       now: (() => {
         let now = 1_000;
@@ -1871,7 +1995,7 @@ test('measurement samples after idle and then rereads the complete final report'
     'monitor:stop',
     'idle:30000',
     'sample:7331:root-start',
-    'terminate:7331:1',
+    'terminate:7331:1:true',
     'logs:persist',
   ]);
   assert.equal(result.startupReport, final);

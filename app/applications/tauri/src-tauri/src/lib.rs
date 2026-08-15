@@ -15,6 +15,7 @@ pub mod launch_intent;
 pub mod native_chrome;
 pub mod sidecar;
 pub mod startup;
+mod startup_job;
 pub mod startup_metrics;
 
 use std::ffi::OsString;
@@ -156,6 +157,15 @@ fn install_shutdown_signal_handlers(_app_handle: tauri::AppHandle) {}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let _startup_job_lease = match startup_job::create_for_current_process_if_requested(
+        std::env::var_os(startup_metrics::STARTUP_REPORT_ENV).is_some(),
+    ) {
+        Ok(lease) => lease,
+        Err(error) => {
+            eprintln!("Failed to establish measured-startup Windows Job Object: {error}");
+            std::process::exit(1);
+        }
+    };
     let startup_metrics = startup_metrics::StartupMetrics::from_env();
     if let Err(error) = startup_metrics.record(startup_metrics::StartupMilestone::ProcessStarted) {
         eprintln!("Warning: failed to record process_started startup milestone: {error}");
