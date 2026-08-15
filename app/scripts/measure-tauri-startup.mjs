@@ -22,10 +22,12 @@ const MEASUREMENT_VERSION = 1;
 const DIAGNOSTICS_OWNER_SCHEMA = 'ride.startup-diagnostics-owner';
 const DIAGNOSTICS_OWNER_VERSION = 1;
 const DIAGNOSTICS_OWNER_FILE = '.ride-startup-diagnostics-owner.json';
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const DIAGNOSTIC_LOG_MAX_BYTES = 1_048_576;
 const STREAM_SETTLE_TIMEOUT_MS = 2_000;
 const SYNC_COMMAND_TIMEOUT_MS = 10_000;
 const SYNC_COMMAND_MAX_BUFFER_BYTES = 16 * 1024 * 1024;
+const SENSITIVE_FRAGMENT_LENGTH = 16;
 const SENSITIVE_ENVIRONMENT_KEY = /(?:TOKEN|SECRET|PASSWORD|PASSWD|KEY|CREDENTIAL|COOKIE|AUTH)/i;
 const SENSITIVE_DESKTOP_PASSTHROUGH_KEYS = new Set(['XAUTHORITY']);
 const MILESTONES = [
@@ -72,6 +74,44 @@ function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+function redactSensitiveFragments(text, sensitiveValues) {
+  const fragments = new Set();
+  for (const value of sensitiveValues) {
+    for (let index = 0; index <= value.length - SENSITIVE_FRAGMENT_LENGTH; index++) {
+      fragments.add(value.slice(index, index + SENSITIVE_FRAGMENT_LENGTH));
+    }
+  }
+  if (fragments.size === 0 || text.length < SENSITIVE_FRAGMENT_LENGTH) {
+    return text;
+  }
+
+  const ranges = [];
+  for (let index = 0; index <= text.length - SENSITIVE_FRAGMENT_LENGTH; index++) {
+    if (!fragments.has(text.slice(index, index + SENSITIVE_FRAGMENT_LENGTH))) {
+      continue;
+    }
+    const end = index + SENSITIVE_FRAGMENT_LENGTH;
+    const previous = ranges.at(-1);
+    if (previous && index <= previous.end) {
+      previous.end = Math.max(previous.end, end);
+    } else {
+      ranges.push({ start: index, end });
+    }
+  }
+  if (ranges.length === 0) {
+    return text;
+  }
+
+  const redacted = [];
+  let cursor = 0;
+  for (const range of ranges) {
+    redacted.push(text.slice(cursor, range.start), '[REDACTED]');
+    cursor = range.end;
+  }
+  redacted.push(text.slice(cursor));
+  return redacted.join('');
+}
+
 export function filterSpawnEnvironment(sourceEnvironment, reportPath) {
   const environment = {};
   const sensitiveValues = [];
@@ -95,10 +135,11 @@ export function filterSpawnEnvironment(sourceEnvironment, reportPath) {
 }
 
 export function redactDiagnosticText(text, sensitiveValues = []) {
-  let redacted = String(text);
-  for (const value of [...new Set(sensitiveValues)]
+  const uniqueSensitiveValues = [...new Set(sensitiveValues)]
     .filter(candidate => typeof candidate === 'string' && candidate.length > 0)
-    .sort((left, right) => right.length - left.length)) {
+    .sort((left, right) => right.length - left.length);
+  let redacted = redactSensitiveFragments(String(text), uniqueSensitiveValues);
+  for (const value of uniqueSensitiveValues) {
     redacted = redacted.replace(new RegExp(escapeRegExp(value), 'g'), '[REDACTED]');
   }
   redacted = redacted.replace(
@@ -123,9 +164,28 @@ function tailBuffer(buffer, maximumBytes) {
   return buffer.subarray(start);
 }
 
-function renderBoundedLog(retained, totalBytes, maximumBytes, sensitiveValues) {
-  const redacted = Buffer.from(redactDiagnosticText(retained.toString('utf8'), sensitiveValues));
-  const omittedBytes = Math.max(0, totalBytes - retained.length);
+function renderBoundedLog(
+  retained,
+  totalBytes,
+  maximumBytes,
+  sensitiveValues,
+  { discardTrailingPartialLine = false } = {},
+) {
+  let safeRetained = retained;
+  if (totalBytes > retained.length) {
+    const firstLineEnd = retained.indexOf(0x0A);
+    safeRetained = firstLineEnd >= 0
+      ? retained.subarray(firstLineEnd + 1)
+      : Buffer.alloc(0);
+  }
+  if (discardTrailingPartialLine && safeRetained.length > 0) {
+    const lastLineEnd = safeRetained.lastIndexOf(0x0A);
+    safeRetained = lastLineEnd >= 0
+      ? safeRetained.subarray(0, lastLineEnd + 1)
+      : Buffer.alloc(0);
+  }
+  const redacted = Buffer.from(redactDiagnosticText(safeRetained.toString('utf8'), sensitiveValues));
+  const omittedBytes = Math.max(0, totalBytes - safeRetained.length);
   if (omittedBytes === 0 && redacted.length <= maximumBytes) {
     return redacted.toString('utf8');
   }
@@ -151,8 +211,8 @@ export function createBoundedLogSink(maximumBytes = DIAGNOSTIC_LOG_MAX_BYTES) {
         ? tailBuffer(next, maximumBytes)
         : tailBuffer(Buffer.concat([retained, next]), maximumBytes);
     },
-    render(sensitiveValues = []) {
-      return renderBoundedLog(retained, totalBytes, maximumBytes, sensitiveValues);
+    render(sensitiveValues = [], options = {}) {
+      return renderBoundedLog(retained, totalBytes, maximumBytes, sensitiveValues, options);
     },
   };
 }
@@ -637,14 +697,21 @@ export function startProcessTreeMonitor(
     try {
       const rows = read(platform);
       const currentRoot = rows.find(processRow => processRow.pid === rootIdentity.pid);
-      if (currentRoot && !sameProcessIdentity(currentRoot, rootIdentity)) {
-        return;
-      }
       let processes;
-      if (currentRoot) {
+      if (currentRoot && sameProcessIdentity(currentRoot, rootIdentity)) {
         processes = aggregateProcessTree(rows, rootIdentity).processes;
-      } else if (platform === 'win32') {
-        const depths = new Map([[rootIdentity.pid, 0]]);
+      } else {
+        const currentByPid = new Map(rows.map(processRow => [processRow.pid, processRow]));
+        const depths = new Map();
+        for (const trackedProcess of tracked.values()) {
+          if (trackedProcess.pid === rootIdentity.pid) {
+            continue;
+          }
+          const currentProcess = currentByPid.get(trackedProcess.pid);
+          if (currentProcess && sameProcessIdentity(currentProcess, trackedProcess)) {
+            depths.set(currentProcess.pid, trackedProcess.depth ?? 1);
+          }
+        }
         let changed = true;
         while (changed) {
           changed = false;
@@ -664,18 +731,6 @@ export function startProcessTreeMonitor(
             creationTime: processRow.creationTime,
             depth: depths.get(processRow.pid),
           }));
-      } else if (rootIdentity.pgid === rootIdentity.pid && rootIdentity.pgid > 0) {
-        processes = rows
-          .filter(processRow => processRow.pgid === rootIdentity.pgid)
-          .map(processRow => ({
-            pid: processRow.pid,
-            ppid: processRow.ppid,
-            pgid: processRow.pgid,
-            creationTime: processRow.creationTime,
-            depth: tracked.get(trackedProcessKey(processRow))?.depth ?? 1,
-          }));
-      } else {
-        processes = [];
       }
       for (const processRow of processes) {
         tracked.set(trackedProcessKey(processRow), processRow);
@@ -753,27 +808,51 @@ export async function waitForStartupReport(
   throw new Error(`startup report timeout after ${timeoutMs}ms: ${reportPath}`);
 }
 
-function waitForReadableEnd(stream) {
-  if (!stream || stream.readableEnded || stream.destroyed) {
-    return Promise.resolve();
+function waitForReadableEnd(stream, timeoutMs = STREAM_SETTLE_TIMEOUT_MS) {
+  if (!stream || stream.readableEnded || stream.closed) {
+    return Promise.resolve(true);
   }
   return new Promise(resolve => {
-    const finish = () => {
+    const finish = settled => {
       clearTimeout(timer);
-      stream.off('end', finish);
-      stream.off('close', finish);
-      stream.off('error', finish);
-      resolve();
+      stream.off('end', onSettled);
+      stream.off('close', onSettled);
+      resolve(settled);
     };
-    const timer = setTimeout(finish, STREAM_SETTLE_TIMEOUT_MS);
+    const onSettled = () => finish(true);
+    const timer = setTimeout(() => finish(false), timeoutMs);
     timer.unref?.();
-    stream.once('end', finish);
-    stream.once('close', finish);
-    stream.once('error', finish);
+    stream.once('end', onSettled);
+    stream.once('close', onSettled);
   });
 }
 
-function attachBoundedLogCapture(child, { stdoutLogPath, stderrLogPath }, sensitiveValues) {
+function concludeCapturedStream(stream, dataListener, safetyErrorListener, settled) {
+  stream.off('data', dataListener);
+  if (stream.closed) {
+    stream.off('error', safetyErrorListener);
+    return;
+  }
+  const releaseSafetyListener = () => {
+    stream.off('close', releaseSafetyListener);
+    stream.off('error', safetyErrorListener);
+  };
+  stream.once('close', releaseSafetyListener);
+  if (!settled && !stream.destroyed) {
+    try {
+      stream.destroy();
+    } catch {
+      // The safety error listener remains until a later close event.
+    }
+  }
+}
+
+export function attachBoundedLogCapture(
+  child,
+  { stdoutLogPath, stderrLogPath },
+  sensitiveValues,
+  { settleTimeoutMs = STREAM_SETTLE_TIMEOUT_MS } = {},
+) {
   const stdout = createBoundedLogSink();
   const stderr = createBoundedLogSink();
   const drainStdout = chunk => stdout.append(chunk);
@@ -791,17 +870,28 @@ function attachBoundedLogCapture(child, { stdoutLogPath, stderrLogPath }, sensit
   return {
     persist() {
       persistence ??= (async () => {
+        let stdoutSettled = false;
+        let stderrSettled = false;
         try {
-          await Promise.all([waitForReadableEnd(child.stdout), waitForReadableEnd(child.stderr)]);
+          [stdoutSettled, stderrSettled] = await Promise.all([
+            waitForReadableEnd(child.stdout, settleTimeoutMs),
+            waitForReadableEnd(child.stderr, settleTimeoutMs),
+          ]);
+          concludeCapturedStream(child.stdout, drainStdout, handleStdoutError, stdoutSettled);
+          concludeCapturedStream(child.stderr, drainStderr, handleStderrError, stderrSettled);
           await Promise.all([
-            fs.promises.writeFile(stdoutLogPath, stdout.render(sensitiveValues)),
-            fs.promises.writeFile(stderrLogPath, stderr.render(sensitiveValues)),
+            fs.promises.writeFile(stdoutLogPath, stdout.render(
+              sensitiveValues,
+              { discardTrailingPartialLine: !stdoutSettled },
+            )),
+            fs.promises.writeFile(stderrLogPath, stderr.render(
+              sensitiveValues,
+              { discardTrailingPartialLine: !stderrSettled },
+            )),
           ]);
         } finally {
           child.stdout.off('data', drainStdout);
           child.stderr.off('data', drainStderr);
-          child.stdout.off('error', handleStdoutError);
-          child.stderr.off('error', handleStderrError);
         }
       })();
       return persistence;
@@ -1187,7 +1277,7 @@ function failurePathForOutput(output) {
 
 async function clearPreviousCampaignArtifacts(output) {
   const resolvedOutput = path.resolve(output);
-  const outputDirectory = path.dirname(resolvedOutput);
+  const outputDirectory = path.resolve(path.dirname(resolvedOutput));
   let ownedDiagnostics;
   try {
     const failure = JSON.parse(await fs.promises.readFile(
@@ -1195,14 +1285,27 @@ async function clearPreviousCampaignArtifacts(output) {
       'utf8',
     ));
     const directoryName = failure?.diagnostics?.directory;
+    const campaignId = failure?.campaignId;
+    const expectedDirectoryName = typeof campaignId === 'string'
+      ? `${artifactStem(resolvedOutput)}-diagnostics-${campaignId}`
+      : undefined;
     if (failure?.status === 'failed'
         && failure.output === resolvedOutput
-        && typeof failure.campaignId === 'string'
-        && failure.campaignId.length > 0
+        && typeof campaignId === 'string'
+        && UUID_PATTERN.test(campaignId)
         && typeof directoryName === 'string'
         && directoryName.length > 0
-        && path.basename(directoryName) === directoryName) {
-      const candidate = path.join(outputDirectory, directoryName);
+        && directoryName !== '.'
+        && directoryName !== '..'
+        && !path.isAbsolute(directoryName)
+        && !directoryName.includes('/')
+        && !directoryName.includes('\\')
+        && path.basename(directoryName) === directoryName
+        && directoryName === expectedDirectoryName) {
+      const candidate = path.resolve(outputDirectory, directoryName);
+      if (path.dirname(candidate) !== outputDirectory) {
+        throw new Error('diagnostics ownership path is outside the output directory');
+      }
       const candidateStat = await fs.promises.lstat(candidate);
       if (!candidateStat.isDirectory() || candidateStat.isSymbolicLink()) {
         throw new Error('diagnostics ownership path is not a real directory');
@@ -1213,7 +1316,7 @@ async function clearPreviousCampaignArtifacts(output) {
       ));
       if (owner?.schema === DIAGNOSTICS_OWNER_SCHEMA
           && owner.version === DIAGNOSTICS_OWNER_VERSION
-          && owner.campaignId === failure.campaignId
+          && owner.campaignId === campaignId
           && owner.output === resolvedOutput) {
         ownedDiagnostics = candidate;
       }

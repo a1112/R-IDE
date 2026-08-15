@@ -16,6 +16,7 @@ import test from 'node:test';
 
 import {
   aggregateProcessTree,
+  attachBoundedLogCapture,
   captureProcessIdentity,
   createBoundedLogSink,
   discoverExecutable,
@@ -41,6 +42,16 @@ function temporaryDirectory(label) {
 function touch(file) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, 'fixture');
+}
+
+function assertNoSensitiveWindows(output, secret, windowLength = 16) {
+  for (let index = 0; index <= secret.length - windowLength; index++) {
+    assert.equal(
+      output.includes(secret.slice(index, index + windowLength)),
+      false,
+      `secret window at offset ${index} must not be present`,
+    );
+  }
 }
 
 function currentRustTarget() {
@@ -558,6 +569,7 @@ test('process tree monitor accumulates identities and releases its timer and exi
   const rootIdentity = { pid: 100, pgid: 100, creationTime: 'root-start' };
   let rows = [
     { pid: 100, ppid: 1, pgid: 100, rssBytes: 10, creationTime: 'root-start' },
+    { pid: 101, ppid: 100, pgid: 100, rssBytes: 20, creationTime: 'backend-start' },
   ];
   let scheduled;
   let cancelled = false;
@@ -592,6 +604,130 @@ test('process tree monitor accumulates identities and releases its timer and exi
   assert.equal(reads, readsAfterStop, 'stopped monitor must not poll again');
   assert.deepEqual(await monitor.stop(), tracked, 'stopping the monitor is idempotent');
   assert.equal(reads, readsAfterStop, 'repeated stop must not query the process table');
+});
+
+test('process tree monitor never seeds discovery from a missing root PID', async () => {
+  const child = new EventEmitter();
+  child.pid = 100;
+  let rows = [
+    { pid: 100, ppid: 1, pgid: null, rssBytes: 10, creationTime: 'root-start' },
+  ];
+  let scheduled;
+  const monitor = startProcessTreeMonitor(
+    { pid: 100, pgid: null, creationTime: 'root-start' },
+    {
+      child,
+      platform: 'win32',
+      read: () => rows,
+      schedule: callback => {
+        scheduled = callback;
+        return { unref() {} };
+      },
+      cancel: () => undefined,
+    },
+  );
+  rows = [
+    { pid: 900, ppid: 100, pgid: null, rssBytes: 20, creationTime: 'unrelated-start' },
+  ];
+  scheduled();
+
+  const tracked = await monitor.stop();
+  assert.deepEqual(tracked.map(processRow => processRow.pid), [100]);
+});
+
+test('process tree monitor follows identity-matched tracked descendants after root exit', async () => {
+  const child = new EventEmitter();
+  child.pid = 100;
+  let rows = [
+    { pid: 100, ppid: 1, pgid: null, rssBytes: 10, creationTime: 'root-start' },
+    { pid: 101, ppid: 100, pgid: null, rssBytes: 20, creationTime: 'backend-start' },
+  ];
+  let scheduled;
+  const monitor = startProcessTreeMonitor(
+    { pid: 100, pgid: null, creationTime: 'root-start' },
+    {
+      child,
+      platform: 'win32',
+      read: () => rows,
+      schedule: callback => {
+        scheduled = callback;
+        return { unref() {} };
+      },
+      cancel: () => undefined,
+    },
+  );
+  rows = [
+    { pid: 101, ppid: 1, pgid: null, rssBytes: 20, creationTime: 'backend-start' },
+    { pid: 102, ppid: 101, pgid: null, rssBytes: 30, creationTime: 'worker-start' },
+  ];
+  scheduled();
+
+  const tracked = await monitor.stop();
+  assert.deepEqual(tracked.map(processRow => processRow.pid), [100, 101, 102]);
+});
+
+test('POSIX monitor does not adopt an untracked process from the old root group', async () => {
+  const child = new EventEmitter();
+  child.pid = 100;
+  let rows = [
+    { pid: 100, ppid: 1, pgid: 100, rssBytes: 10, creationTime: 'root-start' },
+    { pid: 101, ppid: 100, pgid: 100, rssBytes: 20, creationTime: 'backend-start' },
+  ];
+  let scheduled;
+  const monitor = startProcessTreeMonitor(
+    { pid: 100, pgid: 100, creationTime: 'root-start' },
+    {
+      child,
+      platform: 'linux',
+      read: () => rows,
+      schedule: callback => {
+        scheduled = callback;
+        return { unref() {} };
+      },
+      cancel: () => undefined,
+    },
+  );
+  rows = [
+    { pid: 101, ppid: 1, pgid: 100, rssBytes: 20, creationTime: 'backend-start' },
+    { pid: 102, ppid: 101, pgid: 100, rssBytes: 30, creationTime: 'worker-start' },
+    { pid: 900, ppid: 1, pgid: 100, rssBytes: 40, creationTime: 'unrelated-start' },
+  ];
+  scheduled();
+
+  const tracked = await monitor.stop();
+  assert.deepEqual(tracked.map(processRow => processRow.pid), [100, 101, 102]);
+});
+
+test('process tree monitor never seeds discovery from a reused tracked descendant PID', async () => {
+  const child = new EventEmitter();
+  child.pid = 100;
+  let rows = [
+    { pid: 100, ppid: 1, pgid: null, rssBytes: 10, creationTime: 'root-start' },
+    { pid: 101, ppid: 100, pgid: null, rssBytes: 20, creationTime: 'backend-start' },
+  ];
+  let scheduled;
+  const monitor = startProcessTreeMonitor(
+    { pid: 100, pgid: null, creationTime: 'root-start' },
+    {
+      child,
+      platform: 'win32',
+      read: () => rows,
+      schedule: callback => {
+        scheduled = callback;
+        return { unref() {} };
+      },
+      cancel: () => undefined,
+    },
+  );
+  rows = [
+    { pid: 101, ppid: 100, pgid: null, rssBytes: 20, creationTime: 'reused-backend' },
+    { pid: 102, ppid: 101, pgid: null, rssBytes: 30, creationTime: 'untrusted-worker' },
+  ];
+  scheduled();
+
+  const tracked = await monitor.stop();
+  assert.deepEqual(tracked.map(processRow => processRow.pid), [100, 101]);
+  assert.equal(tracked.find(processRow => processRow.pid === 101).creationTime, 'backend-start');
 });
 
 test('cleanup query failure falls back only to the still-owned child handle', async () => {
@@ -1102,6 +1238,89 @@ test('measured process stdout and stderr are captured in per-run log files', asy
   }
 });
 
+test('bounded log capture exposes a controlled stream-settle seam', async () => {
+  const module = await import('../measure-tauri-startup.mjs');
+  assert.equal(typeof module.attachBoundedLogCapture, 'function');
+  const source = fs.readFileSync(
+    path.join(import.meta.dirname, '..', 'measure-tauri-startup.mjs'),
+    'utf8',
+  );
+  const start = source.indexOf('export function attachBoundedLogCapture');
+  const end = source.indexOf('\nexport async function launchMeasuredProcess', start);
+  assert.match(source.slice(start, end), /settleTimeoutMs/);
+});
+
+test('bounded log capture destroys timed-out pipes safely and persists idempotently', async () => {
+  class ControlledReadable extends EventEmitter {
+    readableEnded = false;
+    destroyed = false;
+    closed = false;
+    destroyCalls = 0;
+    dataListenersAtDestroy;
+    errorListenersAtDestroy;
+
+    write(chunk) {
+      this.emit('data', Buffer.from(chunk));
+    }
+
+    end() {
+      this.readableEnded = true;
+      this.emit('end');
+      this.closed = true;
+      this.emit('close');
+    }
+
+    destroy() {
+      this.destroyCalls++;
+      this.dataListenersAtDestroy = this.listenerCount('data');
+      this.errorListenersAtDestroy = this.listenerCount('error');
+      this.destroyed = true;
+      this.emit('error', new Error('synchronous pipe error'));
+      queueMicrotask(() => {
+        this.emit('error', new Error('late pipe error'));
+        this.closed = true;
+        this.emit('close');
+      });
+    }
+  }
+
+  const root = temporaryDirectory('capture-timeout');
+  const stdoutLogPath = path.join(root, 'stdout.log');
+  const stderrLogPath = path.join(root, 'stderr.log');
+  const stdout = new ControlledReadable();
+  const stderr = new ControlledReadable();
+  const capture = attachBoundedLogCapture(
+    { stdout, stderr },
+    { stdoutLogPath, stderrLogPath },
+    [],
+    { settleTimeoutMs: 5 },
+  );
+  stdout.write('safe complete line\napi_token=unfinished-secret');
+  stderr.write('settled stderr\n');
+  stderr.end();
+
+  try {
+    const firstPersistence = capture.persist();
+    assert.strictEqual(capture.persist(), firstPersistence);
+    await firstPersistence;
+
+    assert.equal(stdout.destroyCalls, 1);
+    assert.equal(stdout.dataListenersAtDestroy, 0, 'business data listener must leave before destroy');
+    assert.ok(stdout.errorListenersAtDestroy >= 1, 'safety error listener must cover destroy');
+    assert.equal(stdout.listenerCount('data'), 0);
+    assert.equal(stdout.listenerCount('error'), 0);
+    assert.equal(stdout.closed, true);
+    const stdoutDiagnostic = fs.readFileSync(stdoutLogPath, 'utf8');
+    assert.match(stdoutDiagnostic, /truncated 27 bytes/);
+    assert.match(stdoutDiagnostic, /safe complete line\n$/);
+    assert.doesNotMatch(stdoutDiagnostic, /api_token|unfinished-secret/);
+    assert.equal(fs.readFileSync(stderrLogPath, 'utf8'), 'settled stderr\n');
+    assert.strictEqual(capture.persist(), firstPersistence);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('spawn rejection settles bounded captures and persists empty diagnostic logs', async () => {
   const root = temporaryDirectory('spawn-rejection-logs');
   const stdoutLogPath = path.join(root, 'stdout.log');
@@ -1168,6 +1387,47 @@ test('bounded log sink drains by bytes, keeps the tail, and marks truncation', (
   assert.match(output, /TAIL-END$/);
 });
 
+test('bounded log redaction drops a partial first line that crosses the truncation boundary', () => {
+  const maximumBytes = 1_048_576;
+  const secret = `BOUNDARY-SECRET-BEGIN-${'A'.repeat(80)}-CROSSING-SECRET-PAYLOAD-${'B'.repeat(80)}-END`;
+  const splitInsideSecret = 8;
+  const retainedSecretBytes = Buffer.byteLength(secret) - splitInsideSecret;
+  const safeTail = 'z'.repeat(maximumBytes - retainedSecretBytes - 1);
+  const sink = createBoundedLogSink();
+  sink.append(Buffer.from(`P${secret}\n${safeTail}`));
+
+  const output = sink.render([secret]);
+
+  assert.ok(Buffer.byteLength(output) <= maximumBytes);
+  assert.match(output, /truncated \d+ bytes/);
+  assertNoSensitiveWindows(output, secret);
+  assert.match(output, /z{100}$/);
+});
+
+test('bounded log redaction removes every multiline secret window after boundary truncation', () => {
+  const maximumBytes = 1_048_576;
+  const secret = `${'A'.repeat(40)}\n${'B'.repeat(40)}`;
+  const splitInsideSecret = 8;
+  const retainedSecretBytes = Buffer.byteLength(secret) - splitInsideSecret;
+  const safeTail = 'z'.repeat(maximumBytes - retainedSecretBytes - 1);
+  const sink = createBoundedLogSink();
+  sink.append(Buffer.from(`P${secret}\n${safeTail}`));
+
+  const output = sink.render([secret]);
+
+  assert.ok(Buffer.byteLength(output) <= maximumBytes);
+  assert.match(output, /truncated \d+ bytes/);
+  assertNoSensitiveWindows(output, secret);
+  assert.match(output, /z{100}$/);
+});
+
+test('bounded log redaction preserves an untruncated log without a newline', () => {
+  const sink = createBoundedLogSink(128);
+  sink.append(Buffer.from('ordinary one-line log tail'));
+
+  assert.equal(sink.render([]), 'ordinary one-line log tail');
+});
+
 test('diagnostic redaction covers secret values, assignments, authorization, and cookies', () => {
   const redacted = redactDiagnosticText([
     'raw known-secret',
@@ -1186,6 +1446,18 @@ test('diagnostic redaction covers secret values, assignments, authorization, and
   assert.match(redacted, /api_token=\[REDACTED\]/);
   assert.match(redacted, /Authorization: \[REDACTED\]/);
   assert.match(redacted, /Cookie: \[REDACTED\]/);
+});
+
+test('diagnostic redaction removes partial sensitive-value prefixes, middles, and suffixes', () => {
+  const secret = 'BEGIN-PRIVATE-MATERIAL-0123456789-END-PRIVATE-MATERIAL';
+  const redacted = redactDiagnosticText([
+    `prefix only: ${secret.slice(0, 28)}`,
+    `middle only: ${secret.slice(12, 40)}`,
+    `suffix only: ${secret.slice(-28)}`,
+  ].join('\n'), [secret]);
+
+  assertNoSensitiveWindows(redacted, secret);
+  assert.match(redacted, /\[REDACTED\]/);
 });
 
 test('failed campaign atomically preserves diagnostics, report, and unique copied logs', async () => {
@@ -1500,5 +1772,75 @@ test('next campaign removes only the diagnostics directory owned by a valid old 
     assert.equal(fs.existsSync(ownedDirectory), false);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('campaign cleanup rejects unsafe diagnostic directory metadata without deleting victims', async () => {
+  const campaignId = '123e4567-e89b-42d3-a456-426614174000';
+  const probes = [
+    ['dot', () => '.'],
+    ['dot-dot', () => '..'],
+    ['absolute', root => path.join(root, 'absolute-victim')],
+    ['forward-separator', () => `startup-metrics-diagnostics-${campaignId}/nested`],
+    ['backward-separator', () => `startup-metrics-diagnostics-${campaignId}\\nested`],
+    ['wrong-stem', () => `other-diagnostics-${campaignId}`],
+    ['invalid-uuid', () => 'startup-metrics-diagnostics-not-a-uuid'],
+  ];
+
+  for (const [label, directoryNameFor] of probes) {
+    const root = temporaryDirectory(`cleanup-metadata-${label}`);
+    const outputDirectory = path.join(root, 'artifacts');
+    const executable = path.join(root, 'R-IDE');
+    const output = path.join(outputDirectory, 'startup-metrics.json');
+    fs.mkdirSync(outputDirectory);
+    touch(executable);
+    const directoryName = directoryNameFor(root);
+    const candidate = path.isAbsolute(directoryName)
+      ? directoryName
+      : path.resolve(outputDirectory, directoryName);
+    fs.mkdirSync(candidate, { recursive: true });
+    const candidateVictim = path.join(candidate, `victim-${label}.txt`);
+    fs.writeFileSync(candidateVictim, `preserve ${label}`);
+    fs.writeFileSync(path.join(candidate, '.ride-startup-diagnostics-owner.json'), JSON.stringify({
+      schema: 'ride.startup-diagnostics-owner',
+      version: 1,
+      campaignId,
+      output: path.resolve(output),
+    }));
+    fs.writeFileSync(output, 'STALE-SUCCESS');
+    fs.writeFileSync(path.join(outputDirectory, 'startup-metrics.failure.json'), JSON.stringify({
+      status: 'failed',
+      campaignId,
+      output: path.resolve(output),
+      diagnostics: { directory: directoryName },
+    }));
+
+    try {
+      await runMeasurementCampaign({
+        executable,
+        output,
+        runs: 1,
+        idleMs: 0,
+        timeoutMs: 1,
+        pollMs: 1,
+      }, {
+        measure: async () => ({
+          startupReport: startupReport(finalMilestones),
+          metrics: { processCount: 1, rssBytes: 100 },
+        }),
+      });
+
+      assert.equal(fs.existsSync(output), true, `${label}: measurement output must survive`);
+      assert.equal(fs.existsSync(outputDirectory), true, `${label}: output parent must survive`);
+      assert.equal(fs.existsSync(executable), true, `${label}: executable must survive`);
+      assert.equal(fs.existsSync(candidate), true, `${label}: unowned candidate must survive`);
+      assert.equal(
+        fs.readFileSync(candidateVictim, 'utf8'),
+        `preserve ${label}`,
+        `${label}: candidate contents must survive`,
+      );
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   }
 });
