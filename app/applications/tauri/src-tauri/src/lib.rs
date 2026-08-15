@@ -48,11 +48,12 @@ fn configure_local_proxy_bypass() {
 // 全局状态：存储 Node.js 后端的端口号
 pub struct AppState {
     pub backend_port: Mutex<Option<u16>>,
-    pub backend_pid: Mutex<Option<u32>>,
-    pub backend_stopping: Mutex<bool>,
+    pub backend_ownership: Mutex<startup::BackendOwnershipState>,
+    pub backend_stop_fallback: Mutex<Option<(u32, tokio::sync::mpsc::UnboundedSender<()>)>>,
     pub downloads: download::DownloadManager,
     pub launch_intent_router: launch_intent::LaunchIntentRouter,
     pub startup_metrics: startup_metrics::StartupMetrics,
+    pub runtime_paths: startup::RuntimePathsCache,
 }
 
 impl AppState {
@@ -62,14 +63,15 @@ impl AppState {
     ) -> Self {
         Self {
             backend_port: Mutex::new(None),
-            backend_pid: Mutex::new(None),
-            backend_stopping: Mutex::new(false),
+            backend_ownership: Mutex::new(startup::BackendOwnershipState::default()),
+            backend_stop_fallback: Mutex::new(None),
             downloads: download::DownloadManager::new(),
             launch_intent_router: launch_intent::LaunchIntentRouter::new(
                 MAX_PENDING_LAUNCH_INTENTS,
                 initial_launch_intent,
             ),
             startup_metrics,
+            runtime_paths: startup::RuntimePathsCache::default(),
         }
     }
 }
@@ -222,10 +224,17 @@ pub fn run() {
             }
             native_chrome::install_menu_event_bridge(app.handle());
 
-            // 初始化 sidecar 进程
             let app_handle = app.handle().clone();
-            std::thread::spawn(move || {
-                if let Err(e) = sidecar::start_backend(&app_handle, initial_workspace) {
+            let backend_start = app
+                .state::<AppState>()
+                .backend_ownership
+                .lock()
+                .unwrap()
+                .reserve_start();
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) =
+                    sidecar::start_backend(&app_handle, initial_workspace, backend_start).await
+                {
                     eprintln!("Failed to start backend: {}", e);
                 }
             });

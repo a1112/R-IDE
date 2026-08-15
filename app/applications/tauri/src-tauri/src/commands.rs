@@ -22,8 +22,8 @@ pub fn get_backend_port(state: State<AppState>) -> Result<Option<u16>, String> {
 
 /// Return existing canonical plugin directories without accepting a frontend path.
 #[tauri::command]
-pub fn ride_plugin_directories() -> Result<Vec<String>, String> {
-    crate::sidecar::plugin_directories()
+pub fn ride_plugin_directories(app: AppHandle) -> Result<Vec<String>, String> {
+    crate::sidecar::plugin_directories(&app)
 }
 
 /// Start a native Rust-backed download task.
