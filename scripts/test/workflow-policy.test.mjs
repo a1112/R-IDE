@@ -68,6 +68,21 @@ test('package jobs download VS Code plugins before building the verified bundle'
   assert.ok(buildIndex > downloadIndex, 'plugins must be available before the Tauri build');
 });
 
+test('packaged Tauri builds preserve the complete plugin dependency graph', () => {
+  const workflow = readWorkflow();
+  const packageJob = jobBlocks(workflow).find(({ name }) => name === 'package');
+  assert.ok(packageJob, 'package job is required');
+  assert.match(packageJob.text, /run: yarn build:tauri/);
+
+  const buildHelper = fs.readFileSync(
+    path.join(repositoryRoot, 'app', 'scripts', 'build-tauri-backend.js'),
+    'utf8'
+  );
+  assert.match(buildHelper, /RIDE_TAURI_ENABLE_PLUGINS:\s*['"]1['"]/);
+  assert.match(buildHelper, /RIDE_TAURI_LEAN:\s*['"]0['"]/);
+  assert.doesNotMatch(buildHelper, /RIDE_TAURI_LEAN:\s*['"](?:1|true)['"]/);
+});
+
 test('package jobs measure startup after verification and upload the unsigned JSON report', () => {
   const workflow = readWorkflow();
   const packageJob = jobBlocks(workflow).find(({ name }) => name === 'package');

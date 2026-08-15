@@ -30,7 +30,9 @@ function createBuildPlan(platform = process.platform) {
       env: {
         ...inheritedEnvironment,
         RIDE_TAURI_ENABLE_PLUGINS: '1',
-        RIDE_TAURI_LEAN: '1',
+        // The line-based lean filter can remove transitive frontend modules
+        // required by retained plugin contributions. Keep the complete graph.
+        RIDE_TAURI_LEAN: '0',
       },
       shell: false,
     },

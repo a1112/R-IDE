@@ -12,7 +12,7 @@ test('uses native Windows executables and an explicit environment', () => {
   assert.equal(plan[0].command, 'yarn.cmd');
   assert.equal(plan[1].command, 'yarn.cmd');
   assert.equal(plan[1].env.RIDE_TAURI_ENABLE_PLUGINS, '1');
-  assert.equal(plan[1].env.RIDE_TAURI_LEAN, '1');
+  assert.equal(plan[1].env.RIDE_TAURI_LEAN, '0');
   assert.deepEqual(plan[1].args, ['theia', 'build', '--app-target=browser']);
   assert.equal(plan[1].shell, false);
 });
@@ -43,7 +43,7 @@ test('invokes Windows yarn.cmd through ComSpec without shell prefixes', () => {
   assert.deepEqual(calls[1].args, ['/d', '/s', '/c', 'yarn.cmd theia build --app-target=browser']);
   assert.equal(calls[1].options.shell, false);
   assert.equal(calls[1].options.env.RIDE_TAURI_ENABLE_PLUGINS, '1');
-  assert.equal(calls[1].options.env.RIDE_TAURI_LEAN, '1');
+  assert.equal(calls[1].options.env.RIDE_TAURI_LEAN, '0');
   assert.doesNotMatch(calls[1].args[3], /RIDE_TAURI_LEAN=1/);
 });
 
