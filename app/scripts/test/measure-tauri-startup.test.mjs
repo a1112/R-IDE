@@ -150,7 +150,7 @@ test('every synchronous external command has explicit timeout and buffer bounds'
   const source = fs.readFileSync(
     path.join(import.meta.dirname, '..', 'measure-tauri-startup.mjs'),
     'utf8',
-  );
+  ).replaceAll('\r\n', '\n');
   const boundedCall = (start, end, label) => {
     const startIndex = source.indexOf(start);
     const endIndex = source.indexOf(end, startIndex + start.length);

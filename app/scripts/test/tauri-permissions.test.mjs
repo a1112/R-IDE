@@ -79,7 +79,13 @@ test('remote Tauri frontend receives only audited per-command permissions', asyn
   );
   assert.equal(capability.permissions.some(permission => /(?:^|:)default$|allow-all/.test(permission)), false);
 
-  const localBootstrap = await readFile(path.join(appDirectory, 'applications', 'tauri', 'tauri-frontend', 'bootstrap.js'), 'utf8');
+  const frontendGenerator = await readFile(
+    path.join(appDirectory, 'applications', 'tauri', 'copy-frontend.js'),
+    'utf8'
+  );
+  const bootstrapMatch = /const tauriBootstrapScript = `([\s\S]*?)`;\r?\n\r?\nfs\.writeFileSync\(path\.join\(tauriFrontendDir, 'bootstrap\.js'\)/.exec(frontendGenerator);
+  assert.ok(bootstrapMatch, 'expected the generated local bootstrap source');
+  const localBootstrap = bootstrapMatch[1];
   assert.deepEqual(invokedCommands(localBootstrap), []);
   assert.equal(/\blisten\(\s*['"]/.test(localBootstrap), false);
 });

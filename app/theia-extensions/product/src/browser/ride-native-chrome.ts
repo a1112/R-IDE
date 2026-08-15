@@ -326,7 +326,7 @@ export class RideNativeChrome {
     protected readonly openRequestListener: RideOpenRequestListener;
 
     constructor(options: RideNativeChromeOptions = {}) {
-        this.isTauri = options.isTauri ?? typeof window === 'object' && isTauriRuntime();
+        this.isTauri = options.isTauri ?? (typeof window === 'object' && isTauriRuntime());
         this.platform = options.platform ?? this.resolvePlatform();
         this.openRequestListener = options.listen ?? ((event, handler) => listen<RideOpenRequest>(event, handler));
     }
