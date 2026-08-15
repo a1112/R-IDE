@@ -1329,6 +1329,404 @@ test('POSIX cleanup may safely retain group mode for an exact same-group reparen
   assert.deepEqual(rows, []);
 });
 
+test('POSIX owned group kills an unobserved same-group daemon after the root exits', async () => {
+  const rootIdentity = {
+    pid: 100,
+    pgid: 100,
+    creationTime: 'root-start',
+    startedAt: 1_000,
+  };
+  const ownedGroup = { pgid: 100, rootIdentity, startedAt: 1_000 };
+  let rows = [{
+    pid: 202,
+    ppid: 1,
+    pgid: 100,
+    creationTime: 'unobserved-daemon',
+    startedAt: 2_000,
+  }];
+  const signals = [];
+
+  await terminateMeasuredTree({
+    rootPid: 100,
+    rootIdentity,
+    ownedGroup,
+  }, 'linux', {
+    read: () => rows,
+    kill: (pid, signal) => {
+      signals.push([pid, signal]);
+      if (pid === -100 && signal === 'SIGKILL') {
+        rows = [];
+      }
+      return true;
+    },
+    delay: async () => undefined,
+    cleanupReadAttempts: 1,
+    cleanupVerifyAttempts: 1,
+  });
+
+  assert.deepEqual(signals, [[-100, 'SIGTERM'], [-100, 'SIGKILL']]);
+  assert.deepEqual(rows, []);
+});
+
+test('POSIX owned group refuses SIGKILL after its group leader identity is reused', async () => {
+  const rootIdentity = {
+    pid: 100,
+    pgid: 100,
+    creationTime: 'root-start',
+    startedAt: 1_000,
+  };
+  const ownedGroup = { pgid: 100, rootIdentity, startedAt: 1_000 };
+  let rows = [{ ...rootIdentity, ppid: 1 }];
+  const signals = [];
+
+  await assert.rejects(
+    terminateMeasuredTree({
+      rootPid: 100,
+      rootIdentity,
+      ownedGroup,
+    }, 'linux', {
+      read: () => rows,
+      kill: (pid, signal) => {
+        signals.push([pid, signal]);
+        if (pid === -100 && signal === 'SIGTERM') {
+          rows = [{
+            pid: 100,
+            ppid: 1,
+            pgid: 100,
+            creationTime: 'reused-group-leader',
+            startedAt: 5_000,
+          }];
+        }
+        return true;
+      },
+      delay: async () => undefined,
+      cleanupReadAttempts: 1,
+      cleanupVerifyAttempts: 1,
+    }),
+    /owned process group 100 was reused/,
+  );
+
+  assert.deepEqual(signals, [[-100, 'SIGTERM']]);
+});
+
+test('POSIX owned group refuses TERM when a fresh preflight finds a reused leader', async () => {
+  const rootIdentity = {
+    pid: 100,
+    pgid: 100,
+    creationTime: 'root-start',
+    startedAt: 1_000,
+  };
+  const reusedLeader = {
+    pid: 100,
+    ppid: 1,
+    pgid: 100,
+    creationTime: 'reused-group-leader',
+    startedAt: 5_000,
+  };
+  let reads = 0;
+  const signals = [];
+
+  await assert.rejects(
+    terminateMeasuredTree({
+      rootPid: 100,
+      rootIdentity,
+      ownedGroup: { pgid: 100, rootIdentity, startedAt: 1_000 },
+    }, 'linux', {
+      read: () => ++reads === 1 ? [{ ...rootIdentity, ppid: 1 }] : [reusedLeader],
+      kill: (pid, signal) => {
+        signals.push([pid, signal]);
+        return true;
+      },
+      delay: async () => undefined,
+      cleanupReadAttempts: 1,
+      cleanupVerifyAttempts: 1,
+    }),
+    /owned process group 100 was reused/,
+  );
+
+  assert.deepEqual(signals, []);
+});
+
+test('POSIX owned group latches reuse observed before a foreign leader exits', async () => {
+  const rootIdentity = {
+    pid: 100,
+    pgid: 100,
+    creationTime: 'root-start',
+    startedAt: 1_000,
+  };
+  const foreignMember = {
+    pid: 203,
+    ppid: 1,
+    pgid: 100,
+    creationTime: 'foreign-member',
+    startedAt: 5_100,
+  };
+  let reads = 0;
+  const signals = [];
+
+  await assert.rejects(
+    terminateMeasuredTree({
+      rootPid: 100,
+      rootIdentity,
+      ownedGroup: { pgid: 100, rootIdentity, startedAt: 1_000 },
+    }, 'linux', {
+      read: () => {
+        reads++;
+        return reads === 1
+          ? [{
+            pid: 100,
+            ppid: 1,
+            pgid: 100,
+            creationTime: 'foreign-leader',
+            startedAt: 5_000,
+          }, foreignMember]
+          : [foreignMember];
+      },
+      kill: (pid, signal) => {
+        signals.push([pid, signal]);
+        return true;
+      },
+      delay: async () => undefined,
+      cleanupReadAttempts: 1,
+      cleanupVerifyAttempts: 1,
+    }),
+    /owned process group 100 was reused/,
+  );
+
+  assert.deepEqual(signals, []);
+});
+
+test('POSIX owned group never signals a member older than the captured root', async () => {
+  const rootIdentity = {
+    pid: 100,
+    pgid: 100,
+    creationTime: 'root-start',
+    startedAt: 1_000,
+  };
+  const signals = [];
+
+  await assert.rejects(
+    terminateMeasuredTree({
+      rootPid: 100,
+      rootIdentity,
+      ownedGroup: { pgid: 100, rootIdentity, startedAt: 1_000 },
+    }, 'linux', {
+      read: () => [{
+        pid: 203,
+        ppid: 1,
+        pgid: 100,
+        creationTime: 'older-foreign-member',
+        startedAt: 500,
+      }],
+      kill: (pid, signal) => {
+        signals.push([pid, signal]);
+        return true;
+      },
+      delay: async () => undefined,
+      cleanupReadAttempts: 1,
+      cleanupVerifyAttempts: 1,
+    }),
+    /owned process group 100 has untrusted member chronology/,
+  );
+
+  assert.deepEqual(signals, []);
+});
+
+test('POSIX group-reuse latch still cleans an exact tracked setsid descendant', async () => {
+  const rootIdentity = {
+    pid: 100,
+    pgid: 100,
+    creationTime: 'root-start',
+    startedAt: 1_000,
+  };
+  const trackedDaemon = {
+    pid: 202,
+    ppid: 100,
+    pgid: 200,
+    creationTime: 'setsid-daemon',
+    startedAt: 2_000,
+    depth: 1,
+  };
+  const reusedLeader = {
+    pid: 100,
+    ppid: 1,
+    pgid: 100,
+    creationTime: 'reused-group-leader',
+    startedAt: 5_000,
+  };
+  let reads = 0;
+  let daemonAlive = true;
+  const signals = [];
+
+  await assert.rejects(
+    terminateMeasuredTree({
+      rootPid: 100,
+      rootIdentity,
+      ownedGroup: { pgid: 100, rootIdentity, startedAt: 1_000 },
+      trackedProcesses: [trackedDaemon],
+    }, 'linux', {
+      read: () => {
+        reads++;
+        const leader = reads === 1 ? { ...rootIdentity, ppid: 1 } : reusedLeader;
+        return daemonAlive ? [leader, trackedDaemon] : [leader];
+      },
+      kill: (pid, signal) => {
+        signals.push([pid, signal]);
+        if (pid === 202 && signal === 'SIGKILL') {
+          daemonAlive = false;
+        }
+        return true;
+      },
+      delay: async () => undefined,
+      cleanupReadAttempts: 1,
+      cleanupVerifyAttempts: 1,
+    }),
+    /owned process group 100 was reused/,
+  );
+
+  assert.deepEqual(signals, [[202, 'SIGTERM'], [202, 'SIGKILL']]);
+  assert.equal(daemonAlive, false);
+});
+
+test('POSIX owned group accepts TERM ESRCH when posterior verification proves it empty', async () => {
+  const rootIdentity = {
+    pid: 100,
+    pgid: 100,
+    creationTime: 'root-start',
+    startedAt: 1_000,
+  };
+  let rows = [{
+    pid: 202,
+    ppid: 1,
+    pgid: 100,
+    creationTime: 'exiting-daemon',
+    startedAt: 2_000,
+  }];
+
+  await terminateMeasuredTree({
+    rootPid: 100,
+    rootIdentity,
+    ownedGroup: { pgid: 100, rootIdentity, startedAt: 1_000 },
+  }, 'linux', {
+    read: () => rows,
+    kill: (pid, signal) => {
+      assert.deepEqual([pid, signal], [-100, 'SIGTERM']);
+      rows = [];
+      const error = new Error('no such process group');
+      error.code = 'ESRCH';
+      throw error;
+    },
+    delay: async () => undefined,
+    cleanupReadAttempts: 1,
+    cleanupVerifyAttempts: 1,
+  });
+});
+
+test('POSIX owned group reports an unobserved survivor after SIGKILL fails', async () => {
+  const rootIdentity = {
+    pid: 100,
+    pgid: 100,
+    creationTime: 'root-start',
+    startedAt: 1_000,
+  };
+  const rows = [{
+    pid: 202,
+    ppid: 1,
+    pgid: 100,
+    creationTime: 'stubborn-daemon',
+    startedAt: 2_000,
+  }];
+
+  await assert.rejects(
+    terminateMeasuredTree({
+      rootPid: 100,
+      rootIdentity,
+      ownedGroup: { pgid: 100, rootIdentity, startedAt: 1_000 },
+    }, 'linux', {
+      read: () => rows,
+      kill: (_pid, signal) => signal !== 'SIGKILL',
+      delay: async () => undefined,
+      cleanupReadAttempts: 1,
+      cleanupVerifyAttempts: 1,
+    }),
+    /owned process group 100 still has members \(202\).*SIGKILL -100 returned false/,
+  );
+});
+
+test('POSIX owned group cleanup accepts an already empty group without signaling', async () => {
+  const rootIdentity = {
+    pid: 100,
+    pgid: 100,
+    creationTime: 'root-start',
+    startedAt: 1_000,
+  };
+  const signals = [];
+
+  await terminateMeasuredTree({
+    rootPid: 100,
+    rootIdentity,
+    ownedGroup: { pgid: 100, rootIdentity, startedAt: 1_000 },
+  }, 'linux', {
+    read: () => [],
+    kill: (pid, signal) => {
+      signals.push([pid, signal]);
+      return true;
+    },
+    delay: async () => undefined,
+    cleanupReadAttempts: 1,
+    cleanupVerifyAttempts: 1,
+  });
+
+  assert.deepEqual(signals, []);
+});
+
+test('POSIX owned group keeps tracked setsid descendants on the explicit cleanup path', async () => {
+  const rootIdentity = {
+    pid: 100,
+    pgid: 100,
+    creationTime: 'root-start',
+    startedAt: 1_000,
+  };
+  const trackedDaemon = {
+    pid: 202,
+    ppid: 100,
+    pgid: 200,
+    creationTime: 'setsid-daemon',
+    startedAt: 2_000,
+    depth: 1,
+  };
+  let rows = [{ ...rootIdentity, ppid: 1 }, trackedDaemon];
+  const signals = [];
+
+  await terminateMeasuredTree({
+    rootPid: 100,
+    rootIdentity,
+    ownedGroup: { pgid: 100, rootIdentity, startedAt: 1_000 },
+    trackedProcesses: [trackedDaemon],
+  }, 'linux', {
+    read: () => rows,
+    kill: (pid, signal) => {
+      signals.push([pid, signal]);
+      if (signal === 'SIGKILL') {
+        rows = pid < 0
+          ? rows.filter(row => row.pgid !== -pid)
+          : rows.filter(row => row.pid !== pid);
+      }
+      return true;
+    },
+    delay: async () => undefined,
+    cleanupReadAttempts: 1,
+    cleanupVerifyAttempts: 1,
+  });
+
+  assert.deepEqual(signals, [
+    [-100, 'SIGTERM'],
+    [202, 'SIGTERM'],
+    [-100, 'SIGKILL'],
+    [202, 'SIGKILL'],
+  ]);
+});
+
 test('POSIX cleanup retains a newly revalidated mixed-pgid child after killing the root first', async () => {
   const rootIdentity = {
     pid: 100,
@@ -1766,6 +2164,51 @@ test('measurement timeout always terminates only the process tree it launched', 
     trackedProcesses: [monitoredBackend],
     containmentVerified: false,
   }]);
+});
+
+test('measurement preserves the captured detached POSIX group for cleanup after root exit', async () => {
+  const rootIdentity = {
+    pid: 7331,
+    pgid: 7331,
+    creationTime: 'root-start',
+    startedAt: 1_000,
+  };
+  const terminated = [];
+
+  await assert.rejects(
+    measureOnce(
+      {
+        executable: '/fixture/R-IDE',
+        codeFile: '/fixture/startup.R',
+        reportPath: '/fixture/report.json',
+        idleMs: 0,
+        timeoutMs: 1,
+        pollMs: 1,
+        cwd: '/fixture',
+      },
+      {
+        platform: 'linux',
+        launch: () => ({ pid: 7331 }),
+        capture: async () => rootIdentity,
+        startMonitor: () => ({ stop: async () => [] }),
+        waitForReport: async () => {
+          throw new Error('startup report timeout');
+        },
+        delay: async () => undefined,
+        sample: () => {
+          throw new Error('must not sample');
+        },
+        terminate: async cleanup => terminated.push(cleanup),
+      },
+    ),
+    /startup report timeout/,
+  );
+
+  assert.deepEqual(terminated[0].ownedGroup, {
+    pgid: 7331,
+    rootIdentity,
+    startedAt: 1_000,
+  });
 });
 
 test('a startup report for another PID never attests Windows Job containment', async () => {
@@ -2492,11 +2935,11 @@ test('measurement cleanup failure rejects the campaign and is persisted in failu
             processes: [{ ...rootIdentity, ppid: 1 }],
           }),
           terminate: async () => {
-            throw new Error('startup cleanup incomplete: exact identity 7331 survived');
+            throw new Error('startup cleanup incomplete: owned process group 7331 was reused');
           },
         }),
       }),
-      /cleanup incomplete.*7331/i,
+      /cleanup incomplete.*group 7331 was reused/i,
     );
 
     assert.equal(fs.existsSync(output), false);
@@ -2505,7 +2948,7 @@ test('measurement cleanup failure rejects the campaign and is persisted in failu
       'utf8',
     ));
     assert.equal(diagnostic.status, 'failed');
-    assert.match(diagnostic.error.message, /cleanup incomplete.*7331/i);
+    assert.match(diagnostic.error.message, /cleanup incomplete.*group 7331 was reused/i);
     assert.equal(diagnostic.runIndex, 1);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });

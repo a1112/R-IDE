@@ -904,6 +904,22 @@ export async function captureProcessIdentity(
   );
 }
 
+function captureOwnedProcessGroup(rootIdentity, platform) {
+  if (platform === 'win32') {
+    return undefined;
+  }
+  const verifiedIdentity = validateProcessIdentity(rootIdentity, 'spawned root identity');
+  const startedAt = comparableStartedAt(verifiedIdentity);
+  if (verifiedIdentity.pgid !== verifiedIdentity.pid || startedAt === null) {
+    return undefined;
+  }
+  return {
+    pgid: verifiedIdentity.pid,
+    rootIdentity: { ...verifiedIdentity },
+    startedAt,
+  };
+}
+
 function trackedProcessKey(processRow) {
   return `${processRow.pid}\0${processRow.pgid ?? ''}\0${processRow.creationTime}`;
 }
@@ -1231,6 +1247,7 @@ export async function terminateMeasuredTree(
     child,
     rootPid,
     rootIdentity,
+    ownedGroup,
     trackedProcesses = [],
     containmentVerified = false,
   },
@@ -1318,6 +1335,29 @@ export async function terminateMeasuredTree(
     await terminateControlledChild();
     return;
   }
+  let trustedOwnedGroup;
+  if (platform !== 'win32' && ownedGroup !== undefined) {
+    assertPlainObject(ownedGroup, 'owned process group');
+    const pgid = positiveInteger(ownedGroup.pgid, 'owned process group pgid');
+    const ownerIdentity = validateProcessIdentity(
+      ownedGroup.rootIdentity,
+      'owned process group root identity',
+    );
+    const startedAt = comparableStartedAt(ownerIdentity);
+    if (pgid === 0
+        || pgid !== verifiedRootPid
+        || ownerIdentity.pgid !== pgid
+        || !sameProcessIdentity(ownerIdentity, trustedRootIdentity)
+        || startedAt === null
+        || ownedGroup.startedAt !== startedAt) {
+      throw new Error('owned process group does not match the captured detached root identity');
+    }
+    trustedOwnedGroup = {
+      pgid,
+      rootIdentity: ownerIdentity,
+      startedAt,
+    };
+  }
 
   let rows;
   try {
@@ -1392,6 +1432,36 @@ export async function terminateMeasuredTree(
     `startup cleanup incomplete: ${reason}`
       + (actionFailures.length > 0 ? `; ${actionFailures.join('; ')}` : ''),
   );
+  let ownedGroupWasReused = false;
+  let ownedGroupHasUntrustedChronology = false;
+  const inspectOwnedGroup = currentRows => {
+    if (!trustedOwnedGroup) {
+      return undefined;
+    }
+    const leader = currentRows.find(processRow => processRow.pid === trustedOwnedGroup.pgid);
+    if (leader !== undefined
+        && !sameProcessIdentity(leader, trustedOwnedGroup.rootIdentity)) {
+      ownedGroupWasReused = true;
+    }
+    const allMembers = currentRows.filter(
+      processRow => processRow.pgid === trustedOwnedGroup.pgid,
+    );
+    const eligibleMembers = allMembers.filter(processRow => {
+      const startedAt = comparableStartedAt(processRow);
+      return startedAt !== null && startedAt >= trustedOwnedGroup.startedAt;
+    });
+    if (eligibleMembers.length !== allMembers.length) {
+      ownedGroupHasUntrustedChronology = true;
+    }
+    return { allMembers, eligibleMembers };
+  };
+  const ownedGroupMayBeSignaled = inspection => {
+    if (!inspection || ownedGroupWasReused || ownedGroupHasUntrustedChronology) {
+      return false;
+    }
+    return inspection.eligibleMembers.length > 0;
+  };
+  inspectOwnedGroup(rows);
   const readPlan = async allowTreeForRead => {
     const currentRows = await readWithRetry();
     rememberSafeDescendants(currentRows);
@@ -1438,6 +1508,16 @@ export async function terminateMeasuredTree(
         }
       }
     };
+    const explicitProcessesOutsideOwnedGroup = currentRows => {
+      rememberSafeDescendants(currentRows);
+      const currentByPid = new Map(currentRows.map(processRow => [processRow.pid, processRow]));
+      return planProcessCleanup(
+        currentRows,
+        trustedRootIdentity,
+        cleanupTrackedProcesses,
+        { allowTree: false },
+      ).processIds.filter(pid => currentByPid.get(pid)?.pgid !== trustedOwnedGroup.pgid);
+    };
     const signalPlan = async (plan, signal, allowGroup) => {
       if (plan.mode === 'tree') {
         let currentPlan;
@@ -1459,23 +1539,53 @@ export async function terminateMeasuredTree(
       }
       await terminateExplicit(plan.processIds, signal);
     };
-    await signalPlan(initialPlan, 'SIGTERM', allowTree);
-    await delay(250);
+    if (trustedOwnedGroup) {
+      let termRows;
+      try {
+        termRows = await readWithRetry();
+      } catch {
+        await terminateControlledChild();
+        throw incomplete('process table could not be revalidated before owned-group SIGTERM');
+      }
+      const termInspection = inspectOwnedGroup(termRows);
+      if (ownedGroupMayBeSignaled(termInspection)) {
+        recordSignal(-trustedOwnedGroup.pgid, 'SIGTERM');
+      }
+      await terminateExplicit(explicitProcessesOutsideOwnedGroup(termRows), 'SIGTERM');
+      await delay(250);
 
-    try {
-      rows = await readWithRetry();
-    } catch {
-      await terminateControlledChild();
-      throw incomplete('process table could not be revalidated after SIGTERM');
+      let killRows;
+      try {
+        killRows = await readWithRetry();
+      } catch {
+        await terminateControlledChild();
+        throw incomplete('process table could not be revalidated before owned-group SIGKILL');
+      }
+      const killInspection = inspectOwnedGroup(killRows);
+      if (ownedGroupMayBeSignaled(killInspection)) {
+        recordSignal(-trustedOwnedGroup.pgid, 'SIGKILL');
+      }
+      await terminateExplicit(explicitProcessesOutsideOwnedGroup(killRows), 'SIGKILL');
+    } else {
+      await signalPlan(initialPlan, 'SIGTERM', allowTree);
+      await delay(250);
+
+      try {
+        rows = await readWithRetry();
+      } catch {
+        await terminateControlledChild();
+        throw incomplete('process table could not be revalidated after SIGTERM');
+      }
+      rememberSafeDescendants(rows);
+      const finalPlan = planProcessCleanup(rows, trustedRootIdentity, cleanupTrackedProcesses, {
+        allowTree: allowTree && initialPlan.mode === 'tree',
+      });
+      await signalPlan(finalPlan, 'SIGKILL', allowTree && initialPlan.mode === 'tree');
     }
-    rememberSafeDescendants(rows);
-    const finalPlan = planProcessCleanup(rows, trustedRootIdentity, cleanupTrackedProcesses, {
-      allowTree: allowTree && initialPlan.mode === 'tree',
-    });
-    await signalPlan(finalPlan, 'SIGKILL', allowTree && initialPlan.mode === 'tree');
   }
 
   let survivors = [...exactIdentities.values()];
+  let ownedGroupSurvivors = [];
   for (let attempt = 1; attempt <= verifyAttempts; attempt++) {
     let verificationRows;
     try {
@@ -1487,12 +1597,28 @@ export async function terminateMeasuredTree(
     survivors = [...exactIdentities.values()].filter(identity => verificationRows.some(
       processRow => sameProcessIdentity(processRow, identity),
     ));
-    if (survivors.length === 0) {
+    ownedGroupSurvivors = inspectOwnedGroup(verificationRows)?.allMembers ?? [];
+    if (survivors.length === 0
+        && ownedGroupSurvivors.length === 0
+        && !ownedGroupWasReused
+        && !ownedGroupHasUntrustedChronology) {
       return;
     }
     if (attempt < verifyAttempts) {
       await delay(cleanupReadDelayMs);
     }
+  }
+  if (ownedGroupWasReused) {
+    throw incomplete(`owned process group ${trustedOwnedGroup.pgid} was reused`);
+  }
+  if (ownedGroupHasUntrustedChronology) {
+    throw incomplete(`owned process group ${trustedOwnedGroup.pgid} has untrusted member chronology`);
+  }
+  if (ownedGroupSurvivors.length > 0) {
+    throw incomplete(
+      `owned process group ${trustedOwnedGroup.pgid} still has members (`
+        + `${ownedGroupSurvivors.map(row => row.pid).join(', ')})`,
+    );
   }
   throw incomplete(`exact process identities still running (${survivors.map(row => row.pid).join(', ')})`);
 }
@@ -1509,6 +1635,7 @@ const defaultMeasurementDependencies = {
 
 export async function measureOnce(options, dependencies = defaultMeasurementDependencies) {
   const now = dependencies.now ?? Date.now;
+  const platform = dependencies.platform ?? process.platform;
   const deadline = now() + options.timeoutMs;
   const child = await dependencies.launch(options);
   const rootPid = positiveInteger(child?.pid, 'spawned root pid');
@@ -1516,6 +1643,7 @@ export async function measureOnce(options, dependencies = defaultMeasurementDepe
     throw new Error('spawned root pid must be positive');
   }
   let rootIdentity;
+  let ownedGroup;
   let metrics;
   let monitor;
   let monitoredProcesses = [];
@@ -1536,9 +1664,11 @@ export async function measureOnce(options, dependencies = defaultMeasurementDepe
   };
   try {
     rootIdentity = await dependencies.capture(rootPid, {
+      platform,
       timeoutMs: Math.min(2_000, Math.max(0, deadline - now())),
       pollMs: Math.min(25, options.pollMs),
     });
+    ownedGroup = captureOwnedProcessGroup(rootIdentity, platform);
     monitor = await dependencies.startMonitor(rootIdentity, { child });
     const startupReport = await dependencies.waitForReport(options.reportPath, {
       timeoutMs: Math.max(0, deadline - now()),
@@ -1579,6 +1709,7 @@ export async function measureOnce(options, dependencies = defaultMeasurementDepe
           child,
           rootPid,
           rootIdentity,
+          ...(ownedGroup ? { ownedGroup } : {}),
           trackedProcesses,
           containmentVerified,
         });
