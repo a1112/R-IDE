@@ -23,8 +23,7 @@ import { WorkspaceService } from '@theia/workspace/lib/browser';
 import { HostedPluginSupport } from '@theia/plugin-ext/lib/hosted/browser/hosted-plugin';
 import { TheiaIDEAboutDialog } from './theia-ide-about-dialog';
 import { TheiaIDEContribution } from './theia-ide-contribution';
-import { RideNativeChrome } from './ride-native-chrome';
-import { RideOpenRequestContribution } from './ride-open-request';
+import { bindRideOpenRequestContribution } from './ride-open-request-bindings';
 import { RideWorkbenchContribution } from './ride-workbench-contribution';
 
 export default new ContainerModule((bind, _unbind, isBound, rebind) => {
@@ -45,15 +44,13 @@ export default new ContainerModule((bind, _unbind, isBound, rebind) => {
     bind(FrontendApplicationContribution).toService(RideWorkbenchContribution);
     bind(CommandContribution).toService(RideWorkbenchContribution);
 
-    bind(RideNativeChrome).toDynamicValue(() => new RideNativeChrome()).inSingletonScope();
-    bind(RideOpenRequestContribution).toDynamicValue(context => new RideOpenRequestContribution(
-        context.container.get(WorkspaceService),
-        context.container.get(OpenerService),
-        context.container.get(MessageService),
-        context.container.get(ApplicationShell),
-        context.container.get(RideNativeChrome),
-        context.container.get(FrontendApplicationStateService),
-        context.container.get(HostedPluginSupport)
-    )).inSingletonScope();
-    bind(FrontendApplicationContribution).toService(RideOpenRequestContribution);
+    bindRideOpenRequestContribution(bind, {
+        applicationShell: ApplicationShell,
+        applicationState: FrontendApplicationStateService,
+        contribution: FrontendApplicationContribution,
+        hostedPlugins: HostedPluginSupport,
+        messageService: MessageService,
+        openerService: OpenerService,
+        workspaceService: WorkspaceService
+    });
 });

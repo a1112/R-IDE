@@ -1,0 +1,27 @@
+# Copyright (C) 2026 R-IDE contributors.
+# SPDX-License-Identifier: MIT
+
+[[permission]]
+identifier = "allow-ride-frontend-ready"
+description = "Allows the R-IDE frontend to finish native window initialization."
+commands.allow = ["ride_frontend_ready"]
+
+[[permission]]
+identifier = "allow-ride-record-startup-milestone"
+description = "Allows the R-IDE frontend to report an allowlisted startup milestone."
+commands.allow = ["ride_record_startup_milestone"]
+
+[[permission]]
+identifier = "allow-ride-show-main-menu"
+description = "Allows the R-IDE frontend to open the native application menu."
+commands.allow = ["ride_show_main_menu"]
+
+[[permission]]
+identifier = "allow-ride-start-window-drag"
+description = "Allows the R-IDE frontend title bar to begin dragging the main window."
+commands.allow = ["ride_start_window_drag"]
+
+[[permission]]
+identifier = "allow-ride-window-control"
+description = "Allows the R-IDE frontend title bar to control the main window."
+commands.allow = ["ride_window_control"]

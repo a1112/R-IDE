@@ -36,7 +36,7 @@ jobs:
           restore-keys: |
             quality-${{ runner.os }}-
       - name: Run synchronization and policy tests
-        run: node --test scripts/test/upstream-sync/*.test.mjs scripts/test/workflow-policy.test.mjs scripts/test/desktop-integration-policy.test.mjs scripts/test/appimage-integration.test.mjs
+        run: node --test scripts/test/upstream-sync/*.test.mjs scripts/test/workflow-policy.test.mjs scripts/test/desktop-integration-policy.test.mjs scripts/test/appimage-integration.test.mjs app/scripts/test/tauri-permissions.test.mjs
       - name: Install JavaScript dependencies
         working-directory: app
         run: |
@@ -45,6 +45,7 @@ jobs:
       - name: Lint and build browser compatibility targets
         working-directory: app
         run: |
+          npm --workspace theia-extensions/product test
           yarn lint
           yarn build:extensions
           yarn browser build

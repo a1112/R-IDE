@@ -177,6 +177,36 @@
       "description": "Permission identifier",
       "oneOf": [
         {
+          "description": "Allows the R-IDE frontend to finish native window initialization.",
+          "type": "string",
+          "const": "allow-ride-frontend-ready",
+          "markdownDescription": "Allows the R-IDE frontend to finish native window initialization."
+        },
+        {
+          "description": "Allows the R-IDE frontend to report an allowlisted startup milestone.",
+          "type": "string",
+          "const": "allow-ride-record-startup-milestone",
+          "markdownDescription": "Allows the R-IDE frontend to report an allowlisted startup milestone."
+        },
+        {
+          "description": "Allows the R-IDE frontend to open the native application menu.",
+          "type": "string",
+          "const": "allow-ride-show-main-menu",
+          "markdownDescription": "Allows the R-IDE frontend to open the native application menu."
+        },
+        {
+          "description": "Allows the R-IDE frontend title bar to begin dragging the main window.",
+          "type": "string",
+          "const": "allow-ride-start-window-drag",
+          "markdownDescription": "Allows the R-IDE frontend title bar to begin dragging the main window."
+        },
+        {
+          "description": "Allows the R-IDE frontend title bar to control the main window.",
+          "type": "string",
+          "const": "allow-ride-window-control",
+          "markdownDescription": "Allows the R-IDE frontend title bar to control the main window."
+        },
+        {
           "description": "Default core plugins set.\n#### This default permission set includes:\n\n- `core:path:default`\n- `core:event:default`\n- `core:window:default`\n- `core:webview:default`\n- `core:app:default`\n- `core:image:default`\n- `core:resources:default`\n- `core:menu:default`\n- `core:tray:default`",
           "type": "string",
           "const": "core:default",

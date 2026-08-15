@@ -84,13 +84,13 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
         protected readonly shell: ApplicationShell,
         protected readonly nativeChrome: RideNativeChrome,
         protected readonly applicationState: FrontendApplicationStateService,
-        hostedPlugins: HostedPluginSupport,
+        hostedPlugins: HostedPluginSupport | Promise<HostedPluginSupport>,
         storage?: Storage,
         protected readonly startupMilestoneReporter: StartupMilestoneReporter = reportRideStartupMilestone
     ) {
         this.storage = storage ?? window.sessionStorage;
-        this.pluginWillStart = observePluginPromise(hostedPlugins.willStart);
-        this.pluginDidStart = observePluginPromise(hostedPlugins.didStart);
+        this.pluginWillStart = observePluginPromise(Promise.resolve(hostedPlugins).then(support => support.willStart));
+        this.pluginDidStart = observePluginPromise(Promise.resolve(hostedPlugins).then(support => support.didStart));
     }
 
     onStart(): void {

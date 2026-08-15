@@ -3,11 +3,17 @@
   "identifier": "default",
   "description": "Capability for the main window",
   "windows": ["main"],
+  "local": false,
   "remote": {
     "urls": ["http://127.0.0.1:3000"]
   },
   "permissions": [
     "core:event:allow-listen",
-    "core:event:allow-unlisten"
+    "core:event:allow-unlisten",
+    "allow-ride-frontend-ready",
+    "allow-ride-record-startup-milestone",
+    "allow-ride-show-main-menu",
+    "allow-ride-start-window-drag",
+    "allow-ride-window-control"
   ]
 }

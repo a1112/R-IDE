@@ -9,6 +9,7 @@
     },
     "include": [
         "src/browser/ride-open-request.ts",
+        "src/browser/ride-open-request-bindings.ts",
         "src/browser/ride-native-chrome.ts",
         "test/**/*.ts"
     ]

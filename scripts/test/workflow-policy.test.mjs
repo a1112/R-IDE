@@ -120,6 +120,8 @@ test('quality and compatibility jobs run the required Node builds and Rust check
   assert.match(jobs.quality, /node --test scripts\/test\/upstream-sync\/\*\.test\.mjs scripts\/test\/workflow-policy\.test\.mjs/);
   assert.match(jobs.quality, /node --test[^\n]*scripts\/test\/desktop-integration-policy\.test\.mjs/);
   assert.match(jobs.quality, /node --test[^\n]*scripts\/test\/appimage-integration\.test\.mjs/);
+  assert.match(jobs.quality, /node --test[^\n]*app\/scripts\/test\/tauri-permissions\.test\.mjs/);
+  assert.match(jobs.quality, /npm --workspace theia-extensions\/product test/);
   assert.match(jobs.quality, /yarn lint/);
   assert.match(jobs.quality, /yarn build:extensions/);
   assert.match(jobs.quality, /yarn browser build/);
