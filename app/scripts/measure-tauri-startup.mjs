@@ -754,7 +754,26 @@ export function planProcessCleanup(
   const verifiedIdentity = validateProcessIdentity(rootIdentity, 'spawned root identity');
   const rootMatches = rows.some(row => sameProcessIdentity(row, verifiedIdentity));
   const currentByPid = new Map(rows.map(row => [row.pid, row]));
-  const trackedByPid = new Map(trackedProcesses.map(tracked => [tracked.pid, tracked]));
+  const rootStartedAt = comparableStartedAt(verifiedIdentity);
+  const trackedByPid = new Map();
+  for (const tracked of trackedProcesses) {
+    const current = currentByPid.get(tracked.pid);
+    const currentStartedAt = comparableStartedAt(current) ?? comparableStartedAt(tracked);
+    if (current
+        && sameProcessIdentity(current, tracked)
+        && rootStartedAt !== null
+        && currentStartedAt !== null
+        && currentStartedAt >= rootStartedAt) {
+      trackedByPid.set(tracked.pid, {
+        pid: current.pid,
+        ppid: current.ppid,
+        pgid: current.pgid,
+        creationTime: current.creationTime,
+        startedAt: currentStartedAt,
+        depth: tracked.depth ?? 1,
+      });
+    }
+  }
   if (rootMatches) {
     const chronological = chronologicalProcessTree(rows, verifiedIdentity);
     const chronologicalProcesses = chronological.selected.map(processRow => ({
@@ -768,13 +787,20 @@ export function planProcessCleanup(
     for (const processRow of chronologicalProcesses) {
       trackedByPid.set(processRow.pid, processRow);
     }
+    const selectedProcesses = [...trackedByPid.values()];
     const safeProcessIds = new Set(chronologicalProcesses.map(processRow => processRow.pid));
     const rawProcessIds = rawDescendantIds(rows, verifiedIdentity.pid);
-    const chronologyIsComplete = comparableStartedAt(verifiedIdentity) !== null
+    const chronologyIsComplete = rootStartedAt !== null
       && [...rawProcessIds].every(pid => safeProcessIds.has(pid));
-    const processGroupIsComplete = verifiedIdentity.pgid === null
-      || chronologicalProcesses.every(processRow => processRow.pgid === verifiedIdentity.pgid);
-    if (allowTree && chronologyIsComplete && processGroupIsComplete) {
+    const processGroupIsComplete = selectedProcesses.every(
+      processRow => processRow.pgid === verifiedIdentity.pgid,
+    );
+    const operatingSystemTreeIsComplete = verifiedIdentity.pgid !== null
+      || selectedProcesses.every(processRow => rawProcessIds.has(processRow.pid));
+    if (allowTree
+        && chronologyIsComplete
+        && processGroupIsComplete
+        && operatingSystemTreeIsComplete) {
       return {
         mode: 'tree',
         rootPid: verifiedIdentity.pid,
@@ -783,7 +809,6 @@ export function planProcessCleanup(
       };
     }
   }
-  const rootStartedAt = comparableStartedAt(verifiedIdentity);
   const processIds = [...trackedByPid.values()]
     .filter(tracked => rootMatches || tracked.pid !== verifiedIdentity.pid)
     .filter(tracked => sameProcessIdentity(currentByPid.get(tracked.pid) ?? {}, tracked))

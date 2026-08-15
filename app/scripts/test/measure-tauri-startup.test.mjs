@@ -611,6 +611,49 @@ test('cleanup plans a whole tree only while the captured root identity still mat
   });
 });
 
+test('cleanup plan merges an exact reparented daemon before deciding process-group safety', () => {
+  const rootIdentity = {
+    pid: 100,
+    pgid: 100,
+    creationTime: 'root-start',
+    startedAt: 1_000,
+  };
+  const trackedDaemon = {
+    pid: 102,
+    ppid: 101,
+    pgid: 200,
+    creationTime: 'daemon-start',
+    startedAt: 3_000,
+    depth: 2,
+  };
+  const current = [
+    { ...rootIdentity, ppid: 1 },
+    { ...trackedDaemon, ppid: 1 },
+  ];
+
+  assert.deepEqual(planProcessCleanup(current, rootIdentity, [trackedDaemon]), {
+    mode: 'pids',
+    rootPid: 100,
+    pgid: 100,
+    processIds: [102, 100],
+  });
+
+  const sameGroupDaemon = { ...trackedDaemon, pgid: 100 };
+  assert.deepEqual(
+    planProcessCleanup(
+      [{ ...rootIdentity, ppid: 1 }, { ...sameGroupDaemon, ppid: 1 }],
+      rootIdentity,
+      [sameGroupDaemon],
+    ),
+    {
+      mode: 'tree',
+      rootPid: 100,
+      pgid: 100,
+      processIds: [],
+    },
+  );
+});
+
 test('cleanup excludes a tracked descendant whose PID has been reused', () => {
   const rootIdentity = { pid: 100, pgid: 100, creationTime: 'root-start', startedAt: 1_000 };
   const tracked = [
@@ -1190,6 +1233,100 @@ test('POSIX cleanup rejects group mode when any selected process has another pgi
 
   assert.deepEqual(signals, [[100, 'SIGTERM'], [101, 'SIGTERM']]);
   assert.equal(signals.some(([pid]) => pid < 0), false);
+});
+
+test('POSIX cleanup explicitly terminates an exact mixed-pgid daemon reparented after its parent exits', async () => {
+  const rootIdentity = {
+    pid: 100,
+    pgid: 100,
+    creationTime: 'root-start',
+    startedAt: 1_000,
+  };
+  const trackedDaemon = {
+    pid: 102,
+    ppid: 101,
+    pgid: 200,
+    creationTime: 'daemon-start',
+    startedAt: 3_000,
+    depth: 2,
+  };
+  let rows = [
+    { ...rootIdentity, ppid: 1 },
+    { ...trackedDaemon, ppid: 1 },
+  ];
+  const signals = [];
+
+  await terminateMeasuredTree({
+    rootPid: 100,
+    rootIdentity,
+    trackedProcesses: [trackedDaemon],
+  }, 'linux', {
+    read: () => rows,
+    kill: (pid, signal) => {
+      signals.push([pid, signal]);
+      if (signal === 'SIGKILL') {
+        if (pid < 0) {
+          rows = rows.filter(row => row.pgid !== -pid);
+        } else {
+          rows = rows.filter(row => row.pid !== pid);
+        }
+      }
+      return true;
+    },
+    delay: async () => undefined,
+    cleanupReadAttempts: 1,
+  });
+
+  assert.deepEqual(signals, [
+    [100, 'SIGTERM'],
+    [102, 'SIGTERM'],
+    [100, 'SIGKILL'],
+    [102, 'SIGKILL'],
+  ]);
+  assert.equal(signals.some(([pid]) => pid < 0), false);
+  assert.deepEqual(rows, []);
+});
+
+test('POSIX cleanup may safely retain group mode for an exact same-group reparented daemon', async () => {
+  const rootIdentity = {
+    pid: 100,
+    pgid: 100,
+    creationTime: 'root-start',
+    startedAt: 1_000,
+  };
+  const trackedDaemon = {
+    pid: 102,
+    ppid: 101,
+    pgid: 100,
+    creationTime: 'daemon-start',
+    startedAt: 3_000,
+    depth: 2,
+  };
+  let rows = [
+    { ...rootIdentity, ppid: 1 },
+    { ...trackedDaemon, ppid: 1 },
+  ];
+  const signals = [];
+
+  await terminateMeasuredTree({
+    rootPid: 100,
+    rootIdentity,
+    trackedProcesses: [trackedDaemon],
+  }, 'linux', {
+    read: () => rows,
+    kill: (pid, signal) => {
+      signals.push([pid, signal]);
+      if (signal === 'SIGKILL') {
+        rows = rows.filter(row => row.pgid !== -pid);
+      }
+      return true;
+    },
+    delay: async () => undefined,
+    cleanupReadAttempts: 1,
+  });
+
+  assert.deepEqual(signals, [[-100, 'SIGTERM'], [-100, 'SIGKILL']]);
+  assert.deepEqual(rows, []);
 });
 
 test('POSIX cleanup retains a newly revalidated mixed-pgid child after killing the root first', async () => {
