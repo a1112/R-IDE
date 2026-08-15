@@ -331,12 +331,14 @@ impl StartupMetrics {
                 .map_err(|_| StartupMetricError::RecorderPoisoned)?;
             let elapsed_ms = state.clock.elapsed_ms();
             let outcome = state.report.record(milestone, elapsed_ms)?;
-            // The unbounded send cannot wait for disk I/O. Keeping it in this
-            // critical section preserves mutation order for concurrent callers.
-            recorder
-                .snapshots
-                .send(state.report.clone())
-                .map_err(|error| StartupMetricError::Write(error.to_string()))?;
+            if outcome == RecordOutcome::Recorded {
+                // The unbounded send cannot wait for disk I/O. Keeping it in this
+                // critical section preserves mutation order for concurrent callers.
+                recorder
+                    .snapshots
+                    .send(state.report.clone())
+                    .map_err(|error| StartupMetricError::Write(error.to_string()))?;
+            }
             outcome
         };
         Ok(outcome)

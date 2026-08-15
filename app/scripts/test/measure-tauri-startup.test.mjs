@@ -8,7 +8,7 @@
  ********************************************************************************/
 
 import assert from 'node:assert/strict';
-import { once } from 'node:events';
+import { EventEmitter, once } from 'node:events';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -17,7 +17,9 @@ import test from 'node:test';
 import {
   aggregateProcessTree,
   captureProcessIdentity,
+  createBoundedLogSink,
   discoverExecutable,
+  filterSpawnEnvironment,
   launchMeasuredProcess,
   measureOnce,
   median,
@@ -26,6 +28,8 @@ import {
   parseWindowsProcessTable,
   planProcessCleanup,
   runMeasurementCampaign,
+  redactDiagnosticText,
+  startProcessTreeMonitor,
   terminateMeasuredTree,
   waitForStartupReport,
 } from '../measure-tauri-startup.mjs';
@@ -124,6 +128,41 @@ test('discovers a runnable Linux release before package archives', () => {
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('every synchronous external command has explicit timeout and buffer bounds', () => {
+  const source = fs.readFileSync(
+    path.join(import.meta.dirname, '..', 'measure-tauri-startup.mjs'),
+    'utf8',
+  );
+  const boundedCall = (start, end, label) => {
+    const startIndex = source.indexOf(start);
+    const endIndex = source.indexOf(end, startIndex + start.length);
+    assert.ok(startIndex >= 0 && endIndex > startIndex, `expected ${label} source block`);
+    const block = source.slice(startIndex, endIndex);
+    assert.match(block, /timeout:\s*[A-Z0-9_]+|timeout:\s*\d+/, `${label} needs a timeout`);
+    assert.match(block, /maxBuffer:\s*[A-Z0-9_]+|maxBuffer:\s*\d+/, `${label} needs maxBuffer`);
+  };
+
+  boundedCall("spawnSync(\n      'powershell.exe'", 'return parseWindowsProcessTable', 'CIM query');
+  boundedCall("spawnSync('ps'", 'return parsePosixProcessTable', 'ps query');
+  boundedCall('run = (command, args) => spawnSync', 'kill = (pid, signal)', 'taskkill command');
+  boundedCall("execFileSync('git'", '}).trim()', 'git revision query');
+});
+
+test('owned diagnostics are lstat-checked before reading their ownership sentinel', () => {
+  const source = fs.readFileSync(
+    path.join(import.meta.dirname, '..', 'measure-tauri-startup.mjs'),
+    'utf8',
+  );
+  const start = source.indexOf('async function clearPreviousCampaignArtifacts');
+  const end = source.indexOf('\nasync function readOptionalStartupReport', start);
+  assert.ok(start >= 0 && end > start, 'expected previous campaign cleanup source block');
+  const cleanup = source.slice(start, end);
+  const lstat = cleanup.indexOf('fs.promises.lstat(candidate)');
+  const sentinelRead = cleanup.indexOf('path.join(candidate, DIAGNOSTICS_OWNER_FILE)');
+  assert.ok(lstat >= 0 && sentinelRead >= 0, 'expected directory and sentinel checks');
+  assert.ok(lstat < sentinelRead, 'lstat must reject symlinks before reading a sentinel');
 });
 
 test('startup report parser accepts the strict incremental schema', () => {
@@ -513,6 +552,134 @@ test('root identity capture retries a transient process-table query failure', as
   assert.equal(reads, 2);
 });
 
+test('process tree monitor accumulates identities and releases its timer and exit listener', async () => {
+  const child = new EventEmitter();
+  child.pid = 100;
+  const rootIdentity = { pid: 100, pgid: 100, creationTime: 'root-start' };
+  let rows = [
+    { pid: 100, ppid: 1, pgid: 100, rssBytes: 10, creationTime: 'root-start' },
+  ];
+  let scheduled;
+  let cancelled = false;
+  let reads = 0;
+  const monitor = startProcessTreeMonitor(rootIdentity, {
+    child,
+    platform: 'linux',
+    read: () => {
+      reads++;
+      return rows;
+    },
+    schedule: callback => {
+      scheduled = callback;
+      return { unref() {} };
+    },
+    cancel: () => {
+      cancelled = true;
+    },
+  });
+  rows = [
+    { pid: 101, ppid: 1, pgid: 100, rssBytes: 20, creationTime: 'backend-start' },
+  ];
+  scheduled();
+  child.emit('exit');
+
+  const tracked = await monitor.stop();
+  assert.deepEqual(tracked.map(processRow => processRow.pid), [100, 101]);
+  assert.equal(cancelled, true);
+  assert.equal(child.listenerCount('exit'), 0);
+  const readsAfterStop = reads;
+  scheduled();
+  assert.equal(reads, readsAfterStop, 'stopped monitor must not poll again');
+  assert.deepEqual(await monitor.stop(), tracked, 'stopping the monitor is idempotent');
+  assert.equal(reads, readsAfterStop, 'repeated stop must not query the process table');
+});
+
+test('cleanup query failure falls back only to the still-owned child handle', async () => {
+  const events = [];
+  const child = {
+    pid: 100,
+    killed: false,
+    exitCode: null,
+    signalCode: null,
+    kill(signal) {
+      events.push(`child:${signal}`);
+      this.killed = true;
+      return true;
+    },
+  };
+  await terminateMeasuredTree({
+    child,
+    rootPid: 100,
+    rootIdentity: { pid: 100, pgid: 100, creationTime: 'root-start' },
+    trackedProcesses: [
+      { pid: 101, ppid: 100, pgid: 100, creationTime: 'backend-start', depth: 1 },
+    ],
+  }, 'linux', {
+    read: () => {
+      throw new Error('ps unavailable');
+    },
+    run: () => events.push('taskkill'),
+    kill: () => events.push('bare-pid'),
+    delay: async () => undefined,
+  });
+
+  assert.deepEqual(events, ['child:SIGTERM', 'child:SIGKILL']);
+});
+
+test('process tree monitor refuses to expand after the root PID is reused', async () => {
+  const child = new EventEmitter();
+  child.pid = 100;
+  const rootIdentity = { pid: 100, pgid: 100, creationTime: 'root-start' };
+  let rows = [
+    { pid: 100, ppid: 1, pgid: 100, rssBytes: 10, creationTime: 'root-start' },
+  ];
+  let scheduled;
+  const monitor = startProcessTreeMonitor(rootIdentity, {
+    child,
+    platform: 'linux',
+    read: () => rows,
+    schedule: callback => {
+      scheduled = callback;
+      return { unref() {} };
+    },
+    cancel: () => undefined,
+  });
+  rows = [
+    { pid: 100, ppid: 1, pgid: 100, rssBytes: 10, creationTime: 'reused-root' },
+    { pid: 101, ppid: 100, pgid: 100, rssBytes: 20, creationTime: 'untrusted-backend' },
+  ];
+  scheduled();
+
+  const tracked = await monitor.stop();
+  assert.deepEqual(tracked.map(processRow => processRow.pid), [100]);
+});
+
+test('explicit cleanup revalidates identity immediately before every kill', async () => {
+  const rootIdentity = { pid: 100, pgid: null, creationTime: 'root-start' };
+  const tracked = [
+    { pid: 101, ppid: 100, pgid: null, creationTime: 'backend-start', depth: 1 },
+  ];
+  let reads = 0;
+  const commands = [];
+  await terminateMeasuredTree({
+    rootPid: 100,
+    rootIdentity,
+    trackedProcesses: tracked,
+  }, 'win32', {
+    read: () => {
+      reads++;
+      return reads === 1
+        ? [{ pid: 101, ppid: 1, pgid: null, creationTime: 'backend-start' }]
+        : [{ pid: 101, ppid: 1, pgid: null, creationTime: 'reused-backend' }];
+    },
+    run: (command, args) => commands.push([command, ...args]),
+    delay: async () => undefined,
+  });
+
+  assert.equal(reads, 2);
+  assert.deepEqual(commands, []);
+});
+
 test('tree termination rechecks identity and never targets a reused root or descendant PID', async () => {
   const rootIdentity = { pid: 100, pgid: null, creationTime: 'root-start' };
   const tracked = [
@@ -607,7 +774,6 @@ test('POSIX termination falls back bottom-up to identity-matched tracked descend
 
   assert.deepEqual(signals, [
     [102, 'SIGTERM'],
-    [101, 'SIGTERM'],
     [102, 'SIGKILL'],
   ]);
 });
@@ -641,8 +807,16 @@ test('POSIX termination never sends a group signal when root is not the detached
 test('measurement timeout always terminates only the process tree it launched', async () => {
   const terminated = [];
   const sampled = [];
+  const lifecycle = [];
   const rootIdentity = { pid: 7331, pgid: 7331, creationTime: 'root-start' };
   const child = { pid: 7331 };
+  const monitoredBackend = {
+    pid: 7442,
+    ppid: 7331,
+    pgid: 7331,
+    creationTime: 'backend-start',
+    depth: 1,
+  };
   await assert.rejects(
     measureOnce(
       {
@@ -660,6 +834,12 @@ test('measurement timeout always terminates only the process tree it launched', 
           assert.equal(pid, 7331);
           return rootIdentity;
         },
+        startMonitor: () => ({
+          stop: async () => {
+            lifecycle.push('monitor:stop');
+            return [monitoredBackend];
+          },
+        }),
         waitForReport: async () => {
           throw new Error('startup report timeout');
         },
@@ -669,6 +849,7 @@ test('measurement timeout always terminates only the process tree it launched', 
           return { rootPid: pid, processIds: [pid], processCount: 1, rssBytes: 1 };
         },
         terminate: async cleanup => {
+          lifecycle.push('terminate');
           terminated.push(cleanup);
         },
       },
@@ -676,11 +857,12 @@ test('measurement timeout always terminates only the process tree it launched', 
     /startup report timeout/,
   );
   assert.deepEqual(sampled, []);
+  assert.deepEqual(lifecycle, ['monitor:stop', 'terminate']);
   assert.deepEqual(terminated, [{
     child,
     rootPid: 7331,
     rootIdentity,
-    trackedProcesses: [],
+    trackedProcesses: [monitoredBackend],
   }]);
 });
 
@@ -819,10 +1001,24 @@ test('measurement samples after idle and then rereads the complete final report'
       cwd: '/fixture',
     },
     {
-      launch: () => ({ pid: 7331 }),
+      launch: () => ({
+        pid: 7331,
+        startupLogCapture: {
+          persist: async () => events.push('logs:persist'),
+        },
+      }),
       capture: async pid => {
         events.push(`capture:${pid}`);
         return rootIdentity;
+      },
+      startMonitor: () => {
+        events.push('monitor:start');
+        return {
+          stop: async () => {
+            events.push('monitor:stop');
+            return [];
+          },
+        };
       },
       waitForReport: async (_reportPath, options) => {
         phases.push(options.phase);
@@ -855,9 +1051,12 @@ test('measurement samples after idle and then rereads the complete final report'
   assert.deepEqual(phases, ['target', 'final']);
   assert.deepEqual(events, [
     'capture:7331',
+    'monitor:start',
     'idle:30000',
     'sample:7331:root-start',
+    'monitor:stop',
     'terminate:7331:1',
+    'logs:persist',
   ]);
   assert.equal(result.startupReport, final);
   assert.equal(result.startupReport.milestones.plugins_ready, 60);
@@ -882,12 +1081,111 @@ test('measured process stdout and stderr are captured in per-run log files', asy
       stderrLogPath,
       cwd: root,
     });
+    const stdoutErrorListenersBeforePersistence = child.stdout.listenerCount('error');
+    const stderrErrorListenersBeforePersistence = child.stderr.listenerCount('error');
     await once(child, 'exit');
+    await child.startupLogCapture.persist();
+    assert.ok(
+      stdoutErrorListenersBeforePersistence > 0,
+      'stdout errors must be handled before diagnostic persistence begins',
+    );
+    assert.ok(
+      stderrErrorListenersBeforePersistence > 0,
+      'stderr errors must be handled before diagnostic persistence begins',
+    );
     assert.equal(fs.readFileSync(stdoutLogPath, 'utf8'), 'fixture stdout\n');
     assert.equal(fs.readFileSync(stderrLogPath, 'utf8'), 'fixture stderr\n');
+    assert.equal(child.stdout.listenerCount('error'), 0);
+    assert.equal(child.stderr.listenerCount('error'), 0);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('spawn rejection settles bounded captures and persists empty diagnostic logs', async () => {
+  const root = temporaryDirectory('spawn-rejection-logs');
+  const stdoutLogPath = path.join(root, 'stdout.log');
+  const stderrLogPath = path.join(root, 'stderr.log');
+  try {
+    await assert.rejects(
+      launchMeasuredProcess({
+        executable: path.join(root, 'missing-executable'),
+        codeFile: path.join(root, 'missing-code-file'),
+        reportPath: path.join(root, 'report.json'),
+        stdoutLogPath,
+        stderrLogPath,
+        cwd: root,
+        sourceEnvironment: { PATH: process.env.PATH },
+      }),
+      /ENOENT|spawn/i,
+    );
+    assert.equal(fs.readFileSync(stdoutLogPath, 'utf8'), '');
+    assert.equal(fs.readFileSync(stderrLogPath, 'utf8'), '');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('spawn environment excludes sensitive keys while preserving required variables', () => {
+  const prepared = filterSpawnEnvironment({
+    PATH: '/fixture/bin',
+    SAFE_SETTING: 'enabled',
+    GITHUB_TOKEN: 'token-value',
+    DB_PASSWORD: 'password-value',
+    API_KEY: 'key-value',
+    SESSION_COOKIE: 'cookie-value',
+    AUTH_HEADER: 'auth-value',
+    XAUTHORITY: '/fixture/.Xauthority',
+    RIDE_STARTUP_REPORT: 'stale-report',
+  }, '/fixture/current-report.json');
+
+  assert.deepEqual(prepared.environment, {
+    PATH: '/fixture/bin',
+    SAFE_SETTING: 'enabled',
+    XAUTHORITY: '/fixture/.Xauthority',
+    RIDE_STARTUP_REPORT: '/fixture/current-report.json',
+  });
+  assert.deepEqual(new Set(prepared.sensitiveValues), new Set([
+    'token-value',
+    'password-value',
+    'key-value',
+    'cookie-value',
+    'auth-value',
+    '/fixture/.Xauthority',
+  ]));
+});
+
+test('bounded log sink drains by bytes, keeps the tail, and marks truncation', () => {
+  const sink = createBoundedLogSink(128);
+  for (let index = 0; index < 40; index++) {
+    sink.append(Buffer.from(`chunk-${index}-数据\n`));
+  }
+  sink.append(Buffer.from('TAIL-END'));
+  const output = sink.render([]);
+
+  assert.ok(Buffer.byteLength(output) <= 128);
+  assert.match(output, /truncated \d+ bytes/);
+  assert.match(output, /TAIL-END$/);
+});
+
+test('diagnostic redaction covers secret values, assignments, authorization, and cookies', () => {
+  const redacted = redactDiagnosticText([
+    'raw known-secret',
+    'api_token=assignment-secret',
+    'Authorization: Bearer authorization-secret',
+    'Cookie: session=cookie-secret',
+    '[backend] Proxy-Authorization: Bearer prefixed-authorization-secret',
+    '2026-08-15 Cookie: session=prefixed-cookie-secret',
+  ].join('\n'), ['known-secret']);
+
+  assert.doesNotMatch(
+    redacted,
+    /known-secret|assignment-secret|authorization-secret|cookie-secret|prefixed-authorization-secret|prefixed-cookie-secret/,
+  );
+  assert.match(redacted, /raw \[REDACTED\]/);
+  assert.match(redacted, /api_token=\[REDACTED\]/);
+  assert.match(redacted, /Authorization: \[REDACTED\]/);
+  assert.match(redacted, /Cookie: \[REDACTED\]/);
 });
 
 test('failed campaign atomically preserves diagnostics, report, and unique copied logs', async () => {
@@ -944,21 +1242,33 @@ test('failed campaign atomically preserves diagnostics, report, and unique copie
     assert.equal(diagnostic.platform, process.platform);
     assert.equal(diagnostic.arch, process.arch);
     assert.equal(diagnostic.executable, path.resolve(executable));
+    assert.equal(diagnostic.output, path.resolve(output));
+    assert.match(diagnostic.campaignId, /^[0-9a-f-]{36}$/i);
     assert.deepEqual(diagnostic.startupReport, startupReport(finalMilestones));
+    assert.equal(path.basename(diagnostic.diagnostics.directory), diagnostic.diagnostics.directory);
+    const ownedDiagnostics = path.join(root, diagnostic.diagnostics.directory);
+    const owner = JSON.parse(fs.readFileSync(
+      path.join(ownedDiagnostics, '.ride-startup-diagnostics-owner.json'),
+      'utf8',
+    ));
+    assert.deepEqual(owner, {
+      schema: 'ride.startup-diagnostics-owner',
+      version: 1,
+      campaignId: diagnostic.campaignId,
+      output: path.resolve(output),
+    });
     const stdoutCopy = path.resolve(root, diagnostic.logs.stdout);
     const stderrCopy = path.resolve(root, diagnostic.logs.stderr);
     assert.equal(path.dirname(stdoutCopy), path.dirname(stderrCopy));
-    assert.match(path.basename(path.dirname(stdoutCopy)), /^startup-metrics-diagnostics-/);
+    assert.equal(path.dirname(stdoutCopy), ownedDiagnostics);
     assert.equal(fs.readFileSync(stdoutCopy, 'utf8'), 'stdout run 2\n');
     assert.equal(fs.readFileSync(stderrCopy, 'utf8'), 'stderr run 2\n');
     assert.equal(fs.existsSync(output), false);
-    assert.equal(fs.existsSync(staleDiagnostics), false);
+    assert.equal(fs.existsSync(staleDiagnostics), true);
     assert.equal(fs.readFileSync(similarlyNamedFile, 'utf8'), 'keep file');
     assert.equal(fs.existsSync(unrelatedDirectory), true);
     assert.equal(fs.existsSync(nestedDirectory), true);
-    const currentDiagnostics = fs.readdirSync(root, { withFileTypes: true })
-      .filter(entry => entry.isDirectory() && entry.name.startsWith('startup-metrics-diagnostics-'));
-    assert.deepEqual(currentDiagnostics.map(entry => entry.name), [path.basename(path.dirname(stdoutCopy))]);
+    assert.equal(fs.existsSync(ownedDiagnostics), true);
     assert.deepEqual(
       fs.readdirSync(root).filter(name => name.endsWith('.tmp')),
       [],
@@ -1042,16 +1352,81 @@ test('diagnostic records a bounded parse error instead of copying invalid report
   }
 });
 
+test('failure artifacts bound and redact oversized logs and error messages', async () => {
+  const root = temporaryDirectory('bounded-secret-diagnostic');
+  const executable = path.join(root, 'R-IDE');
+  const output = path.join(root, 'startup-metrics.json');
+  const secret = 'fixture-super-secret-value';
+  touch(executable);
+  try {
+    await assert.rejects(
+      runMeasurementCampaign({
+        executable,
+        output,
+        runs: 1,
+        idleMs: 0,
+        timeoutMs: 1,
+        pollMs: 1,
+      }, {
+        environment: {
+          PATH: process.env.PATH,
+          RIDE_TEST_SECRET: secret,
+        },
+        measure: async options => {
+          fs.writeFileSync(
+            options.stdoutLogPath,
+            `${'x'.repeat(1_100_000)}\napi_token=${secret}\nTAIL-END`,
+          );
+          fs.writeFileSync(
+            options.stderrLogPath,
+            `Authorization: Bearer ${secret}\nCookie: session=${secret}\n`,
+          );
+          throw new Error(`startup failed with ${secret}`);
+        },
+      }),
+      /fixture-super-secret-value/,
+    );
+
+    const diagnosticText = fs.readFileSync(
+      path.join(root, 'startup-metrics.failure.json'),
+      'utf8',
+    );
+    const diagnostic = JSON.parse(diagnosticText);
+    const stdout = fs.readFileSync(path.resolve(root, diagnostic.logs.stdout));
+    const stderr = fs.readFileSync(path.resolve(root, diagnostic.logs.stderr));
+    assert.ok(stdout.byteLength <= 1_048_576);
+    assert.ok(stderr.byteLength <= 1_048_576);
+    assert.match(stdout.toString('utf8'), /truncated \d+ bytes/);
+    assert.match(stdout.toString('utf8'), /TAIL-END$/);
+    assert.doesNotMatch(`${diagnosticText}\n${stdout}\n${stderr}`, new RegExp(secret));
+    assert.doesNotMatch(diagnosticText, /environment|RIDE_TEST_SECRET/);
+    assert.match(stderr.toString('utf8'), /Authorization: \[REDACTED\]/);
+    assert.match(stderr.toString('utf8'), /Cookie: \[REDACTED\]/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('successful campaign writes only the measurement artifact', async () => {
   const root = temporaryDirectory('successful-campaign');
   const executable = path.join(root, 'R-IDE');
   const output = path.join(root, 'startup-metrics.json');
   touch(executable);
   fs.writeFileSync(output, 'STALE-SUCCESS');
-  fs.writeFileSync(path.join(root, 'startup-metrics.failure.json'), '{"status":"stale"}\n');
   const staleDiagnostics = path.join(root, 'startup-metrics-diagnostics-old');
   fs.mkdirSync(staleDiagnostics);
-  fs.writeFileSync(path.join(staleDiagnostics, 'old.log'), 'STALE-DIAGNOSTIC');
+  fs.writeFileSync(path.join(staleDiagnostics, '.ride-startup-diagnostics-owner.json'), JSON.stringify({
+    schema: 'ride.startup-diagnostics-owner',
+    version: 1,
+    campaignId: 'forged-campaign',
+    output: path.resolve(output),
+  }));
+  fs.writeFileSync(path.join(root, 'startup-metrics.failure.json'), JSON.stringify({
+    status: 'failed',
+    campaignId: 'claimed-campaign',
+    output: path.resolve(output),
+    diagnostics: { directory: path.basename(staleDiagnostics) },
+  }));
   const similarlyNamedFile = path.join(root, 'startup-metrics-diagnostics-keep.txt');
   fs.writeFileSync(similarlyNamedFile, 'keep file');
   try {
@@ -1072,8 +1447,57 @@ test('successful campaign writes only the measurement artifact', async () => {
     assert.equal(measurement.runs.length, 1);
     assert.deepEqual(JSON.parse(fs.readFileSync(output, 'utf8')), measurement);
     assert.equal(fs.existsSync(path.join(root, 'startup-metrics.failure.json')), false);
-    assert.equal(fs.existsSync(staleDiagnostics), false);
+    assert.equal(fs.existsSync(staleDiagnostics), true);
     assert.equal(fs.readFileSync(similarlyNamedFile, 'utf8'), 'keep file');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('next campaign removes only the diagnostics directory owned by a valid old failure', async () => {
+  const root = temporaryDirectory('owned-diagnostic-cleanup');
+  const executable = path.join(root, 'R-IDE');
+  const output = path.join(root, 'startup-metrics.json');
+  touch(executable);
+  try {
+    await assert.rejects(
+      runMeasurementCampaign({
+        executable,
+        output,
+        runs: 1,
+        idleMs: 0,
+        timeoutMs: 1,
+        pollMs: 1,
+      }, {
+        measure: async options => {
+          fs.writeFileSync(options.stderrLogPath, 'owned failure\n');
+          throw new Error('owned fixture failure');
+        },
+      }),
+      /owned fixture failure/,
+    );
+    const oldFailure = JSON.parse(fs.readFileSync(
+      path.join(root, 'startup-metrics.failure.json'),
+      'utf8',
+    ));
+    const ownedDirectory = path.join(root, oldFailure.diagnostics.directory);
+    assert.equal(fs.existsSync(ownedDirectory), true);
+
+    await runMeasurementCampaign({
+      executable,
+      output,
+      runs: 1,
+      idleMs: 0,
+      timeoutMs: 1,
+      pollMs: 1,
+    }, {
+      measure: async () => ({
+        startupReport: startupReport(finalMilestones),
+        metrics: { processCount: 1, rssBytes: 100 },
+      }),
+    });
+
+    assert.equal(fs.existsSync(ownedDirectory), false);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

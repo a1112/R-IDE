@@ -118,6 +118,19 @@ struct FailFinalOnceWriter {
     persisted: mpsc::Sender<Value>,
 }
 
+struct CountingWriter {
+    writes: mpsc::Sender<Value>,
+}
+
+impl StartupReportWriter for CountingWriter {
+    fn write(&mut self, report: &StartupReport) -> io::Result<()> {
+        self.writes
+            .send(serde_json::to_value(report).expect("serialize counted report"))
+            .expect("publish counted write");
+        Ok(())
+    }
+}
+
 impl StartupReportWriter for FailFinalOnceWriter {
     fn write(&mut self, report: &StartupReport) -> io::Result<()> {
         let value = serde_json::to_value(report).expect("serialize attempted final report");
@@ -370,6 +383,38 @@ fn writer_retries_a_failed_snapshot_without_an_external_duplicate() {
         .expect("worker retries latest snapshot");
     assert_eq!(retry_attempt, 2);
     assert_eq!(retry["milestones"]["process_started"], 0);
+}
+
+#[test]
+fn duplicate_records_do_not_enqueue_additional_writer_calls() {
+    let (writes_tx, writes_rx) = mpsc::channel();
+    let metrics = StartupMetrics::with_clock_and_writer(
+        "test-platform",
+        "test-arch",
+        77,
+        Arc::new(SequenceClock::new(vec![0, 1, 2, 3, 4])),
+        Box::new(CountingWriter { writes: writes_tx }),
+    );
+
+    assert_eq!(
+        metrics.record(StartupMilestone::ProcessStarted),
+        Ok(RecordOutcome::Recorded)
+    );
+    writes_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("initial snapshot is written");
+
+    for _ in 0..4 {
+        assert_eq!(
+            metrics.record(StartupMilestone::ProcessStarted),
+            Ok(RecordOutcome::Duplicate)
+        );
+    }
+    assert_eq!(
+        writes_rx.recv_timeout(Duration::from_millis(100)),
+        Err(mpsc::RecvTimeoutError::Timeout),
+        "duplicates must not grow the writer queue"
+    );
 }
 
 #[test]
