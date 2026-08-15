@@ -1,0 +1,815 @@
+{
+  "schema": "ride.startup-measurement",
+  "version": 1,
+  "platform": "win32",
+  "arch": "x64",
+  "executable": "L:\\project\\ride-open-with-startup-target\\release\\ride-tauri.exe",
+  "commit": "d034943b7a6094808b2ffe56eea2b41c3666b613",
+  "runs": [
+    {
+      "startupReport": {
+        "schema": "ride.startup-report",
+        "version": 1,
+        "platform": "windows",
+        "arch": "x86_64",
+        "pid": 36592,
+        "milestones": {
+          "process_started": 0,
+          "native_window_visible": 497,
+          "backend_spawned": 526,
+          "backend_listening": 1341,
+          "frontend_shell_attached": 2138,
+          "target_file_opened": 5252,
+          "plugins_started": 5264,
+          "plugins_ready": 5281
+        }
+      },
+      "metrics": {
+        "rootPid": 36592,
+        "rootIdentity": {
+          "pid": 36592,
+          "pgid": null,
+          "creationTime": "/Date(1786789005821)/",
+          "startedAt": 1786789005821
+        },
+        "processIds": [
+          4636,
+          5404,
+          12088,
+          20688,
+          33832,
+          34148,
+          36592,
+          38660,
+          40592,
+          42984,
+          45996,
+          52584,
+          54428,
+          55480
+        ],
+        "processCount": 14,
+        "rssBytes": 1151741952,
+        "processes": [
+          {
+            "pid": 4636,
+            "ppid": 36592,
+            "pgid": null,
+            "creationTime": "/Date(1786789005829)/",
+            "startedAt": 1786789005829,
+            "depth": 1
+          },
+          {
+            "pid": 5404,
+            "ppid": 36592,
+            "pgid": null,
+            "creationTime": "/Date(1786789005936)/",
+            "startedAt": 1786789005936,
+            "depth": 1
+          },
+          {
+            "pid": 12088,
+            "ppid": 5404,
+            "pgid": null,
+            "creationTime": "/Date(1786789007198)/",
+            "startedAt": 1786789007198,
+            "depth": 2
+          },
+          {
+            "pid": 20688,
+            "ppid": 38660,
+            "pgid": null,
+            "creationTime": "/Date(1786789010280)/",
+            "startedAt": 1786789010280,
+            "depth": 3
+          },
+          {
+            "pid": 33832,
+            "ppid": 5404,
+            "pgid": null,
+            "creationTime": "/Date(1786789005957)/",
+            "startedAt": 1786789005957,
+            "depth": 2
+          },
+          {
+            "pid": 34148,
+            "ppid": 36592,
+            "pgid": null,
+            "creationTime": "/Date(1786789006355)/",
+            "startedAt": 1786789006355,
+            "depth": 1
+          },
+          {
+            "pid": 36592,
+            "ppid": 37504,
+            "pgid": null,
+            "creationTime": "/Date(1786789005821)/",
+            "startedAt": 1786789005821,
+            "depth": 0
+          },
+          {
+            "pid": 38660,
+            "ppid": 42984,
+            "pgid": null,
+            "creationTime": "/Date(1786789007979)/",
+            "startedAt": 1786789007979,
+            "depth": 2
+          },
+          {
+            "pid": 40592,
+            "ppid": 42984,
+            "pgid": null,
+            "creationTime": "/Date(1786789009217)/",
+            "startedAt": 1786789009217,
+            "depth": 2
+          },
+          {
+            "pid": 42984,
+            "ppid": 36592,
+            "pgid": null,
+            "creationTime": "/Date(1786789006369)/",
+            "startedAt": 1786789006369,
+            "depth": 1
+          },
+          {
+            "pid": 45996,
+            "ppid": 5404,
+            "pgid": null,
+            "creationTime": "/Date(1786789006132)/",
+            "startedAt": 1786789006132,
+            "depth": 2
+          },
+          {
+            "pid": 52584,
+            "ppid": 5404,
+            "pgid": null,
+            "creationTime": "/Date(1786789006130)/",
+            "startedAt": 1786789006130,
+            "depth": 2
+          },
+          {
+            "pid": 54428,
+            "ppid": 5404,
+            "pgid": null,
+            "creationTime": "/Date(1786789006157)/",
+            "startedAt": 1786789006157,
+            "depth": 2
+          },
+          {
+            "pid": 55480,
+            "ppid": 42984,
+            "pgid": null,
+            "creationTime": "/Date(1786789009299)/",
+            "startedAt": 1786789009299,
+            "depth": 2
+          }
+        ]
+      }
+    },
+    {
+      "startupReport": {
+        "schema": "ride.startup-report",
+        "version": 1,
+        "platform": "windows",
+        "arch": "x86_64",
+        "pid": 10632,
+        "milestones": {
+          "process_started": 0,
+          "native_window_visible": 484,
+          "backend_spawned": 513,
+          "backend_listening": 1429,
+          "frontend_shell_attached": 2316,
+          "target_file_opened": 5173,
+          "plugins_started": 5186,
+          "plugins_ready": 5207
+        }
+      },
+      "metrics": {
+        "rootPid": 10632,
+        "rootIdentity": {
+          "pid": 10632,
+          "pgid": null,
+          "creationTime": "/Date(1786789048092)/",
+          "startedAt": 1786789048092
+        },
+        "processIds": [
+          4924,
+          8112,
+          10632,
+          32200,
+          35312,
+          37984,
+          38972,
+          43860,
+          44640,
+          45144,
+          45832,
+          48676,
+          55380,
+          56016
+        ],
+        "processCount": 14,
+        "rssBytes": 1147756544,
+        "processes": [
+          {
+            "pid": 4924,
+            "ppid": 43860,
+            "pgid": null,
+            "creationTime": "/Date(1786789052617)/",
+            "startedAt": 1786789052617,
+            "depth": 3
+          },
+          {
+            "pid": 8112,
+            "ppid": 10632,
+            "pgid": null,
+            "creationTime": "/Date(1786789048631)/",
+            "startedAt": 1786789048631,
+            "depth": 1
+          },
+          {
+            "pid": 10632,
+            "ppid": 37504,
+            "pgid": null,
+            "creationTime": "/Date(1786789048092)/",
+            "startedAt": 1786789048092,
+            "depth": 0
+          },
+          {
+            "pid": 32200,
+            "ppid": 10632,
+            "pgid": null,
+            "creationTime": "/Date(1786789048209)/",
+            "startedAt": 1786789048209,
+            "depth": 1
+          },
+          {
+            "pid": 35312,
+            "ppid": 32200,
+            "pgid": null,
+            "creationTime": "/Date(1786789048229)/",
+            "startedAt": 1786789048229,
+            "depth": 2
+          },
+          {
+            "pid": 37984,
+            "ppid": 32200,
+            "pgid": null,
+            "creationTime": "/Date(1786789048398)/",
+            "startedAt": 1786789048398,
+            "depth": 2
+          },
+          {
+            "pid": 38972,
+            "ppid": 10632,
+            "pgid": null,
+            "creationTime": "/Date(1786789048102)/",
+            "startedAt": 1786789048102,
+            "depth": 1
+          },
+          {
+            "pid": 43860,
+            "ppid": 8112,
+            "pgid": null,
+            "creationTime": "/Date(1786789050366)/",
+            "startedAt": 1786789050366,
+            "depth": 2
+          },
+          {
+            "pid": 44640,
+            "ppid": 10632,
+            "pgid": null,
+            "creationTime": "/Date(1786789048619)/",
+            "startedAt": 1786789048619,
+            "depth": 1
+          },
+          {
+            "pid": 45144,
+            "ppid": 32200,
+            "pgid": null,
+            "creationTime": "/Date(1786789048399)/",
+            "startedAt": 1786789048399,
+            "depth": 2
+          },
+          {
+            "pid": 45832,
+            "ppid": 8112,
+            "pgid": null,
+            "creationTime": "/Date(1786789051498)/",
+            "startedAt": 1786789051498,
+            "depth": 2
+          },
+          {
+            "pid": 48676,
+            "ppid": 32200,
+            "pgid": null,
+            "creationTime": "/Date(1786789049559)/",
+            "startedAt": 1786789049559,
+            "depth": 2
+          },
+          {
+            "pid": 55380,
+            "ppid": 32200,
+            "pgid": null,
+            "creationTime": "/Date(1786789048424)/",
+            "startedAt": 1786789048424,
+            "depth": 2
+          },
+          {
+            "pid": 56016,
+            "ppid": 8112,
+            "pgid": null,
+            "creationTime": "/Date(1786789051594)/",
+            "startedAt": 1786789051594,
+            "depth": 2
+          }
+        ]
+      }
+    },
+    {
+      "startupReport": {
+        "schema": "ride.startup-report",
+        "version": 1,
+        "platform": "windows",
+        "arch": "x86_64",
+        "pid": 51564,
+        "milestones": {
+          "process_started": 0,
+          "native_window_visible": 652,
+          "backend_spawned": 679,
+          "backend_listening": 1571,
+          "frontend_shell_attached": 2552,
+          "target_file_opened": 5589,
+          "plugins_started": 5601,
+          "plugins_ready": 5621
+        }
+      },
+      "metrics": {
+        "rootPid": 51564,
+        "rootIdentity": {
+          "pid": 51564,
+          "pgid": null,
+          "creationTime": "/Date(1786789090421)/",
+          "startedAt": 1786789090421
+        },
+        "processIds": [
+          2916,
+          7308,
+          16184,
+          18256,
+          25696,
+          29560,
+          36036,
+          38324,
+          46576,
+          49964,
+          51564,
+          53360,
+          53688,
+          55312
+        ],
+        "processCount": 14,
+        "rssBytes": 1154154496,
+        "processes": [
+          {
+            "pid": 2916,
+            "ppid": 38324,
+            "pgid": null,
+            "creationTime": "/Date(1786789090814)/",
+            "startedAt": 1786789090814,
+            "depth": 2
+          },
+          {
+            "pid": 7308,
+            "ppid": 46576,
+            "pgid": null,
+            "creationTime": "/Date(1786789092932)/",
+            "startedAt": 1786789092932,
+            "depth": 2
+          },
+          {
+            "pid": 16184,
+            "ppid": 46576,
+            "pgid": null,
+            "creationTime": "/Date(1786789094147)/",
+            "startedAt": 1786789094147,
+            "depth": 2
+          },
+          {
+            "pid": 18256,
+            "ppid": 38324,
+            "pgid": null,
+            "creationTime": "/Date(1786789090573)/",
+            "startedAt": 1786789090573,
+            "depth": 2
+          },
+          {
+            "pid": 25696,
+            "ppid": 38324,
+            "pgid": null,
+            "creationTime": "/Date(1786789092029)/",
+            "startedAt": 1786789092029,
+            "depth": 2
+          },
+          {
+            "pid": 29560,
+            "ppid": 51564,
+            "pgid": null,
+            "creationTime": "/Date(1786789091115)/",
+            "startedAt": 1786789091115,
+            "depth": 1
+          },
+          {
+            "pid": 36036,
+            "ppid": 7308,
+            "pgid": null,
+            "creationTime": "/Date(1786789095389)/",
+            "startedAt": 1786789095389,
+            "depth": 3
+          },
+          {
+            "pid": 38324,
+            "ppid": 51564,
+            "pgid": null,
+            "creationTime": "/Date(1786789090551)/",
+            "startedAt": 1786789090551,
+            "depth": 1
+          },
+          {
+            "pid": 46576,
+            "ppid": 51564,
+            "pgid": null,
+            "creationTime": "/Date(1786789091125)/",
+            "startedAt": 1786789091125,
+            "depth": 1
+          },
+          {
+            "pid": 49964,
+            "ppid": 51564,
+            "pgid": null,
+            "creationTime": "/Date(1786789090431)/",
+            "startedAt": 1786789090431,
+            "depth": 1
+          },
+          {
+            "pid": 51564,
+            "ppid": 37504,
+            "pgid": null,
+            "creationTime": "/Date(1786789090421)/",
+            "startedAt": 1786789090421,
+            "depth": 0
+          },
+          {
+            "pid": 53360,
+            "ppid": 46576,
+            "pgid": null,
+            "creationTime": "/Date(1786789094060)/",
+            "startedAt": 1786789094060,
+            "depth": 2
+          },
+          {
+            "pid": 53688,
+            "ppid": 38324,
+            "pgid": null,
+            "creationTime": "/Date(1786789090813)/",
+            "startedAt": 1786789090813,
+            "depth": 2
+          },
+          {
+            "pid": 55312,
+            "ppid": 38324,
+            "pgid": null,
+            "creationTime": "/Date(1786789090843)/",
+            "startedAt": 1786789090843,
+            "depth": 2
+          }
+        ]
+      }
+    },
+    {
+      "startupReport": {
+        "schema": "ride.startup-report",
+        "version": 1,
+        "platform": "windows",
+        "arch": "x86_64",
+        "pid": 47344,
+        "milestones": {
+          "process_started": 0,
+          "native_window_visible": 502,
+          "backend_spawned": 531,
+          "backend_listening": 1364,
+          "frontend_shell_attached": 2213,
+          "target_file_opened": 5352,
+          "plugins_started": 5360,
+          "plugins_ready": 5382
+        }
+      },
+      "metrics": {
+        "rootPid": 47344,
+        "rootIdentity": {
+          "pid": 47344,
+          "pgid": null,
+          "creationTime": "/Date(1786789133223)/",
+          "startedAt": 1786789133223
+        },
+        "processIds": [
+          8728,
+          14644,
+          15836,
+          32664,
+          32844,
+          34372,
+          37936,
+          41540,
+          43340,
+          44792,
+          47344,
+          51392,
+          54932,
+          56316
+        ],
+        "processCount": 14,
+        "rssBytes": 1159561216,
+        "processes": [
+          {
+            "pid": 8728,
+            "ppid": 41540,
+            "pgid": null,
+            "creationTime": "/Date(1786789133561)/",
+            "startedAt": 1786789133561,
+            "depth": 2
+          },
+          {
+            "pid": 14644,
+            "ppid": 47344,
+            "pgid": null,
+            "creationTime": "/Date(1786789133231)/",
+            "startedAt": 1786789133231,
+            "depth": 1
+          },
+          {
+            "pid": 15836,
+            "ppid": 54932,
+            "pgid": null,
+            "creationTime": "/Date(1786789137888)/",
+            "startedAt": 1786789137888,
+            "depth": 3
+          },
+          {
+            "pid": 32664,
+            "ppid": 41540,
+            "pgid": null,
+            "creationTime": "/Date(1786789133365)/",
+            "startedAt": 1786789133365,
+            "depth": 2
+          },
+          {
+            "pid": 32844,
+            "ppid": 47344,
+            "pgid": null,
+            "creationTime": "/Date(1786789133778)/",
+            "startedAt": 1786789133778,
+            "depth": 1
+          },
+          {
+            "pid": 34372,
+            "ppid": 41540,
+            "pgid": null,
+            "creationTime": "/Date(1786789133538)/",
+            "startedAt": 1786789133538,
+            "depth": 2
+          },
+          {
+            "pid": 37936,
+            "ppid": 41540,
+            "pgid": null,
+            "creationTime": "/Date(1786789133537)/",
+            "startedAt": 1786789133537,
+            "depth": 2
+          },
+          {
+            "pid": 41540,
+            "ppid": 47344,
+            "pgid": null,
+            "creationTime": "/Date(1786789133342)/",
+            "startedAt": 1786789133342,
+            "depth": 1
+          },
+          {
+            "pid": 43340,
+            "ppid": 32844,
+            "pgid": null,
+            "creationTime": "/Date(1786789136693)/",
+            "startedAt": 1786789136693,
+            "depth": 2
+          },
+          {
+            "pid": 44792,
+            "ppid": 32844,
+            "pgid": null,
+            "creationTime": "/Date(1786789136589)/",
+            "startedAt": 1786789136589,
+            "depth": 2
+          },
+          {
+            "pid": 47344,
+            "ppid": 37504,
+            "pgid": null,
+            "creationTime": "/Date(1786789133223)/",
+            "startedAt": 1786789133223,
+            "depth": 0
+          },
+          {
+            "pid": 51392,
+            "ppid": 47344,
+            "pgid": null,
+            "creationTime": "/Date(1786789133766)/",
+            "startedAt": 1786789133766,
+            "depth": 1
+          },
+          {
+            "pid": 54932,
+            "ppid": 32844,
+            "pgid": null,
+            "creationTime": "/Date(1786789135415)/",
+            "startedAt": 1786789135415,
+            "depth": 2
+          },
+          {
+            "pid": 56316,
+            "ppid": 41540,
+            "pgid": null,
+            "creationTime": "/Date(1786789134624)/",
+            "startedAt": 1786789134624,
+            "depth": 2
+          }
+        ]
+      }
+    },
+    {
+      "startupReport": {
+        "schema": "ride.startup-report",
+        "version": 1,
+        "platform": "windows",
+        "arch": "x86_64",
+        "pid": 24472,
+        "milestones": {
+          "process_started": 0,
+          "native_window_visible": 620,
+          "backend_spawned": 649,
+          "backend_listening": 1504,
+          "frontend_shell_attached": 2271,
+          "target_file_opened": 5310,
+          "plugins_started": 5320,
+          "plugins_ready": 5339
+        }
+      },
+      "metrics": {
+        "rootPid": 24472,
+        "rootIdentity": {
+          "pid": 24472,
+          "pgid": null,
+          "creationTime": "/Date(1786789175706)/",
+          "startedAt": 1786789175706
+        },
+        "processIds": [
+          8116,
+          14252,
+          24472,
+          28408,
+          34868,
+          37348,
+          37516,
+          38708,
+          42704,
+          50604,
+          50956,
+          54752,
+          54816,
+          55632
+        ],
+        "processCount": 14,
+        "rssBytes": 1154396160,
+        "processes": [
+          {
+            "pid": 8116,
+            "ppid": 50604,
+            "pgid": null,
+            "creationTime": "/Date(1786789179318)/",
+            "startedAt": 1786789179318,
+            "depth": 2
+          },
+          {
+            "pid": 14252,
+            "ppid": 28408,
+            "pgid": null,
+            "creationTime": "/Date(1786789176021)/",
+            "startedAt": 1786789176021,
+            "depth": 2
+          },
+          {
+            "pid": 24472,
+            "ppid": 37504,
+            "pgid": null,
+            "creationTime": "/Date(1786789175706)/",
+            "startedAt": 1786789175706,
+            "depth": 0
+          },
+          {
+            "pid": 28408,
+            "ppid": 24472,
+            "pgid": null,
+            "creationTime": "/Date(1786789175836)/",
+            "startedAt": 1786789175836,
+            "depth": 1
+          },
+          {
+            "pid": 34868,
+            "ppid": 28408,
+            "pgid": null,
+            "creationTime": "/Date(1786789175856)/",
+            "startedAt": 1786789175856,
+            "depth": 2
+          },
+          {
+            "pid": 37348,
+            "ppid": 28408,
+            "pgid": null,
+            "creationTime": "/Date(1786789176025)/",
+            "startedAt": 1786789176025,
+            "depth": 2
+          },
+          {
+            "pid": 37516,
+            "ppid": 28408,
+            "pgid": null,
+            "creationTime": "/Date(1786789176052)/",
+            "startedAt": 1786789176052,
+            "depth": 2
+          },
+          {
+            "pid": 38708,
+            "ppid": 24472,
+            "pgid": null,
+            "creationTime": "/Date(1786789175716)/",
+            "startedAt": 1786789175716,
+            "depth": 1
+          },
+          {
+            "pid": 42704,
+            "ppid": 28408,
+            "pgid": null,
+            "creationTime": "/Date(1786789177250)/",
+            "startedAt": 1786789177250,
+            "depth": 2
+          },
+          {
+            "pid": 50604,
+            "ppid": 24472,
+            "pgid": null,
+            "creationTime": "/Date(1786789176382)/",
+            "startedAt": 1786789176382,
+            "depth": 1
+          },
+          {
+            "pid": 50956,
+            "ppid": 50604,
+            "pgid": null,
+            "creationTime": "/Date(1786789178114)/",
+            "startedAt": 1786789178114,
+            "depth": 2
+          },
+          {
+            "pid": 54752,
+            "ppid": 50956,
+            "pgid": null,
+            "creationTime": "/Date(1786789180425)/",
+            "startedAt": 1786789180425,
+            "depth": 3
+          },
+          {
+            "pid": 54816,
+            "ppid": 50604,
+            "pgid": null,
+            "creationTime": "/Date(1786789179233)/",
+            "startedAt": 1786789179233,
+            "depth": 2
+          },
+          {
+            "pid": 55632,
+            "ppid": 24472,
+            "pgid": null,
+            "creationTime": "/Date(1786789176371)/",
+            "startedAt": 1786789176371,
+            "depth": 1
+          }
+        ]
+      }
+    }
+  ],
+  "median": {
+    "targetFileOpenedMs": 5310,
+    "rssBytes": 1154154496,
+    "processCount": 14
+  }
+}
