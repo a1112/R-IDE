@@ -27,6 +27,7 @@ const DIAGNOSTIC_LOG_MAX_BYTES = 1_048_576;
 const STREAM_SETTLE_TIMEOUT_MS = 2_000;
 const SYNC_COMMAND_TIMEOUT_MS = 10_000;
 const SYNC_COMMAND_MAX_BUFFER_BYTES = 16 * 1024 * 1024;
+const PROC_ENVIRONMENT_MAX_BYTES = 4 * 1024 * 1024;
 const SENSITIVE_FRAGMENT_LENGTH = 16;
 const SENSITIVE_ENVIRONMENT_KEY = /(?:TOKEN|SECRET|PASSWORD|PASSWD|KEY|CREDENTIAL|COOKIE|AUTH)/i;
 const SENSITIVE_DESKTOP_PASSTHROUGH_KEYS = new Set(['XAUTHORITY']);
@@ -112,7 +113,14 @@ function redactSensitiveFragments(text, sensitiveValues) {
   return redacted.join('');
 }
 
-export function filterSpawnEnvironment(sourceEnvironment, reportPath) {
+function validateRunId(runId) {
+  if (typeof runId !== 'string' || !UUID_PATTERN.test(runId)) {
+    throw new Error('startup run id must be a UUID');
+  }
+  return runId;
+}
+
+export function filterSpawnEnvironment(sourceEnvironment, reportPath, runId) {
   const environment = {};
   const sensitiveValues = [];
   for (const [key, value] of Object.entries(sourceEnvironment ?? {})) {
@@ -120,6 +128,9 @@ export function filterSpawnEnvironment(sourceEnvironment, reportPath) {
       continue;
     }
     const serialized = String(value);
+    if (key.toUpperCase() === 'RIDE_STARTUP_RUN_ID' && serialized) {
+      sensitiveValues.push(serialized);
+    }
     if (SENSITIVE_ENVIRONMENT_KEY.test(key)) {
       if (serialized) {
         sensitiveValues.push(serialized);
@@ -131,6 +142,14 @@ export function filterSpawnEnvironment(sourceEnvironment, reportPath) {
     environment[key] = serialized;
   }
   environment.RIDE_STARTUP_REPORT = reportPath;
+  if (runId !== undefined) {
+    const verifiedRunId = validateRunId(runId);
+    // Ordinary Tauri, backend, and plugin descendants inherit this marker.
+    // It is measurement provenance, not a defense against a child deliberately
+    // clearing or replacing its environment.
+    environment.RIDE_STARTUP_RUN_ID = verifiedRunId;
+    sensitiveValues.push(verifiedRunId);
+  }
   return { environment, sensitiveValues: [...new Set(sensitiveValues)] };
 }
 
@@ -599,6 +618,258 @@ export function parseWindowsProcessTable(output) {
   });
 }
 
+export function parseLinuxProcEnvironment(environment, runId) {
+  const marker = Buffer.from(`RIDE_STARTUP_RUN_ID=${validateRunId(runId)}`);
+  if (!Buffer.isBuffer(environment)) {
+    throw new Error('Linux proc environment must be a Buffer');
+  }
+  if (environment.length === 0) {
+    return false;
+  }
+  if (environment.at(-1) !== 0) {
+    throw new Error('Linux proc environment must be NUL-terminated');
+  }
+  for (let start = 0; start < environment.length;) {
+    const end = environment.indexOf(0, start);
+    if (end < 0) {
+      throw new Error('Linux proc environment must be NUL-terminated');
+    }
+    if (environment.subarray(start, end).equals(marker)) {
+      return true;
+    }
+    start = end + 1;
+  }
+  return false;
+}
+
+function parseMacOsPsRows(output, label) {
+  const rows = new Map();
+  for (const line of String(output).split(/\r?\n/)) {
+    if (!line.trim()) {
+      continue;
+    }
+    const match = line.match(/^\s*(\d+)\s+(.+?)\s*$/);
+    if (!match) {
+      throw new Error(`invalid macOS ps ${label} row`);
+    }
+    const pid = positiveInteger(match[1], 'macOS ps pid');
+    if (pid === 0) {
+      throw new Error('macOS ps pid must be positive');
+    }
+    if (rows.has(pid)) {
+      throw new Error(`duplicate macOS ps pid ${pid}`);
+    }
+    rows.set(pid, match[2]);
+  }
+  return rows;
+}
+
+export function parseMacOsProcessEnvironments(
+  commandOutput,
+  environmentOutput,
+  runId,
+  stablePids,
+) {
+  const marker = `RIDE_STARTUP_RUN_ID=${validateRunId(runId)}`;
+  const escapedMarker = escapeRegExp(marker);
+  const markerToken = new RegExp(`(?:^|\\s)${escapedMarker}(?:\\s|$)`);
+  if (!(stablePids instanceof Set)) {
+    throw new Error('macOS stable process ids must be a Set');
+  }
+  const commands = parseMacOsPsRows(commandOutput, 'command');
+  const environments = parseMacOsPsRows(environmentOutput, 'environment');
+  for (const rawPid of stablePids) {
+    const pid = positiveInteger(rawPid, 'macOS stable process pid');
+    if (!commands.has(pid) || !environments.has(pid)) {
+      throw new Error(`macOS process environment query omitted stable pid ${pid}`);
+    }
+  }
+
+  const marked = [];
+  for (const [pid, environment] of environments) {
+    const command = commands.get(pid);
+    if (command === undefined) {
+      if (markerToken.test(environment)) {
+        throw new Error(`macOS process command query omitted marker pid ${pid}`);
+      }
+      continue;
+    }
+    let appendedEnvironment;
+    if (environment === command) {
+      appendedEnvironment = '';
+    } else if (environment.startsWith(`${command} `)) {
+      appendedEnvironment = environment.slice(command.length + 1);
+    } else {
+      if (stablePids.has(pid) || markerToken.test(environment)) {
+        throw new Error(`macOS process command changed during environment query for pid ${pid}`);
+      }
+      continue;
+    }
+    if (markerToken.test(appendedEnvironment)) {
+      marked.push(pid);
+    }
+  }
+  return marked.sort((left, right) => left - right);
+}
+
+function readBoundedFile(filePath, maximumBytes) {
+  const handle = fs.openSync(filePath, 'r');
+  try {
+    const chunks = [];
+    let length = 0;
+    while (true) {
+      const capacity = Math.min(64 * 1024, maximumBytes + 1 - length);
+      if (capacity <= 0) {
+        throw new Error('Linux proc environment exceeds the size limit');
+      }
+      const chunk = Buffer.allocUnsafe(capacity);
+      const count = fs.readSync(handle, chunk, 0, capacity, null);
+      if (count === 0) {
+        return Buffer.concat(chunks, length);
+      }
+      chunks.push(chunk.subarray(0, count));
+      length += count;
+      if (length > maximumBytes) {
+        throw new Error('Linux proc environment exceeds the size limit');
+      }
+    }
+  } finally {
+    fs.closeSync(handle);
+  }
+}
+
+function defaultLinuxProcessIds() {
+  return fs.readdirSync('/proc', { withFileTypes: true })
+    .filter(entry => entry.isDirectory() && /^\d+$/.test(entry.name))
+    .map(entry => Number(entry.name))
+    .filter(pid => Number.isSafeInteger(pid) && pid > 0);
+}
+
+export function readLinuxProcEnvironment(
+  pid,
+  {
+    stat = filePath => fs.statSync(filePath),
+    readFile = filePath => readBoundedFile(filePath, PROC_ENVIRONMENT_MAX_BYTES),
+    getuid = () => process.getuid?.(),
+  } = {},
+) {
+  const verifiedPid = positiveInteger(pid, 'Linux proc pid');
+  if (verifiedPid === 0) {
+    throw new Error('Linux proc pid must be positive');
+  }
+  const environmentPath = `/proc/${verifiedPid}/environ`;
+  let metadata;
+  try {
+    metadata = stat(environmentPath);
+  } catch (error) {
+    if (error?.code === 'ENOENT' || error?.code === 'ESRCH') {
+      return null;
+    }
+    throw new Error('Linux proc environment query failed');
+  }
+  const currentUid = getuid();
+  if (Number.isSafeInteger(currentUid) && metadata.uid !== currentUid) {
+    return null;
+  }
+  try {
+    return readFile(environmentPath);
+  } catch (error) {
+    if (error?.code === 'ENOENT' || error?.code === 'ESRCH') {
+      return null;
+    }
+    if (error?.message === 'Linux proc environment exceeds the size limit') {
+      throw error;
+    }
+    throw new Error('Linux proc environment query failed');
+  }
+}
+
+export function discoverMarkedProcessSnapshot(
+  runId,
+  platform = process.platform,
+  {
+    read = readProcessTable,
+    listLinuxPids = defaultLinuxProcessIds,
+    readLinuxEnvironment = readLinuxProcEnvironment,
+    run = (command, args, options) => spawnSync(command, args, options),
+  } = {},
+) {
+  const verifiedRunId = validateRunId(runId);
+  if (platform === 'win32') {
+    return { rows: read(platform), markedRows: [] };
+  }
+
+  const beforeRows = read(platform);
+  const beforeByPid = new Map(beforeRows.map(row => [row.pid, row]));
+  let markedPids;
+  let macCommandOutput;
+  let macEnvironmentOutput;
+  if (platform === 'linux') {
+    markedPids = [];
+    const seen = new Set();
+    for (const pid of listLinuxPids()) {
+      const verifiedPid = positiveInteger(pid, 'Linux proc pid');
+      if (verifiedPid === 0 || seen.has(verifiedPid)) {
+        throw new Error('Linux proc process list is invalid');
+      }
+      seen.add(verifiedPid);
+      const environment = readLinuxEnvironment(verifiedPid);
+      if (environment !== null && parseLinuxProcEnvironment(environment, verifiedRunId)) {
+        markedPids.push(verifiedPid);
+      }
+    }
+  } else if (platform === 'darwin') {
+    const runMacProcessQuery = args => {
+      const result = run('ps', args, {
+        encoding: 'utf8',
+        env: { ...process.env, LANG: 'C', LC_ALL: 'C' },
+        timeout: SYNC_COMMAND_TIMEOUT_MS,
+        maxBuffer: SYNC_COMMAND_MAX_BUFFER_BYTES,
+      });
+      if (result?.error || result?.signal || result?.status !== 0) {
+        throw new Error('macOS process environment query failed');
+      }
+      return result.stdout;
+    };
+    macCommandOutput = runMacProcessQuery(['ww', '-axo', 'pid=,command=']);
+    macEnvironmentOutput = runMacProcessQuery(['eww', '-axo', 'pid=,command=']);
+  } else {
+    throw new Error(`unsupported marker discovery platform ${platform}`);
+  }
+
+  const rows = read(platform);
+  const rowsByPid = new Map();
+  for (const row of rows) {
+    if (rowsByPid.has(row.pid)) {
+      throw new Error(`duplicate process-table pid ${row.pid}`);
+    }
+    rowsByPid.set(row.pid, row);
+  }
+  if (platform === 'darwin') {
+    const stablePids = new Set(rows
+      .filter(row => sameProcessIdentity(row, beforeByPid.get(row.pid) ?? {}))
+      .map(row => row.pid));
+    markedPids = parseMacOsProcessEnvironments(
+      macCommandOutput,
+      macEnvironmentOutput,
+      verifiedRunId,
+      stablePids,
+    );
+  }
+  const markedRows = markedPids.map(pid => {
+    const before = beforeByPid.get(pid);
+    const row = rowsByPid.get(pid);
+    if (!before || !row) {
+      throw new Error(`marker process ${pid} is missing from the process table`);
+    }
+    if (!sameProcessIdentity(row, before)) {
+      throw new Error(`marker process ${pid} changed identity during discovery`);
+    }
+    return row;
+  });
+  return { rows, markedRows };
+}
+
 function processIdentity(row) {
   const identity = {
     pid: row.pid,
@@ -862,8 +1133,73 @@ function readProcessTable(platform = process.platform) {
   return parsePosixProcessTable(result.stdout);
 }
 
-export function sampleProcessTree(rootIdentity, platform = process.platform) {
-  return aggregateProcessTree(readProcessTable(platform), rootIdentity);
+function aggregateMarkedProcessTree(rows, rootIdentity, markedRows) {
+  const tree = aggregateProcessTree(rows, rootIdentity);
+  const currentByPid = new Map(rows.map(row => [row.pid, row]));
+  const rootStartedAt = comparableStartedAt(tree.rootIdentity);
+  if (!markedRows.some(row => sameProcessIdentity(row, tree.rootIdentity))) {
+    throw new Error('spawned root process is missing its startup run marker');
+  }
+  const selected = new Map();
+  for (const processRow of tree.processes) {
+    const current = currentByPid.get(processRow.pid);
+    if (!current || !sameProcessIdentity(current, processRow)) {
+      throw new Error(`sampled process ${processRow.pid} changed identity`);
+    }
+    selected.set(trackedProcessKey(current), { row: current, depth: processRow.depth });
+  }
+  for (const markedRow of markedRows) {
+    const current = currentByPid.get(markedRow.pid);
+    const startedAt = comparableStartedAt(markedRow);
+    if (!current
+        || !sameProcessIdentity(current, markedRow)
+        || rootStartedAt === null
+        || startedAt === null
+        || startedAt < rootStartedAt) {
+      throw new Error(`marked process ${markedRow.pid} has an unverifiable identity`);
+    }
+    selected.set(trackedProcessKey(current), {
+      row: current,
+      depth: tree.processes.find(processRow => processRow.pid === current.pid)?.depth ?? null,
+    });
+  }
+
+  const processes = [...selected.values()].sort((left, right) => left.row.pid - right.row.pid);
+  let rssBytes = 0;
+  for (const { row } of processes) {
+    const processRssBytes = positiveInteger(row.rssBytes, `process ${row.pid} RSS bytes`);
+    if (rssBytes > Number.MAX_SAFE_INTEGER - processRssBytes) {
+      throw new Error('aggregate RSS bytes must be a non-negative safe integer');
+    }
+    rssBytes += processRssBytes;
+  }
+  return {
+    rootPid: tree.rootPid,
+    rootIdentity: tree.rootIdentity,
+    processIds: processes.map(({ row }) => row.pid),
+    processCount: processes.length,
+    rssBytes,
+    processes: processes.map(({ row, depth }) => ({
+      pid: row.pid,
+      ppid: row.ppid,
+      pgid: row.pgid,
+      creationTime: row.creationTime,
+      startedAt: comparableStartedAt(row),
+      depth,
+    })),
+  };
+}
+
+export function sampleProcessTree(
+  rootIdentity,
+  platform = process.platform,
+  { runId, discover = discoverMarkedProcessSnapshot } = {},
+) {
+  if (platform === 'win32' || runId === undefined) {
+    return aggregateProcessTree(readProcessTable(platform), rootIdentity);
+  }
+  const snapshot = discover(validateRunId(runId), platform);
+  return aggregateMarkedProcessTree(snapshot.rows, rootIdentity, snapshot.markedRows);
 }
 
 export async function captureProcessIdentity(
@@ -1199,9 +1535,14 @@ export async function launchMeasuredProcess({
   stdoutLogPath,
   stderrLogPath,
   cwd,
+  runId,
   sourceEnvironment = process.env,
 }) {
-  const preparedEnvironment = filterSpawnEnvironment(sourceEnvironment, reportPath);
+  const preparedEnvironment = filterSpawnEnvironment(
+    sourceEnvironment,
+    reportPath,
+    validateRunId(runId),
+  );
   const child = spawn(executable, [codeFile], {
     cwd,
     detached: process.platform !== 'win32',
@@ -1250,6 +1591,7 @@ export async function terminateMeasuredTree(
     ownedGroup,
     trackedProcesses = [],
     containmentVerified = false,
+    runId,
   },
   platform = process.platform,
   {
@@ -1265,6 +1607,7 @@ export async function terminateMeasuredTree(
     cleanupReadAttempts = 3,
     cleanupVerifyAttempts = 3,
     cleanupReadDelayMs = 25,
+    discoverMarked = discoverMarkedProcessSnapshot,
   } = {},
 ) {
   const verifiedRootPid = positiveInteger(rootPid, 'spawned root pid');
@@ -1319,6 +1662,121 @@ export async function terminateMeasuredTree(
   if (platform === 'win32' && containmentVerified !== true) {
     await terminateControlledChild();
     return;
+  }
+  if (platform !== 'win32' && runId !== undefined) {
+    const verifiedRunId = validateRunId(runId);
+    const actionFailures = [];
+    const incomplete = reason => new Error(
+      `startup cleanup incomplete: ${reason}`
+        + (actionFailures.length > 0 ? `; ${actionFailures.join('; ')}` : ''),
+    );
+    const queryMarkedWithRetry = async () => {
+      let lastError;
+      for (let attempt = 1; attempt <= readAttempts; attempt++) {
+        try {
+          const snapshot = discoverMarked(verifiedRunId, platform);
+          if (!snapshot
+              || !Array.isArray(snapshot.rows)
+              || !Array.isArray(snapshot.markedRows)) {
+            throw new Error('invalid marked process snapshot');
+          }
+          const seen = new Set();
+          for (const markedRow of snapshot.markedRows) {
+            validateProcessIdentity(markedRow, 'marked process identity');
+            const key = trackedProcessKey(markedRow);
+            if (seen.has(key)
+                || !snapshot.rows.some(row => sameProcessIdentity(row, markedRow))) {
+              throw new Error('invalid marked process snapshot');
+            }
+            seen.add(key);
+          }
+          return snapshot;
+        } catch (error) {
+          lastError = error;
+        }
+        if (attempt < readAttempts) {
+          await delay(cleanupReadDelayMs);
+        }
+      }
+      throw lastError ?? new Error('startup run marker query failed');
+    };
+    const queryOrFail = async reason => {
+      try {
+        return await queryMarkedWithRetry();
+      } catch {
+        await terminateControlledChild();
+        throw incomplete(reason);
+      }
+    };
+    const knownIdentities = new Map();
+    const rememberMarked = snapshot => {
+      for (const markedRow of snapshot.markedRows) {
+        knownIdentities.set(trackedProcessKey(markedRow), processIdentity(markedRow));
+      }
+    };
+    const signalOne = (pid, signal) => {
+      try {
+        if (kill(pid, signal) === false) {
+          actionFailures.push(`${signal} ${pid} returned false`);
+        }
+      } catch {
+        actionFailures.push(`${signal} ${pid} threw`);
+      }
+    };
+    const rootFirstMarked = markedRows => [...markedRows].sort((left, right) => {
+      if (left.pid === verifiedRootPid) {
+        return right.pid === verifiedRootPid ? 0 : -1;
+      }
+      if (right.pid === verifiedRootPid) {
+        return 1;
+      }
+      return left.pid - right.pid;
+    });
+    const signalMarked = async (candidates, signal) => {
+      for (const candidate of rootFirstMarked(candidates)) {
+        const current = await queryOrFail(`startup run marker query failed before ${signal}`);
+        rememberMarked(current);
+        if (current.markedRows.some(row => sameProcessIdentity(row, candidate))) {
+          signalOne(candidate.pid, signal);
+        }
+      }
+    };
+
+    const initial = await queryOrFail('startup run marker query failed before SIGTERM');
+    rememberMarked(initial);
+    if (rootIdentity
+        && initial.rows.some(row => sameProcessIdentity(row, rootIdentity))
+        && !initial.markedRows.some(row => sameProcessIdentity(row, rootIdentity))) {
+      await terminateControlledChild();
+      throw incomplete('live root process is missing its startup run marker');
+    }
+    await signalMarked(initial.markedRows, 'SIGTERM');
+    await delay(250);
+
+    const afterTerm = await queryOrFail('startup run marker query failed before SIGKILL');
+    rememberMarked(afterTerm);
+    await signalMarked(afterTerm.markedRows, 'SIGKILL');
+
+    let markerSurvivors = [];
+    let exactSurvivors = [];
+    for (let attempt = 1; attempt <= verifyAttempts; attempt++) {
+      const verification = await queryOrFail('startup run marker query failed during final verification');
+      rememberMarked(verification);
+      markerSurvivors = verification.markedRows;
+      exactSurvivors = [...knownIdentities.values()].filter(identity => (
+        verification.rows.some(row => sameProcessIdentity(row, identity))
+      ));
+      if (markerSurvivors.length === 0 && exactSurvivors.length === 0) {
+        return;
+      }
+      if (attempt < verifyAttempts) {
+        await delay(cleanupReadDelayMs);
+      }
+    }
+    throw incomplete(
+      `startup run marker still has processes (`
+        + `${markerSurvivors.map(row => row.pid).join(', ') || exactSurvivors.map(row => row.pid).join(', ')})`,
+    );
   }
   let trustedRootIdentity;
   if (rootIdentity) {
@@ -1668,7 +2126,11 @@ const defaultMeasurementDependencies = {
   startMonitor: (rootIdentity, { child }) => startProcessTreeMonitor(rootIdentity, { child }),
   waitForReport: waitForStartupReport,
   delay: milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds)),
-  sample: sampleProcessTree,
+  sample: (rootIdentity, { platform, runId }) => sampleProcessTree(
+    rootIdentity,
+    platform,
+    { runId },
+  ),
   terminate: terminateMeasuredTree,
 };
 
@@ -1676,7 +2138,9 @@ export async function measureOnce(options, dependencies = defaultMeasurementDepe
   const now = dependencies.now ?? Date.now;
   const platform = dependencies.platform ?? process.platform;
   const deadline = now() + options.timeoutMs;
-  const child = await dependencies.launch(options);
+  const runId = validateRunId((dependencies.createRunId ?? randomUUID)());
+  options.onRunId?.(runId);
+  const child = await dependencies.launch({ ...options, runId });
   const rootPid = positiveInteger(child?.pid, 'spawned root pid');
   if (rootPid === 0) {
     throw new Error('spawned root pid must be positive');
@@ -1724,7 +2188,7 @@ export async function measureOnce(options, dependencies = defaultMeasurementDepe
     containmentVerified = true;
     await stopMonitorOnce();
     await dependencies.delay(options.idleMs);
-    metrics = dependencies.sample(rootIdentity);
+    metrics = dependencies.sample(rootIdentity, { platform, runId });
     const finalStartupReport = await dependencies.waitForReport(options.reportPath, {
       timeoutMs: Math.max(0, deadline - now()),
       pollMs: options.pollMs,
@@ -1751,6 +2215,7 @@ export async function measureOnce(options, dependencies = defaultMeasurementDepe
           ...(ownedGroup ? { ownedGroup } : {}),
           trackedProcesses,
           containmentVerified,
+          runId,
         });
       } finally {
         await child.startupLogCapture?.persist();
@@ -1898,13 +2363,16 @@ async function clearPreviousCampaignArtifacts(output) {
   }
 }
 
-async function readOptionalStartupReport(reportPath) {
+async function readOptionalStartupReport(reportPath, sensitiveValues) {
   try {
     const serialized = await fs.promises.readFile(reportPath, 'utf8');
     try {
-      return JSON.parse(serialized);
+      return parseStartupReport(serialized, { phase: 'incremental' });
     } catch (error) {
-      return { invalid: true, error: error.message };
+      return {
+        invalid: true,
+        error: redactDiagnosticText(error.message, sensitiveValues),
+      };
     }
   } catch (error) {
     if (error.code === 'ENOENT') {
@@ -1970,12 +2438,15 @@ async function preserveFailureDiagnostic({
     fs.promises.writeFile(copiedStdout, boundedStdout),
     fs.promises.writeFile(copiedStderr, boundedStderr),
   ]);
-  const startupReport = await readOptionalStartupReport(reportPath);
+  const startupReport = await readOptionalStartupReport(reportPath, sensitiveValues);
   const portableRelativePath = file => path.relative(outputDirectory, file).replaceAll('\\', '/');
   const diagnostic = {
     status: 'failed',
     error: {
-      name: typeof error?.name === 'string' ? error.name : 'Error',
+      name: redactDiagnosticText(
+        typeof error?.name === 'string' ? error.name : 'Error',
+        sensitiveValues,
+      ),
       message: redactDiagnosticText(
         typeof error?.message === 'string' ? error.message : String(error),
         sensitiveValues,
@@ -2011,6 +2482,7 @@ export async function runMeasurementCampaign(
   await clearPreviousCampaignArtifacts(options.output);
   const rawRuns = [];
   for (let runIndex = 1; runIndex <= options.runs; runIndex++) {
+    let runId;
     const temporary = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-startup-run-'));
     const codeFile = path.join(temporary, `startup-${runIndex}.R`);
     const reportPath = path.join(temporary, 'startup-report.json');
@@ -2033,9 +2505,20 @@ export async function runMeasurementCampaign(
         pollMs: options.pollMs,
         cwd: applicationRoot,
         sourceEnvironment: environment,
+        onRunId: candidate => {
+          const verifiedRunId = validateRunId(candidate);
+          if (runId !== undefined && runId !== verifiedRunId) {
+            throw new Error('measurement reported more than one startup run id');
+          }
+          runId = verifiedRunId;
+        },
       }));
     } catch (error) {
-      await preserveFailureDiagnostic({
+      const runSensitiveValues = [
+        ...sensitiveValues,
+        ...(runId === undefined ? [] : [runId]),
+      ];
+      const diagnostic = await preserveFailureDiagnostic({
         options,
         executable,
         campaignId,
@@ -2045,9 +2528,11 @@ export async function runMeasurementCampaign(
         reportPath,
         stdoutLogPath,
         stderrLogPath,
-        sensitiveValues,
+        sensitiveValues: runSensitiveValues,
       });
-      throw error;
+      const sanitized = new Error(diagnostic.error.message);
+      sanitized.name = diagnostic.error.name;
+      throw sanitized;
     } finally {
       await fs.promises.rm(temporary, { recursive: true, force: true });
     }

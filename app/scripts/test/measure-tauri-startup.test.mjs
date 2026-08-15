@@ -19,16 +19,21 @@ import {
   attachBoundedLogCapture,
   captureProcessIdentity,
   createBoundedLogSink,
+  discoverMarkedProcessSnapshot,
   discoverExecutable,
   filterSpawnEnvironment,
   launchMeasuredProcess,
   measureOnce,
   median,
+  parseLinuxProcEnvironment,
+  parseMacOsProcessEnvironments,
   parsePosixProcessTable,
   parseStartupReport,
   parseWindowsProcessTable,
   planProcessCleanup,
+  readLinuxProcEnvironment,
   runMeasurementCampaign,
+  sampleProcessTree,
   redactDiagnosticText,
   startProcessTreeMonitor,
   terminateMeasuredTree,
@@ -160,6 +165,15 @@ test('every synchronous external command has explicit timeout and buffer bounds'
   const psQuery = boundedCall("spawnSync('ps'", 'return parsePosixProcessTable', 'ps query');
   assert.match(psQuery, /LANG:\s*'C'/);
   assert.match(psQuery, /LC_ALL:\s*'C'/);
+  const macMarkerQuery = boundedCall(
+    'const runMacProcessQuery = args =>',
+    'macCommandOutput = runMacProcessQuery',
+    'macOS marker query',
+  );
+  assert.match(macMarkerQuery, /LANG:\s*'C'/);
+  assert.match(macMarkerQuery, /LC_ALL:\s*'C'/);
+  assert.match(source, /runMacProcessQuery\(\['ww', '-axo', 'pid=,command='\]\)/);
+  assert.match(source, /runMacProcessQuery\(\['eww', '-axo', 'pid=,command='\]\)/);
   boundedCall('run = (command, args) => spawnSync', 'kill = (pid, signal)', 'taskkill command');
   boundedCall("execFileSync('git'", '}).trim()', 'git revision query');
 });
@@ -432,6 +446,260 @@ test('parses POSIX ps and Windows PowerShell process table fixtures', () => {
       },
     ],
   );
+});
+
+test('Linux proc environment parsing matches only the exact startup run marker entry', () => {
+  const runId = '7f7df1aa-a324-4fd4-b11c-4cc260a94d8f';
+  assert.equal(parseLinuxProcEnvironment(Buffer.from(
+    `SAFE=1\0RIDE_STARTUP_RUN_ID=${runId}\0OTHER=2\0`,
+  ), runId), true);
+  assert.equal(parseLinuxProcEnvironment(Buffer.from(
+    `RIDE_STARTUP_RUN_ID=${runId}-suffix\0`,
+  ), runId), false);
+  assert.equal(parseLinuxProcEnvironment(Buffer.from(
+    `PREFIX_RIDE_STARTUP_RUN_ID=${runId}\0`,
+  ), runId), false);
+  assert.throws(
+    () => parseLinuxProcEnvironment(Buffer.from(`RIDE_STARTUP_RUN_ID=${runId}`), runId),
+    /NUL-terminated/,
+  );
+});
+
+test('Linux proc discovery skips foreign UIDs but fails closed for same-UID access errors', () => {
+  let reads = 0;
+  assert.equal(readLinuxProcEnvironment(202, {
+    stat: () => ({ uid: 2000 }),
+    getuid: () => 1000,
+    readFile: () => {
+      reads++;
+      throw new Error('foreign environment must not be read');
+    },
+  }), null);
+  assert.equal(reads, 0);
+
+  const accessError = Object.assign(new Error('denied'), { code: 'EACCES' });
+  assert.throws(
+    () => readLinuxProcEnvironment(202, {
+      stat: () => ({ uid: 1000 }),
+      getuid: () => 1000,
+      readFile: () => {
+        throw accessError;
+      },
+    }),
+    /Linux proc environment query failed/,
+  );
+  const exited = Object.assign(new Error('gone'), { code: 'ENOENT' });
+  assert.equal(readLinuxProcEnvironment(202, {
+    stat: () => {
+      throw exited;
+    },
+    getuid: () => 1000,
+    readFile: () => Buffer.alloc(0),
+  }), null);
+});
+
+test('macOS ps eww parsing returns exact marker PIDs and rejects incomplete rows', () => {
+  const runId = '7f7df1aa-a324-4fd4-b11c-4cc260a94d8f';
+  const commands = [
+    '101 /Applications/R-IDE',
+    '102 /Applications/Foreign',
+    `103 /Applications/Foreign RIDE_STARTUP_RUN_ID=${runId}`,
+  ].join('\n');
+  const environments = [
+    `101 /Applications/R-IDE RIDE_STARTUP_RUN_ID=${runId} SAFE=1`,
+    '102 /Applications/Foreign RIDE_STARTUP_RUN_ID=80dc8222-0ba1-47b7-a1f7-a8af55e3c355',
+    `103 /Applications/Foreign RIDE_STARTUP_RUN_ID=${runId}`,
+  ].join('\n');
+  assert.deepEqual(parseMacOsProcessEnvironments(
+    commands,
+    environments,
+    runId,
+    new Set([101, 102, 103]),
+  ), [101]);
+  assert.throws(
+    () => parseMacOsProcessEnvironments(
+      commands,
+      `not-a-pid RIDE_STARTUP_RUN_ID=${runId}`,
+      runId,
+      new Set([101, 102, 103]),
+    ),
+    /invalid macOS ps environment row/,
+  );
+  assert.throws(
+    () => parseMacOsProcessEnvironments(commands, [
+      `101 /first RIDE_STARTUP_RUN_ID=${runId}`,
+      `101 /duplicate RIDE_STARTUP_RUN_ID=${runId}`,
+    ].join('\n'), runId, new Set([101, 102, 103])),
+    /duplicate macOS ps pid/,
+  );
+  assert.throws(
+    () => parseMacOsProcessEnvironments(
+      commands,
+      environments.split('\n').filter(line => !line.startsWith('102 ')).join('\n'),
+      runId,
+      new Set([101, 102, 103]),
+    ),
+    /macOS process environment query omitted stable pid 102/,
+  );
+});
+
+test('marked process discovery joins marker PIDs to exact process-table identities', () => {
+  const runId = '7f7df1aa-a324-4fd4-b11c-4cc260a94d8f';
+  const rows = [
+    {
+      pid: 100,
+      ppid: 1,
+      pgid: 100,
+      rssBytes: 1_024,
+      creationTime: 'root-start',
+      startedAt: 1_000,
+    },
+    {
+      pid: 202,
+      ppid: 1,
+      pgid: 202,
+      rssBytes: 2_048,
+      creationTime: 'setsid-start',
+      startedAt: 2_000,
+    },
+  ];
+  const snapshot = discoverMarkedProcessSnapshot(runId, 'linux', {
+    read: () => rows,
+    listLinuxPids: () => [100, 202, 303],
+    readLinuxEnvironment: pid => {
+      if (pid === 303) {
+        return null;
+      }
+      return Buffer.from(`RIDE_STARTUP_RUN_ID=${pid === 202 ? runId : 'foreign'}\0`);
+    },
+  });
+
+  assert.strictEqual(snapshot.rows, rows);
+  assert.deepEqual(snapshot.markedRows, [rows[1]]);
+  assert.throws(
+    () => discoverMarkedProcessSnapshot(runId, 'linux', {
+      read: () => rows,
+      listLinuxPids: () => [404],
+      readLinuxEnvironment: () => Buffer.from(`RIDE_STARTUP_RUN_ID=${runId}\0`),
+    }),
+    /marker process 404 is missing from the process table/,
+  );
+});
+
+test('marked process discovery fails closed when a marker PID is reused mid-query', () => {
+  const runId = '7f7df1aa-a324-4fd4-b11c-4cc260a94d8f';
+  const original = {
+    pid: 202,
+    ppid: 100,
+    pgid: 100,
+    rssBytes: 1_024,
+    creationTime: 'original-start',
+    startedAt: 2_000,
+  };
+  const reused = {
+    ...original,
+    ppid: 1,
+    pgid: 202,
+    creationTime: 'reused-start',
+    startedAt: 3_000,
+  };
+  let reads = 0;
+
+  assert.throws(
+    () => discoverMarkedProcessSnapshot(runId, 'linux', {
+      read: () => (++reads === 1 ? [original] : [reused]),
+      listLinuxPids: () => [202],
+      readLinuxEnvironment: () => Buffer.from(`RIDE_STARTUP_RUN_ID=${runId}\0`),
+    }),
+    /marker process 202 changed identity during discovery/,
+  );
+  assert.equal(reads, 2);
+});
+
+test('macOS marked discovery fails closed for a marker process born after the pre-table snapshot', () => {
+  const runId = '7f7df1aa-a324-4fd4-b11c-4cc260a94d8f';
+  const root = {
+    pid: 100,
+    ppid: 1,
+    pgid: 100,
+    rssBytes: 1_024,
+    creationTime: 'root-start',
+    startedAt: 1_000,
+  };
+  const newborn = {
+    pid: 202,
+    ppid: 100,
+    pgid: 202,
+    rssBytes: 2_048,
+    creationTime: 'newborn-start',
+    startedAt: 2_000,
+  };
+  let reads = 0;
+  const outputs = [
+    '100 /Applications/R-IDE\n202 /Applications/Backend',
+    [
+      `100 /Applications/R-IDE RIDE_STARTUP_RUN_ID=${runId}`,
+      `202 /Applications/Backend RIDE_STARTUP_RUN_ID=${runId}`,
+    ].join('\n'),
+  ];
+  let commands = 0;
+
+  assert.throws(
+    () => discoverMarkedProcessSnapshot(runId, 'darwin', {
+      read: () => (++reads === 1 ? [root] : [root, newborn]),
+      run: () => ({ status: 0, stdout: outputs[commands++] }),
+    }),
+    /marker process 202 is missing from the process table/,
+  );
+  assert.equal(reads, 2);
+  assert.equal(commands, 2);
+});
+
+test('idle RSS sampling includes an escaped marked process exactly once', () => {
+  const runId = '7f7df1aa-a324-4fd4-b11c-4cc260a94d8f';
+  const root = {
+    pid: 100,
+    ppid: 1,
+    pgid: 100,
+    rssBytes: 1_024,
+    creationTime: 'root-start',
+    startedAt: 1_000,
+  };
+  const child = {
+    pid: 101,
+    ppid: 100,
+    pgid: 100,
+    rssBytes: 2_048,
+    creationTime: 'child-start',
+    startedAt: 2_000,
+  };
+  const escaped = {
+    pid: 202,
+    ppid: 1,
+    pgid: 202,
+    rssBytes: 4_096,
+    creationTime: 'setsid-start',
+    startedAt: 3_000,
+  };
+  const foreign = {
+    pid: 303,
+    ppid: 1,
+    pgid: 303,
+    rssBytes: 8_192,
+    creationTime: 'foreign-start',
+    startedAt: 4_000,
+  };
+  const rows = [root, child, escaped, foreign];
+
+  const metrics = sampleProcessTree(root, 'linux', {
+    runId,
+    discover: () => ({ rows, markedRows: [root, child, escaped] }),
+  });
+
+  assert.deepEqual(metrics.processIds, [100, 101, 202]);
+  assert.equal(metrics.processCount, 3);
+  assert.equal(metrics.rssBytes, 7_168);
+  assert.equal(metrics.processes.find(processRow => processRow.pid === 202).depth, null);
 });
 
 test('process table parsers preserve comparable creation chronology and reject malformed clocks', () => {
@@ -1918,6 +2186,164 @@ test('POSIX owned group keeps tracked setsid descendants on the explicit cleanup
   ]);
 });
 
+test('POSIX run marker cleanup terminates same-group, reparented, and setsid processes root-first', async () => {
+  const runId = '7f7df1aa-a324-4fd4-b11c-4cc260a94d8f';
+  const root = {
+    pid: 100, ppid: 1, pgid: 100, creationTime: 'root-start', startedAt: 1_000,
+  };
+  const reparented = {
+    pid: 101, ppid: 1, pgid: 100, creationTime: 'reparent-start', startedAt: 2_000,
+  };
+  const setsid = {
+    pid: 202, ppid: 1, pgid: 202, creationTime: 'setsid-start', startedAt: 3_000,
+  };
+  const foreign = {
+    pid: 303, ppid: 1, pgid: 303, creationTime: 'foreign-start', startedAt: 4_000,
+  };
+  let rows = [root, reparented, setsid, foreign];
+  const markerPids = new Set([100, 101, 202]);
+  const signals = [];
+  let markerQueries = 0;
+
+  await terminateMeasuredTree({
+    rootPid: 100,
+    rootIdentity: root,
+    runId,
+  }, 'linux', {
+    discoverMarked: () => {
+      markerQueries++;
+      return { rows, markedRows: rows.filter(row => markerPids.has(row.pid)) };
+    },
+    read: () => {
+      throw new Error('marker cleanup must not use an unmarked global tree');
+    },
+    kill: (pid, signal) => {
+      signals.push([pid, signal]);
+      if (signal === 'SIGTERM' && pid !== 202) {
+        rows = rows.filter(row => row.pid !== pid);
+        markerPids.delete(pid);
+      }
+      if (signal === 'SIGKILL') {
+        rows = rows.filter(row => row.pid !== pid);
+        markerPids.delete(pid);
+      }
+      return true;
+    },
+    delay: async () => undefined,
+    cleanupReadAttempts: 1,
+    cleanupVerifyAttempts: 1,
+  });
+
+  assert.deepEqual(signals, [
+    [100, 'SIGTERM'],
+    [101, 'SIGTERM'],
+    [202, 'SIGTERM'],
+    [202, 'SIGKILL'],
+  ]);
+  assert.ok(markerQueries >= 7, 'every action and posterior must use a fresh marker query');
+  assert.deepEqual(rows, [foreign]);
+});
+
+test('POSIX run marker cleanup never signals a foreign process without the marker', async () => {
+  const runId = '7f7df1aa-a324-4fd4-b11c-4cc260a94d8f';
+  const root = {
+    pid: 100, ppid: 1, pgid: 100, creationTime: 'root-start', startedAt: 1_000,
+  };
+  const foreign = {
+    pid: 303, ppid: 100, pgid: 100, creationTime: 'foreign-start', startedAt: 2_000,
+  };
+  let rows = [root, foreign];
+  const signals = [];
+
+  await terminateMeasuredTree({ rootPid: 100, rootIdentity: root, runId }, 'linux', {
+    discoverMarked: () => ({
+      rows,
+      markedRows: rows.filter(row => row.pid === 100),
+    }),
+    kill: (pid, signal) => {
+      signals.push([pid, signal]);
+      rows = rows.filter(row => row.pid !== pid);
+      return true;
+    },
+    delay: async () => undefined,
+    cleanupReadAttempts: 1,
+    cleanupVerifyAttempts: 1,
+  });
+
+  assert.deepEqual(signals, [[100, 'SIGTERM']]);
+  assert.deepEqual(rows, [foreign]);
+});
+
+test('POSIX run marker cleanup revalidates identity before signaling a reused PID', async () => {
+  const runId = '7f7df1aa-a324-4fd4-b11c-4cc260a94d8f';
+  const root = {
+    pid: 100, ppid: 1, pgid: 100, creationTime: 'root-start', startedAt: 1_000,
+  };
+  const daemon = {
+    pid: 202, ppid: 100, pgid: 202, creationTime: 'daemon-start', startedAt: 2_000,
+  };
+  const reused = {
+    ...daemon, ppid: 1, creationTime: 'foreign-reuse', startedAt: 3_000,
+  };
+  let rows = [root, daemon];
+  let markedPids = new Set([100, 202]);
+  const signals = [];
+
+  await terminateMeasuredTree({ rootPid: 100, rootIdentity: root, runId }, 'linux', {
+    discoverMarked: () => ({
+      rows,
+      markedRows: rows.filter(row => markedPids.has(row.pid)),
+    }),
+    kill: (pid, signal) => {
+      signals.push([pid, signal]);
+      if (pid === 100) {
+        rows = [reused];
+        markedPids = new Set();
+      }
+      return true;
+    },
+    delay: async () => undefined,
+    cleanupReadAttempts: 1,
+    cleanupVerifyAttempts: 1,
+  });
+
+  assert.deepEqual(signals, [[100, 'SIGTERM']]);
+  assert.deepEqual(rows, [reused]);
+});
+
+test('POSIX run marker cleanup includes a newly discovered daemon in the SIGKILL pass', async () => {
+  const runId = '7f7df1aa-a324-4fd4-b11c-4cc260a94d8f';
+  const root = {
+    pid: 100, ppid: 1, pgid: 100, creationTime: 'root-start', startedAt: 1_000,
+  };
+  const lateDaemon = {
+    pid: 202, ppid: 1, pgid: 202, creationTime: 'late-start', startedAt: 2_000,
+  };
+  let rows = [root];
+  const signals = [];
+
+  await terminateMeasuredTree({ rootPid: 100, rootIdentity: root, runId }, 'linux', {
+    discoverMarked: () => ({ rows, markedRows: rows }),
+    kill: (pid, signal) => {
+      signals.push([pid, signal]);
+      if (pid === 100 && signal === 'SIGTERM') {
+        rows = [lateDaemon];
+      } else if (pid === 202 && signal === 'SIGKILL') {
+        rows = [];
+      }
+      return true;
+    },
+    delay: async () => undefined,
+    cleanupReadAttempts: 1,
+    cleanupVerifyAttempts: 1,
+  });
+
+  assert.deepEqual(signals, [
+    [100, 'SIGTERM'],
+    [202, 'SIGKILL'],
+  ]);
+});
+
 test('POSIX cleanup retains a newly revalidated mixed-pgid child after killing the root first', async () => {
   const rootIdentity = {
     pid: 100,
@@ -2059,7 +2485,11 @@ test('Windows Job cleanup terminates only the exact measured root', async () => 
     rootPid: rootIdentity.pid,
     rootIdentity,
     containmentVerified: true,
+    runId: '7f7df1aa-a324-4fd4-b11c-4cc260a94d8f',
   }, 'win32', {
+    discoverMarked: () => {
+      throw new Error('Windows Job cleanup must not query POSIX run markers');
+    },
     read: () => rows,
     run: (command, args) => {
       commands.push([command, ...args]);
@@ -2300,6 +2730,7 @@ test('measurement timeout always terminates only the process tree it launched', 
   const lifecycle = [];
   const rootIdentity = { pid: 7331, pgid: 7331, creationTime: 'root-start' };
   const child = { pid: 7331 };
+  const runId = '7f7df1aa-a324-4fd4-b11c-4cc260a94d8f';
   const monitoredBackend = {
     pid: 7442,
     ppid: 7331,
@@ -2319,6 +2750,7 @@ test('measurement timeout always terminates only the process tree it launched', 
         cwd: '/fixture',
       },
       {
+        createRunId: () => runId,
         launch: () => child,
         capture: async pid => {
           assert.equal(pid, 7331);
@@ -2354,7 +2786,68 @@ test('measurement timeout always terminates only the process tree it launched', 
     rootIdentity,
     trackedProcesses: [monitoredBackend],
     containmentVerified: false,
+    runId,
   }]);
+});
+
+test('each measurement generates one run marker and threads it through launch, sampling, and cleanup', async () => {
+  const runId = '7f7df1aa-a324-4fd4-b11c-4cc260a94d8f';
+  const rootIdentity = {
+    pid: 7331,
+    pgid: 7331,
+    creationTime: 'root-start',
+    startedAt: 1_000,
+  };
+  const observed = [];
+  let generated = 0;
+  const result = await measureOnce({
+    executable: '/fixture/R-IDE',
+    codeFile: '/fixture/startup.R',
+    reportPath: '/fixture/report.json',
+    idleMs: 0,
+    timeoutMs: 1_000,
+    pollMs: 1,
+    cwd: '/fixture',
+  }, {
+    platform: 'linux',
+    createRunId: () => {
+      generated++;
+      return runId;
+    },
+    launch: options => {
+      observed.push(['launch', options.runId]);
+      return { pid: 7331 };
+    },
+    capture: async () => rootIdentity,
+    startMonitor: () => ({ stop: async () => [] }),
+    waitForReport: async (_reportPath, options) => ({
+      ...(options.phase === 'final' ? startupReport(finalMilestones) : startupReport(targetMilestones)),
+      pid: 7331,
+    }),
+    delay: async () => undefined,
+    sample: (identity, context) => {
+      observed.push(['sample', context.runId, context.platform]);
+      return {
+        rootPid: identity.pid,
+        rootIdentity: identity,
+        processIds: [identity.pid],
+        processCount: 1,
+        rssBytes: 1,
+        processes: [{ ...identity, ppid: 1 }],
+      };
+    },
+    terminate: async cleanup => {
+      observed.push(['terminate', cleanup.runId]);
+    },
+  });
+
+  assert.equal(generated, 1);
+  assert.deepEqual(observed, [
+    ['launch', runId],
+    ['sample', runId, 'linux'],
+    ['terminate', runId],
+  ]);
+  assert.equal(JSON.stringify(result).includes(runId), false);
 });
 
 test('measurement preserves the captured detached POSIX group for cleanup after root exit', async () => {
@@ -2719,6 +3212,7 @@ test('measured process stdout and stderr are captured in per-run log files', asy
       stdoutLogPath,
       stderrLogPath,
       cwd: root,
+      runId: '7f7df1aa-a324-4fd4-b11c-4cc260a94d8f',
     });
     const stdoutErrorListenersBeforePersistence = child.stdout.listenerCount('error');
     const stderrErrorListenersBeforePersistence = child.stderr.listenerCount('error');
@@ -2837,6 +3331,7 @@ test('spawn rejection settles bounded captures and persists empty diagnostic log
         stdoutLogPath,
         stderrLogPath,
         cwd: root,
+        runId: '7f7df1aa-a324-4fd4-b11c-4cc260a94d8f',
         sourceEnvironment: { PATH: process.env.PATH },
       }),
       /ENOENT|spawn/i,
@@ -2849,6 +3344,7 @@ test('spawn rejection settles bounded captures and persists empty diagnostic log
 });
 
 test('spawn environment excludes sensitive keys while preserving required variables', () => {
+  const runId = '7f7df1aa-a324-4fd4-b11c-4cc260a94d8f';
   const prepared = filterSpawnEnvironment({
     PATH: '/fixture/bin',
     SAFE_SETTING: 'enabled',
@@ -2859,13 +3355,15 @@ test('spawn environment excludes sensitive keys while preserving required variab
     AUTH_HEADER: 'auth-value',
     XAUTHORITY: '/fixture/.Xauthority',
     RIDE_STARTUP_REPORT: 'stale-report',
-  }, '/fixture/current-report.json');
+    RIDE_STARTUP_RUN_ID: 'stale-run-id',
+  }, '/fixture/current-report.json', runId);
 
   assert.deepEqual(prepared.environment, {
     PATH: '/fixture/bin',
     SAFE_SETTING: 'enabled',
     XAUTHORITY: '/fixture/.Xauthority',
     RIDE_STARTUP_REPORT: '/fixture/current-report.json',
+    RIDE_STARTUP_RUN_ID: runId,
   });
   assert.deepEqual(new Set(prepared.sensitiveValues), new Set([
     'token-value',
@@ -2874,6 +3372,8 @@ test('spawn environment excludes sensitive keys while preserving required variab
     'cookie-value',
     'auth-value',
     '/fixture/.Xauthority',
+    'stale-run-id',
+    runId,
   ]));
 });
 
@@ -3151,6 +3651,125 @@ test('measurement cleanup failure rejects the campaign and is persisted in failu
   }
 });
 
+test('POSIX marker query failure fails the campaign without persisting marker or environment data', async () => {
+  const root = temporaryDirectory('marker-query-failure');
+  const executable = path.join(root, 'R-IDE');
+  const output = path.join(root, 'startup-metrics.json');
+  const runId = '7f7df1aa-a324-4fd4-b11c-4cc260a94d8f';
+  const leakedEnvironment = `RIDE_STARTUP_RUN_ID=${runId} PRIVATE_VALUE=do-not-persist`;
+  const rootIdentity = {
+    pid: 7331,
+    pgid: 7331,
+    creationTime: 'root-start',
+    startedAt: 1_000,
+  };
+  touch(executable);
+  try {
+    await assert.rejects(
+      runMeasurementCampaign({
+        executable,
+        output,
+        runs: 1,
+        idleMs: 0,
+        timeoutMs: 100,
+        pollMs: 1,
+      }, {
+        measure: options => measureOnce(options, {
+          platform: 'linux',
+          createRunId: () => runId,
+          launch: () => ({ pid: 7331 }),
+          capture: async () => rootIdentity,
+          startMonitor: async () => ({ stop: async () => [] }),
+          waitForReport: async (_reportPath, waitOptions) => waitOptions.phase === 'target'
+            ? startupReport(targetMilestones)
+            : startupReport(finalMilestones),
+          delay: async () => undefined,
+          sample: () => ({
+            rootPid: 7331,
+            rootIdentity,
+            processIds: [7331],
+            processCount: 1,
+            rssBytes: 1,
+            processes: [{ ...rootIdentity, ppid: 1 }],
+          }),
+          terminate: cleanup => terminateMeasuredTree(cleanup, 'linux', {
+            discoverMarked: () => {
+              throw new Error(leakedEnvironment);
+            },
+            delay: async () => undefined,
+            cleanupReadAttempts: 1,
+          }),
+        }),
+      }),
+      /startup cleanup incomplete: startup run marker query failed before SIGTERM/,
+    );
+
+    const failurePath = path.join(root, 'startup-metrics.failure.json');
+    const serialized = fs.readFileSync(failurePath, 'utf8');
+    const diagnostic = JSON.parse(serialized);
+    assert.match(diagnostic.error.message, /startup run marker query failed before SIGTERM/);
+    assert.equal(serialized.includes(runId), false);
+    assert.equal(serialized.includes('PRIVATE_VALUE'), false);
+    assert.equal(serialized.includes('do-not-persist'), false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('campaign redacts its per-run marker from rejection, diagnostics, and invalid reports', async () => {
+  const root = temporaryDirectory('run-marker-redaction');
+  const executable = path.join(root, 'R-IDE');
+  const output = path.join(root, 'startup-metrics.json');
+  const runId = '7f7df1aa-a324-4fd4-b11c-4cc260a94d8f';
+  const privateValue = 'do-not-persist-marker-environment';
+  touch(executable);
+  let rejection;
+  try {
+    try {
+      await runMeasurementCampaign({
+        executable,
+        output,
+        runs: 1,
+        idleMs: 0,
+        timeoutMs: 100,
+        pollMs: 1,
+      }, {
+        environment: {
+          PATH: process.env.PATH,
+          RIDE_STARTUP_RUN_ID: 'stale-run-id',
+          PRIVATE_SECRET: privateValue,
+        },
+        measure: async options => {
+          options.onRunId(runId);
+          fs.writeFileSync(options.reportPath, JSON.stringify({
+            ...startupReport(targetMilestones),
+            leakedEnvironment: `RIDE_STARTUP_RUN_ID=${runId} ${privateValue}`,
+          }));
+          const failure = new Error(`measurement failed ${runId} ${privateValue}`);
+          failure.name = `MarkerFailure-${runId}-${privateValue}`;
+          throw failure;
+        },
+      });
+    } catch (error) {
+      rejection = error;
+    }
+
+    assert.ok(rejection instanceof Error);
+    assert.match(rejection.message, /measurement failed/);
+    assert.equal(String(rejection.stack).includes(runId), false);
+    assert.equal(String(rejection.stack).includes(privateValue), false);
+    const serialized = fs.readFileSync(path.join(root, 'startup-metrics.failure.json'), 'utf8');
+    const diagnostic = JSON.parse(serialized);
+    assert.equal(serialized.includes(runId), false);
+    assert.equal(serialized.includes(privateValue), false);
+    assert.equal(serialized.includes('stale-run-id'), false);
+    assert.equal(diagnostic.startupReport.invalid, true);
+    assert.match(diagnostic.startupReport.error, /unexpected report field/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('timeout diagnostic without a report preserves logs and omits report content', async () => {
   const root = temporaryDirectory('timeout-diagnostic');
   const executable = path.join(root, 'R-IDE');
@@ -3256,7 +3875,11 @@ test('failure artifacts bound and redact oversized logs and error messages', asy
           throw new Error(`startup failed with ${secret}`);
         },
       }),
-      /fixture-super-secret-value/,
+      error => {
+        assert.match(error.message, /startup failed with \[REDACTED\]/);
+        assert.equal(String(error.stack).includes(secret), false);
+        return true;
+      },
     );
 
     const diagnosticText = fs.readFileSync(
