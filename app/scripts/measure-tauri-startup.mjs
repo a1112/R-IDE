@@ -28,6 +28,17 @@ const MILESTONES = [
   'plugins_started',
   'plugins_ready',
 ];
+const RUST_PLATFORMS = new Set(['windows', 'linux', 'macos']);
+const RUST_ARCHITECTURES = new Set(['x86_64', 'aarch64']);
+const NODE_TO_RUST_PLATFORM = {
+  win32: 'windows',
+  linux: 'linux',
+  darwin: 'macos',
+};
+const NODE_TO_RUST_ARCHITECTURE = {
+  x64: 'x86_64',
+  arm64: 'aarch64',
+};
 
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const applicationRoot = path.resolve(scriptDirectory, '..');
@@ -134,7 +145,23 @@ function assertExactKeys(value, allowed, name) {
   }
 }
 
-export function parseStartupReport(serialized) {
+function currentRustTarget() {
+  const platform = NODE_TO_RUST_PLATFORM[process.platform];
+  const arch = NODE_TO_RUST_ARCHITECTURE[process.arch];
+  if (!platform || !arch) {
+    throw new Error(`unsupported measurement runner ${process.platform}/${process.arch}`);
+  }
+  return { platform, arch };
+}
+
+export function parseStartupReport(
+  serialized,
+  {
+    expectedPlatform = currentRustTarget().platform,
+    expectedArch = currentRustTarget().arch,
+    phase = 'target',
+  } = {},
+) {
   let report;
   try {
     report = JSON.parse(serialized);
@@ -150,26 +177,46 @@ export function parseStartupReport(serialized) {
   if (report.schema !== REPORT_SCHEMA || report.version !== REPORT_VERSION) {
     throw new Error(`unsupported startup report schema ${report.schema}@${report.version}`);
   }
-  if (typeof report.platform !== 'string' || report.platform.length === 0) {
-    throw new Error('startup report platform must be a non-empty string');
+  if (!RUST_PLATFORMS.has(report.platform)) {
+    throw new Error(`unsupported startup report platform ${report.platform}`);
   }
-  if (typeof report.arch !== 'string' || report.arch.length === 0) {
-    throw new Error('startup report arch must be a non-empty string');
+  if (!RUST_ARCHITECTURES.has(report.arch)) {
+    throw new Error(`unsupported startup report architecture ${report.arch}`);
+  }
+  if (!RUST_PLATFORMS.has(expectedPlatform) || !RUST_ARCHITECTURES.has(expectedArch)) {
+    throw new Error(`unsupported expected startup target ${expectedPlatform}/${expectedArch}`);
+  }
+  if (report.platform !== expectedPlatform) {
+    throw new Error(
+      `startup report platform ${report.platform} does not match expected ${expectedPlatform}`,
+    );
+  }
+  if (report.arch !== expectedArch) {
+    throw new Error(`startup report architecture ${report.arch} does not match expected ${expectedArch}`);
   }
   if (!Number.isSafeInteger(report.pid) || report.pid <= 0) {
     throw new Error('startup report pid must be a positive safe integer');
   }
   assertPlainObject(report.milestones, 'startup report milestones');
   assertExactKeys(report.milestones, new Set(MILESTONES), 'milestone');
-  if (!Object.hasOwn(report.milestones, 'process_started')) {
-    throw new Error('startup report must contain process_started');
+  if (phase !== 'incremental' && phase !== 'target' && phase !== 'final') {
+    throw new Error(`unsupported startup report phase ${phase}`);
+  }
+  const milestoneKeys = Object.keys(report.milestones);
+  const expectedPrefix = MILESTONES.slice(0, milestoneKeys.length);
+  const requiredPrefixLength = phase === 'incremental' ? 1 : 6;
+  if (milestoneKeys.length < requiredPrefixLength
+      || milestoneKeys.some((milestone, index) => milestone !== expectedPrefix[index])) {
+    throw new Error(phase === 'incremental'
+      ? 'startup report must contain a non-empty canonical milestone prefix'
+      : 'startup report must contain the canonical milestone prefix through target_file_opened');
+  }
+  if (phase === 'final' && milestoneKeys.length !== MILESTONES.length) {
+    throw new Error('startup report must contain the complete final milestone sequence');
   }
 
   let latest = -1;
-  for (const milestone of MILESTONES) {
-    if (!Object.hasOwn(report.milestones, milestone)) {
-      continue;
-    }
+  for (const milestone of milestoneKeys) {
     const elapsed = report.milestones[milestone];
     if (!Number.isSafeInteger(elapsed) || elapsed < 0) {
       throw new Error(`milestone ${milestone} must be a non-negative safe integer`);
@@ -303,14 +350,44 @@ export function sampleProcessTree(rootPid, platform = process.platform) {
 
 export async function waitForStartupReport(
   reportPath,
-  { timeoutMs = 300_000, pollMs = 100 } = {},
+  {
+    timeoutMs = 300_000,
+    pollMs = 100,
+    phase = 'target',
+    expectedPlatform,
+    expectedArch,
+  } = {},
 ) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() <= deadline) {
     try {
-      const report = parseStartupReport(await fs.promises.readFile(reportPath, 'utf8'));
-      if (Object.hasOwn(report.milestones, 'target_file_opened')) {
-        return report;
+      const serialized = await fs.promises.readFile(reportPath, 'utf8');
+      const report = parseStartupReport(serialized, {
+        expectedPlatform,
+        expectedArch,
+        phase: 'incremental',
+      });
+      const milestoneCount = Object.keys(report.milestones).length;
+      if (phase === 'target') {
+        if (milestoneCount >= 6) {
+          return parseStartupReport(serialized, {
+            expectedPlatform,
+            expectedArch,
+            phase: 'target',
+          });
+        }
+        await new Promise(resolve => setTimeout(resolve, pollMs));
+        continue;
+      }
+      if (phase !== 'final') {
+        throw new Error(`unsupported startup report phase ${phase}`);
+      }
+      if (milestoneCount === MILESTONES.length) {
+        return parseStartupReport(serialized, {
+          expectedPlatform,
+          expectedArch,
+          phase: 'final',
+        });
       }
     } catch (error) {
       if (error.code !== 'ENOENT') {
@@ -391,6 +468,8 @@ const defaultMeasurementDependencies = {
 };
 
 export async function measureOnce(options, dependencies = defaultMeasurementDependencies) {
+  const now = dependencies.now ?? Date.now;
+  const deadline = now() + options.timeoutMs;
   const child = await dependencies.launch(options);
   const rootPid = positiveInteger(child?.pid, 'spawned root pid');
   if (rootPid === 0) {
@@ -398,8 +477,11 @@ export async function measureOnce(options, dependencies = defaultMeasurementDepe
   }
   try {
     const startupReport = await dependencies.waitForReport(options.reportPath, {
-      timeoutMs: options.timeoutMs,
+      timeoutMs: Math.max(0, deadline - now()),
       pollMs: options.pollMs,
+      phase: 'target',
+      expectedPlatform: options.expectedPlatform,
+      expectedArch: options.expectedArch,
     });
     if (startupReport.pid !== rootPid) {
       throw new Error(
@@ -408,7 +490,19 @@ export async function measureOnce(options, dependencies = defaultMeasurementDepe
     }
     await dependencies.delay(options.idleMs);
     const metrics = dependencies.sample(rootPid);
-    return { startupReport, metrics };
+    const finalStartupReport = await dependencies.waitForReport(options.reportPath, {
+      timeoutMs: Math.max(0, deadline - now()),
+      pollMs: options.pollMs,
+      phase: 'final',
+      expectedPlatform: options.expectedPlatform,
+      expectedArch: options.expectedArch,
+    });
+    if (finalStartupReport.pid !== rootPid) {
+      throw new Error(
+        `final startup report pid ${finalStartupReport.pid} does not match spawned root pid ${rootPid}`,
+      );
+    }
+    return { startupReport: finalStartupReport, metrics };
   } finally {
     await dependencies.terminate(rootPid);
   }

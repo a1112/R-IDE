@@ -123,10 +123,84 @@ class FakeOpenerService implements OpenerService {
 
 class FakeMessageService {
     readonly errors: string[] = [];
+    errorToThrow: Error | undefined;
 
-    async error(message: string): Promise<undefined> {
+    error(message: string): Promise<undefined> {
         this.errors.push(message);
-        return undefined;
+        if (this.errorToThrow) {
+            throw this.errorToThrow;
+        }
+        return Promise.resolve(undefined);
+    }
+}
+
+interface Deferred<T> {
+    promise: Promise<T>;
+    resolve(value: T | PromiseLike<T>): void;
+    reject(reason?: unknown): void;
+}
+
+function deferred<T = void>(): Deferred<T> {
+    let resolve!: (value: T | PromiseLike<T>) => void;
+    let reject!: (reason?: unknown) => void;
+    const promise = new Promise<T>((promiseResolve, promiseReject) => {
+        resolve = promiseResolve;
+        reject = promiseReject;
+    });
+    return { promise, resolve, reject };
+}
+
+class FakeApplicationStateService {
+    readonly reachedStates: string[] = [];
+    protected readonly attached = deferred<void>();
+
+    constructor(attached = true) {
+        if (attached) {
+            this.attached.resolve();
+        }
+    }
+
+    reachedState(state: string): Promise<void> {
+        this.reachedStates.push(state);
+        assert.equal(state, 'attached_shell');
+        return this.attached.promise;
+    }
+
+    attach(): void {
+        this.attached.resolve();
+    }
+
+    reject(error: Error): void {
+        this.attached.reject(error);
+    }
+}
+
+class FakeHostedPluginSupport {
+    protected readonly willStartDeferred = deferred<void>();
+    protected readonly didStartDeferred = deferred<void>();
+
+    get willStart(): Promise<void> {
+        return this.willStartDeferred.promise;
+    }
+
+    get didStart(): Promise<void> {
+        return this.didStartDeferred.promise;
+    }
+
+    resolveWillStart(): void {
+        this.willStartDeferred.resolve();
+    }
+
+    rejectWillStart(error: Error): void {
+        this.willStartDeferred.reject(error);
+    }
+
+    resolveDidStart(): void {
+        this.didStartDeferred.resolve();
+    }
+
+    rejectDidStart(error: Error): void {
+        this.didStartDeferred.reject(error);
     }
 }
 
@@ -144,7 +218,10 @@ class FakeNativeChrome {
     unlistenCalls = 0;
     protected handler: ((request: RideOpenRequest) => void) | undefined;
 
+    constructor(protected readonly onListen: () => void = () => undefined) { }
+
     async listenForOpenRequests(handler: (request: RideOpenRequest) => void): Promise<() => void> {
+        this.onListen();
         this.registrations++;
         this.handler = handler;
         return () => {
@@ -172,12 +249,19 @@ async function flushRequestChain(): Promise<void> {
     await new Promise<void>(resolve => setImmediate(resolve));
 }
 
+async function flushLifecycle(): Promise<void> {
+    await Promise.resolve();
+    await flushRequestChain();
+}
+
 function createContribution(
     workspacePath = String.raw`C:\project`,
     storage = new MemoryStorage(),
     beforeOpen: (uri: URI) => void = () => undefined,
     reportStartupMilestone: (milestone: RideStartupMilestone) => Promise<void>
-        = async () => undefined
+        = async () => undefined,
+    applicationState = new FakeApplicationStateService(),
+    hostedPlugins = new FakeHostedPluginSupport()
 ): {
     contribution: RideOpenRequestContribution;
     workspace: FakeWorkspaceService;
@@ -187,12 +271,19 @@ function createContribution(
     native: FakeNativeChrome;
     storage: MemoryStorage;
     milestones: RideStartupMilestone[];
+    applicationState: FakeApplicationStateService;
+    hostedPlugins: FakeHostedPluginSupport;
+    events: string[];
 } {
     const workspace = new FakeWorkspaceService({ resource: FileUri.create(workspacePath) });
-    const openers = new FakeOpenerService(beforeOpen);
+    const events: string[] = [];
+    const openers = new FakeOpenerService(uri => {
+        events.push(`open:${uri.path.toString()}`);
+        beforeOpen(uri);
+    });
     const messages = new FakeMessageService();
     const shell = new FakeShell();
-    const native = new FakeNativeChrome();
+    const native = new FakeNativeChrome(() => events.push('listen'));
     const milestones: RideStartupMilestone[] = [];
     const contribution = new RideOpenRequestContribution(
         workspace as never,
@@ -200,13 +291,28 @@ function createContribution(
         messages as never,
         shell as never,
         native as never,
+        applicationState as never,
+        hostedPlugins as never,
         storage,
         async milestone => {
             milestones.push(milestone);
+            events.push(`milestone:${milestone}`);
             await reportStartupMilestone(milestone);
         }
     );
-    return { contribution, workspace, openers, messages, shell, native, storage, milestones };
+    return {
+        contribution,
+        workspace,
+        openers,
+        messages,
+        shell,
+        native,
+        storage,
+        milestones,
+        applicationState,
+        hostedPlugins,
+        events
+    };
 }
 
 test('same-workspace requests open files in order, activate the target editor, and consume duplicate IDs once', async () => {
@@ -487,7 +593,8 @@ test('native listener preserves consecutive cross-workspace requests across orde
         id: '22', source: 'singleInstance', workspace: '/workspace-c', files: ['/workspace-c/c.R']
     };
     const firstWindow = createContribution('/workspace-x', storage);
-    await firstWindow.contribution.onStart();
+    firstWindow.contribution.onStart();
+    await flushLifecycle();
 
     firstWindow.native.emit(requestA);
     firstWindow.native.emit(requestB);
@@ -1073,6 +1180,116 @@ test('browser-preview open-request listener is a no-op', async () => {
     assert.equal(registrations, 0);
 });
 
+test('frontend contribution start schedules initialization without returning its attached-shell wait', async () => {
+    const context = createContribution('/project');
+
+    const returned = context.contribution.onStart();
+
+    assert.equal(returned, undefined);
+    await flushLifecycle();
+    context.contribution.onStop();
+});
+
+test('frontend initialization waits for attached shell before reporting, restoring, and listening', async () => {
+    const storage = new MemoryStorage();
+    storage.setItem(RIDE_OPEN_REQUEST_STATE_KEY, JSON.stringify(stateEnvelope('31', {
+        id: '31',
+        source: 'initial',
+        workspace: '/project',
+        files: ['/project/attached.R']
+    })));
+    const applicationState = new FakeApplicationStateService(false);
+    const context = createContribution(
+        '/project',
+        storage,
+        () => undefined,
+        async () => undefined,
+        applicationState
+    );
+
+    assert.equal(context.contribution.onStart(), undefined);
+    assert.equal(context.contribution.onStart(), undefined);
+    await flushLifecycle();
+    assert.deepEqual(applicationState.reachedStates, ['attached_shell']);
+    assert.deepEqual(context.milestones, []);
+    assert.deepEqual(context.openers.opened, []);
+    assert.equal(context.native.registrations, 0);
+
+    applicationState.attach();
+    await flushLifecycle();
+    assert.deepEqual(context.events, [
+        'milestone:frontend_shell_attached',
+        'open:/project/attached.R',
+        'milestone:target_file_opened',
+        'listen'
+    ]);
+    assert.equal(context.native.registrations, 1);
+});
+
+test('attached-shell rejection is reported without restoring, listening, or leaking initialization', async () => {
+    const applicationState = new FakeApplicationStateService(false);
+    const context = createContribution(
+        '/project',
+        new MemoryStorage(),
+        () => undefined,
+        async () => undefined,
+        applicationState
+    );
+
+    context.contribution.onStart();
+    applicationState.reject(new Error('shell attachment failed'));
+    await flushLifecycle();
+
+    assert.equal(context.native.registrations, 0);
+    assert.deepEqual(context.milestones, []);
+    assert.equal(context.openers.opened.length, 0);
+    assert.match(context.messages.errors[0], /shell attachment failed/);
+});
+
+test('a synchronous notification failure is caught without an unhandled initialization rejection', async () => {
+    const warnings: unknown[][] = [];
+    const originalWarn = console.warn;
+    console.warn = (...values: unknown[]) => {
+        warnings.push(values);
+    };
+    try {
+        const applicationState = new FakeApplicationStateService(false);
+        const context = createContribution(
+            '/project', new MemoryStorage(), () => undefined, async () => undefined, applicationState
+        );
+        context.messages.errorToThrow = new Error('notification unavailable');
+
+        context.contribution.onStart();
+        applicationState.reject(new Error('shell attachment failed'));
+        await flushLifecycle();
+
+        assert.equal(warnings.length, 1);
+        assert.match(String(warnings[0][1]), /notification unavailable/);
+    } finally {
+        console.warn = originalWarn;
+    }
+});
+
+test('disposing before shell attachment cancels deferred initialization', async () => {
+    const applicationState = new FakeApplicationStateService(false);
+    const context = createContribution(
+        '/project',
+        new MemoryStorage(),
+        () => undefined,
+        async () => undefined,
+        applicationState
+    );
+
+    context.contribution.onStart();
+    context.contribution.onStop();
+    applicationState.attach();
+    await flushLifecycle();
+
+    assert.deepEqual(context.milestones, []);
+    assert.equal(context.native.registrations, 0);
+    assert.equal(context.openers.opened.length, 0);
+});
+
 test('frontend lifecycle restores and registers once, then unlistens once on cleanup', async () => {
     const storage = new MemoryStorage();
     storage.setItem(RIDE_OPEN_REQUEST_STATE_KEY, JSON.stringify(stateEnvelope('12', {
@@ -1085,6 +1302,7 @@ test('frontend lifecycle restores and registers once, then unlistens once on cle
 
     await context.contribution.onStart();
     await context.contribution.onStart();
+    await flushLifecycle();
 
     assert.equal(context.openers.opened.length, 1);
     assert.equal(context.native.registrations, 1);
@@ -1118,6 +1336,130 @@ test('target-file milestone is emitted only after a target opens successfully', 
     assert.deepEqual(succeeded.milestones, ['target_file_opened']);
 });
 
+test('already-resolved plugin lifecycle is reported after the target in canonical order', async () => {
+    const hostedPlugins = new FakeHostedPluginSupport();
+    hostedPlugins.resolveDidStart();
+    hostedPlugins.resolveWillStart();
+    const context = createContribution(
+        '/project',
+        new MemoryStorage(),
+        () => undefined,
+        async () => undefined,
+        new FakeApplicationStateService(),
+        hostedPlugins
+    );
+
+    await context.contribution.handleOpenRequest({
+        id: '41', source: 'initial', workspace: '/project', files: ['/project/early-plugin.R']
+    });
+    await flushLifecycle();
+
+    assert.deepEqual(context.milestones, [
+        'target_file_opened',
+        'plugins_started',
+        'plugins_ready'
+    ]);
+});
+
+test('late plugin lifecycle is observed in the background without blocking target opening', async () => {
+    const hostedPlugins = new FakeHostedPluginSupport();
+    const context = createContribution(
+        '/project',
+        new MemoryStorage(),
+        () => undefined,
+        async () => undefined,
+        new FakeApplicationStateService(),
+        hostedPlugins
+    );
+
+    await context.contribution.handleOpenRequest({
+        id: '42', source: 'initial', workspace: '/project', files: ['/project/late-plugin.R']
+    });
+    assert.deepEqual(context.milestones, ['target_file_opened']);
+
+    hostedPlugins.resolveWillStart();
+    await flushLifecycle();
+    assert.deepEqual(context.milestones, ['target_file_opened', 'plugins_started']);
+
+    hostedPlugins.resolveDidStart();
+    await flushLifecycle();
+    assert.deepEqual(context.milestones, [
+        'target_file_opened',
+        'plugins_started',
+        'plugins_ready'
+    ]);
+});
+
+test('plugin lifecycle rejection warns once without blocking files or producing false milestones', async () => {
+    const warnings: unknown[][] = [];
+    const originalWarn = console.warn;
+    console.warn = (...values: unknown[]) => {
+        warnings.push(values);
+    };
+    try {
+        const rejectedWill = new FakeHostedPluginSupport();
+        rejectedWill.rejectWillStart(new Error('willStart failed'));
+        const first = createContribution(
+            '/project', new MemoryStorage(), () => undefined, async () => undefined,
+            new FakeApplicationStateService(), rejectedWill
+        );
+        await first.contribution.handleOpenRequest({
+            id: '43', source: 'initial', workspace: '/project', files: ['/project/will-reject.R']
+        });
+        await flushLifecycle();
+        assert.deepEqual(first.milestones, ['target_file_opened']);
+
+        const rejectedDid = new FakeHostedPluginSupport();
+        rejectedDid.resolveWillStart();
+        rejectedDid.rejectDidStart(new Error('didStart failed'));
+        const second = createContribution(
+            '/project', new MemoryStorage(), () => undefined, async () => undefined,
+            new FakeApplicationStateService(), rejectedDid
+        );
+        await second.contribution.handleOpenRequest({
+            id: '44', source: 'initial', workspace: '/project', files: ['/project/did-reject.R']
+        });
+        await flushLifecycle();
+        assert.deepEqual(second.milestones, ['target_file_opened', 'plugins_started']);
+        assert.equal(warnings.length, 2);
+    } finally {
+        console.warn = originalWarn;
+    }
+});
+
+test('plugin lifecycle reports once and stops after contribution disposal', async () => {
+    const hostedPlugins = new FakeHostedPluginSupport();
+    const context = createContribution(
+        '/project', new MemoryStorage(), () => undefined, async () => undefined,
+        new FakeApplicationStateService(), hostedPlugins
+    );
+    await context.contribution.handleOpenRequest({
+        id: '45', source: 'initial', workspace: '/project', files: ['/project/dispose-plugin.R']
+    });
+    context.contribution.dispose();
+    hostedPlugins.resolveWillStart();
+    hostedPlugins.resolveDidStart();
+    await flushLifecycle();
+    assert.deepEqual(context.milestones, ['target_file_opened']);
+
+    const oncePlugins = new FakeHostedPluginSupport();
+    oncePlugins.resolveWillStart();
+    oncePlugins.resolveDidStart();
+    const once = createContribution(
+        '/project', new MemoryStorage(), () => undefined, async () => undefined,
+        new FakeApplicationStateService(), oncePlugins
+    );
+    await once.contribution.handleOpenRequest({
+        id: '46', source: 'initial', workspace: '/project', files: ['/project/once-a.R']
+    });
+    await once.contribution.handleOpenRequest({
+        id: '47', source: 'singleInstance', workspace: '/project', files: ['/project/once-b.R']
+    });
+    await flushLifecycle();
+    assert.deepEqual(once.milestones.filter(milestone => milestone === 'plugins_started'), ['plugins_started']);
+    assert.deepEqual(once.milestones.filter(milestone => milestone === 'plugins_ready'), ['plugins_ready']);
+});
+
 test('startup reporting failures do not prevent lifecycle registration or opening', async () => {
     const warnings: unknown[][] = [];
     const originalWarn = console.warn;
@@ -1134,7 +1476,8 @@ test('startup reporting failures do not prevent lifecycle registration or openin
             }
         );
 
-        await context.contribution.onStart();
+        context.contribution.onStart();
+        await flushLifecycle();
         await context.contribution.handleOpenRequest({
             id: '23',
             source: 'initial',
@@ -1178,7 +1521,8 @@ test('frontend startup waits for the workspace before restoring pending files', 
     assert.deepEqual(context.openers.opened, []);
 
     markReady!();
-    await started;
+    assert.equal(started, undefined);
+    await flushLifecycle();
     assert.deepEqual(readState(storage), stateEnvelope('14'));
     assert.equal(context.openers.opened.length, 1);
 });

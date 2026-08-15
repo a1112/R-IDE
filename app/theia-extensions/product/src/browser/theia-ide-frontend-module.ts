@@ -10,6 +10,7 @@
 import '../../src/browser/style/index.css';
 
 import { ApplicationShell } from '@theia/core/lib/browser';
+import { FrontendApplicationStateService } from '@theia/core/lib/browser/frontend-application-state';
 import { FrontendApplicationContribution } from '@theia/core/lib/browser/frontend-application-contribution';
 import { AboutDialog } from '@theia/core/lib/browser/about-dialog';
 import { applyBranding } from './theia-ide-config';
@@ -19,6 +20,7 @@ import { MessageService } from '@theia/core/lib/common/message-service';
 import { MenuContribution } from '@theia/core/lib/common/menu';
 import { OpenerService } from '@theia/core/lib/browser/opener-service';
 import { WorkspaceService } from '@theia/workspace/lib/browser';
+import { HostedPluginSupport } from '@theia/plugin-ext/lib/hosted/browser/hosted-plugin';
 import { TheiaIDEAboutDialog } from './theia-ide-about-dialog';
 import { TheiaIDEContribution } from './theia-ide-contribution';
 import { RideNativeChrome } from './ride-native-chrome';
@@ -49,7 +51,9 @@ export default new ContainerModule((bind, _unbind, isBound, rebind) => {
         context.container.get(OpenerService),
         context.container.get(MessageService),
         context.container.get(ApplicationShell),
-        context.container.get(RideNativeChrome)
+        context.container.get(RideNativeChrome),
+        context.container.get(FrontendApplicationStateService),
+        context.container.get(HostedPluginSupport)
     )).inSingletonScope();
     bind(FrontendApplicationContribution).toService(RideOpenRequestContribution);
 });

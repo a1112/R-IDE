@@ -10,6 +10,7 @@
 import type { ApplicationShell } from '@theia/core/lib/browser/shell/application-shell';
 import { invoke, isTauri as isTauriRuntime } from '@tauri-apps/api/core';
 import type { FrontendApplicationContribution } from '@theia/core/lib/browser/frontend-application-contribution';
+import type { FrontendApplicationStateService } from '@theia/core/lib/browser/frontend-application-state';
 import { open } from '@theia/core/lib/browser/opener-service';
 import type { OpenerService } from '@theia/core/lib/browser/opener-service';
 import type { WidgetOpenerOptions } from '@theia/core/lib/browser/widget-open-handler';
@@ -17,6 +18,7 @@ import type { Disposable } from '@theia/core/lib/common/disposable';
 import { FileUri } from '@theia/core/lib/common/file-uri';
 import type { MessageService } from '@theia/core/lib/common/message-service';
 import type { WorkspaceService } from '@theia/workspace/lib/browser';
+import type { HostedPluginSupport } from '@theia/plugin-ext/lib/hosted/browser/hosted-plugin';
 import type { RideNativeChrome } from './ride-native-chrome';
 
 const MAX_U64_ID = '18446744073709551615';
@@ -35,6 +37,10 @@ export type RideStartupMilestone =
     | 'plugins_ready';
 
 type StartupMilestoneReporter = (milestone: RideStartupMilestone) => Promise<void>;
+
+type ObservedPluginPromise =
+    | { readonly succeeded: true }
+    | { readonly succeeded: false; readonly error: unknown };
 
 export interface RideOpenRequest {
     id: string;
@@ -67,6 +73,9 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
     protected disposed = false;
     protected unlisten: (() => void) | undefined;
     protected requestChain = Promise.resolve();
+    protected pluginObservationStarted = false;
+    protected readonly pluginWillStart: Promise<ObservedPluginPromise>;
+    protected readonly pluginDidStart: Promise<ObservedPluginPromise>;
 
     constructor(
         protected readonly workspaceService: WorkspaceService,
@@ -74,22 +83,37 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
         protected readonly messageService: MessageService,
         protected readonly shell: ApplicationShell,
         protected readonly nativeChrome: RideNativeChrome,
+        protected readonly applicationState: FrontendApplicationStateService,
+        hostedPlugins: HostedPluginSupport,
         storage?: Storage,
         protected readonly startupMilestoneReporter: StartupMilestoneReporter = reportRideStartupMilestone
     ) {
         this.storage = storage ?? window.sessionStorage;
+        this.pluginWillStart = observePluginPromise(hostedPlugins.willStart);
+        this.pluginDidStart = observePluginPromise(hostedPlugins.didStart);
     }
 
-    async onStart(): Promise<void> {
+    onStart(): void {
         if (this.started || this.disposed) {
             return;
         }
         this.started = true;
-        await this.workspaceService.ready;
+        this.initializeAfterShellAttached().catch(error => this.reportInitializationFailure(error));
+    }
+
+    protected async initializeAfterShellAttached(): Promise<void> {
+        await this.applicationState.reachedState('attached_shell');
         if (this.disposed) {
             return;
         }
         await this.reportStartupMilestone('frontend_shell_attached');
+        if (this.disposed) {
+            return;
+        }
+        await this.workspaceService.ready;
+        if (this.disposed) {
+            return;
+        }
         await this.restorePendingRequest();
         if (this.disposed) {
             return;
@@ -104,6 +128,18 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
             }
         } catch (error) {
             await this.messageService.error(`R-IDE could not listen for file-open requests: ${errorMessage(error)}`);
+        }
+    }
+
+    protected reportInitializationFailure(error: unknown): void {
+        try {
+            this.messageService
+                .error(`R-IDE could not initialize file-open activation: ${errorMessage(error)}`)
+                .catch(notificationError => {
+                    console.warn('[R-IDE] Failed to report file-open initialization failure.', notificationError);
+                });
+        } catch (notificationError) {
+            console.warn('[R-IDE] Failed to report file-open initialization failure.', notificationError);
         }
     }
 
@@ -208,7 +244,40 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
         }
         if (openedTarget) {
             await this.reportStartupMilestone('target_file_opened');
+            this.startPluginObservation();
         }
+    }
+
+    protected startPluginObservation(): void {
+        if (this.pluginObservationStarted || this.disposed) {
+            return;
+        }
+        this.pluginObservationStarted = true;
+        this.observePluginLifecycle().catch(error => {
+            console.warn('[R-IDE] Failed to observe the plugin lifecycle.', error);
+        });
+    }
+
+    protected async observePluginLifecycle(): Promise<void> {
+        const willStart = await this.pluginWillStart;
+        if (this.disposed) {
+            return;
+        }
+        if (!willStart.succeeded) {
+            console.warn('[R-IDE] Failed to observe plugins starting.', willStart.error);
+            return;
+        }
+        await this.reportStartupMilestone('plugins_started');
+
+        const didStart = await this.pluginDidStart;
+        if (this.disposed) {
+            return;
+        }
+        if (!didStart.succeeded) {
+            console.warn('[R-IDE] Failed to observe plugins becoming ready.', didStart.error);
+            return;
+        }
+        await this.reportStartupMilestone('plugins_ready');
     }
 
     protected async reportStartupMilestone(milestone: RideStartupMilestone): Promise<void> {
@@ -486,4 +555,11 @@ export async function reportRideStartupMilestone(milestone: RideStartupMilestone
         return;
     }
     await invoke('ride_record_startup_milestone', { milestone });
+}
+
+function observePluginPromise(promise: Promise<void>): Promise<ObservedPluginPromise> {
+    return promise.then<ObservedPluginPromise, ObservedPluginPromise>(
+        () => ({ succeeded: true }),
+        error => ({ succeeded: false, error })
+    );
 }
