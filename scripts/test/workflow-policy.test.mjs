@@ -89,6 +89,10 @@ test('package jobs measure startup after verification and upload the unsigned JS
   assert.match(measurementBlock, /npm\s+run\s+measure:tauri-startup/);
   assert.match(measurementBlock, /--output\s+applications\/tauri\/src-tauri\/target\/release\/bundle\/startup-metrics\.json/);
 
+  const uploadBlock = packageJob.text.slice(uploadIndex);
+  assert.match(uploadBlock, /if:\s*always\(\)/);
+  assert.match(uploadBlock, /path:\s*app\/applications\/tauri\/src-tauri\/target\/release\/bundle\/\*\*/);
+
   const packageJson = JSON.parse(fs.readFileSync(path.join(repositoryRoot, 'app', 'package.json'), 'utf8'));
   assert.equal(packageJson.scripts?.['measure:tauri-startup'], 'node scripts/measure-tauri-startup.mjs');
 });
@@ -194,9 +198,25 @@ test('Linux Tauri prerequisites avoid conflicting AppIndicator development packa
   const workflow = readWorkflow();
   assert.match(workflow, /\blibayatana-appindicator3-dev\b/);
   assert.doesNotMatch(workflow, /(?:^|\n)\s*libappindicator3-dev\s*\\/m);
+  const qualityJob = jobBlocks(workflow).find(({ name }) => name === 'quality');
   const packageJob = jobBlocks(workflow).find(({ name }) => name === 'package');
+  assert.ok(qualityJob, 'quality job is required');
   assert.ok(packageJob, 'package job is required');
-  assert.match(packageJob.text, /\bxvfb\b/);
+  assert.doesNotMatch(qualityJob.text, /\bxvfb\b/);
+
+  const prerequisiteIndex = packageJob.text.indexOf('- name: Install Linux Tauri prerequisites');
+  const rustIndex = packageJob.text.indexOf('- name: Install Rust stable toolchain');
+  assert.ok(prerequisiteIndex >= 0, 'package job must install Linux prerequisites');
+  assert.ok(rustIndex > prerequisiteIndex, 'package prerequisites must precede Rust setup');
+  const packagePrerequisites = packageJob.text.slice(prerequisiteIndex, rustIndex);
+  assert.match(packagePrerequisites, /\bxvfb\b/);
+
+  const measurementIndex = packageJob.text.indexOf('- name: Measure packaged Tauri startup on Linux');
+  const nonLinuxIndex = packageJob.text.indexOf('- name: Measure packaged Tauri startup on non-Linux');
+  assert.ok(measurementIndex >= 0 && nonLinuxIndex > measurementIndex,
+    'package job must define the Linux measurement block');
+  const linuxMeasurement = packageJob.text.slice(measurementIndex, nonLinuxIndex);
+  assert.match(linuxMeasurement, /xvfb-run\s+-a\s+npm\s+run\s+measure:tauri-startup/);
 });
 
 test('quality job installs Linux Tauri prerequisites before Rust checks', () => {

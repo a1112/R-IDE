@@ -233,14 +233,22 @@ export function median(values) {
   if (!Array.isArray(values) || values.length === 0) {
     throw new Error('median requires at least one value');
   }
-  if (values.some(value => typeof value !== 'number' || !Number.isFinite(value))) {
-    throw new Error('median values must be finite numbers');
+  if (values.some(value => !Number.isSafeInteger(value) || value < 0)) {
+    throw new Error('median values must be non-negative safe integers');
   }
   const sorted = [...values].sort((left, right) => left - right);
   const middle = Math.floor(sorted.length / 2);
-  return sorted.length % 2 === 1
-    ? sorted[middle]
-    : (sorted[middle - 1] + sorted[middle]) / 2;
+  if (sorted.length % 2 === 1) {
+    return sorted[middle];
+  }
+  const exactSum = BigInt(sorted[middle - 1]) + BigInt(sorted[middle]);
+  if (exactSum % 2n !== 0n) {
+    if (exactSum > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw new Error('even samples do not have an exactly representable safe integer median');
+    }
+    return Number(exactSum) / 2;
+  }
+  return Number(exactSum / 2n);
 }
 
 function positiveInteger(value, name) {
@@ -257,17 +265,28 @@ export function parsePosixProcessTable(output) {
     if (!line.trim()) {
       continue;
     }
-    const fields = line.trim().split(/\s+/);
-    if (fields.length !== 3) {
+    const match = line.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(.+)$/);
+    if (!match) {
       throw new Error(`invalid ps process row: ${line}`);
     }
-    const pid = positiveInteger(fields[0], 'ps pid');
-    const ppid = positiveInteger(fields[1], 'ps ppid');
-    const rssKiB = positiveInteger(fields[2], 'ps RSS');
+    const pid = positiveInteger(match[1], 'ps pid');
+    const ppid = positiveInteger(match[2], 'ps ppid');
+    const pgid = positiveInteger(match[3], 'ps pgid');
+    const rssKiB = positiveInteger(match[4], 'ps RSS');
+    const creationTime = match[5].trim();
     if (pid === 0) {
       throw new Error('ps pid must be positive');
     }
-    rows.push({ pid, ppid, rssBytes: rssKiB * 1024 });
+    if (pgid === 0) {
+      throw new Error('ps pgid must be positive');
+    }
+    if (!creationTime) {
+      throw new Error('ps lstart must not be empty');
+    }
+    if (rssKiB > Math.floor(Number.MAX_SAFE_INTEGER / 1024)) {
+      throw new Error('ps RSS bytes must be a non-negative safe integer');
+    }
+    rows.push({ pid, ppid, pgid, rssBytes: rssKiB * 1024, creationTime });
   }
   return rows;
 }
@@ -280,41 +299,131 @@ export function parseWindowsProcessTable(output) {
     throw new Error(`PowerShell process table is not valid JSON: ${error.message}`);
   }
   const candidates = Array.isArray(payload) ? payload : [payload];
-  return candidates.map((candidate, index) => {
+  return candidates.flatMap((candidate, index) => {
     assertPlainObject(candidate, `PowerShell process row ${index}`);
     const pid = positiveInteger(candidate.ProcessId, 'PowerShell ProcessId');
+    if (pid === 0) {
+      return [];
+    }
     const ppid = positiveInteger(candidate.ParentProcessId, 'PowerShell ParentProcessId');
     const rssBytes = positiveInteger(candidate.WorkingSetSize, 'PowerShell WorkingSetSize');
-    if (pid === 0) {
-      throw new Error('PowerShell ProcessId must be positive');
+    const creationTime = candidate.CreationDate;
+    if (typeof creationTime !== 'string' || !creationTime.trim()) {
+      throw new Error('PowerShell CreationDate must be a non-empty string');
     }
-    return { pid, ppid, rssBytes };
+    return [{ pid, ppid, pgid: null, rssBytes, creationTime }];
   });
 }
 
-export function aggregateProcessTree(rows, rootPid) {
-  const verifiedRoot = positiveInteger(rootPid, 'spawned root pid');
-  if (!rows.some(row => row.pid === verifiedRoot)) {
-    throw new Error(`spawned root process ${verifiedRoot} is absent from the process table`);
+function processIdentity(row) {
+  return {
+    pid: row.pid,
+    pgid: row.pgid,
+    creationTime: row.creationTime,
+  };
+}
+
+function sameProcessIdentity(row, identity) {
+  return row.pid === identity.pid
+    && row.pgid === identity.pgid
+    && row.creationTime === identity.creationTime;
+}
+
+function validateProcessIdentity(identity, name = 'process identity') {
+  assertPlainObject(identity, name);
+  const pid = positiveInteger(identity.pid, `${name} pid`);
+  if (pid === 0) {
+    throw new Error(`${name} pid must be positive`);
   }
-  const processIds = new Set([verifiedRoot]);
+  if (identity.pgid !== null) {
+    const pgid = positiveInteger(identity.pgid, `${name} pgid`);
+    if (pgid === 0) {
+      throw new Error(`${name} pgid must be positive`);
+    }
+  }
+  if (typeof identity.creationTime !== 'string' || !identity.creationTime) {
+    throw new Error(`${name} creation time must be a non-empty string`);
+  }
+  return identity;
+}
+
+export function aggregateProcessTree(rows, rootIdentity) {
+  const verifiedIdentity = validateProcessIdentity(rootIdentity, 'spawned root identity');
+  const verifiedRoot = verifiedIdentity.pid;
+  if (!rows.some(row => sameProcessIdentity(row, verifiedIdentity))) {
+    throw new Error(`spawned root process ${verifiedRoot} does not match its captured identity`);
+  }
+  const depths = new Map([[verifiedRoot, 0]]);
   let changed = true;
   while (changed) {
     changed = false;
     for (const row of rows) {
-      if (!processIds.has(row.pid) && processIds.has(row.ppid)) {
-        processIds.add(row.pid);
+      if (!depths.has(row.pid) && depths.has(row.ppid)) {
+        depths.set(row.pid, depths.get(row.ppid) + 1);
         changed = true;
       }
     }
   }
-  const selected = rows.filter(row => processIds.has(row.pid));
+  const selected = rows.filter(row => depths.has(row.pid));
   const orderedIds = selected.map(row => row.pid).sort((left, right) => left - right);
+  let rssBytes = 0;
+  for (const row of selected) {
+    const processRssBytes = positiveInteger(row.rssBytes, `process ${row.pid} RSS bytes`);
+    if (rssBytes > Number.MAX_SAFE_INTEGER - processRssBytes) {
+      throw new Error('aggregate RSS bytes must be a non-negative safe integer');
+    }
+    rssBytes += processRssBytes;
+  }
   return {
     rootPid: verifiedRoot,
+    rootIdentity: { ...verifiedIdentity },
     processIds: orderedIds,
     processCount: orderedIds.length,
-    rssBytes: selected.reduce((total, row) => total + row.rssBytes, 0),
+    rssBytes,
+    processes: selected
+      .map(row => ({
+        pid: row.pid,
+        ppid: row.ppid,
+        pgid: row.pgid,
+        creationTime: row.creationTime,
+        depth: depths.get(row.pid),
+      }))
+      .sort((left, right) => left.pid - right.pid),
+  };
+}
+
+export function planProcessCleanup(
+  rows,
+  rootIdentity,
+  trackedProcesses = [],
+  { allowTree = true } = {},
+) {
+  const verifiedIdentity = validateProcessIdentity(rootIdentity, 'spawned root identity');
+  const rootMatches = rows.some(row => sameProcessIdentity(row, verifiedIdentity));
+  if (rootMatches && allowTree) {
+    return {
+      mode: 'tree',
+      rootPid: verifiedIdentity.pid,
+      pgid: verifiedIdentity.pgid,
+      processIds: [],
+    };
+  }
+
+  const currentByPid = new Map(rows.map(row => [row.pid, row]));
+  const trackedByPid = new Map(trackedProcesses.map(tracked => [tracked.pid, tracked]));
+  if (rootMatches && !trackedByPid.has(verifiedIdentity.pid)) {
+    trackedByPid.set(verifiedIdentity.pid, { ...verifiedIdentity, depth: 0 });
+  }
+  const processIds = [...trackedByPid.values()]
+    .filter(tracked => rootMatches || tracked.pid !== verifiedIdentity.pid)
+    .filter(tracked => sameProcessIdentity(currentByPid.get(tracked.pid) ?? {}, tracked))
+    .sort((left, right) => (right.depth ?? 0) - (left.depth ?? 0))
+    .map(tracked => tracked.pid);
+  return {
+    mode: 'pids',
+    rootPid: verifiedIdentity.pid,
+    pgid: verifiedIdentity.pgid,
+    processIds,
   };
 }
 
@@ -327,7 +436,7 @@ function readProcessTable(platform = process.platform) {
         '-NoProfile',
         '-NonInteractive',
         '-Command',
-        'Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,WorkingSetSize | ConvertTo-Json -Compress',
+        'Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,WorkingSetSize,CreationDate | ConvertTo-Json -Compress',
       ],
       { encoding: 'utf8', windowsHide: true },
     );
@@ -337,15 +446,53 @@ function readProcessTable(platform = process.platform) {
     return parseWindowsProcessTable(result.stdout);
   }
 
-  const result = spawnSync('ps', ['-axo', 'pid=,ppid=,rss='], { encoding: 'utf8' });
+  const result = spawnSync('ps', ['-axo', 'pid=,ppid=,pgid=,rss=,lstart='], { encoding: 'utf8' });
   if (result.error || result.status !== 0) {
     throw new Error(`ps process query failed: ${result.error?.message ?? result.stderr}`);
   }
   return parsePosixProcessTable(result.stdout);
 }
 
-export function sampleProcessTree(rootPid, platform = process.platform) {
-  return aggregateProcessTree(readProcessTable(platform), rootPid);
+export function sampleProcessTree(rootIdentity, platform = process.platform) {
+  return aggregateProcessTree(readProcessTable(platform), rootIdentity);
+}
+
+export async function captureProcessIdentity(
+  rootPid,
+  {
+    platform = process.platform,
+    timeoutMs = 2_000,
+    pollMs = 25,
+    read = readProcessTable,
+    delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds)),
+    now = Date.now,
+  } = {},
+) {
+  const verifiedRoot = positiveInteger(rootPid, 'spawned root pid');
+  if (verifiedRoot === 0) {
+    throw new Error('spawned root pid must be positive');
+  }
+  const deadline = now() + timeoutMs;
+  let lastReadError;
+  while (true) {
+    try {
+      const row = read(platform).find(candidate => candidate.pid === verifiedRoot);
+      if (row) {
+        return validateProcessIdentity(processIdentity(row), 'spawned root identity');
+      }
+      lastReadError = undefined;
+    } catch (error) {
+      lastReadError = error;
+    }
+    if (now() > deadline) {
+      break;
+    }
+    await delay(pollMs);
+  }
+  throw new Error(
+    `spawned root process ${verifiedRoot} did not appear in the process table`
+      + (lastReadError ? `: ${lastReadError.message}` : ''),
+  );
 }
 
 export async function waitForStartupReport(
@@ -399,68 +546,111 @@ export async function waitForStartupReport(
   throw new Error(`startup report timeout after ${timeoutMs}ms: ${reportPath}`);
 }
 
-async function launchMeasuredProcess({ executable, codeFile, reportPath, cwd }) {
-  const child = spawn(executable, [codeFile], {
-    cwd,
-    detached: process.platform !== 'win32',
-    env: { ...process.env, RIDE_STARTUP_REPORT: reportPath },
-    stdio: 'ignore',
-    windowsHide: true,
-  });
-  await new Promise((resolve, reject) => {
-    child.once('spawn', resolve);
-    child.once('error', reject);
-  });
-  return child;
-}
-
-async function terminateMeasuredTree(rootPid, platform = process.platform) {
-  if (!Number.isSafeInteger(rootPid) || rootPid <= 0) {
-    return;
-  }
-  if (platform === 'win32') {
-    spawnSync('taskkill.exe', ['/PID', String(rootPid), '/T', '/F'], {
-      stdio: 'ignore',
+export async function launchMeasuredProcess({
+  executable,
+  codeFile,
+  reportPath,
+  stdoutLogPath,
+  stderrLogPath,
+  cwd,
+}) {
+  const stdoutDescriptor = fs.openSync(stdoutLogPath, 'a');
+  const stderrDescriptor = fs.openSync(stderrLogPath, 'a');
+  let child;
+  try {
+    child = spawn(executable, [codeFile], {
+      cwd,
+      detached: process.platform !== 'win32',
+      env: { ...process.env, RIDE_STARTUP_REPORT: reportPath },
+      stdio: ['ignore', stdoutDescriptor, stderrDescriptor],
       windowsHide: true,
     });
+    await new Promise((resolve, reject) => {
+      child.once('spawn', resolve);
+      child.once('error', reject);
+    });
+    return child;
+  } finally {
+    fs.closeSync(stdoutDescriptor);
+    fs.closeSync(stderrDescriptor);
+  }
+}
+
+export async function terminateMeasuredTree(
+  rootIdentity,
+  trackedProcesses = [],
+  platform = process.platform,
+  {
+    read = readProcessTable,
+    run = (command, args) => spawnSync(command, args, {
+      stdio: 'ignore',
+      windowsHide: true,
+    }),
+    kill = (pid, signal) => process.kill(pid, signal),
+    delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds)),
+  } = {},
+) {
+  let rows;
+  try {
+    rows = read(platform);
+  } catch {
+    return;
+  }
+  const allowTree = platform === 'win32'
+    || (rootIdentity.pgid === rootIdentity.pid
+      && Number.isSafeInteger(rootIdentity.pgid)
+      && rootIdentity.pgid > 0);
+  const initialPlan = planProcessCleanup(rows, rootIdentity, trackedProcesses, { allowTree });
+  if (platform === 'win32') {
+    if (initialPlan.mode === 'tree') {
+      run('taskkill.exe', ['/PID', String(initialPlan.rootPid), '/T', '/F']);
+    } else {
+      for (const pid of initialPlan.processIds) {
+        run('taskkill.exe', ['/PID', String(pid), '/F']);
+      }
+    }
     return;
   }
 
-  let descendants = [];
-  try {
-    descendants = aggregateProcessTree(readProcessTable(platform), rootPid).processIds
-      .filter(pid => pid !== rootPid)
-      .reverse();
-  } catch {
-    // The root may have already exited. The detached process-group ID remains scoped to this spawn.
-  }
-  try {
-    process.kill(-rootPid, 'SIGTERM');
-  } catch {
-    for (const pid of descendants) {
+  const signalPlan = (plan, signal) => {
+    if (plan.mode === 'tree') {
+      if (!Number.isSafeInteger(plan.pgid)
+          || plan.pgid <= 0
+          || plan.pgid !== plan.rootPid) {
+        return;
+      }
       try {
-        process.kill(pid, 'SIGTERM');
+        kill(-plan.pgid, signal);
       } catch {
-        // A verified descendant may have exited between process-table capture and cleanup.
+        // The verified root may exit between the process-table read and the signal.
+      }
+      return;
+    }
+    for (const pid of plan.processIds) {
+      try {
+        kill(pid, signal);
+      } catch {
+        // A verified descendant may exit between the process-table read and the signal.
       }
     }
-  }
-  await new Promise(resolve => setTimeout(resolve, 250));
+  };
+  signalPlan(initialPlan, 'SIGTERM');
+  await delay(250);
+
   try {
-    process.kill(-rootPid, 'SIGKILL');
+    rows = read(platform);
   } catch {
-    for (const pid of descendants) {
-      try {
-        process.kill(pid, 'SIGKILL');
-      } catch {
-        // Cleanup is best effort and remains limited to verified descendants.
-      }
-    }
+    return;
   }
+  const finalPlan = planProcessCleanup(rows, rootIdentity, trackedProcesses, {
+    allowTree: allowTree && initialPlan.mode === 'tree',
+  });
+  signalPlan(finalPlan, 'SIGKILL');
 }
 
 const defaultMeasurementDependencies = {
   launch: launchMeasuredProcess,
+  capture: captureProcessIdentity,
   waitForReport: waitForStartupReport,
   delay: milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds)),
   sample: sampleProcessTree,
@@ -475,7 +665,13 @@ export async function measureOnce(options, dependencies = defaultMeasurementDepe
   if (rootPid === 0) {
     throw new Error('spawned root pid must be positive');
   }
+  let rootIdentity;
+  let metrics;
   try {
+    rootIdentity = await dependencies.capture(rootPid, {
+      timeoutMs: Math.min(2_000, Math.max(0, deadline - now())),
+      pollMs: Math.min(25, options.pollMs),
+    });
     const startupReport = await dependencies.waitForReport(options.reportPath, {
       timeoutMs: Math.max(0, deadline - now()),
       pollMs: options.pollMs,
@@ -489,7 +685,7 @@ export async function measureOnce(options, dependencies = defaultMeasurementDepe
       );
     }
     await dependencies.delay(options.idleMs);
-    const metrics = dependencies.sample(rootPid);
+    metrics = dependencies.sample(rootIdentity);
     const finalStartupReport = await dependencies.waitForReport(options.reportPath, {
       timeoutMs: Math.max(0, deadline - now()),
       pollMs: options.pollMs,
@@ -504,7 +700,9 @@ export async function measureOnce(options, dependencies = defaultMeasurementDepe
     }
     return { startupReport: finalStartupReport, metrics };
   } finally {
-    await dependencies.terminate(rootPid);
+    if (rootIdentity) {
+      await dependencies.terminate(rootIdentity, metrics?.processes ?? []);
+    }
   }
 }
 
@@ -577,29 +775,115 @@ async function writeJsonAtomically(output, value) {
   }
 }
 
-async function main(argv) {
-  const options = parseArguments(argv);
-  const executable = options.executable ?? discoverExecutable(options.bundleRoot);
-  if (!existingFile(executable)) {
-    throw new Error(`Tauri executable does not exist: ${executable}`);
-  }
+function artifactStem(output) {
+  const extension = path.extname(output);
+  return path.basename(output, extension);
+}
 
-  const rawRuns = [];
-  for (let run = 1; run <= options.runs; run++) {
-    const temporary = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-startup-run-'));
-    const codeFile = path.join(temporary, `startup-${run}.R`);
-    const reportPath = path.join(temporary, 'startup-report.json');
+function failurePathForOutput(output) {
+  return path.join(path.dirname(output), `${artifactStem(output)}.failure.json`);
+}
+
+async function readOptionalStartupReport(reportPath) {
+  try {
+    const serialized = await fs.promises.readFile(reportPath, 'utf8');
     try {
-      await fs.promises.writeFile(codeFile, '# R-IDE startup measurement\n');
-      rawRuns.push(await measureOnce({
+      return JSON.parse(serialized);
+    } catch (error) {
+      return { invalid: true, error: error.message };
+    }
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      return undefined;
+    }
+    throw error;
+  }
+}
+
+async function preserveFailureDiagnostic({
+  options,
+  executable,
+  runIndex,
+  completedRuns,
+  error,
+  reportPath,
+  stdoutLogPath,
+  stderrLogPath,
+}) {
+  const outputDirectory = path.dirname(options.output);
+  await fs.promises.mkdir(outputDirectory, { recursive: true });
+  const diagnosticsDirectory = await fs.promises.mkdtemp(path.join(
+    outputDirectory,
+    `${artifactStem(options.output)}-diagnostics-`,
+  ));
+  const copiedStdout = path.join(diagnosticsDirectory, 'stdout.log');
+  const copiedStderr = path.join(diagnosticsDirectory, 'stderr.log');
+  await fs.promises.copyFile(stdoutLogPath, copiedStdout);
+  await fs.promises.copyFile(stderrLogPath, copiedStderr);
+  const startupReport = await readOptionalStartupReport(reportPath);
+  const portableRelativePath = file => path.relative(outputDirectory, file).replaceAll('\\', '/');
+  const diagnostic = {
+    status: 'failed',
+    error: {
+      name: typeof error?.name === 'string' ? error.name : 'Error',
+      message: typeof error?.message === 'string' ? error.message : String(error),
+    },
+    completedRuns,
+    platform: process.platform,
+    arch: process.arch,
+    executable: path.resolve(executable),
+    runIndex,
+    logs: {
+      stdout: portableRelativePath(copiedStdout),
+      stderr: portableRelativePath(copiedStderr),
+    },
+    ...(startupReport === undefined ? {} : { startupReport }),
+  };
+  await writeJsonAtomically(failurePathForOutput(options.output), diagnostic);
+  return diagnostic;
+}
+
+export async function runMeasurementCampaign(
+  options,
+  { measure = measureOnce } = {},
+) {
+  const executable = path.resolve(options.executable);
+  const rawRuns = [];
+  for (let runIndex = 1; runIndex <= options.runs; runIndex++) {
+    const temporary = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-startup-run-'));
+    const codeFile = path.join(temporary, `startup-${runIndex}.R`);
+    const reportPath = path.join(temporary, 'startup-report.json');
+    const stdoutLogPath = path.join(temporary, 'stdout.log');
+    const stderrLogPath = path.join(temporary, 'stderr.log');
+    try {
+      await Promise.all([
+        fs.promises.writeFile(codeFile, '# R-IDE startup measurement\n'),
+        fs.promises.writeFile(stdoutLogPath, ''),
+        fs.promises.writeFile(stderrLogPath, ''),
+      ]);
+      rawRuns.push(await measure({
         executable,
         codeFile,
         reportPath,
+        stdoutLogPath,
+        stderrLogPath,
         idleMs: options.idleMs,
         timeoutMs: options.timeoutMs,
         pollMs: options.pollMs,
         cwd: applicationRoot,
       }));
+    } catch (error) {
+      await preserveFailureDiagnostic({
+        options,
+        executable,
+        runIndex,
+        completedRuns: [...rawRuns],
+        error,
+        reportPath,
+        stdoutLogPath,
+        stderrLogPath,
+      });
+      throw error;
     } finally {
       await fs.promises.rm(temporary, { recursive: true, force: true });
     }
@@ -610,7 +894,7 @@ async function main(argv) {
     version: MEASUREMENT_VERSION,
     platform: process.platform,
     arch: process.arch,
-    executable: path.resolve(executable),
+    executable,
     commit: currentCommit(),
     runs: rawRuns,
     median: {
@@ -622,6 +906,18 @@ async function main(argv) {
     },
   };
   await writeJsonAtomically(options.output, measurement);
+  await fs.promises.rm(failurePathForOutput(options.output), { force: true });
+  return measurement;
+}
+
+async function main(argv) {
+  const options = parseArguments(argv);
+  const executable = options.executable ?? discoverExecutable(options.bundleRoot);
+  if (!existingFile(executable)) {
+    throw new Error(`Tauri executable does not exist: ${executable}`);
+  }
+
+  const measurement = await runMeasurementCampaign({ ...options, executable });
   process.stdout.write(`${JSON.stringify(measurement, null, 2)}\n`);
 }
 

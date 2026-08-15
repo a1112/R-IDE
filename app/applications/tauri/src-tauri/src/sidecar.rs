@@ -393,6 +393,23 @@ fn set_backend_port(app_handle: &AppHandle, port: u16) {
     navigate_main_window_to_backend(app_handle, port);
 }
 
+pub fn publish_backend_listening_in_order(
+    port: u16,
+    record: impl FnOnce(StartupMilestone),
+    publish: impl FnOnce(u16),
+) {
+    record(StartupMilestone::BackendListening);
+    publish(port);
+}
+
+fn publish_backend_listening(app_handle: &AppHandle, port: u16) {
+    publish_backend_listening_in_order(
+        port,
+        |milestone| record_startup_milestone(app_handle, milestone),
+        |port| set_backend_port(app_handle, port),
+    );
+}
+
 fn set_backend_pid(app_handle: &AppHandle, pid: Option<u32>) {
     if let Some(state) = app_handle.try_state::<crate::AppState>() {
         *state.backend_pid.lock().unwrap() = pid;
@@ -628,11 +645,7 @@ async fn start_node_backend_process(
                         extract_port_from_line(&line).and_then(|value| value.parse::<u16>().ok())
                     {
                         log::info!("Backend ready on port {}", port);
-                        record_startup_milestone(
-                            app_handle,
-                            StartupMilestone::BackendListening,
-                        );
-                        set_backend_port(app_handle, port);
+                        publish_backend_listening(app_handle, port);
                         backend_ready = true;
                         break;
                     }
@@ -770,11 +783,7 @@ pub async fn start_backend_process(
                             if let Some(port_str) = extract_port_from_line(&line) {
                                 if let Ok(port) = port_str.parse::<u16>() {
                                     backend_ready = true;
-                                    record_startup_milestone(
-                                        app_handle,
-                                        StartupMilestone::BackendListening,
-                                    );
-                                    set_backend_port(app_handle, port);
+                                    publish_backend_listening(app_handle, port);
                                 }
                             }
                         }
@@ -811,7 +820,7 @@ pub async fn start_backend_process(
                 let fallback_port = 3000;
                 log::warn!("Backend did not report a port within {}s; using fallback port {}", BACKEND_STARTUP_TIMEOUT, fallback_port);
                 backend_ready = true;
-                set_backend_port(app_handle, fallback_port);
+                publish_backend_listening(app_handle, fallback_port);
             }
         }
     }

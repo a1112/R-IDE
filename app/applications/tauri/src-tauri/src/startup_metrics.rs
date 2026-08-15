@@ -12,7 +12,7 @@ use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Instant;
 
 pub const STARTUP_REPORT_ENV: &str = "RIDE_STARTUP_REPORT";
@@ -238,15 +238,35 @@ impl ElapsedClock for MonotonicClock {
 }
 
 #[derive(Debug)]
-struct StartupRecorder {
-    output_path: PathBuf,
+struct StartupRecorderState {
     report: StartupReport,
     clock: Arc<dyn ElapsedClock>,
 }
 
+#[derive(Debug)]
+struct StartupRecorder {
+    state: Mutex<StartupRecorderState>,
+    snapshots: mpsc::Sender<StartupReport>,
+}
+
 #[derive(Clone, Debug)]
 pub struct StartupMetrics {
-    recorder: Option<Arc<Mutex<StartupRecorder>>>,
+    recorder: Option<Arc<StartupRecorder>>,
+}
+
+pub trait StartupReportWriter: Send + 'static {
+    fn write(&mut self, report: &StartupReport) -> io::Result<()>;
+}
+
+#[derive(Debug)]
+struct AtomicStartupReportWriter {
+    output_path: PathBuf,
+}
+
+impl StartupReportWriter for AtomicStartupReportWriter {
+    fn write(&mut self, report: &StartupReport) -> io::Result<()> {
+        write_report_atomically(&self.output_path, report)
+    }
 }
 
 impl StartupMetrics {
@@ -267,14 +287,34 @@ impl StartupMetrics {
         pid: u32,
         clock: Arc<dyn ElapsedClock>,
     ) -> Self {
+        let Some(output_path) = output_path else {
+            return Self { recorder: None };
+        };
+        Self::with_clock_and_writer(
+            platform,
+            arch,
+            pid,
+            clock,
+            Box::new(AtomicStartupReportWriter { output_path }),
+        )
+    }
+
+    pub fn with_clock_and_writer(
+        platform: impl Into<String>,
+        arch: impl Into<String>,
+        pid: u32,
+        clock: Arc<dyn ElapsedClock>,
+        writer: Box<dyn StartupReportWriter>,
+    ) -> Self {
+        let snapshots = spawn_report_writer(writer);
         Self {
-            recorder: output_path.map(|output_path| {
-                Arc::new(Mutex::new(StartupRecorder {
-                    output_path,
+            recorder: Some(Arc::new(StartupRecorder {
+                state: Mutex::new(StartupRecorderState {
                     report: StartupReport::new(platform, arch, pid),
                     clock,
-                }))
-            }),
+                }),
+                snapshots,
+            })),
         }
     }
 
@@ -282,18 +322,21 @@ impl StartupMetrics {
         let Some(recorder) = &self.recorder else {
             return Ok(RecordOutcome::Disabled);
         };
-        let mut recorder = recorder
-            .lock()
-            .map_err(|_| StartupMetricError::RecorderPoisoned)?;
-        let elapsed_ms = recorder.clock.elapsed_ms();
-        let previous = recorder.report.clone();
-        let outcome = recorder.report.record(milestone, elapsed_ms)?;
-        if outcome == RecordOutcome::Recorded {
-            if let Err(error) = write_report_atomically(&recorder.output_path, &recorder.report) {
-                recorder.report = previous;
-                return Err(StartupMetricError::Write(error.to_string()));
-            }
-        }
+        let outcome = {
+            let mut state = recorder
+                .state
+                .lock()
+                .map_err(|_| StartupMetricError::RecorderPoisoned)?;
+            let elapsed_ms = state.clock.elapsed_ms();
+            let outcome = state.report.record(milestone, elapsed_ms)?;
+            // The unbounded send cannot wait for disk I/O. Keeping it in this
+            // critical section preserves mutation order for concurrent callers.
+            recorder
+                .snapshots
+                .send(state.report.clone())
+                .map_err(|error| StartupMetricError::Write(error.to_string()))?;
+            outcome
+        };
         Ok(outcome)
     }
 
@@ -302,6 +345,23 @@ impl StartupMetrics {
             log::warn!("Failed to record startup milestone {milestone:?}: {error}");
         }
     }
+}
+
+fn spawn_report_writer(mut writer: Box<dyn StartupReportWriter>) -> mpsc::Sender<StartupReport> {
+    let (sender, snapshots) = mpsc::channel::<StartupReport>();
+    if let Err(error) = std::thread::Builder::new()
+        .name("ride-startup-report-writer".to_string())
+        .spawn(move || {
+            while let Ok(snapshot) = snapshots.recv() {
+                if let Err(error) = writer.write(&snapshot) {
+                    log::warn!("Failed to publish startup report snapshot: {error}");
+                }
+            }
+        })
+    {
+        log::warn!("Failed to start startup report writer: {error}");
+    }
+    sender
 }
 
 fn write_report_atomically(path: &Path, report: &StartupReport) -> io::Result<()> {

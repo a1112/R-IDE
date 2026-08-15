@@ -9,12 +9,14 @@
 
 use ride_tauri::startup_metrics::{
     RecordOutcome, StartupMetricError, StartupMetrics, StartupMilestone, StartupReport,
+    StartupReportWriter,
 };
 use serde_json::Value;
 use std::fs;
+use std::io;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug)]
 struct SequenceClock {
@@ -48,6 +50,66 @@ fn unique_report_path(label: &str) -> PathBuf {
         "ride-startup-metrics-{label}-{}-{nonce}.json",
         std::process::id()
     ))
+}
+
+fn wait_for_report_milestone(path: &PathBuf, milestone: &str) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Ok(bytes) = fs::read(path) {
+            if let Ok(report) = serde_json::from_slice::<Value>(&bytes) {
+                if report["milestones"].get(milestone).is_some() {
+                    return report;
+                }
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {milestone} in {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[derive(Debug)]
+struct BlockingWriter {
+    started: mpsc::Sender<()>,
+    release: mpsc::Receiver<()>,
+    written: mpsc::Sender<Value>,
+}
+
+impl StartupReportWriter for BlockingWriter {
+    fn write(&mut self, report: &StartupReport) -> io::Result<()> {
+        self.started.send(()).expect("signal writer start");
+        self.release.recv().expect("release blocked writer");
+        self.written
+            .send(serde_json::to_value(report).expect("serialize observed report"))
+            .expect("publish observed report");
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct FailOnceWriter {
+    attempts: mpsc::Sender<(usize, Value)>,
+    attempt: usize,
+}
+
+impl StartupReportWriter for FailOnceWriter {
+    fn write(&mut self, report: &StartupReport) -> io::Result<()> {
+        self.attempt += 1;
+        self.attempts
+            .send((
+                self.attempt,
+                serde_json::to_value(report).expect("serialize attempted report"),
+            ))
+            .expect("publish write attempt");
+        if self.attempt == 1 {
+            Err(io::Error::other("injected first write failure"))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 #[test]
@@ -174,19 +236,22 @@ fn enabled_recorder_publishes_incrementally_readable_json() {
     metrics
         .record(StartupMilestone::ProcessStarted)
         .expect("publish process start");
-    let first: Value = serde_json::from_slice(&fs::read(&output).expect("read first report"))
-        .expect("parse first report");
+    let first = wait_for_report_milestone(&output, "process_started");
     assert_eq!(first["milestones"]["process_started"], 0);
     assert_eq!(first["milestones"].get("backend_spawned"), None);
 
     metrics
         .record(StartupMilestone::BackendSpawned)
         .expect("publish backend spawn");
-    let second: Value = serde_json::from_slice(&fs::read(&output).expect("read second report"))
-        .expect("parse second report");
+    let second = wait_for_report_milestone(&output, "backend_spawned");
     assert_eq!(second["milestones"]["process_started"], 0);
     assert_eq!(second["milestones"]["backend_spawned"], 15);
 
+    let output_name = output
+        .file_name()
+        .expect("report file name")
+        .to_string_lossy();
+    let temporary_prefix = format!(".{output_name}.");
     assert!(
         fs::read_dir(output.parent().expect("report parent"))
             .expect("read report parent")
@@ -194,11 +259,128 @@ fn enabled_recorder_publishes_incrementally_readable_json() {
             .all(|entry| !entry
                 .file_name()
                 .to_string_lossy()
-                .contains("ride-startup-metrics-incremental")
-                || entry.path() == output),
+                .starts_with(&temporary_prefix)),
         "atomic writer must not leave sibling temporary files"
     );
     fs::remove_file(output).expect("remove report");
+}
+
+#[test]
+fn blocked_writer_does_not_block_recording_and_preserves_snapshot_order() {
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let (written_tx, written_rx) = mpsc::channel();
+    let metrics = StartupMetrics::with_clock_and_writer(
+        "test-platform",
+        "test-arch",
+        77,
+        Arc::new(SequenceClock::new(vec![0, 15])),
+        Box::new(BlockingWriter {
+            started: started_tx,
+            release: release_rx,
+            written: written_tx,
+        }),
+    );
+
+    assert_eq!(
+        metrics.record(StartupMilestone::ProcessStarted),
+        Ok(RecordOutcome::Recorded)
+    );
+    started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("first write starts");
+
+    let second_metrics = metrics.clone();
+    let (recorded_tx, recorded_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        recorded_tx
+            .send(second_metrics.record(StartupMilestone::BackendSpawned))
+            .expect("publish record result");
+    });
+    assert_eq!(
+        recorded_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("recording must not wait for blocked I/O"),
+        Ok(RecordOutcome::Recorded)
+    );
+
+    release_tx.send(()).expect("release first write");
+    let first = written_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("first snapshot");
+    started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("second write starts after first");
+    release_tx.send(()).expect("release second write");
+    let second = written_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("second snapshot");
+
+    assert_eq!(first["milestones"]["process_started"], 0);
+    assert_eq!(first["milestones"].get("backend_spawned"), None);
+    assert_eq!(second["milestones"]["backend_spawned"], 15);
+}
+
+#[test]
+fn duplicate_retries_the_latest_snapshot_after_a_writer_failure() {
+    let (attempts_tx, attempts_rx) = mpsc::channel();
+    let metrics = StartupMetrics::with_clock_and_writer(
+        "test-platform",
+        "test-arch",
+        77,
+        Arc::new(SequenceClock::new(vec![0, 99])),
+        Box::new(FailOnceWriter {
+            attempts: attempts_tx,
+            attempt: 0,
+        }),
+    );
+
+    assert_eq!(
+        metrics.record(StartupMilestone::ProcessStarted),
+        Ok(RecordOutcome::Recorded)
+    );
+    let (first_attempt, _) = attempts_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("failed first write attempt");
+    assert_eq!(first_attempt, 1);
+
+    assert_eq!(
+        metrics.record(StartupMilestone::ProcessStarted),
+        Ok(RecordOutcome::Duplicate)
+    );
+    let (retry_attempt, retry) = attempts_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("duplicate retries latest snapshot");
+    assert_eq!(retry_attempt, 2);
+    assert_eq!(retry["milestones"]["process_started"], 0);
+}
+
+#[test]
+fn backend_listening_is_recorded_before_the_port_is_published() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let record_events = events.clone();
+    let publish_events = events.clone();
+
+    ride_tauri::sidecar::publish_backend_listening_in_order(
+        3000,
+        move |milestone| {
+            record_events
+                .lock()
+                .expect("record events")
+                .push(format!("record:{milestone:?}"));
+        },
+        move |port| {
+            publish_events
+                .lock()
+                .expect("publish events")
+                .push(format!("publish:{port}"));
+        },
+    );
+
+    assert_eq!(
+        *events.lock().expect("final events"),
+        ["record:BackendListening", "publish:3000"]
+    );
 }
 
 #[test]
