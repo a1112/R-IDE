@@ -13,11 +13,13 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 pub const STARTUP_REPORT_ENV: &str = "RIDE_STARTUP_REPORT";
 pub const STARTUP_REPORT_SCHEMA: &str = "ride.startup-report";
 pub const STARTUP_REPORT_VERSION: u32 = 1;
+const STARTUP_REPORT_WRITE_ATTEMPTS: usize = 3;
+const STARTUP_REPORT_RETRY_DELAY_MS: u64 = 10;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -353,15 +355,37 @@ fn spawn_report_writer(mut writer: Box<dyn StartupReportWriter>) -> mpsc::Sender
         .name("ride-startup-report-writer".to_string())
         .spawn(move || {
             while let Ok(snapshot) = snapshots.recv() {
-                if let Err(error) = writer.write(&snapshot) {
-                    log::warn!("Failed to publish startup report snapshot: {error}");
-                }
+                write_snapshot_with_retry(writer.as_mut(), &snapshot);
             }
         })
     {
         log::warn!("Failed to start startup report writer: {error}");
     }
     sender
+}
+
+fn write_snapshot_with_retry(writer: &mut dyn StartupReportWriter, snapshot: &StartupReport) {
+    for attempt in 1..=STARTUP_REPORT_WRITE_ATTEMPTS {
+        match writer.write(snapshot) {
+            Ok(()) => return,
+            Err(error) if attempt < STARTUP_REPORT_WRITE_ATTEMPTS => {
+                log::warn!(
+                    "Failed to publish startup report snapshot (attempt {attempt}/{}): {error}",
+                    STARTUP_REPORT_WRITE_ATTEMPTS
+                );
+                std::thread::sleep(Duration::from_millis(
+                    STARTUP_REPORT_RETRY_DELAY_MS * attempt as u64,
+                ));
+            }
+            Err(error) => {
+                log::warn!(
+                    "Failed to publish startup report snapshot after {} attempts: {error}",
+                    STARTUP_REPORT_WRITE_ATTEMPTS
+                );
+                return;
+            }
+        }
+    }
 }
 
 fn write_report_atomically(path: &Path, report: &StartupReport) -> io::Result<()> {

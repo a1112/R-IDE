@@ -15,6 +15,7 @@ use serde_json::Value;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -109,6 +110,26 @@ impl StartupReportWriter for FailOnceWriter {
         } else {
             Ok(())
         }
+    }
+}
+
+struct FailFinalOnceWriter {
+    final_attempts: Arc<AtomicUsize>,
+    persisted: mpsc::Sender<Value>,
+}
+
+impl StartupReportWriter for FailFinalOnceWriter {
+    fn write(&mut self, report: &StartupReport) -> io::Result<()> {
+        let value = serde_json::to_value(report).expect("serialize attempted final report");
+        if value["milestones"].get("plugins_ready").is_some()
+            && self.final_attempts.fetch_add(1, Ordering::SeqCst) == 0
+        {
+            return Err(io::Error::other("injected final write failure"));
+        }
+        self.persisted
+            .send(value)
+            .expect("publish persisted report snapshot");
+        Ok(())
     }
 }
 
@@ -322,13 +343,13 @@ fn blocked_writer_does_not_block_recording_and_preserves_snapshot_order() {
 }
 
 #[test]
-fn duplicate_retries_the_latest_snapshot_after_a_writer_failure() {
+fn writer_retries_a_failed_snapshot_without_an_external_duplicate() {
     let (attempts_tx, attempts_rx) = mpsc::channel();
     let metrics = StartupMetrics::with_clock_and_writer(
         "test-platform",
         "test-arch",
         77,
-        Arc::new(SequenceClock::new(vec![0, 99])),
+        Arc::new(SequenceClock::new(vec![0])),
         Box::new(FailOnceWriter {
             attempts: attempts_tx,
             attempt: 0,
@@ -344,15 +365,51 @@ fn duplicate_retries_the_latest_snapshot_after_a_writer_failure() {
         .expect("failed first write attempt");
     assert_eq!(first_attempt, 1);
 
-    assert_eq!(
-        metrics.record(StartupMilestone::ProcessStarted),
-        Ok(RecordOutcome::Duplicate)
-    );
     let (retry_attempt, retry) = attempts_rx
         .recv_timeout(Duration::from_secs(1))
-        .expect("duplicate retries latest snapshot");
+        .expect("worker retries latest snapshot");
     assert_eq!(retry_attempt, 2);
     assert_eq!(retry["milestones"]["process_started"], 0);
+}
+
+#[test]
+fn final_snapshot_is_persisted_after_its_first_write_fails() {
+    let final_attempts = Arc::new(AtomicUsize::new(0));
+    let (persisted_tx, persisted_rx) = mpsc::channel();
+    let metrics = StartupMetrics::with_clock_and_writer(
+        "test-platform",
+        "test-arch",
+        77,
+        Arc::new(SequenceClock::new(vec![0, 5, 10, 15, 20, 25, 30, 35])),
+        Box::new(FailFinalOnceWriter {
+            final_attempts: final_attempts.clone(),
+            persisted: persisted_tx,
+        }),
+    );
+
+    for milestone in [
+        StartupMilestone::ProcessStarted,
+        StartupMilestone::NativeWindowVisible,
+        StartupMilestone::BackendSpawned,
+        StartupMilestone::BackendListening,
+        StartupMilestone::FrontendShellAttached,
+        StartupMilestone::TargetFileOpened,
+        StartupMilestone::PluginsStarted,
+        StartupMilestone::PluginsReady,
+    ] {
+        assert_eq!(metrics.record(milestone), Ok(RecordOutcome::Recorded));
+    }
+
+    let final_report = loop {
+        let persisted = persisted_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker automatically retries and persists final snapshot");
+        if persisted["milestones"].get("plugins_ready").is_some() {
+            break persisted;
+        }
+    };
+    assert_eq!(final_attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(final_report["milestones"]["plugins_ready"], 35);
 }
 
 #[test]

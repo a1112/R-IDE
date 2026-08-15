@@ -577,8 +577,12 @@ export async function launchMeasuredProcess({
 }
 
 export async function terminateMeasuredTree(
-  rootIdentity,
-  trackedProcesses = [],
+  {
+    child,
+    rootPid,
+    rootIdentity,
+    trackedProcesses = [],
+  },
   platform = process.platform,
   {
     read = readProcessTable,
@@ -590,6 +594,40 @@ export async function terminateMeasuredTree(
     delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds)),
   } = {},
 ) {
+  const verifiedRootPid = positiveInteger(rootPid, 'spawned root pid');
+  const controlledChildIsRunning = child?.pid === verifiedRootPid
+    && child.killed === false
+    && child.exitCode === null
+    && child.signalCode === null
+    && typeof child.kill === 'function';
+  let trustedRootIdentity = false;
+  if (rootIdentity) {
+    try {
+      trustedRootIdentity = validateProcessIdentity(rootIdentity, 'spawned root identity').pid
+        === verifiedRootPid;
+    } catch {
+      trustedRootIdentity = false;
+    }
+  }
+  if (!trustedRootIdentity) {
+    if (controlledChildIsRunning) {
+      try {
+        child.kill('SIGTERM');
+      } catch {
+        // The controlled child may exit immediately before its handle is signalled.
+      }
+      await delay(250);
+      if (child.exitCode === null && child.signalCode === null) {
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          // The controlled child may exit during the grace period.
+        }
+      }
+    }
+    return;
+  }
+
   let rows;
   try {
     rows = read(platform);
@@ -700,9 +738,12 @@ export async function measureOnce(options, dependencies = defaultMeasurementDepe
     }
     return { startupReport: finalStartupReport, metrics };
   } finally {
-    if (rootIdentity) {
-      await dependencies.terminate(rootIdentity, metrics?.processes ?? []);
-    }
+    await dependencies.terminate({
+      child,
+      rootPid,
+      rootIdentity,
+      trackedProcesses: metrics?.processes ?? [],
+    });
   }
 }
 
@@ -784,6 +825,38 @@ function failurePathForOutput(output) {
   return path.join(path.dirname(output), `${artifactStem(output)}.failure.json`);
 }
 
+async function clearPreviousCampaignArtifacts(output) {
+  const resolvedOutput = path.resolve(output);
+  const outputDirectory = path.dirname(resolvedOutput);
+  const diagnosticsPrefix = `${artifactStem(resolvedOutput)}-diagnostics-`;
+  await Promise.all([
+    fs.promises.rm(resolvedOutput, { force: true }),
+    fs.promises.rm(failurePathForOutput(resolvedOutput), { force: true }),
+  ]);
+
+  let entries;
+  try {
+    entries = await fs.promises.readdir(outputDirectory, { withFileTypes: true });
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      return;
+    }
+    throw error;
+  }
+  const staleDiagnostics = entries
+    .filter(entry => entry.isDirectory() && entry.name.startsWith(diagnosticsPrefix))
+    .map(entry => path.resolve(outputDirectory, entry.name));
+  for (const stalePath of staleDiagnostics) {
+    if (path.dirname(stalePath) !== outputDirectory) {
+      throw new Error(`refusing to remove diagnostics outside ${outputDirectory}`);
+    }
+  }
+  await Promise.all(staleDiagnostics.map(stalePath => fs.promises.rm(stalePath, {
+    recursive: true,
+    force: true,
+  })));
+}
+
 async function readOptionalStartupReport(reportPath) {
   try {
     const serialized = await fs.promises.readFile(reportPath, 'utf8');
@@ -848,6 +921,7 @@ export async function runMeasurementCampaign(
   { measure = measureOnce } = {},
 ) {
   const executable = path.resolve(options.executable);
+  await clearPreviousCampaignArtifacts(options.output);
   const rawRuns = [];
   for (let runIndex = 1; runIndex <= options.runs; runIndex++) {
     const temporary = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-startup-run-'));

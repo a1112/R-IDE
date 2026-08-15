@@ -522,7 +522,11 @@ test('tree termination rechecks identity and never targets a reused root or desc
   ];
   const commands = [];
 
-  await terminateMeasuredTree(rootIdentity, tracked, 'win32', {
+  await terminateMeasuredTree({
+    rootPid: rootIdentity.pid,
+    rootIdentity,
+    trackedProcesses: tracked,
+  }, 'win32', {
     read: () => [
       { pid: 100, ppid: 1, pgid: null, creationTime: 'reused-root' },
       { pid: 101, ppid: 1, pgid: null, creationTime: 'reused-child' },
@@ -538,7 +542,10 @@ test('tree termination rechecks identity and never targets a reused root or desc
 test('tree termination uses whole-tree cleanup when the captured root still matches', async () => {
   const rootIdentity = { pid: 100, pgid: null, creationTime: 'root-start' };
   const commands = [];
-  await terminateMeasuredTree(rootIdentity, [], 'win32', {
+  await terminateMeasuredTree({
+    rootPid: rootIdentity.pid,
+    rootIdentity,
+  }, 'win32', {
     read: () => [
       { pid: 100, ppid: 1, pgid: null, creationTime: 'root-start' },
     ],
@@ -555,7 +562,10 @@ test('POSIX termination signals the verified process group after each identity r
     { pid: 100, ppid: 1, pgid: 100, creationTime: 'root-start' },
   ];
   const signals = [];
-  await terminateMeasuredTree(rootIdentity, [], 'linux', {
+  await terminateMeasuredTree({
+    rootPid: rootIdentity.pid,
+    rootIdentity,
+  }, 'linux', {
     read: () => rows,
     kill: (pid, signal) => signals.push([pid, signal]),
     delay: async () => undefined,
@@ -573,7 +583,11 @@ test('POSIX termination falls back bottom-up to identity-matched tracked descend
   ];
   let reads = 0;
   const signals = [];
-  await terminateMeasuredTree(rootIdentity, tracked, 'linux', {
+  await terminateMeasuredTree({
+    rootPid: rootIdentity.pid,
+    rootIdentity,
+    trackedProcesses: tracked,
+  }, 'linux', {
     read: () => {
       reads++;
       return reads === 1
@@ -605,7 +619,11 @@ test('POSIX termination never sends a group signal when root is not the detached
     { pid: 101, ppid: 100, pgid: 50, creationTime: 'child-start', depth: 1 },
   ];
   const signals = [];
-  await terminateMeasuredTree(rootIdentity, tracked, 'linux', {
+  await terminateMeasuredTree({
+    rootPid: rootIdentity.pid,
+    rootIdentity,
+    trackedProcesses: tracked,
+  }, 'linux', {
     read: () => tracked,
     kill: (pid, signal) => signals.push([pid, signal]),
     delay: async () => undefined,
@@ -624,6 +642,7 @@ test('measurement timeout always terminates only the process tree it launched', 
   const terminated = [];
   const sampled = [];
   const rootIdentity = { pid: 7331, pgid: 7331, creationTime: 'root-start' };
+  const child = { pid: 7331 };
   await assert.rejects(
     measureOnce(
       {
@@ -636,7 +655,7 @@ test('measurement timeout always terminates only the process tree it launched', 
         cwd: '/fixture',
       },
       {
-        launch: () => ({ pid: 7331 }),
+        launch: () => child,
         capture: async pid => {
           assert.equal(pid, 7331);
           return rootIdentity;
@@ -649,15 +668,134 @@ test('measurement timeout always terminates only the process tree it launched', 
           sampled.push(pid);
           return { rootPid: pid, processIds: [pid], processCount: 1, rssBytes: 1 };
         },
-        terminate: async (identity, tracked) => {
-          terminated.push({ identity, tracked });
+        terminate: async cleanup => {
+          terminated.push(cleanup);
         },
       },
     ),
     /startup report timeout/,
   );
   assert.deepEqual(sampled, []);
-  assert.deepEqual(terminated, [{ identity: rootIdentity, tracked: [] }]);
+  assert.deepEqual(terminated, [{
+    child,
+    rootPid: 7331,
+    rootIdentity,
+    trackedProcesses: [],
+  }]);
+});
+
+test('capture failure safely terminates only the controlled child handle', async () => {
+  const events = [];
+  const child = {
+    pid: 7331,
+    killed: false,
+    exitCode: null,
+    signalCode: null,
+    kill(signal) {
+      events.push(`child:${signal}`);
+      this.killed = true;
+      this.exitCode = 0;
+      return true;
+    },
+  };
+
+  await assert.rejects(
+    measureOnce(
+      {
+        executable: '/fixture/R-IDE',
+        codeFile: '/fixture/startup.R',
+        reportPath: '/fixture/report.json',
+        idleMs: 0,
+        timeoutMs: 1,
+        pollMs: 1,
+        cwd: '/fixture',
+      },
+      {
+        launch: () => child,
+        capture: async () => {
+          throw new Error('identity capture failed');
+        },
+        waitForReport: async () => {
+          throw new Error('must not wait for a report');
+        },
+        delay: async () => undefined,
+        sample: () => {
+          throw new Error('must not sample');
+        },
+        terminate: cleanup => terminateMeasuredTree(cleanup, 'win32', {
+          read: () => {
+            events.push('process-table');
+            return [];
+          },
+          run: () => events.push('taskkill'),
+          kill: () => events.push('bare-pid'),
+          delay: async () => undefined,
+        }),
+      },
+    ),
+    /identity capture failed/,
+  );
+
+  assert.deepEqual(events, ['child:SIGTERM']);
+});
+
+test('capture failure force-stops a controlled child that ignores graceful termination', async () => {
+  const signals = [];
+  const child = {
+    pid: 7331,
+    killed: false,
+    exitCode: null,
+    signalCode: null,
+    kill(signal) {
+      signals.push(signal);
+      this.killed = true;
+      return true;
+    },
+  };
+
+  await terminateMeasuredTree({ child, rootPid: 7331 }, 'linux', {
+    read: () => {
+      throw new Error('identity-less cleanup must not read the process table');
+    },
+    run: () => {
+      throw new Error('identity-less cleanup must not invoke taskkill');
+    },
+    kill: () => {
+      throw new Error('identity-less cleanup must not signal a bare PID');
+    },
+    delay: async () => undefined,
+  });
+
+  assert.deepEqual(signals, ['SIGTERM', 'SIGKILL']);
+});
+
+test('identity-less cleanup rejects an unrelated or already-finished child handle', async () => {
+  const events = [];
+  for (const child of [
+    {
+      pid: 9000,
+      killed: false,
+      exitCode: null,
+      signalCode: null,
+      kill: () => events.push('wrong-pid'),
+    },
+    {
+      pid: 7331,
+      killed: false,
+      exitCode: 0,
+      signalCode: null,
+      kill: () => events.push('finished'),
+    },
+  ]) {
+    await terminateMeasuredTree({ child, rootPid: 7331 }, 'linux', {
+      read: () => events.push('process-table'),
+      run: () => events.push('taskkill'),
+      kill: () => events.push('bare-pid'),
+      delay: async () => undefined,
+    });
+  }
+
+  assert.deepEqual(events, []);
 });
 
 test('measurement samples after idle and then rereads the complete final report', async () => {
@@ -704,8 +842,8 @@ test('measurement samples after idle and then rereads the complete final report'
           processes,
         };
       },
-      terminate: async (identity, tracked) => {
-        events.push(`terminate:${identity.pid}:${tracked.length}`);
+      terminate: async cleanup => {
+        events.push(`terminate:${cleanup.rootIdentity.pid}:${cleanup.trackedProcesses.length}`);
       },
       now: (() => {
         let now = 1_000;
@@ -757,6 +895,17 @@ test('failed campaign atomically preserves diagnostics, report, and unique copie
   const executable = path.join(root, 'R-IDE.exe');
   const output = path.join(root, 'startup-metrics.json');
   touch(executable);
+  fs.writeFileSync(output, 'STALE-SUCCESS');
+  fs.writeFileSync(path.join(root, 'startup-metrics.failure.json'), '{"status":"stale"}\n');
+  const staleDiagnostics = path.join(root, 'startup-metrics-diagnostics-old');
+  fs.mkdirSync(staleDiagnostics);
+  fs.writeFileSync(path.join(staleDiagnostics, 'old.log'), 'STALE-DIAGNOSTIC');
+  const similarlyNamedFile = path.join(root, 'startup-metrics-diagnostics-keep.txt');
+  fs.writeFileSync(similarlyNamedFile, 'keep file');
+  const unrelatedDirectory = path.join(root, 'other-diagnostics-old');
+  fs.mkdirSync(unrelatedDirectory);
+  const nestedDirectory = path.join(root, 'nested', 'startup-metrics-diagnostics-nested');
+  fs.mkdirSync(nestedDirectory, { recursive: true });
   let calls = 0;
   const completedRun = {
     startupReport: startupReport(finalMilestones),
@@ -803,6 +952,13 @@ test('failed campaign atomically preserves diagnostics, report, and unique copie
     assert.equal(fs.readFileSync(stdoutCopy, 'utf8'), 'stdout run 2\n');
     assert.equal(fs.readFileSync(stderrCopy, 'utf8'), 'stderr run 2\n');
     assert.equal(fs.existsSync(output), false);
+    assert.equal(fs.existsSync(staleDiagnostics), false);
+    assert.equal(fs.readFileSync(similarlyNamedFile, 'utf8'), 'keep file');
+    assert.equal(fs.existsSync(unrelatedDirectory), true);
+    assert.equal(fs.existsSync(nestedDirectory), true);
+    const currentDiagnostics = fs.readdirSync(root, { withFileTypes: true })
+      .filter(entry => entry.isDirectory() && entry.name.startsWith('startup-metrics-diagnostics-'));
+    assert.deepEqual(currentDiagnostics.map(entry => entry.name), [path.basename(path.dirname(stdoutCopy))]);
     assert.deepEqual(
       fs.readdirSync(root).filter(name => name.endsWith('.tmp')),
       [],
@@ -891,7 +1047,13 @@ test('successful campaign writes only the measurement artifact', async () => {
   const executable = path.join(root, 'R-IDE');
   const output = path.join(root, 'startup-metrics.json');
   touch(executable);
+  fs.writeFileSync(output, 'STALE-SUCCESS');
   fs.writeFileSync(path.join(root, 'startup-metrics.failure.json'), '{"status":"stale"}\n');
+  const staleDiagnostics = path.join(root, 'startup-metrics-diagnostics-old');
+  fs.mkdirSync(staleDiagnostics);
+  fs.writeFileSync(path.join(staleDiagnostics, 'old.log'), 'STALE-DIAGNOSTIC');
+  const similarlyNamedFile = path.join(root, 'startup-metrics-diagnostics-keep.txt');
+  fs.writeFileSync(similarlyNamedFile, 'keep file');
   try {
     const measurement = await runMeasurementCampaign({
       executable,
@@ -910,7 +1072,8 @@ test('successful campaign writes only the measurement artifact', async () => {
     assert.equal(measurement.runs.length, 1);
     assert.deepEqual(JSON.parse(fs.readFileSync(output, 'utf8')), measurement);
     assert.equal(fs.existsSync(path.join(root, 'startup-metrics.failure.json')), false);
-    assert.equal(fs.readdirSync(root).some(name => name.includes('diagnostics')), false);
+    assert.equal(fs.existsSync(staleDiagnostics), false);
+    assert.equal(fs.readFileSync(similarlyNamedFile, 'utf8'), 'keep file');
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
