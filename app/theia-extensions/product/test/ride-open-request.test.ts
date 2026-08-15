@@ -1481,6 +1481,27 @@ test('deferred hosted plugin resolution rejection is consumed after disposal', a
     assert.deepEqual(context.milestones, []);
 });
 
+test('unresolved hosted plugin provider does not block shell initialization or target opening', async () => {
+    const hostedPlugins = deferred<FakeHostedPluginSupport>();
+    const context = createContribution(
+        '/project', new MemoryStorage(), () => undefined, async () => undefined,
+        new FakeApplicationStateService(), hostedPlugins.promise
+    );
+
+    context.contribution.onStart();
+    await flushLifecycle();
+    assert.equal(context.native.registrations, 1);
+
+    await context.contribution.handleOpenRequest({
+        id: '48', source: 'initial', workspace: '/project', files: ['/project/provider-pending.R']
+    });
+    assert.deepEqual(context.milestones, ['frontend_shell_attached', 'target_file_opened']);
+
+    context.contribution.dispose();
+    hostedPlugins.reject(new Error('provider rejected after disposal'));
+    await context.contribution.settlePluginObservations();
+});
+
 test('startup reporting failures do not prevent lifecycle registration or opening', async () => {
     const warnings: unknown[][] = [];
     const originalWarn = console.warn;

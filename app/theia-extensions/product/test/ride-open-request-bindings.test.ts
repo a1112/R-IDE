@@ -53,22 +53,31 @@ test('frontend contribution remains synchronously constructible with async hoste
             openerService: Symbol('OpenerService'),
             workspaceService: Symbol('WorkspaceService')
         };
-        const bindSynchronousDependencies = (target: Container): void => {
+        const bindSynchronousDependencies = (
+            target: Container,
+            applicationState: FrontendApplicationStateService
+        ): void => {
             target.bind(identifiers.workspaceService).toConstantValue({ ready: Promise.resolve() } as WorkspaceService);
             target.bind(identifiers.openerService).toConstantValue({} as OpenerService);
             target.bind(identifiers.messageService).toConstantValue({} as MessageService);
             target.bind(identifiers.applicationShell).toConstantValue({} as ApplicationShell);
-            target.bind(identifiers.applicationState).toConstantValue({} as FrontendApplicationStateService);
+            target.bind(identifiers.applicationState).toConstantValue(applicationState);
         };
-        bindSynchronousDependencies(container);
+        let attachShell!: () => void;
+        const attachedShell = new Promise<void>(resolve => {
+            attachShell = resolve;
+        });
+        bindSynchronousDependencies(container, {
+            reachedState: () => attachedShell
+        } as unknown as FrontendApplicationStateService);
 
         let resolveHostedPlugins!: (value: HostedPluginSupport) => void;
         const hostedPlugins = new Promise<HostedPluginSupport>(resolve => {
             resolveHostedPlugins = resolve;
         });
-        let hostedResolutionStarted = false;
+        let hostedResolutionStarts = 0;
         container.bind(identifiers.hostedPlugins).toDynamicValue(() => {
-            hostedResolutionStarted = true;
+            hostedResolutionStarts++;
             return hostedPlugins;
         });
         container.load(new ContainerModule(bind => bindRideOpenRequestContribution(bind, identifiers)));
@@ -80,13 +89,26 @@ test('frontend contribution remains synchronously constructible with async hoste
         assert.equal(contributions.length, 1);
         assert.ok(contributions[0] instanceof RideOpenRequestContribution);
         assert.equal(
-            hostedResolutionStarted,
-            false,
+            hostedResolutionStarts,
+            0,
             'the synchronous contribution factory must not start asynchronous container resolution'
         );
 
         await new Promise<void>(resolve => queueMicrotask(resolve));
-        assert.equal(hostedResolutionStarted, true);
+        await new Promise<void>(resolve => queueMicrotask(resolve));
+        assert.equal(
+            hostedResolutionStarts,
+            0,
+            'microtasks between Theia startup phases must not start shared-container async resolution'
+        );
+
+        (contributions[0] as RideOpenRequestContribution).onStart();
+        (contributions[0] as RideOpenRequestContribution).onStart();
+        await new Promise<void>(resolve => queueMicrotask(resolve));
+        assert.equal(hostedResolutionStarts, 0, 'plugin resolution must wait for the attached shell');
+        attachShell();
+        await new Promise<void>(resolve => setImmediate(resolve));
+        assert.equal(hostedResolutionStarts, 1);
 
         resolveHostedPlugins({
             willStart: Promise.resolve(),
@@ -99,7 +121,9 @@ test('frontend contribution remains synchronously constructible with async hoste
             ['asynchronous getAsync failure', () => Promise.reject(new Error('asynchronous getAsync failure'))]
         ] as const) {
             const failingContainer = new Container();
-            bindSynchronousDependencies(failingContainer);
+            bindSynchronousDependencies(failingContainer, {
+                reachedState: () => Promise.resolve()
+            } as unknown as FrontendApplicationStateService);
             Object.defineProperty(failingContainer, 'getAsync', {
                 configurable: true,
                 value: getAsyncFailure
@@ -110,6 +134,7 @@ test('frontend contribution remains synchronously constructible with async hoste
             assert.doesNotThrow(() => {
                 failingContribution = failingContainer.get(identifiers.contribution) as RideOpenRequestContribution;
             });
+            failingContribution.onStart();
             const observations = failingContribution as unknown as {
                 pluginWillStart: Promise<{ succeeded: boolean; error?: unknown }>;
                 pluginDidStart: Promise<{ succeeded: boolean; error?: unknown }>;
@@ -120,6 +145,27 @@ test('frontend contribution remains synchronously constructible with async hoste
                 assert.match(String(result.error), new RegExp(expectedFailure));
             }
         }
+
+        const disposedContainer = new Container();
+        let attachDisposedShell!: () => void;
+        const disposedShell = new Promise<void>(resolve => {
+            attachDisposedShell = resolve;
+        });
+        bindSynchronousDependencies(disposedContainer, {
+            reachedState: () => disposedShell
+        } as unknown as FrontendApplicationStateService);
+        let disposedResolutionStarts = 0;
+        disposedContainer.bind(identifiers.hostedPlugins).toDynamicValue(() => {
+            disposedResolutionStarts++;
+            return hostedPlugins;
+        });
+        disposedContainer.load(new ContainerModule(bind => bindRideOpenRequestContribution(bind, identifiers)));
+        const disposedContribution = disposedContainer.get(identifiers.contribution) as RideOpenRequestContribution;
+        disposedContribution.onStart();
+        disposedContribution.dispose();
+        attachDisposedShell();
+        await new Promise<void>(resolve => setImmediate(resolve));
+        assert.equal(disposedResolutionStarts, 0);
     } finally {
         Object.defineProperty(globalThis, 'window', { configurable: true, value: previousWindow });
         Object.defineProperty(globalThis, 'navigator', { configurable: true, value: previousNavigator });

@@ -86,7 +86,8 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
         protected readonly applicationState: FrontendApplicationStateService,
         hostedPlugins: HostedPluginSupport | Promise<HostedPluginSupport>,
         storage?: Storage,
-        protected readonly startupMilestoneReporter: StartupMilestoneReporter = reportRideStartupMilestone
+        protected readonly startupMilestoneReporter: StartupMilestoneReporter = reportRideStartupMilestone,
+        protected readonly startHostedPluginResolution: () => void = () => undefined
     ) {
         this.storage = storage ?? window.sessionStorage;
         this.pluginWillStart = observePluginPromise(Promise.resolve(hostedPlugins).then(support => support.willStart));
@@ -106,6 +107,7 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
         if (this.disposed) {
             return;
         }
+        this.startHostedPluginResolution();
         await this.reportStartupMilestone('frontend_shell_attached');
         if (this.disposed) {
             return;

@@ -25,22 +25,41 @@ export interface RideOpenRequestBindingIdentifiers {
     readonly workspaceService: interfaces.ServiceIdentifier<WorkspaceService>;
 }
 
-function resolveAfterSynchronousContribution<T>(
+interface DeferredContainerResolution<T> {
+    readonly promise: Promise<T>;
+    readonly start: () => void;
+}
+
+function prepareContainerResolution<T>(
     container: interfaces.Container,
     identifier: interfaces.ServiceIdentifier<T>
-): Promise<T> {
-    return new Promise<T>((resolve, reject) => {
-        // Starting getAsync while Inversify is still building the synchronous
-        // contribution makes that entire contribution resolution asynchronous.
-        // Defer it until the current resolution stack has unwound instead.
-        queueMicrotask(() => {
-            try {
-                Promise.resolve(container.getAsync(identifier)).then(resolve, reject);
-            } catch (error) {
-                reject(error);
-            }
-        });
+): DeferredContainerResolution<T> {
+    let resolvePromise!: (value: T | PromiseLike<T>) => void;
+    let rejectPromise!: (reason?: unknown) => void;
+    let started = false;
+    const promise = new Promise<T>((resolve, reject) => {
+        resolvePromise = resolve;
+        rejectPromise = reject;
     });
+    return {
+        promise,
+        start: () => {
+            if (started) {
+                return;
+            }
+            started = true;
+            // The promise is observed by the contribution before this runs.
+            // Waiting for attached_shell keeps this shared-container getAsync
+            // out of every synchronous Theia contribution registry.
+            queueMicrotask(() => {
+                try {
+                    Promise.resolve(container.getAsync(identifier)).then(resolvePromise, rejectPromise);
+                } catch (error) {
+                    rejectPromise(error);
+                }
+            });
+        }
+    };
 }
 
 export function bindRideOpenRequestContribution(
@@ -48,14 +67,20 @@ export function bindRideOpenRequestContribution(
     identifiers: RideOpenRequestBindingIdentifiers
 ): void {
     bind(RideNativeChrome).toDynamicValue(() => new RideNativeChrome()).inSingletonScope();
-    bind(RideOpenRequestContribution).toDynamicValue(context => new RideOpenRequestContribution(
-        context.container.get(identifiers.workspaceService),
-        context.container.get(identifiers.openerService),
-        context.container.get(identifiers.messageService),
-        context.container.get(identifiers.applicationShell),
-        context.container.get(RideNativeChrome),
-        context.container.get(identifiers.applicationState),
-        resolveAfterSynchronousContribution(context.container, identifiers.hostedPlugins)
-    )).inSingletonScope();
+    bind(RideOpenRequestContribution).toDynamicValue(context => {
+        const hostedPlugins = prepareContainerResolution(context.container, identifiers.hostedPlugins);
+        return new RideOpenRequestContribution(
+            context.container.get(identifiers.workspaceService),
+            context.container.get(identifiers.openerService),
+            context.container.get(identifiers.messageService),
+            context.container.get(identifiers.applicationShell),
+            context.container.get(RideNativeChrome),
+            context.container.get(identifiers.applicationState),
+            hostedPlugins.promise,
+            undefined,
+            undefined,
+            hostedPlugins.start
+        );
+    }).inSingletonScope();
     bind(identifiers.contribution).toService(RideOpenRequestContribution);
 }
