@@ -1434,6 +1434,12 @@ export async function terminateMeasuredTree(
   );
   let ownedGroupWasReused = false;
   let ownedGroupHasUntrustedChronology = false;
+  let frozenOwnedGroupMembers;
+  let frozenOwnedGroupStableMembers;
+  let ownedGroupMembershipChanged = false;
+  const stableOwnedGroupMemberKey = processRow => (
+    `${processRow.pid}\0${processRow.creationTime}`
+  );
   const inspectOwnedGroup = currentRows => {
     if (!trustedOwnedGroup) {
       return undefined;
@@ -1453,10 +1459,38 @@ export async function terminateMeasuredTree(
     if (eligibleMembers.length !== allMembers.length) {
       ownedGroupHasUntrustedChronology = true;
     }
+    if (frozenOwnedGroupMembers !== undefined
+        && allMembers.some(processRow => !frozenOwnedGroupMembers.has(
+          trackedProcessKey(processRow),
+        ))) {
+      ownedGroupMembershipChanged = true;
+    }
+    if (frozenOwnedGroupStableMembers !== undefined
+        && currentRows.some(processRow => (
+          frozenOwnedGroupStableMembers.has(stableOwnedGroupMemberKey(processRow))
+            && !frozenOwnedGroupMembers.has(trackedProcessKey(processRow))
+        ))) {
+      ownedGroupMembershipChanged = true;
+    }
     return { allMembers, eligibleMembers };
   };
+  const freezeOwnedGroupMembers = inspection => {
+    if (inspection
+        && !ownedGroupWasReused
+        && !ownedGroupHasUntrustedChronology) {
+      frozenOwnedGroupMembers = new Set(
+        inspection.allMembers.map(processRow => trackedProcessKey(processRow)),
+      );
+      frozenOwnedGroupStableMembers = new Set(
+        inspection.allMembers.map(processRow => stableOwnedGroupMemberKey(processRow)),
+      );
+    }
+  };
   const ownedGroupMayBeSignaled = inspection => {
-    if (!inspection || ownedGroupWasReused || ownedGroupHasUntrustedChronology) {
+    if (!inspection
+        || ownedGroupWasReused
+        || ownedGroupHasUntrustedChronology
+        || ownedGroupMembershipChanged) {
       return false;
     }
     return inspection.eligibleMembers.length > 0;
@@ -1548,6 +1582,7 @@ export async function terminateMeasuredTree(
         throw incomplete('process table could not be revalidated before owned-group SIGTERM');
       }
       const termInspection = inspectOwnedGroup(termRows);
+      freezeOwnedGroupMembers(termInspection);
       if (ownedGroupMayBeSignaled(termInspection)) {
         recordSignal(-trustedOwnedGroup.pgid, 'SIGTERM');
       }
@@ -1601,7 +1636,8 @@ export async function terminateMeasuredTree(
     if (survivors.length === 0
         && ownedGroupSurvivors.length === 0
         && !ownedGroupWasReused
-        && !ownedGroupHasUntrustedChronology) {
+        && !ownedGroupHasUntrustedChronology
+        && !ownedGroupMembershipChanged) {
       return;
     }
     if (attempt < verifyAttempts) {
@@ -1613,6 +1649,9 @@ export async function terminateMeasuredTree(
   }
   if (ownedGroupHasUntrustedChronology) {
     throw incomplete(`owned process group ${trustedOwnedGroup.pgid} has untrusted member chronology`);
+  }
+  if (ownedGroupMembershipChanged) {
+    throw incomplete(`owned process group ${trustedOwnedGroup.pgid} membership changed after SIGTERM`);
   }
   if (ownedGroupSurvivors.length > 0) {
     throw incomplete(

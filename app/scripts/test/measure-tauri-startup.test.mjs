@@ -1409,6 +1409,197 @@ test('POSIX owned group refuses SIGKILL after its group leader identity is reuse
   assert.deepEqual(signals, [[-100, 'SIGTERM']]);
 });
 
+test('POSIX owned group freezes TERM membership across foreign leader reuse and exit', async () => {
+  const rootIdentity = {
+    pid: 100,
+    pgid: 100,
+    creationTime: 'root-start',
+    startedAt: 1_000,
+  };
+  const foreignChild = {
+    pid: 203,
+    ppid: 100,
+    pgid: 100,
+    creationTime: 'foreign-child',
+    startedAt: 5_100,
+  };
+  let rows = [{ ...rootIdentity, ppid: 1 }];
+  const signals = [];
+
+  await assert.rejects(
+    terminateMeasuredTree({
+      rootPid: 100,
+      rootIdentity,
+      ownedGroup: { pgid: 100, rootIdentity, startedAt: 1_000 },
+    }, 'linux', {
+      read: () => rows,
+      kill: (pid, signal) => {
+        signals.push([pid, signal]);
+        if (signal === 'SIGTERM') {
+          rows = [{
+            pid: 100,
+            ppid: 1,
+            pgid: 100,
+            creationTime: 'foreign-leader',
+            startedAt: 5_000,
+          }, foreignChild];
+          return true;
+        }
+        return false;
+      },
+      delay: async () => {
+        rows = [foreignChild];
+      },
+      cleanupReadAttempts: 1,
+      cleanupVerifyAttempts: 1,
+    }),
+    /owned process group 100 membership changed after SIGTERM/,
+  );
+
+  assert.deepEqual(signals, [[-100, 'SIGTERM']]);
+  assert.deepEqual(rows, [foreignChild]);
+});
+
+test('POSIX owned group rejects a new owned-looking child after TERM', async () => {
+  const rootIdentity = {
+    pid: 100,
+    pgid: 100,
+    creationTime: 'root-start',
+    startedAt: 1_000,
+  };
+  const newChild = {
+    pid: 203,
+    ppid: 1,
+    pgid: 100,
+    creationTime: 'late-child',
+    startedAt: 2_000,
+  };
+  let rows = [{ ...rootIdentity, ppid: 1 }];
+  const signals = [];
+
+  await assert.rejects(
+    terminateMeasuredTree({
+      rootPid: 100,
+      rootIdentity,
+      ownedGroup: { pgid: 100, rootIdentity, startedAt: 1_000 },
+    }, 'linux', {
+      read: () => rows,
+      kill: (pid, signal) => {
+        signals.push([pid, signal]);
+        if (signal === 'SIGTERM') {
+          rows = [newChild];
+          return true;
+        }
+        return false;
+      },
+      delay: async () => undefined,
+      cleanupReadAttempts: 1,
+      cleanupVerifyAttempts: 1,
+    }),
+    /owned process group 100 membership changed after SIGTERM/,
+  );
+
+  assert.deepEqual(signals, [[-100, 'SIGTERM']]);
+  assert.deepEqual(rows, [newChild]);
+});
+
+test('POSIX owned group rejects a frozen PID whose process identity changes after TERM', async () => {
+  const rootIdentity = {
+    pid: 100,
+    pgid: 100,
+    creationTime: 'root-start',
+    startedAt: 1_000,
+  };
+  const originalDaemon = {
+    pid: 202,
+    ppid: 100,
+    pgid: 100,
+    creationTime: 'original-daemon',
+    startedAt: 2_000,
+  };
+  const reusedDaemon = {
+    ...originalDaemon,
+    ppid: 1,
+    creationTime: 'reused-daemon-pid',
+    startedAt: 5_000,
+  };
+  let rows = [{ ...rootIdentity, ppid: 1 }, originalDaemon];
+  const signals = [];
+
+  await assert.rejects(
+    terminateMeasuredTree({
+      rootPid: 100,
+      rootIdentity,
+      ownedGroup: { pgid: 100, rootIdentity, startedAt: 1_000 },
+    }, 'linux', {
+      read: () => rows,
+      kill: (pid, signal) => {
+        signals.push([pid, signal]);
+        if (signal === 'SIGTERM') {
+          rows = [reusedDaemon];
+          return true;
+        }
+        return false;
+      },
+      delay: async () => undefined,
+      cleanupReadAttempts: 1,
+      cleanupVerifyAttempts: 1,
+    }),
+    /owned process group 100 membership changed after SIGTERM/,
+  );
+
+  assert.deepEqual(signals, [[-100, 'SIGTERM']]);
+  assert.deepEqual(rows, [reusedDaemon]);
+});
+
+test('POSIX owned group rejects a frozen daemon that escapes to another process group', async () => {
+  const rootIdentity = {
+    pid: 100,
+    pgid: 100,
+    creationTime: 'root-start',
+    startedAt: 1_000,
+  };
+  const originalDaemon = {
+    pid: 202,
+    ppid: 100,
+    pgid: 100,
+    creationTime: 'daemon-start',
+    startedAt: 2_000,
+  };
+  const escapedDaemon = {
+    ...originalDaemon,
+    ppid: 1,
+    pgid: 200,
+  };
+  let rows = [{ ...rootIdentity, ppid: 1 }, originalDaemon];
+  const signals = [];
+
+  await assert.rejects(
+    terminateMeasuredTree({
+      rootPid: 100,
+      rootIdentity,
+      ownedGroup: { pgid: 100, rootIdentity, startedAt: 1_000 },
+    }, 'linux', {
+      read: () => rows,
+      kill: (pid, signal) => {
+        signals.push([pid, signal]);
+        if (signal === 'SIGTERM') {
+          rows = [escapedDaemon];
+          return true;
+        }
+        return false;
+      },
+      delay: async () => undefined,
+      cleanupReadAttempts: 1,
+      cleanupVerifyAttempts: 1,
+    }),
+    /owned process group 100 membership changed after SIGTERM/,
+  );
+
+  assert.deepEqual(signals, [[-100, 'SIGTERM']]);
+  assert.deepEqual(rows, [escapedDaemon]);
+});
+
 test('POSIX owned group refuses TERM when a fresh preflight finds a reused leader', async () => {
   const rootIdentity = {
     pid: 100,
@@ -2935,11 +3126,13 @@ test('measurement cleanup failure rejects the campaign and is persisted in failu
             processes: [{ ...rootIdentity, ppid: 1 }],
           }),
           terminate: async () => {
-            throw new Error('startup cleanup incomplete: owned process group 7331 was reused');
+            throw new Error(
+              'startup cleanup incomplete: owned process group 7331 membership changed after SIGTERM',
+            );
           },
         }),
       }),
-      /cleanup incomplete.*group 7331 was reused/i,
+      /cleanup incomplete.*group 7331 membership changed after SIGTERM/i,
     );
 
     assert.equal(fs.existsSync(output), false);
@@ -2948,7 +3141,10 @@ test('measurement cleanup failure rejects the campaign and is persisted in failu
       'utf8',
     ));
     assert.equal(diagnostic.status, 'failed');
-    assert.match(diagnostic.error.message, /cleanup incomplete.*group 7331 was reused/i);
+    assert.match(
+      diagnostic.error.message,
+      /cleanup incomplete.*group 7331 membership changed after SIGTERM/i,
+    );
     assert.equal(diagnostic.runIndex, 1);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
