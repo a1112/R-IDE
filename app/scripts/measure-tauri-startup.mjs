@@ -135,8 +135,19 @@ export function filterSpawnEnvironment(sourceEnvironment, reportPath) {
 }
 
 export function redactDiagnosticText(text, sensitiveValues = []) {
-  const uniqueSensitiveValues = [...new Set(sensitiveValues)]
-    .filter(candidate => typeof candidate === 'string' && candidate.length > 0)
+  const normalizedSensitiveValues = [];
+  for (const candidate of sensitiveValues) {
+    if (typeof candidate !== 'string' || candidate.trim().length === 0) {
+      continue;
+    }
+    normalizedSensitiveValues.push(candidate);
+    for (const line of candidate.split(/\r\n|\n|\r/)) {
+      if (line.length > 0 && line.trim().length > 0) {
+        normalizedSensitiveValues.push(line, line.trim());
+      }
+    }
+  }
+  const uniqueSensitiveValues = [...new Set(normalizedSensitiveValues)]
     .sort((left, right) => right.length - left.length);
   let redacted = redactSensitiveFragments(String(text), uniqueSensitiveValues);
   for (const value of uniqueSensitiveValues) {
@@ -761,7 +772,9 @@ export function planProcessCleanup(
     const rawProcessIds = rawDescendantIds(rows, verifiedIdentity.pid);
     const chronologyIsComplete = comparableStartedAt(verifiedIdentity) !== null
       && [...rawProcessIds].every(pid => safeProcessIds.has(pid));
-    if (allowTree && chronologyIsComplete) {
+    const processGroupIsComplete = verifiedIdentity.pgid === null
+      || chronologicalProcesses.every(processRow => processRow.pgid === verifiedIdentity.pgid);
+    if (allowTree && chronologyIsComplete && processGroupIsComplete) {
       return {
         mode: 'tree',
         rootPid: verifiedIdentity.pid,
@@ -885,18 +898,18 @@ export function startProcessTreeMonitor(
   {
     child,
     platform = process.platform,
-    intervalMs = 50,
+    intervalMs = 2_000,
     read = readProcessTable,
-    schedule = (callback, milliseconds) => setInterval(callback, milliseconds),
-    cancel = timer => clearInterval(timer),
+    schedule = (callback, milliseconds) => setTimeout(callback, milliseconds),
+    cancel = timer => clearTimeout(timer),
   } = {},
 ) {
   const tracked = new Map();
   let stopped = false;
-  const poll = () => {
-    if (stopped) {
-      return;
-    }
+  let timer;
+  let generation = 0;
+  let stopPromise;
+  const collect = () => {
     try {
       const rows = read(platform);
       const currentRoot = rows.find(processRow => processRow.pid === rootIdentity.pid);
@@ -947,20 +960,51 @@ export function startProcessTreeMonitor(
       // A transient query failure or early root exit leaves accumulated identities intact.
     }
   };
-  poll();
-  const timer = schedule(poll, intervalMs);
-  timer?.unref?.();
-  const onRootExit = () => poll();
+  const scheduleNext = () => {
+    if (stopped) {
+      return;
+    }
+    const token = ++generation;
+    timer = schedule(() => {
+      if (stopped || token !== generation) {
+        return;
+      }
+      timer = undefined;
+      collect();
+      scheduleNext();
+    }, intervalMs);
+    timer?.unref?.();
+  };
+  const cancelScheduled = () => {
+    generation++;
+    if (timer !== undefined) {
+      cancel(timer);
+      timer = undefined;
+    }
+  };
+  collect();
+  scheduleNext();
+  const onRootExit = () => {
+    if (stopped) {
+      return;
+    }
+    cancelScheduled();
+    collect();
+    scheduleNext();
+  };
   child?.once?.('exit', onRootExit);
   return {
     async stop() {
-      if (!stopped) {
-        poll();
+      if (!stopPromise) {
         stopped = true;
-        cancel(timer);
+        cancelScheduled();
         child?.off?.('exit', onRootExit);
+        stopPromise = Promise.resolve().then(() => {
+          collect();
+          return [...tracked.values()].sort((left, right) => left.pid - right.pid);
+        });
       }
-      return [...tracked.values()].sort((left, right) => left.pid - right.pid);
+      return stopPromise;
     },
   };
 }
@@ -1175,9 +1219,37 @@ export async function terminateMeasuredTree(
     }),
     kill = (pid, signal) => process.kill(pid, signal),
     delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds)),
+    cleanupReadAttempts = 3,
+    cleanupVerifyAttempts = 3,
+    cleanupReadDelayMs = 25,
   } = {},
 ) {
   const verifiedRootPid = positiveInteger(rootPid, 'spawned root pid');
+  const boundedAttempts = (value, label) => {
+    if (!Number.isSafeInteger(value) || value < 1 || value > 10) {
+      throw new Error(`${label} must be an integer between 1 and 10`);
+    }
+    return value;
+  };
+  const readAttempts = boundedAttempts(cleanupReadAttempts, 'cleanup read attempts');
+  const verifyAttempts = boundedAttempts(cleanupVerifyAttempts, 'cleanup verify attempts');
+  if (!Number.isSafeInteger(cleanupReadDelayMs) || cleanupReadDelayMs < 0) {
+    throw new Error('cleanup read delay must be a non-negative safe integer');
+  }
+  const readWithRetry = async () => {
+    let lastError;
+    for (let attempt = 1; attempt <= readAttempts; attempt++) {
+      try {
+        return read(platform);
+      } catch (error) {
+        lastError = error;
+      }
+      if (attempt < readAttempts) {
+        await delay(cleanupReadDelayMs);
+      }
+    }
+    throw lastError ?? new Error('process-table query failed');
+  };
   const terminateControlledChild = async () => {
     const controlledChildIsRunning = child?.pid === verifiedRootPid
       && child.killed === false
@@ -1201,13 +1273,15 @@ export async function terminateMeasuredTree(
       }
     }
   };
-  let trustedRootIdentity = false;
+  let trustedRootIdentity;
   if (rootIdentity) {
     try {
-      trustedRootIdentity = validateProcessIdentity(rootIdentity, 'spawned root identity').pid
-        === verifiedRootPid;
+      const candidate = validateProcessIdentity(rootIdentity, 'spawned root identity');
+      if (candidate.pid === verifiedRootPid) {
+        trustedRootIdentity = candidate;
+      }
     } catch {
-      trustedRootIdentity = false;
+      trustedRootIdentity = undefined;
     }
   }
   if (!trustedRootIdentity) {
@@ -1217,18 +1291,18 @@ export async function terminateMeasuredTree(
 
   let rows;
   try {
-    rows = read(platform);
+    rows = await readWithRetry();
   } catch {
     await terminateControlledChild();
-    return;
+    throw new Error('startup cleanup incomplete: process table could not be verified');
   }
   const allowTree = platform === 'win32'
-    || (rootIdentity.pgid === rootIdentity.pid
-      && Number.isSafeInteger(rootIdentity.pgid)
-      && rootIdentity.pgid > 0);
+    || (trustedRootIdentity.pgid === trustedRootIdentity.pid
+      && Number.isSafeInteger(trustedRootIdentity.pgid)
+      && trustedRootIdentity.pgid > 0);
   let cleanupTrackedProcesses = trackedProcesses;
-  if (rows.some(row => sameProcessIdentity(row, rootIdentity))) {
-    const chronological = chronologicalProcessTree(rows, rootIdentity);
+  if (rows.some(row => sameProcessIdentity(row, trustedRootIdentity))) {
+    const chronological = chronologicalProcessTree(rows, trustedRootIdentity);
     cleanupTrackedProcesses = mergeTrackedProcesses(
       trackedProcesses,
       chronological.selected.map(processRow => ({
@@ -1241,109 +1315,175 @@ export async function terminateMeasuredTree(
       })),
     );
   }
-  const initialPlan = planProcessCleanup(rows, rootIdentity, cleanupTrackedProcesses, { allowTree });
+  const exactIdentities = new Map();
+  const rememberIdentities = processes => {
+    for (const processRow of processes) {
+      exactIdentities.set(trackedProcessKey(processRow), processRow);
+    }
+  };
+  const rememberSafeDescendants = currentRows => {
+    if (!currentRows.some(row => sameProcessIdentity(row, trustedRootIdentity))) {
+      return;
+    }
+    const chronological = chronologicalProcessTree(currentRows, trustedRootIdentity);
+    const observedProcesses = chronological.selected.map(processRow => ({
+      pid: processRow.pid,
+      ppid: processRow.ppid,
+      pgid: processRow.pgid,
+      creationTime: processRow.creationTime,
+      startedAt: comparableStartedAt(processRow),
+      depth: chronological.discovered.get(processRow.pid).depth,
+    }));
+    cleanupTrackedProcesses = mergeTrackedProcesses(cleanupTrackedProcesses, observedProcesses);
+    rememberIdentities(observedProcesses);
+  };
+  rememberIdentities([trustedRootIdentity, ...cleanupTrackedProcesses]);
+  const actionFailures = [];
+  const recordCommand = (command, args) => {
+    try {
+      const result = run(command, args);
+      if (result?.error || result?.signal || result?.status !== 0) {
+        actionFailures.push(`${command} ${args.join(' ')} did not report success`);
+      }
+    } catch {
+      actionFailures.push(`${command} ${args.join(' ')} threw`);
+    }
+  };
+  const recordSignal = (pid, signal) => {
+    try {
+      if (kill(pid, signal) === false) {
+        actionFailures.push(`${signal} ${pid} returned false`);
+      }
+    } catch {
+      actionFailures.push(`${signal} ${pid} threw`);
+    }
+  };
+  const incomplete = reason => new Error(
+    `startup cleanup incomplete: ${reason}`
+      + (actionFailures.length > 0 ? `; ${actionFailures.join('; ')}` : ''),
+  );
+  const readPlan = async allowTreeForRead => {
+    const currentRows = await readWithRetry();
+    rememberSafeDescendants(currentRows);
+    return planProcessCleanup(
+      currentRows,
+      trustedRootIdentity,
+      cleanupTrackedProcesses,
+      { allowTree: allowTreeForRead },
+    );
+  };
+  const rootFirst = processIds => processIds.includes(verifiedRootPid)
+    ? [verifiedRootPid, ...processIds.filter(pid => pid !== verifiedRootPid)]
+    : processIds;
+  const initialPlan = planProcessCleanup(
+    rows,
+    trustedRootIdentity,
+    cleanupTrackedProcesses,
+    { allowTree },
+  );
   if (platform === 'win32') {
     const terminateExplicit = async processIds => {
       for (const pid of processIds) {
         let currentPlan;
         try {
-          currentPlan = planProcessCleanup(read(platform), rootIdentity, cleanupTrackedProcesses, {
-            allowTree: false,
-          });
+          currentPlan = await readPlan(false);
         } catch {
           await terminateControlledChild();
-          return false;
+          throw incomplete('process table could not be revalidated before taskkill');
         }
         if (currentPlan.processIds.includes(pid)) {
-          run('taskkill.exe', ['/PID', String(pid), '/F']);
+          recordCommand('taskkill.exe', ['/PID', String(pid), '/F']);
         }
       }
-      return true;
     };
-    const rootFirst = processIds => processIds.includes(verifiedRootPid)
-      ? [verifiedRootPid, ...processIds.filter(pid => pid !== verifiedRootPid)]
-      : processIds;
     if (initialPlan.mode === 'tree') {
       let currentPlan;
       try {
-        currentPlan = planProcessCleanup(read(platform), rootIdentity, cleanupTrackedProcesses, {
-          allowTree: true,
-        });
+        currentPlan = await readPlan(true);
       } catch {
         await terminateControlledChild();
-        return;
+        throw incomplete('process table could not be revalidated before taskkill');
       }
       if (currentPlan.mode === 'tree') {
-        run('taskkill.exe', ['/PID', String(currentPlan.rootPid), '/T', '/F']);
+        recordCommand('taskkill.exe', ['/PID', String(currentPlan.rootPid), '/T', '/F']);
       } else {
         await terminateExplicit(rootFirst(currentPlan.processIds));
       }
     } else {
       await terminateExplicit(rootFirst(initialPlan.processIds));
     }
-    return;
-  }
-
-  const terminateExplicit = async (processIds, signal) => {
-    for (const pid of processIds) {
-      let currentPlan;
-      try {
-        currentPlan = planProcessCleanup(read(platform), rootIdentity, cleanupTrackedProcesses, {
-          allowTree: false,
-        });
-      } catch {
-        await terminateControlledChild();
-        return false;
-      }
-      if (currentPlan.processIds.includes(pid)) {
+  } else {
+    const terminateExplicit = async (processIds, signal) => {
+      for (const pid of rootFirst(processIds)) {
+        let currentPlan;
         try {
-          kill(pid, signal);
+          currentPlan = await readPlan(false);
         } catch {
-          // A verified descendant may exit between revalidation and the signal.
+          await terminateControlledChild();
+          throw incomplete('process table could not be revalidated before signaling');
+        }
+        if (currentPlan.processIds.includes(pid)) {
+          recordSignal(pid, signal);
         }
       }
-    }
-    return true;
-  };
-  const signalPlan = async (plan, signal, allowGroup) => {
-    if (plan.mode === 'tree') {
-      let currentPlan;
-      try {
-        currentPlan = planProcessCleanup(read(platform), rootIdentity, cleanupTrackedProcesses, {
-          allowTree: allowGroup,
-        });
-      } catch {
-        await terminateControlledChild();
-        return false;
-      }
-      if (currentPlan.mode === 'tree'
-          && Number.isSafeInteger(currentPlan.pgid)
-          && currentPlan.pgid > 0
-          && currentPlan.pgid === currentPlan.rootPid) {
+    };
+    const signalPlan = async (plan, signal, allowGroup) => {
+      if (plan.mode === 'tree') {
+        let currentPlan;
         try {
-          kill(-currentPlan.pgid, signal);
+          currentPlan = await readPlan(allowGroup);
         } catch {
-          // The verified root may exit between revalidation and the group signal.
+          await terminateControlledChild();
+          throw incomplete('process table could not be revalidated before group signaling');
         }
-        return true;
+        if (currentPlan.mode === 'tree'
+            && Number.isSafeInteger(currentPlan.pgid)
+            && currentPlan.pgid > 0
+            && currentPlan.pgid === currentPlan.rootPid) {
+          recordSignal(-currentPlan.pgid, signal);
+          return;
+        }
+        await terminateExplicit(currentPlan.processIds, signal);
+        return;
       }
-      return terminateExplicit(currentPlan.processIds, signal);
-    }
-    return terminateExplicit(plan.processIds, signal);
-  };
-  await signalPlan(initialPlan, 'SIGTERM', allowTree);
-  await delay(250);
+      await terminateExplicit(plan.processIds, signal);
+    };
+    await signalPlan(initialPlan, 'SIGTERM', allowTree);
+    await delay(250);
 
-  try {
-    rows = read(platform);
-  } catch {
-    await terminateControlledChild();
-    return;
+    try {
+      rows = await readWithRetry();
+    } catch {
+      await terminateControlledChild();
+      throw incomplete('process table could not be revalidated after SIGTERM');
+    }
+    rememberSafeDescendants(rows);
+    const finalPlan = planProcessCleanup(rows, trustedRootIdentity, cleanupTrackedProcesses, {
+      allowTree: allowTree && initialPlan.mode === 'tree',
+    });
+    await signalPlan(finalPlan, 'SIGKILL', allowTree && initialPlan.mode === 'tree');
   }
-  const finalPlan = planProcessCleanup(rows, rootIdentity, cleanupTrackedProcesses, {
-    allowTree: allowTree && initialPlan.mode === 'tree',
-  });
-  await signalPlan(finalPlan, 'SIGKILL', allowTree && initialPlan.mode === 'tree');
+
+  let survivors = [...exactIdentities.values()];
+  for (let attempt = 1; attempt <= verifyAttempts; attempt++) {
+    let verificationRows;
+    try {
+      verificationRows = await readWithRetry();
+    } catch {
+      await terminateControlledChild();
+      throw incomplete('process table could not be read for final verification');
+    }
+    survivors = [...exactIdentities.values()].filter(identity => verificationRows.some(
+      processRow => sameProcessIdentity(processRow, identity),
+    ));
+    if (survivors.length === 0) {
+      return;
+    }
+    if (attempt < verifyAttempts) {
+      await delay(cleanupReadDelayMs);
+    }
+  }
+  throw incomplete(`exact process identities still running (${survivors.map(row => row.pid).join(', ')})`);
 }
 
 const defaultMeasurementDependencies = {
@@ -1367,6 +1507,21 @@ export async function measureOnce(options, dependencies = defaultMeasurementDepe
   let rootIdentity;
   let metrics;
   let monitor;
+  let monitoredProcesses = [];
+  let stopMonitorPromise;
+  const stopMonitorOnce = () => {
+    if (!stopMonitorPromise) {
+      const activeMonitor = monitor;
+      monitor = undefined;
+      stopMonitorPromise = activeMonitor
+        ? Promise.resolve(activeMonitor.stop()).then(processes => {
+          monitoredProcesses = mergeTrackedProcesses(monitoredProcesses, processes);
+          return monitoredProcesses;
+        })
+        : Promise.resolve(monitoredProcesses);
+    }
+    return stopMonitorPromise;
+  };
   try {
     rootIdentity = await dependencies.capture(rootPid, {
       timeoutMs: Math.min(2_000, Math.max(0, deadline - now())),
@@ -1385,6 +1540,7 @@ export async function measureOnce(options, dependencies = defaultMeasurementDepe
         `startup report pid ${startupReport.pid} does not match spawned root pid ${rootPid}`,
       );
     }
+    await stopMonitorOnce();
     await dependencies.delay(options.idleMs);
     metrics = dependencies.sample(rootIdentity);
     const finalStartupReport = await dependencies.waitForReport(options.reportPath, {
@@ -1403,9 +1559,7 @@ export async function measureOnce(options, dependencies = defaultMeasurementDepe
   } finally {
     let trackedProcesses = metrics?.processes ?? [];
     try {
-      if (monitor) {
-        trackedProcesses = mergeTrackedProcesses(trackedProcesses, await monitor.stop());
-      }
+      trackedProcesses = mergeTrackedProcesses(trackedProcesses, await stopMonitorOnce());
     } finally {
       try {
         await dependencies.terminate({

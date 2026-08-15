@@ -733,6 +733,69 @@ test('process tree monitor accumulates identities and releases its timer and exi
   assert.equal(reads, readsAfterStop, 'repeated stop must not query the process table');
 });
 
+test('process tree monitor uses a low-frequency non-overlapping recursive timeout', async () => {
+  const child = new EventEmitter();
+  child.pid = 100;
+  const rootIdentity = {
+    pid: 100,
+    pgid: null,
+    creationTime: 'root-start',
+    startedAt: 1_000,
+  };
+  const rows = [{ ...rootIdentity, ppid: 1 }];
+  const scheduled = [];
+  const cancelled = [];
+  let reads = 0;
+  let schedulesDuringRead = 0;
+
+  const monitor = startProcessTreeMonitor(rootIdentity, {
+    child,
+    platform: 'win32',
+    read: () => {
+      reads++;
+      schedulesDuringRead = scheduled.filter(timer => !timer.cancelled).length;
+      return rows;
+    },
+    schedule: (callback, milliseconds) => {
+      const timer = {
+        callback: () => {
+          timer.cancelled = true;
+          callback();
+        },
+        milliseconds,
+        cancelled: false,
+        unref() {},
+      };
+      scheduled.push(timer);
+      return timer;
+    },
+    cancel: timer => {
+      timer.cancelled = true;
+      cancelled.push(timer);
+    },
+  });
+
+  assert.equal(scheduled.length, 1);
+  assert.equal(scheduled[0].milliseconds, 2_000);
+  const firstTimer = scheduled[0];
+  firstTimer.callback();
+  assert.equal(schedulesDuringRead, 0, 'the next timeout must not exist while a poll is running');
+  assert.equal(scheduled.length, 2, 'a completed poll schedules exactly one successor');
+
+  child.emit('exit');
+  assert.equal(scheduled.length, 3, 'root exit replaces the pending timeout with one successor');
+  const readsAfterExit = reads;
+  firstTimer.callback();
+  assert.equal(reads, readsAfterExit, 'a stale cancelled callback must not query or reschedule');
+
+  await monitor.stop();
+  assert.equal(cancelled.length >= 2, true);
+  assert.equal(reads, 4, 'initial, driven tick, root exit, and final stop are the only queries');
+  const readsAfterStop = reads;
+  scheduled.at(-1).callback();
+  assert.equal(reads, readsAfterStop, 'stopped monitor callbacks must be inert');
+});
+
 test('process tree monitor never seeds discovery from a missing root PID', async () => {
   const child = new EventEmitter();
   child.pid = 100;
@@ -908,23 +971,266 @@ test('cleanup query failure falls back only to the still-owned child handle', as
       return true;
     },
   };
-  await terminateMeasuredTree({
-    child,
-    rootPid: 100,
-    rootIdentity: { pid: 100, pgid: 100, creationTime: 'root-start' },
-    trackedProcesses: [
-      { pid: 101, ppid: 100, pgid: 100, creationTime: 'backend-start', depth: 1 },
-    ],
-  }, 'linux', {
-    read: () => {
-      throw new Error('ps unavailable');
-    },
-    run: () => events.push('taskkill'),
-    kill: () => events.push('bare-pid'),
-    delay: async () => undefined,
-  });
+  await assert.rejects(
+    terminateMeasuredTree({
+      child,
+      rootPid: 100,
+      rootIdentity: { pid: 100, pgid: 100, creationTime: 'root-start', startedAt: 1_000 },
+      trackedProcesses: [
+        {
+          pid: 101,
+          ppid: 100,
+          pgid: 100,
+          creationTime: 'backend-start',
+          startedAt: 2_000,
+          depth: 1,
+        },
+      ],
+    }, 'linux', {
+      read: () => {
+        throw new Error('ps unavailable');
+      },
+      run: () => events.push('taskkill'),
+      kill: () => events.push('bare-pid'),
+      delay: async () => undefined,
+      cleanupReadAttempts: 2,
+    }),
+    /cleanup incomplete.*process table/i,
+  );
 
   assert.deepEqual(events, ['child:SIGTERM', 'child:SIGKILL']);
+});
+
+test('cleanup retries a transient process-table query and verifies exact identity removal', async () => {
+  const rootIdentity = {
+    pid: 100,
+    pgid: null,
+    creationTime: 'root-start',
+    startedAt: 1_000,
+  };
+  let rows = [{ ...rootIdentity, ppid: 1 }];
+  let reads = 0;
+  const commands = [];
+
+  await terminateMeasuredTree({ rootPid: 100, rootIdentity }, 'win32', {
+    read: () => {
+      reads++;
+      if (reads === 1) {
+        throw new Error('transient CIM failure');
+      }
+      return rows;
+    },
+    run: (command, args) => {
+      commands.push([command, ...args]);
+      rows = [];
+      return { status: 0 };
+    },
+    delay: async () => undefined,
+    cleanupReadAttempts: 2,
+  });
+
+  assert.deepEqual(commands, [['taskkill.exe', '/PID', '100', '/T', '/F']]);
+  assert.ok(reads >= 3, 'cleanup must reread after termination to verify disappearance');
+});
+
+test('cleanup rejects a successful command when an exact process identity survives', async () => {
+  const rootIdentity = {
+    pid: 100,
+    pgid: null,
+    creationTime: 'root-start',
+    startedAt: 1_000,
+  };
+  const rows = [{ ...rootIdentity, ppid: 1 }];
+
+  await assert.rejects(
+    terminateMeasuredTree({ rootPid: 100, rootIdentity }, 'win32', {
+      read: () => rows,
+      run: () => ({ status: 0 }),
+      delay: async () => undefined,
+      cleanupReadAttempts: 1,
+    }),
+    /cleanup incomplete.*100/i,
+  );
+});
+
+test('cleanup accepts a failed command only when posterior identity verification proves exit', async () => {
+  const rootIdentity = {
+    pid: 100,
+    pgid: null,
+    creationTime: 'root-start',
+    startedAt: 1_000,
+  };
+  let rows = [{ ...rootIdentity, ppid: 1 }];
+
+  await terminateMeasuredTree({ rootPid: 100, rootIdentity }, 'win32', {
+    read: () => rows,
+    run: () => {
+      rows = [];
+      return { status: 1, stderr: 'already gone' };
+    },
+    delay: async () => undefined,
+    cleanupReadAttempts: 1,
+  });
+});
+
+test('cleanup posterior verification includes descendants discovered during action revalidation', async () => {
+  const rootIdentity = {
+    pid: 100,
+    pgid: null,
+    creationTime: 'root-start',
+    startedAt: 1_000,
+  };
+  const childIdentity = {
+    pid: 101,
+    ppid: 100,
+    pgid: null,
+    creationTime: 'child-start',
+    startedAt: 2_000,
+  };
+  let reads = 0;
+  let rows = [{ ...rootIdentity, ppid: 1 }];
+
+  await assert.rejects(
+    terminateMeasuredTree({ rootPid: 100, rootIdentity }, 'win32', {
+      read: () => {
+        reads++;
+        if (reads === 2) {
+          rows = [{ ...rootIdentity, ppid: 1 }, childIdentity];
+        }
+        return rows;
+      },
+      run: () => {
+        rows = [childIdentity];
+        return { status: 1 };
+      },
+      delay: async () => undefined,
+      cleanupReadAttempts: 1,
+      cleanupVerifyAttempts: 1,
+    }),
+    /cleanup incomplete.*101/i,
+  );
+});
+
+test('cleanup reports a failed POSIX signal while its exact identity remains alive', async () => {
+  const rootIdentity = {
+    pid: 100,
+    pgid: 50,
+    creationTime: 'root-start',
+    startedAt: 1_000,
+  };
+  const rows = [{ ...rootIdentity, ppid: 1 }];
+
+  await assert.rejects(
+    terminateMeasuredTree({ rootPid: 100, rootIdentity }, 'linux', {
+      read: () => rows,
+      kill: () => false,
+      delay: async () => undefined,
+      cleanupReadAttempts: 1,
+      cleanupVerifyAttempts: 1,
+    }),
+    /cleanup incomplete.*returned false/i,
+  );
+});
+
+test('cleanup fails closed when the posterior process-table query cannot be verified', async () => {
+  const rootIdentity = {
+    pid: 100,
+    pgid: null,
+    creationTime: 'root-start',
+    startedAt: 1_000,
+  };
+  let reads = 0;
+
+  await assert.rejects(
+    terminateMeasuredTree({ rootPid: 100, rootIdentity }, 'win32', {
+      read: () => {
+        reads++;
+        if (reads >= 3) {
+          throw new Error('CIM unavailable during verification');
+        }
+        return [{ ...rootIdentity, ppid: 1 }];
+      },
+      run: () => ({ status: 0 }),
+      delay: async () => undefined,
+      cleanupReadAttempts: 2,
+    }),
+    /cleanup incomplete.*final verification/i,
+  );
+});
+
+test('POSIX cleanup rejects group mode when any selected process has another pgid', async () => {
+  const rootIdentity = {
+    pid: 100,
+    pgid: 100,
+    creationTime: 'root-start',
+    startedAt: 1_000,
+  };
+  let rows = [
+    { ...rootIdentity, ppid: 1 },
+    {
+      pid: 101,
+      ppid: 100,
+      pgid: 200,
+      creationTime: 'child-start',
+      startedAt: 2_000,
+    },
+  ];
+  const signals = [];
+
+  await terminateMeasuredTree({ rootPid: 100, rootIdentity }, 'linux', {
+    read: () => rows,
+    kill: (pid, signal) => {
+      signals.push([pid, signal]);
+      rows = rows.filter(row => row.pid !== pid);
+      return true;
+    },
+    delay: async () => undefined,
+    cleanupReadAttempts: 1,
+  });
+
+  assert.deepEqual(signals, [[100, 'SIGTERM'], [101, 'SIGTERM']]);
+  assert.equal(signals.some(([pid]) => pid < 0), false);
+});
+
+test('POSIX cleanup retains a newly revalidated mixed-pgid child after killing the root first', async () => {
+  const rootIdentity = {
+    pid: 100,
+    pgid: 100,
+    creationTime: 'root-start',
+    startedAt: 1_000,
+  };
+  const childIdentity = {
+    pid: 101,
+    ppid: 100,
+    pgid: 200,
+    creationTime: 'child-start',
+    startedAt: 2_000,
+  };
+  let reads = 0;
+  let rows = [{ ...rootIdentity, ppid: 1 }];
+  const signals = [];
+
+  await terminateMeasuredTree({ rootPid: 100, rootIdentity }, 'linux', {
+    read: () => {
+      reads++;
+      if (reads === 2) {
+        rows = [{ ...rootIdentity, ppid: 1 }, childIdentity];
+      }
+      return rows;
+    },
+    kill: (pid, signal) => {
+      signals.push([pid, signal]);
+      rows = rows
+        .filter(row => row.pid !== pid)
+        .map(row => row.pid === 101 ? { ...row, ppid: 1 } : row);
+      return true;
+    },
+    delay: async () => undefined,
+    cleanupReadAttempts: 1,
+  });
+
+  assert.deepEqual(signals, [[100, 'SIGTERM'], [101, 'SIGTERM']]);
+  assert.equal(signals.some(([pid]) => pid < 0), false);
 });
 
 test('process tree monitor refuses to expand after the root PID is reused', async () => {
@@ -977,7 +1283,7 @@ test('explicit cleanup revalidates identity immediately before every kill', asyn
     delay: async () => undefined,
   });
 
-  assert.equal(reads, 2);
+  assert.equal(reads, 3, 'cleanup performs a final posterior identity read');
   assert.deepEqual(commands, []);
 });
 
@@ -990,17 +1296,22 @@ test('tree termination rechecks identity and never targets a reused root or desc
   ];
   const commands = [];
 
+  let rows = [
+    { pid: 100, ppid: 1, pgid: null, creationTime: 'reused-root', startedAt: 4_000 },
+    { pid: 101, ppid: 1, pgid: null, creationTime: 'reused-child', startedAt: 4_000 },
+    { pid: 102, ppid: 1, pgid: null, creationTime: 'grandchild-start', startedAt: 3_000 },
+  ];
   await terminateMeasuredTree({
     rootPid: rootIdentity.pid,
     rootIdentity,
     trackedProcesses: tracked,
   }, 'win32', {
-    read: () => [
-      { pid: 100, ppid: 1, pgid: null, creationTime: 'reused-root', startedAt: 4_000 },
-      { pid: 101, ppid: 1, pgid: null, creationTime: 'reused-child', startedAt: 4_000 },
-      { pid: 102, ppid: 1, pgid: null, creationTime: 'grandchild-start', startedAt: 3_000 },
-    ],
-    run: (command, args) => commands.push([command, ...args]),
+    read: () => rows,
+    run: (command, args) => {
+      commands.push([command, ...args]);
+      rows = rows.filter(row => row.pid !== Number(args[1]));
+      return { status: 0 };
+    },
     delay: async () => undefined,
   });
 
@@ -1010,14 +1321,19 @@ test('tree termination rechecks identity and never targets a reused root or desc
 test('tree termination uses whole-tree cleanup when the captured root still matches', async () => {
   const rootIdentity = { pid: 100, pgid: null, creationTime: 'root-start', startedAt: 1_000 };
   const commands = [];
+  let rows = [
+    { pid: 100, ppid: 1, pgid: null, creationTime: 'root-start', startedAt: 1_000 },
+  ];
   await terminateMeasuredTree({
     rootPid: rootIdentity.pid,
     rootIdentity,
   }, 'win32', {
-    read: () => [
-      { pid: 100, ppid: 1, pgid: null, creationTime: 'root-start', startedAt: 1_000 },
-    ],
-    run: (command, args) => commands.push([command, ...args]),
+    read: () => rows,
+    run: (command, args) => {
+      commands.push([command, ...args]);
+      rows = [];
+      return { status: 0 };
+    },
     delay: async () => undefined,
   });
 
@@ -1031,7 +1347,7 @@ test('Windows cleanup never lets taskkill tree expansion reach a child older tha
     creationTime: 'root-current',
     startedAt: 1_000,
   };
-  const rows = [
+  let rows = [
     { pid: 100, ppid: 1, pgid: null, rssBytes: 1, creationTime: 'root-current', startedAt: 1_000 },
     { pid: 101, ppid: 100, pgid: null, rssBytes: 1, creationTime: 'stale-child', startedAt: 900 },
     { pid: 102, ppid: 100, pgid: null, rssBytes: 1, creationTime: 'owned-child', startedAt: 1_100 },
@@ -1048,7 +1364,11 @@ test('Windows cleanup never lets taskkill tree expansion reach a child older tha
     ],
   }, 'win32', {
     read: () => rows,
-    run: (command, args) => commands.push([command, ...args]),
+    run: (command, args) => {
+      commands.push([command, ...args]);
+      rows = rows.filter(row => row.pid !== Number(args[1]));
+      return { status: 0 };
+    },
     delay: async () => undefined,
   });
 
@@ -1063,7 +1383,7 @@ test('Windows cleanup never lets taskkill tree expansion reach a child older tha
 
 test('POSIX termination signals the verified process group after each identity read', async () => {
   const rootIdentity = { pid: 100, pgid: 100, creationTime: 'root-start', startedAt: 1_000 };
-  const rows = [
+  let rows = [
     { pid: 100, ppid: 1, pgid: 100, creationTime: 'root-start', startedAt: 1_000 },
   ];
   const signals = [];
@@ -1072,7 +1392,13 @@ test('POSIX termination signals the verified process group after each identity r
     rootIdentity,
   }, 'linux', {
     read: () => rows,
-    kill: (pid, signal) => signals.push([pid, signal]),
+    kill: (pid, signal) => {
+      signals.push([pid, signal]);
+      if (signal === 'SIGKILL') {
+        rows = [];
+      }
+      return true;
+    },
     delay: async () => undefined,
   });
 
@@ -1087,6 +1413,7 @@ test('POSIX termination falls back bottom-up to identity-matched tracked descend
     { pid: 102, ppid: 101, pgid: 100, creationTime: 'grandchild-start', startedAt: 3_000, depth: 2 },
   ];
   let reads = 0;
+  let grandchildAlive = true;
   const signals = [];
   await terminateMeasuredTree({
     rootPid: rootIdentity.pid,
@@ -1095,7 +1422,7 @@ test('POSIX termination falls back bottom-up to identity-matched tracked descend
   }, 'linux', {
     read: () => {
       reads++;
-      return reads === 1
+      const currentRows = reads === 1
         ? [
           { pid: 100, ppid: 1, pgid: 100, creationTime: 'reused-root', startedAt: 4_000 },
           { pid: 101, ppid: 1, pgid: 100, creationTime: 'child-start', startedAt: 2_000 },
@@ -1105,8 +1432,15 @@ test('POSIX termination falls back bottom-up to identity-matched tracked descend
           { pid: 101, ppid: 1, pgid: 101, creationTime: 'reused-child', startedAt: 4_000 },
           { pid: 102, ppid: 1, pgid: 100, creationTime: 'grandchild-start', startedAt: 3_000 },
         ];
+      return currentRows.filter(row => row.pid !== 102 || grandchildAlive);
     },
-    kill: (pid, signal) => signals.push([pid, signal]),
+    kill: (pid, signal) => {
+      signals.push([pid, signal]);
+      if (pid === 102 && signal === 'SIGKILL') {
+        grandchildAlive = false;
+      }
+      return true;
+    },
     delay: async () => undefined,
   });
 
@@ -1122,22 +1456,29 @@ test('POSIX termination never sends a group signal when root is not the detached
     { pid: 100, ppid: 1, pgid: 50, creationTime: 'root-start', startedAt: 1_000, depth: 0 },
     { pid: 101, ppid: 100, pgid: 50, creationTime: 'child-start', startedAt: 2_000, depth: 1 },
   ];
+  let rows = [...tracked];
   const signals = [];
   await terminateMeasuredTree({
     rootPid: rootIdentity.pid,
     rootIdentity,
     trackedProcesses: tracked,
   }, 'linux', {
-    read: () => tracked,
-    kill: (pid, signal) => signals.push([pid, signal]),
+    read: () => rows,
+    kill: (pid, signal) => {
+      signals.push([pid, signal]);
+      if (signal === 'SIGKILL') {
+        rows = rows.filter(row => row.pid !== pid);
+      }
+      return true;
+    },
     delay: async () => undefined,
   });
 
   assert.deepEqual(signals, [
-    [101, 'SIGTERM'],
     [100, 'SIGTERM'],
-    [101, 'SIGKILL'],
+    [101, 'SIGTERM'],
     [100, 'SIGKILL'],
+    [101, 'SIGKILL'],
   ]);
   assert.equal(signals.some(([pid]) => pid < 0), false);
 });
@@ -1390,14 +1731,79 @@ test('measurement samples after idle and then rereads the complete final report'
   assert.deepEqual(events, [
     'capture:7331',
     'monitor:start',
+    'monitor:stop',
     'idle:30000',
     'sample:7331:root-start',
-    'monitor:stop',
     'terminate:7331:1',
     'logs:persist',
   ]);
   assert.equal(result.startupReport, final);
   assert.equal(result.startupReport.milestones.plugins_ready, 60);
+});
+
+test('measurement stops process monitoring before the idle sampling window', async () => {
+  const early = startupReport(targetMilestones);
+  const final = startupReport(finalMilestones);
+  const child = new EventEmitter();
+  child.pid = 7331;
+  const rootIdentity = {
+    pid: 7331,
+    pgid: null,
+    creationTime: 'root-start',
+    startedAt: 1_000,
+  };
+  const rows = [{ ...rootIdentity, ppid: 1, rssBytes: 1 }];
+  const scheduled = [];
+  let reads = 0;
+  let readsAtIdleStart;
+
+  await measureOnce({
+    executable: '/fixture/R-IDE',
+    codeFile: '/fixture/startup.R',
+    reportPath: '/fixture/report.json',
+    idleMs: 30_000,
+    timeoutMs: 300_000,
+    pollMs: 1,
+    cwd: '/fixture',
+  }, {
+    launch: () => child,
+    capture: async () => rootIdentity,
+    startMonitor: identity => startProcessTreeMonitor(identity, {
+      child,
+      platform: 'win32',
+      read: () => {
+        reads++;
+        return rows;
+      },
+      schedule: callback => {
+        const timer = { callback, cancelled: false, unref() {} };
+        scheduled.push(timer);
+        return timer;
+      },
+      cancel: timer => {
+        timer.cancelled = true;
+      },
+    }),
+    waitForReport: async (_reportPath, options) => options.phase === 'target' ? early : final,
+    delay: async () => {
+      readsAtIdleStart = reads;
+      for (const timer of scheduled) {
+        timer.callback();
+      }
+      assert.equal(reads, readsAtIdleStart, 'idle must not issue monitor process-table queries');
+    },
+    sample: identity => ({
+      rootPid: identity.pid,
+      rootIdentity: identity,
+      processIds: [identity.pid],
+      processCount: 1,
+      rssBytes: 1,
+      processes: rows,
+    }),
+    terminate: async () => undefined,
+  });
+
+  assert.equal(readsAtIdleStart, 2, 'monitor performs only initial and target-stop final reads');
 });
 
 test('measured process stdout and stderr are captured in per-run log files', async () => {
@@ -1623,6 +2029,19 @@ test('bounded log redaction removes every multiline secret window after boundary
   assert.match(output, /z{100}$/);
 });
 
+test('bounded log redaction drops a retained secret tail shorter than the fragment window', () => {
+  const secret = `BEGIN-${'A'.repeat(82)}-SHORTEND`;
+  const retainedSecretTail = secret.slice(-8);
+  const sink = createBoundedLogSink(128);
+  sink.append(Buffer.from(`P${secret}\n${'z'.repeat(119)}`));
+
+  const output = sink.render([secret]);
+
+  assert.doesNotMatch(output, new RegExp(retainedSecretTail));
+  assert.match(output, /truncated \d+ bytes/);
+  assert.match(output, /z{40}$/);
+});
+
 test('bounded log redaction preserves an untruncated log without a newline', () => {
   const sink = createBoundedLogSink(128);
   sink.append(Buffer.from('ordinary one-line log tail'));
@@ -1660,6 +2079,27 @@ test('diagnostic redaction removes partial sensitive-value prefixes, middles, an
 
   assertNoSensitiveWindows(redacted, secret);
   assert.match(redacted, /\[REDACTED\]/);
+});
+
+test('diagnostic redaction removes short nonempty lines from multiline sensitive values', () => {
+  const multilineSecret = [
+    '-----BEGIN PRIVATE MATERIAL-----',
+    'abc123',
+    'SHORT-SECRET',
+    '   trimmed-secret   ',
+    '',
+    '-----END PRIVATE MATERIAL-----',
+  ].join('\r\n');
+  const redacted = redactDiagnosticText([
+    'short line: abc123',
+    'short tail: SHORT-SECRET',
+    'logger trimmed indentation: trimmed-secret',
+    'ordinary   spaces must remain intact',
+  ].join('\n'), [multilineSecret, '   ', '\r\n\t\r\n']);
+
+  assert.doesNotMatch(redacted, /abc123|SHORT-SECRET|trimmed-secret/);
+  assert.match(redacted, /short line: \[REDACTED\]/);
+  assert.match(redacted, /ordinary   spaces must remain intact/);
 });
 
 test('failed campaign atomically preserves diagnostics, report, and unique copied logs', async () => {
@@ -1748,6 +2188,64 @@ test('failed campaign atomically preserves diagnostics, report, and unique copie
       [],
       'atomic diagnostic writes must not leave temporary files',
     );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('measurement cleanup failure rejects the campaign and is persisted in failure diagnostics', async () => {
+  const root = temporaryDirectory('cleanup-failure-diagnostic');
+  const executable = path.join(root, 'R-IDE.exe');
+  const output = path.join(root, 'startup-metrics.json');
+  touch(executable);
+  const rootIdentity = {
+    pid: 7331,
+    pgid: null,
+    creationTime: 'root-start',
+    startedAt: 1_000,
+  };
+  try {
+    await assert.rejects(
+      runMeasurementCampaign({
+        executable,
+        output,
+        runs: 1,
+        idleMs: 0,
+        timeoutMs: 100,
+        pollMs: 1,
+      }, {
+        measure: options => measureOnce(options, {
+          launch: () => ({ pid: 7331 }),
+          capture: async () => rootIdentity,
+          startMonitor: async () => ({ stop: async () => [] }),
+          waitForReport: async (_reportPath, waitOptions) => waitOptions.phase === 'target'
+            ? startupReport(targetMilestones)
+            : startupReport(finalMilestones),
+          delay: async () => undefined,
+          sample: () => ({
+            rootPid: 7331,
+            rootIdentity,
+            processIds: [7331],
+            processCount: 1,
+            rssBytes: 1,
+            processes: [{ ...rootIdentity, ppid: 1 }],
+          }),
+          terminate: async () => {
+            throw new Error('startup cleanup incomplete: exact identity 7331 survived');
+          },
+        }),
+      }),
+      /cleanup incomplete.*7331/i,
+    );
+
+    assert.equal(fs.existsSync(output), false);
+    const diagnostic = JSON.parse(fs.readFileSync(
+      path.join(root, 'startup-metrics.failure.json'),
+      'utf8',
+    ));
+    assert.equal(diagnostic.status, 'failed');
+    assert.match(diagnostic.error.message, /cleanup incomplete.*7331/i);
+    assert.equal(diagnostic.runIndex, 1);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
