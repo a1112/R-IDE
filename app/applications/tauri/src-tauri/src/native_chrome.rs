@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use tauri::menu::{MenuBuilder, SubmenuBuilder};
 use tauri::{AppHandle, Emitter, LogicalPosition, Manager, WebviewWindow};
 
+use crate::startup_metrics::StartupMilestone;
 use crate::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -59,8 +60,15 @@ pub fn ride_frontend_ready(
     );
 
     let state = app.state::<AppState>();
+    let startup_metrics = state.startup_metrics.clone();
     let report = state.launch_intent_router.frontend_ready_after_show(
-        || window.show(),
+        || {
+            let result = window.show();
+            if result.is_ok() {
+                startup_metrics.record_or_warn(StartupMilestone::NativeWindowVisible);
+            }
+            result
+        },
         |error| log::warn!("Failed to show main window after frontend ready: {error}"),
         |intent| app.emit_to("main", "ride-open-request", intent),
     );
@@ -71,6 +79,23 @@ pub fn ride_frontend_ready(
             failure.error
         );
     }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn ride_record_startup_milestone(
+    app: AppHandle,
+    milestone: StartupMilestone,
+) -> Result<(), String> {
+    if !milestone.is_frontend_reportable() {
+        return Err(format!(
+            "Startup milestone {milestone:?} cannot be reported by the frontend"
+        ));
+    }
+
+    app.state::<AppState>()
+        .startup_metrics
+        .record_or_warn(milestone);
     Ok(())
 }
 

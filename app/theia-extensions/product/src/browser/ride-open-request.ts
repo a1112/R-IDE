@@ -8,6 +8,7 @@
  ********************************************************************************/
 
 import type { ApplicationShell } from '@theia/core/lib/browser/shell/application-shell';
+import { invoke, isTauri as isTauriRuntime } from '@tauri-apps/api/core';
 import type { FrontendApplicationContribution } from '@theia/core/lib/browser/frontend-application-contribution';
 import { open } from '@theia/core/lib/browser/opener-service';
 import type { OpenerService } from '@theia/core/lib/browser/opener-service';
@@ -27,6 +28,13 @@ const LEGACY_PENDING_KEY = 'r-ide.open-request.pending.v1';
 const LEGACY_LAST_CONSUMED_KEY = 'r-ide.open-request.last-consumed.v1';
 
 export type RideOpenRequestSource = 'initial' | 'singleInstance' | 'openedUrl';
+export type RideStartupMilestone =
+    | 'frontend_shell_attached'
+    | 'target_file_opened'
+    | 'plugins_started'
+    | 'plugins_ready';
+
+type StartupMilestoneReporter = (milestone: RideStartupMilestone) => Promise<void>;
 
 export interface RideOpenRequest {
     id: string;
@@ -66,7 +74,8 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
         protected readonly messageService: MessageService,
         protected readonly shell: ApplicationShell,
         protected readonly nativeChrome: RideNativeChrome,
-        storage?: Storage
+        storage?: Storage,
+        protected readonly startupMilestoneReporter: StartupMilestoneReporter = reportRideStartupMilestone
     ) {
         this.storage = storage ?? window.sessionStorage;
     }
@@ -80,6 +89,7 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
         if (this.disposed) {
             return;
         }
+        await this.reportStartupMilestone('frontend_shell_attached');
         await this.restorePendingRequest();
         if (this.disposed) {
             return;
@@ -180,10 +190,12 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
 
     protected async openFiles(request: RideOpenRequest): Promise<void> {
         let targetWidgetId: string | undefined;
+        let openedTarget = false;
         const options: WidgetOpenerOptions = { mode: 'open' };
         for (const file of request.files) {
             try {
                 const opened = await open(this.openerService, FileUri.create(file), options);
+                openedTarget = true;
                 if (hasWidgetId(opened)) {
                     targetWidgetId = opened.id;
                 }
@@ -193,6 +205,17 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
         }
         if (targetWidgetId) {
             await this.shell.activateWidget(targetWidgetId);
+        }
+        if (openedTarget) {
+            await this.reportStartupMilestone('target_file_opened');
+        }
+    }
+
+    protected async reportStartupMilestone(milestone: RideStartupMilestone): Promise<void> {
+        try {
+            await this.startupMilestoneReporter(milestone);
+        } catch (error) {
+            console.warn(`[R-IDE] Failed to report startup milestone ${milestone}.`, error);
         }
     }
 
@@ -456,4 +479,11 @@ function hasWidgetId(value: object | undefined): value is { id: string } {
 
 function errorMessage(error: unknown): string {
     return error instanceof Error ? error.message : String(error);
+}
+
+export async function reportRideStartupMilestone(milestone: RideStartupMilestone): Promise<void> {
+    if (typeof window !== 'object' || !isTauriRuntime()) {
+        return;
+    }
+    await invoke('ride_record_startup_milestone', { milestone });
 }

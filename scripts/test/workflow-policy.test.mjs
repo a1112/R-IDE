@@ -68,6 +68,31 @@ test('package jobs download VS Code plugins before building the verified bundle'
   assert.ok(buildIndex > downloadIndex, 'plugins must be available before the Tauri build');
 });
 
+test('package jobs measure startup after verification and upload the unsigned JSON report', () => {
+  const workflow = readWorkflow();
+  const packageJob = jobBlocks(workflow).find(({ name }) => name === 'package');
+  assert.ok(packageJob, 'package job is required');
+  const verifyIndex = packageJob.text.indexOf('- name: Verify the packaged Tauri application');
+  const linuxMeasureIndex = packageJob.text.indexOf('- name: Measure packaged Tauri startup on Linux');
+  const desktopMeasureIndex = packageJob.text.indexOf('- name: Measure packaged Tauri startup on non-Linux');
+  const uploadIndex = packageJob.text.indexOf('- name: Upload unsigned native bundles');
+  assert.ok(verifyIndex >= 0, 'package job must verify the bundle');
+  assert.ok(linuxMeasureIndex > verifyIndex, 'Linux measurement must follow bundle verification');
+  assert.ok(desktopMeasureIndex > verifyIndex, 'desktop measurement must follow bundle verification');
+  assert.ok(uploadIndex > linuxMeasureIndex && uploadIndex > desktopMeasureIndex,
+    'startup reports must be generated before artifact upload');
+
+  const measurementBlock = packageJob.text.slice(linuxMeasureIndex, uploadIndex);
+  assert.match(measurementBlock, /if:\s*runner\.os\s*==\s*['"]Linux['"]/);
+  assert.match(measurementBlock, /if:\s*runner\.os\s*!=\s*['"]Linux['"]/);
+  assert.match(measurementBlock, /xvfb-run\s+-a\s+npm\s+run\s+measure:tauri-startup/);
+  assert.match(measurementBlock, /npm\s+run\s+measure:tauri-startup/);
+  assert.match(measurementBlock, /--output\s+applications\/tauri\/src-tauri\/target\/release\/bundle\/startup-metrics\.json/);
+
+  const packageJson = JSON.parse(fs.readFileSync(path.join(repositoryRoot, 'app', 'package.json'), 'utf8'));
+  assert.equal(packageJson.scripts?.['measure:tauri-startup'], 'node scripts/measure-tauri-startup.mjs');
+});
+
 test('macOS package builds retry transient DMG bundling failures once', () => {
   const workflow = readWorkflow();
   const packageJob = jobBlocks(workflow).find(({ name }) => name === 'package');
@@ -169,6 +194,9 @@ test('Linux Tauri prerequisites avoid conflicting AppIndicator development packa
   const workflow = readWorkflow();
   assert.match(workflow, /\blibayatana-appindicator3-dev\b/);
   assert.doesNotMatch(workflow, /(?:^|\n)\s*libappindicator3-dev\s*\\/m);
+  const packageJob = jobBlocks(workflow).find(({ name }) => name === 'package');
+  assert.ok(packageJob, 'package job is required');
+  assert.match(packageJob.text, /\bxvfb\b/);
 });
 
 test('quality job installs Linux Tauri prerequisites before Rust checks', () => {

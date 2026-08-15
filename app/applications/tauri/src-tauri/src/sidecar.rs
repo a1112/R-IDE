@@ -8,6 +8,7 @@
  ********************************************************************************/
 
 use crate::startup::BackendLaunchPlan;
+use crate::startup_metrics::StartupMilestone;
 use dirs::home_dir;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::fs;
@@ -577,6 +578,7 @@ async fn start_node_backend_process(
         .spawn_command(command)
         .map_err(|e| format!("Failed to spawn backend in PTY: {}", e))?;
     drop(pair.slave);
+    record_startup_milestone(app_handle, StartupMilestone::BackendSpawned);
 
     let child_pid = child.process_id();
     if let Some(pid) = child_pid {
@@ -626,6 +628,10 @@ async fn start_node_backend_process(
                         extract_port_from_line(&line).and_then(|value| value.parse::<u16>().ok())
                     {
                         log::info!("Backend ready on port {}", port);
+                        record_startup_milestone(
+                            app_handle,
+                            StartupMilestone::BackendListening,
+                        );
                         set_backend_port(app_handle, port);
                         backend_ready = true;
                         break;
@@ -730,6 +736,7 @@ pub async fn start_backend_process(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("Failed to spawn backend: {}", e))?;
+    record_startup_milestone(app_handle, StartupMilestone::BackendSpawned);
 
     if let Some(pid) = child.id() {
         log::info!("Backend process started with pid {}", pid);
@@ -763,6 +770,10 @@ pub async fn start_backend_process(
                             if let Some(port_str) = extract_port_from_line(&line) {
                                 if let Ok(port) = port_str.parse::<u16>() {
                                     backend_ready = true;
+                                    record_startup_milestone(
+                                        app_handle,
+                                        StartupMilestone::BackendListening,
+                                    );
                                     set_backend_port(app_handle, port);
                                 }
                             }
@@ -803,6 +814,16 @@ pub async fn start_backend_process(
                 set_backend_port(app_handle, fallback_port);
             }
         }
+    }
+}
+
+fn record_startup_milestone(app_handle: &AppHandle, milestone: StartupMilestone) {
+    if let Some(state) = app_handle.try_state::<crate::AppState>() {
+        state.startup_metrics.record_or_warn(milestone);
+    } else {
+        log::warn!(
+            "Cannot record startup milestone {milestone:?}: application state is unavailable"
+        );
     }
 }
 

@@ -76,6 +76,7 @@ jobs:
             libssl-dev \
             libgtk-3-dev \
             patchelf \
+            xvfb \
             wget
       - name: Install Rust stable toolchain
         run: |
@@ -214,6 +215,14 @@ jobs:
       - name: Verify the packaged Tauri application
         working-directory: app
         run: npm --workspace applications/tauri run verify
+      - name: Measure packaged Tauri startup on Linux
+        if: runner.os == 'Linux'
+        working-directory: app
+        run: xvfb-run -a npm run measure:tauri-startup -- --output applications/tauri/src-tauri/target/release/bundle/startup-metrics.json
+      - name: Measure packaged Tauri startup on non-Linux
+        if: runner.os != 'Linux'
+        working-directory: app
+        run: npm run measure:tauri-startup -- --output applications/tauri/src-tauri/target/release/bundle/startup-metrics.json
       - name: Upload unsigned native bundles
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:

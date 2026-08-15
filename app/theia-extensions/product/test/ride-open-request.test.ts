@@ -17,7 +17,8 @@ import { RideNativeChrome } from '../src/browser/ride-native-chrome';
 import {
     RIDE_OPEN_REQUEST_STATE_KEY,
     RideOpenRequest,
-    RideOpenRequestContribution
+    RideOpenRequestContribution,
+    RideStartupMilestone
 } from '../src/browser/ride-open-request';
 
 const LEGACY_PENDING_KEY = 'r-ide.open-request.pending.v1';
@@ -174,7 +175,9 @@ async function flushRequestChain(): Promise<void> {
 function createContribution(
     workspacePath = String.raw`C:\project`,
     storage = new MemoryStorage(),
-    beforeOpen: (uri: URI) => void = () => undefined
+    beforeOpen: (uri: URI) => void = () => undefined,
+    reportStartupMilestone: (milestone: RideStartupMilestone) => Promise<void>
+        = async () => undefined
 ): {
     contribution: RideOpenRequestContribution;
     workspace: FakeWorkspaceService;
@@ -183,21 +186,27 @@ function createContribution(
     shell: FakeShell;
     native: FakeNativeChrome;
     storage: MemoryStorage;
+    milestones: RideStartupMilestone[];
 } {
     const workspace = new FakeWorkspaceService({ resource: FileUri.create(workspacePath) });
     const openers = new FakeOpenerService(beforeOpen);
     const messages = new FakeMessageService();
     const shell = new FakeShell();
     const native = new FakeNativeChrome();
+    const milestones: RideStartupMilestone[] = [];
     const contribution = new RideOpenRequestContribution(
         workspace as never,
         openers,
         messages as never,
         shell as never,
         native as never,
-        storage
+        storage,
+        async milestone => {
+            milestones.push(milestone);
+            await reportStartupMilestone(milestone);
+        }
     );
-    return { contribution, workspace, openers, messages, shell, native, storage };
+    return { contribution, workspace, openers, messages, shell, native, storage, milestones };
 }
 
 test('same-workspace requests open files in order, activate the target editor, and consume duplicate IDs once', async () => {
@@ -1079,10 +1088,67 @@ test('frontend lifecycle restores and registers once, then unlistens once on cle
 
     assert.equal(context.openers.opened.length, 1);
     assert.equal(context.native.registrations, 1);
+    assert.deepEqual(context.milestones, ['frontend_shell_attached', 'target_file_opened']);
 
     context.contribution.onStop();
     context.contribution.onStop();
     assert.equal(context.native.unlistenCalls, 1);
+});
+
+test('target-file milestone is emitted only after a target opens successfully', async () => {
+    const failed = createContribution('/project', new MemoryStorage(), () => {
+        throw new Error('editor unavailable');
+    });
+    await failed.contribution.handleOpenRequest({
+        id: '21',
+        source: 'initial',
+        workspace: '/project',
+        files: ['/project/fail.R']
+    });
+    assert.deepEqual(failed.milestones, []);
+    assert.equal(failed.messages.errors.length, 1);
+
+    const succeeded = createContribution('/project');
+    await succeeded.contribution.handleOpenRequest({
+        id: '22',
+        source: 'initial',
+        workspace: '/project',
+        files: ['/project/success.R']
+    });
+    assert.deepEqual(succeeded.milestones, ['target_file_opened']);
+});
+
+test('startup reporting failures do not prevent lifecycle registration or opening', async () => {
+    const warnings: unknown[][] = [];
+    const originalWarn = console.warn;
+    console.warn = (...values: unknown[]) => {
+        warnings.push(values);
+    };
+    try {
+        const context = createContribution(
+            '/project',
+            new MemoryStorage(),
+            () => undefined,
+            async () => {
+                throw new Error('metrics unavailable');
+            }
+        );
+
+        await context.contribution.onStart();
+        await context.contribution.handleOpenRequest({
+            id: '23',
+            source: 'initial',
+            workspace: '/project',
+            files: ['/project/report-failure.R']
+        });
+
+        assert.equal(context.native.registrations, 1);
+        assert.equal(context.openers.opened.length, 1);
+        assert.equal(context.messages.errors.length, 0);
+        assert.equal(warnings.length, 2);
+    } finally {
+        console.warn = originalWarn;
+    }
 });
 
 test('frontend startup waits for the workspace before restoring pending files', async () => {

@@ -15,6 +15,7 @@ pub mod launch_intent;
 pub mod native_chrome;
 pub mod sidecar;
 pub mod startup;
+pub mod startup_metrics;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -50,10 +51,14 @@ pub struct AppState {
     pub backend_stopping: Mutex<bool>,
     pub downloads: download::DownloadManager,
     pub launch_intent_router: launch_intent::LaunchIntentRouter,
+    pub startup_metrics: startup_metrics::StartupMetrics,
 }
 
 impl AppState {
-    fn new(initial_launch_intent: Option<launch_intent::LaunchIntent>) -> Self {
+    fn new(
+        initial_launch_intent: Option<launch_intent::LaunchIntent>,
+        startup_metrics: startup_metrics::StartupMetrics,
+    ) -> Self {
         Self {
             backend_port: Mutex::new(None),
             backend_pid: Mutex::new(None),
@@ -63,6 +68,7 @@ impl AppState {
                 MAX_PENDING_LAUNCH_INTENTS,
                 initial_launch_intent,
             ),
+            startup_metrics,
         }
     }
 }
@@ -73,6 +79,7 @@ fn configure_activation_builder<B, P, RegisterPlugin, ManageState>(
     builder: B,
     activation_plugin: P,
     initial_launch_intent: Option<launch_intent::LaunchIntent>,
+    startup_metrics: startup_metrics::StartupMetrics,
     register_plugin: RegisterPlugin,
     manage_state: ManageState,
 ) -> B
@@ -81,7 +88,10 @@ where
     ManageState: FnOnce(B, AppState) -> B,
 {
     let builder = register_plugin(builder, activation_plugin);
-    manage_state(builder, AppState::new(initial_launch_intent))
+    manage_state(
+        builder,
+        AppState::new(initial_launch_intent, startup_metrics),
+    )
 }
 
 fn restore_main_window(app: &tauri::AppHandle) {
@@ -146,6 +156,10 @@ fn install_shutdown_signal_handlers(_app_handle: tauri::AppHandle) {}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let startup_metrics = startup_metrics::StartupMetrics::from_env();
+    if let Err(error) = startup_metrics.record(startup_metrics::StartupMilestone::ProcessStarted) {
+        eprintln!("Warning: failed to record process_started startup milestone: {error}");
+    }
     configure_local_proxy_bypass();
     let _ = env_logger::try_init();
 
@@ -176,6 +190,7 @@ pub fn run() {
             log_launch_intent_delivery_failures("single-instance", report.failures);
         }),
         initial_launch_intent,
+        startup_metrics,
         |builder, plugin| builder.plugin(plugin),
         |builder, state| builder.manage(state),
     );
@@ -184,6 +199,16 @@ pub fn run() {
         .setup(move |app| {
             if let Some(window) = app.get_webview_window("main") {
                 native_chrome::configure_native_window(&window);
+                match window.is_visible() {
+                    Ok(true) => app
+                        .state::<AppState>()
+                        .startup_metrics
+                        .record_or_warn(startup_metrics::StartupMilestone::NativeWindowVisible),
+                    Ok(false) => {}
+                    Err(error) => {
+                        log::warn!("Failed to observe initial main-window visibility: {error}")
+                    }
+                }
             }
             native_chrome::install_menu_event_bridge(app.handle());
 
@@ -213,6 +238,7 @@ pub fn run() {
             native_chrome::ride_start_window_drag,
             native_chrome::ride_window_control,
             native_chrome::ride_frontend_ready,
+            native_chrome::ride_record_startup_milestone,
             commands::open_directory,
             commands::save_file,
             commands::show_in_folder,
@@ -293,6 +319,13 @@ mod tests {
             },
             probe,
             Some(initial.clone()),
+            startup_metrics::StartupMetrics::with_clock(
+                None,
+                "test",
+                "test",
+                1,
+                Arc::new(TestClock),
+            ),
             |mut builder, plugin| {
                 builder.assembly_order.push("plugin");
                 builder.plugin = Some(plugin);
@@ -316,5 +349,14 @@ mod tests {
             Ok::<_, ()>(())
         });
         assert_eq!(delivered, vec![initial]);
+    }
+
+    #[derive(Debug)]
+    struct TestClock;
+
+    impl startup_metrics::ElapsedClock for TestClock {
+        fn elapsed_ms(&self) -> u64 {
+            0
+        }
     }
 }
