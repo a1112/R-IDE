@@ -11,9 +11,10 @@ import type { OpenerService } from '@theia/core/lib/browser/opener-service';
 import type { MessageService } from '@theia/core/lib/common/message-service';
 import { interfaces } from '@theia/core/shared/inversify';
 import type { HostedPluginSupport } from '@theia/plugin-ext/lib/hosted/browser/hosted-plugin';
+import { PluginServer } from '@theia/plugin-ext/lib/common/plugin-protocol';
 import type { WorkspaceService } from '@theia/workspace/lib/browser';
 import { RideNativeChrome } from './ride-native-chrome';
-import { RideOpenRequestContribution } from './ride-open-request';
+import { RideOpenRequestContribution, RidePluginDeploymentScheduler } from './ride-open-request';
 
 export interface RideOpenRequestBindingIdentifiers {
     readonly applicationShell: interfaces.ServiceIdentifier<ApplicationShell>;
@@ -69,17 +70,26 @@ export function bindRideOpenRequestContribution(
     bind(RideNativeChrome).toDynamicValue(() => new RideNativeChrome()).inSingletonScope();
     bind(RideOpenRequestContribution).toDynamicValue(context => {
         const hostedPlugins = prepareContainerResolution(context.container, identifiers.hostedPlugins);
+        const pluginServer = prepareContainerResolution<PluginServer>(context.container, PluginServer);
+        const nativeChrome = context.container.get(RideNativeChrome);
+        const pluginDeployment = new RidePluginDeploymentScheduler(
+            pluginServer.promise,
+            () => nativeChrome.getPluginDirectories(),
+            undefined,
+            pluginServer.start
+        );
         return new RideOpenRequestContribution(
             context.container.get(identifiers.workspaceService),
             context.container.get(identifiers.openerService),
             context.container.get(identifiers.messageService),
             context.container.get(identifiers.applicationShell),
-            context.container.get(RideNativeChrome),
+            nativeChrome,
             context.container.get(identifiers.applicationState),
             hostedPlugins.promise,
             undefined,
             undefined,
-            hostedPlugins.start
+            hostedPlugins.start,
+            pluginDeployment
         );
     }).inSingletonScope();
     bind(identifiers.contribution).toService(RideOpenRequestContribution);

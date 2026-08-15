@@ -183,6 +183,12 @@
           "markdownDescription": "Allows the R-IDE frontend to finish native window initialization."
         },
         {
+          "description": "Allows the R-IDE frontend to request native-resolved plugin directories.",
+          "type": "string",
+          "const": "allow-ride-plugin-directories",
+          "markdownDescription": "Allows the R-IDE frontend to request native-resolved plugin directories."
+        },
+        {
           "description": "Allows the R-IDE frontend to report an allowlisted startup milestone.",
           "type": "string",
           "const": "allow-ride-record-startup-milestone",

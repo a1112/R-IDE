@@ -11,6 +11,7 @@
     "core:event:allow-listen",
     "core:event:allow-unlisten",
     "allow-ride-frontend-ready",
+    "allow-ride-plugin-directories",
     "allow-ride-record-startup-milestone",
     "allow-ride-show-main-menu",
     "allow-ride-start-window-drag",

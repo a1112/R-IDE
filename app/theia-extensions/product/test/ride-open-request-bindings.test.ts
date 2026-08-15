@@ -13,6 +13,7 @@ import type { FrontendApplicationContribution } from '@theia/core/lib/browser/fr
 import type { OpenerService } from '@theia/core/lib/browser/opener-service';
 import type { MessageService } from '@theia/core/lib/common/message-service';
 import type { HostedPluginSupport } from '@theia/plugin-ext/lib/hosted/browser/hosted-plugin';
+import { PluginServer } from '@theia/plugin-ext/lib/common/plugin-protocol';
 import type { WorkspaceService } from '@theia/workspace/lib/browser';
 import {
     bindRideOpenRequestContribution,
@@ -76,9 +77,14 @@ test('frontend contribution remains synchronously constructible with async hoste
             resolveHostedPlugins = resolve;
         });
         let hostedResolutionStarts = 0;
+        let pluginServerResolutionStarts = 0;
         container.bind(identifiers.hostedPlugins).toDynamicValue(() => {
             hostedResolutionStarts++;
             return hostedPlugins;
+        });
+        container.bind(PluginServer).toDynamicValue(() => {
+            pluginServerResolutionStarts++;
+            return { install: async () => undefined } as unknown as PluginServer;
         });
         container.load(new ContainerModule(bind => bindRideOpenRequestContribution(bind, identifiers)));
 
@@ -93,6 +99,7 @@ test('frontend contribution remains synchronously constructible with async hoste
             0,
             'the synchronous contribution factory must not start asynchronous container resolution'
         );
+        assert.equal(pluginServerResolutionStarts, 0);
 
         await new Promise<void>(resolve => queueMicrotask(resolve));
         await new Promise<void>(resolve => queueMicrotask(resolve));
@@ -101,20 +108,30 @@ test('frontend contribution remains synchronously constructible with async hoste
             0,
             'microtasks between Theia startup phases must not start shared-container async resolution'
         );
+        assert.equal(pluginServerResolutionStarts, 0);
 
         (contributions[0] as RideOpenRequestContribution).onStart();
         (contributions[0] as RideOpenRequestContribution).onStart();
         await new Promise<void>(resolve => queueMicrotask(resolve));
         assert.equal(hostedResolutionStarts, 0, 'plugin resolution must wait for the attached shell');
+        assert.equal(pluginServerResolutionStarts, 0, 'plugin server resolution must wait for the attached shell');
         attachShell();
         await new Promise<void>(resolve => setImmediate(resolve));
         assert.equal(hostedResolutionStarts, 1);
+        assert.equal(
+            pluginServerResolutionStarts,
+            0,
+            'plugin server resolution must wait for target, demand, or the no-file timer'
+        );
+        await (contributions[0] as RideOpenRequestContribution).requestPluginDeployment();
+        assert.equal(pluginServerResolutionStarts, 1);
 
         resolveHostedPlugins({
             willStart: Promise.resolve(),
             didStart: Promise.resolve()
         } as HostedPluginSupport);
         await hostedPlugins;
+        (contributions[0] as RideOpenRequestContribution).dispose();
 
         for (const [expectedFailure, getAsyncFailure] of [
             ['synchronous getAsync failure', () => { throw new Error('synchronous getAsync failure'); }],
@@ -144,6 +161,7 @@ test('frontend contribution remains synchronously constructible with async hoste
             for (const result of results) {
                 assert.match(String(result.error), new RegExp(expectedFailure));
             }
+            failingContribution.dispose();
         }
 
         const disposedContainer = new Container();
@@ -159,6 +177,9 @@ test('frontend contribution remains synchronously constructible with async hoste
             disposedResolutionStarts++;
             return hostedPlugins;
         });
+        disposedContainer.bind(PluginServer).toConstantValue(
+            { install: async () => undefined } as unknown as PluginServer
+        );
         disposedContainer.load(new ContainerModule(bind => bindRideOpenRequestContribution(bind, identifiers)));
         const disposedContribution = disposedContainer.get(identifiers.contribution) as RideOpenRequestContribution;
         disposedContribution.onStart();

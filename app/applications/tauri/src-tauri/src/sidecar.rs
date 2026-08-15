@@ -15,6 +15,7 @@ use std::fs;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
+use std::sync::OnceLock;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, Url};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -25,6 +26,7 @@ const BACKEND_STARTUP_TIMEOUT: u64 = 240; // seconds
 const BACKEND_PORT: u16 = 3000;
 const BACKEND_PROBE_INTERVAL: Duration = Duration::from_millis(50);
 const BACKEND_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+static PLUGIN_DIRECTORY_CANDIDATES: OnceLock<Vec<PathBuf>> = OnceLock::new();
 
 fn current_exe_dir() -> PathBuf {
     std::env::current_exe()
@@ -207,64 +209,43 @@ fn get_backend_config() -> BackendConfig {
     }
 }
 
-/// 获取插件目录路径
-fn get_plugins_dir() -> PathBuf {
-    // 优先使用环境变量
-    if let Ok(path) = std::env::var("RIDE_PLUGINS_DIR") {
-        return PathBuf::from(path);
-    }
-
-    // 尝试几个可能的位置
-    let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let exe_dir = current_exe_dir();
-    let home = home_dir().unwrap_or_else(|| PathBuf::from("."));
-
-    let mut possible_locations: Vec<PathBuf> = resource_dir_candidates()
-        .into_iter()
-        .map(|resources_dir| resources_dir.join("plugins"))
-        .collect();
-
-    possible_locations.extend([
-        // 当前工作目录
-        current_dir
-            .join("applications")
-            .join("tauri")
-            .join("resources")
-            .join("plugins"),
-        // 开发环境：从 Tauri 应用目录运行
-        current_dir.join("../../plugins"),
-        // 开发环境：从 src-tauri 目录运行
-        current_dir.join("../../../plugins"),
-        // 项目根目录的 plugins
-        current_dir.join("plugins"),
-        // 用户配置目录
-        home.join(".ride").join("plugins"),
-    ]);
-
-    for base in [&current_dir, &exe_dir] {
-        possible_locations.extend(
-            base.ancestors()
-                .take(8)
-                .map(|ancestor| ancestor.join("plugins")),
-        );
-    }
-
-    for location in possible_locations {
-        if is_plugin_dir_ready(&location) {
-            log::info!("Using plugins directory: {:?}", location);
-            return location;
+fn plugin_directory_candidates() -> &'static [PathBuf] {
+    PLUGIN_DIRECTORY_CANDIDATES.get_or_init(|| {
+        if let Some(path) = std::env::var_os("RIDE_PLUGINS_DIR") {
+            return vec![PathBuf::from(path)];
         }
-    }
 
-    // 默认：使用用户配置目录
-    let default_plugins = home_dir().unwrap_or_default().join(".ride").join("plugins");
+        let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let exe_dir = current_exe_dir();
+        let home = home_dir().unwrap_or_else(|| PathBuf::from("."));
 
-    log::info!("Creating default plugins directory: {:?}", default_plugins);
-    fs::create_dir_all(&default_plugins).unwrap_or_else(|e| {
-        log::warn!("Failed to create plugins directory: {}", e);
-    });
+        let mut possible_locations: Vec<PathBuf> = resource_dir_candidates()
+            .into_iter()
+            .map(|resources_dir| resources_dir.join("plugins"))
+            .collect();
 
-    default_plugins
+        possible_locations.extend([
+            current_dir
+                .join("applications")
+                .join("tauri")
+                .join("resources")
+                .join("plugins"),
+            current_dir.join("../../plugins"),
+            current_dir.join("../../../plugins"),
+            current_dir.join("plugins"),
+            home.join(".ride").join("plugins"),
+        ]);
+
+        for base in [&current_dir, &exe_dir] {
+            possible_locations.extend(
+                base.ancestors()
+                    .take(8)
+                    .map(|ancestor| ancestor.join("plugins")),
+            );
+        }
+
+        possible_locations
+    })
 }
 
 fn is_plugin_dir_ready(location: &Path) -> bool {
@@ -280,27 +261,35 @@ fn is_plugin_dir_ready(location: &Path) -> bool {
     })
 }
 
-/// Initialize the user plugin directory while keeping bundled plugins in place.
-pub fn initialize_plugins() -> Result<(), String> {
-    let user_plugins = home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".ride")
-        .join("plugins");
-    fs::create_dir_all(&user_plugins)
-        .map_err(|e| format!("Failed to create plugins directory: {}", e))?;
-    log::info!("User plugins directory: {:?}", user_plugins);
-
-    for bundled_plugins in resource_dir_candidates()
-        .into_iter()
-        .map(|resources_dir| resources_dir.join("plugins"))
-    {
-        if is_plugin_dir_ready(&bundled_plugins) {
-            log::info!("Using bundled plugins in place: {:?}", bundled_plugins);
-            break;
+fn canonical_ready_plugin_directories(
+    candidates: impl IntoIterator<Item = PathBuf>,
+) -> Vec<PathBuf> {
+    for candidate in candidates {
+        if !is_plugin_dir_ready(&candidate) {
+            continue;
         }
+        let Ok(canonical) = fs::canonicalize(&candidate) else {
+            continue;
+        };
+        // Preserve the historical trusted-candidate priority. Installing every
+        // ready ancestor/user directory as a System plugin would expand the
+        // code-loading trust boundary beyond the bundled directory.
+        return vec![canonical];
     }
+    Vec::new()
+}
 
-    Ok(())
+/// Resolve plugin directories on frontend demand, after the core editor is visible.
+pub fn plugin_directories() -> Result<Vec<String>, String> {
+    canonical_ready_plugin_directories(plugin_directory_candidates().iter().cloned())
+        .into_iter()
+        .map(|directory| {
+            directory
+                .into_os_string()
+                .into_string()
+                .map_err(|_| "Plugin directory is not valid Unicode".to_string())
+        })
+        .collect()
 }
 
 /// 获取配置目录路径
@@ -698,7 +687,6 @@ async fn wait_for_node_backend_readiness(
 async fn start_node_backend_process(
     app_handle: &AppHandle,
     config: &BackendConfig,
-    plugins_dir: PathBuf,
     config_dir: PathBuf,
     launch_plan: &BackendLaunchPlan,
 ) -> Result<(), String> {
@@ -718,9 +706,6 @@ async fn start_node_backend_process(
     command.arg("--log-level=info");
     command.arg(format!("--port={BACKEND_PORT}"));
     command.arg("--hostname=127.0.0.1");
-    if is_plugin_dir_ready(&plugins_dir) {
-        command.arg(format!("--plugins=local-dir:{}", plugins_dir.display()));
-    }
     if let Some(backend_dir) = config.script_path.parent() {
         command.cwd(backend_dir);
     }
@@ -893,26 +878,15 @@ pub async fn start_backend_process(
         config.script_path
     );
 
-    let plugins_dir = get_plugins_dir();
     let config_dir = get_config_dir();
 
     if config.use_node {
-        return start_node_backend_process(
-            app_handle,
-            &config,
-            plugins_dir,
-            config_dir,
-            launch_plan,
-        )
-        .await;
+        return start_node_backend_process(app_handle, &config, config_dir, launch_plan).await;
     }
 
     // 设置命令
     let mut cmd = Command::new(&config.script_path);
     cmd.arg("--port=3000").arg("--hostname=127.0.0.1");
-    if is_plugin_dir_ready(&plugins_dir) {
-        cmd.arg(format!("--plugins=local-dir:{}", plugins_dir.display()));
-    }
     cmd.args(launch_plan.arguments());
 
     cmd.env("NODE_ENV", "production");
@@ -1167,10 +1141,49 @@ pub fn stop_backend(app_handle: &AppHandle) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_backend_port_available, wait_for_node_backend_readiness};
+    use super::{
+        canonical_ready_plugin_directories, ensure_backend_port_available,
+        wait_for_node_backend_readiness,
+    };
     use std::net::TcpListener;
+    use std::path::PathBuf;
     use std::time::Duration;
     use tokio::sync::mpsc;
+
+    struct PluginFixture(PathBuf);
+
+    impl Drop for PluginFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn plugin_directory_discovery_selects_only_the_first_canonical_ready_directory() {
+        let root =
+            std::env::temp_dir().join(format!("ride-plugin-directories-{}", uuid::Uuid::new_v4()));
+        let fixture = PluginFixture(root.clone());
+        let ready = root.join("ready");
+        let later = root.join("later");
+        let empty = root.join("empty");
+        std::fs::create_dir_all(ready.join("extension-a")).expect("create ready plugin dir");
+        std::fs::create_dir_all(later.join("extension-b")).expect("create later plugin dir");
+        std::fs::create_dir_all(&empty).expect("create empty plugin dir");
+
+        let discovered = canonical_ready_plugin_directories([
+            root.join("missing"),
+            empty,
+            ready.clone(),
+            ready.join("."),
+            later,
+        ]);
+
+        assert_eq!(
+            discovered,
+            vec![std::fs::canonicalize(ready).expect("canonical ready plugin dir")]
+        );
+        drop(fixture);
+    }
 
     #[test]
     fn backend_port_preflight_rejects_an_existing_listener() {

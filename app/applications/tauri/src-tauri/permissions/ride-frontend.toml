@@ -7,6 +7,11 @@ description = "Allows the R-IDE frontend to finish native window initialization.
 commands.allow = ["ride_frontend_ready"]
 
 [[permission]]
+identifier = "allow-ride-plugin-directories"
+description = "Allows the R-IDE frontend to request native-resolved plugin directories."
+commands.allow = ["ride_plugin_directories"]
+
+[[permission]]
 identifier = "allow-ride-record-startup-milestone"
 description = "Allows the R-IDE frontend to report an allowlisted startup milestone."
 commands.allow = ["ride_record_startup_milestone"]

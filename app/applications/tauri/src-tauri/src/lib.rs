@@ -222,11 +222,6 @@ pub fn run() {
             }
             native_chrome::install_menu_event_bridge(app.handle());
 
-            // 初始化插件目录
-            if let Err(e) = sidecar::initialize_plugins() {
-                eprintln!("Failed to initialize plugins: {}", e);
-            }
-
             // 初始化 sidecar 进程
             let app_handle = app.handle().clone();
             std::thread::spawn(move || {
@@ -239,6 +234,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_backend_port,
+            commands::ride_plugin_directories,
             commands::download_start,
             commands::download_cancel,
             commands::download_list,

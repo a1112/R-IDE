@@ -12,7 +12,7 @@ const tauriDirectory = path.join(appDirectory, 'applications', 'tauri', 'src-tau
 const productDirectory = path.join(appDirectory, 'theia-extensions', 'product', 'src', 'browser');
 
 function invokedCommands(source) {
-  return [...source.matchAll(/\binvoke\(\s*['"]([^'"]+)['"]/g)].map(match => match[1]);
+  return [...source.matchAll(/\binvoke(?:<[^>]+>)?\s*\(\s*['"]([^'"]+)['"]/g)].map(match => match[1]);
 }
 
 async function sourceFiles(directory) {
@@ -49,6 +49,7 @@ test('remote Tauri frontend receives only audited per-command permissions', asyn
   const commands = [...new Set(sources.flatMap(invokedCommands))].sort();
   assert.deepEqual(commands, [
     'ride_frontend_ready',
+    'ride_plugin_directories',
     'ride_record_startup_milestone',
     'ride_show_main_menu',
     'ride_start_window_drag',

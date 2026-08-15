@@ -19,6 +19,8 @@ import { FileUri } from '@theia/core/lib/common/file-uri';
 import type { MessageService } from '@theia/core/lib/common/message-service';
 import type { WorkspaceService } from '@theia/workspace/lib/browser';
 import type { HostedPluginSupport } from '@theia/plugin-ext/lib/hosted/browser/hosted-plugin';
+import { PluginType } from '@theia/plugin-ext/lib/common/plugin-protocol';
+import type { PluginServer } from '@theia/plugin-ext/lib/common/plugin-protocol';
 import type { RideNativeChrome } from './ride-native-chrome';
 
 const MAX_U64_ID = '18446744073709551615';
@@ -37,6 +39,80 @@ export type RideStartupMilestone =
     | 'plugins_ready';
 
 type StartupMilestoneReporter = (milestone: RideStartupMilestone) => Promise<void>;
+
+interface RidePluginDeploymentSchedulerOptions {
+    readonly delayMs: number;
+    readonly setTimeout: (callback: () => void, delay: number) => unknown;
+    readonly clearTimeout: (handle: unknown) => void;
+}
+
+const DEFAULT_PLUGIN_DEPLOYMENT_OPTIONS: RidePluginDeploymentSchedulerOptions = {
+    delayMs: 1_500,
+    setTimeout: (callback, delay) => globalThis.setTimeout(callback, delay),
+    clearTimeout: handle => globalThis.clearTimeout(handle as ReturnType<typeof setTimeout>)
+};
+
+export class RidePluginDeploymentScheduler implements Disposable {
+    protected timer: unknown | undefined;
+    protected deployment: Promise<boolean> | undefined;
+    protected readonly resolvedPluginServer: Promise<Pick<PluginServer, 'install'>>;
+
+    constructor(
+        pluginServer: Pick<PluginServer, 'install'> | Promise<Pick<PluginServer, 'install'>>,
+        protected readonly pluginDirectories: () => Promise<readonly string[]>,
+        protected readonly options: RidePluginDeploymentSchedulerOptions = DEFAULT_PLUGIN_DEPLOYMENT_OPTIONS,
+        protected readonly startPluginServerResolution: () => void = () => undefined
+    ) {
+        this.resolvedPluginServer = Promise.resolve(pluginServer);
+        this.resolvedPluginServer.catch(() => undefined);
+    }
+
+    scheduleFallback(): void {
+        if (this.timer !== undefined || this.deployment) {
+            return;
+        }
+        this.timer = this.options.setTimeout(() => {
+            this.timer = undefined;
+            this.deployNow();
+        }, this.options.delayMs);
+    }
+
+    deployNow(): Promise<boolean> {
+        this.cancelFallback();
+        if (!this.deployment) {
+            this.deployment = this.deploy().then(
+                () => true,
+                error => {
+                    console.warn('[R-IDE] Failed to deploy bundled plugins.', error);
+                    return false;
+                }
+            );
+        }
+        return this.deployment;
+    }
+
+    cancelFallback(): void {
+        if (this.timer !== undefined) {
+            this.options.clearTimeout(this.timer);
+            this.timer = undefined;
+        }
+    }
+
+    dispose(): void {
+        if (this.timer !== undefined) {
+            this.options.clearTimeout(this.timer);
+            this.timer = undefined;
+        }
+    }
+
+    protected async deploy(): Promise<void> {
+        this.startPluginServerResolution();
+        const pluginServer = await this.resolvedPluginServer;
+        for (const directory of await this.pluginDirectories()) {
+            await pluginServer.install(`local-dir:${directory}`, PluginType.System);
+        }
+    }
+}
 
 type ObservedPluginPromise =
     | { readonly succeeded: true }
@@ -68,11 +144,15 @@ interface NormalizedNativePath {
 
 export class RideOpenRequestContribution implements FrontendApplicationContribution, Disposable {
     protected readonly storage: Storage;
+    protected readonly initializationComplete: Promise<void>;
+    protected resolveInitializationComplete!: () => void;
+    protected initializationCompleted = false;
     protected restoreAttempted = false;
     protected started = false;
     protected disposed = false;
     protected unlisten: (() => void) | undefined;
     protected requestChain = Promise.resolve();
+    protected acceptedOpenRequest = false;
     protected pluginObservationStarted = false;
     protected readonly pluginWillStart: Promise<ObservedPluginPromise>;
     protected readonly pluginDidStart: Promise<ObservedPluginPromise>;
@@ -87,9 +167,13 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
         hostedPlugins: HostedPluginSupport | Promise<HostedPluginSupport>,
         storage?: Storage,
         protected readonly startupMilestoneReporter: StartupMilestoneReporter = reportRideStartupMilestone,
-        protected readonly startHostedPluginResolution: () => void = () => undefined
+        protected readonly startHostedPluginResolution: () => void = () => undefined,
+        protected readonly pluginDeployment?: RidePluginDeploymentScheduler
     ) {
         this.storage = storage ?? window.sessionStorage;
+        this.initializationComplete = new Promise(resolve => {
+            this.resolveInitializationComplete = resolve;
+        });
         this.pluginWillStart = observePluginPromise(Promise.resolve(hostedPlugins).then(support => support.willStart));
         this.pluginDidStart = observePluginPromise(Promise.resolve(hostedPlugins).then(support => support.didStart));
     }
@@ -116,13 +200,8 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
         if (this.disposed) {
             return;
         }
-        await this.restorePendingRequest();
-        if (this.disposed) {
-            return;
-        }
-
         try {
-            const unlisten = await this.nativeChrome.listenForOpenRequests(request => this.enqueueOpenRequest(request));
+            const unlisten = await this.nativeChrome.listenForOpenRequests(request => this.enqueueAfterInitialization(request));
             if (this.disposed) {
                 unlisten();
             } else {
@@ -130,6 +209,24 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
             }
         } catch (error) {
             await this.messageService.error(`R-IDE could not listen for file-open requests: ${errorMessage(error)}`);
+        }
+        if (this.disposed) {
+            return;
+        }
+        let restoredPending = false;
+        try {
+            restoredPending = await this.restorePendingRequest();
+        } finally {
+            this.finishInitialization();
+        }
+        if (this.disposed) {
+            return;
+        }
+        if (!restoredPending && !this.disposed) {
+            await this.nativeChrome.waitForFrontendReadyNotification();
+            if (!this.disposed && !this.acceptedOpenRequest) {
+                this.pluginDeployment?.scheduleFallback();
+            }
         }
     }
 
@@ -154,6 +251,8 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
             return;
         }
         this.disposed = true;
+        this.finishInitialization();
+        this.pluginDeployment?.dispose();
         this.unlisten?.();
         this.unlisten = undefined;
     }
@@ -164,7 +263,6 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
             await this.messageService.error('R-IDE rejected an invalid file-open request.');
             return;
         }
-
         const stateRead = await this.readState();
         if (stateRead.kind === 'invalid') {
             return;
@@ -175,11 +273,15 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
         }
 
         if (state && state.requests.length > 0) {
-            await this.commitState({
+            const committed = await this.commitState({
                 version: 2,
                 lastConsumed: request.id,
                 requests: [...state.requests, request]
             });
+            if (committed) {
+                this.acceptedOpenRequest = true;
+                this.pluginDeployment?.cancelFallback();
+            }
             return;
         }
 
@@ -193,6 +295,8 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
             return;
         }
 
+        this.acceptedOpenRequest = true;
+        this.pluginDeployment?.cancelFallback();
         if (!currentWorkspace) {
             try {
                 this.workspaceService.open(FileUri.create(request.workspace), { preserveWindow: true });
@@ -205,17 +309,18 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
         await this.openFiles(request);
     }
 
-    async restorePendingRequest(): Promise<void> {
+    async restorePendingRequest(): Promise<boolean> {
         if (this.restoreAttempted) {
-            return;
+            return false;
         }
         this.restoreAttempted = true;
 
         const stateRead = await this.readState();
         if (stateRead.kind !== 'valid' || stateRead.state.requests.length === 0) {
-            return;
+            return false;
         }
         await this.dispatchPendingRequests(stateRead.state);
+        return true;
     }
 
     protected enqueueOpenRequest(request: RideOpenRequest): void {
@@ -224,6 +329,21 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
             .catch(error => {
                 this.messageService.error(`R-IDE could not process a file-open request: ${errorMessage(error)}`).catch(console.warn);
             });
+    }
+
+    protected enqueueAfterInitialization(request: RideOpenRequest): void {
+        this.initializationComplete.then(() => {
+            if (!this.disposed) {
+                this.enqueueOpenRequest(request);
+            }
+        });
+    }
+
+    protected finishInitialization(): void {
+        if (!this.initializationCompleted) {
+            this.initializationCompleted = true;
+            this.resolveInitializationComplete();
+        }
     }
 
     protected async openFiles(request: RideOpenRequest): Promise<void> {
@@ -246,8 +366,16 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
         }
         if (openedTarget) {
             await this.reportStartupMilestone('target_file_opened');
-            this.startPluginObservation();
+            this.requestPluginDeployment().then(deployed => {
+                if (deployed) {
+                    this.startPluginObservation();
+                }
+            });
         }
+    }
+
+    async requestPluginDeployment(): Promise<boolean> {
+        return this.pluginDeployment?.deployNow() ?? true;
     }
 
     protected startPluginObservation(): void {

@@ -33,6 +33,11 @@ type RideOpenRequestListener = (
     handler: (event: { payload: RideOpenRequest }) => void
 ) => Promise<() => void>;
 
+let resolveFrontendReadyNotification!: () => void;
+const frontendReadyNotification = new Promise<void>(resolve => {
+    resolveFrontendReadyNotification = resolve;
+});
+
 export interface RideNativeChromeOptions {
     isTauri?: boolean;
     platform?: RidePlatform;
@@ -375,13 +380,35 @@ export class RideNativeChrome {
     }
 
     async notifyFrontendReady(locale: RideLanguage): Promise<void> {
-        if (!this.isTauri) {
-            return;
-        }
+        try {
+            if (!this.isTauri) {
+                return;
+            }
 
-        await invoke('ride_frontend_ready', { locale }).catch(error => {
-            console.warn('[R-IDE] Failed to report frontend readiness.', error);
-        });
+            await invoke('ride_frontend_ready', { locale }).catch(error => {
+                console.warn('[R-IDE] Failed to report frontend readiness.', error);
+            });
+        } finally {
+            // RideWorkbenchContribution and RideOpenRequestContribution use
+            // separate instances. This module-scoped latch closes the native
+            // initial-intent delivery window for both of them.
+            resolveFrontendReadyNotification();
+        }
+    }
+
+    waitForFrontendReadyNotification(): Promise<void> {
+        return frontendReadyNotification;
+    }
+
+    async getPluginDirectories(): Promise<string[]> {
+        if (!this.isTauri) {
+            return [];
+        }
+        const directories = await invoke<unknown>('ride_plugin_directories');
+        if (!Array.isArray(directories) || directories.some(directory => typeof directory !== 'string')) {
+            throw new Error('R-IDE received invalid native plugin directories.');
+        }
+        return directories;
     }
 
     async listenForNativeMenuCommands(handler: (command: string) => void): Promise<() => void> {

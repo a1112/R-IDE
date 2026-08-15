@@ -13,11 +13,13 @@ import { OpenerService, OpenHandler, OpenerOptions } from '@theia/core/lib/brows
 import type { WidgetOpenerOptions } from '@theia/core/lib/browser/widget-open-handler';
 import { FileUri } from '@theia/core/lib/common/file-uri';
 import URI from '@theia/core/lib/common/uri';
+import { PluginType } from '@theia/plugin-ext/lib/common/plugin-protocol';
 import { RideNativeChrome } from '../src/browser/ride-native-chrome';
 import {
     RIDE_OPEN_REQUEST_STATE_KEY,
     RideOpenRequest,
     RideOpenRequestContribution,
+    RidePluginDeploymentScheduler,
     RideStartupMilestone
 } from '../src/browser/ride-open-request';
 
@@ -97,7 +99,7 @@ class FakeOpenerService implements OpenerService {
     readonly opened: Array<{ uri: URI; options: OpenerOptions | undefined }> = [];
     readonly handlerActivations: string[] = [];
 
-    constructor(protected readonly beforeOpen: (uri: URI) => void = () => undefined) { }
+    constructor(protected readonly beforeOpen: (uri: URI) => void | Promise<void> = () => undefined) { }
 
     async getOpeners(): Promise<OpenHandler[]> {
         return [await this.getOpener()];
@@ -108,7 +110,7 @@ class FakeOpenerService implements OpenerService {
             id: 'test-editor',
             canHandle: () => 100,
             open: async (uri, options) => {
-                this.beforeOpen(uri);
+                await this.beforeOpen(uri);
                 this.opened.push({ uri, options });
                 const widget = { id: `editor-${this.opened.length}` };
                 const mode = (options as WidgetOpenerOptions | undefined)?.mode ?? 'activate';
@@ -148,6 +150,51 @@ function deferred<T = void>(): Deferred<T> {
         reject = promiseReject;
     });
     return { promise, resolve, reject };
+}
+
+class FakePluginDeploymentTimer {
+    readonly scheduledDelays: number[] = [];
+    readonly cleared: unknown[] = [];
+    protected callback: (() => void) | undefined;
+    protected readonly handle = { kind: 'plugin-deployment-timer' };
+
+    set = (callback: () => void, delay: number): unknown => {
+        this.callback = callback;
+        this.scheduledDelays.push(delay);
+        return this.handle;
+    };
+
+    clear = (handle: unknown): void => {
+        this.cleared.push(handle);
+        if (handle === this.handle) {
+            this.callback = undefined;
+        }
+    };
+
+    fire(): void {
+        const callback = this.callback;
+        this.callback = undefined;
+        callback?.();
+    }
+}
+
+function createPluginDeploymentScheduler(
+    events: string[],
+    timer = new FakePluginDeploymentTimer(),
+    install: (entry: string, type?: PluginType) => Promise<void> = async (entry, type) => {
+        events.push(`install:${entry}:${type}`);
+    }
+): { scheduler: RidePluginDeploymentScheduler; timer: FakePluginDeploymentTimer } {
+    const scheduler = new RidePluginDeploymentScheduler(
+        { install } as never,
+        async () => ['C:\\R-IDE\\plugins'],
+        {
+            delayMs: 250,
+            setTimeout: timer.set,
+            clearTimeout: timer.clear
+        }
+    );
+    return { scheduler, timer };
 }
 
 class FakeApplicationStateService {
@@ -218,7 +265,10 @@ class FakeNativeChrome {
     unlistenCalls = 0;
     protected handler: ((request: RideOpenRequest) => void) | undefined;
 
-    constructor(protected readonly onListen: () => void = () => undefined) { }
+    constructor(
+        protected readonly onListen: () => void = () => undefined,
+        protected readonly frontendReady: Promise<void> = Promise.resolve()
+    ) { }
 
     async listenForOpenRequests(handler: (request: RideOpenRequest) => void): Promise<() => void> {
         this.onListen();
@@ -228,6 +278,10 @@ class FakeNativeChrome {
             this.unlistenCalls++;
             this.handler = undefined;
         };
+    }
+
+    waitForFrontendReadyNotification(): Promise<void> {
+        return this.frontendReady;
     }
 
     emit(payload: unknown): void {
@@ -263,11 +317,13 @@ async function flushLifecycle(): Promise<void> {
 function createContribution(
     workspacePath = String.raw`C:\project`,
     storage = new MemoryStorage(),
-    beforeOpen: (uri: URI) => void = () => undefined,
+    beforeOpen: (uri: URI) => void | Promise<void> = () => undefined,
     reportStartupMilestone: (milestone: RideStartupMilestone) => Promise<void>
         = async () => undefined,
     applicationState = new FakeApplicationStateService(),
-    hostedPlugins: FakeHostedPluginSupport | Promise<FakeHostedPluginSupport> = new FakeHostedPluginSupport()
+    hostedPlugins: FakeHostedPluginSupport | Promise<FakeHostedPluginSupport> = new FakeHostedPluginSupport(),
+    pluginDeployment?: RidePluginDeploymentScheduler,
+    nativeChrome?: FakeNativeChrome
 ): {
     contribution: TestRideOpenRequestContribution;
     workspace: FakeWorkspaceService;
@@ -283,13 +339,13 @@ function createContribution(
 } {
     const workspace = new FakeWorkspaceService({ resource: FileUri.create(workspacePath) });
     const events: string[] = [];
-    const openers = new FakeOpenerService(uri => {
+    const openers = new FakeOpenerService(async uri => {
         events.push(`open:${uri.path.toString()}`);
-        beforeOpen(uri);
+        await beforeOpen(uri);
     });
     const messages = new FakeMessageService();
     const shell = new FakeShell();
-    const native = new FakeNativeChrome(() => events.push('listen'));
+    const native = nativeChrome ?? new FakeNativeChrome(() => events.push('listen'));
     const milestones: RideStartupMilestone[] = [];
     const contribution = new TestRideOpenRequestContribution(
         workspace as never,
@@ -304,7 +360,9 @@ function createContribution(
             milestones.push(milestone);
             events.push(`milestone:${milestone}`);
             await reportStartupMilestone(milestone);
-        }
+        },
+        () => undefined,
+        pluginDeployment
     );
     return {
         contribution,
@@ -320,6 +378,251 @@ function createContribution(
         events
     };
 }
+
+test('target file opens before deferred plugin installation begins', async () => {
+    const events: string[] = [];
+    const { scheduler } = createPluginDeploymentScheduler(events);
+    const context = createContribution(
+        '/project',
+        new MemoryStorage(),
+        () => { events.push('open'); },
+        async () => undefined,
+        new FakeApplicationStateService(),
+        new FakeHostedPluginSupport(),
+        scheduler
+    );
+
+    await context.contribution.handleOpenRequest({
+        id: '49', source: 'initial', workspace: '/project', files: ['/project/deferred-plugin.R']
+    });
+    await flushLifecycle();
+
+    assert.deepEqual(events, [
+        'open',
+        `install:local-dir:C:\\R-IDE\\plugins:${PluginType.System}`
+    ]);
+});
+
+test('no-file startup schedules plugin deployment after a bounded delay', async () => {
+    const events: string[] = [];
+    const { scheduler, timer } = createPluginDeploymentScheduler(events);
+    const context = createContribution(
+        '/project', new MemoryStorage(), () => undefined, async () => undefined,
+        new FakeApplicationStateService(), new FakeHostedPluginSupport(), scheduler
+    );
+
+    context.contribution.onStart();
+    await flushLifecycle();
+    assert.deepEqual(timer.scheduledDelays, [250]);
+    assert.deepEqual(events, []);
+
+    timer.fire();
+    await flushLifecycle();
+    assert.deepEqual(events, [`install:local-dir:C:\\R-IDE\\plugins:${PluginType.System}`]);
+});
+
+test('no-file fallback waits until the native initial-intent window has closed', async () => {
+    const frontendReady = deferred<void>();
+    const events: string[] = [];
+    const { scheduler, timer } = createPluginDeploymentScheduler(events);
+    const native = new FakeNativeChrome(() => events.push('listen'), frontendReady.promise);
+    const context = createContribution(
+        '/project', new MemoryStorage(), () => undefined, async () => undefined,
+        new FakeApplicationStateService(), new FakeHostedPluginSupport(), scheduler, native
+    );
+
+    context.contribution.onStart();
+    await flushLifecycle();
+    assert.equal(native.registrations, 1, 'the listener must be active before native intent delivery');
+    assert.deepEqual(timer.scheduledDelays, []);
+    timer.fire();
+    await flushLifecycle();
+    assert.deepEqual(events, ['listen']);
+
+    frontendReady.resolve();
+    await flushLifecycle();
+    assert.deepEqual(timer.scheduledDelays, [250]);
+});
+
+test('an initial native target received before frontend-ready suppresses the fallback timer', async () => {
+    const frontendReady = deferred<void>();
+    const opened = deferred<void>();
+    const events: string[] = [];
+    const { scheduler, timer } = createPluginDeploymentScheduler(events);
+    const native = new FakeNativeChrome(() => events.push('listen'), frontendReady.promise);
+    const context = createContribution(
+        '/project', new MemoryStorage(), async () => {
+            events.push('opening');
+            await opened.promise;
+        }, async () => undefined, new FakeApplicationStateService(), new FakeHostedPluginSupport(), scheduler, native
+    );
+
+    context.contribution.onStart();
+    await flushLifecycle();
+    native.emit({
+        id: '53', source: 'initial', workspace: '/project', files: ['/project/initial-before-ready.R']
+    });
+    await flushLifecycle();
+    assert.deepEqual(events, ['listen', 'opening']);
+
+    frontendReady.resolve();
+    await flushLifecycle();
+    assert.deepEqual(timer.scheduledDelays, []);
+    opened.resolve();
+    await flushLifecycle();
+    assert.deepEqual(events, [
+        'listen',
+        'opening',
+        `install:local-dir:C:\\R-IDE\\plugins:${PluginType.System}`
+    ]);
+});
+
+test('restored target opening suppresses the no-file timer until the editor is active', async () => {
+    const storage = new MemoryStorage();
+    storage.setItem(RIDE_OPEN_REQUEST_STATE_KEY, JSON.stringify(stateEnvelope('51', {
+        id: '51', source: 'initial', workspace: '/project', files: ['/project/slow-restore.R']
+    })));
+    const opened = deferred<void>();
+    const events: string[] = [];
+    const { scheduler, timer } = createPluginDeploymentScheduler(events);
+    const context = createContribution(
+        '/project', storage, async () => {
+            events.push('opening');
+            await opened.promise;
+        }, async () => undefined, new FakeApplicationStateService(), new FakeHostedPluginSupport(), scheduler
+    );
+
+    context.contribution.onStart();
+    await flushLifecycle();
+    assert.deepEqual(events, ['opening']);
+    assert.equal(context.native.registrations, 1, 'native intents must be buffered while a stored target restores');
+    assert.deepEqual(timer.scheduledDelays, [], 'a pending target must not race the no-file timer');
+
+    opened.resolve();
+    await flushLifecycle();
+    assert.deepEqual(events, [
+        'opening',
+        `install:local-dir:C:\\R-IDE\\plugins:${PluginType.System}`
+    ]);
+});
+
+test('a native target request cancels an already scheduled no-file fallback while opening', async () => {
+    const opened = deferred<void>();
+    const events: string[] = [];
+    const { scheduler, timer } = createPluginDeploymentScheduler(events);
+    const context = createContribution(
+        '/project', new MemoryStorage(), async () => {
+            events.push('opening');
+            await opened.promise;
+        }, async () => undefined, new FakeApplicationStateService(), new FakeHostedPluginSupport(), scheduler
+    );
+
+    context.contribution.onStart();
+    await flushLifecycle();
+    assert.deepEqual(timer.scheduledDelays, [250]);
+    context.native.emit({
+        id: '52', source: 'singleInstance', workspace: '/project', files: ['/project/slow-native.R']
+    });
+    await flushLifecycle();
+    assert.deepEqual(events, ['opening']);
+    assert.equal(timer.cleared.length, 1);
+
+    timer.fire();
+    await flushLifecycle();
+    assert.deepEqual(events, ['opening']);
+    opened.resolve();
+    await flushLifecycle();
+    assert.deepEqual(events, [
+        'opening',
+        `install:local-dir:C:\\R-IDE\\plugins:${PluginType.System}`
+    ]);
+});
+
+test('a duplicate request does not cancel the no-file fallback', async () => {
+    const storage = new MemoryStorage();
+    storage.setItem(RIDE_OPEN_REQUEST_STATE_KEY, JSON.stringify(stateEnvelope('52')));
+    const events: string[] = [];
+    const { scheduler, timer } = createPluginDeploymentScheduler(events);
+    const context = createContribution(
+        '/project', storage, () => undefined, async () => undefined,
+        new FakeApplicationStateService(), new FakeHostedPluginSupport(), scheduler
+    );
+
+    context.contribution.onStart();
+    await flushLifecycle();
+    context.native.emit({
+        id: '52', source: 'singleInstance', workspace: '/project', files: ['/project/duplicate.R']
+    });
+    await flushLifecycle();
+
+    assert.equal(timer.cleared.length, 0);
+    timer.fire();
+    await flushLifecycle();
+    assert.deepEqual(events, [`install:local-dir:C:\\R-IDE\\plugins:${PluginType.System}`]);
+});
+
+test('plugin-dependent demand deploys immediately and cancels the fallback timer', async () => {
+    const events: string[] = [];
+    const { scheduler, timer } = createPluginDeploymentScheduler(events);
+    const context = createContribution(
+        '/project', new MemoryStorage(), () => undefined, async () => undefined,
+        new FakeApplicationStateService(), new FakeHostedPluginSupport(), scheduler
+    );
+
+    context.contribution.onStart();
+    await flushLifecycle();
+    await context.contribution.requestPluginDeployment();
+
+    assert.equal(timer.cleared.length, 1);
+    assert.deepEqual(events, [`install:local-dir:C:\\R-IDE\\plugins:${PluginType.System}`]);
+});
+
+test('plugin deployment is idempotent across concurrent and repeated demand', async () => {
+    const installs: Array<{ entry: string; type: PluginType | undefined }> = [];
+    const release = deferred<void>();
+    const { scheduler } = createPluginDeploymentScheduler([], new FakePluginDeploymentTimer(), async (entry, type) => {
+        installs.push({ entry, type });
+        await release.promise;
+    });
+
+    const first = scheduler.deployNow();
+    const second = scheduler.deployNow();
+    await flushRequestChain();
+    assert.deepEqual(installs, [{ entry: 'local-dir:C:\\R-IDE\\plugins', type: PluginType.System }]);
+
+    release.resolve();
+    await Promise.all([first, second]);
+    await scheduler.deployNow();
+    assert.equal(installs.length, 1);
+});
+
+test('plugin deployment failure remains non-blocking and leaves the editor open', async () => {
+    const warnings: unknown[][] = [];
+    const originalWarn = console.warn;
+    console.warn = (...values: unknown[]) => warnings.push(values);
+    try {
+        const { scheduler } = createPluginDeploymentScheduler([], new FakePluginDeploymentTimer(), async () => {
+            throw new Error('deployment unavailable');
+        });
+        const context = createContribution(
+            '/project', new MemoryStorage(), () => undefined, async () => undefined,
+            new FakeApplicationStateService(), new FakeHostedPluginSupport(), scheduler
+        );
+
+        await context.contribution.handleOpenRequest({
+            id: '50', source: 'initial', workspace: '/project', files: ['/project/still-open.R']
+        });
+        await flushLifecycle();
+
+        assert.equal(context.openers.opened.length, 1);
+        assert.deepEqual(context.shell.activated, ['editor-1']);
+        assert.equal(context.messages.errors.length, 0);
+        assert.equal(warnings.length, 1);
+        assert.match(String(warnings[0][1]), /deployment unavailable/);
+    } finally {
+        console.warn = originalWarn;
+    }
+});
 
 test('same-workspace requests open files in order, activate the target editor, and consume duplicate IDs once', async () => {
     const { contribution, workspace, openers, messages, shell } = createContribution();
@@ -1225,9 +1528,9 @@ test('frontend initialization waits for attached shell before reporting, restori
     await flushLifecycle();
     assert.deepEqual(context.events, [
         'milestone:frontend_shell_attached',
+        'listen',
         'open:/project/attached.R',
-        'milestone:target_file_opened',
-        'listen'
+        'milestone:target_file_opened'
     ]);
     assert.equal(context.native.registrations, 1);
 });
