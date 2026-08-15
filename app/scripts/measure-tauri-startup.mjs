@@ -2069,6 +2069,10 @@ export async function terminateMeasuredTree(
       await terminateControlledChild();
       throw incomplete('process table could not be read for final verification');
     }
+    // A cooperative child can clear the marker between verification rounds.
+    // Preserve every exact identity while it is observable so a later marker
+    // disappearance cannot turn a surviving process into a false success.
+    rememberIdentities(latestMarkedProcesses);
     survivors = [...exactIdentities.values()].filter(identity => verificationRows.some(
       processRow => sameProcessIdentity(processRow, identity),
     ));

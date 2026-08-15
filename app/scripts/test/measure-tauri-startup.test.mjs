@@ -2438,6 +2438,83 @@ test('POSIX run marker cleanup includes a newly discovered daemon in the SIGKILL
   ]);
 });
 
+test('POSIX final verification permanently remembers a marker identity seen in an earlier round', async () => {
+  const runId = '7f7df1aa-a324-4fd4-b11c-4cc260a94d8f';
+  const root = {
+    pid: 100, ppid: 1, pgid: 100, creationTime: 'root-start', startedAt: 1_000,
+  };
+  const daemon = {
+    pid: 202, ppid: 1, pgid: 202, creationTime: 'daemon-start', startedAt: 2_000,
+  };
+  let queries = 0;
+  const signals = [];
+
+  await assert.rejects(terminateMeasuredTree({ rootPid: 100, rootIdentity: root, runId }, 'linux', {
+    discoverMarked: () => {
+      queries++;
+      if (queries <= 2) {
+        return { rows: [root], markedRows: [root] };
+      }
+      if (queries === 3) {
+        return { rows: [], markedRows: [] };
+      }
+      return {
+        rows: [daemon],
+        markedRows: queries === 4 ? [daemon] : [],
+      };
+    },
+    kill: (pid, signal) => {
+      signals.push([pid, signal]);
+      return true;
+    },
+    delay: async () => undefined,
+    cleanupReadAttempts: 1,
+    cleanupVerifyAttempts: 2,
+  }), /exact process identities still running \(202\)/);
+
+  assert.deepEqual(signals, [[100, 'SIGTERM']]);
+});
+
+test('POSIX final verification does not retain a reused PID as the marked identity', async () => {
+  const runId = '7f7df1aa-a324-4fd4-b11c-4cc260a94d8f';
+  const root = {
+    pid: 100, ppid: 1, pgid: 100, creationTime: 'root-start', startedAt: 1_000,
+  };
+  const daemon = {
+    pid: 202, ppid: 1, pgid: 202, creationTime: 'daemon-start', startedAt: 2_000,
+  };
+  const reused = {
+    ...daemon, creationTime: 'reused-start', startedAt: 3_000,
+  };
+  let queries = 0;
+  const signals = [];
+
+  await terminateMeasuredTree({ rootPid: 100, rootIdentity: root, runId }, 'linux', {
+    discoverMarked: () => {
+      queries++;
+      if (queries <= 2) {
+        return { rows: [root], markedRows: [root] };
+      }
+      if (queries === 3) {
+        return { rows: [], markedRows: [] };
+      }
+      if (queries === 4) {
+        return { rows: [daemon], markedRows: [daemon] };
+      }
+      return { rows: [reused], markedRows: [] };
+    },
+    kill: (pid, signal) => {
+      signals.push([pid, signal]);
+      return true;
+    },
+    delay: async () => undefined,
+    cleanupReadAttempts: 1,
+    cleanupVerifyAttempts: 2,
+  });
+
+  assert.deepEqual(signals, [[100, 'SIGTERM']]);
+});
+
 test('POSIX marker query failure still best-effort cleans exact tracked processes before failing', async () => {
   const runId = '7f7df1aa-a324-4fd4-b11c-4cc260a94d8f';
   const root = {
