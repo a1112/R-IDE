@@ -465,10 +465,23 @@ test('Linux proc environment parsing matches only the exact startup run marker e
   );
 });
 
-test('Linux proc discovery skips foreign UIDs but fails closed for same-UID access errors', () => {
+test('Linux proc discovery ignores nondumpable environ ownership and fails closed for same-UID access errors', () => {
   let reads = 0;
+  const accessError = Object.assign(new Error('denied'), { code: 'EACCES' });
+  assert.throws(() => readLinuxProcEnvironment(202, {
+    stat: () => ({ uid: 0 }),
+    readStatus: () => Buffer.from('Name:\tride\nUid:\t1000\t1000\t1000\t1000\n'),
+    getuid: () => 1000,
+    readFile: () => {
+      reads++;
+      throw accessError;
+    },
+  }), /Linux proc environment query failed/);
+  assert.equal(reads, 1, 'same-UID nondumpable processes must not be skipped by environ owner');
+
+  reads = 0;
   assert.equal(readLinuxProcEnvironment(202, {
-    stat: () => ({ uid: 2000 }),
+    readStatus: () => Buffer.from('Name:\tforeign\nUid:\t2000\t2001\t2000\t2000\n'),
     getuid: () => 1000,
     readFile: () => {
       reads++;
@@ -477,25 +490,28 @@ test('Linux proc discovery skips foreign UIDs but fails closed for same-UID acce
   }), null);
   assert.equal(reads, 0);
 
-  const accessError = Object.assign(new Error('denied'), { code: 'EACCES' });
-  assert.throws(
-    () => readLinuxProcEnvironment(202, {
-      stat: () => ({ uid: 1000 }),
-      getuid: () => 1000,
-      readFile: () => {
-        throw accessError;
-      },
-    }),
-    /Linux proc environment query failed/,
-  );
   const exited = Object.assign(new Error('gone'), { code: 'ENOENT' });
   assert.equal(readLinuxProcEnvironment(202, {
-    stat: () => {
+    readStatus: () => {
       throw exited;
     },
     getuid: () => 1000,
     readFile: () => Buffer.alloc(0),
   }), null);
+});
+
+test('Linux proc discovery fails closed for malformed or missing status UIDs', () => {
+  for (const status of [
+    Buffer.from('Name:\tride\n'),
+    Buffer.from('Name:\tride\nUid:\t1000\tinvalid\t1000\t1000\n'),
+    Buffer.from('Name:\tride\nUid:\t1000\t1000\t1000\n'),
+  ]) {
+    assert.throws(() => readLinuxProcEnvironment(202, {
+      readStatus: () => status,
+      getuid: () => 1000,
+      readFile: () => Buffer.from('SAFE=1\0'),
+    }), /Linux proc status query failed/);
+  }
 });
 
 test('macOS ps eww parsing returns exact marker PIDs and rejects incomplete rows', () => {
@@ -2250,7 +2266,7 @@ test('POSIX run marker cleanup never signals a foreign process without the marke
     pid: 100, ppid: 1, pgid: 100, creationTime: 'root-start', startedAt: 1_000,
   };
   const foreign = {
-    pid: 303, ppid: 100, pgid: 100, creationTime: 'foreign-start', startedAt: 2_000,
+    pid: 303, ppid: 1, pgid: 303, creationTime: 'foreign-start', startedAt: 2_000,
   };
   let rows = [root, foreign];
   const signals = [];
@@ -2272,6 +2288,84 @@ test('POSIX run marker cleanup never signals a foreign process without the marke
 
   assert.deepEqual(signals, [[100, 'SIGTERM']]);
   assert.deepEqual(rows, [foreign]);
+});
+
+test('POSIX run marker cleanup augments tracked setsid processes that exec without the marker', async () => {
+  const runId = '7f7df1aa-a324-4fd4-b11c-4cc260a94d8f';
+  const root = {
+    pid: 100, ppid: 1, pgid: 100, creationTime: 'root-start', startedAt: 1_000,
+  };
+  const trackedSetsid = {
+    pid: 202, ppid: 1, pgid: 202, creationTime: 'setsid-start', startedAt: 2_000, depth: 2,
+  };
+  const chronologicalChild = {
+    pid: 101, ppid: 100, pgid: 100, creationTime: 'child-start', startedAt: 1_500,
+  };
+  let rows = [root, chronologicalChild, trackedSetsid];
+  const signals = [];
+
+  await terminateMeasuredTree({
+    rootPid: 100,
+    rootIdentity: root,
+    trackedProcesses: [trackedSetsid],
+    runId,
+  }, 'linux', {
+    read: () => rows,
+    discoverMarked: () => ({
+      rows,
+      markedRows: rows.filter(row => row.pid === 100),
+    }),
+    kill: (pid, signal) => {
+      signals.push([pid, signal]);
+      rows = rows.filter(row => row.pid !== pid);
+      return true;
+    },
+    delay: async () => undefined,
+    cleanupReadAttempts: 1,
+    cleanupVerifyAttempts: 1,
+  });
+
+  assert.deepEqual(signals[0], [100, 'SIGTERM']);
+  assert.deepEqual(signals.slice(1).sort((left, right) => left[0] - right[0]), [
+    [101, 'SIGTERM'], [202, 'SIGTERM'],
+  ]);
+  assert.deepEqual(rows, []);
+});
+
+test('POSIX run marker cleanup augments an unmarked member of the captured owned group', async () => {
+  const runId = '7f7df1aa-a324-4fd4-b11c-4cc260a94d8f';
+  const root = {
+    pid: 100, ppid: 1, pgid: 100, creationTime: 'root-start', startedAt: 1_000,
+  };
+  const daemon = {
+    pid: 202, ppid: 1, pgid: 100, creationTime: 'daemon-start', startedAt: 2_000,
+  };
+  let rows = [root, daemon];
+  const signals = [];
+
+  await terminateMeasuredTree({
+    rootPid: 100,
+    rootIdentity: root,
+    ownedGroup: { pgid: 100, rootIdentity: root, startedAt: 1_000 },
+    runId,
+  }, 'linux', {
+    read: () => rows,
+    discoverMarked: () => ({
+      rows,
+      markedRows: rows.filter(row => row.pid === 100),
+    }),
+    kill: (pid, signal) => {
+      signals.push([pid, signal]);
+      rows = rows.filter(row => row.pid !== pid);
+      return true;
+    },
+    delay: async () => undefined,
+    cleanupReadAttempts: 1,
+    cleanupVerifyAttempts: 1,
+  });
+
+  assert.deepEqual(signals, [[100, 'SIGTERM'], [202, 'SIGTERM']]);
+  assert.deepEqual(rows, []);
 });
 
 test('POSIX run marker cleanup revalidates identity before signaling a reused PID', async () => {
@@ -2342,6 +2436,41 @@ test('POSIX run marker cleanup includes a newly discovered daemon in the SIGKILL
     [100, 'SIGTERM'],
     [202, 'SIGKILL'],
   ]);
+});
+
+test('POSIX marker query failure still best-effort cleans exact tracked processes before failing', async () => {
+  const runId = '7f7df1aa-a324-4fd4-b11c-4cc260a94d8f';
+  const root = {
+    pid: 100, ppid: 1, pgid: 100, creationTime: 'root-start', startedAt: 1_000,
+  };
+  const trackedSetsid = {
+    pid: 202, ppid: 1, pgid: 202, creationTime: 'setsid-start', startedAt: 2_000, depth: 2,
+  };
+  let rows = [root, trackedSetsid];
+  const signals = [];
+
+  await assert.rejects(terminateMeasuredTree({
+    rootPid: 100,
+    rootIdentity: root,
+    trackedProcesses: [trackedSetsid],
+    runId,
+  }, 'linux', {
+    discoverMarked: () => {
+      throw new Error('private marker query payload');
+    },
+    read: () => rows,
+    kill: (pid, signal) => {
+      signals.push([pid, signal]);
+      rows = rows.filter(row => row.pid !== pid);
+      return true;
+    },
+    delay: async () => undefined,
+    cleanupReadAttempts: 1,
+    cleanupVerifyAttempts: 1,
+  }), /startup run marker query could not be verified/);
+
+  assert.deepEqual(signals, [[100, 'SIGTERM'], [202, 'SIGTERM']]);
+  assert.deepEqual(rows, []);
 });
 
 test('POSIX cleanup retains a newly revalidated mixed-pgid child after killing the root first', async () => {
@@ -3696,18 +3825,20 @@ test('POSIX marker query failure fails the campaign without persisting marker or
             discoverMarked: () => {
               throw new Error(leakedEnvironment);
             },
+            read: () => [],
             delay: async () => undefined,
             cleanupReadAttempts: 1,
+            cleanupVerifyAttempts: 1,
           }),
         }),
       }),
-      /startup cleanup incomplete: startup run marker query failed before SIGTERM/,
+      /startup cleanup incomplete: startup run marker query could not be verified/,
     );
 
     const failurePath = path.join(root, 'startup-metrics.failure.json');
     const serialized = fs.readFileSync(failurePath, 'utf8');
     const diagnostic = JSON.parse(serialized);
-    assert.match(diagnostic.error.message, /startup run marker query failed before SIGTERM/);
+    assert.match(diagnostic.error.message, /startup run marker query could not be verified/);
     assert.equal(serialized.includes(runId), false);
     assert.equal(serialized.includes('PRIVATE_VALUE'), false);
     assert.equal(serialized.includes('do-not-persist'), false);

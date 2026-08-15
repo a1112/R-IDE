@@ -748,7 +748,7 @@ function defaultLinuxProcessIds() {
 export function readLinuxProcEnvironment(
   pid,
   {
-    stat = filePath => fs.statSync(filePath),
+    readStatus = filePath => readBoundedFile(filePath, PROC_ENVIRONMENT_MAX_BYTES),
     readFile = filePath => readBoundedFile(filePath, PROC_ENVIRONMENT_MAX_BYTES),
     getuid = () => process.getuid?.(),
   } = {},
@@ -757,18 +757,39 @@ export function readLinuxProcEnvironment(
   if (verifiedPid === 0) {
     throw new Error('Linux proc pid must be positive');
   }
+  const statusPath = `/proc/${verifiedPid}/status`;
   const environmentPath = `/proc/${verifiedPid}/environ`;
-  let metadata;
+  let status;
   try {
-    metadata = stat(environmentPath);
+    status = readStatus(statusPath);
   } catch (error) {
     if (error?.code === 'ENOENT' || error?.code === 'ESRCH') {
       return null;
     }
-    throw new Error('Linux proc environment query failed');
+    throw new Error('Linux proc status query failed');
   }
+  const statusText = Buffer.isBuffer(status) ? status.toString('utf8') : status;
+  if (typeof statusText !== 'string') {
+    throw new Error('Linux proc status query failed');
+  }
+  const uidLines = statusText.split(/\r?\n/).filter(line => line.startsWith('Uid:'));
+  if (uidLines.length !== 1) {
+    throw new Error('Linux proc status query failed');
+  }
+  const uidMatch = /^Uid:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*$/.exec(uidLines[0]);
+  if (!uidMatch) {
+    throw new Error('Linux proc status query failed');
+  }
+  const [realUid, effectiveUid] = uidMatch.slice(1, 3).map(value => Number(value));
   const currentUid = getuid();
-  if (Number.isSafeInteger(currentUid) && metadata.uid !== currentUid) {
+  if (![currentUid, realUid, effectiveUid].every(
+    uid => Number.isSafeInteger(uid) && uid >= 0,
+  )) {
+    throw new Error('Linux proc status query failed');
+  }
+  // /proc/<pid>/environ ownership can change for nondumpable same-UID
+  // processes. The kernel's status Uid tuple is the ownership source of truth.
+  if (realUid !== currentUid && effectiveUid !== currentUid) {
     return null;
   }
   try {
@@ -1622,8 +1643,45 @@ export async function terminateMeasuredTree(
   if (!Number.isSafeInteger(cleanupReadDelayMs) || cleanupReadDelayMs < 0) {
     throw new Error('cleanup read delay must be a non-negative safe integer');
   }
+  const markerEnabled = platform !== 'win32' && runId !== undefined;
+  const verifiedRunId = markerEnabled ? validateRunId(runId) : undefined;
+  let latestMarkedProcesses = [];
+  let markerQueryFailed = false;
+  const validateMarkedSnapshot = snapshot => {
+    if (!snapshot || !Array.isArray(snapshot.rows) || !Array.isArray(snapshot.markedRows)) {
+      throw new Error('invalid marked process snapshot');
+    }
+    const seen = new Set();
+    for (const markedRow of snapshot.markedRows) {
+      validateProcessIdentity(markedRow, 'marked process identity');
+      const key = trackedProcessKey(markedRow);
+      if (seen.has(key) || !snapshot.rows.some(row => sameProcessIdentity(row, markedRow))) {
+        throw new Error('invalid marked process snapshot');
+      }
+      seen.add(key);
+    }
+    return snapshot;
+  };
   const readWithRetry = async () => {
     let lastError;
+    if (markerEnabled) {
+      for (let attempt = 1; attempt <= readAttempts; attempt++) {
+        try {
+          const snapshot = validateMarkedSnapshot(discoverMarked(verifiedRunId, platform));
+          latestMarkedProcesses = snapshot.markedRows;
+          return snapshot.rows;
+        } catch (error) {
+          lastError = error;
+        }
+        if (attempt < readAttempts) {
+          await delay(cleanupReadDelayMs);
+        }
+      }
+      // Marker discovery is cooperative provenance. A persistent failure makes
+      // the campaign incomplete, but must not skip best-effort cleanup of the
+      // independently verified process tree, tracked identities, or owned group.
+      markerQueryFailed = true;
+    }
     for (let attempt = 1; attempt <= readAttempts; attempt++) {
       try {
         return read(platform);
@@ -1662,121 +1720,6 @@ export async function terminateMeasuredTree(
   if (platform === 'win32' && containmentVerified !== true) {
     await terminateControlledChild();
     return;
-  }
-  if (platform !== 'win32' && runId !== undefined) {
-    const verifiedRunId = validateRunId(runId);
-    const actionFailures = [];
-    const incomplete = reason => new Error(
-      `startup cleanup incomplete: ${reason}`
-        + (actionFailures.length > 0 ? `; ${actionFailures.join('; ')}` : ''),
-    );
-    const queryMarkedWithRetry = async () => {
-      let lastError;
-      for (let attempt = 1; attempt <= readAttempts; attempt++) {
-        try {
-          const snapshot = discoverMarked(verifiedRunId, platform);
-          if (!snapshot
-              || !Array.isArray(snapshot.rows)
-              || !Array.isArray(snapshot.markedRows)) {
-            throw new Error('invalid marked process snapshot');
-          }
-          const seen = new Set();
-          for (const markedRow of snapshot.markedRows) {
-            validateProcessIdentity(markedRow, 'marked process identity');
-            const key = trackedProcessKey(markedRow);
-            if (seen.has(key)
-                || !snapshot.rows.some(row => sameProcessIdentity(row, markedRow))) {
-              throw new Error('invalid marked process snapshot');
-            }
-            seen.add(key);
-          }
-          return snapshot;
-        } catch (error) {
-          lastError = error;
-        }
-        if (attempt < readAttempts) {
-          await delay(cleanupReadDelayMs);
-        }
-      }
-      throw lastError ?? new Error('startup run marker query failed');
-    };
-    const queryOrFail = async reason => {
-      try {
-        return await queryMarkedWithRetry();
-      } catch {
-        await terminateControlledChild();
-        throw incomplete(reason);
-      }
-    };
-    const knownIdentities = new Map();
-    const rememberMarked = snapshot => {
-      for (const markedRow of snapshot.markedRows) {
-        knownIdentities.set(trackedProcessKey(markedRow), processIdentity(markedRow));
-      }
-    };
-    const signalOne = (pid, signal) => {
-      try {
-        if (kill(pid, signal) === false) {
-          actionFailures.push(`${signal} ${pid} returned false`);
-        }
-      } catch {
-        actionFailures.push(`${signal} ${pid} threw`);
-      }
-    };
-    const rootFirstMarked = markedRows => [...markedRows].sort((left, right) => {
-      if (left.pid === verifiedRootPid) {
-        return right.pid === verifiedRootPid ? 0 : -1;
-      }
-      if (right.pid === verifiedRootPid) {
-        return 1;
-      }
-      return left.pid - right.pid;
-    });
-    const signalMarked = async (candidates, signal) => {
-      for (const candidate of rootFirstMarked(candidates)) {
-        const current = await queryOrFail(`startup run marker query failed before ${signal}`);
-        rememberMarked(current);
-        if (current.markedRows.some(row => sameProcessIdentity(row, candidate))) {
-          signalOne(candidate.pid, signal);
-        }
-      }
-    };
-
-    const initial = await queryOrFail('startup run marker query failed before SIGTERM');
-    rememberMarked(initial);
-    if (rootIdentity
-        && initial.rows.some(row => sameProcessIdentity(row, rootIdentity))
-        && !initial.markedRows.some(row => sameProcessIdentity(row, rootIdentity))) {
-      await terminateControlledChild();
-      throw incomplete('live root process is missing its startup run marker');
-    }
-    await signalMarked(initial.markedRows, 'SIGTERM');
-    await delay(250);
-
-    const afterTerm = await queryOrFail('startup run marker query failed before SIGKILL');
-    rememberMarked(afterTerm);
-    await signalMarked(afterTerm.markedRows, 'SIGKILL');
-
-    let markerSurvivors = [];
-    let exactSurvivors = [];
-    for (let attempt = 1; attempt <= verifyAttempts; attempt++) {
-      const verification = await queryOrFail('startup run marker query failed during final verification');
-      rememberMarked(verification);
-      markerSurvivors = verification.markedRows;
-      exactSurvivors = [...knownIdentities.values()].filter(identity => (
-        verification.rows.some(row => sameProcessIdentity(row, identity))
-      ));
-      if (markerSurvivors.length === 0 && exactSurvivors.length === 0) {
-        return;
-      }
-      if (attempt < verifyAttempts) {
-        await delay(cleanupReadDelayMs);
-      }
-    }
-    throw incomplete(
-      `startup run marker still has processes (`
-        + `${markerSurvivors.map(row => row.pid).join(', ') || exactSurvivors.map(row => row.pid).join(', ')})`,
-    );
   }
   let trustedRootIdentity;
   if (rootIdentity) {
@@ -1825,10 +1768,14 @@ export async function terminateMeasuredTree(
     throw new Error('startup cleanup incomplete: process table could not be verified');
   }
   const allowTree = platform === 'win32'
-    || (trustedRootIdentity.pgid === trustedRootIdentity.pid
+    || (!markerEnabled
+      && trustedRootIdentity.pgid === trustedRootIdentity.pid
       && Number.isSafeInteger(trustedRootIdentity.pgid)
       && trustedRootIdentity.pgid > 0);
-  let cleanupTrackedProcesses = trackedProcesses;
+  let cleanupTrackedProcesses = mergeTrackedProcesses(
+    trackedProcesses,
+    latestMarkedProcesses,
+  );
   if (rows.some(row => sameProcessIdentity(row, trustedRootIdentity))) {
     const chronological = chronologicalProcessTree(rows, trustedRootIdentity);
     cleanupTrackedProcesses = mergeTrackedProcesses(
@@ -1850,6 +1797,17 @@ export async function terminateMeasuredTree(
     }
   };
   const rememberSafeDescendants = currentRows => {
+    const rootStartedAt = comparableStartedAt(trustedRootIdentity);
+    const currentMarkers = latestMarkedProcesses.filter(marked => {
+      const current = currentRows.find(row => sameProcessIdentity(row, marked));
+      const startedAt = comparableStartedAt(current);
+      return current !== undefined
+        && rootStartedAt !== null
+        && startedAt !== null
+        && startedAt >= rootStartedAt;
+    });
+    cleanupTrackedProcesses = mergeTrackedProcesses(cleanupTrackedProcesses, currentMarkers);
+    rememberIdentities(currentMarkers);
     if (!currentRows.some(row => sameProcessIdentity(row, trustedRootIdentity))) {
       return;
     }
@@ -1953,7 +1911,23 @@ export async function terminateMeasuredTree(
     }
     return inspection.eligibleMembers.length > 0;
   };
-  inspectOwnedGroup(rows);
+  const rememberSafeOwnedGroupMembers = inspection => {
+    if (!markerEnabled
+        || !inspection
+        || ownedGroupWasReused
+        || ownedGroupHasUntrustedChronology
+        || ownedGroupMembershipChanged) {
+      return;
+    }
+    cleanupTrackedProcesses = mergeTrackedProcesses(
+      cleanupTrackedProcesses,
+      inspection.eligibleMembers,
+    );
+    rememberIdentities(inspection.eligibleMembers);
+  };
+  rememberSafeDescendants(rows);
+  const initialOwnedGroupInspection = inspectOwnedGroup(rows);
+  rememberSafeOwnedGroupMembers(initialOwnedGroupInspection);
   const readPlan = async allowTreeForRead => {
     const currentRows = await readWithRetry();
     rememberSafeDescendants(currentRows);
@@ -2002,13 +1976,18 @@ export async function terminateMeasuredTree(
     };
     const explicitProcessesOutsideOwnedGroup = currentRows => {
       rememberSafeDescendants(currentRows);
+      const inspection = inspectOwnedGroup(currentRows);
+      rememberSafeOwnedGroupMembers(inspection);
       const currentByPid = new Map(currentRows.map(processRow => [processRow.pid, processRow]));
-      return planProcessCleanup(
+      const selected = planProcessCleanup(
         currentRows,
         trustedRootIdentity,
         cleanupTrackedProcesses,
         { allowTree: false },
-      ).processIds.filter(pid => currentByPid.get(pid)?.pgid !== trustedOwnedGroup.pgid);
+      ).processIds;
+      return markerEnabled
+        ? selected
+        : selected.filter(pid => currentByPid.get(pid)?.pgid !== trustedOwnedGroup.pgid);
     };
     const signalPlan = async (plan, signal, allowGroup) => {
       if (plan.mode === 'tree') {
@@ -2040,8 +2019,9 @@ export async function terminateMeasuredTree(
         throw incomplete('process table could not be revalidated before owned-group SIGTERM');
       }
       const termInspection = inspectOwnedGroup(termRows);
+      rememberSafeOwnedGroupMembers(termInspection);
       freezeOwnedGroupMembers(termInspection);
-      if (ownedGroupMayBeSignaled(termInspection)) {
+      if (!markerEnabled && ownedGroupMayBeSignaled(termInspection)) {
         recordSignal(-trustedOwnedGroup.pgid, 'SIGTERM');
       }
       await terminateExplicit(explicitProcessesOutsideOwnedGroup(termRows), 'SIGTERM');
@@ -2055,7 +2035,8 @@ export async function terminateMeasuredTree(
         throw incomplete('process table could not be revalidated before owned-group SIGKILL');
       }
       const killInspection = inspectOwnedGroup(killRows);
-      if (ownedGroupMayBeSignaled(killInspection)) {
+      rememberSafeOwnedGroupMembers(killInspection);
+      if (!markerEnabled && ownedGroupMayBeSignaled(killInspection)) {
         recordSignal(-trustedOwnedGroup.pgid, 'SIGKILL');
       }
       await terminateExplicit(explicitProcessesOutsideOwnedGroup(killRows), 'SIGKILL');
@@ -2079,6 +2060,7 @@ export async function terminateMeasuredTree(
 
   let survivors = [...exactIdentities.values()];
   let ownedGroupSurvivors = [];
+  let markerSurvivors = latestMarkedProcesses;
   for (let attempt = 1; attempt <= verifyAttempts; attempt++) {
     let verificationRows;
     try {
@@ -2090,9 +2072,14 @@ export async function terminateMeasuredTree(
     survivors = [...exactIdentities.values()].filter(identity => verificationRows.some(
       processRow => sameProcessIdentity(processRow, identity),
     ));
+    markerSurvivors = latestMarkedProcesses.filter(identity => verificationRows.some(
+      processRow => sameProcessIdentity(processRow, identity),
+    ));
     ownedGroupSurvivors = inspectOwnedGroup(verificationRows)?.allMembers ?? [];
     if (survivors.length === 0
+        && markerSurvivors.length === 0
         && ownedGroupSurvivors.length === 0
+        && !markerQueryFailed
         && !ownedGroupWasReused
         && !ownedGroupHasUntrustedChronology
         && !ownedGroupMembershipChanged) {
@@ -2115,6 +2102,14 @@ export async function terminateMeasuredTree(
     throw incomplete(
       `owned process group ${trustedOwnedGroup.pgid} still has members (`
         + `${ownedGroupSurvivors.map(row => row.pid).join(', ')})`,
+    );
+  }
+  if (markerQueryFailed) {
+    throw incomplete('startup run marker query could not be verified');
+  }
+  if (markerSurvivors.length > 0) {
+    throw incomplete(
+      `startup run marker still has processes (${markerSurvivors.map(row => row.pid).join(', ')})`,
     );
   }
   throw incomplete(`exact process identities still running (${survivors.map(row => row.pid).join(', ')})`);
