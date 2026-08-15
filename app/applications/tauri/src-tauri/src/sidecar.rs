@@ -610,12 +610,48 @@ fn handle_backend_process_exit(
     }
 }
 
+#[derive(Debug)]
+enum BackendReadinessFailure {
+    ChildExited(String),
+    TimedOut(String),
+}
+
+impl BackendReadinessFailure {
+    fn message(self) -> String {
+        match self {
+            Self::ChildExited(exit) => {
+                format!("Backend process exited before ready: {exit}")
+            }
+            Self::TimedOut(message) => message,
+        }
+    }
+}
+
+fn finish_backend_readiness(
+    result: Result<u16, BackendReadinessFailure>,
+    terminate: impl FnOnce(),
+    clear: impl FnOnce(),
+) -> Result<u16, String> {
+    match result {
+        Ok(port) => Ok(port),
+        Err(BackendReadinessFailure::ChildExited(exit)) => {
+            clear();
+            Err(BackendReadinessFailure::ChildExited(exit).message())
+        }
+        Err(failure @ BackendReadinessFailure::TimedOut(_)) => {
+            terminate();
+            clear();
+            Err(failure.message())
+        }
+    }
+}
+
 async fn wait_for_node_backend_readiness(
     line_rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
     exit_rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
     port: u16,
     timeout: Duration,
-) -> Result<u16, String> {
+) -> Result<u16, BackendReadinessFailure> {
     let startup_timeout = tokio::time::sleep(timeout);
     tokio::pin!(startup_timeout);
     let mut probe_interval = tokio::time::interval(BACKEND_PROBE_INTERVAL);
@@ -630,9 +666,20 @@ async fn wait_for_node_backend_readiness(
             exit = exit_rx.recv(), if child_wait_open => {
                 match exit {
                     Some(exit) => {
-                        return Err(format!("Backend process exited before ready: {exit}"));
+                        return Err(BackendReadinessFailure::ChildExited(exit));
                     }
                     None => child_wait_open = false,
+                }
+            }
+            _ = &mut startup_timeout => {
+                return Err(BackendReadinessFailure::TimedOut(format!(
+                    "Backend startup timeout: port {port} did not accept connections within {}s",
+                    timeout.as_secs()
+                )));
+            }
+            _ = probe_interval.tick(), if child_reported_port => {
+                if backend_port_is_listening(port).await {
+                    return Ok(port);
                 }
             }
             line = line_rx.recv(), if line_reader_open => {
@@ -643,17 +690,6 @@ async fn wait_for_node_backend_readiness(
                     }
                     None => line_reader_open = false,
                 }
-            }
-            _ = probe_interval.tick(), if child_reported_port => {
-                if backend_port_is_listening(port).await {
-                    return Ok(port);
-                }
-            }
-            _ = &mut startup_timeout => {
-                return Err(format!(
-                    "Backend startup timeout: port {port} did not accept connections within {}s",
-                    timeout.as_secs()
-                ));
             }
         }
     }
@@ -777,14 +813,21 @@ async fn start_node_backend_process(
         let _ = exit_tx.send(exit);
     });
 
-    let ready_port = wait_for_node_backend_readiness(
-        &mut line_rx,
-        &mut exit_rx,
-        BACKEND_PORT,
-        Duration::from_secs(BACKEND_STARTUP_TIMEOUT),
-    )
-    .await
-    .inspect_err(|_| cleanup_failed_backend_start(app_handle, child_pid))?;
+    let ready_port = finish_backend_readiness(
+        wait_for_node_backend_readiness(
+            &mut line_rx,
+            &mut exit_rx,
+            BACKEND_PORT,
+            Duration::from_secs(BACKEND_STARTUP_TIMEOUT),
+        )
+        .await,
+        || {
+            if let Some(pid) = child_pid {
+                let _ = terminate_process_tree(pid);
+            }
+        },
+        || clear_backend_state(app_handle),
+    )?;
     log::info!("Backend ready on port {}", ready_port);
     publish_backend_listening(app_handle, ready_port);
 
@@ -1161,7 +1204,14 @@ mod tests {
         .await
         .expect_err("an unrelated listener cannot attest child readiness");
 
-        assert!(error.contains("child exited"), "{error}");
+        assert!(
+            matches!(
+                error,
+                super::BackendReadinessFailure::ChildExited(ref exit)
+                    if exit.contains("child exited")
+            ),
+            "{error:?}"
+        );
     }
 
     #[tokio::test]
@@ -1207,8 +1257,61 @@ mod tests {
         .await
         .expect_err("an exited child cannot become ready");
 
-        assert!(error.contains("exit status: 17"), "{error}");
+        assert!(
+            matches!(
+                error,
+                super::BackendReadinessFailure::ChildExited(ref exit)
+                    if exit.contains("exit status: 17")
+            ),
+            "{error:?}"
+        );
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backend_timeout_is_not_starved_by_continuous_stdout() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("reserve unused port");
+        let port = listener.local_addr().expect("listener address").port();
+        drop(listener);
+        let (line_tx, mut line_rx) = mpsc::unbounded_channel();
+        let (_exit_tx, mut exit_rx) = mpsc::unbounded_channel();
+        for _ in 0..1_000 {
+            line_tx.send("still starting".to_string()).unwrap();
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let producer_stop = stop.clone();
+        let producer = std::thread::spawn(move || {
+            while !producer_stop.load(Ordering::SeqCst) {
+                if line_tx.send("still starting".to_string()).is_err() {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+        });
+        let mut wait = tokio::spawn(async move {
+            wait_for_node_backend_readiness(
+                &mut line_rx,
+                &mut exit_rx,
+                port,
+                Duration::from_millis(20),
+            )
+            .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let finished = wait.is_finished();
+        stop.store(true, Ordering::SeqCst);
+        wait.abort();
+        let _ = (&mut wait).await;
+        producer.join().expect("stdout producer stops");
+
+        assert!(
+            finished,
+            "continuous stdout must not starve startup timeout"
+        );
     }
 
     #[test]
@@ -1270,6 +1373,22 @@ mod tests {
 
         assert_eq!(result, Err("PTY setup failed".to_string()));
         assert!(cleaned);
+    }
+
+    #[test]
+    fn child_exit_failure_clears_state_without_killing_a_reused_pid() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let error = super::finish_backend_readiness(
+            Err(super::BackendReadinessFailure::ChildExited(
+                "exit status: 17".to_string(),
+            )),
+            || events.borrow_mut().push("kill"),
+            || events.borrow_mut().push("clear"),
+        )
+        .expect_err("child exit is a startup failure");
+
+        assert!(error.contains("exit status: 17"), "{error}");
+        assert_eq!(*events.borrow(), ["clear"]);
     }
 
     #[test]
