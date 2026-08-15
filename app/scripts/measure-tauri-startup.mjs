@@ -418,6 +418,106 @@ function positiveInteger(value, name) {
   return parsed;
 }
 
+function epochFromUtcComponents({
+  year,
+  month,
+  day,
+  hour,
+  minute,
+  second,
+  millisecond,
+  offsetMinutes,
+}) {
+  const localEpoch = Date.UTC(year, month - 1, day, hour, minute, second, millisecond);
+  const normalized = new Date(localEpoch);
+  const validComponents = normalized.getUTCFullYear() === year
+    && normalized.getUTCMonth() === month - 1
+    && normalized.getUTCDate() === day
+    && normalized.getUTCHours() === hour
+    && normalized.getUTCMinutes() === minute
+    && normalized.getUTCSeconds() === second
+    && normalized.getUTCMilliseconds() === millisecond;
+  if (!validComponents || !Number.isSafeInteger(offsetMinutes)) {
+    return null;
+  }
+  const epoch = localEpoch - (offsetMinutes * 60_000);
+  return Number.isSafeInteger(epoch) ? epoch : null;
+}
+
+function parseProcessStartedAt(creationTime) {
+  const serialized = typeof creationTime === 'string' ? creationTime.trim() : '';
+  if (!serialized) {
+    return null;
+  }
+  const dotNet = serialized.match(/^\/Date\((-?\d+)(?:[+-]\d{4})?\)\/$/);
+  if (dotNet) {
+    const epoch = Number(dotNet[1]);
+    return Number.isSafeInteger(epoch) ? epoch : null;
+  }
+  const dmtf = serialized.match(
+    /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})\.(\d{6})([+-])(\d{3})$/,
+  );
+  if (dmtf) {
+    const [, year, month, day, hour, minute, second, fraction, sign, offset] = dmtf;
+    return epochFromUtcComponents({
+      year: Number(year),
+      month: Number(month),
+      day: Number(day),
+      hour: Number(hour),
+      minute: Number(minute),
+      second: Number(second),
+      millisecond: Number(fraction.slice(0, 3)),
+      offsetMinutes: Number(offset) * (sign === '+' ? 1 : -1),
+    });
+  }
+  const iso = serialized.match(
+    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(Z|([+-])(\d{2}):(\d{2}))$/,
+  );
+  if (iso) {
+    const [, year, month, day, hour, minute, second, fraction = '', zone, sign, offsetHour, offsetMinute]
+      = iso;
+    const numericOffsetHour = zone === 'Z' ? 0 : Number(offsetHour);
+    const numericOffsetMinute = zone === 'Z' ? 0 : Number(offsetMinute);
+    if (numericOffsetHour > 23 || numericOffsetMinute > 59) {
+      return null;
+    }
+    return epochFromUtcComponents({
+      year: Number(year),
+      month: Number(month),
+      day: Number(day),
+      hour: Number(hour),
+      minute: Number(minute),
+      second: Number(second),
+      millisecond: Number(fraction.padEnd(3, '0').slice(0, 3) || 0),
+      offsetMinutes: zone === 'Z'
+        ? 0
+        : ((numericOffsetHour * 60) + numericOffsetMinute) * (sign === '+' ? 1 : -1),
+    });
+  }
+  const posix = serialized.match(
+    /^(Sun|Mon|Tue|Wed|Thu|Fri|Sat)\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})\s+(\d{4})$/,
+  );
+  if (!posix) {
+    return null;
+  }
+  const [, weekday, monthName, day, hour, minute, second, year] = posix;
+  const epoch = Date.parse(serialized);
+  if (!Number.isSafeInteger(epoch)) {
+    return null;
+  }
+  const parsed = new Date(epoch);
+  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const weekdays = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const validComponents = parsed.getFullYear() === Number(year)
+    && parsed.getMonth() === months.indexOf(monthName)
+    && parsed.getDate() === Number(day)
+    && parsed.getHours() === Number(hour)
+    && parsed.getMinutes() === Number(minute)
+    && parsed.getSeconds() === Number(second)
+    && weekdays[parsed.getDay()] === weekday;
+  return validComponents ? epoch : null;
+}
+
 export function parsePosixProcessTable(output) {
   const rows = [];
   for (const line of output.split(/\r?\n/)) {
@@ -445,7 +545,14 @@ export function parsePosixProcessTable(output) {
     if (rssKiB > Math.floor(Number.MAX_SAFE_INTEGER / 1024)) {
       throw new Error('ps RSS bytes must be a non-negative safe integer');
     }
-    rows.push({ pid, ppid, pgid, rssBytes: rssKiB * 1024, creationTime });
+    rows.push({
+      pid,
+      ppid,
+      pgid,
+      rssBytes: rssKiB * 1024,
+      creationTime,
+      startedAt: parseProcessStartedAt(creationTime),
+    });
   }
   return rows;
 }
@@ -470,16 +577,27 @@ export function parseWindowsProcessTable(output) {
     if (typeof creationTime !== 'string' || !creationTime.trim()) {
       throw new Error('PowerShell CreationDate must be a non-empty string');
     }
-    return [{ pid, ppid, pgid: null, rssBytes, creationTime }];
+    return [{
+      pid,
+      ppid,
+      pgid: null,
+      rssBytes,
+      creationTime,
+      startedAt: parseProcessStartedAt(creationTime),
+    }];
   });
 }
 
 function processIdentity(row) {
-  return {
+  const identity = {
     pid: row.pid,
     pgid: row.pgid,
     creationTime: row.creationTime,
   };
+  if (Object.hasOwn(row, 'startedAt')) {
+    identity.startedAt = row.startedAt;
+  }
+  return identity;
 }
 
 function sameProcessIdentity(row, identity) {
@@ -506,24 +624,73 @@ function validateProcessIdentity(identity, name = 'process identity') {
   return identity;
 }
 
-export function aggregateProcessTree(rows, rootIdentity) {
+function comparableStartedAt(processRow) {
+  return Number.isSafeInteger(processRow?.startedAt) ? processRow.startedAt : null;
+}
+
+function discoverChronologicalDescendants(rows, seeds, rootStartedAt) {
+  const discovered = new Map(seeds);
+  if (rootStartedAt === null) {
+    return discovered;
+  }
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const row of rows) {
+      if (discovered.has(row.pid)) {
+        continue;
+      }
+      const parent = discovered.get(row.ppid);
+      const childStartedAt = comparableStartedAt(row);
+      if (!parent
+          || parent.startedAt === null
+          || childStartedAt === null
+          || childStartedAt < parent.startedAt
+          || childStartedAt < rootStartedAt) {
+        continue;
+      }
+      discovered.set(row.pid, {
+        depth: parent.depth + 1,
+        startedAt: childStartedAt,
+      });
+      changed = true;
+    }
+  }
+  return discovered;
+}
+
+function chronologicalProcessTree(rows, rootIdentity) {
   const verifiedIdentity = validateProcessIdentity(rootIdentity, 'spawned root identity');
   const verifiedRoot = verifiedIdentity.pid;
   if (!rows.some(row => sameProcessIdentity(row, verifiedIdentity))) {
     throw new Error(`spawned root process ${verifiedRoot} does not match its captured identity`);
   }
-  const depths = new Map([[verifiedRoot, 0]]);
-  let changed = true;
-  while (changed) {
-    changed = false;
-    for (const row of rows) {
-      if (!depths.has(row.pid) && depths.has(row.ppid)) {
-        depths.set(row.pid, depths.get(row.ppid) + 1);
-        changed = true;
-      }
-    }
-  }
-  const selected = rows.filter(row => depths.has(row.pid));
+  const rootRow = rows.find(row => sameProcessIdentity(row, verifiedIdentity));
+  const rootStartedAt = comparableStartedAt(rootRow);
+  const discovered = discoverChronologicalDescendants(
+    rows,
+    new Map([[
+      verifiedRoot,
+      { depth: 0, startedAt: rootStartedAt },
+    ]]),
+    rootStartedAt,
+  );
+  const selected = rows.filter(row => discovered.has(row.pid));
+  return {
+    verifiedIdentity,
+    verifiedRoot,
+    selected,
+    discovered,
+  };
+}
+
+export function aggregateProcessTree(rows, rootIdentity) {
+  const {
+    verifiedIdentity,
+    verifiedRoot,
+    selected,
+    discovered,
+  } = chronologicalProcessTree(rows, rootIdentity);
   const orderedIds = selected.map(row => row.pid).sort((left, right) => left - right);
   let rssBytes = 0;
   for (const row of selected) {
@@ -545,10 +712,26 @@ export function aggregateProcessTree(rows, rootIdentity) {
         ppid: row.ppid,
         pgid: row.pgid,
         creationTime: row.creationTime,
-        depth: depths.get(row.pid),
+        startedAt: comparableStartedAt(row),
+        depth: discovered.get(row.pid).depth,
       }))
       .sort((left, right) => left.pid - right.pid),
   };
+}
+
+function rawDescendantIds(rows, rootPid) {
+  const descendants = new Set([rootPid]);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const row of rows) {
+      if (!descendants.has(row.pid) && descendants.has(row.ppid)) {
+        descendants.add(row.pid);
+        changed = true;
+      }
+    }
+  }
+  return descendants;
 }
 
 export function planProcessCleanup(
@@ -559,23 +742,42 @@ export function planProcessCleanup(
 ) {
   const verifiedIdentity = validateProcessIdentity(rootIdentity, 'spawned root identity');
   const rootMatches = rows.some(row => sameProcessIdentity(row, verifiedIdentity));
-  if (rootMatches && allowTree) {
-    return {
-      mode: 'tree',
-      rootPid: verifiedIdentity.pid,
-      pgid: verifiedIdentity.pgid,
-      processIds: [],
-    };
-  }
-
   const currentByPid = new Map(rows.map(row => [row.pid, row]));
   const trackedByPid = new Map(trackedProcesses.map(tracked => [tracked.pid, tracked]));
-  if (rootMatches && !trackedByPid.has(verifiedIdentity.pid)) {
-    trackedByPid.set(verifiedIdentity.pid, { ...verifiedIdentity, depth: 0 });
+  if (rootMatches) {
+    const chronological = chronologicalProcessTree(rows, verifiedIdentity);
+    const chronologicalProcesses = chronological.selected.map(processRow => ({
+      pid: processRow.pid,
+      ppid: processRow.ppid,
+      pgid: processRow.pgid,
+      creationTime: processRow.creationTime,
+      startedAt: comparableStartedAt(processRow),
+      depth: chronological.discovered.get(processRow.pid).depth,
+    }));
+    for (const processRow of chronologicalProcesses) {
+      trackedByPid.set(processRow.pid, processRow);
+    }
+    const safeProcessIds = new Set(chronologicalProcesses.map(processRow => processRow.pid));
+    const rawProcessIds = rawDescendantIds(rows, verifiedIdentity.pid);
+    const chronologyIsComplete = comparableStartedAt(verifiedIdentity) !== null
+      && [...rawProcessIds].every(pid => safeProcessIds.has(pid));
+    if (allowTree && chronologyIsComplete) {
+      return {
+        mode: 'tree',
+        rootPid: verifiedIdentity.pid,
+        pgid: verifiedIdentity.pgid,
+        processIds: [],
+      };
+    }
   }
+  const rootStartedAt = comparableStartedAt(verifiedIdentity);
   const processIds = [...trackedByPid.values()]
     .filter(tracked => rootMatches || tracked.pid !== verifiedIdentity.pid)
     .filter(tracked => sameProcessIdentity(currentByPid.get(tracked.pid) ?? {}, tracked))
+    .filter(tracked => tracked.pid === verifiedIdentity.pid
+      || (rootStartedAt !== null
+        && comparableStartedAt(tracked) !== null
+        && comparableStartedAt(tracked) >= rootStartedAt))
     .sort((left, right) => (right.depth ?? 0) - (left.depth ?? 0))
     .map(tracked => tracked.pid);
   return {
@@ -612,6 +814,7 @@ function readProcessTable(platform = process.platform) {
 
   const result = spawnSync('ps', ['-axo', 'pid=,ppid=,pgid=,rss=,lstart='], {
     encoding: 'utf8',
+    env: { ...process.env, LANG: 'C', LC_ALL: 'C' },
     timeout: SYNC_COMMAND_TIMEOUT_MS,
     maxBuffer: SYNC_COMMAND_MAX_BUFFER_BYTES,
   });
@@ -702,34 +905,39 @@ export function startProcessTreeMonitor(
         processes = aggregateProcessTree(rows, rootIdentity).processes;
       } else {
         const currentByPid = new Map(rows.map(processRow => [processRow.pid, processRow]));
-        const depths = new Map();
+        const rootStartedAt = comparableStartedAt(rootIdentity);
+        const seeds = new Map();
         for (const trackedProcess of tracked.values()) {
           if (trackedProcess.pid === rootIdentity.pid) {
             continue;
           }
           const currentProcess = currentByPid.get(trackedProcess.pid);
-          if (currentProcess && sameProcessIdentity(currentProcess, trackedProcess)) {
-            depths.set(currentProcess.pid, trackedProcess.depth ?? 1);
+          const currentStartedAt = comparableStartedAt(currentProcess);
+          // A non-root entry reaches `tracked` only through an earlier
+          // root-matched chronological walk. It may remain a seed after the
+          // root exits only while its exact identity and comparable clock
+          // still match; an unparseable tracked row is retained but not used.
+          if (currentProcess
+              && sameProcessIdentity(currentProcess, trackedProcess)
+              && rootStartedAt !== null
+              && currentStartedAt !== null
+              && currentStartedAt >= rootStartedAt) {
+            seeds.set(currentProcess.pid, {
+              depth: trackedProcess.depth ?? 1,
+              startedAt: currentStartedAt,
+            });
           }
         }
-        let changed = true;
-        while (changed) {
-          changed = false;
-          for (const processRow of rows) {
-            if (!depths.has(processRow.pid) && depths.has(processRow.ppid)) {
-              depths.set(processRow.pid, depths.get(processRow.ppid) + 1);
-              changed = true;
-            }
-          }
-        }
+        const discovered = discoverChronologicalDescendants(rows, seeds, rootStartedAt);
         processes = rows
-          .filter(processRow => depths.has(processRow.pid))
+          .filter(processRow => discovered.has(processRow.pid))
           .map(processRow => ({
             pid: processRow.pid,
             ppid: processRow.ppid,
             pgid: processRow.pgid,
             creationTime: processRow.creationTime,
-            depth: depths.get(processRow.pid),
+            startedAt: comparableStartedAt(processRow),
+            depth: discovered.get(processRow.pid).depth,
           }));
       }
       for (const processRow of processes) {
@@ -1018,13 +1226,28 @@ export async function terminateMeasuredTree(
     || (rootIdentity.pgid === rootIdentity.pid
       && Number.isSafeInteger(rootIdentity.pgid)
       && rootIdentity.pgid > 0);
-  const initialPlan = planProcessCleanup(rows, rootIdentity, trackedProcesses, { allowTree });
+  let cleanupTrackedProcesses = trackedProcesses;
+  if (rows.some(row => sameProcessIdentity(row, rootIdentity))) {
+    const chronological = chronologicalProcessTree(rows, rootIdentity);
+    cleanupTrackedProcesses = mergeTrackedProcesses(
+      trackedProcesses,
+      chronological.selected.map(processRow => ({
+        pid: processRow.pid,
+        ppid: processRow.ppid,
+        pgid: processRow.pgid,
+        creationTime: processRow.creationTime,
+        startedAt: comparableStartedAt(processRow),
+        depth: chronological.discovered.get(processRow.pid).depth,
+      })),
+    );
+  }
+  const initialPlan = planProcessCleanup(rows, rootIdentity, cleanupTrackedProcesses, { allowTree });
   if (platform === 'win32') {
     const terminateExplicit = async processIds => {
       for (const pid of processIds) {
         let currentPlan;
         try {
-          currentPlan = planProcessCleanup(read(platform), rootIdentity, trackedProcesses, {
+          currentPlan = planProcessCleanup(read(platform), rootIdentity, cleanupTrackedProcesses, {
             allowTree: false,
           });
         } catch {
@@ -1037,10 +1260,13 @@ export async function terminateMeasuredTree(
       }
       return true;
     };
+    const rootFirst = processIds => processIds.includes(verifiedRootPid)
+      ? [verifiedRootPid, ...processIds.filter(pid => pid !== verifiedRootPid)]
+      : processIds;
     if (initialPlan.mode === 'tree') {
       let currentPlan;
       try {
-        currentPlan = planProcessCleanup(read(platform), rootIdentity, trackedProcesses, {
+        currentPlan = planProcessCleanup(read(platform), rootIdentity, cleanupTrackedProcesses, {
           allowTree: true,
         });
       } catch {
@@ -1050,10 +1276,10 @@ export async function terminateMeasuredTree(
       if (currentPlan.mode === 'tree') {
         run('taskkill.exe', ['/PID', String(currentPlan.rootPid), '/T', '/F']);
       } else {
-        await terminateExplicit(currentPlan.processIds);
+        await terminateExplicit(rootFirst(currentPlan.processIds));
       }
     } else {
-      await terminateExplicit(initialPlan.processIds);
+      await terminateExplicit(rootFirst(initialPlan.processIds));
     }
     return;
   }
@@ -1062,7 +1288,7 @@ export async function terminateMeasuredTree(
     for (const pid of processIds) {
       let currentPlan;
       try {
-        currentPlan = planProcessCleanup(read(platform), rootIdentity, trackedProcesses, {
+        currentPlan = planProcessCleanup(read(platform), rootIdentity, cleanupTrackedProcesses, {
           allowTree: false,
         });
       } catch {
@@ -1083,7 +1309,7 @@ export async function terminateMeasuredTree(
     if (plan.mode === 'tree') {
       let currentPlan;
       try {
-        currentPlan = planProcessCleanup(read(platform), rootIdentity, trackedProcesses, {
+        currentPlan = planProcessCleanup(read(platform), rootIdentity, cleanupTrackedProcesses, {
           allowTree: allowGroup,
         });
       } catch {
@@ -1114,7 +1340,7 @@ export async function terminateMeasuredTree(
     await terminateControlledChild();
     return;
   }
-  const finalPlan = planProcessCleanup(rows, rootIdentity, trackedProcesses, {
+  const finalPlan = planProcessCleanup(rows, rootIdentity, cleanupTrackedProcesses, {
     allowTree: allowTree && initialPlan.mode === 'tree',
   });
   await signalPlan(finalPlan, 'SIGKILL', allowTree && initialPlan.mode === 'tree');

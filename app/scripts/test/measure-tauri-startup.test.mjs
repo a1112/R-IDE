@@ -153,10 +153,13 @@ test('every synchronous external command has explicit timeout and buffer bounds'
     const block = source.slice(startIndex, endIndex);
     assert.match(block, /timeout:\s*[A-Z0-9_]+|timeout:\s*\d+/, `${label} needs a timeout`);
     assert.match(block, /maxBuffer:\s*[A-Z0-9_]+|maxBuffer:\s*\d+/, `${label} needs maxBuffer`);
+    return block;
   };
 
   boundedCall("spawnSync(\n      'powershell.exe'", 'return parseWindowsProcessTable', 'CIM query');
-  boundedCall("spawnSync('ps'", 'return parsePosixProcessTable', 'ps query');
+  const psQuery = boundedCall("spawnSync('ps'", 'return parsePosixProcessTable', 'ps query');
+  assert.match(psQuery, /LANG:\s*'C'/);
+  assert.match(psQuery, /LC_ALL:\s*'C'/);
   boundedCall('run = (command, args) => spawnSync', 'kill = (pid, signal)', 'taskkill command');
   boundedCall("execFileSync('git'", '}).trim()', 'git revision query');
 });
@@ -334,6 +337,7 @@ test('RSS conversion, aggregation, and median reject unsafe integer arithmetic',
         pgid: 10,
         rssBytes: Number.MAX_SAFE_INTEGER,
         creationTime: 'root-start',
+        startedAt: 1_000,
       },
       {
         pid: 11,
@@ -341,8 +345,9 @@ test('RSS conversion, aggregation, and median reject unsafe integer arithmetic',
         pgid: 10,
         rssBytes: 1,
         creationTime: 'child-start',
+        startedAt: 1_000,
       },
-    ], { pid: 10, pgid: 10, creationTime: 'root-start' }),
+    ], { pid: 10, pgid: 10, creationTime: 'root-start', startedAt: 1_000 }),
     /aggregate RSS.*safe integer/,
   );
   assert.throws(() => median([Number.MAX_SAFE_INTEGER + 1]), /safe integers/);
@@ -366,6 +371,7 @@ test('parses POSIX ps and Windows PowerShell process table fixtures', () => {
         pgid: 10,
         rssBytes: 2_097_152,
         creationTime: 'Sat Aug 15 12:34:56 2026',
+        startedAt: Date.parse('Sat Aug 15 12:34:56 2026'),
       },
       {
         pid: 11,
@@ -373,6 +379,7 @@ test('parses POSIX ps and Windows PowerShell process table fixtures', () => {
         pgid: 10,
         rssBytes: 1_048_576,
         creationTime: 'Sat Aug 15 12:34:57 2026',
+        startedAt: Date.parse('Sat Aug 15 12:34:57 2026'),
       },
       {
         pid: 99,
@@ -380,6 +387,7 @@ test('parses POSIX ps and Windows PowerShell process table fixtures', () => {
         pgid: 99,
         rssBytes: 524_288,
         creationTime: 'Sat Aug 15 12:35:00 2026',
+        startedAt: Date.parse('Sat Aug 15 12:35:00 2026'),
       },
     ],
   );
@@ -412,6 +420,7 @@ test('parses POSIX ps and Windows PowerShell process table fixtures', () => {
         pgid: null,
         rssBytes: 2_000,
         creationTime: '20260815123456.000000+480',
+        startedAt: Date.UTC(2026, 7, 15, 4, 34, 56),
       },
       {
         pid: 11,
@@ -419,20 +428,113 @@ test('parses POSIX ps and Windows PowerShell process table fixtures', () => {
         pgid: null,
         rssBytes: 3_000,
         creationTime: '20260815123457.000000+480',
+        startedAt: Date.UTC(2026, 7, 15, 4, 34, 57),
       },
     ],
   );
 });
 
+test('process table parsers preserve comparable creation chronology and reject malformed clocks', () => {
+  const windowsRows = parseWindowsProcessTable(JSON.stringify([
+    {
+      ProcessId: 10,
+      ParentProcessId: 1,
+      WorkingSetSize: 1,
+      CreationDate: '20260815123456.123456-300',
+    },
+    {
+      ProcessId: 11,
+      ParentProcessId: 10,
+      WorkingSetSize: 1,
+      CreationDate: '/Date(1786765431765)/',
+    },
+    {
+      ProcessId: 12,
+      ParentProcessId: 10,
+      WorkingSetSize: 1,
+      CreationDate: 'not-a-date',
+    },
+    {
+      ProcessId: 13,
+      ParentProcessId: 10,
+      WorkingSetSize: 1,
+      CreationDate: '9999',
+    },
+    {
+      ProcessId: 14,
+      ParentProcessId: 10,
+      WorkingSetSize: 1,
+      CreationDate: '2026-08-15T12:34:56.789+08:00',
+    },
+    {
+      ProcessId: 15,
+      ParentProcessId: 10,
+      WorkingSetSize: 1,
+      CreationDate: '08/15/2026 12:34:56',
+    },
+    {
+      ProcessId: 16,
+      ParentProcessId: 10,
+      WorkingSetSize: 1,
+      CreationDate: '2026-08-15T12:34:56',
+    },
+  ]));
+  assert.equal(windowsRows[0].startedAt, Date.UTC(2026, 7, 15, 17, 34, 56, 123));
+  assert.equal(windowsRows[1].startedAt, 1_786_765_431_765);
+  assert.equal(windowsRows[2].startedAt, null);
+  assert.equal(windowsRows[3].startedAt, null);
+  assert.equal(windowsRows[4].startedAt, Date.UTC(2026, 7, 15, 4, 34, 56, 789));
+  assert.equal(windowsRows[5].startedAt, null);
+  assert.equal(windowsRows[6].startedAt, null);
+
+  const posixRows = parsePosixProcessTable(`
+    20 1 20 1 Sat Aug 15 12:34:56 2026
+    21 20 20 1 malformed timestamp
+    22 20 20 1 2026-08-15
+  `);
+  assert.equal(posixRows[0].startedAt, Date.parse('Sat Aug 15 12:34:56 2026'));
+  assert.equal(posixRows[1].startedAt, null);
+  assert.equal(posixRows[2].startedAt, null);
+
+  const malformedCleanupRows = parseWindowsProcessTable(JSON.stringify([
+    {
+      ProcessId: 100,
+      ParentProcessId: 1,
+      WorkingSetSize: 1,
+      CreationDate: '20260815123456.000000+000',
+    },
+    {
+      ProcessId: 101,
+      ParentProcessId: 100,
+      WorkingSetSize: 1,
+      CreationDate: '9999',
+    },
+  ]));
+  assert.deepEqual(planProcessCleanup(
+    malformedCleanupRows,
+    {
+      pid: 100,
+      pgid: null,
+      creationTime: malformedCleanupRows[0].creationTime,
+      startedAt: malformedCleanupRows[0].startedAt,
+    },
+  ), {
+    mode: 'pids',
+    rootPid: 100,
+    pgid: null,
+    processIds: [100],
+  });
+});
+
 test('process aggregation includes only verified descendants of the spawned root', () => {
   const rows = [
-    { pid: 100, ppid: 1, pgid: 100, rssBytes: 10, creationTime: 'root-start' },
-    { pid: 101, ppid: 100, pgid: 100, rssBytes: 20, creationTime: 'child-start' },
-    { pid: 102, ppid: 101, pgid: 100, rssBytes: 30, creationTime: 'grandchild-start' },
-    { pid: 200, ppid: 1, pgid: 200, rssBytes: 1_000, creationTime: 'other-start' },
-    { pid: 201, ppid: 200, pgid: 200, rssBytes: 2_000, creationTime: 'other-child-start' },
+    { pid: 100, ppid: 1, pgid: 100, rssBytes: 10, creationTime: 'root-start', startedAt: 1_000 },
+    { pid: 101, ppid: 100, pgid: 100, rssBytes: 20, creationTime: 'child-start', startedAt: 1_000 },
+    { pid: 102, ppid: 101, pgid: 100, rssBytes: 30, creationTime: 'grandchild-start', startedAt: 2_000 },
+    { pid: 200, ppid: 1, pgid: 200, rssBytes: 1_000, creationTime: 'other-start', startedAt: 1_000 },
+    { pid: 201, ppid: 200, pgid: 200, rssBytes: 2_000, creationTime: 'other-child-start', startedAt: 2_000 },
   ];
-  const rootIdentity = { pid: 100, pgid: 100, creationTime: 'root-start' };
+  const rootIdentity = { pid: 100, pgid: 100, creationTime: 'root-start', startedAt: 1_000 };
 
   assert.deepEqual(aggregateProcessTree(rows, rootIdentity), {
     rootPid: 100,
@@ -441,9 +543,9 @@ test('process aggregation includes only verified descendants of the spawned root
     processCount: 3,
     rssBytes: 60,
     processes: [
-      { pid: 100, ppid: 1, pgid: 100, creationTime: 'root-start', depth: 0 },
-      { pid: 101, ppid: 100, pgid: 100, creationTime: 'child-start', depth: 1 },
-      { pid: 102, ppid: 101, pgid: 100, creationTime: 'grandchild-start', depth: 2 },
+      { pid: 100, ppid: 1, pgid: 100, creationTime: 'root-start', startedAt: 1_000, depth: 0 },
+      { pid: 101, ppid: 100, pgid: 100, creationTime: 'child-start', startedAt: 1_000, depth: 1 },
+      { pid: 102, ppid: 101, pgid: 100, creationTime: 'grandchild-start', startedAt: 2_000, depth: 2 },
     ],
   });
   assert.throws(
@@ -452,11 +554,36 @@ test('process aggregation includes only verified descendants of the spawned root
   );
 });
 
+test('process aggregation rejects root-PID reuse edges and validates chronology at every level', () => {
+  const rootIdentity = {
+    pid: 100,
+    pgid: null,
+    creationTime: 'root-current',
+    startedAt: 1_000,
+  };
+  const rows = [
+    { pid: 100, ppid: 1, pgid: null, rssBytes: 10, creationTime: 'root-current', startedAt: 1_000 },
+    { pid: 101, ppid: 100, pgid: null, rssBytes: 20, creationTime: 'old-child', startedAt: 900 },
+    { pid: 102, ppid: 100, pgid: null, rssBytes: 30, creationTime: 'equal-child', startedAt: 1_000 },
+    { pid: 103, ppid: 102, pgid: null, rssBytes: 40, creationTime: 'valid-grandchild', startedAt: 1_100 },
+    { pid: 104, ppid: 103, pgid: null, rssBytes: 50, creationTime: 'older-great-grandchild', startedAt: 1_050 },
+    { pid: 105, ppid: 103, pgid: null, rssBytes: 60, creationTime: 'malformed-child', startedAt: null },
+    { pid: 106, ppid: 101, pgid: null, rssBytes: 70, creationTime: 'child-of-stale-parent', startedAt: 1_200 },
+  ];
+
+  const aggregate = aggregateProcessTree(rows, rootIdentity);
+  assert.deepEqual(aggregate.processIds, [100, 102, 103]);
+  assert.deepEqual(
+    aggregate.processes.map(processRow => [processRow.pid, processRow.depth, processRow.startedAt]),
+    [[100, 0, 1_000], [102, 1, 1_000], [103, 2, 1_100]],
+  );
+});
+
 test('cleanup plans a whole tree only while the captured root identity still matches', () => {
-  const rootIdentity = { pid: 100, pgid: 100, creationTime: 'root-start' };
+  const rootIdentity = { pid: 100, pgid: 100, creationTime: 'root-start', startedAt: 1_000 };
   const tracked = [
-    { pid: 100, ppid: 1, pgid: 100, creationTime: 'root-start', depth: 0 },
-    { pid: 101, ppid: 100, pgid: 100, creationTime: 'child-start', depth: 1 },
+    { pid: 100, ppid: 1, pgid: 100, creationTime: 'root-start', startedAt: 1_000, depth: 0 },
+    { pid: 101, ppid: 100, pgid: 100, creationTime: 'child-start', startedAt: 2_000, depth: 1 },
   ];
 
   assert.deepEqual(planProcessCleanup(tracked, rootIdentity, tracked), {
@@ -485,15 +612,15 @@ test('cleanup plans a whole tree only while the captured root identity still mat
 });
 
 test('cleanup excludes a tracked descendant whose PID has been reused', () => {
-  const rootIdentity = { pid: 100, pgid: 100, creationTime: 'root-start' };
+  const rootIdentity = { pid: 100, pgid: 100, creationTime: 'root-start', startedAt: 1_000 };
   const tracked = [
-    { pid: 100, ppid: 1, pgid: 100, creationTime: 'root-start', depth: 0 },
-    { pid: 101, ppid: 100, pgid: 100, creationTime: 'child-start', depth: 1 },
-    { pid: 102, ppid: 101, pgid: 100, creationTime: 'grandchild-start', depth: 2 },
+    { pid: 100, ppid: 1, pgid: 100, creationTime: 'root-start', startedAt: 1_000, depth: 0 },
+    { pid: 101, ppid: 100, pgid: 100, creationTime: 'child-start', startedAt: 2_000, depth: 1 },
+    { pid: 102, ppid: 101, pgid: 100, creationTime: 'grandchild-start', startedAt: 3_000, depth: 2 },
   ];
   const current = [
-    { pid: 101, ppid: 1, pgid: 101, creationTime: 'reused-child' },
-    { pid: 102, ppid: 1, pgid: 100, creationTime: 'grandchild-start' },
+    { pid: 101, ppid: 1, pgid: 101, creationTime: 'reused-child', startedAt: 4_000 },
+    { pid: 102, ppid: 1, pgid: 100, creationTime: 'grandchild-start', startedAt: 3_000 },
   ];
 
   assert.deepEqual(planProcessCleanup(current, rootIdentity, tracked).processIds, [102]);
@@ -566,10 +693,10 @@ test('root identity capture retries a transient process-table query failure', as
 test('process tree monitor accumulates identities and releases its timer and exit listener', async () => {
   const child = new EventEmitter();
   child.pid = 100;
-  const rootIdentity = { pid: 100, pgid: 100, creationTime: 'root-start' };
+  const rootIdentity = { pid: 100, pgid: 100, creationTime: 'root-start', startedAt: 1_000 };
   let rows = [
-    { pid: 100, ppid: 1, pgid: 100, rssBytes: 10, creationTime: 'root-start' },
-    { pid: 101, ppid: 100, pgid: 100, rssBytes: 20, creationTime: 'backend-start' },
+    { pid: 100, ppid: 1, pgid: 100, rssBytes: 10, creationTime: 'root-start', startedAt: 1_000 },
+    { pid: 101, ppid: 100, pgid: 100, rssBytes: 20, creationTime: 'backend-start', startedAt: 2_000 },
   ];
   let scheduled;
   let cancelled = false;
@@ -590,7 +717,7 @@ test('process tree monitor accumulates identities and releases its timer and exi
     },
   });
   rows = [
-    { pid: 101, ppid: 1, pgid: 100, rssBytes: 20, creationTime: 'backend-start' },
+    { pid: 101, ppid: 1, pgid: 100, rssBytes: 20, creationTime: 'backend-start', startedAt: 2_000 },
   ];
   scheduled();
   child.emit('exit');
@@ -610,11 +737,11 @@ test('process tree monitor never seeds discovery from a missing root PID', async
   const child = new EventEmitter();
   child.pid = 100;
   let rows = [
-    { pid: 100, ppid: 1, pgid: null, rssBytes: 10, creationTime: 'root-start' },
+    { pid: 100, ppid: 1, pgid: null, rssBytes: 10, creationTime: 'root-start', startedAt: 1_000 },
   ];
   let scheduled;
   const monitor = startProcessTreeMonitor(
-    { pid: 100, pgid: null, creationTime: 'root-start' },
+    { pid: 100, pgid: null, creationTime: 'root-start', startedAt: 1_000 },
     {
       child,
       platform: 'win32',
@@ -627,7 +754,7 @@ test('process tree monitor never seeds discovery from a missing root PID', async
     },
   );
   rows = [
-    { pid: 900, ppid: 100, pgid: null, rssBytes: 20, creationTime: 'unrelated-start' },
+    { pid: 900, ppid: 100, pgid: null, rssBytes: 20, creationTime: 'unrelated-start', startedAt: 2_000 },
   ];
   scheduled();
 
@@ -639,12 +766,12 @@ test('process tree monitor follows identity-matched tracked descendants after ro
   const child = new EventEmitter();
   child.pid = 100;
   let rows = [
-    { pid: 100, ppid: 1, pgid: null, rssBytes: 10, creationTime: 'root-start' },
-    { pid: 101, ppid: 100, pgid: null, rssBytes: 20, creationTime: 'backend-start' },
+    { pid: 100, ppid: 1, pgid: null, rssBytes: 10, creationTime: 'root-start', startedAt: 1_000 },
+    { pid: 101, ppid: 100, pgid: null, rssBytes: 20, creationTime: 'backend-start', startedAt: 2_000 },
   ];
   let scheduled;
   const monitor = startProcessTreeMonitor(
-    { pid: 100, pgid: null, creationTime: 'root-start' },
+    { pid: 100, pgid: null, creationTime: 'root-start', startedAt: 1_000 },
     {
       child,
       platform: 'win32',
@@ -657,8 +784,8 @@ test('process tree monitor follows identity-matched tracked descendants after ro
     },
   );
   rows = [
-    { pid: 101, ppid: 1, pgid: null, rssBytes: 20, creationTime: 'backend-start' },
-    { pid: 102, ppid: 101, pgid: null, rssBytes: 30, creationTime: 'worker-start' },
+    { pid: 101, ppid: 1, pgid: null, rssBytes: 20, creationTime: 'backend-start', startedAt: 2_000 },
+    { pid: 102, ppid: 101, pgid: null, rssBytes: 30, creationTime: 'worker-start', startedAt: 3_000 },
   ];
   scheduled();
 
@@ -670,12 +797,12 @@ test('POSIX monitor does not adopt an untracked process from the old root group'
   const child = new EventEmitter();
   child.pid = 100;
   let rows = [
-    { pid: 100, ppid: 1, pgid: 100, rssBytes: 10, creationTime: 'root-start' },
-    { pid: 101, ppid: 100, pgid: 100, rssBytes: 20, creationTime: 'backend-start' },
+    { pid: 100, ppid: 1, pgid: 100, rssBytes: 10, creationTime: 'root-start', startedAt: 1_000 },
+    { pid: 101, ppid: 100, pgid: 100, rssBytes: 20, creationTime: 'backend-start', startedAt: 2_000 },
   ];
   let scheduled;
   const monitor = startProcessTreeMonitor(
-    { pid: 100, pgid: 100, creationTime: 'root-start' },
+    { pid: 100, pgid: 100, creationTime: 'root-start', startedAt: 1_000 },
     {
       child,
       platform: 'linux',
@@ -688,9 +815,9 @@ test('POSIX monitor does not adopt an untracked process from the old root group'
     },
   );
   rows = [
-    { pid: 101, ppid: 1, pgid: 100, rssBytes: 20, creationTime: 'backend-start' },
-    { pid: 102, ppid: 101, pgid: 100, rssBytes: 30, creationTime: 'worker-start' },
-    { pid: 900, ppid: 1, pgid: 100, rssBytes: 40, creationTime: 'unrelated-start' },
+    { pid: 101, ppid: 1, pgid: 100, rssBytes: 20, creationTime: 'backend-start', startedAt: 2_000 },
+    { pid: 102, ppid: 101, pgid: 100, rssBytes: 30, creationTime: 'worker-start', startedAt: 3_000 },
+    { pid: 900, ppid: 1, pgid: 100, rssBytes: 40, creationTime: 'unrelated-start', startedAt: 2_000 },
   ];
   scheduled();
 
@@ -702,12 +829,12 @@ test('process tree monitor never seeds discovery from a reused tracked descendan
   const child = new EventEmitter();
   child.pid = 100;
   let rows = [
-    { pid: 100, ppid: 1, pgid: null, rssBytes: 10, creationTime: 'root-start' },
-    { pid: 101, ppid: 100, pgid: null, rssBytes: 20, creationTime: 'backend-start' },
+    { pid: 100, ppid: 1, pgid: null, rssBytes: 10, creationTime: 'root-start', startedAt: 1_000 },
+    { pid: 101, ppid: 100, pgid: null, rssBytes: 20, creationTime: 'backend-start', startedAt: 2_000 },
   ];
   let scheduled;
   const monitor = startProcessTreeMonitor(
-    { pid: 100, pgid: null, creationTime: 'root-start' },
+    { pid: 100, pgid: null, creationTime: 'root-start', startedAt: 1_000 },
     {
       child,
       platform: 'win32',
@@ -720,14 +847,52 @@ test('process tree monitor never seeds discovery from a reused tracked descendan
     },
   );
   rows = [
-    { pid: 101, ppid: 100, pgid: null, rssBytes: 20, creationTime: 'reused-backend' },
-    { pid: 102, ppid: 101, pgid: null, rssBytes: 30, creationTime: 'untrusted-worker' },
+    { pid: 101, ppid: 100, pgid: null, rssBytes: 20, creationTime: 'reused-backend', startedAt: 4_000 },
+    { pid: 102, ppid: 101, pgid: null, rssBytes: 30, creationTime: 'untrusted-worker', startedAt: 5_000 },
   ];
   scheduled();
 
   const tracked = await monitor.stop();
   assert.deepEqual(tracked.map(processRow => processRow.pid), [100, 101]);
   assert.equal(tracked.find(processRow => processRow.pid === 101).creationTime, 'backend-start');
+});
+
+test('process tree monitor rejects stale edges and never expands from an unparseable tracked clock', async () => {
+  const child = new EventEmitter();
+  child.pid = 100;
+  const rootIdentity = {
+    pid: 100,
+    pgid: null,
+    creationTime: 'root-current',
+    startedAt: 1_000,
+  };
+  let rows = [
+    { pid: 100, ppid: 1, pgid: null, rssBytes: 1, creationTime: 'root-current', startedAt: 1_000 },
+    { pid: 101, ppid: 100, pgid: null, rssBytes: 1, creationTime: 'tracked-child', startedAt: 2_000 },
+    { pid: 900, ppid: 100, pgid: null, rssBytes: 1, creationTime: 'old-stale-child', startedAt: 900 },
+  ];
+  let scheduled;
+  const monitor = startProcessTreeMonitor(rootIdentity, {
+    child,
+    platform: 'win32',
+    read: () => rows,
+    schedule: callback => {
+      scheduled = callback;
+      return { unref() {} };
+    },
+    cancel: () => undefined,
+  });
+
+  rows = [
+    { pid: 101, ppid: 1, pgid: null, rssBytes: 1, creationTime: 'tracked-child', startedAt: null },
+    { pid: 102, ppid: 101, pgid: null, rssBytes: 1, creationTime: 'untrusted-grandchild', startedAt: 3_000 },
+  ];
+  scheduled();
+
+  const tracked = await monitor.stop();
+  assert.deepEqual(tracked.map(processRow => processRow.pid), [100, 101]);
+  assert.equal(tracked.some(processRow => processRow.pid === 900), false);
+  assert.equal(tracked.some(processRow => processRow.pid === 102), false);
 });
 
 test('cleanup query failure falls back only to the still-owned child handle', async () => {
@@ -791,9 +956,9 @@ test('process tree monitor refuses to expand after the root PID is reused', asyn
 });
 
 test('explicit cleanup revalidates identity immediately before every kill', async () => {
-  const rootIdentity = { pid: 100, pgid: null, creationTime: 'root-start' };
+  const rootIdentity = { pid: 100, pgid: null, creationTime: 'root-start', startedAt: 1_000 };
   const tracked = [
-    { pid: 101, ppid: 100, pgid: null, creationTime: 'backend-start', depth: 1 },
+    { pid: 101, ppid: 100, pgid: null, creationTime: 'backend-start', startedAt: 2_000, depth: 1 },
   ];
   let reads = 0;
   const commands = [];
@@ -805,8 +970,8 @@ test('explicit cleanup revalidates identity immediately before every kill', asyn
     read: () => {
       reads++;
       return reads === 1
-        ? [{ pid: 101, ppid: 1, pgid: null, creationTime: 'backend-start' }]
-        : [{ pid: 101, ppid: 1, pgid: null, creationTime: 'reused-backend' }];
+        ? [{ pid: 101, ppid: 1, pgid: null, creationTime: 'backend-start', startedAt: 2_000 }]
+        : [{ pid: 101, ppid: 1, pgid: null, creationTime: 'reused-backend', startedAt: 3_000 }];
     },
     run: (command, args) => commands.push([command, ...args]),
     delay: async () => undefined,
@@ -817,11 +982,11 @@ test('explicit cleanup revalidates identity immediately before every kill', asyn
 });
 
 test('tree termination rechecks identity and never targets a reused root or descendant PID', async () => {
-  const rootIdentity = { pid: 100, pgid: null, creationTime: 'root-start' };
+  const rootIdentity = { pid: 100, pgid: null, creationTime: 'root-start', startedAt: 1_000 };
   const tracked = [
-    { pid: 100, ppid: 1, pgid: null, creationTime: 'root-start', depth: 0 },
-    { pid: 101, ppid: 100, pgid: null, creationTime: 'child-start', depth: 1 },
-    { pid: 102, ppid: 101, pgid: null, creationTime: 'grandchild-start', depth: 2 },
+    { pid: 100, ppid: 1, pgid: null, creationTime: 'root-start', startedAt: 1_000, depth: 0 },
+    { pid: 101, ppid: 100, pgid: null, creationTime: 'child-start', startedAt: 2_000, depth: 1 },
+    { pid: 102, ppid: 101, pgid: null, creationTime: 'grandchild-start', startedAt: 3_000, depth: 2 },
   ];
   const commands = [];
 
@@ -831,9 +996,9 @@ test('tree termination rechecks identity and never targets a reused root or desc
     trackedProcesses: tracked,
   }, 'win32', {
     read: () => [
-      { pid: 100, ppid: 1, pgid: null, creationTime: 'reused-root' },
-      { pid: 101, ppid: 1, pgid: null, creationTime: 'reused-child' },
-      { pid: 102, ppid: 1, pgid: null, creationTime: 'grandchild-start' },
+      { pid: 100, ppid: 1, pgid: null, creationTime: 'reused-root', startedAt: 4_000 },
+      { pid: 101, ppid: 1, pgid: null, creationTime: 'reused-child', startedAt: 4_000 },
+      { pid: 102, ppid: 1, pgid: null, creationTime: 'grandchild-start', startedAt: 3_000 },
     ],
     run: (command, args) => commands.push([command, ...args]),
     delay: async () => undefined,
@@ -843,14 +1008,14 @@ test('tree termination rechecks identity and never targets a reused root or desc
 });
 
 test('tree termination uses whole-tree cleanup when the captured root still matches', async () => {
-  const rootIdentity = { pid: 100, pgid: null, creationTime: 'root-start' };
+  const rootIdentity = { pid: 100, pgid: null, creationTime: 'root-start', startedAt: 1_000 };
   const commands = [];
   await terminateMeasuredTree({
     rootPid: rootIdentity.pid,
     rootIdentity,
   }, 'win32', {
     read: () => [
-      { pid: 100, ppid: 1, pgid: null, creationTime: 'root-start' },
+      { pid: 100, ppid: 1, pgid: null, creationTime: 'root-start', startedAt: 1_000 },
     ],
     run: (command, args) => commands.push([command, ...args]),
     delay: async () => undefined,
@@ -859,10 +1024,47 @@ test('tree termination uses whole-tree cleanup when the captured root still matc
   assert.deepEqual(commands, [['taskkill.exe', '/PID', '100', '/T', '/F']]);
 });
 
-test('POSIX termination signals the verified process group after each identity read', async () => {
-  const rootIdentity = { pid: 100, pgid: 100, creationTime: 'root-start' };
+test('Windows cleanup never lets taskkill tree expansion reach a child older than the root', async () => {
+  const rootIdentity = {
+    pid: 100,
+    pgid: null,
+    creationTime: 'root-current',
+    startedAt: 1_000,
+  };
   const rows = [
-    { pid: 100, ppid: 1, pgid: 100, creationTime: 'root-start' },
+    { pid: 100, ppid: 1, pgid: null, rssBytes: 1, creationTime: 'root-current', startedAt: 1_000 },
+    { pid: 101, ppid: 100, pgid: null, rssBytes: 1, creationTime: 'stale-child', startedAt: 900 },
+    { pid: 102, ppid: 100, pgid: null, rssBytes: 1, creationTime: 'owned-child', startedAt: 1_100 },
+    { pid: 103, ppid: 100, pgid: null, rssBytes: 1, creationTime: 'malformed-child', startedAt: null },
+  ];
+  const commands = [];
+
+  await terminateMeasuredTree({
+    rootPid: rootIdentity.pid,
+    rootIdentity,
+    trackedProcesses: [
+      { ...rows[0], depth: 0 },
+      { ...rows[2], depth: 1 },
+    ],
+  }, 'win32', {
+    read: () => rows,
+    run: (command, args) => commands.push([command, ...args]),
+    delay: async () => undefined,
+  });
+
+  assert.equal(commands.some(command => command.includes('/T')), false);
+  assert.equal(commands.some(command => command.includes('101')), false);
+  assert.equal(commands.some(command => command.includes('103')), false);
+  assert.deepEqual(commands, [
+    ['taskkill.exe', '/PID', '100', '/F'],
+    ['taskkill.exe', '/PID', '102', '/F'],
+  ]);
+});
+
+test('POSIX termination signals the verified process group after each identity read', async () => {
+  const rootIdentity = { pid: 100, pgid: 100, creationTime: 'root-start', startedAt: 1_000 };
+  const rows = [
+    { pid: 100, ppid: 1, pgid: 100, creationTime: 'root-start', startedAt: 1_000 },
   ];
   const signals = [];
   await terminateMeasuredTree({
@@ -878,11 +1080,11 @@ test('POSIX termination signals the verified process group after each identity r
 });
 
 test('POSIX termination falls back bottom-up to identity-matched tracked descendants', async () => {
-  const rootIdentity = { pid: 100, pgid: 100, creationTime: 'root-start' };
+  const rootIdentity = { pid: 100, pgid: 100, creationTime: 'root-start', startedAt: 1_000 };
   const tracked = [
-    { pid: 100, ppid: 1, pgid: 100, creationTime: 'root-start', depth: 0 },
-    { pid: 101, ppid: 100, pgid: 100, creationTime: 'child-start', depth: 1 },
-    { pid: 102, ppid: 101, pgid: 100, creationTime: 'grandchild-start', depth: 2 },
+    { pid: 100, ppid: 1, pgid: 100, creationTime: 'root-start', startedAt: 1_000, depth: 0 },
+    { pid: 101, ppid: 100, pgid: 100, creationTime: 'child-start', startedAt: 2_000, depth: 1 },
+    { pid: 102, ppid: 101, pgid: 100, creationTime: 'grandchild-start', startedAt: 3_000, depth: 2 },
   ];
   let reads = 0;
   const signals = [];
@@ -895,13 +1097,13 @@ test('POSIX termination falls back bottom-up to identity-matched tracked descend
       reads++;
       return reads === 1
         ? [
-          { pid: 100, ppid: 1, pgid: 100, creationTime: 'reused-root' },
-          { pid: 101, ppid: 1, pgid: 100, creationTime: 'child-start' },
-          { pid: 102, ppid: 1, pgid: 100, creationTime: 'grandchild-start' },
+          { pid: 100, ppid: 1, pgid: 100, creationTime: 'reused-root', startedAt: 4_000 },
+          { pid: 101, ppid: 1, pgid: 100, creationTime: 'child-start', startedAt: 2_000 },
+          { pid: 102, ppid: 1, pgid: 100, creationTime: 'grandchild-start', startedAt: 3_000 },
         ]
         : [
-          { pid: 101, ppid: 1, pgid: 101, creationTime: 'reused-child' },
-          { pid: 102, ppid: 1, pgid: 100, creationTime: 'grandchild-start' },
+          { pid: 101, ppid: 1, pgid: 101, creationTime: 'reused-child', startedAt: 4_000 },
+          { pid: 102, ppid: 1, pgid: 100, creationTime: 'grandchild-start', startedAt: 3_000 },
         ];
     },
     kill: (pid, signal) => signals.push([pid, signal]),
@@ -915,10 +1117,10 @@ test('POSIX termination falls back bottom-up to identity-matched tracked descend
 });
 
 test('POSIX termination never sends a group signal when root is not the detached group leader', async () => {
-  const rootIdentity = { pid: 100, pgid: 50, creationTime: 'root-start' };
+  const rootIdentity = { pid: 100, pgid: 50, creationTime: 'root-start', startedAt: 1_000 };
   const tracked = [
-    { pid: 100, ppid: 1, pgid: 50, creationTime: 'root-start', depth: 0 },
-    { pid: 101, ppid: 100, pgid: 50, creationTime: 'child-start', depth: 1 },
+    { pid: 100, ppid: 1, pgid: 50, creationTime: 'root-start', startedAt: 1_000, depth: 0 },
+    { pid: 101, ppid: 100, pgid: 50, creationTime: 'child-start', startedAt: 2_000, depth: 1 },
   ];
   const signals = [];
   await terminateMeasuredTree({
