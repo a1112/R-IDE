@@ -53,17 +53,24 @@ test('frontend contribution remains synchronously constructible with async hoste
             openerService: Symbol('OpenerService'),
             workspaceService: Symbol('WorkspaceService')
         };
-        container.bind(identifiers.workspaceService).toConstantValue({ ready: Promise.resolve() } as WorkspaceService);
-        container.bind(identifiers.openerService).toConstantValue({} as OpenerService);
-        container.bind(identifiers.messageService).toConstantValue({} as MessageService);
-        container.bind(identifiers.applicationShell).toConstantValue({} as ApplicationShell);
-        container.bind(identifiers.applicationState).toConstantValue({} as FrontendApplicationStateService);
+        const bindSynchronousDependencies = (target: Container): void => {
+            target.bind(identifiers.workspaceService).toConstantValue({ ready: Promise.resolve() } as WorkspaceService);
+            target.bind(identifiers.openerService).toConstantValue({} as OpenerService);
+            target.bind(identifiers.messageService).toConstantValue({} as MessageService);
+            target.bind(identifiers.applicationShell).toConstantValue({} as ApplicationShell);
+            target.bind(identifiers.applicationState).toConstantValue({} as FrontendApplicationStateService);
+        };
+        bindSynchronousDependencies(container);
 
         let resolveHostedPlugins!: (value: HostedPluginSupport) => void;
         const hostedPlugins = new Promise<HostedPluginSupport>(resolve => {
             resolveHostedPlugins = resolve;
         });
-        container.bind(identifiers.hostedPlugins).toDynamicValue(() => hostedPlugins);
+        let hostedResolutionStarted = false;
+        container.bind(identifiers.hostedPlugins).toDynamicValue(() => {
+            hostedResolutionStarted = true;
+            return hostedPlugins;
+        });
         container.load(new ContainerModule(bind => bindRideOpenRequestContribution(bind, identifiers)));
 
         let contributions: FrontendApplicationContribution[] = [];
@@ -72,12 +79,47 @@ test('frontend contribution remains synchronously constructible with async hoste
         });
         assert.equal(contributions.length, 1);
         assert.ok(contributions[0] instanceof RideOpenRequestContribution);
+        assert.equal(
+            hostedResolutionStarted,
+            false,
+            'the synchronous contribution factory must not start asynchronous container resolution'
+        );
+
+        await new Promise<void>(resolve => queueMicrotask(resolve));
+        assert.equal(hostedResolutionStarted, true);
 
         resolveHostedPlugins({
             willStart: Promise.resolve(),
             didStart: Promise.resolve()
         } as HostedPluginSupport);
         await hostedPlugins;
+
+        for (const [expectedFailure, getAsyncFailure] of [
+            ['synchronous getAsync failure', () => { throw new Error('synchronous getAsync failure'); }],
+            ['asynchronous getAsync failure', () => Promise.reject(new Error('asynchronous getAsync failure'))]
+        ] as const) {
+            const failingContainer = new Container();
+            bindSynchronousDependencies(failingContainer);
+            Object.defineProperty(failingContainer, 'getAsync', {
+                configurable: true,
+                value: getAsyncFailure
+            });
+            failingContainer.load(new ContainerModule(bind => bindRideOpenRequestContribution(bind, identifiers)));
+
+            let failingContribution!: RideOpenRequestContribution;
+            assert.doesNotThrow(() => {
+                failingContribution = failingContainer.get(identifiers.contribution) as RideOpenRequestContribution;
+            });
+            const observations = failingContribution as unknown as {
+                pluginWillStart: Promise<{ succeeded: boolean; error?: unknown }>;
+                pluginDidStart: Promise<{ succeeded: boolean; error?: unknown }>;
+            };
+            const results = await Promise.all([observations.pluginWillStart, observations.pluginDidStart]);
+            assert.deepEqual(results.map(result => result.succeeded), [false, false]);
+            for (const result of results) {
+                assert.match(String(result.error), new RegExp(expectedFailure));
+            }
+        }
     } finally {
         Object.defineProperty(globalThis, 'window', { configurable: true, value: previousWindow });
         Object.defineProperty(globalThis, 'navigator', { configurable: true, value: previousNavigator });

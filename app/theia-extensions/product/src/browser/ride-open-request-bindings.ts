@@ -25,6 +25,24 @@ export interface RideOpenRequestBindingIdentifiers {
     readonly workspaceService: interfaces.ServiceIdentifier<WorkspaceService>;
 }
 
+function resolveAfterSynchronousContribution<T>(
+    container: interfaces.Container,
+    identifier: interfaces.ServiceIdentifier<T>
+): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+        // Starting getAsync while Inversify is still building the synchronous
+        // contribution makes that entire contribution resolution asynchronous.
+        // Defer it until the current resolution stack has unwound instead.
+        queueMicrotask(() => {
+            try {
+                Promise.resolve(container.getAsync(identifier)).then(resolve, reject);
+            } catch (error) {
+                reject(error);
+            }
+        });
+    });
+}
+
 export function bindRideOpenRequestContribution(
     bind: interfaces.Bind,
     identifiers: RideOpenRequestBindingIdentifiers
@@ -37,11 +55,7 @@ export function bindRideOpenRequestContribution(
         context.container.get(identifiers.applicationShell),
         context.container.get(RideNativeChrome),
         context.container.get(identifiers.applicationState),
-        // HostedPluginSupport has asynchronous dependencies in the generated
-        // browser container. Starting its resolution without awaiting it keeps
-        // FrontendApplicationContribution synchronously constructible while the
-        // contribution still observes the real willStart/didStart promises.
-        context.container.getAsync(identifiers.hostedPlugins)
+        resolveAfterSynchronousContribution(context.container, identifiers.hostedPlugins)
     )).inSingletonScope();
     bind(identifiers.contribution).toService(RideOpenRequestContribution);
 }

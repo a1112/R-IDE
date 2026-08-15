@@ -236,6 +236,12 @@ class FakeNativeChrome {
     }
 }
 
+class TestRideOpenRequestContribution extends RideOpenRequestContribution {
+    async settlePluginObservations(): Promise<void> {
+        await Promise.all([this.pluginWillStart, this.pluginDidStart]);
+    }
+}
+
 function stateEnvelope(lastConsumed: string, ...requests: object[]): object {
     return { version: 2, lastConsumed, requests };
 }
@@ -261,9 +267,9 @@ function createContribution(
     reportStartupMilestone: (milestone: RideStartupMilestone) => Promise<void>
         = async () => undefined,
     applicationState = new FakeApplicationStateService(),
-    hostedPlugins = new FakeHostedPluginSupport()
+    hostedPlugins: FakeHostedPluginSupport | Promise<FakeHostedPluginSupport> = new FakeHostedPluginSupport()
 ): {
-    contribution: RideOpenRequestContribution;
+    contribution: TestRideOpenRequestContribution;
     workspace: FakeWorkspaceService;
     openers: FakeOpenerService;
     messages: FakeMessageService;
@@ -272,7 +278,7 @@ function createContribution(
     storage: MemoryStorage;
     milestones: RideStartupMilestone[];
     applicationState: FakeApplicationStateService;
-    hostedPlugins: FakeHostedPluginSupport;
+    hostedPlugins: FakeHostedPluginSupport | Promise<FakeHostedPluginSupport>;
     events: string[];
 } {
     const workspace = new FakeWorkspaceService({ resource: FileUri.create(workspacePath) });
@@ -285,7 +291,7 @@ function createContribution(
     const shell = new FakeShell();
     const native = new FakeNativeChrome(() => events.push('listen'));
     const milestones: RideStartupMilestone[] = [];
-    const contribution = new RideOpenRequestContribution(
+    const contribution = new TestRideOpenRequestContribution(
         workspace as never,
         openers,
         messages as never,
@@ -1458,6 +1464,21 @@ test('plugin lifecycle reports once and stops after contribution disposal', asyn
     await flushLifecycle();
     assert.deepEqual(once.milestones.filter(milestone => milestone === 'plugins_started'), ['plugins_started']);
     assert.deepEqual(once.milestones.filter(milestone => milestone === 'plugins_ready'), ['plugins_ready']);
+});
+
+test('deferred hosted plugin resolution rejection is consumed after disposal', async () => {
+    const hostedPlugins = deferred<FakeHostedPluginSupport>();
+    const context = createContribution(
+        '/project', new MemoryStorage(), () => undefined, async () => undefined,
+        new FakeApplicationStateService(), hostedPlugins.promise
+    );
+
+    context.contribution.dispose();
+    hostedPlugins.reject(new Error('hosted plugin resolution failed'));
+
+    await context.contribution.settlePluginObservations();
+    await flushLifecycle();
+    assert.deepEqual(context.milestones, []);
 });
 
 test('startup reporting failures do not prevent lifecycle registration or opening', async () => {
