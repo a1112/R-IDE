@@ -12,6 +12,7 @@
         "src/browser/ride-open-request-bindings.ts",
         "src/browser/ride-native-chrome.ts",
         "src/browser/ride-performance.ts",
+        "src/browser/ride-performance-contribution.ts",
         "test/**/*.ts"
     ]
 }

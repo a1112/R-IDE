@@ -7,6 +7,11 @@ description = "Allows the R-IDE frontend to finish native window initialization.
 commands.allow = ["ride_frontend_ready"]
 
 [[permission]]
+identifier = "allow-ride-performance-snapshot"
+description = "Allows the R-IDE frontend to request one native process-tree performance snapshot."
+commands.allow = ["ride_performance_snapshot"]
+
+[[permission]]
 identifier = "allow-ride-plugin-directories"
 description = "Allows the R-IDE frontend to request native-resolved plugin directories."
 commands.allow = ["ride_plugin_directories"]

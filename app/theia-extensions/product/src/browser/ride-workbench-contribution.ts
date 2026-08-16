@@ -256,7 +256,9 @@ export class RideWorkbenchContribution implements FrontendApplicationContributio
             button.addEventListener('click', event => {
                 event.preventDefault();
                 event.stopPropagation();
-                void this.nativeChrome.runWindowAction(action);
+                this.nativeChrome.runWindowAction(action).catch(error => {
+                    console.warn(`[R-IDE] Window action failed: ${action}`, error);
+                });
             });
             controls.appendChild(button);
         }

@@ -25,6 +25,8 @@ import { TheiaIDEAboutDialog } from './theia-ide-about-dialog';
 import { TheiaIDEContribution } from './theia-ide-contribution';
 import { bindRideOpenRequestContribution } from './ride-open-request-bindings';
 import { RideWorkbenchContribution } from './ride-workbench-contribution';
+import { RideNativeChrome } from './ride-native-chrome';
+import { RidePerformanceContribution } from './ride-performance-contribution';
 
 export default new ContainerModule((bind, _unbind, isBound, rebind) => {
     applyBranding();
@@ -43,6 +45,10 @@ export default new ContainerModule((bind, _unbind, isBound, rebind) => {
     bind(RideWorkbenchContribution).toSelf().inSingletonScope();
     bind(FrontendApplicationContribution).toService(RideWorkbenchContribution);
     bind(CommandContribution).toService(RideWorkbenchContribution);
+
+    bind(RideNativeChrome).toSelf().inSingletonScope();
+    bind(RidePerformanceContribution).toSelf().inSingletonScope();
+    bind(FrontendApplicationContribution).toService(RidePerformanceContribution);
 
     bindRideOpenRequestContribution(bind, {
         applicationShell: ApplicationShell,

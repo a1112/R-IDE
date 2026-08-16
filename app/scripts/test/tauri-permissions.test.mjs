@@ -49,6 +49,7 @@ test('remote Tauri frontend receives only audited per-command permissions', asyn
   const commands = [...new Set(sources.flatMap(invokedCommands))].sort();
   assert.deepEqual(commands, [
     'ride_frontend_ready',
+    'ride_performance_snapshot',
     'ride_plugin_directories',
     'ride_record_startup_milestone',
     'ride_show_main_menu',
