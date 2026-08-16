@@ -142,10 +142,33 @@ function patchBuiltFilesForLeanTauri() {
     }
 }
 
+function patchBuiltParcelWatcherLoad() {
+    const backendBundle = path.join(__dirname, 'lib', 'backend', 'main.js');
+    if (!fs.existsSync(backendBundle)) {
+        return;
+    }
+
+    const source = fs.readFileSync(backendBundle, 'utf8');
+    const nativeWatcherPathExport = /(\b[\w$]+\.exports)\s*=\s*(["'])\.\/native\/watcher\.node\2/g;
+    const patched = source.replace(
+        nativeWatcherPathExport,
+        '$1=require("./native/watcher.node")'
+    );
+
+    if (patched === source && source.includes('./native/watcher.node')
+        && !source.includes('require("./native/watcher.node")')) {
+        throw new Error('Unable to patch the Parcel watcher native module loader.');
+    }
+    if (patched !== source) {
+        fs.writeFileSync(backendBundle, patched);
+    }
+}
+
 patchGeneratedFilesForLeanTauri();
 
 // Prevent Inversify service identifiers from being split across duplicate
 // @theia package copies in the mixed-version workspace.
+browserOptions.plugins.push(createTheiaModuleDedupePlugin(__dirname));
 nodeOptions.plugins.push(createTheiaModuleDedupePlugin(__dirname));
 
 // serve favicon from root and inject link tag into index.html
@@ -188,6 +211,7 @@ if (watch) {
         await browserContext.dispose();
         await nodeContext.rebuild();
         await nodeContext.dispose();
+        patchBuiltParcelWatcherLoad();
         patchBuiltFilesForLeanTauri();
     } catch {
         process.exit(1);
