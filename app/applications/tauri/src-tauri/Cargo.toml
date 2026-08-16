@@ -24,6 +24,7 @@ libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "stream"] }
 futures-util = "0.3"
 sha2 = "0.10"
+sysinfo = { version = "0.38.4", default-features = false, features = ["system"] }
 zip = { version = "0.6.6", default-features = false, features = ["deflate"] }
 tar = "0.4"
 flate2 = "1.1"

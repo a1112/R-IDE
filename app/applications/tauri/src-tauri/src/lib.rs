@@ -13,6 +13,7 @@ pub mod commands;
 pub mod download;
 pub mod launch_intent;
 pub mod native_chrome;
+pub mod performance;
 pub mod sidecar;
 pub mod startup;
 mod startup_job;
