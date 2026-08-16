@@ -11,11 +11,16 @@ import { FrontendApplicationContribution } from '@theia/core/lib/browser/fronten
 import { FrontendApplicationStateService } from '@theia/core/lib/browser/frontend-application-state';
 import { StatusBar, StatusBarAlignment } from '@theia/core/lib/browser/status-bar/status-bar-types';
 import { Disposable } from '@theia/core/lib/common/disposable';
-import { inject, injectable } from '@theia/core/shared/inversify';
+import { inject, injectable, interfaces } from '@theia/core/shared/inversify';
 import { getStoredRideLanguage, RideLanguage, RideNativeChrome } from './ride-native-chrome';
 import { PerformanceViewState, RidePerformancePoller } from './ride-performance';
 
 const RIDE_PERFORMANCE_STATUS_BAR_ID = 'ride-performance';
+
+export function bindRidePerformanceContribution(bind: interfaces.Bind): void {
+    bind(RidePerformanceContribution).toSelf().inSingletonScope();
+    bind(FrontendApplicationContribution).toService(RidePerformanceContribution);
+}
 
 @injectable()
 export class RidePerformanceContribution implements FrontendApplicationContribution, Disposable {
