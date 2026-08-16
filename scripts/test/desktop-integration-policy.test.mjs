@@ -179,6 +179,16 @@ test('the main Tauri window suspends background throttling', () => {
   assert.equal(mainWindow.backgroundThrottling, 'suspend');
 });
 
+test('the main Tauri window uses custom borderless chrome while remaining resizable', () => {
+  const mainWindow = config.app.windows.find(({ label }) => label === 'main');
+
+  assert.ok(mainWindow, 'expected a main Tauri window');
+  assert.equal(mainWindow.decorations, false);
+  assert.equal(mainWindow.resizable, true);
+  assert.equal(mainWindow.minWidth, 1024);
+  assert.equal(mainWindow.minHeight, 768);
+});
+
 function readRequiredText(filePath, description) {
   assert.ok(fs.existsSync(filePath), `expected ${description} at ${filePath}`);
   return fs.readFileSync(filePath, 'utf8');
