@@ -30,7 +30,7 @@ export interface PerformanceViewState {
 
 export interface RidePerformancePollerOptions {
     fetchSnapshot: () => Promise<RidePerformanceSnapshot>;
-    onUpdate: (state: PerformanceViewState) => void;
+    onUpdate: (state: PerformanceViewState) => void | Promise<void>;
     setInterval: (handler: () => void, delay: number) => unknown;
     clearInterval: (handle: unknown) => void;
     locale?: string;
@@ -46,7 +46,7 @@ function formatUnitValue(value: number): string {
 
 export function formatBytes(bytes: number): string {
     const normalizedBytes = Number.isFinite(bytes) ? Math.max(0, bytes) : 0;
-    const units = ['B', 'KB', 'MB', 'GB'];
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
     let value = normalizedBytes;
     let unitIndex = 0;
 
@@ -58,7 +58,13 @@ export function formatBytes(bytes: number): string {
     if (unitIndex === 0) {
         return `${Math.round(value)} ${units[unitIndex]}`;
     }
-    return `${formatUnitValue(value)} ${units[unitIndex]}`;
+    let formattedValue = formatUnitValue(value);
+    if (Number(formattedValue) >= 1_024 && unitIndex < units.length - 1) {
+        value = Number(formattedValue) / 1_024;
+        unitIndex++;
+        formattedValue = formatUnitValue(value);
+    }
+    return `${formattedValue} ${units[unitIndex]}`;
 }
 
 function formatCpu(cpuPercent: number): string {
@@ -124,6 +130,7 @@ export class RidePerformancePoller {
     protected requestInFlight = false;
     protected consecutiveFailures = 0;
     protected lastSuccessfulView: PerformanceViewState | undefined;
+    protected unavailablePublished = false;
 
     constructor(protected readonly options: RidePerformancePollerOptions) {
         this.locale = options.locale ?? 'en';
@@ -135,9 +142,9 @@ export class RidePerformancePoller {
         }
         this.started = true;
         this.intervalHandle = this.options.setInterval(() => {
-            void this.refresh();
+            this.refresh().catch(() => undefined);
         }, PERFORMANCE_POLL_INTERVAL_MS);
-        void this.refresh();
+        this.refresh().catch(() => undefined);
     }
 
     dispose(): void {
@@ -156,26 +163,47 @@ export class RidePerformancePoller {
         }
         this.requestInFlight = true;
         try {
-            const snapshot = await this.options.fetchSnapshot();
+            let snapshot: RidePerformanceSnapshot;
+            try {
+                snapshot = await this.options.fetchSnapshot();
+            } catch {
+                await this.handleFetchFailure();
+                return;
+            }
+
             if (this.disposed) {
                 return;
             }
             const view = formatPerformanceSnapshot(snapshot, this.locale);
             this.consecutiveFailures = 0;
             this.lastSuccessfulView = view;
-            this.options.onUpdate(view);
-        } catch {
-            if (this.disposed) {
-                return;
-            }
-            this.consecutiveFailures++;
-            if (this.consecutiveFailures >= FAILURE_THRESHOLD) {
-                this.options.onUpdate(unavailableView(this.locale));
-            } else if (this.lastSuccessfulView) {
-                this.options.onUpdate(this.lastSuccessfulView);
-            }
+            this.unavailablePublished = false;
+            await this.publish(view);
         } finally {
             this.requestInFlight = false;
+        }
+    }
+
+    protected async handleFetchFailure(): Promise<void> {
+        if (this.disposed) {
+            return;
+        }
+        this.consecutiveFailures++;
+        if (this.consecutiveFailures >= FAILURE_THRESHOLD) {
+            if (!this.unavailablePublished) {
+                this.unavailablePublished = true;
+                await this.publish(unavailableView(this.locale));
+            }
+        } else if (this.lastSuccessfulView) {
+            await this.publish(this.lastSuccessfulView);
+        }
+    }
+
+    protected async publish(view: PerformanceViewState): Promise<void> {
+        try {
+            await this.options.onUpdate(view);
+        } catch {
+            // A rendering failure must not be treated as a performance sampling failure.
         }
     }
 }

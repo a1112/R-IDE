@@ -51,8 +51,7 @@ function deferred<T>(): Deferred<T> {
 }
 
 async function flushPromises(): Promise<void> {
-    await Promise.resolve();
-    await Promise.resolve();
+    await new Promise<void>(resolve => setImmediate(resolve));
 }
 
 class FakeIntervals {
@@ -88,7 +87,9 @@ function createPoller(
     return {
         poller: new RidePerformancePoller({
             fetchSnapshot,
-            onUpdate: state => updates.push(state),
+            onUpdate: state => {
+                updates.push(state);
+            },
             setInterval: intervals.set,
             clearInterval: intervals.clear,
             locale
@@ -124,6 +125,13 @@ test('formats binary byte units through gigabytes', () => {
     assert.equal(formatBytes(1_536), '1.5 KB');
     assert.equal(formatBytes(10 * 1_024 * 1_024), '10 MB');
     assert.equal(formatBytes(1.5 * 1_024 * 1_024 * 1_024), '1.5 GB');
+});
+
+test('promotes rounded unit boundaries and formats terabytes', () => {
+    assert.equal(formatBytes(1_024 ** 2 - 1), '1 MB');
+    assert.equal(formatBytes(1_024 ** 3 - 1), '1 GB');
+    assert.equal(formatBytes(1_024 ** 4), '1 TB');
+    assert.equal(formatBytes(1.5 * 1_024 ** 4), '1.5 TB');
 });
 
 test('formats English labels and process-count grammar', () => {
@@ -225,6 +233,103 @@ test('retains the latest value for two failures and publishes unavailable on the
     ]);
     assert.equal(updates[updates.length - 1]?.available, false);
     assert.equal(updates[updates.length - 1]?.tooltip, 'R-IDE 性能数据暂不可用');
+});
+
+test('does not repeatedly publish unavailable after the third failure', async () => {
+    const updates: PerformanceViewState[] = [];
+    const context = createPoller(async () => {
+        throw new Error('unavailable');
+    }, updates);
+
+    context.poller.start();
+    await flushPromises();
+    context.intervals.tick();
+    await flushPromises();
+    context.intervals.tick();
+    await flushPromises();
+    context.intervals.tick();
+    await flushPromises();
+    context.intervals.tick();
+    await flushPromises();
+
+    assert.equal(updates.length, 1);
+    assert.equal(updates[0].available, false);
+});
+
+test('a synchronous publication throw is called once and does not count as a fetch failure', async () => {
+    const fetchResults: Array<RidePerformanceSnapshot | Error> = [
+        snapshot({ total: usage(6, 6_144, 2) }),
+        new Error('first fetch failure'),
+        new Error('second fetch failure')
+    ];
+    const published: PerformanceViewState[] = [];
+    let publicationCalls = 0;
+    const intervals = new FakeIntervals();
+    const poller = new RidePerformancePoller({
+        fetchSnapshot: async () => {
+            const result = fetchResults.shift();
+            if (result instanceof Error) {
+                throw result;
+            }
+            assert.ok(result);
+            return result;
+        },
+        onUpdate: state => {
+            publicationCalls++;
+            if (publicationCalls === 1) {
+                throw new Error('status bar unavailable');
+            }
+            published.push(state);
+        },
+        setInterval: intervals.set,
+        clearInterval: intervals.clear,
+        locale: 'en'
+    });
+
+    poller.start();
+    await flushPromises();
+    intervals.tick();
+    await flushPromises();
+    intervals.tick();
+    await flushPromises();
+
+    assert.equal(publicationCalls, 3);
+    assert.deepEqual(published.map(state => state.available), [true, true]);
+});
+
+test('awaits and catches asynchronous publication rejection without a false fetch failure', async () => {
+    const publication = deferred<void>();
+    let fetchCalls = 0;
+    let publicationCalls = 0;
+    const intervals = new FakeIntervals();
+    const poller = new RidePerformancePoller({
+        fetchSnapshot: async () => {
+            fetchCalls++;
+            return snapshot({ total: usage(fetchCalls, 1_024, 1) });
+        },
+        onUpdate: async () => {
+            publicationCalls++;
+            if (publicationCalls === 1) {
+                await publication.promise;
+            }
+        },
+        setInterval: intervals.set,
+        clearInterval: intervals.clear,
+        locale: 'en'
+    });
+
+    poller.start();
+    await flushPromises();
+    intervals.tick();
+    assert.equal(fetchCalls, 1, 'publication remains part of the non-overlapping request');
+
+    publication.reject(new Error('async status bar unavailable'));
+    await flushPromises();
+    intervals.tick();
+    await flushPromises();
+
+    assert.equal(fetchCalls, 2);
+    assert.equal(publicationCalls, 2);
 });
 
 test('does not publish invented values before a third initial failure', async () => {
