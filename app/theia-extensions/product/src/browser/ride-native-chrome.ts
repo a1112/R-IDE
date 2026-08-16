@@ -27,7 +27,26 @@ interface NativeMenuPayload {
     command: string;
 }
 
-type RidePlatform = 'macos' | 'windows' | 'linux' | 'unknown';
+export type RidePlatform = 'macos' | 'windows' | 'linux' | 'unknown';
+export type RideWindowControlAction = 'close' | 'minimize' | 'toggleMaximize';
+
+export interface RideWindowControlLayout {
+    placement: 'left' | 'right';
+    actions: RideWindowControlAction[];
+}
+
+export function getRideWindowControls(platform: RidePlatform): RideWindowControlLayout {
+    if (platform === 'macos') {
+        return {
+            placement: 'left',
+            actions: ['close', 'minimize', 'toggleMaximize']
+        };
+    }
+    return {
+        placement: 'right',
+        actions: ['minimize', 'toggleMaximize', 'close']
+    };
+}
 type RideOpenRequestListener = (
     event: string,
     handler: (event: { payload: RideOpenRequest }) => void
@@ -60,6 +79,7 @@ export const RIDE_TEXT = {
         askAssistant: 'Ask R-IDE Assistant...',
         bottomPanel: 'Bottom Panel',
         cacheSuggestion: 'Use caching to reduce database queries',
+        close: 'Close',
         closeAllEditors: 'Close All Editors',
         closeEditor: 'Close Editor',
         commandPalette: 'Command Palette...',
@@ -131,6 +151,7 @@ export const RIDE_TEXT = {
         askAssistant: '询问 R-IDE Assistant...',
         bottomPanel: '底部栏',
         cacheSuggestion: '使用缓存减少数据库查询',
+        close: '关闭',
         closeAllEditors: '关闭所有编辑器',
         closeEditor: '关闭编辑器',
         commandPalette: '命令面板...',
