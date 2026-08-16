@@ -66,7 +66,7 @@ Also cover a missing parent, a process that exits between refresh and lookup, an
 
 **Step 3: Run tests to verify they fail**
 
-Run: `cargo test --manifest-path app/applications/tauri/src-tauri/Cargo.toml performance::tests`
+Run: `npm --prefix app run test:tauri-rust -- performance::tests`
 
 Expected: FAIL because `ProcessSample`, `aggregate_snapshot`, or result types are not defined.
 
@@ -99,7 +99,7 @@ Implement descendant discovery using a parent-to-children map. Classify the root
 
 **Step 5: Run the native unit tests**
 
-Run: `cargo test --manifest-path app/applications/tauri/src-tauri/Cargo.toml performance::tests`
+Run: `npm --prefix app run test:tauri-rust -- performance::tests`
 
 Expected: all performance aggregation tests PASS.
 
@@ -130,7 +130,7 @@ Use a `ProcessSource` trait in tests rather than starting real child processes.
 
 **Step 2: Run tests to verify they fail**
 
-Run: `cargo test --manifest-path app/applications/tauri/src-tauri/Cargo.toml performance::tests`
+Run: `npm --prefix app run test:tauri-rust -- performance::tests`
 
 Expected: FAIL because the sampler and source abstraction do not exist.
 
@@ -179,7 +179,7 @@ Register it in `tauri::generate_handler!`.
 
 Run: `cargo fmt --manifest-path app/applications/tauri/src-tauri/Cargo.toml --check`
 
-Run: `cargo test --manifest-path app/applications/tauri/src-tauri/Cargo.toml`
+Run: `npm --prefix app run test:tauri-rust`
 
 Run: `cargo clippy --manifest-path app/applications/tauri/src-tauri/Cargo.toml --all-targets --no-deps -- -D warnings`
 
@@ -347,7 +347,7 @@ Capture stdout/stderr, wait for `Frontend ready`, and inspect the actual R-IDE w
 
 Run: `npm --workspace theia-extensions/product test`
 
-Run: `cargo test --manifest-path app/applications/tauri/src-tauri/Cargo.toml`
+Run: `npm --prefix app run test:tauri-rust`
 
 Run: `cargo clippy --manifest-path app/applications/tauri/src-tauri/Cargo.toml --all-targets --no-deps -- -D warnings`
 

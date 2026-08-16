@@ -56,6 +56,7 @@
     "test:sync": "node --test ../scripts/test/upstream-sync/*.test.mjs",
     "check:sync": "node ../scripts/sync-upstream.mjs check",
     "check:rust": "node scripts/check-rust.js",
+    "test:tauri-rust": "node scripts/run-tauri-tests.js",
     "measure:tauri-startup": "node scripts/measure-tauri-startup.mjs",
     "electron": "yarn --cwd applications/electron",
     "electron-next": "yarn --cwd applications/electron-next",

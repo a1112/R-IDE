@@ -449,6 +449,26 @@ fn node_runtime_path(path: &Path) -> PathBuf {
     // prefix. Node 24 treats a `\\?\C:\...` entry script as `C:` and exits
     // before loading JavaScript, so keep verbatim paths inside Rust and
     // simplify only values that cross into the Node process.
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+
+        let mut components = path.components();
+        if let Some(Component::Prefix(prefix)) = components.next() {
+            if let Prefix::VerbatimUNC(server, share) = prefix.kind() {
+                let mut simplified = PathBuf::from(r"\\");
+                simplified.push(server);
+                simplified.push(share);
+                for component in components {
+                    if !matches!(component, Component::RootDir) {
+                        simplified.push(component.as_os_str());
+                    }
+                }
+                return simplified;
+            }
+        }
+    }
+
     dunce::simplified(path).to_path_buf()
 }
 
