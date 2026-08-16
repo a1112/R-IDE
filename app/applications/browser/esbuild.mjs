@@ -7,6 +7,7 @@ import { nodeOptions } from './gen-esbuild.node.mjs';
 import { copy } from 'esbuild-plugin-copy';
 import fs from 'node:fs';
 import path from 'node:path';
+import { createTheiaModuleDedupePlugin } from './ride-esbuild-dedupe.mjs';
 
 import esbuild from 'esbuild';
 
@@ -142,6 +143,10 @@ function patchBuiltFilesForLeanTauri() {
 }
 
 patchGeneratedFilesForLeanTauri();
+
+// Prevent Inversify service identifiers from being split across duplicate
+// @theia package copies in the mixed-version workspace.
+nodeOptions.plugins.push(createTheiaModuleDedupePlugin(__dirname));
 
 // serve favicon from root and inject link tag into index.html
 browserOptions.plugins.push(
