@@ -53,6 +53,7 @@ pub struct AppState {
     pub backend_stop_fallback: Mutex<Option<(u32, tokio::sync::mpsc::UnboundedSender<()>)>>,
     pub downloads: download::DownloadManager,
     pub launch_intent_router: launch_intent::LaunchIntentRouter,
+    pub performance: performance::PerformanceSampler,
     pub startup_metrics: startup_metrics::StartupMetrics,
     pub runtime_paths: startup::RuntimePathsCache,
 }
@@ -71,10 +72,25 @@ impl AppState {
                 MAX_PENDING_LAUNCH_INTENTS,
                 initial_launch_intent,
             ),
+            performance: performance::PerformanceSampler::default(),
             startup_metrics,
             runtime_paths: startup::RuntimePathsCache::default(),
         }
     }
+}
+
+fn performance_snapshot_for_current_process<F>(
+    backend_ownership: &Mutex<startup::BackendOwnershipState>,
+    sample: F,
+) -> Result<performance::PerformanceSnapshot, String>
+where
+    F: FnOnce(u32, Option<u32>) -> Result<performance::PerformanceSnapshot, String>,
+{
+    let backend_pid = backend_ownership
+        .lock()
+        .map_err(|_| "backend ownership mutex is poisoned".to_string())?
+        .pid();
+    sample(std::process::id(), backend_pid)
 }
 
 /// Registers the activation plugin first, then injects its state before the
@@ -255,6 +271,7 @@ pub fn run() {
             native_chrome::ride_window_control,
             native_chrome::ride_frontend_ready,
             native_chrome::ride_record_startup_milestone,
+            performance::ride_performance_snapshot,
             commands::open_directory,
             commands::save_file,
             commands::show_in_folder,
@@ -355,6 +372,8 @@ mod tests {
         )
         .build();
 
+        let _performance_sampler: &performance::PerformanceSampler = &app.performance;
+
         assert_eq!(
             *setup_next_id.lock().expect("setup observation mutex"),
             Some(2)
@@ -374,5 +393,54 @@ mod tests {
         fn elapsed_ms(&self) -> u64 {
             0
         }
+    }
+
+    #[test]
+    fn performance_snapshot_forwards_current_root_and_owned_backend_pid_after_unlocking() {
+        let mut backend = startup::BackendOwnershipState::default();
+        let token = backend.reserve_start();
+        assert!(backend.register_spawn(token, 4242));
+        let backend_ownership = Mutex::new(backend);
+        let observed = Arc::new(Mutex::new(None));
+        let observed_by_sampler = Arc::clone(&observed);
+
+        performance_snapshot_for_current_process(&backend_ownership, |root_pid, backend_pid| {
+            assert!(backend_ownership.try_lock().is_ok());
+            *observed_by_sampler.lock().expect("observation mutex") = Some((root_pid, backend_pid));
+            Ok(performance::PerformanceSnapshot {
+                sampled_at_ms: 0,
+                total: performance::UsageGroup::default(),
+                main: performance::UsageGroup::default(),
+                backend: performance::UsageGroup::default(),
+                plugin_host: performance::UsageGroup::default(),
+                other: performance::UsageGroup::default(),
+            })
+        })
+        .expect("performance snapshot");
+
+        assert_eq!(
+            *observed.lock().expect("observation mutex"),
+            Some((std::process::id(), Some(4242)))
+        );
+    }
+
+    #[test]
+    fn poisoned_backend_ownership_mutex_returns_a_clear_error() {
+        let backend_ownership = Arc::new(Mutex::new(startup::BackendOwnershipState::default()));
+        let backend_for_poisoning = Arc::clone(&backend_ownership);
+        let _ = std::thread::spawn(move || {
+            let _guard = backend_for_poisoning
+                .lock()
+                .expect("backend ownership mutex");
+            panic!("poison backend ownership mutex");
+        })
+        .join();
+
+        let error = performance_snapshot_for_current_process(&backend_ownership, |_, _| {
+            panic!("sampler must not run when backend ownership is poisoned")
+        })
+        .expect_err("poisoned backend ownership must fail");
+
+        assert_eq!(error, "backend ownership mutex is poisoned");
     }
 }

@@ -9,6 +9,9 @@
 
 use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
+use sysinfo::{CpuRefreshKind, Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 #[derive(Clone, Debug, Default, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -38,6 +41,125 @@ struct ProcessSample {
     executable: String,
     name: String,
     command_line: String,
+}
+
+trait ProcessSource {
+    fn refresh(&mut self) -> Result<(), String>;
+    fn process_ids(&self) -> Vec<u32>;
+    fn process_sample(&self, pid: u32) -> Option<ProcessSample>;
+    fn logical_cpu_count(&self) -> usize;
+    fn sampled_at_ms(&self) -> Result<u64, String>;
+}
+
+impl ProcessSource for System {
+    fn refresh(&mut self) -> Result<(), String> {
+        self.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing()
+                .with_cpu()
+                .with_memory()
+                .with_cmd(UpdateKind::OnlyIfNotSet)
+                .with_exe(UpdateKind::OnlyIfNotSet)
+                .without_tasks(),
+        );
+        Ok(())
+    }
+
+    fn process_ids(&self) -> Vec<u32> {
+        self.processes().keys().map(|pid| pid.as_u32()).collect()
+    }
+
+    fn process_sample(&self, pid: u32) -> Option<ProcessSample> {
+        let process = self.process(Pid::from_u32(pid))?;
+        Some(ProcessSample {
+            pid: process.pid().as_u32(),
+            parent_pid: process.parent().map(Pid::as_u32),
+            cpu_percent: process.cpu_usage(),
+            memory_bytes: process.memory(),
+            executable: process
+                .exe()
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            name: process.name().to_string_lossy().into_owned(),
+            command_line: process
+                .cmd()
+                .iter()
+                .map(|part| part.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(" "),
+        })
+    }
+
+    fn logical_cpu_count(&self) -> usize {
+        self.cpus().len()
+    }
+
+    fn sampled_at_ms(&self) -> Result<u64, String> {
+        let duration = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| format!("system clock is before UNIX epoch: {error}"))?;
+        Ok(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+    }
+}
+
+pub struct PerformanceSampler {
+    system: Mutex<System>,
+}
+
+impl Default for PerformanceSampler {
+    fn default() -> Self {
+        let mut system = System::new();
+        system.refresh_cpu_list(CpuRefreshKind::nothing());
+        Self {
+            system: Mutex::new(system),
+        }
+    }
+}
+
+impl PerformanceSampler {
+    pub fn snapshot(
+        &self,
+        root_pid: u32,
+        backend_pid: Option<u32>,
+    ) -> Result<PerformanceSnapshot, String> {
+        snapshot_from_source(&self.system, root_pid, backend_pid)
+    }
+}
+
+#[tauri::command]
+pub fn ride_performance_snapshot(
+    state: tauri::State<'_, crate::AppState>,
+) -> Result<PerformanceSnapshot, String> {
+    crate::performance_snapshot_for_current_process(
+        &state.backend_ownership,
+        |root_pid, backend_pid| state.performance.snapshot(root_pid, backend_pid),
+    )
+}
+
+fn snapshot_from_source<S: ProcessSource>(
+    source: &Mutex<S>,
+    root_pid: u32,
+    backend_pid: Option<u32>,
+) -> Result<PerformanceSnapshot, String> {
+    let mut source = source
+        .lock()
+        .map_err(|_| "performance sampler mutex is poisoned".to_string())?;
+    source.refresh()?;
+    let samples = source
+        .process_ids()
+        .into_iter()
+        .filter_map(|pid| source.process_sample(pid))
+        .collect::<Vec<_>>();
+    let logical_cpu_count = source.logical_cpu_count().max(1);
+    let sampled_at_ms = source.sampled_at_ms()?;
+    Ok(aggregate_snapshot(
+        &samples,
+        root_pid,
+        backend_pid,
+        logical_cpu_count,
+        sampled_at_ms,
+    ))
 }
 
 fn aggregate_snapshot(
@@ -148,6 +270,8 @@ fn is_plugin_host(sample: &ProcessSample) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     fn sample(
         pid: u32,
@@ -165,6 +289,104 @@ mod tests {
             name: identity.to_string(),
             command_line: identity.to_string(),
         }
+    }
+
+    struct StatefulProcessSource {
+        refresh_count: Arc<AtomicUsize>,
+    }
+
+    impl ProcessSource for StatefulProcessSource {
+        fn refresh(&mut self) -> Result<(), String> {
+            self.refresh_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn process_ids(&self) -> Vec<u32> {
+            vec![10, 99]
+        }
+
+        fn process_sample(&self, pid: u32) -> Option<ProcessSample> {
+            (pid == 10).then(|| {
+                sample(
+                    10,
+                    None,
+                    self.refresh_count.load(Ordering::SeqCst) as f32 * 10.0,
+                    10,
+                    "ride-tauri",
+                )
+            })
+        }
+
+        fn logical_cpu_count(&self) -> usize {
+            1
+        }
+
+        fn sampled_at_ms(&self) -> Result<u64, String> {
+            Ok(self.refresh_count.load(Ordering::SeqCst) as u64)
+        }
+    }
+
+    #[test]
+    fn repeated_samples_reuse_the_same_process_source_state() {
+        let refresh_count = Arc::new(AtomicUsize::new(0));
+        let source = Mutex::new(StatefulProcessSource {
+            refresh_count: Arc::clone(&refresh_count),
+        });
+
+        let first = snapshot_from_source(&source, 10, None).expect("first snapshot");
+        let second = snapshot_from_source(&source, 10, None).expect("second snapshot");
+
+        assert_eq!(refresh_count.load(Ordering::SeqCst), 2);
+        assert_eq!(first.total.cpu_percent, 10.0);
+        assert_eq!(second.total.cpu_percent, 20.0);
+    }
+
+    #[test]
+    fn ignores_processes_that_terminate_between_refresh_and_collection() {
+        let source = Mutex::new(StatefulProcessSource {
+            refresh_count: Arc::new(AtomicUsize::new(0)),
+        });
+
+        let snapshot = snapshot_from_source(&source, 10, None).expect("snapshot");
+
+        assert_eq!(snapshot.total.process_count, 1);
+        assert_eq!(snapshot.total.memory_bytes, 10);
+    }
+
+    #[test]
+    fn default_sampler_collects_the_current_process_with_an_epoch_timestamp() {
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after UNIX epoch")
+            .as_millis() as u64;
+        let sampler = PerformanceSampler::default();
+
+        let snapshot = sampler
+            .snapshot(std::process::id(), None)
+            .expect("sysinfo snapshot");
+
+        let after = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after UNIX epoch")
+            .as_millis() as u64;
+        assert!((before..=after).contains(&snapshot.sampled_at_ms));
+        assert_eq!(snapshot.main.process_count, 1);
+        assert!(snapshot.total.process_count >= 1);
+    }
+
+    #[test]
+    fn poisoned_sampler_mutex_returns_a_clear_error() {
+        let sampler = PerformanceSampler::default();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = sampler.system.lock().expect("sampler mutex");
+            panic!("poison sampler mutex");
+        }));
+
+        let error = sampler
+            .snapshot(std::process::id(), None)
+            .expect_err("poisoned sampler must fail");
+
+        assert_eq!(error, "performance sampler mutex is poisoned");
     }
 
     #[test]
