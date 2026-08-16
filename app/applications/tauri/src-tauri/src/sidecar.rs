@@ -421,16 +421,35 @@ fn backend_use_watcher_process() -> bool {
 }
 
 fn backend_child_path() -> String {
-    let mut paths = std::env::var("PATH").unwrap_or_default();
-    for required in ["/usr/bin", "/bin", "/usr/sbin", "/sbin"] {
-        if !paths.split(':').any(|entry| entry == required) {
-            if !paths.is_empty() {
-                paths.push(':');
-            }
-            paths.push_str(required);
-        }
+    backend_child_path_from(std::env::var("PATH").unwrap_or_default())
+}
+
+fn backend_child_path_from(paths: String) -> String {
+    #[cfg(windows)]
+    {
+        paths
     }
-    paths
+    #[cfg(not(windows))]
+    {
+        let mut paths = paths;
+        for required in ["/usr/bin", "/bin", "/usr/sbin", "/sbin"] {
+            if !paths.split(':').any(|entry| entry == required) {
+                if !paths.is_empty() {
+                    paths.push(':');
+                }
+                paths.push_str(required);
+            }
+        }
+        paths
+    }
+}
+
+fn node_runtime_path(path: &Path) -> PathBuf {
+    // Tauri canonicalizes packaged resource paths with Windows' verbatim
+    // prefix. Node 24 treats a `\\?\C:\...` entry script as `C:` and exits
+    // before loading JavaScript, so keep verbatim paths inside Rust and
+    // simplify only values that cross into the Node process.
+    dunce::simplified(path).to_path_buf()
 }
 
 fn ensure_backend_port_available(port: u16) -> Result<(), String> {
@@ -655,6 +674,9 @@ async fn start_node_backend_process(
     backend_start: BackendStartToken,
 ) -> Result<(), String> {
     ensure_backend_port_available(BACKEND_PORT)?;
+    let script_path = node_runtime_path(&config.script_path);
+    let config_dir = node_runtime_path(&config_dir);
+    let frontend_dir = frontend_dir.map(|path| node_runtime_path(&path));
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
@@ -666,11 +688,11 @@ async fn start_node_backend_process(
         .map_err(|e| format!("Failed to create backend PTY: {}", e))?;
 
     let mut command = CommandBuilder::new(&config.node_exe);
-    command.arg(&config.script_path);
+    command.arg(&script_path);
     command.arg("--log-level=info");
     command.arg(format!("--port={BACKEND_PORT}"));
     command.arg("--hostname=127.0.0.1");
-    if let Some(backend_dir) = config.script_path.parent() {
+    if let Some(backend_dir) = script_path.parent() {
         command.cwd(backend_dir);
     }
     if !backend_use_watcher_process() {
@@ -1101,16 +1123,19 @@ async fn start_backend_direct_process(
     backend_start: BackendStartToken,
 ) -> Result<(), String> {
     ensure_backend_port_available(BACKEND_PORT)?;
+    let script_path = node_runtime_path(&config.script_path);
+    let config_dir = node_runtime_path(&config_dir);
+    let frontend_dir = frontend_dir.map(|path| node_runtime_path(&path));
     let mut command = Command::new(&config.node_exe);
     if config.use_node {
-        command.arg(&config.script_path);
+        command.arg(&script_path);
     }
     command
         .arg("--log-level=info")
         .arg(format!("--port={BACKEND_PORT}"))
         .arg("--hostname=127.0.0.1");
     if config.use_node {
-        if let Some(backend_dir) = config.script_path.parent() {
+        if let Some(backend_dir) = script_path.parent() {
             command.current_dir(backend_dir);
         }
         if !backend_use_watcher_process() {
@@ -1754,6 +1779,31 @@ mod tests {
             "Theia app listening on http://127.0.0.1:3999.",
             3000
         ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_backend_child_path_preserves_the_windows_path_list() {
+        let path = r"C:\Program Files\Git\cmd;D:\Tools\bin";
+
+        assert_eq!(super::backend_child_path_from(path.to_string()), path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_node_runtime_path_removes_verbatim_prefixes() {
+        assert_eq!(
+            super::node_runtime_path(&PathBuf::from(
+                r"\\?\C:\Program Files\R-IDE\resources\backend\main.js",
+            )),
+            PathBuf::from(r"C:\Program Files\R-IDE\resources\backend\main.js")
+        );
+        assert_eq!(
+            super::node_runtime_path(&PathBuf::from(
+                r"\\?\UNC\server\share\R-IDE\resources\backend\main.js",
+            )),
+            PathBuf::from(r"\\server\share\R-IDE\resources\backend\main.js")
+        );
     }
 
     #[cfg(windows)]

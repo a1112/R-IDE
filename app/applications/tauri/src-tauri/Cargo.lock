@@ -3147,6 +3147,7 @@ name = "ride-tauri"
 version = "1.72.100"
 dependencies = [
  "dirs 5.0.1",
+ "dunce",
  "env_logger",
  "flate2",
  "futures-util",
