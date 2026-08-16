@@ -11,6 +11,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { FrontendApplicationStateService } from '@theia/core/lib/browser/frontend-application-state';
 import { StatusBarAlignment, type StatusBar, type StatusBarEntry } from '@theia/core/lib/browser/status-bar/status-bar-types';
+import { MarkdownString } from '@theia/core/lib/common/markdown-rendering/markdown-string';
 import { RideNativeChrome } from '../src/browser/ride-native-chrome';
 import { RidePerformanceContribution } from '../src/browser/ride-performance-contribution';
 import type { RidePerformanceSnapshot } from '../src/browser/ride-performance';
@@ -130,24 +131,33 @@ test('waits for ready then publishes the exact right-aligned footer entry', asyn
 
     assert.deepEqual(commands, ['ride_performance_snapshot']);
     assert.equal(statusBar.setCalls.length, 1);
-    assert.deepEqual(statusBar.setCalls[0], {
+    const statusCall = statusBar.setCalls[0] as StatusBarCall;
+    const { tooltip, ...entryWithoutTooltip } = statusCall.entry;
+    assert.deepEqual({ id: statusCall.id, entry: entryWithoutTooltip }, {
         id: 'ride-performance',
         entry: {
             name: 'R-IDE Performance',
             text: '$(pulse) CPU 2.3%  Memory 684 MB',
-            tooltip: 'R-IDE Total  CPU 2.3%  Memory 684 MB  5 processes\n'
-                + 'Main  CPU 0.5%  Memory 100 B  1 process\n'
-                + 'Backend  CPU 0.8%  Memory 200 B  1 process\n'
-                + 'Plugin Host  CPU 0.6%  Memory 300 B  2 processes\n'
-                + 'Other  CPU 0.4%  Memory 84 B  1 process',
             alignment: StatusBarAlignment.RIGHT,
             priority: 5,
             accessibilityInformation: {
-                label: 'R-IDE Performance: CPU 2.3%, Memory 684 MB',
-                role: 'status'
+                label: 'R-IDE Performance: CPU 2.3%, Memory 684 MB'
             }
         }
     });
+    assert.ok(MarkdownString.is(tooltip));
+    assert.equal(tooltip.isTrusted, false);
+    assert.equal(tooltip.supportHtml, false);
+    const renderedLines = tooltip.value.split('\\\n').map(line =>
+        line.replace(/&nbsp;/g, ' ').replace(/\\-/g, '-')
+    );
+    assert.deepEqual(renderedLines, [
+        'R-IDE Total  CPU 2.3%  Memory 684 MB  5 processes',
+        'Main  CPU 0.5%  Memory 100 B  1 process',
+        'Backend  CPU 0.8%  Memory 200 B  1 process',
+        'Plugin Host  CPU 0.6%  Memory 300 B  2 processes',
+        'Other  CPU 0.4%  Memory 84 B  1 process'
+    ]);
 
     assert.deepEqual(statusBar.removed, ['ride-performance']);
 });

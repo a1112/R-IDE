@@ -12,7 +12,38 @@ const tauriDirectory = path.join(appDirectory, 'applications', 'tauri', 'src-tau
 const productDirectory = path.join(appDirectory, 'theia-extensions', 'product', 'src', 'browser');
 
 function invokedCommands(source) {
-  return [...source.matchAll(/\binvoke(?:<[^>]+>)?\s*\(\s*['"]([^'"]+)['"]/g)].map(match => match[1]);
+  const invokeNames = new Set(['invoke']);
+  const coreImportPattern = /import\s*{([^}]*)}\s*from\s*['"]@tauri-apps\/api\/core['"]/g;
+  for (const match of source.matchAll(coreImportPattern)) {
+    for (const specifier of match[1].split(',')) {
+      const invokeImport = /^\s*invoke(?:\s+as\s+([A-Za-z_$][\w$]*))?\s*$/.exec(specifier);
+      if (invokeImport) {
+        invokeNames.add(invokeImport[1] ?? 'invoke');
+      }
+    }
+  }
+
+  const commands = [];
+  for (const invokeName of invokeNames) {
+    const escapedName = invokeName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const callPattern = new RegExp(
+      `(?<![\\w$])${escapedName}(?:<[^>]+>)?\\s*\\(\\s*['"]([^'"]+)['"]`,
+      'g'
+    );
+    commands.push(...[...source.matchAll(callPattern)].map(match => match[1]));
+  }
+  return commands;
+}
+
+function auditedCommands(sources, expectedCommands) {
+  const commands = [...new Set(sources.flatMap(invokedCommands))].sort();
+  const expected = new Set(expectedCommands);
+  const unauthorized = commands.filter(command => !expected.has(command));
+  if (unauthorized.length > 0) {
+    throw new Error(`Unaudited Tauri commands: ${unauthorized.join(', ')}`);
+  }
+  assert.deepEqual(commands, expectedCommands);
+  return commands;
 }
 
 async function sourceFiles(directory) {
@@ -46,8 +77,7 @@ function parseCommandPermissions(source) {
 test('remote Tauri frontend receives only audited per-command permissions', async () => {
   const frontendSources = await sourceFiles(productDirectory);
   const sources = await Promise.all(frontendSources.map(source => readFile(source, 'utf8')));
-  const commands = [...new Set(sources.flatMap(invokedCommands))].sort();
-  assert.deepEqual(commands, [
+  const commands = auditedCommands(sources, [
     'ride_frontend_ready',
     'ride_performance_snapshot',
     'ride_plugin_directories',
@@ -89,4 +119,17 @@ test('remote Tauri frontend receives only audited per-command permissions', asyn
   const localBootstrap = bootstrapMatch[1];
   assert.deepEqual(invokedCommands(localBootstrap), []);
   assert.equal(/\blisten\(\s*['"]/.test(localBootstrap), false);
+});
+
+test('rejects unauthorized literal commands invoked through an imported alias', () => {
+  const aliasedInvokeFixture = `
+    import { invoke as hiddenInvoke, isTauri } from '@tauri-apps/api/core';
+    this.invoke('ride_frontend_ready');
+    hiddenInvoke('ride_unauthorized');
+  `;
+
+  assert.throws(
+    () => auditedCommands([aliasedInvokeFixture], ['ride_frontend_ready']),
+    /ride_unauthorized/
+  );
 });

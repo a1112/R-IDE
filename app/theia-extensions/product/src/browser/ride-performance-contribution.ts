@@ -11,6 +11,10 @@ import { FrontendApplicationContribution } from '@theia/core/lib/browser/fronten
 import { FrontendApplicationStateService } from '@theia/core/lib/browser/frontend-application-state';
 import { StatusBar, StatusBarAlignment } from '@theia/core/lib/browser/status-bar/status-bar-types';
 import { Disposable } from '@theia/core/lib/common/disposable';
+import {
+    MarkdownStringImpl,
+    MarkdownStringTextNewlineStyle
+} from '@theia/core/lib/common/markdown-rendering/markdown-string';
 import { inject, injectable, interfaces } from '@theia/core/shared/inversify';
 import { getStoredRideLanguage, RideLanguage, RideNativeChrome } from './ride-native-chrome';
 import { PerformanceViewState, RidePerformancePoller } from './ride-performance';
@@ -74,16 +78,20 @@ export class RidePerformanceContribution implements FrontendApplicationContribut
     protected async updateStatusBar(state: PerformanceViewState): Promise<void> {
         const name = this.locale === 'zh-cn' ? 'R-IDE 性能' : 'R-IDE Performance';
         const summary = state.text.replace(/^\$\(pulse\)\s*/, '').replace(/\s{2,}/g, ', ');
+        const tooltip = new MarkdownStringImpl('', {
+            isTrusted: false,
+            supportHtml: false,
+            supportThemeIcons: false
+        }).appendText(state.tooltip, MarkdownStringTextNewlineStyle.Break);
         this.statusBarTouched = true;
         await this.statusBar.setElement(RIDE_PERFORMANCE_STATUS_BAR_ID, {
             name,
             text: state.text,
-            tooltip: state.tooltip,
+            tooltip,
             alignment: StatusBarAlignment.RIGHT,
             priority: 5,
             accessibilityInformation: {
-                label: `${name}: ${summary}`,
-                role: 'status'
+                label: `${name}: ${summary}`
             }
         });
         if (this.disposed) {
