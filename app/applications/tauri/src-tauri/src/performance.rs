@@ -47,12 +47,20 @@ fn aggregate_snapshot(
     logical_cpu_count: usize,
     sampled_at_ms: u64,
 ) -> PerformanceSnapshot {
-    let samples_by_pid = samples
-        .iter()
-        .map(|sample| (sample.pid, sample))
-        .collect::<HashMap<_, _>>();
-    let mut children_by_parent = HashMap::<u32, Vec<u32>>::new();
+    let mut samples_by_pid = HashMap::new();
+    let mut duplicate_pids = HashSet::new();
     for sample in samples {
+        if duplicate_pids.contains(&sample.pid) {
+            continue;
+        }
+        if samples_by_pid.insert(sample.pid, sample).is_some() {
+            samples_by_pid.remove(&sample.pid);
+            duplicate_pids.insert(sample.pid);
+        }
+    }
+
+    let mut children_by_parent = HashMap::<u32, Vec<u32>>::new();
+    for sample in samples_by_pid.values() {
         if let Some(parent_pid) = sample.parent_pid {
             children_by_parent
                 .entry(parent_pid)
@@ -125,9 +133,16 @@ fn normalize_cpu(group: &mut UsageGroup, logical_cpu_count: usize) {
 }
 
 fn is_plugin_host(sample: &ProcessSample) -> bool {
-    sample.executable.contains("plugin-host")
-        || sample.name.contains("plugin-host")
-        || sample.command_line.contains("plugin-host")
+    const MARKER: &[u8] = b"plugin-host";
+    let contains_marker = |value: &str| {
+        value
+            .as_bytes()
+            .windows(MARKER.len())
+            .any(|window| window.eq_ignore_ascii_case(MARKER))
+    };
+    contains_marker(&sample.executable)
+        || contains_marker(&sample.name)
+        || contains_marker(&sample.command_line)
 }
 
 #[cfg(test)]
@@ -206,6 +221,28 @@ mod tests {
     }
 
     #[test]
+    fn classifies_plugin_hosts_with_ascii_case_insensitive_matching() {
+        let mut executable = sample(20, Some(10), 1.0, 20, "node");
+        executable.executable = "helpers/PLUGIN-HOST.exe".into();
+        let mut name = sample(30, Some(10), 1.0, 30, "node");
+        name.name = "Plugin-Host-Worker".into();
+        let mut command_line = sample(40, Some(10), 1.0, 40, "node");
+        command_line.command_line = "node --type=PLUGIN-host".into();
+        let rows = vec![
+            sample(10, None, 1.0, 10, "ride-tauri"),
+            executable,
+            name,
+            command_line,
+        ];
+
+        let snapshot = aggregate_snapshot(&rows, 10, None, 4, 1_000);
+
+        assert_eq!(snapshot.plugin_host.process_count, 3);
+        assert_eq!(snapshot.plugin_host.memory_bytes, 90);
+        assert_eq!(snapshot.other.process_count, 0);
+    }
+
+    #[test]
     fn root_and_exact_backend_pid_take_precedence_over_plugin_host_text() {
         let rows = vec![
             sample(10, None, 1.0, 10, "ride-plugin-host"),
@@ -233,6 +270,26 @@ mod tests {
         assert_eq!(snapshot.total.memory_bytes, 10);
         assert_eq!(snapshot.backend, UsageGroup::default());
         assert_eq!(snapshot.plugin_host, UsageGroup::default());
+        assert_eq!(snapshot.other, UsageGroup::default());
+    }
+
+    #[test]
+    fn rejects_conflicting_duplicate_pids_before_building_parent_links() {
+        let rows = vec![
+            sample(10, None, 1.0, 10, "ride-tauri"),
+            sample(20, Some(10), 1.0, 20, "discarded-child"),
+            sample(20, Some(99), 1.0, 200, "foreign-retained-row"),
+            sample(30, Some(20), 1.0, 30, "foreign-grandchild"),
+        ];
+        let mut reversed_duplicates = rows.clone();
+        reversed_duplicates.swap(1, 2);
+
+        let snapshot = aggregate_snapshot(&rows, 10, None, 2, 1_000);
+        let reversed = aggregate_snapshot(&reversed_duplicates, 10, None, 2, 1_000);
+
+        assert_eq!(snapshot, reversed);
+        assert_eq!(snapshot.total.process_count, 1);
+        assert_eq!(snapshot.total.memory_bytes, 10);
         assert_eq!(snapshot.other, UsageGroup::default());
     }
 
