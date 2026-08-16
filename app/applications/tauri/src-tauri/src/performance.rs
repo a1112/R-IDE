@@ -44,7 +44,7 @@ struct ProcessSample {
 }
 
 trait ProcessSource {
-    fn refresh(&mut self) -> Result<(), String>;
+    fn refresh(&mut self) -> Result<usize, String>;
     fn process_ids(&self) -> Vec<u32>;
     fn process_sample(&self, pid: u32) -> Option<ProcessSample>;
     fn logical_cpu_count(&self) -> usize;
@@ -52,8 +52,8 @@ trait ProcessSource {
 }
 
 impl ProcessSource for System {
-    fn refresh(&mut self) -> Result<(), String> {
-        self.refresh_processes_specifics(
+    fn refresh(&mut self) -> Result<usize, String> {
+        Ok(self.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
             ProcessRefreshKind::nothing()
@@ -62,8 +62,7 @@ impl ProcessSource for System {
                 .with_cmd(UpdateKind::OnlyIfNotSet)
                 .with_exe(UpdateKind::OnlyIfNotSet)
                 .without_tasks(),
-        );
-        Ok(())
+        ))
     }
 
     fn process_ids(&self) -> Vec<u32> {
@@ -127,7 +126,7 @@ impl PerformanceSampler {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn ride_performance_snapshot(
     state: tauri::State<'_, crate::AppState>,
 ) -> Result<PerformanceSnapshot, String> {
@@ -145,12 +144,20 @@ fn snapshot_from_source<S: ProcessSource>(
     let mut source = source
         .lock()
         .map_err(|_| "performance sampler mutex is poisoned".to_string())?;
-    source.refresh()?;
+    let refreshed_processes = source.refresh()?;
+    if refreshed_processes == 0 {
+        return Err("process refresh returned no processes".to_string());
+    }
     let samples = source
         .process_ids()
         .into_iter()
         .filter_map(|pid| source.process_sample(pid))
         .collect::<Vec<_>>();
+    if !samples.iter().any(|sample| sample.pid == root_pid) {
+        return Err(format!(
+            "root process {root_pid} is absent after process refresh"
+        ));
+    }
     let logical_cpu_count = source.logical_cpu_count().max(1);
     let sampled_at_ms = source.sampled_at_ms()?;
     Ok(aggregate_snapshot(
@@ -293,12 +300,13 @@ mod tests {
 
     struct StatefulProcessSource {
         refresh_count: Arc<AtomicUsize>,
+        refreshed_processes: usize,
     }
 
     impl ProcessSource for StatefulProcessSource {
-        fn refresh(&mut self) -> Result<(), String> {
+        fn refresh(&mut self) -> Result<usize, String> {
             self.refresh_count.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+            Ok(self.refreshed_processes)
         }
 
         fn process_ids(&self) -> Vec<u32> {
@@ -326,11 +334,36 @@ mod tests {
         }
     }
 
+    struct MissingRootProcessSource;
+
+    impl ProcessSource for MissingRootProcessSource {
+        fn refresh(&mut self) -> Result<usize, String> {
+            Ok(1)
+        }
+
+        fn process_ids(&self) -> Vec<u32> {
+            vec![99]
+        }
+
+        fn process_sample(&self, pid: u32) -> Option<ProcessSample> {
+            (pid == 99).then(|| sample(99, None, 1.0, 99, "unrelated"))
+        }
+
+        fn logical_cpu_count(&self) -> usize {
+            1
+        }
+
+        fn sampled_at_ms(&self) -> Result<u64, String> {
+            Ok(1)
+        }
+    }
+
     #[test]
     fn repeated_samples_reuse_the_same_process_source_state() {
         let refresh_count = Arc::new(AtomicUsize::new(0));
         let source = Mutex::new(StatefulProcessSource {
             refresh_count: Arc::clone(&refresh_count),
+            refreshed_processes: 1,
         });
 
         let first = snapshot_from_source(&source, 10, None).expect("first snapshot");
@@ -345,12 +378,36 @@ mod tests {
     fn ignores_processes_that_terminate_between_refresh_and_collection() {
         let source = Mutex::new(StatefulProcessSource {
             refresh_count: Arc::new(AtomicUsize::new(0)),
+            refreshed_processes: 1,
         });
 
         let snapshot = snapshot_from_source(&source, 10, None).expect("snapshot");
 
         assert_eq!(snapshot.total.process_count, 1);
         assert_eq!(snapshot.total.memory_bytes, 10);
+    }
+
+    #[test]
+    fn zero_refreshed_processes_returns_an_error() {
+        let source = Mutex::new(StatefulProcessSource {
+            refresh_count: Arc::new(AtomicUsize::new(0)),
+            refreshed_processes: 0,
+        });
+
+        let error = snapshot_from_source(&source, 10, None)
+            .expect_err("zero refreshed processes must fail");
+
+        assert_eq!(error, "process refresh returned no processes");
+    }
+
+    #[test]
+    fn missing_root_after_a_nonzero_refresh_returns_an_error() {
+        let source = Mutex::new(MissingRootProcessSource);
+
+        let error =
+            snapshot_from_source(&source, 10, None).expect_err("missing root process must fail");
+
+        assert_eq!(error, "root process 10 is absent after process refresh");
     }
 
     #[test]
@@ -387,6 +444,21 @@ mod tests {
             .expect_err("poisoned sampler must fail");
 
         assert_eq!(error, "performance sampler mutex is poisoned");
+    }
+
+    #[test]
+    fn performance_command_uses_the_tauri_async_threadpool_path() {
+        let source = include_str!("performance.rs");
+
+        assert!(source
+            .lines()
+            .zip(source.lines().skip(1))
+            .any(|(attribute, declaration)| {
+                attribute.trim() == "#[tauri::command(async)]"
+                    && declaration
+                        .trim_start()
+                        .starts_with("pub fn ride_performance_snapshot")
+            }));
     }
 
     #[test]
