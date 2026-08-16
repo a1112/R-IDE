@@ -191,19 +191,20 @@ export class RidePerformancePoller {
         this.consecutiveFailures++;
         if (this.consecutiveFailures >= FAILURE_THRESHOLD) {
             if (!this.unavailablePublished) {
-                this.unavailablePublished = true;
-                await this.publish(unavailableView(this.locale));
+                this.unavailablePublished = await this.publish(unavailableView(this.locale));
             }
         } else if (this.lastSuccessfulView) {
             await this.publish(this.lastSuccessfulView);
         }
     }
 
-    protected async publish(view: PerformanceViewState): Promise<void> {
+    protected async publish(view: PerformanceViewState): Promise<boolean> {
         try {
             await this.options.onUpdate(view);
+            return true;
         } catch {
             // A rendering failure must not be treated as a performance sampling failure.
+            return false;
         }
     }
 }

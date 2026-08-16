@@ -256,6 +256,43 @@ test('does not repeatedly publish unavailable after the third failure', async ()
     assert.equal(updates[0].available, false);
 });
 
+test('retries unavailable after publication fails and deduplicates after publication succeeds', async () => {
+    let unavailableAttempts = 0;
+    const published: PerformanceViewState[] = [];
+    const intervals = new FakeIntervals();
+    const poller = new RidePerformancePoller({
+        fetchSnapshot: async () => {
+            throw new Error('sampling unavailable');
+        },
+        onUpdate: async state => {
+            assert.equal(state.available, false);
+            unavailableAttempts++;
+            if (unavailableAttempts === 1) {
+                throw new Error('status bar temporarily unavailable');
+            }
+            published.push(state);
+        },
+        setInterval: intervals.set,
+        clearInterval: intervals.clear,
+        locale: 'en'
+    });
+
+    poller.start();
+    await flushPromises();
+    intervals.tick();
+    await flushPromises();
+    intervals.tick();
+    await flushPromises();
+    intervals.tick();
+    await flushPromises();
+    intervals.tick();
+    await flushPromises();
+
+    assert.equal(unavailableAttempts, 2);
+    assert.equal(published.length, 1);
+    assert.equal(published[0].text, '$(pulse) Performance unavailable');
+});
+
 test('a synchronous publication throw is called once and does not count as a fetch failure', async () => {
     const fetchResults: Array<RidePerformanceSnapshot | Error> = [
         snapshot({ total: usage(6, 6_144, 2) }),
