@@ -27,6 +27,16 @@ const ROLES = [
   'terminal',
   'other',
 ];
+const HISTORICAL_BASELINE_PATH = path.resolve(
+  import.meta.dirname,
+  '..',
+  '..',
+  'applications',
+  'tauri',
+  'perf',
+  'baselines',
+  'pre-optimization-windows-x64-d034943.json',
+);
 
 function roleMetrics(rssBytes) {
   return Object.fromEntries(ROLES.map(role => [role, role === 'main'
@@ -114,27 +124,7 @@ function measurement({
 }
 
 function legacyBaseline() {
-  const targetFileOpenedMs = 5_310;
-  const rssBytes = 1_154_154_496;
-  return {
-    schema: 'ride.startup-measurement',
-    version: 1,
-    platform: 'win32',
-    arch: 'x64',
-    commit: 'd034943b7a6094808b2ffe56eea2b41c3666b613',
-    migration: { ...HISTORICAL_BASELINE_MIGRATION },
-    runs: Array.from(
-      { length: 5 },
-      (_, index) => startupRun(targetFileOpenedMs, rssBytes, 8_300 + index),
-    ).map(run => ({
-      startupReport: run.startupReport,
-      metrics: {
-        processCount: run.metrics.processCount,
-        rssBytes: run.metrics.rssBytes,
-      },
-    })),
-    median: { targetFileOpenedMs, rssBytes, processCount: 1 },
-  };
+  return JSON.parse(fs.readFileSync(HISTORICAL_BASELINE_PATH, 'utf8'));
 }
 
 test('accepts exactly five compatible v2 runs at the fixed gain thresholds', () => {
@@ -349,18 +339,34 @@ test('accepts v1 only with the explicit historical d034943 migration marker', ()
   );
 });
 
-test('checked-in historical baseline carries the one-time migration marker', () => {
-  const baselinePath = path.resolve(
-    import.meta.dirname,
-    '..',
-    '..',
-    'applications',
-    'tauri',
-    'perf',
-    'baselines',
-    'pre-optimization-windows-x64-d034943.json',
+test('historical migration binds the exact strict legacy measurement contents', () => {
+  assert.equal(
+    HISTORICAL_BASELINE_MIGRATION.measurementSha256,
+    '4be0515d823807c82d4d4e8c70319e503d98a17230c3e740be14c2322d38e004',
   );
-  const baseline = JSON.parse(fs.readFileSync(baselinePath, 'utf8'));
+  const candidate = measurement({ targetFileOpenedMs: 3_717, rssBytes: 1_038_739_046 });
+  const mutations = [
+    ['run contents', baseline => { baseline.runs[0].startupReport.milestones.plugins_ready += 1; }],
+    ['median', baseline => { baseline.median.processCount += 1; }],
+    ['timestamp', baseline => { baseline.runs[0].metrics.rootIdentity.startedAt += 1; }],
+    ['extra field', baseline => { baseline.unexpected = true; }],
+  ];
+  for (const [label, mutate] of mutations) {
+    const baseline = legacyBaseline();
+    mutate(baseline);
+    assert.throws(
+      () => compareTauriPerformance(baseline, candidate, {
+        minStartupGain: 30,
+        minMemoryGain: 10,
+      }),
+      /historical.*(?:digest|contents)|unexpected field|reported median/i,
+      label,
+    );
+  }
+});
+
+test('checked-in historical baseline carries the one-time migration marker', () => {
+  const baseline = legacyBaseline();
   assert.deepEqual(baseline.migration, HISTORICAL_BASELINE_MIGRATION);
   assert.equal(Object.hasOwn(baseline, 'executable'), false);
   assert.doesNotMatch(JSON.stringify(baseline), /ride-open-with-startup-target|"commandLine"/i);

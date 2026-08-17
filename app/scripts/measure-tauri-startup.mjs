@@ -35,6 +35,26 @@ const SENSITIVE_DESKTOP_PASSTHROUGH_KEYS = new Set(['XAUTHORITY']);
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const COMMIT_PATTERN = /^[0-9a-f]{40}$/;
 const PROFILE_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const SEMVER_NUMERIC_IDENTIFIER = '(?:0|[1-9]\\d*)';
+const SEMVER_NON_NUMERIC_IDENTIFIER = '(?:[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)';
+const SEMVER_PRERELEASE_IDENTIFIER = [
+  '(?:',
+  SEMVER_NUMERIC_IDENTIFIER,
+  '|',
+  SEMVER_NON_NUMERIC_IDENTIFIER,
+  ')',
+].join('');
+const SEMVER_PATTERN = new RegExp([
+  '^',
+  SEMVER_NUMERIC_IDENTIFIER,
+  '\\.',
+  SEMVER_NUMERIC_IDENTIFIER,
+  '\\.',
+  SEMVER_NUMERIC_IDENTIFIER,
+  `(?:-${SEMVER_PRERELEASE_IDENTIFIER}(?:\\.${SEMVER_PRERELEASE_IDENTIFIER})*)?`,
+  '(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?',
+  '$',
+].join(''));
 const METADATA_MAX_BYTES = 4 * 1024 * 1024;
 const PROCESS_ROLES = [
   'main',
@@ -379,6 +399,13 @@ function normalizedText(value, name) {
   return value.trim().replace(/\s+/g, ' ').toLowerCase();
 }
 
+function canonicalSemver(value, name) {
+  if (typeof value !== 'string' || value.length > 256 || !SEMVER_PATTERN.test(value)) {
+    throw new Error(`${name} must be a canonical SemVer`);
+  }
+  return value;
+}
+
 function currentRustTarget() {
   const platform = NODE_TO_RUST_PLATFORM[process.platform];
   const arch = NODE_TO_RUST_ARCHITECTURE[process.arch];
@@ -595,7 +622,7 @@ function parseProcessStartedAt(creationTime) {
 
 export function parsePosixProcessTable(output) {
   const rows = [];
-  for (const line of output.split(/\r?\n/)) {
+  for (const [lineIndex, line] of output.split(/\r?\n/).entries()) {
     if (!line.trim()) {
       continue;
     }
@@ -610,7 +637,9 @@ export function parsePosixProcessTable(output) {
       }
     }
     if (!match) {
-      throw new Error(`invalid ps process row: ${line}`);
+      throw new Error(
+        `invalid ps process row ${lineIndex + 1}: expected numeric process fields`,
+      );
     }
     const pid = positiveInteger(match[1], 'ps pid');
     const ppid = positiveInteger(match[2], 'ps ppid');
@@ -2917,7 +2946,7 @@ async function readPluginBuildMetadata(executable) {
     assertPlainObject(manifest, `packaged plugin ${entry.name} manifest`);
     const publisher = normalizedText(manifest.publisher, `packaged plugin ${entry.name} publisher`);
     const name = normalizedText(manifest.name, `packaged plugin ${entry.name} name`);
-    const version = normalizedText(manifest.version, `packaged plugin ${entry.name} version`);
+    const version = canonicalSemver(manifest.version, `packaged plugin ${entry.name} version`);
     const id = `${publisher}.${name}`;
     if (entry.name.toLowerCase() !== id || ids.has(id)) {
       throw new Error(`packaged plugin ${entry.name} identity is not canonical`);
@@ -3241,10 +3270,10 @@ export async function runMeasurementCampaign(
   } = {},
 ) {
   const executable = path.resolve(options.executable);
+  await clearPreviousCampaignArtifacts(options.output);
   const campaignId = randomUUID();
   const { sensitiveValues } = filterSpawnEnvironment(environment, 'diagnostic-redaction');
   const { build, host } = validateCampaignMetadata(await readMetadata({ options, executable }));
-  await clearPreviousCampaignArtifacts(options.output);
   const rawRuns = [];
   for (let runIndex = 1; runIndex <= options.runs; runIndex++) {
     let runId;

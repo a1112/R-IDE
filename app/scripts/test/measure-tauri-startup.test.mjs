@@ -551,6 +551,30 @@ test('POSIX process parsing ignores kernel rows without a signalable process gro
   );
 });
 
+test('malformed POSIX process rows report only a safe line number and field shape', () => {
+  const secretRow = [
+    '11 10 BROKEN 20',
+    'token=token-secret-value',
+    'password=password-secret-value',
+    'Authorization: Bearer authorization-secret-value',
+    'TOPSECRETCOMMANDLINE',
+  ].join(' ');
+  assert.throws(
+    () => parsePosixProcessTable([
+      '10 1 10 1 Sat Aug 15 12:34:56 2026 /opt/ride/R-IDE /opt/ride/R-IDE',
+      secretRow,
+    ].join('\n')),
+    error => {
+      assert.match(error.message, /ps process row 2.*field/i);
+      assert.doesNotMatch(
+        `${error.name}\n${error.message}\n${error.stack}`,
+        /token|password|authorization|TOPSECRETCOMMANDLINE|BROKEN/i,
+      );
+      return true;
+    },
+  );
+});
+
 test('classifies verified process roles by precedence without persisting process command text', () => {
   const rootIdentity = {
     pid: 10,
@@ -4665,6 +4689,52 @@ test('diagnostic redaction removes short nonempty lines from multiline sensitive
   assert.match(redacted, /ordinary   spaces must remain intact/);
 });
 
+test('malformed POSIX process rows persist no command-line secrets in failure diagnostics', async () => {
+  const root = temporaryDirectory('malformed-posix-diagnostic');
+  const executable = path.join(root, 'R-IDE');
+  const output = path.join(root, 'startup-metrics.json');
+  const secretRow = [
+    '11 10 BROKEN 20',
+    'token=token-secret-value',
+    'password=password-secret-value',
+    'Authorization: Bearer authorization-secret-value',
+    'TOPSECRETCOMMANDLINE',
+  ].join(' ');
+  touch(executable);
+  try {
+    await assert.rejects(
+      runMeasurementCampaign({
+        executable,
+        output,
+        runs: 1,
+        idleMs: 0,
+        timeoutMs: 100,
+        pollMs: 1,
+      }, campaignDependencies({
+        measure: async () => parsePosixProcessTable(secretRow),
+      })),
+      error => {
+        assert.match(error.message, /ps process row 1.*field/i);
+        assert.doesNotMatch(
+          `${error.name}\n${error.message}\n${error.stack}`,
+          /token|password|authorization|TOPSECRETCOMMANDLINE|BROKEN/i,
+        );
+        return true;
+      },
+    );
+    const serializedDiagnostic = fs.readFileSync(
+      path.join(root, 'startup-metrics.failure.json'),
+      'utf8',
+    );
+    assert.doesNotMatch(
+      serializedDiagnostic,
+      /token|password|authorization|TOPSECRETCOMMANDLINE|BROKEN/i,
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('failed campaign atomically preserves diagnostics, report, and unique copied logs', async () => {
   const root = temporaryDirectory('failure-diagnostic');
   const executable = path.join(root, 'R-IDE.exe');
@@ -5272,6 +5342,55 @@ test('profile contract digest excludes commit and canonically includes every con
   }
 });
 
+test('plugin fingerprint preserves canonical SemVer case and rejects non-canonical versions', async () => {
+  const root = temporaryDirectory('plugin-version-fingerprint');
+  const executable = path.join(root, 'R-IDE.exe');
+  const profileManifest = path.join(root, 'profile.json');
+  const pluginManifest = path.join(
+    root,
+    'resources',
+    'plugins',
+    'acme.tool',
+    'extension',
+    'package.json',
+  );
+  touch(executable);
+  fs.writeFileSync(profileManifest, JSON.stringify({
+    schema: 'ride.tauri-profile',
+    version: 1,
+    profile: 'tauri-critical',
+    commit: '4'.repeat(40),
+  }));
+  fs.mkdirSync(path.dirname(pluginManifest), { recursive: true });
+  const readVersion = async version => {
+    fs.writeFileSync(pluginManifest, JSON.stringify({
+      publisher: 'Acme',
+      name: 'Tool',
+      version,
+    }));
+    return readCampaignMetadata({
+      executable,
+      options: { profileManifest },
+    }, {
+      readCommit: () => '4'.repeat(40),
+    });
+  };
+
+  try {
+    const upperPrerelease = await readVersion('1.0.0-RC');
+    const lowerPrerelease = await readVersion('1.0.0-rc');
+    assert.notEqual(
+      upperPrerelease.build.pluginManifestSha256,
+      lowerPrerelease.build.pluginManifestSha256,
+    );
+    for (const invalid of [' 1.0.0', '1.0.0 ', '1.0. 0', '01.0.0', 'v1.0.0']) {
+      await assert.rejects(readVersion(invalid), /plugin.*version.*canonical|semver/i);
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('CLI missing-executable errors redact the executable path and its fragments', () => {
   const root = temporaryDirectory('cli-private-executable');
   const executable = path.join(root, 'sensitive-binary-name.exe');
@@ -5429,6 +5548,58 @@ test('packaged metadata reader fails closed on non-canonical manifests and resou
     );
   } finally {
     fs.rmSync(missingRoot, { recursive: true, force: true });
+  }
+});
+
+test('metadata failures invalidate stale successful output and owned diagnostics first', async () => {
+  for (const [label, metadataError] of [
+    ['missing', new Error('profile metadata is missing')],
+    ['malformed', new Error('profile metadata is malformed')],
+  ]) {
+    const root = temporaryDirectory(`metadata-${label}-stale-output`);
+    const executable = path.join(root, 'R-IDE.exe');
+    const output = path.join(root, 'startup-metrics.json');
+    const failurePath = path.join(root, 'startup-metrics.failure.json');
+    const campaignId = label === 'missing'
+      ? '11111111-1111-4111-8111-111111111111'
+      : '22222222-2222-4222-8222-222222222222';
+    const diagnosticsName = `startup-metrics-diagnostics-${campaignId}`;
+    const diagnostics = path.join(root, diagnosticsName);
+    touch(executable);
+    fs.writeFileSync(output, JSON.stringify({ status: 'stale-success' }));
+    fs.mkdirSync(diagnostics);
+    fs.writeFileSync(path.join(diagnostics, '.ride-startup-diagnostics-owner.json'), JSON.stringify({
+      schema: 'ride.startup-diagnostics-owner',
+      version: 1,
+      campaignId,
+      output: path.resolve(output),
+    }));
+    fs.writeFileSync(failurePath, JSON.stringify({
+      status: 'failed',
+      output: path.resolve(output),
+      campaignId,
+      diagnostics: { directory: diagnosticsName },
+    }));
+    try {
+      await assert.rejects(
+        runMeasurementCampaign({
+          executable,
+          output,
+          runs: 1,
+          idleMs: 0,
+          timeoutMs: 100,
+          pollMs: 1,
+        }, {
+          readCampaignMetadata: async () => { throw metadataError; },
+        }),
+        metadataError,
+      );
+      assert.equal(fs.existsSync(output), false, `${label} metadata must invalidate stale output`);
+      assert.equal(fs.existsSync(failurePath), false, `${label} metadata must invalidate stale failure`);
+      assert.equal(fs.existsSync(diagnostics), false, `${label} metadata must remove owned diagnostics`);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   }
 });
 

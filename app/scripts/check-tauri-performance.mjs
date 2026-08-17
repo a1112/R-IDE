@@ -7,6 +7,7 @@
  * SPDX-License-Identifier: MIT
  ********************************************************************************/
 
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
@@ -46,6 +47,7 @@ export const HISTORICAL_BASELINE_MIGRATION = Object.freeze({
   id: 'pre-optimization-windows-x64-d034943',
   commit: 'd034943b7a6094808b2ffe56eea2b41c3666b613',
   hostFingerprint: 'c9d29a9892dd025c849e37d6217666e51451ce32c3c3a57390aa8d2dd1f98c37',
+  measurementSha256: '4be0515d823807c82d4d4e8c70319e503d98a17230c3e740be14c2322d38e004',
 });
 
 function fail(message) {
@@ -72,6 +74,25 @@ function exactKeys(value, keys, label) {
       fail(`${label} is missing field ${key}`);
     }
   }
+}
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalJson).join(',')}]`;
+  }
+  if (value !== null && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map(key => (
+      `${JSON.stringify(key)}:${canonicalJson(value[key])}`
+    )).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function legacyMeasurementSha256(measurement) {
+  const contents = Object.fromEntries(
+    Object.entries(measurement).filter(([key]) => key !== 'migration'),
+  );
+  return createHash('sha256').update(canonicalJson(contents)).digest('hex');
 }
 
 function nonNegativeInteger(value, label) {
@@ -333,11 +354,20 @@ function validateMigration(migration) {
 }
 
 function validateLegacyBaseline(measurement) {
-  plainObject(measurement, 'baseline');
+  validateMigration(measurement?.migration);
+  exactKeys(measurement, [
+    'schema',
+    'version',
+    'platform',
+    'arch',
+    'commit',
+    'migration',
+    'runs',
+    'median',
+  ], 'baseline');
   if (measurement.schema !== MEASUREMENT_SCHEMA || measurement.version !== 1) {
     fail(`baseline must use ${MEASUREMENT_SCHEMA}@2`);
   }
-  validateMigration(measurement.migration);
   if (measurement.commit !== HISTORICAL_BASELINE_MIGRATION.commit) {
     fail('baseline v1 commit does not match the historical d034943 migration marker');
   }
@@ -345,13 +375,59 @@ function validateLegacyBaseline(measurement) {
     fail('historical d034943 baseline must contain exactly 5 runs');
   }
   for (const [index, run] of measurement.runs.entries()) {
-    plainObject(run, `baseline run ${index + 1}`);
+    const label = `baseline run ${index + 1}`;
+    exactKeys(run, ['startupReport', 'metrics'], label);
     validateStartupReport(run.startupReport, measurement, `baseline run ${index + 1}`);
-    plainObject(run.metrics, `baseline run ${index + 1} metrics`);
-    positiveInteger(run.metrics.processCount, `baseline run ${index + 1} processCount`);
-    nonNegativeInteger(run.metrics.rssBytes, `baseline run ${index + 1} rssBytes`);
+    exactKeys(run.metrics, [
+      'rootPid',
+      'rootIdentity',
+      'processIds',
+      'processCount',
+      'rssBytes',
+      'processes',
+    ], `${label} metrics`);
+    const rootPid = positiveInteger(run.metrics.rootPid, `${label} rootPid`);
+    const processCount = positiveInteger(run.metrics.processCount, `${label} processCount`);
+    nonNegativeInteger(run.metrics.rssBytes, `${label} rssBytes`);
+    validateProcessIdentity(run.metrics.rootIdentity, `${label} rootIdentity`);
+    if (run.metrics.rootIdentity.pid !== rootPid || run.startupReport.pid !== rootPid) {
+      fail(`${label} root identity does not match its startup report`);
+    }
+    if (!Array.isArray(run.metrics.processIds)
+        || !Array.isArray(run.metrics.processes)
+        || run.metrics.processIds.length !== processCount
+        || run.metrics.processes.length !== processCount) {
+      fail(`${label} process arrays must match processCount`);
+    }
+    const processIds = run.metrics.processIds.map((pid, processIndex) => (
+      positiveInteger(pid, `${label} processIds[${processIndex}]`)
+    ));
+    if (new Set(processIds).size !== processIds.length || !processIds.includes(rootPid)) {
+      fail(`${label} processIds must be unique and contain the root`);
+    }
+    for (const [processIndex, processRow] of run.metrics.processes.entries()) {
+      exactKeys(
+        processRow,
+        ['pid', 'ppid', 'pgid', 'creationTime', 'startedAt', 'depth'],
+        `${label} process ${processIndex}`,
+      );
+      positiveInteger(processRow.pid, `${label} process ${processIndex} pid`);
+      nonNegativeInteger(processRow.ppid, `${label} process ${processIndex} ppid`);
+      if (processRow.pgid !== null) {
+        positiveInteger(processRow.pgid, `${label} process ${processIndex} pgid`);
+      }
+      nonEmptyString(processRow.creationTime, `${label} process ${processIndex} creationTime`);
+      safeNumber(processRow.startedAt, `${label} process ${processIndex} startedAt`);
+      if (processRow.depth !== null) {
+        nonNegativeInteger(processRow.depth, `${label} process ${processIndex} depth`);
+      }
+    }
   }
-  plainObject(measurement.median, 'baseline median');
+  exactKeys(
+    measurement.median,
+    ['targetFileOpenedMs', 'rssBytes', 'processCount'],
+    'baseline median',
+  );
   const medians = {
     targetFileOpenedMs: median(measurement.runs.map(run => (
       run.startupReport.milestones.target_file_opened
@@ -363,6 +439,10 @@ function validateLegacyBaseline(measurement) {
     if (measurement.median[field] !== expected) {
       fail(`baseline reported median ${field} does not match its runs`);
     }
+  }
+  if (legacyMeasurementSha256(measurement)
+      !== HISTORICAL_BASELINE_MIGRATION.measurementSha256) {
+    fail('historical d034943 baseline contents do not match the fixed measurement digest');
   }
   return {
     measurement,
