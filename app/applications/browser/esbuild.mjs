@@ -17,6 +17,7 @@ import {
 import {
     createTauriBrowserBuildPlans,
 } from './tauri-src/esbuild-deferred.mjs';
+import { createProfileMetadataPlugin } from './tauri-src/esbuild-metadata.mjs';
 
 import esbuild from 'esbuild';
 
@@ -33,6 +34,20 @@ if (profileManifest) {
         baseDirectory: __dirname,
         allowedPackages,
     }));
+}
+
+function withProfileMetadata(options, target) {
+    if (!profileManifest) {
+        return options;
+    }
+    return {
+        ...options,
+        plugins: [...(options.plugins ?? []), createProfileMetadataPlugin({
+            target,
+            profileManifest,
+            baseDirectory: __dirname,
+        })],
+    };
 }
 
 function patchBuiltRpcNotificationTarget() {
@@ -78,6 +93,17 @@ function patchBuiltParcelWatcherLoad() {
 // upward from an isolated profile target on every supported platform.
 browserOptions.plugins.push(createTheiaModuleDedupePlugin(__dirname));
 nodeOptions.plugins.push(createTheiaModuleDedupePlugin(__dirname));
+nodeOptions.plugins.push({
+    name: 'ride-tauri-backend-patches',
+    setup(build) {
+        build.onEnd(result => {
+            if (result.errors.length === 0) {
+                patchBuiltParcelWatcherLoad();
+                patchBuiltRpcNotificationTarget();
+            }
+        });
+    },
+});
 
 // Serve the favicon from the root and inject its link into generated HTML.
 browserOptions.plugins.push(
@@ -108,10 +134,17 @@ const browserBuildPlans = profileManifest
     ? createTauriBrowserBuildPlans(browserOptions, profileManifest, __dirname)
     : { main: browserOptions, classic: [] };
 const browserContexts = [];
-for (const options of [browserBuildPlans.main, ...browserBuildPlans.classic]) {
-    browserContexts.push(await esbuild.context(options));
+const browserTargets = [
+    { target: 'frontend-main', options: browserBuildPlans.main },
+    ...browserBuildPlans.classic.map(options => {
+        const targetName = Object.keys(options.entryPoints)[0];
+        return { target: `frontend-${targetName}`, options };
+    }),
+];
+for (const { target, options } of browserTargets) {
+    browserContexts.push(await esbuild.context(withProfileMetadata(options, target)));
 }
-const nodeContext = await esbuild.context(nodeOptions);
+const nodeContext = await esbuild.context(withProfileMetadata(nodeOptions, 'backend'));
 
 if (watch) {
     await Promise.all([
@@ -126,8 +159,6 @@ if (watch) {
         }
         await nodeContext.rebuild();
         await nodeContext.dispose();
-        patchBuiltParcelWatcherLoad();
-        patchBuiltRpcNotificationTarget();
     } catch (error) {
         console.error(error);
         process.exit(1);
