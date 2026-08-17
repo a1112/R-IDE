@@ -114,13 +114,10 @@ async fn loopback_readiness_connects_without_log_evidence_and_times_out_boundedl
         .expect("listening backend is ready without stdout parsing");
 
     drop(listener);
-    let unavailable =
-        std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve unavailable port");
-    let unavailable_port = unavailable
-        .local_addr()
-        .expect("unavailable address")
-        .port();
-    drop(unavailable);
+    // TCP port zero is reserved and cannot be a listening service endpoint.
+    // Releasing an ephemeral listener here would introduce a race with other
+    // processes that can claim the port before the readiness probe runs.
+    let unavailable_port = 0;
     let timeout_policy = BackendReadinessPolicy::new(
         Duration::from_millis(40),
         Duration::from_millis(5),
