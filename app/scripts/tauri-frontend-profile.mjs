@@ -33,6 +33,30 @@ function currentCommit() {
     return commit;
 }
 
+async function defaultSourceIdentity() {
+    const commit = currentCommit();
+    const status = execFileSync('git', ['status', '--porcelain=v1', '--untracked-files=no', '--', 'app'], {
+        cwd: repositoryDirectory,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 5000,
+        maxBuffer: 1024 * 1024,
+    }).trim();
+    return { commit, clean: status === '' };
+}
+
+function validateSourceIdentity(identity) {
+    const keys = identity && typeof identity === 'object' && !Array.isArray(identity)
+        ? Object.keys(identity).sort(compareText)
+        : [];
+    if (keys.join('\0') !== ['clean', 'commit'].join('\0')
+        || !/^[0-9a-f]{40}$/.test(identity.commit ?? '')
+        || identity.clean !== true) {
+        throw new Error('The tracked source tree must be clean with a canonical current commit.');
+    }
+    return { commit: identity.commit, clean: true };
+}
+
 function canonicalJson(value) {
     if (value === null || typeof value === 'boolean' || typeof value === 'string') {
         return JSON.stringify(value);
@@ -93,7 +117,7 @@ function validateInstalledManifest(requestName, spec, manifest, dependencyPath, 
     if (!validRange) {
         throw new Error(`${dependencyPath.join(' -> ')}: dependency "${requestName}" has invalid ${constraint} range "${expected.range}".`);
     }
-    if (!semver.satisfies(manifest.version, validRange, { includePrerelease: true })) {
+    if (!semver.satisfies(manifest.version, validRange)) {
         throw new Error(`${dependencyPath.join(' -> ')}: installed version ${manifest.version} does not satisfy ${constraint} range ${expected.range}.`);
     }
     return expected;
@@ -265,7 +289,7 @@ function dependencyEntries(manifest) {
 }
 
 function isTheiaExtension(manifest) {
-    return Array.isArray(manifest?.theiaExtensions);
+    return Array.isArray(manifest?.theiaExtensions) && manifest.theiaExtensions.length > 0;
 }
 
 export function resolveProfile({ profileName = 'tauri-critical', profileConfig, browserManifest, packageManifests }) {
@@ -307,13 +331,15 @@ export function resolveProfile({ profileName = 'tauri-critical', profileConfig, 
             if (!manifest) {
                 throw new Error(`${dependencyPath.join(' -> ')}: required dependency is not installed.`);
             }
-            validateInstalledManifest(
-                requestName,
-                browserDependencies[requestName],
-                manifest,
-                dependencyPath,
-                'browser manifest',
-            );
+            if (Object.hasOwn(browserDependencies, requestName)) {
+                validateInstalledManifest(
+                    requestName,
+                    browserDependencies[requestName],
+                    manifest,
+                    dependencyPath,
+                    'browser manifest',
+                );
+            }
             if (ancestry.length > 0) {
                 validateInstalledManifest(requestName, parentSpec, manifest, dependencyPath, 'parent dependency');
             }
@@ -327,18 +353,12 @@ export function resolveProfile({ profileName = 'tauri-critical', profileConfig, 
             const dependencies = new Set();
             dependenciesByNode.set(requestName, dependencies);
             for (const [dependencyName, dependency] of dependencyEntries(manifest)) {
-                if (!Object.hasOwn(browserDependencies, dependencyName)) {
-                    continue;
-                }
                 const installed = packageManifests[dependencyName];
                 if (!installed && dependency.optional) {
                     continue;
                 }
                 if (!installed) {
                     throw new Error(`${[...dependencyPath, dependencyName].join(' -> ')}: required dependency is not installed.`);
-                }
-                if (!isTheiaExtension(installed)) {
-                    continue;
                 }
                 dependencies.add(dependencyName);
                 visit(dependencyName, dependency.spec, dependencyPath);
@@ -379,11 +399,12 @@ export function resolveProfile({ profileName = 'tauri-critical', profileConfig, 
     }
 
     const closure = stableStronglyConnectedOrder(selectedClosure.visited, selectedClosure.dependenciesByNode);
-    const extensions = closure.filter(name => Object.hasOwn(browserDependencies, name));
+    const extensions = closure.filter(name => isTheiaExtension(packageManifests[name]));
     const packages = closure.map(requestName => ({
         requestName,
         packageName: packageManifests[requestName].name,
         version: packageManifests[requestName].version,
+        dependencyPath: selectedClosure.firstPath.get(requestName),
     }));
     const contract = {
         schema: PROFILE_SCHEMA,
@@ -403,19 +424,240 @@ function assertProfilePath(browserDirectory, candidate) {
     }
 }
 
-export function createAtomicDirectoryPlan(browserDirectory, targetName = PROFILE_DIRECTORY_NAME, nonce = `${process.pid}`) {
-    if (targetName !== PROFILE_DIRECTORY_NAME) {
-        throw new Error(`Atomic profile target must be named ${PROFILE_DIRECTORY_NAME}.`);
+function assertPathSegment(value, label) {
+    if (typeof value !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value)
+        || value === '.' || value === '..') {
+        throw new Error(`${label} is not canonical.`);
     }
-    const resolvedBrowserDirectory = path.resolve(browserDirectory);
-    const targetDirectory = path.join(resolvedBrowserDirectory, targetName);
-    const unique = crypto.randomBytes(6).toString('hex');
-    const temporaryDirectory = path.join(resolvedBrowserDirectory, `${targetName}.tmp-${nonce}-${unique}`);
-    const backupDirectory = path.join(resolvedBrowserDirectory, `${targetName}.old-${nonce}-${unique}`);
-    assertProfilePath(resolvedBrowserDirectory, targetDirectory);
-    assertProfilePath(resolvedBrowserDirectory, temporaryDirectory);
-    assertProfilePath(resolvedBrowserDirectory, backupDirectory);
-    return { targetDirectory, temporaryDirectory, backupDirectory };
+}
+
+export function createDirectoryTransactionPlan(parentDirectory, targetName, transactionId) {
+    assertPathSegment(targetName, 'Directory transaction target name');
+    assertPathSegment(transactionId, 'Directory transaction id');
+    const resolvedParent = path.resolve(parentDirectory);
+    const targetDirectory = path.join(resolvedParent, targetName);
+    const temporaryDirectory = path.join(resolvedParent, `.${targetName}.tmp-${transactionId}`);
+    const backupDirectory = path.join(resolvedParent, `.${targetName}.old-${transactionId}`);
+    const markerPath = path.join(resolvedParent, `.${targetName}.transaction-${transactionId}.json`);
+    for (const candidate of [targetDirectory, temporaryDirectory, backupDirectory, markerPath]) {
+        assertProfilePath(resolvedParent, candidate);
+    }
+    return {
+        parentDirectory: resolvedParent,
+        targetName,
+        transactionId,
+        targetDirectory,
+        temporaryDirectory,
+        backupDirectory,
+        markerPath,
+    };
+}
+
+const defaultSleep = delay => new Promise(resolve => setTimeout(resolve, delay));
+
+export async function retryFilesystemOperation(operation, {
+    platform = process.platform,
+    maxAttempts = 5,
+    delayMs = 25,
+    sleep = defaultSleep,
+} = {}) {
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        try {
+            return await operation();
+        } catch (error) {
+            const retryable = platform === 'win32' && (error?.code === 'EPERM' || error?.code === 'EBUSY');
+            if (!retryable || attempt === maxAttempts) {
+                throw error;
+            }
+            await sleep(delayMs * attempt);
+        }
+    }
+    throw new Error('Filesystem retry exhausted unexpectedly.');
+}
+
+async function pathState(candidate, filesystem) {
+    try {
+        const stat = await filesystem.lstat(candidate);
+        return { exists: true, stat };
+    } catch (error) {
+        if (error.code === 'ENOENT') {
+            return { exists: false };
+        }
+        throw error;
+    }
+}
+
+function filesystemOptions(options = {}) {
+    return {
+        filesystem: options.filesystem ?? fs.promises,
+        retry: {
+            platform: options.platform,
+            maxAttempts: options.maxAttempts,
+            delayMs: options.delayMs,
+            sleep: options.sleep,
+        },
+    };
+}
+
+async function retryRename(filesystem, source, destination, retry) {
+    return retryFilesystemOperation(() => filesystem.rename(source, destination), retry);
+}
+
+async function retryRemove(filesystem, candidate, retry) {
+    const state = await pathState(candidate, filesystem);
+    if (!state.exists) {
+        return;
+    }
+    if (state.stat.isSymbolicLink()) {
+        throw new Error(`Refusing to remove symbolic transaction path: ${candidate}`);
+    }
+    return retryFilesystemOperation(() => filesystem.rm(candidate, { recursive: true, force: false }), retry);
+}
+
+async function retryUnlink(filesystem, candidate, retry) {
+    return retryFilesystemOperation(() => filesystem.unlink(candidate), retry).catch(error => {
+        if (error.code !== 'ENOENT') {
+            throw error;
+        }
+    });
+}
+
+function transactionMarker(plan, state) {
+    return {
+        schema: 'ride.directory-transaction@1',
+        targetName: plan.targetName,
+        transactionId: plan.transactionId,
+        state,
+    };
+}
+
+async function writeTransactionMarker(plan, state, filesystem) {
+    const existing = await pathState(plan.markerPath, filesystem);
+    if (existing.exists && existing.stat.isSymbolicLink()) {
+        throw new Error(`Refusing symbolic transaction marker: ${plan.markerPath}`);
+    }
+    await filesystem.writeFile(plan.markerPath, `${JSON.stringify(transactionMarker(plan, state))}\n`, { flag: 'w' });
+}
+
+function parseTransactionMarker(text, plan) {
+    let marker;
+    try {
+        marker = JSON.parse(text);
+    } catch (error) {
+        throw new Error(`Malformed directory transaction marker ${plan.markerPath}: ${error.message}`);
+    }
+    const exactKeys = ['schema', 'state', 'targetName', 'transactionId'];
+    if (!marker || typeof marker !== 'object' || Array.isArray(marker)
+        || Object.keys(marker).sort(compareText).join('\0') !== exactKeys.join('\0')
+        || marker.schema !== 'ride.directory-transaction@1'
+        || marker.targetName !== plan.targetName
+        || marker.transactionId !== plan.transactionId
+        || !['prepared', 'backed-up', 'installed', 'rolled-back'].includes(marker.state)) {
+        throw new Error(`Invalid directory transaction marker ${plan.markerPath}.`);
+    }
+    return marker;
+}
+
+async function assertRegularDirectoryIfPresent(candidate, filesystem) {
+    const state = await pathState(candidate, filesystem);
+    if (state.exists && (!state.stat.isDirectory() || state.stat.isSymbolicLink())) {
+        throw new Error(`Directory transaction path is not a regular directory: ${candidate}`);
+    }
+    return state.exists;
+}
+
+export async function recoverDirectoryTransactions({ parentDirectory, targetName }, options = {}) {
+    assertPathSegment(targetName, 'Directory transaction target name');
+    const resolvedParent = path.resolve(parentDirectory);
+    const { filesystem, retry } = filesystemOptions(options);
+    let entries;
+    try {
+        entries = await filesystem.readdir(resolvedParent, { withFileTypes: true });
+    } catch (error) {
+        if (error.code === 'ENOENT') {
+            return;
+        }
+        throw error;
+    }
+    const prefix = `.${targetName}.transaction-`;
+    const suffix = '.json';
+    for (const entry of entries.sort((left, right) => compareText(left.name, right.name))) {
+        if (!entry.isFile() || !entry.name.startsWith(prefix) || !entry.name.endsWith(suffix)) {
+            continue;
+        }
+        const transactionId = entry.name.slice(prefix.length, -suffix.length);
+        const plan = createDirectoryTransactionPlan(resolvedParent, targetName, transactionId);
+        const marker = parseTransactionMarker(await filesystem.readFile(plan.markerPath, 'utf8'), plan);
+        const targetExists = await assertRegularDirectoryIfPresent(plan.targetDirectory, filesystem);
+        const backupExists = await assertRegularDirectoryIfPresent(plan.backupDirectory, filesystem);
+        await assertRegularDirectoryIfPresent(plan.temporaryDirectory, filesystem);
+        if (marker.state === 'backed-up') {
+            if (targetExists || !backupExists) {
+                throw new Error(`Cannot safely recover backed-up directory transaction ${transactionId}.`);
+            }
+            await retryRename(filesystem, plan.backupDirectory, plan.targetDirectory, retry);
+            await retryRemove(filesystem, plan.temporaryDirectory, retry);
+            await retryUnlink(filesystem, plan.markerPath, retry);
+            continue;
+        }
+        if (marker.state === 'installed') {
+            if (!targetExists) {
+                throw new Error(`Cannot safely recover installed directory transaction ${transactionId}.`);
+            }
+            await retryRemove(filesystem, plan.backupDirectory, retry);
+            await retryRemove(filesystem, plan.temporaryDirectory, retry);
+            await retryUnlink(filesystem, plan.markerPath, retry);
+            continue;
+        }
+        if (backupExists && !targetExists) {
+            await retryRename(filesystem, plan.backupDirectory, plan.targetDirectory, retry);
+        } else if (backupExists) {
+            throw new Error(`Cannot safely recover directory transaction ${transactionId} with two originals.`);
+        }
+        await retryRemove(filesystem, plan.temporaryDirectory, retry);
+        await retryUnlink(filesystem, plan.markerPath, retry);
+    }
+}
+
+export async function replaceDirectoryTransactional(plan, options = {}) {
+    const expected = createDirectoryTransactionPlan(plan.parentDirectory, plan.targetName, plan.transactionId);
+    for (const field of ['targetDirectory', 'temporaryDirectory', 'backupDirectory', 'markerPath']) {
+        if (path.resolve(plan[field]) !== path.resolve(expected[field])) {
+            throw new Error(`Directory transaction ${field} is not canonical.`);
+        }
+    }
+    const { filesystem, retry } = filesystemOptions(options);
+    await recoverDirectoryTransactions({ parentDirectory: plan.parentDirectory, targetName: plan.targetName }, options);
+    if (!await assertRegularDirectoryIfPresent(plan.temporaryDirectory, filesystem)) {
+        throw new Error(`Directory transaction source is missing: ${plan.temporaryDirectory}`);
+    }
+    const targetExists = await assertRegularDirectoryIfPresent(plan.targetDirectory, filesystem);
+    if (await assertRegularDirectoryIfPresent(plan.backupDirectory, filesystem)) {
+        throw new Error(`Directory transaction backup already exists: ${plan.backupDirectory}`);
+    }
+    await writeTransactionMarker(plan, 'prepared', filesystem);
+    if (targetExists) {
+        await retryRename(filesystem, plan.targetDirectory, plan.backupDirectory, retry);
+        await writeTransactionMarker(plan, 'backed-up', filesystem);
+    }
+    try {
+        await retryRename(filesystem, plan.temporaryDirectory, plan.targetDirectory, retry);
+    } catch (installError) {
+        if (!targetExists) {
+            throw installError;
+        }
+        try {
+            await retryRename(filesystem, plan.backupDirectory, plan.targetDirectory, retry);
+            await writeTransactionMarker(plan, 'rolled-back', filesystem);
+            await retryUnlink(filesystem, plan.markerPath, retry);
+        } catch (rollbackError) {
+            throw new AggregateError([installError, rollbackError], 'Directory install and rollback both failed.');
+        }
+        throw installError;
+    }
+    await writeTransactionMarker(plan, 'installed', filesystem);
+    await retryRemove(filesystem, plan.backupDirectory, retry);
+    await retryUnlink(filesystem, plan.markerPath, retry);
 }
 
 async function copyRegularTree(source, destination) {
@@ -435,29 +677,6 @@ async function copyRegularTree(source, destination) {
     const entries = await fs.promises.readdir(source, { withFileTypes: true });
     for (const entry of entries.sort((left, right) => compareText(left.name, right.name))) {
         await copyRegularTree(path.join(source, entry.name), path.join(destination, entry.name));
-    }
-}
-
-async function replaceDirectoryAtomically(plan) {
-    const targetExists = await fs.promises.lstat(plan.targetDirectory).then(() => true, error => {
-        if (error.code === 'ENOENT') {
-            return false;
-        }
-        throw error;
-    });
-    if (targetExists) {
-        await fs.promises.rename(plan.targetDirectory, plan.backupDirectory);
-    }
-    try {
-        await fs.promises.rename(plan.temporaryDirectory, plan.targetDirectory);
-    } catch (error) {
-        if (targetExists) {
-            await fs.promises.rename(plan.backupDirectory, plan.targetDirectory);
-        }
-        throw error;
-    }
-    if (targetExists) {
-        await fs.promises.rm(plan.backupDirectory, { recursive: true, force: true });
     }
 }
 
@@ -494,39 +713,71 @@ async function defaultResolveInstalledManifest(requestName, fromDirectory) {
 
 async function loadInstalledClosure(browserManifest, roots, resolver, browserDirectory) {
     const manifests = {};
-    const loading = new Set();
-    const load = async (requestName, fromDirectory, optional = false) => {
-        if (loading.has(requestName) || Object.hasOwn(manifests, requestName)) {
-            return;
+    const records = new Map();
+    const load = async (requestName, spec, fromDirectory, dependencyPath, optional = false) => {
+        const expected = parseDependencySpec(requestName, spec);
+        if (!semver.validRange(expected.range)) {
+            throw new Error(`${dependencyPath.join(' -> ')}: dependency "${requestName}" has invalid dependency range "${expected.range}".`);
         }
-        loading.add(requestName);
         let installed;
         try {
             installed = await resolver(requestName, fromDirectory);
         } catch (error) {
-            loading.delete(requestName);
             if (optional) {
                 return;
             }
-            throw new Error(`Required dependency "${requestName}" is not installed: ${error.message}`);
+            throw new Error(`${dependencyPath.join(' -> ')}: required dependency is not installed: ${error.message}`);
         }
+        if (!installed || typeof installed.packageDirectory !== 'string' || !path.isAbsolute(path.resolve(installed.packageDirectory))) {
+            throw new Error(`${dependencyPath.join(' -> ')}: installed dependency has no package directory.`);
+        }
+        validateInstalledManifest(requestName, spec, installed.manifest, dependencyPath, 'parent dependency');
+        if (Object.hasOwn(browserManifest.dependencies ?? {}, requestName)) {
+            validateInstalledManifest(
+                requestName,
+                browserManifest.dependencies[requestName],
+                installed.manifest,
+                dependencyPath,
+                'browser manifest',
+            );
+        }
+        const existing = records.get(requestName);
+        if (existing) {
+            if (existing.manifest.name !== installed.manifest.name || existing.manifest.version !== installed.manifest.version) {
+                throw new Error(
+                    `Conflicting installed identity for "${requestName}": `
+                    + `${existing.dependencyPath.join(' -> ')} resolved ${existing.manifest.name}@${existing.manifest.version}, `
+                    + `but ${dependencyPath.join(' -> ')} resolved ${installed.manifest.name}@${installed.manifest.version}.`,
+                );
+            }
+            return;
+        }
+        const record = {
+            requestName,
+            packageDirectory: path.resolve(installed.packageDirectory),
+            manifest: installed.manifest,
+            dependencyPath,
+        };
+        records.set(requestName, record);
         manifests[requestName] = installed.manifest;
         for (const [dependencyName, dependency] of dependencyEntries(installed.manifest)) {
-            if (!Object.hasOwn(browserManifest.dependencies ?? {}, dependencyName)) {
-                continue;
-            }
-            // Every node in this graph is a direct browser application root.
-            // Resolve from that application, not from a dependency's nested
-            // node_modules, so another workspace application's version cannot
-            // shadow the version declared by the browser manifest.
-            await load(dependencyName, browserDirectory, dependency.optional);
+            await load(
+                dependencyName,
+                dependency.spec,
+                record.packageDirectory,
+                [...dependencyPath, dependencyName],
+                dependency.optional,
+            );
         }
-        loading.delete(requestName);
     };
     for (const root of roots) {
-        await load(root, browserDirectory);
+        const spec = browserManifest.dependencies?.[root];
+        if (typeof spec !== 'string') {
+            throw new Error(`Unknown profile root "${root}".`);
+        }
+        await load(root, spec, browserDirectory, [root]);
     }
-    return { manifests };
+    return { manifests, records };
 }
 
 function selectedRoots(profileName, profileConfig, browserManifest) {
@@ -539,26 +790,70 @@ function selectedRoots(profileName, profileConfig, browserManifest) {
         : [...new Set(profile.roots ?? [])].sort(compareText);
 }
 
+function generatedExtensionSpec(requestName, browserManifest, record) {
+    if (Object.hasOwn(browserManifest.dependencies ?? {}, requestName)) {
+        return browserManifest.dependencies[requestName];
+    }
+    return requestName === record.manifest.name
+        ? record.manifest.version
+        : `npm:${record.manifest.name}@${record.manifest.version}`;
+}
+
+async function linkInstalledPackage(targetDirectory, requestName, packageDirectory) {
+    const segments = requestName.startsWith('@') ? requestName.split('/') : [requestName];
+    if (segments.some(segment => !segment || segment === '.' || segment === '..')) {
+        throw new Error(`Cannot link non-canonical package request "${requestName}".`);
+    }
+    const linkPath = path.join(targetDirectory, 'node_modules', ...segments);
+    await fs.promises.mkdir(path.dirname(linkPath), { recursive: true });
+    await fs.promises.symlink(packageDirectory, linkPath, process.platform === 'win32' ? 'junction' : 'dir');
+}
+
+async function verifyGeneratedExtensions(targetDirectory, dependencies, records) {
+    for (const [requestName, spec] of Object.entries(dependencies).sort(([left], [right]) => compareText(left, right))) {
+        const installed = await defaultResolveInstalledManifest(requestName, targetDirectory);
+        validateInstalledManifest(requestName, spec, installed.manifest, [requestName], 'generated application');
+        const expected = records.get(requestName);
+        if (!expected || expected.manifest.name !== installed.manifest.name || expected.manifest.version !== installed.manifest.version) {
+            throw new Error(`Generated application resolved an unexpected identity for "${requestName}".`);
+        }
+    }
+}
+
 export async function generateProfileTarget({
     browserDirectory,
     profileName = 'tauri-critical',
+    buildId,
+    sourceIdentity = defaultSourceIdentity,
     resolveInstalledManifest = defaultResolveInstalledManifest,
 } = {}) {
     const resolvedBrowserDirectory = path.resolve(browserDirectory);
+    assertPathSegment(buildId, 'Tauri profile build id');
+    const identity = validateSourceIdentity(await sourceIdentity());
     const browserManifest = JSON.parse(await fs.promises.readFile(path.join(resolvedBrowserDirectory, 'package.json'), 'utf8'));
     const profileConfig = JSON.parse(await fs.promises.readFile(path.join(resolvedBrowserDirectory, 'tauri-profile.json'), 'utf8'));
     const roots = selectedRoots(profileName, profileConfig, browserManifest);
-    const { manifests } = await loadInstalledClosure(browserManifest, roots, resolveInstalledManifest, resolvedBrowserDirectory);
+    const { manifests, records } = await loadInstalledClosure(browserManifest, roots, resolveInstalledManifest, resolvedBrowserDirectory);
     for (const devDependency of profileConfig.buildDevDependencies ?? []) {
         const installed = await resolveInstalledManifest(devDependency, resolvedBrowserDirectory);
         validateInstalledManifest(devDependency, browserManifest.devDependencies?.[devDependency], installed.manifest, [devDependency]);
     }
     const resolved = resolveProfile({ profileName, profileConfig, browserManifest, packageManifests: manifests });
-    const plan = createAtomicDirectoryPlan(resolvedBrowserDirectory);
-    await fs.promises.rm(plan.temporaryDirectory, { recursive: true, force: true });
+    const buildsDirectory = path.join(resolvedBrowserDirectory, PROFILE_DIRECTORY_NAME, 'builds');
+    await fs.promises.mkdir(buildsDirectory, { recursive: true });
+    await recoverDirectoryTransactions({ parentDirectory: buildsDirectory, targetName: buildId });
+    if ((await pathState(path.join(buildsDirectory, buildId), fs.promises)).exists) {
+        throw new Error(`Tauri profile build id "${buildId}" already exists and is immutable.`);
+    }
+    const transactionId = `${process.pid}-${crypto.randomBytes(6).toString('hex')}`;
+    const plan = createDirectoryTransactionPlan(buildsDirectory, buildId, transactionId);
+    await retryRemove(fs.promises, plan.temporaryDirectory, {});
     await fs.promises.mkdir(plan.temporaryDirectory, { recursive: true });
     try {
-        const dependencies = Object.fromEntries(resolved.extensions.map(name => [name, browserManifest.dependencies[name]]));
+        const dependencies = Object.fromEntries(resolved.extensions.map(name => [
+            name,
+            generatedExtensionSpec(name, browserManifest, records.get(name)),
+        ]));
         const devDependencies = Object.fromEntries((profileConfig.buildDevDependencies ?? []).map(name => {
             const spec = browserManifest.devDependencies?.[name];
             if (!spec) {
@@ -577,6 +872,9 @@ export async function generateProfileTarget({
             devDependencies,
         };
         await fs.promises.writeFile(path.join(plan.temporaryDirectory, 'package.json'), `${JSON.stringify(generatedPackage, null, 2)}\n`);
+        for (const requestName of resolved.extensions) {
+            await linkInstalledPackage(plan.temporaryDirectory, requestName, records.get(requestName).packageDirectory);
+        }
         for (const file of CUSTOM_FILES) {
             await copyRegularTree(path.join(resolvedBrowserDirectory, file), path.join(plan.temporaryDirectory, file));
         }
@@ -589,7 +887,9 @@ export async function generateProfileTarget({
         const profileManifest = {
             schema: 'ride.tauri-profile',
             version: 1,
-            commit: currentCommit(),
+            commit: identity.commit,
+            sourceIdentity: identity,
+            buildId,
             profile: resolved.profile,
             digest: resolved.digest,
             roots: resolved.roots,
@@ -598,66 +898,367 @@ export async function generateProfileTarget({
             featureGroups: resolved.featureGroups,
         };
         await fs.promises.writeFile(path.join(plan.temporaryDirectory, PROFILE_MANIFEST_NAME), `${JSON.stringify(profileManifest, null, 2)}\n`);
-        await replaceDirectoryAtomically(plan);
+        await verifyGeneratedExtensions(plan.temporaryDirectory, dependencies, records);
+        await replaceDirectoryTransactional(plan);
     } catch (error) {
-        await fs.promises.rm(plan.temporaryDirectory, { recursive: true, force: true });
+        await retryRemove(fs.promises, plan.temporaryDirectory, {}).catch(() => {});
         throw error;
     }
-    return { ...resolved, targetDirectory: plan.targetDirectory };
+    return { ...resolved, buildId, sourceIdentity: identity, targetDirectory: plan.targetDirectory };
 }
 
-export async function publishProfileBuild({ browserDirectory } = {}) {
-    const resolvedBrowserDirectory = path.resolve(browserDirectory);
-    const profileDirectory = path.join(resolvedBrowserDirectory, PROFILE_DIRECTORY_NAME);
-    const sourceLib = path.join(profileDirectory, 'lib');
-    const sourceManifest = path.join(profileDirectory, PROFILE_MANIFEST_NAME);
-    const destinationLib = path.join(resolvedBrowserDirectory, 'lib');
-    const unique = `${process.pid}-${crypto.randomBytes(6).toString('hex')}`;
-    const temporaryLib = path.join(resolvedBrowserDirectory, `.ride-tauri-lib.tmp-${unique}`);
-    const backupLib = path.join(resolvedBrowserDirectory, `.ride-tauri-lib.old-${unique}`);
-    assertProfilePath(resolvedBrowserDirectory, temporaryLib);
-    assertProfilePath(resolvedBrowserDirectory, backupLib);
-    await fs.promises.rm(temporaryLib, { recursive: true, force: true });
-    await copyRegularTree(sourceLib, temporaryLib);
-    const manifestText = await fs.promises.readFile(sourceManifest);
-    await fs.promises.writeFile(path.join(temporaryLib, PROFILE_MANIFEST_NAME), manifestText);
-    for (const output of ['frontend', 'backend']) {
-        await fs.promises.mkdir(path.join(temporaryLib, output), { recursive: true });
-        await fs.promises.writeFile(path.join(temporaryLib, output, PROFILE_MANIFEST_NAME), manifestText);
+function assertExactObjectFields(value, fields, label) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        throw new Error(`${label} must be an object with exact manifest fields.`);
     }
-    const destinationExists = fs.existsSync(destinationLib);
-    if (destinationExists) {
-        await fs.promises.rename(destinationLib, backupLib);
+    const actual = Object.keys(value).sort(compareText);
+    const expected = [...fields].sort(compareText);
+    if (actual.join('\0') !== expected.join('\0')) {
+        const unexpected = actual.filter(field => !expected.includes(field));
+        throw new Error(`${label} has invalid manifest fields${unexpected.length ? `: unsupported ${unexpected.join(', ')}` : ''}.`);
     }
+}
+
+function validateStringArray(value, label) {
+    if (!Array.isArray(value) || value.some(item => typeof item !== 'string' || !item || item !== item.trim())) {
+        throw new Error(`${label} must contain canonical package names.`);
+    }
+    if (new Set(value).size !== value.length) {
+        throw new Error(`${label} must not contain duplicate package names.`);
+    }
+}
+
+function validateProfileBuildManifest(manifestText, { expectedProfile, buildId, identity }) {
+    let manifest;
     try {
-        await fs.promises.rename(temporaryLib, destinationLib);
+        manifest = JSON.parse(manifestText);
     } catch (error) {
-        if (destinationExists) {
-            await fs.promises.rename(backupLib, destinationLib);
+        throw new Error(`Tauri profile manifest is malformed: ${error.message}`);
+    }
+    assertExactObjectFields(manifest, [
+        'schema',
+        'version',
+        'commit',
+        'sourceIdentity',
+        'buildId',
+        'profile',
+        'digest',
+        'roots',
+        'extensions',
+        'packages',
+        'featureGroups',
+    ], 'Tauri profile manifest');
+    if (manifest.schema !== 'ride.tauri-profile' || manifest.version !== 1) {
+        throw new Error('Tauri profile manifest schema must be ride.tauri-profile@1.');
+    }
+    assertExactObjectFields(manifest.sourceIdentity, ['commit', 'clean'], 'Tauri profile source identity');
+    const manifestIdentity = validateSourceIdentity(manifest.sourceIdentity);
+    if (manifest.profile !== expectedProfile) {
+        throw new Error(`Tauri profile mismatch: expected "${expectedProfile}", found "${manifest.profile}".`);
+    }
+    if (manifest.buildId !== buildId) {
+        throw new Error(`Tauri profile build id mismatch: expected "${buildId}", found "${manifest.buildId}".`);
+    }
+    if (manifest.commit !== manifestIdentity.commit || manifest.commit !== identity.commit) {
+        throw new Error(`Tauri profile commit mismatch: build ${manifest.commit} is stale for current commit ${identity.commit}.`);
+    }
+    validateStringArray(manifest.roots, 'Tauri profile roots');
+    validateStringArray(manifest.extensions, 'Tauri profile extensions');
+    if (!Array.isArray(manifest.packages)) {
+        throw new Error('Tauri profile packages must be an array.');
+    }
+    for (const record of manifest.packages) {
+        assertExactObjectFields(record, ['requestName', 'packageName', 'version', 'dependencyPath'], 'Tauri profile package');
+        if (typeof record.requestName !== 'string' || !record.requestName
+            || typeof record.packageName !== 'string' || !record.packageName
+            || !semver.valid(record.version)) {
+            throw new Error('Tauri profile package identity is invalid.');
         }
-        throw error;
+        validateStringArray(record.dependencyPath, `Tauri profile package ${record.requestName} dependency path`);
     }
-    if (destinationExists) {
-        await fs.promises.rm(backupLib, { recursive: true, force: true });
+    if (!manifest.featureGroups || typeof manifest.featureGroups !== 'object' || Array.isArray(manifest.featureGroups)) {
+        throw new Error('Tauri profile feature groups must be an object.');
     }
+    if (!/^[0-9a-f]{64}$/.test(manifest.digest ?? '')) {
+        throw new Error('Tauri profile digest is not canonical.');
+    }
+    const contract = {
+        schema: PROFILE_SCHEMA,
+        profile: manifest.profile,
+        roots: manifest.roots,
+        extensions: manifest.extensions,
+        packages: manifest.packages,
+        featureGroups: manifest.featureGroups,
+    };
+    const digest = canonicalDigest(contract);
+    if (digest !== manifest.digest) {
+        throw new Error(`Tauri profile digest mismatch: expected ${digest}, found ${manifest.digest}.`);
+    }
+    return manifest;
+}
+
+function canonicalBuildSource(browserDirectory, buildId) {
+    return path.join(path.resolve(browserDirectory), PROFILE_DIRECTORY_NAME, 'builds', buildId);
+}
+
+function defaultIsProcessAlive(pid) {
+    try {
+        process.kill(pid, 0);
+        return true;
+    } catch (error) {
+        return error.code === 'EPERM';
+    }
+}
+
+function parsePublishLockOwner(text, lockDirectory) {
+    let owner;
+    try {
+        owner = JSON.parse(text);
+    } catch (error) {
+        throw new Error(`Malformed Tauri publish lock owner in ${lockDirectory}: ${error.message}`);
+    }
+    assertExactObjectFields(owner, ['schema', 'pid', 'buildId', 'profile', 'commit', 'acquiredAt'], 'Tauri publish lock owner');
+    if (owner.schema !== 'ride.tauri-publish-lock@1'
+        || !Number.isSafeInteger(owner.pid) || owner.pid <= 0
+        || !Number.isFinite(owner.acquiredAt) || owner.acquiredAt < 0
+        || !/^[0-9a-f]{40}$/.test(owner.commit ?? '')) {
+        throw new Error(`Invalid Tauri publish lock owner in ${lockDirectory}.`);
+    }
+    assertPathSegment(owner.buildId, 'Tauri publish lock build id');
+    if (typeof owner.profile !== 'string' || !owner.profile || owner.profile !== owner.profile.trim()) {
+        throw new Error(`Invalid Tauri publish lock profile in ${lockDirectory}.`);
+    }
+    return owner;
+}
+
+async function readPublishLockOwner(lockDirectory, filesystem) {
+    const ownerPath = path.join(lockDirectory, 'owner.json');
+    const ownerState = await pathState(ownerPath, filesystem);
+    if (!ownerState.exists) {
+        throw Object.assign(new Error(`Tauri publish lock owner is not initialized in ${lockDirectory}.`), { code: 'ENOENT' });
+    }
+    if (!ownerState.stat.isFile() || ownerState.stat.isSymbolicLink()) {
+        throw new Error(`Refusing unsafe Tauri publish lock owner path: ${ownerPath}`);
+    }
+    return parsePublishLockOwner(await filesystem.readFile(ownerPath, 'utf8'), lockDirectory);
+}
+
+export async function acquirePublishLock({
+    browserDirectory,
+    owner,
+    filesystem = fs.promises,
+    now = Date.now,
+    sleep = defaultSleep,
+    timeoutMs = 30_000,
+    retryDelayMs = 50,
+    staleMs = 5 * 60_000,
+    isProcessAlive = defaultIsProcessAlive,
+    platform = process.platform,
+} = {}) {
+    const resolvedBrowserDirectory = path.resolve(browserDirectory);
+    assertPathSegment(owner?.buildId, 'Tauri publish lock build id');
+    if (typeof owner?.profile !== 'string' || !owner.profile || !/^[0-9a-f]{40}$/.test(owner.commit ?? '')) {
+        throw new Error('Tauri publish lock owner identity is invalid.');
+    }
+    if (!Number.isFinite(timeoutMs) || timeoutMs < 0 || !Number.isFinite(staleMs) || staleMs < 0
+        || !Number.isFinite(retryDelayMs) || retryDelayMs < 0) {
+        throw new Error('Tauri publish lock timing is invalid.');
+    }
+    const lockDirectory = path.join(resolvedBrowserDirectory, '.ride-tauri-publish.lock');
+    assertProfilePath(resolvedBrowserDirectory, lockDirectory);
+    const startedAt = now();
+    while (true) {
+        const acquiredAt = now();
+        const lockOwner = {
+            schema: 'ride.tauri-publish-lock@1',
+            pid: process.pid,
+            buildId: owner.buildId,
+            profile: owner.profile,
+            commit: owner.commit,
+            acquiredAt,
+        };
+        try {
+            await filesystem.mkdir(lockDirectory);
+            try {
+                await filesystem.writeFile(path.join(lockDirectory, 'owner.json'), `${JSON.stringify(lockOwner)}\n`, { flag: 'wx' });
+            } catch (error) {
+                await retryRemove(filesystem, lockDirectory, { platform, sleep }).catch(() => {});
+                throw error;
+            }
+            return async () => {
+                const current = await readPublishLockOwner(lockDirectory, filesystem);
+                if (current.pid !== lockOwner.pid || current.buildId !== lockOwner.buildId
+                    || current.profile !== lockOwner.profile || current.commit !== lockOwner.commit
+                    || current.acquiredAt !== lockOwner.acquiredAt) {
+                    throw new Error('Tauri publish lock ownership changed before release.');
+                }
+                await retryRemove(filesystem, lockDirectory, { platform, sleep });
+            };
+        } catch (error) {
+            if (error.code !== 'EEXIST') {
+                throw error;
+            }
+        }
+
+        const state = await pathState(lockDirectory, filesystem);
+        if (!state.exists) {
+            continue;
+        }
+        if (!state.stat.isDirectory() || state.stat.isSymbolicLink()) {
+            throw new Error(`Refusing unsafe Tauri publish lock path: ${lockDirectory}`);
+        }
+        const currentTime = now();
+        let currentOwner;
+        try {
+            currentOwner = await readPublishLockOwner(lockDirectory, filesystem);
+        } catch (error) {
+            if (error.code !== 'ENOENT') {
+                throw error;
+            }
+            if (currentTime - startedAt >= timeoutMs) {
+                throw new Error('Timed out waiting for Tauri publish lock owner initialization.');
+            }
+            await sleep(retryDelayMs);
+            continue;
+        }
+        if (currentTime - currentOwner.acquiredAt >= staleMs && !isProcessAlive(currentOwner.pid)) {
+            const staleDirectory = path.join(
+                resolvedBrowserDirectory,
+                `.ride-tauri-publish.lock.stale-${process.pid}-${crypto.randomBytes(6).toString('hex')}`,
+            );
+            assertProfilePath(resolvedBrowserDirectory, staleDirectory);
+            try {
+                await retryRename(filesystem, lockDirectory, staleDirectory, { platform, sleep });
+            } catch (error) {
+                if (error.code === 'ENOENT') {
+                    continue;
+                }
+                throw error;
+            }
+            await retryRemove(filesystem, staleDirectory, { platform, sleep });
+            continue;
+        }
+        if (currentTime - startedAt >= timeoutMs) {
+            throw new Error(`Timed out waiting for Tauri publish lock owned by build "${currentOwner.buildId}".`);
+        }
+        await sleep(retryDelayMs);
+    }
+}
+
+export async function publishProfileBuild({
+    browserDirectory,
+    expectedProfile,
+    buildId,
+    sourceDirectory,
+    sourceIdentity = defaultSourceIdentity,
+    copyTree = copyRegularTree,
+    lockOptions = {},
+    transactionOptions = {},
+} = {}) {
+    const resolvedBrowserDirectory = path.resolve(browserDirectory);
+    assertPathSegment(buildId, 'Tauri profile build id');
+    if (typeof expectedProfile !== 'string' || !expectedProfile) {
+        throw new Error('Expected Tauri profile is required for publish.');
+    }
+    const expectedSource = canonicalBuildSource(resolvedBrowserDirectory, buildId);
+    if (path.resolve(sourceDirectory ?? '') !== path.resolve(expectedSource)) {
+        throw new Error(`Tauri profile source directory is not canonical for build "${buildId}".`);
+    }
+    const identity = validateSourceIdentity(await sourceIdentity());
+    const sourceLib = path.join(expectedSource, 'lib');
+    const sourceManifest = path.join(expectedSource, PROFILE_MANIFEST_NAME);
+    const destinationLib = path.join(resolvedBrowserDirectory, 'lib');
+    const initialManifestText = await fs.promises.readFile(sourceManifest);
+    validateProfileBuildManifest(initialManifestText, { expectedProfile, buildId, identity });
+    const release = await acquirePublishLock({
+        browserDirectory: resolvedBrowserDirectory,
+        owner: { buildId, profile: expectedProfile, commit: identity.commit },
+        ...lockOptions,
+    });
+    try {
+        const lockedIdentity = validateSourceIdentity(await sourceIdentity());
+        if (lockedIdentity.commit !== identity.commit) {
+            throw new Error('Tauri profile source identity changed while waiting for the publish lock.');
+        }
+        const manifestText = await fs.promises.readFile(sourceManifest);
+        const manifest = validateProfileBuildManifest(manifestText, {
+            expectedProfile,
+            buildId,
+            identity: lockedIdentity,
+        });
+        if (!manifestText.equals(initialManifestText)) {
+            throw new Error('Tauri profile source manifest changed while waiting for the publish lock.');
+        }
+        const unique = `${process.pid}-${crypto.randomBytes(6).toString('hex')}`;
+        const plan = createDirectoryTransactionPlan(resolvedBrowserDirectory, 'lib', unique);
+        await recoverDirectoryTransactions(
+            { parentDirectory: resolvedBrowserDirectory, targetName: 'lib' },
+            transactionOptions,
+        );
+        await retryRemove(fs.promises, plan.temporaryDirectory, {});
+        await copyTree(sourceLib, plan.temporaryDirectory);
+        await fs.promises.writeFile(path.join(plan.temporaryDirectory, PROFILE_MANIFEST_NAME), manifestText);
+        for (const output of ['frontend', 'backend']) {
+            await fs.promises.mkdir(path.join(plan.temporaryDirectory, output), { recursive: true });
+            await fs.promises.writeFile(path.join(plan.temporaryDirectory, output, PROFILE_MANIFEST_NAME), manifestText);
+        }
+        await replaceDirectoryTransactional(plan, transactionOptions);
+        await retryRemove(fs.promises, expectedSource, {});
+        return { profile: manifest.profile, buildId: manifest.buildId, digest: manifest.digest, destinationLib };
+    } finally {
+        await release();
+    }
+}
+
+export function parseProfileCliArguments(argv, environment = process.env) {
+    const [command, ...tokens] = argv;
+    if (command !== 'prepare' && command !== 'publish') {
+        throw new Error('Usage: node tauri-frontend-profile.mjs <prepare|publish> --profile <name> --build-id <id> [--source-dir <path>]');
+    }
+    const values = new Map();
+    for (let index = 0; index < tokens.length; index += 2) {
+        const option = tokens[index];
+        const value = tokens[index + 1];
+        if (!['--profile', '--build-id', '--source-dir'].includes(option) || typeof value !== 'string' || !value
+            || values.has(option)) {
+            throw new Error(`Invalid or duplicate Tauri profile CLI option "${option ?? '<missing>'}".`);
+        }
+        values.set(option, value);
+    }
+    const profileName = values.get('--profile') ?? environment.RIDE_TAURI_FRONTEND_PROFILE ?? 'tauri-critical';
+    const buildId = values.get('--build-id');
+    if (!buildId) {
+        throw new Error('Tauri profile CLI requires --build-id.');
+    }
+    assertPathSegment(buildId, 'Tauri profile build id');
+    const sourceDirectory = values.get('--source-dir');
+    if (command === 'publish' && !sourceDirectory) {
+        throw new Error('Tauri profile publish requires --source-dir.');
+    }
+    if (command === 'prepare' && sourceDirectory) {
+        throw new Error('Tauri profile prepare does not accept --source-dir.');
+    }
+    return { command, profileName, buildId, sourceDirectory };
 }
 
 async function runCli() {
-    const command = process.argv[2];
-    const profileIndex = process.argv.indexOf('--profile');
-    const profileName = profileIndex >= 0 ? process.argv[profileIndex + 1] : process.env.RIDE_TAURI_FRONTEND_PROFILE ?? 'tauri-critical';
+    const { command, profileName, buildId, sourceDirectory } = parseProfileCliArguments(process.argv.slice(2));
     const browserDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'applications', 'browser');
     if (command === 'prepare') {
-        const result = await generateProfileTarget({ browserDirectory, profileName });
+        const result = await generateProfileTarget({ browserDirectory, profileName, buildId });
         process.stdout.write(`Prepared ${result.profile} profile ${result.digest} at ${result.targetDirectory}\n`);
         return;
     }
     if (command === 'publish') {
-        await publishProfileBuild({ browserDirectory });
-        process.stdout.write(`Published ${profileName} frontend and backend bundles.\n`);
+        const result = await publishProfileBuild({
+            browserDirectory,
+            expectedProfile: profileName,
+            buildId,
+            sourceDirectory,
+        });
+        process.stdout.write(`Published ${result.profile} build ${result.buildId} frontend and backend bundles.\n`);
         return;
     }
-    throw new Error('Usage: node tauri-frontend-profile.mjs <prepare|publish> [--profile <name>]');
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

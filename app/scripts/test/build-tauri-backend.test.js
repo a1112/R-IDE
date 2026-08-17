@@ -6,27 +6,31 @@ const path = require('node:path');
 const helperPath = path.resolve(__dirname, '..', 'build-tauri-backend.js');
 const browserDirectory = path.resolve(__dirname, '..', '..', 'applications', 'browser');
 const profileDirectory = path.join(browserDirectory, '.ride-tauri-profile');
+const testBuildDirectory = path.join(profileDirectory, 'builds', 'unit-build');
 
 test('defaults to an isolated tauri-critical build and publishes it atomically', () => {
   const { createBuildPlan } = require(helperPath);
-  const plan = createBuildPlan('win32', undefined, {});
+  const plan = createBuildPlan('win32', undefined, {}, { buildIdFactory: () => 'unit-build' });
 
   assert.equal(plan.length, 4);
   assert.equal(plan[0].command, process.execPath);
-  assert.deepEqual(plan[0].args.slice(-3), ['prepare', '--profile', 'tauri-critical']);
+  assert.deepEqual(plan[0].args.slice(-5), ['prepare', '--profile', 'tauri-critical', '--build-id', 'unit-build']);
   assert.equal(plan[0].cwd, browserDirectory);
   assert.equal(plan[1].command, process.execPath);
   assert.match(plan[1].args[0], /@theia[\\/]cli[\\/]bin[\\/]theia\.js$/);
   assert.deepEqual(plan[1].args.slice(1), ['rebuild:browser', '--cacheRoot', path.resolve(browserDirectory, '..', '..')]);
-  assert.equal(plan[1].cwd, profileDirectory);
+  assert.equal(plan[1].cwd, testBuildDirectory);
   assert.equal(plan[2].command, process.execPath);
   assert.deepEqual(plan[2].args.slice(1), ['build', '--app-target=browser']);
-  assert.equal(plan[2].cwd, profileDirectory);
+  assert.equal(plan[2].cwd, testBuildDirectory);
   assert.equal(plan[3].command, process.execPath);
-  assert.deepEqual(plan[3].args.slice(-3), ['publish', '--profile', 'tauri-critical']);
+  assert.deepEqual(plan[3].args.slice(-7), [
+    'publish', '--profile', 'tauri-critical', '--build-id', 'unit-build', '--source-dir', testBuildDirectory,
+  ]);
   assert.equal(plan[3].cwd, browserDirectory);
   for (const step of plan) {
     assert.equal(step.env.RIDE_TAURI_FRONTEND_PROFILE, 'tauri-critical');
+    assert.equal(step.env.RIDE_TAURI_BUILD_ID, 'unit-build');
     assert.equal(step.env.RIDE_TAURI_LEAN, undefined);
     assert.equal(step.env.RIDE_TAURI_ENABLE_PLUGINS, undefined);
     assert.equal(step.shell, false);
@@ -35,12 +39,16 @@ test('defaults to an isolated tauri-critical build and publishes it atomically',
 
 test('uses the explicit full profile and every browser root', () => {
   const { createBuildPlan } = require(helperPath);
-  const plan = createBuildPlan('linux', undefined, { RIDE_TAURI_FRONTEND_PROFILE: 'full' });
+  const plan = createBuildPlan('linux', undefined, { RIDE_TAURI_FRONTEND_PROFILE: 'full' }, {
+    buildIdFactory: () => 'unit-build',
+  });
 
   assert.equal(plan[1].command, process.execPath);
   assert.equal(plan[2].command, process.execPath);
-  assert.deepEqual(plan[0].args.slice(-3), ['prepare', '--profile', 'full']);
-  assert.deepEqual(plan[3].args.slice(-3), ['publish', '--profile', 'full']);
+  assert.deepEqual(plan[0].args.slice(-5), ['prepare', '--profile', 'full', '--build-id', 'unit-build']);
+  assert.deepEqual(plan[3].args.slice(-7), [
+    'publish', '--profile', 'full', '--build-id', 'unit-build', '--source-dir', testBuildDirectory,
+  ]);
   assert.equal(plan[2].env.RIDE_TAURI_FRONTEND_PROFILE, 'full');
 
   const config = JSON.parse(fs.readFileSync(path.join(browserDirectory, 'tauri-profile.json'), 'utf8'));
@@ -54,6 +62,23 @@ test('rejects unknown profiles before spawning any build process', () => {
     () => createBuildPlan('linux', undefined, { RIDE_TAURI_FRONTEND_PROFILE: 'mystery' }),
     /Unknown Tauri frontend profile "mystery"/,
   );
+});
+
+test('creates a unique canonical build id when no deterministic factory is injected', () => {
+  const { createBuildPlan } = require(helperPath);
+  const first = createBuildPlan('linux', 'tauri-critical', {});
+  const second = createBuildPlan('linux', 'tauri-critical', {});
+  const firstBuildId = first[0].args[first[0].args.indexOf('--build-id') + 1];
+  const secondBuildId = second[0].args[second[0].args.indexOf('--build-id') + 1];
+
+  assert.match(firstBuildId, /^[a-z0-9][a-z0-9-]{15,63}$/);
+  assert.notEqual(firstBuildId, secondBuildId);
+  for (const step of first) {
+    assert.equal(step.env.RIDE_TAURI_BUILD_ID, firstBuildId);
+  }
+  assert.equal(first[1].cwd, path.join(profileDirectory, 'builds', firstBuildId));
+  assert.equal(first[2].cwd, first[1].cwd);
+  assert.equal(first[3].args[first[3].args.indexOf('--source-dir') + 1], first[1].cwd);
 });
 
 test('invokes the workspace Theia CLI through Node without shell-specific wrappers', () => {
@@ -75,6 +100,19 @@ test('invokes the workspace Theia CLI through Node without shell-specific wrappe
   assert.equal(calls[3].command, process.execPath);
   assert.equal(calls[2].options.shell, false);
   assert.equal(calls[2].options.env.RIDE_TAURI_FRONTEND_PROFILE, 'tauri-critical');
+});
+
+test('returns status 1 when a build step is terminated by a signal', () => {
+  const { runBuild } = require(helperPath);
+  const previousExitCode = process.exitCode;
+  try {
+    process.exitCode = undefined;
+    const status = runBuild('linux', () => ({ status: null, signal: 'SIGTERM' }), 'tauri-critical', {});
+    assert.equal(status, 1);
+    assert.equal(process.exitCode, 1);
+  } finally {
+    process.exitCode = previousExitCode;
+  }
 });
 
 test('declares the exact browser-root inventory for every feature group', () => {
@@ -195,6 +233,10 @@ test('removes obsolete Tauri lean switches from production scripts', () => {
 test('ignores generated profile targets and atomic staging directories', () => {
   const ignore = fs.readFileSync(path.resolve(browserDirectory, '..', '..', '.gitignore'), 'utf8');
   assert.match(ignore, /\*\*\/\.ride-tauri-profile\//);
-  assert.match(ignore, /\*\*\/\.ride-tauri-profile\.tmp-\*/);
-  assert.match(ignore, /\*\*\/\.ride-tauri-lib\.tmp-\*/);
+  assert.match(ignore, /\*\*\/\.ride-tauri-profile\/builds\//);
+  assert.match(ignore, /\*\*\/\.ride-tauri-publish\.lock\//);
+  assert.match(ignore, /\*\*\/\.ride-tauri-publish\.lock\.stale-\*\//);
+  assert.match(ignore, /\*\*\/\.lib\.tmp-\*\//);
+  assert.match(ignore, /\*\*\/\.lib\.old-\*\//);
+  assert.match(ignore, /\*\*\/\.lib\.transaction-\*\.json/);
 });

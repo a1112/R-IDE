@@ -84,17 +84,22 @@ test('packaged Tauri builds preserve the complete plugin dependency graph', () =
   );
   assert.match(buildHelper, /environment\.RIDE_TAURI_FRONTEND_PROFILE\s*\?\?\s*['"]tauri-critical['"]/);
   assert.match(buildHelper, /RIDE_TAURI_FRONTEND_PROFILE:\s*selectedProfile/);
+  assert.match(buildHelper, /RIDE_TAURI_BUILD_ID:\s*buildId/);
   assert.match(buildHelper, /profileDirectory\s*=\s*path\.join\(browserDirectory,\s*['"]\.ride-tauri-profile['"]\)/);
+  assert.match(buildHelper, /buildDirectory\s*=\s*path\.join\(profileDirectory,\s*['"]builds['"],\s*buildId\)/);
   const prepareIndex = buildHelper.indexOf("args: [profileScript, 'prepare'");
   const rebuildIndex = buildHelper.indexOf("'rebuild:browser'");
   const theiaBuildIndex = buildHelper.indexOf("'build', '--app-target=browser'");
-  const publishIndex = buildHelper.indexOf("args: [profileScript, 'publish'");
+  const publishIndex = buildHelper.indexOf("'publish',", theiaBuildIndex);
   assert.ok(prepareIndex >= 0 && rebuildIndex > prepareIndex,
     'the isolated profile must be prepared before Theia rebuild');
   assert.ok(theiaBuildIndex > rebuildIndex, 'Theia build must follow isolated rebuild');
   assert.ok(publishIndex > theiaBuildIndex, 'atomic publish must follow the isolated build');
-  assert.match(buildHelper.slice(rebuildIndex, theiaBuildIndex), /cwd:\s*profileDirectory/);
-  assert.match(buildHelper.slice(theiaBuildIndex, publishIndex), /cwd:\s*profileDirectory/);
+  assert.match(buildHelper.slice(prepareIndex, rebuildIndex), /--build-id['"],\s*buildId/);
+  assert.match(buildHelper.slice(rebuildIndex, theiaBuildIndex), /cwd:\s*buildDirectory/);
+  assert.match(buildHelper.slice(theiaBuildIndex, publishIndex), /cwd:\s*buildDirectory/);
+  assert.match(buildHelper.slice(publishIndex), /--build-id['"],\s*buildId/);
+  assert.match(buildHelper.slice(publishIndex), /--source-dir['"],\s*buildDirectory/);
   for (const obsolete of ['RIDE_TAURI_' + 'ENABLE_PLUGINS', 'RIDE_TAURI_' + 'LEAN']) {
     assert.doesNotMatch(buildHelper, new RegExp(obsolete));
   }
@@ -104,8 +109,11 @@ test('packaged Tauri builds preserve the complete plugin dependency graph', () =
     'utf8'
   );
   assert.match(profileGenerator, /export async function publishProfileBuild/);
-  assert.match(profileGenerator, /\.ride-tauri-lib\.tmp-/);
-  assert.match(profileGenerator, /rename\(temporaryLib,\s*destinationLib\)/);
+  assert.match(profileGenerator, /export async function acquirePublishLock/);
+  assert.match(profileGenerator, /\.ride-tauri-publish\.lock/);
+  assert.match(profileGenerator, /replaceDirectoryTransactional\(plan/);
+  assert.match(profileGenerator, /recoverDirectoryTransactions/);
+  assert.match(profileGenerator, /validateProfileBuildManifest/);
 
   const profile = JSON.parse(fs.readFileSync(
     path.join(repositoryRoot, 'app', 'applications', 'browser', 'tauri-profile.json'),

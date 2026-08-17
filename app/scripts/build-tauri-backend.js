@@ -5,6 +5,7 @@
  */
 
 const path = require('node:path');
+const crypto = require('node:crypto');
 const { spawnSync } = require('node:child_process');
 
 const browserDirectory = path.resolve(__dirname, '..', 'applications', 'browser');
@@ -22,20 +23,26 @@ function resolveProfileName(profile, environment) {
   return selected;
 }
 
-function createBuildPlan(platform = process.platform, profile, environment = process.env) {
+function createBuildPlan(platform = process.platform, profile, environment = process.env, options = {}) {
   const selectedProfile = resolveProfileName(profile, environment);
+  const buildId = (options.buildIdFactory ?? crypto.randomUUID)();
+  if (typeof buildId !== 'string' || !/^[a-z0-9][a-z0-9._-]{0,127}$/.test(buildId)) {
+    throw new Error(`Tauri profile build id "${buildId}" is not canonical.`);
+  }
+  const buildDirectory = path.join(profileDirectory, 'builds', buildId);
   const inheritedEnvironment = Object.fromEntries(
     Object.entries(environment).filter(([name]) => !/^RIDE_TAURI_(?:LEAN|ENABLE_PLUGINS)$/.test(name)),
   );
   const buildEnvironment = {
     ...inheritedEnvironment,
     RIDE_TAURI_FRONTEND_PROFILE: selectedProfile,
+    RIDE_TAURI_BUILD_ID: buildId,
   };
 
   return [
     {
       command: process.execPath,
-      args: [profileScript, 'prepare', '--profile', selectedProfile],
+      args: [profileScript, 'prepare', '--profile', selectedProfile, '--build-id', buildId],
       cwd: browserDirectory,
       env: buildEnvironment,
       shell: false,
@@ -43,20 +50,26 @@ function createBuildPlan(platform = process.platform, profile, environment = pro
     {
       command: process.execPath,
       args: [theiaCli, 'rebuild:browser', '--cacheRoot', appDirectory],
-      cwd: profileDirectory,
+      cwd: buildDirectory,
       env: buildEnvironment,
       shell: false,
     },
     {
       command: process.execPath,
       args: [theiaCli, 'build', '--app-target=browser'],
-      cwd: profileDirectory,
+      cwd: buildDirectory,
       env: buildEnvironment,
       shell: false,
     },
     {
       command: process.execPath,
-      args: [profileScript, 'publish', '--profile', selectedProfile],
+      args: [
+        profileScript,
+        'publish',
+        '--profile', selectedProfile,
+        '--build-id', buildId,
+        '--source-dir', buildDirectory,
+      ],
       cwd: browserDirectory,
       env: buildEnvironment,
       shell: false,
@@ -97,7 +110,7 @@ function runBuild(platform = process.platform, spawn = spawnSync, profile, envir
     }
     if (result.status !== 0) {
       process.exitCode = result.status ?? 1;
-      return result.status;
+      return result.status ?? 1;
     }
   }
   return 0;

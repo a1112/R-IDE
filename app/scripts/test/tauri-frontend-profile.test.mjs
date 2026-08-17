@@ -3,12 +3,19 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { createRequire } from 'node:module';
 
 import {
+    acquirePublishLock,
     canonicalDigest,
-    createAtomicDirectoryPlan,
+    createDirectoryTransactionPlan,
     generateProfileTarget,
+    publishProfileBuild,
+    parseProfileCliArguments,
+    recoverDirectoryTransactions,
+    replaceDirectoryTransactional,
     resolveProfile,
+    retryFilesystemOperation,
 } from '../tauri-frontend-profile.mjs';
 
 function manifest(name, dependencies = {}, extra = {}) {
@@ -115,28 +122,40 @@ test('rejects required missing dependencies and reports the dependency path', ()
     );
 });
 
-test('limits the application closure to browser roots instead of unrelated runtime packages', () => {
+test('records runtime closure packages without declaring them as Theia extensions', () => {
     const result = resolveProfile(fixture({
-        dependencies: { product: '^1.0.0', shared: '^1.0.0' },
+        dependencies: { product: '^1.0.0' },
         packages: {
             product: manifest('product', { electron: '42.3.0' }),
+            electron: { name: 'electron', version: '42.3.0' },
         },
     }));
 
     assert.deepEqual(result.extensions, ['product']);
-    assert.deepEqual(result.packages, [{ requestName: 'product', packageName: 'product', version: '1.2.3' }]);
+    assert.deepEqual(result.packages.map(entry => entry.requestName), ['electron', 'product']);
 });
 
-test('does not collapse nested runtime versions into the Theia extension graph', () => {
+test('does not declare a package with an empty Theia contribution list as an extension', () => {
     const result = resolveProfile(fixture({
+        dependencies: { product: '^1.0.0' },
+        packages: {
+            product: manifest('product', { runtime: '^1.0.0' }),
+            runtime: { name: 'runtime', version: '1.1.0', theiaExtensions: [] },
+        },
+    }));
+
+    assert.deepEqual(result.extensions, ['product']);
+    assert.deepEqual(result.packages.map(entry => entry.requestName), ['runtime', 'product']);
+});
+
+test('rejects an installed runtime that violates its parent dependency range', () => {
+    assert.throws(() => resolveProfile(fixture({
         dependencies: { product: '^1.0.0', utility: '^9.0.0' },
         packages: {
             product: manifest('product', { utility: '^4.0.0' }),
             utility: { name: 'utility', version: '9.1.0' },
         },
-    }));
-
-    assert.deepEqual(result.extensions, ['product']);
+    })), /product -> utility.*9\.1\.0.*parent dependency.*\^4\.0\.0/i);
 });
 
 test('uses exact package names for deferred conflicts without prefix matching', () => {
@@ -283,6 +302,7 @@ test('resolves npm aliases and validates alias target name and version', () => {
         requestName: 'core-alias',
         packageName: '@theia/core',
         version: '1.2.3',
+        dependencyPath: ['product', 'core-alias'],
     });
 
     input.packageManifests['core-alias'] = manifest('@theia/core', {}, { version: '2.0.0' });
@@ -352,26 +372,490 @@ test('includes the complete @theia/plugin-ext transitive browser-root closure', 
     ]);
 });
 
-test('constrains atomic target paths to the ignored profile directory', () => {
-    const browserDirectory = path.resolve('browser-app');
-    const plan = createAtomicDirectoryPlan(browserDirectory, '.ride-tauri-profile', 'unit');
+test('discovers a transitive Theia extension outside the browser root manifest', () => {
+    const result = resolveProfile(fixture({
+        roots: ['product'],
+        dependencies: { product: '^1.0.0' },
+        packages: {
+            product: manifest('product', { helper: '^1.0.0' }),
+            helper: {
+                name: 'helper',
+                version: '1.4.0',
+                dependencies: { 'nested-theia': '^2.0.0' },
+            },
+            'nested-theia': manifest('nested-theia', {}, { version: '2.3.0' }),
+        },
+    }));
 
-    assert.equal(plan.targetDirectory, path.join(browserDirectory, '.ride-tauri-profile'));
-    assert.equal(path.dirname(plan.temporaryDirectory), browserDirectory);
-    assert.match(path.basename(plan.temporaryDirectory), /^\.ride-tauri-profile\.tmp-unit-/);
-    assert.throws(() => createAtomicDirectoryPlan(browserDirectory, '..', 'unit'), /\.ride-tauri-profile/i);
-    assert.throws(() => createAtomicDirectoryPlan(browserDirectory, 'profile', 'unit'), /\.ride-tauri-profile/i);
+    assert.deepEqual(result.extensions, ['nested-theia', 'product']);
+    assert.deepEqual(result.packages.map(entry => entry.requestName), [
+        'nested-theia',
+        'helper',
+        'product',
+    ]);
+    assert.deepEqual(result.packages.find(entry => entry.requestName === 'nested-theia').dependencyPath, [
+        'product',
+        'helper',
+        'nested-theia',
+    ]);
+});
+
+test('uses npm default prerelease range semantics', () => {
+    assert.throws(() => resolveProfile(fixture({
+        dependencies: { product: '^1.2.0' },
+        packages: { product: manifest('product', {}, { version: '1.3.0-beta.1' }) },
+    })), /product.*1\.3\.0-beta\.1.*does not satisfy.*\^1\.2\.0/i);
+
+    const explicit = resolveProfile(fixture({
+        dependencies: { product: '^1.3.0-beta.1' },
+        packages: { product: manifest('product', {}, { version: '1.3.0-beta.2' }) },
+    }));
+    assert.deepEqual(explicit.extensions, ['product']);
+});
+
+async function writeSentinel(directory, value) {
+    await fs.promises.mkdir(directory, { recursive: true });
+    await fs.promises.writeFile(path.join(directory, 'sentinel.txt'), value);
+}
+
+test('directory transaction replaces a target and removes its recovery artifacts', async t => {
+    const parentDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-transaction-ok-'));
+    t.after(() => fs.promises.rm(parentDirectory, { recursive: true, force: true }));
+    const plan = createDirectoryTransactionPlan(parentDirectory, 'lib', 'success');
+    await writeSentinel(plan.targetDirectory, 'old');
+    await writeSentinel(plan.temporaryDirectory, 'new');
+
+    await replaceDirectoryTransactional(plan);
+
+    assert.equal(await fs.promises.readFile(path.join(plan.targetDirectory, 'sentinel.txt'), 'utf8'), 'new');
+    assert.equal(fs.existsSync(plan.backupDirectory), false);
+    assert.equal(fs.existsSync(plan.markerPath), false);
+});
+
+test('directory transaction restores original bytes when install rename fails', async t => {
+    const parentDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-transaction-rollback-'));
+    t.after(() => fs.promises.rm(parentDirectory, { recursive: true, force: true }));
+    const plan = createDirectoryTransactionPlan(parentDirectory, 'lib', 'install-fails');
+    await writeSentinel(plan.targetDirectory, 'old-bytes');
+    await writeSentinel(plan.temporaryDirectory, 'new-bytes');
+    let renameCount = 0;
+    const filesystem = {
+        ...fs.promises,
+        rename: async (source, destination) => {
+            renameCount += 1;
+            if (renameCount === 2) {
+                throw Object.assign(new Error('install failed'), { code: 'EIO' });
+            }
+            return fs.promises.rename(source, destination);
+        },
+    };
+
+    await assert.rejects(replaceDirectoryTransactional(plan, { filesystem }), /install failed/);
+
+    assert.equal(await fs.promises.readFile(path.join(plan.targetDirectory, 'sentinel.txt'), 'utf8'), 'old-bytes');
+    assert.equal(await fs.promises.readFile(path.join(plan.temporaryDirectory, 'sentinel.txt'), 'utf8'), 'new-bytes');
+    assert.equal(fs.existsSync(plan.backupDirectory), false);
+});
+
+test('directory transaction preserves original and rollback errors for recovery', async t => {
+    const parentDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-transaction-double-fail-'));
+    t.after(() => fs.promises.rm(parentDirectory, { recursive: true, force: true }));
+    const plan = createDirectoryTransactionPlan(parentDirectory, 'lib', 'rollback-fails');
+    await writeSentinel(plan.targetDirectory, 'old');
+    await writeSentinel(plan.temporaryDirectory, 'new');
+    let renameCount = 0;
+    const filesystem = {
+        ...fs.promises,
+        rename: async (source, destination) => {
+            renameCount += 1;
+            if (renameCount === 2) {
+                throw Object.assign(new Error('install failed'), { code: 'EIO' });
+            }
+            if (renameCount === 3) {
+                throw Object.assign(new Error('rollback failed'), { code: 'EACCES' });
+            }
+            return fs.promises.rename(source, destination);
+        },
+    };
+
+    await assert.rejects(replaceDirectoryTransactional(plan, { filesystem }), error => {
+        assert.ok(error instanceof AggregateError);
+        assert.match(error.errors[0].message, /install failed/);
+        assert.match(error.errors[1].message, /rollback failed/);
+        return true;
+    });
+    assert.equal(fs.existsSync(plan.targetDirectory), false);
+    assert.equal(await fs.promises.readFile(path.join(plan.backupDirectory, 'sentinel.txt'), 'utf8'), 'old');
+    assert.equal(fs.existsSync(plan.markerPath), true);
+});
+
+test('cleanup failure leaves an installed marker that startup recovery completes', async t => {
+    const parentDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-transaction-cleanup-'));
+    t.after(() => fs.promises.rm(parentDirectory, { recursive: true, force: true }));
+    const plan = createDirectoryTransactionPlan(parentDirectory, 'lib', 'cleanup-fails');
+    await writeSentinel(plan.targetDirectory, 'old');
+    await writeSentinel(plan.temporaryDirectory, 'new');
+    const filesystem = {
+        ...fs.promises,
+        rm: async (candidate, options) => {
+            if (path.resolve(candidate) === path.resolve(plan.backupDirectory)) {
+                throw Object.assign(new Error('cleanup failed'), { code: 'EACCES' });
+            }
+            return fs.promises.rm(candidate, options);
+        },
+    };
+
+    await assert.rejects(replaceDirectoryTransactional(plan, { filesystem }), /cleanup failed/);
+    assert.equal(await fs.promises.readFile(path.join(plan.targetDirectory, 'sentinel.txt'), 'utf8'), 'new');
+    assert.equal(fs.existsSync(plan.backupDirectory), true);
+    assert.equal(JSON.parse(await fs.promises.readFile(plan.markerPath, 'utf8')).state, 'installed');
+
+    await recoverDirectoryTransactions({ parentDirectory, targetName: 'lib' });
+    assert.equal(fs.existsSync(plan.backupDirectory), false);
+    assert.equal(fs.existsSync(plan.markerPath), false);
+});
+
+test('startup recovery restores a backed-up target when the target is missing', async t => {
+    const parentDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-transaction-orphan-'));
+    t.after(() => fs.promises.rm(parentDirectory, { recursive: true, force: true }));
+    const plan = createDirectoryTransactionPlan(parentDirectory, 'lib', 'orphaned');
+    await writeSentinel(plan.backupDirectory, 'old');
+    await writeSentinel(plan.temporaryDirectory, 'new');
+    await fs.promises.writeFile(plan.markerPath, `${JSON.stringify({
+        schema: 'ride.directory-transaction@1',
+        targetName: 'lib',
+        transactionId: 'orphaned',
+        state: 'backed-up',
+    })}\n`);
+
+    await recoverDirectoryTransactions({ parentDirectory, targetName: 'lib' });
+
+    assert.equal(await fs.promises.readFile(path.join(plan.targetDirectory, 'sentinel.txt'), 'utf8'), 'old');
+    assert.equal(fs.existsSync(plan.temporaryDirectory), false);
+    assert.equal(fs.existsSync(plan.markerPath), false);
+});
+
+test('Windows filesystem retry is bounded to EPERM and EBUSY', async () => {
+    let attempts = 0;
+    const delays = [];
+    const value = await retryFilesystemOperation(async () => {
+        attempts += 1;
+        if (attempts < 3) {
+            throw Object.assign(new Error('locked'), { code: attempts === 1 ? 'EPERM' : 'EBUSY' });
+        }
+        return 'done';
+    }, {
+        platform: 'win32',
+        maxAttempts: 3,
+        delayMs: 7,
+        sleep: async delay => delays.push(delay),
+    });
+
+    assert.equal(value, 'done');
+    assert.equal(attempts, 3);
+    assert.deepEqual(delays, [7, 14]);
+    let immediateAttempts = 0;
+    await assert.rejects(retryFilesystemOperation(async () => {
+        immediateAttempts += 1;
+        throw Object.assign(new Error('bad path'), { code: 'ENOENT' });
+    }, { platform: 'win32', maxAttempts: 5, sleep: async () => {} }), /bad path/);
+    assert.equal(immediateAttempts, 1);
+});
+
+function profileBuildManifest({ profile = 'tauri-critical', buildId = 'publish-build', commit = 'd'.repeat(40) } = {}) {
+    const contract = {
+        schema: 'ride.tauri-frontend-profile@2',
+        profile,
+        roots: ['product'],
+        extensions: ['product'],
+        packages: [{
+            requestName: 'product',
+            packageName: 'product',
+            version: '1.2.3',
+            dependencyPath: ['product'],
+        }],
+        featureGroups: {},
+    };
+    return {
+        schema: 'ride.tauri-profile',
+        version: 1,
+        commit,
+        sourceIdentity: { commit, clean: true },
+        buildId,
+        profile,
+        digest: canonicalDigest(contract),
+        roots: contract.roots,
+        extensions: contract.extensions,
+        packages: contract.packages,
+        featureGroups: contract.featureGroups,
+    };
+}
+
+async function createPublishSource(browserDirectory, manifest, marker = manifest.profile) {
+    const sourceDirectory = path.join(browserDirectory, '.ride-tauri-profile', 'builds', manifest.buildId);
+    await fs.promises.mkdir(path.join(sourceDirectory, 'lib', 'frontend'), { recursive: true });
+    await fs.promises.mkdir(path.join(sourceDirectory, 'lib', 'backend'), { recursive: true });
+    await fs.promises.writeFile(path.join(sourceDirectory, 'lib', 'frontend', 'index.html'), marker);
+    await fs.promises.writeFile(path.join(sourceDirectory, 'lib', 'backend', 'main.js'), marker);
+    await fs.promises.writeFile(path.join(sourceDirectory, 'ride-tauri-profile.json'), `${JSON.stringify(manifest, null, 2)}\n`);
+    return sourceDirectory;
+}
+
+test('publish validates identity and writes byte-identical manifests before cleaning its build', async t => {
+    const browserDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-publish-ok-'));
+    t.after(() => fs.promises.rm(browserDirectory, { recursive: true, force: true }));
+    const manifest = profileBuildManifest();
+    const sourceDirectory = await createPublishSource(browserDirectory, manifest);
+
+    const result = await publishProfileBuild({
+        browserDirectory,
+        expectedProfile: manifest.profile,
+        buildId: manifest.buildId,
+        sourceDirectory,
+        sourceIdentity: async () => manifest.sourceIdentity,
+    });
+
+    assert.equal(result.profile, manifest.profile);
+    assert.equal(result.buildId, manifest.buildId);
+    const destination = path.join(browserDirectory, 'lib');
+    const copies = await Promise.all([
+        path.join(destination, 'ride-tauri-profile.json'),
+        path.join(destination, 'frontend', 'ride-tauri-profile.json'),
+        path.join(destination, 'backend', 'ride-tauri-profile.json'),
+    ].map(candidate => fs.promises.readFile(candidate)));
+    assert.equal(copies[0].equals(copies[1]), true);
+    assert.equal(copies[0].equals(copies[2]), true);
+    assert.equal(JSON.parse(copies[0]).commit, manifest.commit);
+    assert.equal(fs.existsSync(sourceDirectory), false);
+});
+
+test('publish rejects profile mismatch, stale commit, and corrupt digest without replacing lib', async t => {
+    const browserDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-publish-reject-'));
+    t.after(() => fs.promises.rm(browserDirectory, { recursive: true, force: true }));
+    await writeSentinel(path.join(browserDirectory, 'lib'), 'previous');
+
+    const wrongProfile = profileBuildManifest({ buildId: 'wrong-profile', profile: 'full' });
+    await assert.rejects(publishProfileBuild({
+        browserDirectory,
+        expectedProfile: 'tauri-critical',
+        buildId: wrongProfile.buildId,
+        sourceDirectory: await createPublishSource(browserDirectory, wrongProfile),
+        sourceIdentity: async () => wrongProfile.sourceIdentity,
+    }), /profile.*mismatch/i);
+
+    const stale = profileBuildManifest({ buildId: 'stale-build', commit: 'e'.repeat(40) });
+    await assert.rejects(publishProfileBuild({
+        browserDirectory,
+        expectedProfile: stale.profile,
+        buildId: stale.buildId,
+        sourceDirectory: await createPublishSource(browserDirectory, stale),
+        sourceIdentity: async () => ({ commit: 'f'.repeat(40), clean: true }),
+    }), /stale|commit.*mismatch/i);
+
+    const corrupt = profileBuildManifest({ buildId: 'corrupt-build' });
+    corrupt.digest = '0'.repeat(64);
+    await assert.rejects(publishProfileBuild({
+        browserDirectory,
+        expectedProfile: corrupt.profile,
+        buildId: corrupt.buildId,
+        sourceDirectory: await createPublishSource(browserDirectory, corrupt),
+        sourceIdentity: async () => corrupt.sourceIdentity,
+    }), /digest.*mismatch/i);
+
+    assert.equal(await fs.promises.readFile(path.join(browserDirectory, 'lib', 'sentinel.txt'), 'utf8'), 'previous');
+});
+
+test('publish rejects malformed manifest fields and a non-canonical source directory', async t => {
+    const browserDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-publish-malformed-'));
+    t.after(() => fs.promises.rm(browserDirectory, { recursive: true, force: true }));
+    const malformed = { ...profileBuildManifest({ buildId: 'malformed-build' }), unexpected: true };
+    const sourceDirectory = await createPublishSource(browserDirectory, malformed);
+    await assert.rejects(publishProfileBuild({
+        browserDirectory,
+        expectedProfile: malformed.profile,
+        buildId: malformed.buildId,
+        sourceDirectory,
+        sourceIdentity: async () => malformed.sourceIdentity,
+    }), /manifest fields|unsupported.*unexpected/i);
+
+    const valid = profileBuildManifest({ buildId: 'source-build' });
+    const canonicalSource = await createPublishSource(browserDirectory, valid);
+    await assert.rejects(publishProfileBuild({
+        browserDirectory,
+        expectedProfile: valid.profile,
+        buildId: valid.buildId,
+        sourceDirectory: path.join(browserDirectory, 'elsewhere'),
+        sourceIdentity: async () => valid.sourceIdentity,
+    }), /source directory.*canonical/i);
+    assert.equal(fs.existsSync(canonicalSource), true);
+});
+
+test('publish lock safely recovers a stale dead owner and writes canonical ownership', async t => {
+    const browserDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-publish-lock-'));
+    t.after(() => fs.promises.rm(browserDirectory, { recursive: true, force: true }));
+    const lockDirectory = path.join(browserDirectory, '.ride-tauri-publish.lock');
+    await fs.promises.mkdir(lockDirectory);
+    await fs.promises.writeFile(path.join(lockDirectory, 'owner.json'), `${JSON.stringify({
+        schema: 'ride.tauri-publish-lock@1',
+        pid: 999999,
+        buildId: 'dead-build',
+        profile: 'tauri-critical',
+        commit: '1'.repeat(40),
+        acquiredAt: 100,
+    })}\n`);
+
+    const release = await acquirePublishLock({
+        browserDirectory,
+        owner: {
+            buildId: 'live-build',
+            profile: 'full',
+            commit: '2'.repeat(40),
+        },
+        now: () => 10_000,
+        staleMs: 1_000,
+        timeoutMs: 2_000,
+        sleep: async () => {},
+        isProcessAlive: () => false,
+    });
+
+    const owner = JSON.parse(await fs.promises.readFile(path.join(lockDirectory, 'owner.json'), 'utf8'));
+    assert.deepEqual(owner, {
+        schema: 'ride.tauri-publish-lock@1',
+        pid: process.pid,
+        buildId: 'live-build',
+        profile: 'full',
+        commit: '2'.repeat(40),
+        acquiredAt: 10_000,
+    });
+    await release();
+    assert.equal(fs.existsSync(lockDirectory), false);
+});
+
+test('publish lock waits for owner metadata initialization instead of failing ENOENT', async t => {
+    const browserDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-publish-lock-race-'));
+    t.after(() => fs.promises.rm(browserDirectory, { recursive: true, force: true }));
+    const lockDirectory = path.join(browserDirectory, '.ride-tauri-publish.lock');
+    await fs.promises.mkdir(lockDirectory);
+    let waits = 0;
+    const release = await acquirePublishLock({
+        browserDirectory,
+        owner: { buildId: 'next-build', profile: 'full', commit: '4'.repeat(40) },
+        now: () => 10_000,
+        staleMs: 1_000,
+        timeoutMs: 2_000,
+        isProcessAlive: () => false,
+        sleep: async () => {
+            waits += 1;
+            if (waits === 1) {
+                await fs.promises.writeFile(path.join(lockDirectory, 'owner.json'), `${JSON.stringify({
+                    schema: 'ride.tauri-publish-lock@1',
+                    pid: 999999,
+                    buildId: 'initializing-build',
+                    profile: 'tauri-critical',
+                    commit: '4'.repeat(40),
+                    acquiredAt: 100,
+                })}\n`);
+            }
+        },
+    });
+
+    assert.ok(waits >= 1);
+    await release();
+});
+
+test('concurrent publishes serialize and never mix profile outputs', async t => {
+    const browserDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-publish-concurrent-'));
+    t.after(() => fs.promises.rm(browserDirectory, { recursive: true, force: true }));
+    const firstManifest = profileBuildManifest({ buildId: 'first-build', profile: 'tauri-critical', commit: '3'.repeat(40) });
+    const secondManifest = profileBuildManifest({ buildId: 'second-build', profile: 'full', commit: '3'.repeat(40) });
+    const firstSource = await createPublishSource(browserDirectory, firstManifest, 'first-build');
+    const secondSource = await createPublishSource(browserDirectory, secondManifest, 'second-build');
+    let allowFirstCopy;
+    const firstCopyGate = new Promise(resolve => { allowFirstCopy = resolve; });
+    let firstEntered;
+    const firstEnteredPromise = new Promise(resolve => { firstEntered = resolve; });
+    let secondCopyStarted = false;
+    const copyTree = async (source, destination) => {
+        if (path.resolve(source) === path.resolve(path.join(firstSource, 'lib'))) {
+            firstEntered();
+            await firstCopyGate;
+        } else if (path.resolve(source) === path.resolve(path.join(secondSource, 'lib'))) {
+            secondCopyStarted = true;
+        }
+        await fs.promises.cp(source, destination, { recursive: true, errorOnExist: true });
+    };
+    const common = {
+        browserDirectory,
+        sourceIdentity: async () => ({ commit: '3'.repeat(40), clean: true }),
+        copyTree,
+        lockOptions: { retryDelayMs: 2, timeoutMs: 2_000 },
+    };
+    const first = publishProfileBuild({
+        ...common,
+        expectedProfile: firstManifest.profile,
+        buildId: firstManifest.buildId,
+        sourceDirectory: firstSource,
+    });
+    await firstEnteredPromise;
+    const second = publishProfileBuild({
+        ...common,
+        expectedProfile: secondManifest.profile,
+        buildId: secondManifest.buildId,
+        sourceDirectory: secondSource,
+    });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(secondCopyStarted, false, 'second publish must wait outside the copy/install section');
+    allowFirstCopy();
+    await Promise.all([first, second]);
+
+    const destination = path.join(browserDirectory, 'lib');
+    const rootManifest = JSON.parse(await fs.promises.readFile(path.join(destination, 'ride-tauri-profile.json'), 'utf8'));
+    const frontendMarker = await fs.promises.readFile(path.join(destination, 'frontend', 'index.html'), 'utf8');
+    const backendMarker = await fs.promises.readFile(path.join(destination, 'backend', 'main.js'), 'utf8');
+    assert.equal(rootManifest.buildId, 'second-build');
+    assert.equal(rootManifest.profile, 'full');
+    assert.equal(frontendMarker, 'second-build');
+    assert.equal(backendMarker, 'second-build');
+    assert.equal(fs.existsSync(firstSource), false);
+    assert.equal(fs.existsSync(secondSource), false);
+});
+
+test('CLI requires and preserves profile build identity arguments', () => {
+    assert.deepEqual(parseProfileCliArguments([
+        'prepare', '--profile', 'tauri-critical', '--build-id', 'cli-build',
+    ], {}), {
+        command: 'prepare',
+        profileName: 'tauri-critical',
+        buildId: 'cli-build',
+        sourceDirectory: undefined,
+    });
+    assert.deepEqual(parseProfileCliArguments([
+        'publish', '--profile', 'full', '--build-id', 'cli-full', '--source-dir', 'C:\\builds\\cli-full',
+    ], {}), {
+        command: 'publish',
+        profileName: 'full',
+        buildId: 'cli-full',
+        sourceDirectory: 'C:\\builds\\cli-full',
+    });
+    assert.throws(() => parseProfileCliArguments(['publish', '--profile', 'full'], {}), /--build-id/i);
+    assert.throws(() => parseProfileCliArguments([
+        'publish', '--profile', 'full', '--build-id', 'cli-full',
+    ], {}), /--source-dir/i);
 });
 
 test('generates an isolated target without writing tracked package.json or src-gen', async t => {
     const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-profile-test-'));
     t.after(() => fs.promises.rm(root, { recursive: true, force: true }));
     const browserDirectory = path.join(root, 'app', 'applications', 'browser');
-    const packageDirectory = path.join(root, 'installed', 'product');
+    const packageDirectories = {
+        product: path.join(root, 'installed', 'product'),
+        shared: path.join(root, 'installed', 'shared'),
+        '@theia/cli': path.join(root, 'installed', 'theia-cli'),
+    };
     await fs.promises.mkdir(path.join(browserDirectory, 'resources'), { recursive: true });
     await fs.promises.mkdir(path.join(browserDirectory, 'ico'), { recursive: true });
     await fs.promises.mkdir(path.join(browserDirectory, 'src-gen'), { recursive: true });
-    await fs.promises.mkdir(packageDirectory, { recursive: true });
+    await Promise.all(Object.values(packageDirectories).map(directory => fs.promises.mkdir(directory, { recursive: true })));
     await fs.promises.writeFile(path.join(browserDirectory, 'package.json'), JSON.stringify({
         name: 'browser-app',
         version: '1.0.0',
@@ -390,26 +874,31 @@ test('generates an isolated target without writing tracked package.json or src-g
     await fs.promises.writeFile(path.join(browserDirectory, 'resources', 'preload.html'), '<main></main>\n');
     await fs.promises.writeFile(path.join(browserDirectory, 'ico', 'favicon.ico'), 'ico');
     await fs.promises.writeFile(path.join(browserDirectory, 'src-gen', 'sentinel.txt'), 'tracked generated sentinel');
-    await fs.promises.writeFile(path.join(packageDirectory, 'package.json'), JSON.stringify(manifest('product')));
+    const installedManifests = {
+        product: manifest('product', { shared: '^1.0.0' }),
+        shared: manifest('shared'),
+        '@theia/cli': { name: '@theia/cli', version: '1.2.3' },
+    };
+    await Promise.all(Object.entries(installedManifests).map(([requestName, installedManifest]) => (
+        fs.promises.writeFile(path.join(packageDirectories[requestName], 'package.json'), JSON.stringify(installedManifest))
+    )));
     const originalPackage = await fs.promises.readFile(path.join(browserDirectory, 'package.json'), 'utf8');
 
     const result = await generateProfileTarget({
         browserDirectory,
         profileName: 'tauri-critical',
+        buildId: 'isolated-build',
+        sourceIdentity: async () => ({ commit: '9'.repeat(40), clean: true }),
         resolveInstalledManifest: async (requestName, fromDirectory) => ({
-            manifest: requestName === '@theia/cli'
-                ? manifest('@theia/cli')
-                : requestName === 'shared'
-                    ? manifest('shared', {}, { version: fromDirectory === browserDirectory ? '1.2.3' : '0.5.0' })
-                    : manifest('product', { shared: '^1.0.0' }),
-            packageDirectory,
+            manifest: installedManifests[requestName],
+            packageDirectory: packageDirectories[requestName],
             requestName,
         }),
     });
 
     assert.equal(await fs.promises.readFile(path.join(browserDirectory, 'package.json'), 'utf8'), originalPackage);
     assert.equal(await fs.promises.readFile(path.join(browserDirectory, 'src-gen', 'sentinel.txt'), 'utf8'), 'tracked generated sentinel');
-    assert.equal(result.targetDirectory, path.join(browserDirectory, '.ride-tauri-profile'));
+    assert.equal(result.targetDirectory, path.join(browserDirectory, '.ride-tauri-profile', 'builds', 'isolated-build'));
     const generatedPackage = JSON.parse(await fs.promises.readFile(path.join(result.targetDirectory, 'package.json'), 'utf8'));
     assert.deepEqual(generatedPackage.dependencies, { shared: '^1.0.0', product: '^1.0.0' });
     assert.deepEqual(generatedPackage.devDependencies, { '@theia/cli': '^1.0.0' });
@@ -423,8 +912,125 @@ test('generates an isolated target without writing tracked package.json or src-g
     assert.equal(profileManifest.schema, 'ride.tauri-profile');
     assert.equal(profileManifest.version, 1);
     assert.equal(profileManifest.profile, 'tauri-critical');
-    assert.match(profileManifest.commit, /^[0-9a-f]{40}$/);
+    assert.equal(profileManifest.commit, '9'.repeat(40));
+    assert.deepEqual(profileManifest.sourceIdentity, { commit: '9'.repeat(40), clean: true });
+    assert.equal(profileManifest.buildId, 'isolated-build');
     assert.match(profileManifest.digest, /^[0-9a-f]{64}$/);
     assert.deepEqual(profileManifest.featureGroups, result.featureGroups);
     assert.equal(fs.existsSync(path.join(result.targetDirectory, 'src-gen', 'sentinel.txt')), false);
+});
+
+test('generates and resolves a nested transitive Theia extension from its installed directory', async t => {
+    const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-profile-nested-'));
+    t.after(() => fs.promises.rm(root, { recursive: true, force: true }));
+    const browserDirectory = path.join(root, 'app', 'applications', 'browser');
+    const installedRoot = path.join(root, 'installed');
+    const directories = Object.fromEntries(['product', 'helper', 'nested-theia', '@theia-cli'].map(name => [
+        name,
+        path.join(installedRoot, name),
+    ]));
+    await fs.promises.mkdir(path.join(browserDirectory, 'resources'), { recursive: true });
+    await fs.promises.mkdir(path.join(browserDirectory, 'ico'), { recursive: true });
+    for (const directory of Object.values(directories)) {
+        await fs.promises.mkdir(directory, { recursive: true });
+    }
+    const browserManifest = {
+        name: 'browser-app',
+        version: '1.0.0',
+        dependencies: { product: '^1.0.0' },
+        devDependencies: { '@theia/cli': '^1.0.0' },
+    };
+    const manifests = {
+        product: manifest('product', { helper: '^1.0.0' }),
+        helper: { name: 'helper', version: '1.4.0', dependencies: { 'nested-theia': '^2.0.0' } },
+        'nested-theia': manifest('nested-theia', {}, { version: '2.3.0' }),
+        '@theia/cli': { name: '@theia/cli', version: '1.2.3' },
+    };
+    await fs.promises.writeFile(path.join(browserDirectory, 'package.json'), JSON.stringify(browserManifest));
+    await fs.promises.writeFile(path.join(browserDirectory, 'tauri-profile.json'), JSON.stringify({
+        schema: 'ride.tauri-frontend-profile@2',
+        profiles: { 'tauri-critical': { roots: ['product'] }, full: { includeAllBrowserRoots: true } },
+        featureGroups: {},
+        buildDevDependencies: ['@theia/cli'],
+    }));
+    await fs.promises.writeFile(path.join(browserDirectory, 'esbuild.mjs'), 'export {};\n');
+    await fs.promises.writeFile(path.join(browserDirectory, 'ride-esbuild-dedupe.mjs'), 'export {};\n');
+    for (const [requestName, packageManifest] of Object.entries(manifests)) {
+        await fs.promises.writeFile(path.join(directories[requestName === '@theia/cli' ? '@theia-cli' : requestName], 'package.json'), JSON.stringify(packageManifest));
+    }
+
+    const result = await generateProfileTarget({
+        browserDirectory,
+        profileName: 'tauri-critical',
+        buildId: 'nested-build',
+        sourceIdentity: async () => ({ commit: 'a'.repeat(40), clean: true }),
+        resolveInstalledManifest: async requestName => ({
+            requestName,
+            packageDirectory: directories[requestName === '@theia/cli' ? '@theia-cli' : requestName],
+            manifest: manifests[requestName],
+        }),
+    });
+
+    assert.equal(result.targetDirectory, path.join(browserDirectory, '.ride-tauri-profile', 'builds', 'nested-build'));
+    const generated = JSON.parse(await fs.promises.readFile(path.join(result.targetDirectory, 'package.json'), 'utf8'));
+    assert.deepEqual(generated.dependencies, {
+        'nested-theia': '2.3.0',
+        product: '^1.0.0',
+    });
+    const targetRequire = createRequire(path.join(result.targetDirectory, 'package.json'));
+    assert.equal(targetRequire.resolve('nested-theia/package.json'), path.join(directories['nested-theia'], 'package.json'));
+});
+
+test('rejects dirty source identity before generating a build target', async t => {
+    const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-profile-dirty-'));
+    t.after(() => fs.promises.rm(root, { recursive: true, force: true }));
+    await assert.rejects(generateProfileTarget({
+        browserDirectory: root,
+        profileName: 'tauri-critical',
+        buildId: 'dirty-build',
+        sourceIdentity: async () => ({ commit: 'b'.repeat(40), clean: false }),
+    }), /tracked source tree.*clean/i);
+});
+
+test('rejects conflicting installed identities for one request name with both paths', async t => {
+    const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-profile-conflict-'));
+    t.after(() => fs.promises.rm(root, { recursive: true, force: true }));
+    const browserDirectory = path.join(root, 'browser');
+    await fs.promises.mkdir(browserDirectory, { recursive: true });
+    await fs.promises.writeFile(path.join(browserDirectory, 'package.json'), JSON.stringify({
+        name: 'browser-app', version: '1.0.0', dependencies: { product: '^1.0.0' }, devDependencies: {},
+    }));
+    await fs.promises.writeFile(path.join(browserDirectory, 'tauri-profile.json'), JSON.stringify({
+        schema: 'ride.tauri-frontend-profile@2',
+        profiles: { 'tauri-critical': { roots: ['product'] } },
+        featureGroups: {},
+    }));
+    await fs.promises.writeFile(path.join(browserDirectory, 'esbuild.mjs'), 'export {};\n');
+    await fs.promises.writeFile(path.join(browserDirectory, 'ride-esbuild-dedupe.mjs'), 'export {};\n');
+    const packageByRequest = {
+        product: manifest('product', { left: '^1.0.0', right: '^1.0.0' }),
+        left: { name: 'left', version: '1.0.0', dependencies: { shared: '^1.0.0' } },
+        right: { name: 'right', version: '1.0.0', dependencies: { shared: 'npm:other@^1.0.0' } },
+    };
+    await assert.rejects(generateProfileTarget({
+        browserDirectory,
+        profileName: 'tauri-critical',
+        buildId: 'conflict-build',
+        sourceIdentity: async () => ({ commit: 'c'.repeat(40), clean: true }),
+        resolveInstalledManifest: async (requestName, fromDirectory) => {
+            if (requestName === 'shared') {
+                const fromRight = path.basename(fromDirectory) === 'right';
+                return {
+                    requestName,
+                    packageDirectory: path.join(root, fromRight ? 'other' : 'shared'),
+                    manifest: { name: fromRight ? 'other' : 'shared', version: '1.2.0' },
+                };
+            }
+            return {
+                requestName,
+                packageDirectory: path.join(root, requestName),
+                manifest: packageByRequest[requestName],
+            };
+        },
+    }), /product -> left -> shared.*product -> right -> shared|product -> right -> shared.*product -> left -> shared/i);
 });
