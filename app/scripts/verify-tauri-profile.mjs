@@ -118,15 +118,19 @@ function loadExtensionContributions(browserDirectory, packageName) {
   }
 }
 
-function verifyExtensionTargets(browserDirectory, expectedPackages, frontendMetadata, backendMetadata, label) {
+function verifyExtensionTargets(browserDirectory, expectedPackages, frontendMetadata, backendMetadata, label, deferredModules) {
   const frontendInputs = Object.keys(frontendMetadata.inputs);
   const backendInputs = Object.keys(backendMetadata.inputs);
   const missing = [];
   for (const packageName of expectedPackages) {
     const contributions = loadExtensionContributions(browserDirectory, packageName);
-    const needsFrontend = contributions.some(contribution =>
-      ['frontend', 'frontendOnly', 'frontendPreload', 'frontendOnlyPreload'].some(field => typeof contribution[field] === 'string')
-    );
+    const frontendFields = ['frontend', 'frontendPreload'];
+    const frontendContributions = contributions.flatMap(contribution =>
+      frontendFields
+        .filter(field => typeof contribution[field] === 'string')
+        .map(field => contribution[field])
+    ).filter(contribution => !deferredModules.has(`${packageName}/${contribution}`));
+    const needsFrontend = frontendContributions.length > 0;
     const needsBackend = contributions.some(contribution => typeof contribution.backend === 'string');
     if (needsFrontend && !frontendInputs.some(input => pathContainsPackage(input, packageName))) {
       missing.push(`${packageName} (frontend-main)`);
@@ -135,8 +139,11 @@ function verifyExtensionTargets(browserDirectory, expectedPackages, frontendMeta
       missing.push(`${packageName} (backend)`);
     }
     for (const contribution of contributions) {
-      for (const field of ['frontend', 'frontendOnly', 'frontendPreload', 'frontendOnlyPreload']) {
+      for (const field of frontendFields) {
         if (typeof contribution[field] === 'string') {
+          if (deferredModules.has(`${packageName}/${contribution[field]}`)) {
+            continue;
+          }
           const expected = contribution[field].endsWith('.js') ? contribution[field] : `${contribution[field]}.js`;
           if (!frontendInputs.some(input => pathContainsPackage(input, packageName) && hasPathSuffix(input, expected))) {
             missing.push(`${packageName}/${contribution[field]} (frontend-main)`);
@@ -249,6 +256,16 @@ function verifyDeferredChunks(manifest, frontendRecord, browserDirectory) {
       if (!Object.keys(detail.inputs).some(input => hasPathSuffix(input, expectedEntry))) {
         throw new Error(`Deferred feature chunk for ${groupName} does not include its expected entry input.`);
       }
+      if (typeof feature.module !== 'string' || !feature.module) {
+        throw new Error(`Deferred feature module metadata is invalid for ${groupName}.`);
+      }
+      const moduleParts = feature.module.split('/');
+      const packageName = feature.module.startsWith('@')
+        ? moduleParts.slice(0, 2).join('/')
+        : moduleParts[0];
+      if (!Object.keys(detail.inputs).some(input => pathContainsPackage(input, packageName))) {
+        throw new Error(`Deferred feature chunk for ${groupName} does not include package ${packageName}.`);
+      }
       assertRegularOutput(browserDirectory, outputPath, `Deferred feature ${groupName}`);
       const digest = crypto.createHash('sha256')
         .update(fs.readFileSync(path.resolve(browserDirectory, outputPath)))
@@ -313,7 +330,7 @@ export function verifyTauriProfileInventory({
     ['lib/backend/plugin-host.js', 'Plugin host', 'node_modules/@theia/plugin-ext/lib/hosted/node/plugin-host.js'],
     ['lib/backend/backend-init-theia.js', 'Theia plugin initialization', 'node_modules/@theia/plugin-ext/lib/hosted/node/scanners/backend-init-theia.js'],
     ['lib/backend/plugin-vscode-init.js', 'VS Code plugin initialization', 'node_modules/@theia/plugin-ext-vscode/lib/node/plugin-vscode-init.js'],
-    ['lib/backend/parcel-watcher.js', 'Parcel watcher', 'node_modules/@theia/filesystem/lib/node/parcel-watcher.js'],
+    ['lib/backend/parcel-watcher.js', 'Parcel watcher', 'node_modules/@theia/filesystem/lib/node/parcel-watcher/index.js'],
   ]) {
     requireOutput(metadataRecords.backend, suffix, label, resolvedBrowserDirectory, entryPoint);
   }
@@ -329,12 +346,17 @@ export function verifyTauriProfileInventory({
   }
 
   const expectedPackages = manifest.profile === 'full' ? manifest.roots : manifest.extensions;
+  const deferredModules = new Set(Object.values(manifest.featureGroups)
+    .flatMap(group => group.deferredFrontendModules ?? [])
+    .map(feature => feature.module)
+    .filter(module => typeof module === 'string' && module));
   verifyExtensionTargets(
     resolvedBrowserDirectory,
     expectedPackages,
     metadataRecords['frontend-main'].metafile,
     metadataRecords.backend.metafile,
     `${manifest.profile} profile`,
+    deferredModules,
   );
   const frontendInputs = Object.keys(metadataRecords['frontend-main'].metafile.inputs);
   if (!frontendInputs.some(input => pathContainsPackage(input, 'theia-ide-product-ext'))) {

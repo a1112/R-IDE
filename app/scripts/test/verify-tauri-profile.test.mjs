@@ -38,7 +38,10 @@ function writeJson(file, value) {
 }
 
 function metadata(manifest, target, inputs, outputs) {
-  const allInputs = [...new Set([...inputs, ...outputs.map(output => output.entryPoint).filter(Boolean)])];
+  const allInputs = [...new Set([
+    ...inputs,
+    ...outputs.flatMap(output => [output.entryPoint, ...(output.additionalInputs ?? [])]).filter(Boolean),
+  ])];
   return {
     schema: 'ride.esbuild-metafile@1',
     profile: manifest.profile,
@@ -52,7 +55,11 @@ function metadata(manifest, target, inputs, outputs) {
         output.path,
         {
           bytes: 1,
-          inputs: output.entryPoint ? { [output.entryPoint]: { bytesInOutput: 1 } } : {},
+          inputs: Object.fromEntries(
+            [output.entryPoint, ...(output.additionalInputs ?? [])]
+              .filter(Boolean)
+              .map(input => [input, { bytesInOutput: 1 }]),
+          ),
           imports: [],
           exports: [],
           ...(output.entryPoint ? { entryPoint: output.entryPoint } : {}),
@@ -104,7 +111,11 @@ function createFixture(profile = 'tauri-critical') {
   const records = {
     'frontend-main': metadata(manifest, 'frontend-main', frontendInputs, [
       { path: 'lib/frontend/bundle.js', entryPoint: 'src-gen/frontend/index.js' },
-      { path: 'lib/frontend/chunks/secondary-window-feature-ABC123.js', entryPoint: 'tauri-src/secondary-window-feature.ts' },
+      {
+        path: 'lib/frontend/chunks/secondary-window-feature-ABC123.js',
+        entryPoint: 'tauri-src/secondary-window-feature.ts',
+        additionalInputs: ['node_modules/@theia/secondary-window/lib/browser/secondary-window-frontend-module.js'],
+      },
     ]),
     'frontend-secondary-window': metadata(manifest, 'frontend-secondary-window', ['node_modules/@theia/secondary-window/lib/browser/index.js'], [
       { path: 'lib/frontend/secondary-window.js', entryPoint: 'src-gen/frontend/secondary-index.js' },
@@ -120,7 +131,7 @@ function createFixture(profile = 'tauri-critical') {
       { path: 'lib/backend/plugin-host.js', entryPoint: 'node_modules/@theia/plugin-ext/lib/hosted/node/plugin-host.js' },
       { path: 'lib/backend/backend-init-theia.js', entryPoint: 'node_modules/@theia/plugin-ext/lib/hosted/node/scanners/backend-init-theia.js' },
       { path: 'lib/backend/plugin-vscode-init.js', entryPoint: 'node_modules/@theia/plugin-ext-vscode/lib/node/plugin-vscode-init.js' },
-      { path: 'lib/backend/parcel-watcher.js', entryPoint: 'node_modules/@theia/filesystem/lib/node/parcel-watcher.js' },
+      { path: 'lib/backend/parcel-watcher.js', entryPoint: 'node_modules/@theia/filesystem/lib/node/parcel-watcher/index.js' },
     ]),
   };
   for (const [name, record] of Object.entries(records)) {
@@ -166,7 +177,11 @@ test('rejects a missing deferred chunk and a deferred-only backend package', () 
 
     fixture.records['frontend-main'] = metadata(fixture.manifest, 'frontend-main', fixture.manifest.extensions.map(extension => `node_modules/${extension}/lib/browser/frontend-module.js`), [
       { path: 'lib/frontend/bundle.js', entryPoint: 'src-gen/frontend/index.js' },
-      { path: 'lib/frontend/chunks/secondary-window-feature-ABC123.js', entryPoint: 'tauri-src/secondary-window-feature.ts' },
+      {
+        path: 'lib/frontend/chunks/secondary-window-feature-ABC123.js',
+        entryPoint: 'tauri-src/secondary-window-feature.ts',
+        additionalInputs: ['node_modules/@theia/secondary-window/lib/browser/secondary-window-frontend-module.js'],
+      },
     ]);
     for (const output of Object.keys(fixture.records['frontend-main'].metafile.outputs)) {
       fixture.records['frontend-main'].outputHashes[output] = crypto.createHash('sha256').update('x').digest('hex');
