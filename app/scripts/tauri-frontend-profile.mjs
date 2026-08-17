@@ -102,7 +102,14 @@ function parseDependencySpec(requestName, spec) {
     };
 }
 
-function validateInstalledManifest(requestName, spec, manifest, dependencyPath, constraint = 'dependency') {
+function validateInstalledManifest(
+    requestName,
+    spec,
+    manifest,
+    dependencyPath,
+    constraint = 'dependency',
+    enforceRange = true,
+) {
     if (!manifest || typeof manifest !== 'object') {
         throw new Error(`${dependencyPath.join(' -> ')}: required dependency is not installed.`);
     }
@@ -117,7 +124,7 @@ function validateInstalledManifest(requestName, spec, manifest, dependencyPath, 
     if (!validRange) {
         throw new Error(`${dependencyPath.join(' -> ')}: dependency "${requestName}" has invalid ${constraint} range "${expected.range}".`);
     }
-    if (!semver.satisfies(manifest.version, validRange)) {
+    if (enforceRange && !semver.satisfies(manifest.version, validRange)) {
         throw new Error(`${dependencyPath.join(' -> ')}: installed version ${manifest.version} does not satisfy ${constraint} range ${expected.range}.`);
     }
     return expected;
@@ -351,7 +358,14 @@ export function resolveProfile({
                 );
             }
             if (ancestry.length > 0) {
-                validateInstalledManifest(requestName, parentSpec, manifest, dependencyPath, 'parent dependency');
+                validateInstalledManifest(
+                    requestName,
+                    parentSpec,
+                    manifest,
+                    dependencyPath,
+                    'parent dependency',
+                    isTheiaExtension(manifest),
+                );
             }
             if (!firstPath.has(requestName)) {
                 firstPath.set(requestName, dependencyPath);
@@ -805,7 +819,14 @@ export async function resolveInstalledPackageGraph({ browserManifest, roots, res
         if (!installed || typeof installed.packageDirectory !== 'string' || !path.isAbsolute(installed.packageDirectory)) {
             throw new Error(`${dependencyPath.join(' -> ')}: installed dependency has no package directory.`);
         }
-        validateInstalledManifest(requestName, spec, installed.manifest, dependencyPath, 'parent dependency');
+        validateInstalledManifest(
+            requestName,
+            spec,
+            installed.manifest,
+            dependencyPath,
+            'parent dependency',
+            rootSet.has(requestName) || isTheiaExtension(installed.manifest),
+        );
         if (rootSet.has(requestName)) {
             validateInstalledManifest(
                 requestName,

@@ -166,14 +166,26 @@ test('does not declare a package with an empty Theia contribution list as an ext
     assert.deepEqual(result.packages.map(entry => entry.requestName), ['runtime', 'product']);
 });
 
-test('rejects an installed runtime that violates its parent dependency range', () => {
-    assert.throws(() => resolveProfile(fixture({
+test('records a package-manager runtime override outside its parent range', () => {
+    const result = resolveProfile(fixture({
         dependencies: { product: '^1.0.0', utility: '^9.0.0' },
         packages: {
             product: manifest('product', { utility: '^4.0.0' }),
             utility: { name: 'utility', version: '9.1.0' },
         },
-    })), /product -> utility.*9\.1\.0.*parent dependency.*\^4\.0\.0/i);
+    }));
+    assert.deepEqual(result.extensions, ['product']);
+    assert.deepEqual(result.packages.map(entry => entry.requestName), ['utility', 'product']);
+});
+
+test('rejects a transitive Theia extension that violates its parent range', () => {
+    assert.throws(() => resolveProfile(fixture({
+        dependencies: { product: '^1.0.0' },
+        packages: {
+            product: manifest('product', { child: '^1.0.0' }),
+            child: manifest('child', {}, { version: '2.0.0' }),
+        },
+    })), /product -> child.*2\.0\.0.*parent dependency.*\^1\.0\.0/i);
 });
 
 test('does not apply an unselected browser root range to a nested runtime dependency', () => {
