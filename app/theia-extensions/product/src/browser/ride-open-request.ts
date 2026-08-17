@@ -93,7 +93,8 @@ export class RidePluginDeploymentScheduler implements Disposable {
         this.startPluginServerResolution();
         const pluginServer = await this.resolvedPluginServer;
         for (const directory of await this.pluginDirectories()) {
-            await pluginServer.install(`local-dir:${directory}`, PluginType.System);
+            const entry = FileUri.create(directory).withScheme('local-dir').toString();
+            await pluginServer.install(entry, PluginType.System);
         }
     }
 }

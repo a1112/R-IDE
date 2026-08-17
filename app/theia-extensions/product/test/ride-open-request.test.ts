@@ -28,6 +28,9 @@ const LEGACY_PENDING_KEY = 'r-ide.open-request.pending.v1';
 const LEGACY_LAST_CONSUMED_KEY = 'r-ide.open-request.last-consumed.v1';
 const MAX_PENDING_REQUESTS = 64;
 const MAX_STATE_CHARS = 262_144;
+const WINDOWS_PLUGIN_DIRECTORY = 'C:\\R-IDE\\plugins';
+const WINDOWS_PLUGIN_ENTRY = 'local-dir:/c%3A/R-IDE/plugins';
+const WINDOWS_PLUGIN_INSTALL_EVENT = `install:${WINDOWS_PLUGIN_ENTRY}:${PluginType.System}`;
 
 class MemoryStorage implements Storage {
     protected readonly values = new Map<string, string>();
@@ -223,7 +226,7 @@ function createPluginDeploymentScheduler(
 ): { scheduler: RidePluginDeploymentScheduler } {
     const scheduler = new RidePluginDeploymentScheduler(
         { install } as never,
-        async () => ['C:\\R-IDE\\plugins']
+        async () => [WINDOWS_PLUGIN_DIRECTORY]
     );
     return { scheduler };
 }
@@ -856,7 +859,7 @@ test('restored queue commit failure after a failed target schedules one plugin f
     assert.deepEqual(events, [
         'open:/project/first-fails.R',
         'resolve:hosted-plugins',
-        `install:local-dir:C:\\R-IDE\\plugins:${PluginType.System}`
+        WINDOWS_PLUGIN_INSTALL_EVENT
     ]);
 });
 
@@ -905,7 +908,7 @@ async function verifyCommitNotificationFailureKeepsFallback(kind: 'throw' | 'rej
         assert.deepEqual(events, [
             'open:/project/first-fails.R',
             'resolve:hosted-plugins',
-            `install:local-dir:C:\\R-IDE\\plugins:${PluginType.System}`
+            WINDOWS_PLUGIN_INSTALL_EVENT
         ]);
     } finally {
         console.warn = originalWarn;
@@ -958,7 +961,7 @@ test('exhausted restored queue with only failed local targets schedules one boun
         'open:/project/first-fails.R',
         'open:/project/second-fails.R',
         'resolve:hosted-plugins',
-        `install:local-dir:C:\\R-IDE\\plugins:${PluginType.System}`
+        WINDOWS_PLUGIN_INSTALL_EVENT
     ]);
 });
 
@@ -1006,7 +1009,7 @@ test('target file opens before deferred plugin installation begins', async () =>
 
     assert.deepEqual(events, [
         'open',
-        `install:local-dir:C:\\R-IDE\\plugins:${PluginType.System}`
+        WINDOWS_PLUGIN_INSTALL_EVENT
     ]);
 });
 
@@ -1027,7 +1030,7 @@ test('no-file startup schedules plugin deployment after a bounded delay', async 
 
     deferredWork.fireTimer();
     await flushLifecycle();
-    assert.deepEqual(events, [`install:local-dir:C:\\R-IDE\\plugins:${PluginType.System}`]);
+    assert.deepEqual(events, [WINDOWS_PLUGIN_INSTALL_EVENT]);
 });
 
 test('no-file fallback waits until the native initial-intent window has closed', async () => {
@@ -1085,7 +1088,7 @@ test('an initial native target received before frontend-ready suppresses the fal
     assert.deepEqual(events, [
         'listen',
         'opening',
-        `install:local-dir:C:\\R-IDE\\plugins:${PluginType.System}`
+        WINDOWS_PLUGIN_INSTALL_EVENT
     ]);
 });
 
@@ -1116,7 +1119,7 @@ test('restored target opening suppresses the no-file timer until the editor is a
     await flushLifecycle();
     assert.deepEqual(events, [
         'opening',
-        `install:local-dir:C:\\R-IDE\\plugins:${PluginType.System}`
+        WINDOWS_PLUGIN_INSTALL_EVENT
     ]);
 });
 
@@ -1150,7 +1153,7 @@ test('a native target request cancels an already scheduled no-file fallback whil
     await flushLifecycle();
     assert.deepEqual(events, [
         'opening',
-        `install:local-dir:C:\\R-IDE\\plugins:${PluginType.System}`
+        WINDOWS_PLUGIN_INSTALL_EVENT
     ]);
 });
 
@@ -1176,7 +1179,7 @@ test('a duplicate request does not cancel the no-file fallback', async () => {
     assert.equal(deferredWork.cleared.length, 0);
     deferredWork.fireTimer();
     await flushLifecycle();
-    assert.deepEqual(events, [`install:local-dir:C:\\R-IDE\\plugins:${PluginType.System}`]);
+    assert.deepEqual(events, [WINDOWS_PLUGIN_INSTALL_EVENT]);
 });
 
 test('plugin-dependent demand deploys immediately and cancels the fallback timer', async () => {
@@ -1194,7 +1197,7 @@ test('plugin-dependent demand deploys immediately and cancels the fallback timer
     await context.contribution.requestPluginDeployment();
 
     assert.equal(deferredWork.cleared.length, 1);
-    assert.deepEqual(events, [`install:local-dir:C:\\R-IDE\\plugins:${PluginType.System}`]);
+    assert.deepEqual(events, [WINDOWS_PLUGIN_INSTALL_EVENT]);
 });
 
 test('plugin deployment is idempotent across concurrent and repeated demand', async () => {
@@ -1208,12 +1211,23 @@ test('plugin deployment is idempotent across concurrent and repeated demand', as
     const first = scheduler.deployNow();
     const second = scheduler.deployNow();
     await flushRequestChain();
-    assert.deepEqual(installs, [{ entry: 'local-dir:C:\\R-IDE\\plugins', type: PluginType.System }]);
+    assert.deepEqual(installs, [{ entry: WINDOWS_PLUGIN_ENTRY, type: PluginType.System }]);
 
     release.resolve();
     await Promise.all([first, second]);
     await scheduler.deployNow();
     assert.equal(installs.length, 1);
+});
+
+test('plugin deployment encodes a Windows directory as a local-dir URI', async () => {
+    const installs: string[] = [];
+    const { scheduler } = createPluginDeploymentScheduler([], async entry => {
+        installs.push(entry);
+    });
+
+    assert.equal(await scheduler.deployNow(), true);
+    assert.deepEqual(installs, [WINDOWS_PLUGIN_ENTRY]);
+    assert.equal(installs[0].includes('C:\\'), false);
 });
 
 test('plugin deployment disposal prevents deployment that has not started', async () => {
@@ -1390,7 +1404,7 @@ test('async workspace handoff failure preserves state and schedules bounded plug
     await flushLifecycle();
     assert.deepEqual(events, [
         'resolve:hosted-plugins',
-        `install:local-dir:C:\\R-IDE\\plugins:${PluginType.System}`
+        WINDOWS_PLUGIN_INSTALL_EVENT
     ]);
 });
 
@@ -1819,7 +1833,7 @@ test('a queued workspace switch failure keeps the failed head and tail for a lat
     await flushLifecycle();
     assert.deepEqual(events, [
         'resolve:hosted-plugins',
-        `install:local-dir:C:\\R-IDE\\plugins:${PluginType.System}`
+        WINDOWS_PLUGIN_INSTALL_EVENT
     ]);
 
     const windowB = createContribution(requestB.workspace, storage);
