@@ -81,6 +81,8 @@ class FaultyStorage extends MemoryStorage {
 class FakeWorkspaceService {
     readonly opened: Array<{ uri: URI; options: { preserveWindow?: boolean } | undefined }> = [];
     openError: Error | undefined;
+    legacyOpenCalls = 0;
+    openWorkspaceCalls = 0;
     ready: Promise<void> = Promise.resolve();
     workspace: { resource: URI } | undefined;
 
@@ -89,6 +91,16 @@ class FakeWorkspaceService {
     }
 
     open(uri: URI, options?: { preserveWindow?: boolean }): void {
+        this.legacyOpenCalls++;
+        if (this.openError) {
+            throw this.openError;
+        }
+        this.opened.push({ uri, options });
+    }
+
+    async openWorkspace(uri: URI, options?: { preserveWindow?: boolean }): Promise<void> {
+        this.openWorkspaceCalls++;
+        await Promise.resolve();
         if (this.openError) {
             throw this.openError;
         }
@@ -153,32 +165,6 @@ function deferred<T = void>(): Deferred<T> {
     return { promise, resolve, reject };
 }
 
-class FakePluginDeploymentTimer {
-    readonly scheduledDelays: number[] = [];
-    readonly cleared: unknown[] = [];
-    protected callback: (() => void) | undefined;
-    protected readonly handle = { kind: 'plugin-deployment-timer' };
-
-    set = (callback: () => void, delay: number): unknown => {
-        this.callback = callback;
-        this.scheduledDelays.push(delay);
-        return this.handle;
-    };
-
-    clear = (handle: unknown): void => {
-        this.cleared.push(handle);
-        if (handle === this.handle) {
-            this.callback = undefined;
-        }
-    };
-
-    fire(): void {
-        const callback = this.callback;
-        this.callback = undefined;
-        callback?.();
-    }
-}
-
 class FakeDeferredWorkScheduler implements RideDeferredWorkScheduler {
     readonly scheduledDelays: number[] = [];
     readonly cleared: unknown[] = [];
@@ -227,21 +213,15 @@ class FakeDeferredWorkScheduler implements RideDeferredWorkScheduler {
 
 function createPluginDeploymentScheduler(
     events: string[],
-    timer = new FakePluginDeploymentTimer(),
     install: (entry: string, type?: PluginType) => Promise<void> = async (entry, type) => {
         events.push(`install:${entry}:${type}`);
     }
-): { scheduler: RidePluginDeploymentScheduler; timer: FakePluginDeploymentTimer } {
+): { scheduler: RidePluginDeploymentScheduler } {
     const scheduler = new RidePluginDeploymentScheduler(
         { install } as never,
-        async () => ['C:\\R-IDE\\plugins'],
-        {
-            delayMs: 250,
-            setTimeout: timer.set,
-            clearTimeout: timer.clear
-        }
+        async () => ['C:\\R-IDE\\plugins']
     );
-    return { scheduler, timer };
+    return { scheduler };
 }
 
 class FakeApplicationStateService {
@@ -301,11 +281,11 @@ class FakeHostedPluginSupport {
 class FakeShell {
     readonly activated: string[] = [];
 
-    constructor(protected readonly onActivate: (id: string) => void = () => undefined) { }
+    constructor(protected readonly onActivate: (id: string) => void | Promise<void> = () => undefined) { }
 
     async activateWidget(id: string): Promise<undefined> {
         this.activated.push(id);
-        this.onActivate(id);
+        await this.onActivate(id);
         return undefined;
     }
 }
@@ -387,7 +367,7 @@ function createContribution(
     nativeChrome?: FakeNativeChrome,
     deferredWorkScheduler?: RideDeferredWorkScheduler,
     startHostedPluginResolution: () => void = () => undefined,
-    onActivate: (id: string) => void = () => undefined
+    onActivate: (id: string) => void | Promise<void> = () => undefined
 ): {
     contribution: TestRideOpenRequestContribution;
     workspace: FakeWorkspaceService;
@@ -411,17 +391,7 @@ function createContribution(
     const shell = new FakeShell(onActivate);
     const native = nativeChrome ?? new FakeNativeChrome(() => events.push('listen'));
     const milestones: RideStartupMilestone[] = [];
-    const deploymentOptions = pluginDeployment as unknown as {
-        options?: {
-            setTimeout(callback: () => void, delay: number): unknown;
-            clearTimeout(handle: unknown): void;
-        };
-    };
-    const effectiveDeferredWorkScheduler = deferredWorkScheduler ?? (deploymentOptions?.options ? {
-        yield: async () => undefined,
-        setTimeout: deploymentOptions.options.setTimeout,
-        clearTimeout: deploymentOptions.options.clearTimeout
-    } : new FakeDeferredWorkScheduler());
+    const effectiveDeferredWorkScheduler = deferredWorkScheduler ?? new FakeDeferredWorkScheduler();
     const contribution = new TestRideOpenRequestContribution(
         workspace as never,
         openers,
@@ -465,7 +435,6 @@ test('target startup yields before resolving and deploying plugins in canonical 
     const deployment = new RidePluginDeploymentScheduler(
         pluginServer.promise,
         async () => ['/plugins'],
-        undefined,
         () => {
             events.push('resolve:plugin-server');
             pluginServer.resolve({
@@ -510,7 +479,6 @@ test('plugin demand starts both deferred resolutions immediately and remains ide
     const deployment = new RidePluginDeploymentScheduler(
         pluginServer.promise,
         async () => ['/plugins'],
-        undefined,
         () => {
             events.push('resolve:plugin-server');
             pluginServer.resolve({ install: async () => { events.push('deploy:plugins'); } });
@@ -543,6 +511,92 @@ test('plugin demand starts both deferred resolutions immediately and remains ide
     assert.equal(events.filter(event => event === 'resolve:hosted-plugins').length, 1);
     assert.equal(events.filter(event => event === 'resolve:plugin-server').length, 1);
     assert.equal(events.filter(event => event === 'deploy:plugins').length, 1);
+});
+
+test('synchronous yield failure resets deferred activation and starts plugins once', async () => {
+    const events: string[] = [];
+    const deployment = new RidePluginDeploymentScheduler(
+        { install: async () => { events.push('deploy:plugins'); } } as never,
+        async () => ['/plugins']
+    );
+    const deferredWork: RideDeferredWorkScheduler = {
+        yield: () => {
+            events.push('yield');
+            throw new Error('yield threw synchronously');
+        },
+        setTimeout: () => ({ kind: 'unused-timer' }),
+        clearTimeout: () => undefined
+    };
+    const warnings: unknown[][] = [];
+    const originalWarn = console.warn;
+    console.warn = (...values: unknown[]) => { warnings.push(values); };
+    try {
+        const context = createContribution(
+            '/project', new MemoryStorage(), () => undefined, async () => undefined,
+            new FakeApplicationStateService(), new FakeHostedPluginSupport(), deployment,
+            new FakeNativeChrome(), deferredWork,
+            () => { events.push('resolve:hosted-plugins'); }
+        );
+
+        await assert.doesNotReject(context.contribution.handleOpenRequest({
+            id: '74', source: 'initial', workspace: '/project', files: ['/project/sync-yield-failure.R']
+        }));
+        await context.contribution.requestPluginDeployment();
+        await flushLifecycle();
+
+        assert.deepEqual(events, [
+            'yield',
+            'resolve:hosted-plugins',
+            'deploy:plugins'
+        ]);
+        assert.equal(warnings.length, 1);
+        assert.match(String(warnings[0][1]), /yield threw synchronously/);
+    } finally {
+        console.warn = originalWarn;
+    }
+});
+
+test('rejected yield resets deferred activation and starts plugins once without rejection', async () => {
+    const events: string[] = [];
+    const deployment = new RidePluginDeploymentScheduler(
+        { install: async () => { events.push('deploy:plugins'); } } as never,
+        async () => ['/plugins']
+    );
+    const deferredWork: RideDeferredWorkScheduler = {
+        yield: () => {
+            events.push('yield');
+            return Promise.reject(new Error('yield promise rejected'));
+        },
+        setTimeout: () => ({ kind: 'unused-timer' }),
+        clearTimeout: () => undefined
+    };
+    const warnings: unknown[][] = [];
+    const originalWarn = console.warn;
+    console.warn = (...values: unknown[]) => { warnings.push(values); };
+    try {
+        const context = createContribution(
+            '/project', new MemoryStorage(), () => undefined, async () => undefined,
+            new FakeApplicationStateService(), new FakeHostedPluginSupport(), deployment,
+            new FakeNativeChrome(), deferredWork,
+            () => { events.push('resolve:hosted-plugins'); }
+        );
+
+        await assert.doesNotReject(context.contribution.handleOpenRequest({
+            id: '75', source: 'initial', workspace: '/project', files: ['/project/rejected-yield.R']
+        }));
+        await flushLifecycle();
+        await context.contribution.requestPluginDeployment();
+
+        assert.deepEqual(events, [
+            'yield',
+            'resolve:hosted-plugins',
+            'deploy:plugins'
+        ]);
+        assert.equal(warnings.length, 1);
+        assert.match(String(warnings[0][1]), /yield promise rejected/);
+    } finally {
+        console.warn = originalWarn;
+    }
 });
 
 test('disposal before deferred yield prevents plugin work and clears the no-file timer', async () => {
@@ -600,6 +654,36 @@ test('failed target never reports target milestone and falls back to bounded plu
     assert.deepEqual(events, ['resolve:hosted-plugins']);
 });
 
+test('target activation failure reports safely and uses bounded fallback without target milestone', async () => {
+    const events: string[] = [];
+    const deployment = new RidePluginDeploymentScheduler(
+        { install: async () => { events.push('deploy:plugins'); } } as never,
+        async () => ['/plugins']
+    );
+    const deferredWork = new FakeDeferredWorkScheduler(events);
+    const context = createContribution(
+        '/project', new MemoryStorage(), () => undefined, async () => undefined,
+        new FakeApplicationStateService(), new FakeHostedPluginSupport(), deployment,
+        new FakeNativeChrome(), deferredWork,
+        () => { events.push('resolve:hosted-plugins'); },
+        async () => { throw new Error('widget activation failed'); }
+    );
+
+    await assert.doesNotReject(context.contribution.handleOpenRequest({
+        id: '76', source: 'initial', workspace: '/project', files: ['/project/activation-fails.R']
+    }));
+
+    assert.deepEqual(context.milestones, []);
+    assert.equal(context.messages.errors.length, 1);
+    assert.match(context.messages.errors[0], /widget activation failed/);
+    assert.deepEqual(deferredWork.scheduledDelays, [1_500]);
+    assert.deepEqual(events, []);
+
+    deferredWork.fireTimer();
+    await flushLifecycle();
+    assert.deepEqual(events, ['resolve:hosted-plugins', 'deploy:plugins']);
+});
+
 test('failed target still schedules fallback when error notification also fails', async () => {
     const storage = new MemoryStorage();
     storage.setItem(RIDE_OPEN_REQUEST_STATE_KEY, JSON.stringify(stateEnvelope('65', {
@@ -642,7 +726,6 @@ test('restored queue cancels a failed target fallback while the next target is s
     const deployment = new RidePluginDeploymentScheduler(
         pluginServer.promise,
         async () => ['/plugins'],
-        undefined,
         () => {
             events.push('resolve:plugin-server');
             pluginServer.resolve({ install: async () => { events.push('deploy:plugins'); } });
@@ -735,7 +818,7 @@ test('restored queue handoff after a failed local target does not schedule plugi
     assert.deepEqual(deferredWork.scheduledDelays, []);
 });
 
-test('restored queue commit failure after a failed target does not schedule plugin fallback', async () => {
+test('restored queue commit failure after a failed target schedules one plugin fallback', async () => {
     const events: string[] = [];
     const storage = new FaultyStorage();
     storage.setItem(RIDE_OPEN_REQUEST_STATE_KEY, JSON.stringify(stateEnvelope('71', {
@@ -763,10 +846,14 @@ test('restored queue commit failure after a failed target does not schedule plug
     assert.deepEqual(events, ['open:/project/first-fails.R']);
     assert.match(context.messages.errors[context.messages.errors.length - 1] ?? '', /storage commit failed/);
 
+    assert.deepEqual(deferredWork.scheduledDelays, [1_500]);
     deferredWork.fireTimer();
     await flushLifecycle();
-    assert.deepEqual(events, ['open:/project/first-fails.R']);
-    assert.deepEqual(deferredWork.scheduledDelays, []);
+    assert.deepEqual(events, [
+        'open:/project/first-fails.R',
+        'resolve:hosted-plugins',
+        `install:local-dir:C:\\R-IDE\\plugins:${PluginType.System}`
+    ]);
 });
 
 test('exhausted restored queue with only failed local targets schedules one bounded fallback', async () => {
@@ -860,18 +947,20 @@ test('target file opens before deferred plugin installation begins', async () =>
 
 test('no-file startup schedules plugin deployment after a bounded delay', async () => {
     const events: string[] = [];
-    const { scheduler, timer } = createPluginDeploymentScheduler(events);
+    const { scheduler } = createPluginDeploymentScheduler(events);
+    const deferredWork = new FakeDeferredWorkScheduler();
     const context = createContribution(
         '/project', new MemoryStorage(), () => undefined, async () => undefined,
-        new FakeApplicationStateService(), new FakeHostedPluginSupport(), scheduler
+        new FakeApplicationStateService(), new FakeHostedPluginSupport(), scheduler,
+        undefined, deferredWork
     );
 
     context.contribution.onStart();
     await flushLifecycle();
-    assert.deepEqual(timer.scheduledDelays, [1_500]);
+    assert.deepEqual(deferredWork.scheduledDelays, [1_500]);
     assert.deepEqual(events, []);
 
-    timer.fire();
+    deferredWork.fireTimer();
     await flushLifecycle();
     assert.deepEqual(events, [`install:local-dir:C:\\R-IDE\\plugins:${PluginType.System}`]);
 });
@@ -879,37 +968,40 @@ test('no-file startup schedules plugin deployment after a bounded delay', async 
 test('no-file fallback waits until the native initial-intent window has closed', async () => {
     const frontendReady = deferred<void>();
     const events: string[] = [];
-    const { scheduler, timer } = createPluginDeploymentScheduler(events);
+    const { scheduler } = createPluginDeploymentScheduler(events);
+    const deferredWork = new FakeDeferredWorkScheduler();
     const native = new FakeNativeChrome(() => events.push('listen'), frontendReady.promise);
     const context = createContribution(
         '/project', new MemoryStorage(), () => undefined, async () => undefined,
-        new FakeApplicationStateService(), new FakeHostedPluginSupport(), scheduler, native
+        new FakeApplicationStateService(), new FakeHostedPluginSupport(), scheduler, native, deferredWork
     );
 
     context.contribution.onStart();
     await flushLifecycle();
     assert.equal(native.registrations, 1, 'the listener must be active before native intent delivery');
-    assert.deepEqual(timer.scheduledDelays, []);
-    timer.fire();
+    assert.deepEqual(deferredWork.scheduledDelays, []);
+    deferredWork.fireTimer();
     await flushLifecycle();
     assert.deepEqual(events, ['listen']);
 
     frontendReady.resolve();
     await flushLifecycle();
-    assert.deepEqual(timer.scheduledDelays, [1_500]);
+    assert.deepEqual(deferredWork.scheduledDelays, [1_500]);
 });
 
 test('an initial native target received before frontend-ready suppresses the fallback timer', async () => {
     const frontendReady = deferred<void>();
     const opened = deferred<void>();
     const events: string[] = [];
-    const { scheduler, timer } = createPluginDeploymentScheduler(events);
+    const { scheduler } = createPluginDeploymentScheduler(events);
+    const deferredWork = new FakeDeferredWorkScheduler();
     const native = new FakeNativeChrome(() => events.push('listen'), frontendReady.promise);
     const context = createContribution(
         '/project', new MemoryStorage(), async () => {
             events.push('opening');
             await opened.promise;
-        }, async () => undefined, new FakeApplicationStateService(), new FakeHostedPluginSupport(), scheduler, native
+        }, async () => undefined, new FakeApplicationStateService(), new FakeHostedPluginSupport(), scheduler, native,
+        deferredWork
     );
 
     context.contribution.onStart();
@@ -922,7 +1014,7 @@ test('an initial native target received before frontend-ready suppresses the fal
 
     frontendReady.resolve();
     await flushLifecycle();
-    assert.deepEqual(timer.scheduledDelays, []);
+    assert.deepEqual(deferredWork.scheduledDelays, []);
     opened.resolve();
     await flushLifecycle();
     assert.deepEqual(events, [
@@ -939,19 +1031,21 @@ test('restored target opening suppresses the no-file timer until the editor is a
     })));
     const opened = deferred<void>();
     const events: string[] = [];
-    const { scheduler, timer } = createPluginDeploymentScheduler(events);
+    const { scheduler } = createPluginDeploymentScheduler(events);
+    const deferredWork = new FakeDeferredWorkScheduler();
     const context = createContribution(
         '/project', storage, async () => {
             events.push('opening');
             await opened.promise;
-        }, async () => undefined, new FakeApplicationStateService(), new FakeHostedPluginSupport(), scheduler
+        }, async () => undefined, new FakeApplicationStateService(), new FakeHostedPluginSupport(), scheduler,
+        undefined, deferredWork
     );
 
     context.contribution.onStart();
     await flushLifecycle();
     assert.deepEqual(events, ['opening']);
     assert.equal(context.native.registrations, 1, 'native intents must be buffered while a stored target restores');
-    assert.deepEqual(timer.scheduledDelays, [], 'a pending target must not race the no-file timer');
+    assert.deepEqual(deferredWork.scheduledDelays, [], 'a pending target must not race the no-file timer');
 
     opened.resolve();
     await flushLifecycle();
@@ -964,25 +1058,27 @@ test('restored target opening suppresses the no-file timer until the editor is a
 test('a native target request cancels an already scheduled no-file fallback while opening', async () => {
     const opened = deferred<void>();
     const events: string[] = [];
-    const { scheduler, timer } = createPluginDeploymentScheduler(events);
+    const { scheduler } = createPluginDeploymentScheduler(events);
+    const deferredWork = new FakeDeferredWorkScheduler();
     const context = createContribution(
         '/project', new MemoryStorage(), async () => {
             events.push('opening');
             await opened.promise;
-        }, async () => undefined, new FakeApplicationStateService(), new FakeHostedPluginSupport(), scheduler
+        }, async () => undefined, new FakeApplicationStateService(), new FakeHostedPluginSupport(), scheduler,
+        undefined, deferredWork
     );
 
     context.contribution.onStart();
     await flushLifecycle();
-    assert.deepEqual(timer.scheduledDelays, [1_500]);
+    assert.deepEqual(deferredWork.scheduledDelays, [1_500]);
     context.native.emit({
         id: '52', source: 'singleInstance', workspace: '/project', files: ['/project/slow-native.R']
     });
     await flushLifecycle();
     assert.deepEqual(events, ['opening']);
-    assert.equal(timer.cleared.length, 1);
+    assert.equal(deferredWork.cleared.length, 1);
 
-    timer.fire();
+    deferredWork.fireTimer();
     await flushLifecycle();
     assert.deepEqual(events, ['opening']);
     opened.resolve();
@@ -997,10 +1093,12 @@ test('a duplicate request does not cancel the no-file fallback', async () => {
     const storage = new MemoryStorage();
     storage.setItem(RIDE_OPEN_REQUEST_STATE_KEY, JSON.stringify(stateEnvelope('52')));
     const events: string[] = [];
-    const { scheduler, timer } = createPluginDeploymentScheduler(events);
+    const { scheduler } = createPluginDeploymentScheduler(events);
+    const deferredWork = new FakeDeferredWorkScheduler();
     const context = createContribution(
         '/project', storage, () => undefined, async () => undefined,
-        new FakeApplicationStateService(), new FakeHostedPluginSupport(), scheduler
+        new FakeApplicationStateService(), new FakeHostedPluginSupport(), scheduler,
+        undefined, deferredWork
     );
 
     context.contribution.onStart();
@@ -1010,32 +1108,34 @@ test('a duplicate request does not cancel the no-file fallback', async () => {
     });
     await flushLifecycle();
 
-    assert.equal(timer.cleared.length, 0);
-    timer.fire();
+    assert.equal(deferredWork.cleared.length, 0);
+    deferredWork.fireTimer();
     await flushLifecycle();
     assert.deepEqual(events, [`install:local-dir:C:\\R-IDE\\plugins:${PluginType.System}`]);
 });
 
 test('plugin-dependent demand deploys immediately and cancels the fallback timer', async () => {
     const events: string[] = [];
-    const { scheduler, timer } = createPluginDeploymentScheduler(events);
+    const { scheduler } = createPluginDeploymentScheduler(events);
+    const deferredWork = new FakeDeferredWorkScheduler();
     const context = createContribution(
         '/project', new MemoryStorage(), () => undefined, async () => undefined,
-        new FakeApplicationStateService(), new FakeHostedPluginSupport(), scheduler
+        new FakeApplicationStateService(), new FakeHostedPluginSupport(), scheduler,
+        undefined, deferredWork
     );
 
     context.contribution.onStart();
     await flushLifecycle();
     await context.contribution.requestPluginDeployment();
 
-    assert.equal(timer.cleared.length, 1);
+    assert.equal(deferredWork.cleared.length, 1);
     assert.deepEqual(events, [`install:local-dir:C:\\R-IDE\\plugins:${PluginType.System}`]);
 });
 
 test('plugin deployment is idempotent across concurrent and repeated demand', async () => {
     const installs: Array<{ entry: string; type: PluginType | undefined }> = [];
     const release = deferred<void>();
-    const { scheduler } = createPluginDeploymentScheduler([], new FakePluginDeploymentTimer(), async (entry, type) => {
+    const { scheduler } = createPluginDeploymentScheduler([], async (entry, type) => {
         installs.push({ entry, type });
         await release.promise;
     });
@@ -1051,12 +1151,40 @@ test('plugin deployment is idempotent across concurrent and repeated demand', as
     assert.equal(installs.length, 1);
 });
 
+test('plugin deployment disposal prevents deployment that has not started', async () => {
+    const events: string[] = [];
+    const { scheduler } = createPluginDeploymentScheduler(events);
+
+    scheduler.dispose();
+
+    assert.equal(await scheduler.deployNow(), false);
+    assert.deepEqual(events, []);
+});
+
+test('plugin deployment disposal preserves a shared deployment already in progress', async () => {
+    const release = deferred<void>();
+    let installs = 0;
+    const { scheduler } = createPluginDeploymentScheduler([], async () => {
+        installs++;
+        await release.promise;
+    });
+
+    const first = scheduler.deployNow();
+    scheduler.dispose();
+    const second = scheduler.deployNow();
+
+    assert.strictEqual(second, first);
+    release.resolve();
+    assert.equal(await second, true);
+    assert.equal(installs, 1);
+});
+
 test('plugin deployment failure remains non-blocking and leaves the editor open', async () => {
     const warnings: unknown[][] = [];
     const originalWarn = console.warn;
     console.warn = (...values: unknown[]) => warnings.push(values);
     try {
-        const { scheduler } = createPluginDeploymentScheduler([], new FakePluginDeploymentTimer(), async () => {
+        const { scheduler } = createPluginDeploymentScheduler([], async () => {
             throw new Error('deployment unavailable');
         });
         const context = createContribution(
@@ -1081,7 +1209,7 @@ test('plugin deployment failure remains non-blocking and leaves the editor open'
 
 test('unresolved plugin deployment does not block plugin lifecycle reporting', async () => {
     const deployment = deferred<void>();
-    const { scheduler } = createPluginDeploymentScheduler([], new FakePluginDeploymentTimer(), async () => {
+    const { scheduler } = createPluginDeploymentScheduler([], async () => {
         await deployment.promise;
     });
     const hostedPlugins = new FakeHostedPluginSupport();
@@ -1162,9 +1290,43 @@ test('different-workspace requests persist only the typed handoff and switch wit
         files: ['D:/new-project/analysis.R']
     }));
     assert.equal(workspace.opened.length, 1);
+    assert.equal(workspace.openWorkspaceCalls, 1);
+    assert.equal(workspace.legacyOpenCalls, 0);
     assert.equal(comparableFilePath(workspace.opened[0].uri), 'd:/new-project');
     assert.deepEqual(workspace.opened[0].options, { preserveWindow: true });
     assert.deepEqual(messages.errors, []);
+});
+
+test('async workspace handoff failure preserves state and schedules bounded plugin fallback', async () => {
+    const events: string[] = [];
+    const { scheduler: deployment } = createPluginDeploymentScheduler(events);
+    const deferredWork = new FakeDeferredWorkScheduler();
+    const context = createContribution(
+        '/project', new MemoryStorage(), () => undefined, async () => undefined,
+        new FakeApplicationStateService(), new FakeHostedPluginSupport(), deployment,
+        new FakeNativeChrome(), deferredWork,
+        () => { events.push('resolve:hosted-plugins'); }
+    );
+    context.workspace.openError = new Error('async workspace handoff failed');
+    const request: RideOpenRequest = {
+        id: '77', source: 'singleInstance', workspace: '/other', files: ['/other/file.R']
+    };
+
+    await assert.doesNotReject(context.contribution.handleOpenRequest(request));
+
+    assert.deepEqual(readState(context.storage), stateEnvelope('77', request));
+    assert.equal(context.workspace.openWorkspaceCalls, 1);
+    assert.equal(context.workspace.legacyOpenCalls, 0);
+    assert.deepEqual(context.workspace.opened, []);
+    assert.match(context.messages.errors[0], /async workspace handoff failed/);
+    assert.deepEqual(deferredWork.scheduledDelays, [1_500]);
+
+    deferredWork.fireTimer();
+    await flushLifecycle();
+    assert.deepEqual(events, [
+        'resolve:hosted-plugins',
+        `install:local-dir:C:\\R-IDE\\plugins:${PluginType.System}`
+    ]);
 });
 
 test('an initial state commit failure consumes nothing and performs no open or switch', async () => {
@@ -1568,15 +1730,32 @@ test('a queued workspace switch failure keeps the failed head and tail for a lat
         id: '42', source: 'singleInstance', workspace: '/workspace-c', files: ['/workspace-c/c.R']
     };
     storage.setItem(RIDE_OPEN_REQUEST_STATE_KEY, JSON.stringify(stateEnvelope(requestC.id, requestA, requestB, requestC)));
-    const windowA = createContribution(requestA.workspace, storage);
+    const events: string[] = [];
+    const { scheduler: deployment } = createPluginDeploymentScheduler(events);
+    const deferredWork = new FakeDeferredWorkScheduler();
+    const windowA = createContribution(
+        requestA.workspace, storage, () => { throw new Error('queued editor unavailable'); }, async () => undefined,
+        new FakeApplicationStateService(), new FakeHostedPluginSupport(), deployment,
+        new FakeNativeChrome(), deferredWork,
+        () => { events.push('resolve:hosted-plugins'); }
+    );
     windowA.workspace.openError = new Error('queued switch failed');
 
     await windowA.contribution.restorePendingRequest();
 
-    assert.deepEqual(windowA.openers.opened.map(entry => entry.uri.toString()), ['file:///workspace-a/a.R']);
+    assert.deepEqual(windowA.openers.opened, []);
     assert.deepEqual(readState(storage), stateEnvelope(requestC.id, requestB, requestC));
     assert.equal(windowA.workspace.opened.length, 0);
-    assert.match(windowA.messages.errors[0], /queued switch failed/);
+    assert.equal(windowA.workspace.openWorkspaceCalls, 1);
+    assert.equal(windowA.workspace.legacyOpenCalls, 0);
+    assert.equal(windowA.messages.errors.some(message => /queued switch failed/.test(message)), true);
+    assert.deepEqual(deferredWork.scheduledDelays, [1_500]);
+    deferredWork.fireTimer();
+    await flushLifecycle();
+    assert.deepEqual(events, [
+        'resolve:hosted-plugins',
+        `install:local-dir:C:\\R-IDE\\plugins:${PluginType.System}`
+    ]);
 
     const windowB = createContribution(requestB.workspace, storage);
     await windowB.contribution.restorePendingRequest();

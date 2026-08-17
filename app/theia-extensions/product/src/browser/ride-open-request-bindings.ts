@@ -85,7 +85,6 @@ export function bindRideOpenRequestContribution(
         const pluginDeployment = new RidePluginDeploymentScheduler(
             pluginServer.promise,
             () => nativeChrome.getPluginDirectories(),
-            undefined,
             pluginServer.start
         );
         return new RideOpenRequestContribution(

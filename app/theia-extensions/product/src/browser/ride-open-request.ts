@@ -54,69 +54,39 @@ export const DEFAULT_RIDE_DEFERRED_WORK_SCHEDULER: RideDeferredWorkScheduler = {
 
 const NO_FILE_PLUGIN_FALLBACK_DELAY_MS = 1_500;
 
-interface RidePluginDeploymentSchedulerOptions {
-    readonly delayMs: number;
-    readonly setTimeout: (callback: () => void, delay: number) => unknown;
-    readonly clearTimeout: (handle: unknown) => void;
-}
-
-const DEFAULT_PLUGIN_DEPLOYMENT_OPTIONS: RidePluginDeploymentSchedulerOptions = {
-    delayMs: 1_500,
-    setTimeout: (callback, delay) => globalThis.setTimeout(callback, delay),
-    clearTimeout: handle => globalThis.clearTimeout(handle as ReturnType<typeof setTimeout>)
-};
-
 export class RidePluginDeploymentScheduler implements Disposable {
-    protected timer: unknown | undefined;
+    protected disposed = false;
     protected deployment: Promise<boolean> | undefined;
     protected readonly resolvedPluginServer: Promise<Pick<PluginServer, 'install'>>;
 
     constructor(
         pluginServer: Pick<PluginServer, 'install'> | Promise<Pick<PluginServer, 'install'>>,
         protected readonly pluginDirectories: () => Promise<readonly string[]>,
-        protected readonly options: RidePluginDeploymentSchedulerOptions = DEFAULT_PLUGIN_DEPLOYMENT_OPTIONS,
         protected readonly startPluginServerResolution: () => void = () => undefined
     ) {
         this.resolvedPluginServer = Promise.resolve(pluginServer);
         this.resolvedPluginServer.catch(() => undefined);
     }
 
-    scheduleFallback(): void {
-        if (this.timer !== undefined || this.deployment) {
-            return;
-        }
-        this.timer = this.options.setTimeout(() => {
-            this.timer = undefined;
-            this.deployNow();
-        }, this.options.delayMs);
-    }
-
     deployNow(): Promise<boolean> {
-        this.cancelFallback();
-        if (!this.deployment) {
-            this.deployment = this.deploy().then(
-                () => true,
-                error => {
-                    console.warn('[R-IDE] Failed to deploy bundled plugins.', error);
-                    return false;
-                }
-            );
+        if (this.deployment) {
+            return this.deployment;
         }
+        if (this.disposed) {
+            return Promise.resolve(false);
+        }
+        this.deployment = this.deploy().then(
+            () => true,
+            error => {
+                console.warn('[R-IDE] Failed to deploy bundled plugins.', error);
+                return false;
+            }
+        );
         return this.deployment;
     }
 
-    cancelFallback(): void {
-        if (this.timer !== undefined) {
-            this.options.clearTimeout(this.timer);
-            this.timer = undefined;
-        }
-    }
-
     dispose(): void {
-        if (this.timer !== undefined) {
-            this.options.clearTimeout(this.timer);
-            this.timer = undefined;
-        }
+        this.disposed = true;
     }
 
     protected async deploy(): Promise<void> {
@@ -302,7 +272,6 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
             if (committed) {
                 this.acceptedOpenRequest = true;
                 this.cancelPluginFallback();
-                this.pluginDeployment?.cancelFallback();
             }
             return;
         }
@@ -319,12 +288,9 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
 
         this.acceptedOpenRequest = true;
         this.cancelPluginFallback();
-        this.pluginDeployment?.cancelFallback();
         if (!currentWorkspace) {
-            try {
-                this.workspaceService.open(FileUri.create(request.workspace), { preserveWindow: true });
-            } catch (error) {
-                await this.messageService.error(`R-IDE could not switch workspace: ${errorMessage(error)}`);
+            if (!await this.openWorkspaceForHandoff(request.workspace)) {
+                this.schedulePluginFallback();
             }
             return;
         }
@@ -373,6 +339,7 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
         this.cancelPluginFallback();
         let targetWidgetId: string | undefined;
         let openedTarget = false;
+        let editableTarget = false;
         const options: WidgetOpenerOptions = { mode: 'open' };
         try {
             for (const file of request.files) {
@@ -383,23 +350,32 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
                         targetWidgetId = opened.id;
                     }
                 } catch (error) {
-                    try {
-                        await this.messageService.error(`R-IDE could not open ${file}: ${errorMessage(error)}`);
-                    } catch (notificationError) {
-                        console.warn('[R-IDE] Failed to report a file-open failure.', notificationError);
-                    }
+                    await this.reportErrorSafely(
+                        `R-IDE could not open ${file}: ${errorMessage(error)}`,
+                        '[R-IDE] Failed to report a file-open failure.'
+                    );
                 }
             }
             if (targetWidgetId) {
-                await this.shell.activateWidget(targetWidgetId);
+                try {
+                    await this.shell.activateWidget(targetWidgetId);
+                    editableTarget = true;
+                } catch (error) {
+                    await this.reportErrorSafely(
+                        `R-IDE could not activate the opened target: ${errorMessage(error)}`,
+                        '[R-IDE] Failed to report a target-activation failure.'
+                    );
+                }
+            } else {
+                editableTarget = openedTarget;
             }
-            if (openedTarget) {
+            if (editableTarget) {
                 this.targetFileOpened = true;
                 await this.reportStartupMilestone('target_file_opened');
                 this.schedulePluginActivationAfterYield();
             }
         } finally {
-            if (!openedTarget) {
+            if (!editableTarget) {
                 this.schedulePluginFallback();
             }
         }
@@ -424,21 +400,21 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
             return;
         }
         this.pluginActivationScheduled = true;
-        this.deferredWorkScheduler.yield().then(
-            () => {
-                this.pluginActivationScheduled = false;
-                if (!this.disposed) {
-                    this.requestPluginDeployment();
-                }
-            },
-            error => {
-                this.pluginActivationScheduled = false;
-                console.warn('[R-IDE] Failed to yield before plugin activation.', error);
-                if (!this.disposed) {
-                    this.requestPluginDeployment();
-                }
+        const activate = (): void => {
+            this.pluginActivationScheduled = false;
+            if (!this.disposed) {
+                this.requestPluginDeployment();
             }
-        );
+        };
+        const activateAfterFailure = (error: unknown): void => {
+            console.warn('[R-IDE] Failed to yield before plugin activation.', error);
+            activate();
+        };
+        try {
+            Promise.resolve(this.deferredWorkScheduler.yield()).then(activate, activateAfterFailure);
+        } catch (error) {
+            activateAfterFailure(error);
+        }
     }
 
     protected schedulePluginFallback(): void {
@@ -607,10 +583,32 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
         return true;
     }
 
+    protected async openWorkspaceForHandoff(workspace: string): Promise<boolean> {
+        try {
+            await this.workspaceService.openWorkspace(FileUri.create(workspace), { preserveWindow: true });
+            return true;
+        } catch (error) {
+            await this.reportErrorSafely(
+                `R-IDE could not switch workspace: ${errorMessage(error)}`,
+                '[R-IDE] Failed to report a workspace-switch failure.'
+            );
+            return false;
+        }
+    }
+
+    protected async reportErrorSafely(message: string, warning: string): Promise<void> {
+        try {
+            await this.messageService.error(message);
+        } catch (error) {
+            console.warn(warning, error);
+        }
+    }
+
     protected async dispatchPendingRequests(initialState: RideOpenRequestState): Promise<void> {
         let state = initialState;
         let attemptedTarget = false;
         let queueExhausted = false;
+        let currentWindowFailure = false;
         this.dispatchingPendingTargets = true;
         this.cancelPluginFallback();
         try {
@@ -620,11 +618,7 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
                 }
                 const request = state.requests[0];
                 if (!this.isCurrentWorkspace(request.workspace)) {
-                    try {
-                        this.workspaceService.open(FileUri.create(request.workspace), { preserveWindow: true });
-                    } catch (error) {
-                        await this.messageService.error(`R-IDE could not switch workspace: ${errorMessage(error)}`);
-                    }
+                    currentWindowFailure = !await this.openWorkspaceForHandoff(request.workspace);
                     return;
                 }
 
@@ -633,6 +627,7 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
                     requests: state.requests.slice(1)
                 };
                 if (!await this.commitState(nextState)) {
+                    currentWindowFailure = true;
                     return;
                 }
                 attemptedTarget = true;
@@ -642,7 +637,7 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
             queueExhausted = true;
         } finally {
             this.dispatchingPendingTargets = false;
-            if (queueExhausted && attemptedTarget && !this.targetFileOpened) {
+            if (!this.targetFileOpened && (currentWindowFailure || queueExhausted && attemptedTarget)) {
                 this.schedulePluginFallback();
             }
         }
