@@ -9,8 +9,28 @@ import { copy } from 'esbuild-plugin-copy';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createTheiaModuleDedupePlugin } from './ride-esbuild-dedupe.mjs';
+import {
+    buildAllowedTheiaPackageSet,
+    createTauriProfileAuditPlugin,
+    loadTauriProfileManifest,
+} from './tauri-esbuild-profile-audit.mjs';
 
 import esbuild from 'esbuild';
+
+const profileManifest = await loadTauriProfileManifest(__dirname);
+if (profileManifest) {
+    const allowedPackages = buildAllowedTheiaPackageSet(profileManifest);
+    browserOptions.metafile = true;
+    nodeOptions.metafile = true;
+    browserOptions.plugins.unshift(createTauriProfileAuditPlugin({
+        baseDirectory: __dirname,
+        allowedPackages,
+    }));
+    nodeOptions.plugins.unshift(createTauriProfileAuditPlugin({
+        baseDirectory: __dirname,
+        allowedPackages,
+    }));
+}
 
 function patchBuiltRpcNotificationTarget() {
     const backendBundle = path.join(__dirname, 'lib', 'backend', 'main.js');

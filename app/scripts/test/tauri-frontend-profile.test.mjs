@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -23,6 +23,12 @@ import {
     resolveInstalledManifest,
     selectCanonicalPackageManifest,
 } from '../tauri-frontend-profile.mjs';
+import {
+    auditTheiaMetafile,
+    buildAllowedTheiaPackageSet,
+    createTauriProfileAuditPlugin,
+    loadTauriProfileManifest,
+} from '../../applications/browser/tauri-esbuild-profile-audit.mjs';
 
 const require = createRequire(import.meta.url);
 const properLockfile = require('proper-lockfile');
@@ -62,6 +68,61 @@ function fixture({ roots = ['product'], featureGroups = {}, dependencies, packag
         packageManifests: packages,
     };
 }
+
+test('Tauri esbuild contract rejects undeclared Theia inputs and accepts allowed subpaths', async t => {
+    const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-esbuild-audit-'));
+    t.after(() => fs.promises.rm(directory, { recursive: true, force: true }));
+    const allowedDirectory = path.join(directory, 'node_modules', '@theia', 'allowed');
+    const forbiddenDirectory = path.join(directory, 'deduped-packages', 'forbidden');
+    await fs.promises.mkdir(path.join(allowedDirectory, 'lib'), { recursive: true });
+    await fs.promises.mkdir(path.join(forbiddenDirectory, 'lib'), { recursive: true });
+    await fs.promises.writeFile(path.join(allowedDirectory, 'package.json'), JSON.stringify({ name: '@theia/allowed' }));
+    await fs.promises.writeFile(path.join(forbiddenDirectory, 'package.json'), JSON.stringify({ name: '@theia/forbidden' }));
+
+    const allowed = buildAllowedTheiaPackageSet({
+        packages: [{ requestName: '@theia/allowed-alias', packageName: '@theia/allowed' }],
+    });
+    assert.deepEqual([...allowed].sort(), ['@theia/allowed', '@theia/allowed-alias']);
+    await auditTheiaMetafile({
+        metafile: { inputs: { 'node_modules\\@theia\\allowed\\lib\\frontend.js': {} } },
+        allowedPackages: allowed,
+        baseDirectory: directory,
+    });
+    await assert.rejects(
+        auditTheiaMetafile({
+            metafile: { inputs: { [path.join(forbiddenDirectory, 'lib', 'backend.js')]: {} } },
+            allowedPackages: allowed,
+            baseDirectory: directory,
+        }),
+        error => {
+            assert.match(error.message, /@theia\/forbidden/);
+            assert.doesNotMatch(error.message, new RegExp(directory.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+            return true;
+        },
+    );
+
+    const callbacks = {};
+    createTauriProfileAuditPlugin({ baseDirectory: directory, allowedPackages: allowed }).setup({
+        onResolve(filter, callback) {
+            callbacks.resolve = { filter, callback };
+        },
+        onEnd(callback) {
+            callbacks.end = callback;
+        },
+    });
+    assert.equal(await callbacks.resolve.callback({ path: '@theia/allowed/lib/browser' }), undefined);
+    assert.match((await callbacks.resolve.callback({ path: '@theia/forbidden/lib/browser' })).errors[0].text, /undeclared/);
+    await assert.rejects(
+        callbacks.end({ errors: [], metafile: { inputs: { [path.join(forbiddenDirectory, 'lib', 'backend.js')]: {} } } }),
+        /@theia\/forbidden/,
+    );
+});
+
+test('tracked full browser without a generated profile manifest keeps audit disabled', async t => {
+    const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-esbuild-full-'));
+    t.after(() => fs.promises.rm(directory, { recursive: true, force: true }));
+    assert.equal(await loadTauriProfileManifest(directory), undefined);
+});
 
 test('resolves a stable dependency-first topological extension closure', () => {
     const packages = {
@@ -629,6 +690,38 @@ async function writeSentinel(directory, value) {
     await fs.promises.writeFile(path.join(directory, 'sentinel.txt'), value);
 }
 
+const transactionStateSequence = {
+    prepared: 1,
+    'backed-up': 2,
+    installed: 3,
+    'rolled-back': 4,
+};
+
+function transactionStatePath(plan, state, nonce = state.replaceAll('-', '')) {
+    const sequence = String(transactionStateSequence[state]).padStart(2, '0');
+    return path.join(
+        plan.parentDirectory,
+        `.${plan.targetName}.transaction-${plan.transactionId}.${sequence}-${state}-${nonce}.json`,
+    );
+}
+
+async function writeTransactionStateFixture(plan, state, nonce, contents) {
+    const marker = contents ?? `${JSON.stringify({
+        schema: 'ride.directory-transaction@2',
+        targetName: plan.targetName,
+        transactionId: plan.transactionId,
+        state,
+        sequence: transactionStateSequence[state],
+    })}\n`;
+    await fs.promises.writeFile(transactionStatePath(plan, state, nonce), marker);
+}
+
+async function transactionArtifacts(plan) {
+    return (await fs.promises.readdir(plan.parentDirectory))
+        .filter(name => name.startsWith(`.${plan.targetName}.transaction-${plan.transactionId}.`))
+        .sort();
+}
+
 test('directory transaction replaces a target and removes its recovery artifacts', async t => {
     const parentDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-transaction-ok-'));
     t.after(() => fs.promises.rm(parentDirectory, { recursive: true, force: true }));
@@ -653,9 +746,12 @@ test('directory transaction restores original bytes when install rename fails', 
     const filesystem = {
         ...fs.promises,
         rename: async (source, destination) => {
-            renameCount += 1;
-            if (renameCount === 2) {
-                throw Object.assign(new Error('install failed'), { code: 'EIO' });
+            if ([plan.targetDirectory, plan.temporaryDirectory, plan.backupDirectory]
+                .some(candidate => path.resolve(candidate) === path.resolve(source))) {
+                renameCount += 1;
+                if (renameCount === 2) {
+                    throw Object.assign(new Error('install failed'), { code: 'EIO' });
+                }
             }
             return fs.promises.rename(source, destination);
         },
@@ -678,12 +774,15 @@ test('directory transaction preserves original and rollback errors for recovery'
     const filesystem = {
         ...fs.promises,
         rename: async (source, destination) => {
-            renameCount += 1;
-            if (renameCount === 2) {
-                throw Object.assign(new Error('install failed'), { code: 'EIO' });
-            }
-            if (renameCount === 3) {
-                throw Object.assign(new Error('rollback failed'), { code: 'EACCES' });
+            if ([plan.targetDirectory, plan.temporaryDirectory, plan.backupDirectory]
+                .some(candidate => path.resolve(candidate) === path.resolve(source))) {
+                renameCount += 1;
+                if (renameCount === 2) {
+                    throw Object.assign(new Error('install failed'), { code: 'EIO' });
+                }
+                if (renameCount === 3) {
+                    throw Object.assign(new Error('rollback failed'), { code: 'EACCES' });
+                }
             }
             return fs.promises.rename(source, destination);
         },
@@ -697,7 +796,7 @@ test('directory transaction preserves original and rollback errors for recovery'
     });
     assert.equal(fs.existsSync(plan.targetDirectory), false);
     assert.equal(await fs.promises.readFile(path.join(plan.backupDirectory, 'sentinel.txt'), 'utf8'), 'old');
-    assert.equal(fs.existsSync(plan.markerPath), true);
+    assert.ok((await transactionArtifacts(plan)).some(name => name.includes('.02-backed-up-')));
 });
 
 test('cleanup failure leaves an installed marker that startup recovery completes', async t => {
@@ -719,11 +818,13 @@ test('cleanup failure leaves an installed marker that startup recovery completes
     await assert.rejects(replaceDirectoryTransactional(plan, { filesystem }), /cleanup failed/);
     assert.equal(await fs.promises.readFile(path.join(plan.targetDirectory, 'sentinel.txt'), 'utf8'), 'new');
     assert.equal(fs.existsSync(plan.backupDirectory), true);
-    assert.equal(JSON.parse(await fs.promises.readFile(plan.markerPath, 'utf8')).state, 'installed');
+    const installedMarker = (await transactionArtifacts(plan)).find(name => name.includes('.03-installed-'));
+    assert.ok(installedMarker);
+    assert.equal(JSON.parse(await fs.promises.readFile(path.join(parentDirectory, installedMarker), 'utf8')).state, 'installed');
 
     await recoverDirectoryTransactions({ parentDirectory, targetName: 'lib' });
     assert.equal(fs.existsSync(plan.backupDirectory), false);
-    assert.equal(fs.existsSync(plan.markerPath), false);
+    assert.deepEqual(await transactionArtifacts(plan), []);
 });
 
 test('startup recovery restores a backed-up target when the target is missing', async t => {
@@ -765,6 +866,137 @@ test('startup recovery rolls back an installed target when a backed-up marker st
     assert.equal(fs.existsSync(plan.backupDirectory), false);
     assert.equal(fs.existsSync(plan.temporaryDirectory), false);
     assert.equal(fs.existsSync(plan.markerPath), false);
+});
+
+test('transaction state publication syncs file and parent before filesystem mutation', async t => {
+    const parentDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-transaction-fsync-'));
+    t.after(() => fs.promises.rm(parentDirectory, { recursive: true, force: true }));
+    const plan = createDirectoryTransactionPlan(parentDirectory, 'lib', 'fsync-order');
+    await writeSentinel(plan.targetDirectory, 'old');
+    await writeSentinel(plan.temporaryDirectory, 'new');
+    const events = [];
+    const filesystem = {
+        ...fs.promises,
+        open: async (candidate, flags) => {
+            if (path.resolve(candidate) === path.resolve(parentDirectory)) {
+                events.push('open-parent');
+                return {
+                    sync: async () => { events.push('sync-parent'); },
+                    close: async () => { events.push('close-parent'); },
+                };
+            }
+            events.push('open-marker-temp');
+            const handle = await fs.promises.open(candidate, flags);
+            return {
+                writeFile: async data => { events.push('write-marker'); await handle.writeFile(data); },
+                sync: async () => { events.push('sync-marker'); await handle.sync(); },
+                close: async () => { events.push('close-marker'); await handle.close(); },
+            };
+        },
+        rename: async (source, destination) => {
+            if (path.basename(source).includes('.marker-tmp-')) {
+                events.push('rename-marker');
+            } else {
+                events.push('rename-directory');
+            }
+            return fs.promises.rename(source, destination);
+        },
+    };
+
+    await replaceDirectoryTransactional(plan, {
+        filesystem,
+        createMarkerNonce: (() => { let value = 0; return () => `nonce${value += 1}`; })(),
+    });
+
+    const firstDirectoryRename = events.indexOf('rename-directory');
+    assert.deepEqual(events.slice(0, firstDirectoryRename), [
+        'open-marker-temp',
+        'write-marker',
+        'sync-marker',
+        'close-marker',
+        'rename-marker',
+        'open-parent',
+        'sync-parent',
+        'close-parent',
+    ]);
+});
+
+test('transaction recovers safely after marker write or rename interruption', async t => {
+    for (const failure of ['write', 'rename']) {
+        const parentDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), `ride-transaction-marker-${failure}-`));
+        t.after(() => fs.promises.rm(parentDirectory, { recursive: true, force: true }));
+        const plan = createDirectoryTransactionPlan(parentDirectory, 'lib', `${failure}-interrupted`);
+        await writeSentinel(plan.targetDirectory, 'complete-old');
+        await writeSentinel(plan.temporaryDirectory, 'complete-new');
+        const filesystem = {
+            ...fs.promises,
+            open: async (candidate, flags) => {
+                const handle = await fs.promises.open(candidate, flags);
+                if (failure !== 'write' || !path.basename(candidate).includes('.marker-tmp-')) {
+                    return handle;
+                }
+                return {
+                    writeFile: async data => {
+                        await handle.writeFile(data.subarray ? data.subarray(0, 4) : String(data).slice(0, 4));
+                        throw new Error('marker write interrupted');
+                    },
+                    sync: () => handle.sync(),
+                    close: () => handle.close(),
+                };
+            },
+            rename: async (source, destination) => {
+                if (failure === 'rename' && path.basename(source).includes('.marker-tmp-')) {
+                    throw new Error('marker rename interrupted');
+                }
+                return fs.promises.rename(source, destination);
+            },
+        };
+
+        await assert.rejects(replaceDirectoryTransactional(plan, {
+            filesystem,
+            createMarkerNonce: () => `${failure}nonce`,
+        }), new RegExp(`marker ${failure} interrupted`));
+        await recoverDirectoryTransactions({ parentDirectory, targetName: 'lib' });
+        assert.equal(await fs.promises.readFile(path.join(plan.targetDirectory, 'sentinel.txt'), 'utf8'), 'complete-old');
+        assert.equal(await fs.promises.readFile(path.join(plan.temporaryDirectory, 'sentinel.txt'), 'utf8'), 'complete-new');
+        assert.deepEqual(await transactionArtifacts(plan), []);
+    }
+});
+
+test('recovery uses the previous complete state when the latest marker is truncated', async t => {
+    const parentDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-transaction-truncated-'));
+    t.after(() => fs.promises.rm(parentDirectory, { recursive: true, force: true }));
+    const plan = createDirectoryTransactionPlan(parentDirectory, 'lib', 'truncated-latest');
+    await writeSentinel(plan.targetDirectory, 'complete-old');
+    await writeSentinel(plan.temporaryDirectory, 'complete-new');
+    await writeTransactionStateFixture(plan, 'prepared', 'preparednonce');
+    await fs.promises.rename(plan.targetDirectory, plan.backupDirectory);
+    await writeTransactionStateFixture(plan, 'backed-up', 'truncatednonce', '{"schema":');
+
+    await recoverDirectoryTransactions({ parentDirectory, targetName: 'lib' });
+
+    assert.equal(await fs.promises.readFile(path.join(plan.targetDirectory, 'sentinel.txt'), 'utf8'), 'complete-old');
+    assert.equal(fs.existsSync(plan.backupDirectory), false);
+    assert.equal(fs.existsSync(plan.temporaryDirectory), false);
+    assert.deepEqual(await transactionArtifacts(plan), []);
+});
+
+test('recovery restores a complete old version after power loss in backed-up state', async t => {
+    const parentDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-transaction-power-loss-'));
+    t.after(() => fs.promises.rm(parentDirectory, { recursive: true, force: true }));
+    const plan = createDirectoryTransactionPlan(parentDirectory, 'lib', 'power-loss');
+    await writeSentinel(plan.targetDirectory, 'complete-old');
+    await writeSentinel(plan.temporaryDirectory, 'complete-new');
+    await writeTransactionStateFixture(plan, 'prepared', 'preparednonce');
+    await fs.promises.rename(plan.targetDirectory, plan.backupDirectory);
+    await writeTransactionStateFixture(plan, 'backed-up', 'backupnonce');
+
+    await recoverDirectoryTransactions({ parentDirectory, targetName: 'lib' });
+
+    assert.equal(await fs.promises.readFile(path.join(plan.targetDirectory, 'sentinel.txt'), 'utf8'), 'complete-old');
+    assert.equal(fs.existsSync(plan.backupDirectory), false);
+    assert.equal(fs.existsSync(plan.temporaryDirectory), false);
+    assert.deepEqual(await transactionArtifacts(plan), []);
 });
 
 test('Windows filesystem retry is bounded to EPERM and EBUSY', async () => {
@@ -927,7 +1159,7 @@ test('proper-lockfile is a direct exact production dependency', async () => {
     assert.equal(packageManifest.devDependencies?.['proper-lockfile'], '4.1.2');
     const productionSource = await fs.promises.readFile(path.join(appDirectory, 'scripts', 'tauri-frontend-profile.mjs'), 'utf8');
     assert.match(productionSource, /require\(['"]proper-lockfile['"]\)/);
-    assert.doesNotMatch(productionSource, /leaseId|quarantine|isProcessAlive|process\.kill\(pid|parsePublishLockOwner|readPublishLockOwner/);
+    assert.doesNotMatch(productionSource, /createPublishLockFilesystem|leaseId|quarantine|isProcessAlive|process\.kill\(pid|parsePublishLockOwner|readPublishLockOwner/);
 });
 
 test('publish lock delegates fixed cross-process policy to proper-lockfile', async t => {
@@ -953,6 +1185,7 @@ test('publish lock delegates fixed cross-process policy to proper-lockfile', asy
     assert.ok(captured.options.retries.retries > 0);
     assert.ok(captured.options.retries.retries * captured.options.retries.maxTimeout <= 31_000);
     assert.equal(typeof captured.options.onCompromised, 'function');
+    assert.equal('fs' in captured.options, false, 'proper-lockfile must use its native filesystem implementation');
     lock.assertHealthy();
     await lock.release();
     assert.equal(released, true);
@@ -1042,6 +1275,67 @@ test('publish preserves both operation and lock release failures', async t => {
     });
 });
 
+test('publish removes its partial copy before a transaction marker exists', async t => {
+    const browserDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-publish-copy-cleanup-'));
+    t.after(() => fs.promises.rm(browserDirectory, { recursive: true, force: true }));
+    await writeSentinel(path.join(browserDirectory, 'lib'), 'previous');
+    const manifest = profileBuildManifest({ buildId: 'partial-copy-build' });
+    const sourceDirectory = await createPublishSource(browserDirectory, manifest);
+
+    await assert.rejects(publishProfileBuild({
+        browserDirectory,
+        expectedProfile: manifest.profile,
+        buildId: manifest.buildId,
+        sourceDirectory,
+        sourceIdentity: async () => manifest.sourceIdentity,
+        copyTree: async (_source, destination) => {
+            await fs.promises.mkdir(destination, { recursive: true });
+            await fs.promises.writeFile(path.join(destination, 'partial.txt'), 'partial');
+            throw new Error('partial copy failed');
+        },
+    }), /partial copy failed/);
+
+    assert.equal(await fs.promises.readFile(path.join(browserDirectory, 'lib', 'sentinel.txt'), 'utf8'), 'previous');
+    const leftovers = (await fs.promises.readdir(browserDirectory)).filter(name => name.startsWith('.lib.tmp-'));
+    assert.deepEqual(leftovers, []);
+});
+
+test('publish preserves copy and temporary cleanup failures', async t => {
+    const browserDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-publish-copy-cleanup-error-'));
+    t.after(() => fs.promises.rm(browserDirectory, { recursive: true, force: true }));
+    const manifest = profileBuildManifest({ buildId: 'partial-copy-cleanup-error' });
+    const sourceDirectory = await createPublishSource(browserDirectory, manifest);
+    const filesystem = {
+        ...fs.promises,
+        rm: async (candidate, options) => {
+            if (path.basename(candidate).startsWith('.lib.tmp-')) {
+                throw new Error('temporary cleanup failed');
+            }
+            return fs.promises.rm(candidate, options);
+        },
+    };
+
+    await assert.rejects(publishProfileBuild({
+        browserDirectory,
+        expectedProfile: manifest.profile,
+        buildId: manifest.buildId,
+        sourceDirectory,
+        sourceIdentity: async () => manifest.sourceIdentity,
+        copyTree: async (_source, destination) => {
+            await fs.promises.mkdir(destination, { recursive: true });
+            throw new Error('copy failed before marker');
+        },
+        transactionOptions: { filesystem },
+    }), error => {
+        assert.ok(error instanceof AggregateError);
+        assert.deepEqual(error.errors.map(item => item.message), [
+            'copy failed before marker',
+            'temporary cleanup failed',
+        ]);
+        return true;
+    });
+});
+
 test('proper-lockfile heartbeat keeps an active publish lock from becoming stale', { timeout: 12_000 }, async t => {
     const browserDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-publish-lock-heartbeat-'));
     t.after(() => fs.promises.rm(browserDirectory, { recursive: true, force: true }));
@@ -1061,24 +1355,53 @@ test('proper-lockfile heartbeat keeps an active publish lock from becoming stale
     await lock.release();
 });
 
-test('proper-lockfile recovers stale v1 and v2 lock directories and release allows a successor', async t => {
-    for (const schema of ['ride.tauri-publish-lock@1', 'ride.tauri-publish-lock@2']) {
-        const browserDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-publish-lock-stale-'));
+test('legacy and non-proper publish locks fail closed without deleting any contents', async t => {
+    const cases = [
+        ['active-v1', 'owner.json', JSON.stringify({ schema: 'ride.tauri-publish-lock@1', pid: process.pid })],
+        ['stale-v2', 'owner.json', JSON.stringify({ schema: 'ride.tauri-publish-lock@2', pid: 999999 })],
+        ['dead-owner', 'owner.json', '{"schema":"ride.tauri-publish-lock@1","pid":999999}'],
+        ['ownerless-init', 'legacy-initializing.tmp', 'initializing'],
+    ];
+    for (const [name, entryName, contents] of cases) {
+        const browserDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), `ride-publish-lock-${name}-`));
         t.after(() => fs.promises.rm(browserDirectory, { recursive: true, force: true }));
         const lockDirectory = path.join(browserDirectory, '.ride-tauri-publish.lock');
+        const entryPath = path.join(lockDirectory, entryName);
         await fs.promises.mkdir(lockDirectory);
-        await fs.promises.writeFile(path.join(lockDirectory, 'owner.json'), `${JSON.stringify({ schema })}\n`);
+        await fs.promises.writeFile(entryPath, contents);
         const staleTime = new Date(Date.now() - 60_000);
         await fs.promises.utimes(lockDirectory, staleTime, staleTime);
+        let providerCalls = 0;
 
-        const recovered = await acquirePublishLock({ browserDirectory });
+        await assert.rejects(acquirePublishLock({
+            browserDirectory,
+            lockProvider: {
+                lock: async () => {
+                    providerCalls += 1;
+                    return async () => {};
+                },
+            },
+        }), /legacy|non-proper.*publish lock.*remove.*manually/i);
+        assert.equal(providerCalls, 0);
+        assert.equal(await fs.promises.readFile(entryPath, 'utf8'), contents);
         assert.equal(fs.existsSync(lockDirectory), true);
-        await recovered.release();
-        assert.equal(fs.existsSync(lockDirectory), false);
-        const successor = await acquirePublishLock({ browserDirectory });
-        await successor.release();
-        assert.equal(fs.existsSync(lockDirectory), false);
     }
+});
+
+test('proper-lockfile alone recovers its stale empty lock and release allows a successor', async t => {
+    const browserDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-publish-lock-stale-empty-'));
+    t.after(() => fs.promises.rm(browserDirectory, { recursive: true, force: true }));
+    const lockDirectory = path.join(browserDirectory, '.ride-tauri-publish.lock');
+    await fs.promises.mkdir(lockDirectory);
+    const staleTime = new Date(Date.now() - 60_000);
+    await fs.promises.utimes(lockDirectory, staleTime, staleTime);
+
+    const recovered = await acquirePublishLock({ browserDirectory });
+    await recovered.release();
+    assert.equal(fs.existsSync(lockDirectory), false);
+    const successor = await acquirePublishLock({ browserDirectory });
+    await successor.release();
+    assert.equal(fs.existsSync(lockDirectory), false);
 });
 
 test('proper-lockfile serializes three independent process critical sections', { timeout: 15_000 }, async t => {
@@ -1240,6 +1563,7 @@ test('generates an isolated target without writing tracked package.json or src-g
     }, null, 2));
     await fs.promises.writeFile(path.join(browserDirectory, 'esbuild.mjs'), 'export {};\n');
     await fs.promises.writeFile(path.join(browserDirectory, 'ride-esbuild-dedupe.mjs'), 'export {};\n');
+    await fs.promises.writeFile(path.join(browserDirectory, 'tauri-esbuild-profile-audit.mjs'), 'export {};\n');
     await fs.promises.writeFile(path.join(browserDirectory, 'resources', 'preload.html'), '<main></main>\n');
     await fs.promises.writeFile(path.join(browserDirectory, 'ico', 'favicon.ico'), 'ico');
     await fs.promises.writeFile(path.join(browserDirectory, 'src-gen', 'sentinel.txt'), 'tracked generated sentinel');
@@ -1274,6 +1598,7 @@ test('generates an isolated target without writing tracked package.json or src-g
     assert.deepEqual(generatedPackage.theia, { generator: { config: { preloadTemplate: './resources/preload.html' } } });
     assert.equal(generatedPackage.scripts, undefined);
     assert.ok(fs.existsSync(path.join(result.targetDirectory, 'esbuild.mjs')));
+    assert.ok(fs.existsSync(path.join(result.targetDirectory, 'tauri-esbuild-profile-audit.mjs')));
     assert.ok(fs.existsSync(path.join(result.targetDirectory, 'ride-esbuild-dedupe.mjs')));
     assert.ok(fs.existsSync(path.join(result.targetDirectory, 'resources', 'preload.html')));
     assert.ok(fs.existsSync(path.join(result.targetDirectory, 'ico', 'favicon.ico')));
@@ -1324,6 +1649,7 @@ test('generates and resolves a nested transitive Theia extension from its instal
     }));
     await fs.promises.writeFile(path.join(browserDirectory, 'esbuild.mjs'), 'export {};\n');
     await fs.promises.writeFile(path.join(browserDirectory, 'ride-esbuild-dedupe.mjs'), 'export {};\n');
+    await fs.promises.writeFile(path.join(browserDirectory, 'tauri-esbuild-profile-audit.mjs'), 'export {};\n');
     for (const [requestName, packageManifest] of Object.entries(manifests)) {
         await fs.promises.writeFile(path.join(directories[requestName === '@theia/cli' ? '@theia-cli' : requestName], 'package.json'), JSON.stringify(packageManifest));
     }
@@ -1358,7 +1684,49 @@ test('rejects dirty source identity before generating a build target', async t =
         profileName: 'tauri-critical',
         buildId: 'dirty-build',
         sourceIdentity: async () => ({ commit: 'b'.repeat(40), clean: false }),
-    }), /tracked source tree.*clean/i);
+    }), /source tree.*clean/i);
+});
+
+test('source provenance ignores generated paths but rejects an untracked app resource before prepare', async t => {
+    const repository = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-profile-provenance-'));
+    t.after(() => fs.promises.rm(repository, { recursive: true, force: true }));
+    const runGit = args => execFileSync('git', args, { cwd: repository, stdio: 'ignore' });
+    runGit(['init']);
+    runGit(['config', 'user.email', 'tests@example.invalid']);
+    runGit(['config', 'user.name', 'R-IDE Tests']);
+    await fs.promises.mkdir(path.join(repository, 'app', 'resources'), { recursive: true });
+    await fs.promises.writeFile(path.join(repository, '.gitignore'), [
+        'app/node_modules/',
+        'app/lib/',
+        'app/.ride-tauri-profile/',
+        'app/src-gen/',
+        '',
+    ].join('\n'));
+    await fs.promises.writeFile(path.join(repository, 'app', 'tracked.txt'), 'tracked');
+    runGit(['add', '.']);
+    runGit(['commit', '-m', 'fixture']);
+    const profileModule = await import('../tauri-frontend-profile.mjs');
+    assert.equal(typeof profileModule.readSourceIdentity, 'function');
+
+    for (const relative of ['node_modules/cache.bin', 'lib/main.js', '.ride-tauri-profile/builds/x/file', 'src-gen/generated.js']) {
+        const candidate = path.join(repository, 'app', relative);
+        await fs.promises.mkdir(path.dirname(candidate), { recursive: true });
+        await fs.promises.writeFile(candidate, 'ignored');
+    }
+    assert.deepEqual(profileModule.readSourceIdentity(repository), {
+        commit: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repository, encoding: 'utf8' }).trim(),
+        clean: true,
+    });
+
+    await fs.promises.writeFile(path.join(repository, 'app', 'resources', 'untracked-asset.png'), 'new input');
+    const dirtyIdentity = profileModule.readSourceIdentity(repository);
+    assert.equal(dirtyIdentity.clean, false);
+    await assert.rejects(generateProfileTarget({
+        browserDirectory: path.join(repository, 'app', 'browser'),
+        profileName: 'tauri-critical',
+        buildId: 'untracked-resource',
+        sourceIdentity: async () => dirtyIdentity,
+    }), /source tree.*clean/i);
 });
 
 test('rejects conflicting installed identities for one request name with both paths', async t => {
@@ -1376,6 +1744,7 @@ test('rejects conflicting installed identities for one request name with both pa
     }));
     await fs.promises.writeFile(path.join(browserDirectory, 'esbuild.mjs'), 'export {};\n');
     await fs.promises.writeFile(path.join(browserDirectory, 'ride-esbuild-dedupe.mjs'), 'export {};\n');
+    await fs.promises.writeFile(path.join(browserDirectory, 'tauri-esbuild-profile-audit.mjs'), 'export {};\n');
     const packageByRequest = {
         product: manifest('product', { left: '^1.0.0', right: '^1.0.0' }),
         left: { name: 'left', version: '1.0.0', dependencies: { shared: '^1.0.0' } },

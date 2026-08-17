@@ -197,6 +197,10 @@ test('removes string and prefix filtering while retaining build safety fixes', (
   assert.doesNotMatch(esbuildSource, /leanTauri|startsWith\(prefix\)|split\(['"]\\n['"]\)\.filter/);
   assert.doesNotMatch(esbuildSource, /src-gen.*writeFileSync|patchGeneratedFilesForLeanTauri/s);
   assert.match(esbuildSource, /createTheiaModuleDedupePlugin/);
+  assert.match(esbuildSource, /loadTauriProfileManifest/);
+  assert.match(esbuildSource, /createTauriProfileAuditPlugin/);
+  assert.match(esbuildSource, /browserOptions\.metafile\s*=\s*true/);
+  assert.match(esbuildSource, /nodeOptions\.metafile\s*=\s*true/);
   assert.match(esbuildSource, /patchBuiltParcelWatcherLoad/);
   assert.match(esbuildSource, /native\/watcher\.node/);
 });
@@ -238,5 +242,5 @@ test('ignores generated profile targets and atomic staging directories', () => {
   assert.match(ignore, /\*\*\/\.ride-tauri-publish\.lock\.stale-\*\//);
   assert.match(ignore, /\*\*\/\.lib\.tmp-\*\//);
   assert.match(ignore, /\*\*\/\.lib\.old-\*\//);
-  assert.match(ignore, /\*\*\/\.lib\.transaction-\*\.json/);
+  assert.ok(ignore.split(/\r?\n/).includes('**/.lib.transaction-*'));
 });

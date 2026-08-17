@@ -23,7 +23,7 @@ license-check-summary.txt*
 **/.ride-tauri-publish.lock.stale-*/
 **/.lib.tmp-*/
 **/.lib.old-*/
-**/.lib.transaction-*.json
+**/.lib.transaction-*
 **/resources/backend/*
 **/resources/plugins/*
 !**/resources/backend/

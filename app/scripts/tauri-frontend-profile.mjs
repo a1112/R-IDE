@@ -12,7 +12,7 @@ const properLockfile = require('proper-lockfile');
 export const PROFILE_SCHEMA = 'ride.tauri-frontend-profile@2';
 export const PROFILE_DIRECTORY_NAME = '.ride-tauri-profile';
 const PROFILE_MANIFEST_NAME = 'ride-tauri-profile.json';
-const CUSTOM_FILES = ['esbuild.mjs', 'ride-esbuild-dedupe.mjs'];
+const CUSTOM_FILES = ['esbuild.mjs', 'ride-esbuild-dedupe.mjs', 'tauri-esbuild-profile-audit.mjs'];
 const CUSTOM_DIRECTORIES = ['resources', 'ico'];
 const PUBLISH_LOCK_STALE_MS = 5_000;
 const PUBLISH_LOCK_UPDATE_MS = 2_000;
@@ -24,9 +24,10 @@ function compareText(left, right) {
     return left < right ? -1 : left > right ? 1 : 0;
 }
 
-function currentCommit() {
-    const commit = execFileSync('git', ['rev-parse', 'HEAD'], {
-        cwd: repositoryDirectory,
+export function readSourceIdentity(sourceRepository = repositoryDirectory, run = execFileSync) {
+    const resolvedRepository = path.resolve(sourceRepository);
+    const commit = run('git', ['rev-parse', 'HEAD'], {
+        cwd: resolvedRepository,
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'ignore'],
         timeout: 5000,
@@ -35,19 +36,18 @@ function currentCommit() {
     if (!/^[0-9a-f]{40}$/.test(commit)) {
         throw new Error('Current Git commit is not canonical.');
     }
-    return commit;
-}
-
-async function defaultSourceIdentity() {
-    const commit = currentCommit();
-    const status = execFileSync('git', ['status', '--porcelain=v1', '--untracked-files=no', '--', 'app'], {
-        cwd: repositoryDirectory,
+    const status = run('git', ['status', '--porcelain=v1', '--untracked-files=all', '--', 'app'], {
+        cwd: resolvedRepository,
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'pipe'],
         timeout: 5000,
         maxBuffer: 1024 * 1024,
     }).trim();
     return { commit, clean: status === '' };
+}
+
+async function defaultSourceIdentity() {
+    return readSourceIdentity(repositoryDirectory);
 }
 
 function validateSourceIdentity(identity) {
@@ -57,7 +57,7 @@ function validateSourceIdentity(identity) {
     if (keys.join('\0') !== ['clean', 'commit'].join('\0')
         || !/^[0-9a-f]{40}$/.test(identity.commit ?? '')
         || identity.clean !== true) {
-        throw new Error('The tracked source tree must be clean with a canonical current commit.');
+        throw new Error('The source tree must be clean with a canonical current commit.');
     }
     return { commit: identity.commit, clean: true };
 }
@@ -540,7 +540,8 @@ export function createDirectoryTransactionPlan(parentDirectory, targetName, tran
     const temporaryDirectory = path.join(resolvedParent, `.${targetName}.tmp-${transactionId}`);
     const backupDirectory = path.join(resolvedParent, `.${targetName}.old-${transactionId}`);
     const markerPath = path.join(resolvedParent, `.${targetName}.transaction-${transactionId}.json`);
-    for (const candidate of [targetDirectory, temporaryDirectory, backupDirectory, markerPath]) {
+    const markerPrefix = path.join(resolvedParent, `.${targetName}.transaction-${transactionId}.`);
+    for (const candidate of [targetDirectory, temporaryDirectory, backupDirectory, markerPath, markerPrefix]) {
         assertProfilePath(resolvedParent, candidate);
     }
     return {
@@ -551,6 +552,7 @@ export function createDirectoryTransactionPlan(parentDirectory, targetName, tran
         temporaryDirectory,
         backupDirectory,
         markerPath,
+        markerPrefix,
     };
 }
 
@@ -623,37 +625,122 @@ async function retryUnlink(filesystem, candidate, retry) {
     });
 }
 
+const transactionStates = new Map([
+    ['prepared', 1],
+    ['backed-up', 2],
+    ['installed', 3],
+    ['rolled-back', 4],
+]);
+
 function transactionMarker(plan, state) {
     return {
-        schema: 'ride.directory-transaction@1',
+        schema: 'ride.directory-transaction@2',
         targetName: plan.targetName,
         transactionId: plan.transactionId,
         state,
+        sequence: transactionStates.get(state),
     };
 }
 
-async function writeTransactionMarker(plan, state, filesystem) {
-    const existing = await pathState(plan.markerPath, filesystem);
-    if (existing.exists && existing.stat.isSymbolicLink()) {
-        throw new Error(`Refusing symbolic transaction marker: ${plan.markerPath}`);
-    }
-    await filesystem.writeFile(plan.markerPath, `${JSON.stringify(transactionMarker(plan, state))}\n`, { flag: 'w' });
+function transactionStateMarkerPath(plan, state, nonce) {
+    const sequence = String(transactionStates.get(state)).padStart(2, '0');
+    return `${plan.markerPrefix}${sequence}-${state}-${nonce}.json`;
 }
 
-function parseTransactionMarker(text, plan) {
+function transactionTempMarkerPath(plan, nonce) {
+    return `${plan.markerPrefix}marker-tmp-${nonce}`;
+}
+
+async function syncParentDirectory(parentDirectory, filesystem, platform) {
+    let handle;
+    try {
+        handle = await filesystem.open(parentDirectory, 'r');
+        await handle.sync();
+    } catch (error) {
+        const unsupportedOnWindows = platform === 'win32'
+            && ['EACCES', 'EISDIR', 'EINVAL', 'ENOTSUP', 'EPERM'].includes(error?.code);
+        if (!unsupportedOnWindows) {
+            throw error;
+        }
+    } finally {
+        await handle?.close();
+    }
+}
+
+async function writeTransactionMarker(plan, state, options) {
+    const { filesystem, retry } = filesystemOptions(options);
+    const createMarkerNonce = options.createMarkerNonce ?? (() => crypto.randomBytes(6).toString('hex'));
+    const nonce = createMarkerNonce();
+    assertPathSegment(nonce, 'Directory transaction marker nonce');
+    const temporaryMarker = transactionTempMarkerPath(plan, nonce);
+    const stateMarker = transactionStateMarkerPath(plan, state, nonce);
+    for (const candidate of [temporaryMarker, stateMarker]) {
+        assertProfilePath(plan.parentDirectory, candidate);
+    }
+    const data = Buffer.from(`${JSON.stringify(transactionMarker(plan, state))}\n`);
+    let handle;
+    let writeError;
+    try {
+        handle = await filesystem.open(temporaryMarker, 'wx');
+        await handle.writeFile(data);
+        await handle.sync();
+    } catch (error) {
+        writeError = error;
+    }
+    let closeError;
+    try {
+        await handle?.close();
+    } catch (error) {
+        closeError = error;
+    }
+    if (writeError && closeError) {
+        throw new AggregateError([writeError, closeError], 'Transaction marker write and close both failed.');
+    }
+    if (writeError) {
+        throw writeError;
+    }
+    if (closeError) {
+        throw closeError;
+    }
+    await retryRename(filesystem, temporaryMarker, stateMarker, retry);
+    await syncParentDirectory(plan.parentDirectory, filesystem, options.platform ?? process.platform);
+    return stateMarker;
+}
+
+async function removeTransactionMarkerFiles(plan, filesystem, retry) {
+    const markerPrefix = path.basename(plan.markerPrefix);
+    const legacyMarker = path.basename(plan.markerPath);
+    const entries = await filesystem.readdir(plan.parentDirectory, { withFileTypes: true });
+    for (const entry of entries.sort((left, right) => compareText(left.name, right.name))) {
+        if (entry.name !== legacyMarker && !entry.name.startsWith(markerPrefix)) {
+            continue;
+        }
+        if (!entry.isFile() || entry.isSymbolicLink()) {
+            throw new Error(`Directory transaction marker is not a regular file: ${entry.name}`);
+        }
+        await retryUnlink(filesystem, path.join(plan.parentDirectory, entry.name), retry);
+    }
+}
+
+function parseTransactionMarker(text, plan, expected = undefined) {
     let marker;
     try {
         marker = JSON.parse(text);
     } catch (error) {
         throw new Error(`Malformed directory transaction marker ${plan.markerPath}: ${error.message}`);
     }
-    const exactKeys = ['schema', 'state', 'targetName', 'transactionId'];
+    const legacy = marker?.schema === 'ride.directory-transaction@1';
+    const exactKeys = legacy
+        ? ['schema', 'state', 'targetName', 'transactionId']
+        : ['schema', 'sequence', 'state', 'targetName', 'transactionId'];
     if (!marker || typeof marker !== 'object' || Array.isArray(marker)
         || Object.keys(marker).sort(compareText).join('\0') !== exactKeys.join('\0')
-        || marker.schema !== 'ride.directory-transaction@1'
+        || (!legacy && marker.schema !== 'ride.directory-transaction@2')
         || marker.targetName !== plan.targetName
         || marker.transactionId !== plan.transactionId
-        || !['prepared', 'backed-up', 'installed', 'rolled-back'].includes(marker.state)) {
+        || !transactionStates.has(marker.state)
+        || (!legacy && marker.sequence !== transactionStates.get(marker.state))
+        || (expected && (marker.state !== expected.state || marker.sequence !== expected.sequence))) {
         throw new Error(`Invalid directory transaction marker ${plan.markerPath}.`);
     }
     return marker;
@@ -680,52 +767,138 @@ export async function recoverDirectoryTransactions({ parentDirectory, targetName
         }
         throw error;
     }
+    const escapedTarget = targetName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const prefix = `.${targetName}.transaction-`;
-    const suffix = '.json';
+    const statePattern = new RegExp(
+        `^\\.${escapedTarget}\\.transaction-(.+)\\.(\\d{2})-(prepared|backed-up|installed|rolled-back)-([A-Za-z0-9][A-Za-z0-9._-]{0,127})\\.json$`,
+    );
+    const temporaryPattern = new RegExp(
+        `^\\.${escapedTarget}\\.transaction-(.+)\\.marker-tmp-([A-Za-z0-9][A-Za-z0-9._-]{0,127})$`,
+    );
+    const legacyPattern = new RegExp(`^\\.${escapedTarget}\\.transaction-(.+)\\.json$`);
+    const groups = new Map();
+    const groupFor = transactionId => {
+        assertPathSegment(transactionId, 'Directory transaction id');
+        if (!groups.has(transactionId)) {
+            groups.set(transactionId, { stateFiles: [], temporaryFiles: [], legacyFiles: [] });
+        }
+        return groups.get(transactionId);
+    };
     for (const entry of entries.sort((left, right) => compareText(left.name, right.name))) {
-        if (!entry.isFile() || !entry.name.startsWith(prefix) || !entry.name.endsWith(suffix)) {
+        if (!entry.name.startsWith(prefix)) {
             continue;
         }
-        const transactionId = entry.name.slice(prefix.length, -suffix.length);
+        if (!entry.isFile() || entry.isSymbolicLink()) {
+            throw new Error(`Directory transaction marker is not a regular file: ${entry.name}`);
+        }
+        const stateMatch = entry.name.match(statePattern);
+        if (stateMatch) {
+            groupFor(stateMatch[1]).stateFiles.push({
+                path: path.join(resolvedParent, entry.name),
+                sequence: Number(stateMatch[2]),
+                state: stateMatch[3],
+            });
+            continue;
+        }
+        const temporaryMatch = entry.name.match(temporaryPattern);
+        if (temporaryMatch) {
+            groupFor(temporaryMatch[1]).temporaryFiles.push(path.join(resolvedParent, entry.name));
+            continue;
+        }
+        const legacyMatch = entry.name.match(legacyPattern);
+        if (legacyMatch) {
+            groupFor(legacyMatch[1]).legacyFiles.push(path.join(resolvedParent, entry.name));
+            continue;
+        }
+        throw new Error(`Unrecognized directory transaction marker: ${entry.name}`);
+    }
+
+    for (const transactionId of [...groups.keys()].sort(compareText)) {
+        const group = groups.get(transactionId);
         const plan = createDirectoryTransactionPlan(resolvedParent, targetName, transactionId);
-        const marker = parseTransactionMarker(await filesystem.readFile(plan.markerPath, 'utf8'), plan);
-        const targetExists = await assertRegularDirectoryIfPresent(plan.targetDirectory, filesystem);
-        const backupExists = await assertRegularDirectoryIfPresent(plan.backupDirectory, filesystem);
-        await assertRegularDirectoryIfPresent(plan.temporaryDirectory, filesystem);
-        if (marker.state === 'backed-up') {
-            if (!backupExists) {
-                throw new Error(`Cannot safely recover backed-up directory transaction ${transactionId}.`);
+        const complete = [];
+        let firstMalformed;
+        for (const record of group.stateFiles) {
+            try {
+                const marker = parseTransactionMarker(
+                    await filesystem.readFile(record.path, 'utf8'),
+                    plan,
+                    record,
+                );
+                complete.push({ ...record, marker });
+            } catch (error) {
+                firstMalformed ??= error;
             }
-            if (targetExists) {
-                await retryRemove(filesystem, plan.targetDirectory, retry);
+        }
+        for (const legacyPath of group.legacyFiles) {
+            try {
+                const marker = parseTransactionMarker(await filesystem.readFile(legacyPath, 'utf8'), plan);
+                complete.push({
+                    path: legacyPath,
+                    sequence: transactionStates.get(marker.state),
+                    state: marker.state,
+                    marker,
+                });
+            } catch (error) {
+                firstMalformed ??= error;
             }
-            await retryRename(filesystem, plan.backupDirectory, plan.targetDirectory, retry);
-            await retryRemove(filesystem, plan.temporaryDirectory, retry);
-            await retryUnlink(filesystem, plan.markerPath, retry);
+        }
+        if (complete.length === 0) {
+            if (group.stateFiles.length > 0 || group.legacyFiles.length > 0) {
+                throw firstMalformed ?? new Error(`Directory transaction ${transactionId} has no complete state marker.`);
+            }
+            for (const markerPath of group.temporaryFiles) {
+                await retryUnlink(filesystem, markerPath, retry);
+            }
             continue;
         }
+        complete.sort((left, right) => left.sequence - right.sequence || compareText(left.path, right.path));
+        for (let index = 1; index < complete.length; index += 1) {
+            if (complete[index - 1].sequence === complete[index].sequence) {
+                throw new Error(`Directory transaction ${transactionId} has duplicate state markers.`);
+            }
+        }
+        const marker = complete.at(-1).marker;
+        let targetExists = await assertRegularDirectoryIfPresent(plan.targetDirectory, filesystem);
+        let backupExists = await assertRegularDirectoryIfPresent(plan.backupDirectory, filesystem);
+        await assertRegularDirectoryIfPresent(plan.temporaryDirectory, filesystem);
         if (marker.state === 'installed') {
             if (!targetExists) {
                 throw new Error(`Cannot safely recover installed directory transaction ${transactionId}.`);
             }
             await retryRemove(filesystem, plan.backupDirectory, retry);
-            await retryRemove(filesystem, plan.temporaryDirectory, retry);
-            await retryUnlink(filesystem, plan.markerPath, retry);
-            continue;
-        }
-        if (backupExists && !targetExists) {
-            await retryRename(filesystem, plan.backupDirectory, plan.targetDirectory, retry);
+        } else if (marker.state === 'rolled-back') {
+            if (!targetExists && backupExists) {
+                await retryRename(filesystem, plan.backupDirectory, plan.targetDirectory, retry);
+                targetExists = true;
+                backupExists = false;
+            }
+            if (!targetExists || backupExists) {
+                throw new Error(`Cannot safely recover rolled-back directory transaction ${transactionId}.`);
+            }
         } else if (backupExists) {
-            throw new Error(`Cannot safely recover directory transaction ${transactionId} with two originals.`);
+            if (targetExists) {
+                await retryRemove(filesystem, plan.targetDirectory, retry);
+            }
+            await retryRename(filesystem, plan.backupDirectory, plan.targetDirectory, retry);
+        } else if (marker.state === 'backed-up' && !targetExists) {
+            throw new Error(`Cannot safely recover backed-up directory transaction ${transactionId}.`);
         }
         await retryRemove(filesystem, plan.temporaryDirectory, retry);
-        await retryUnlink(filesystem, plan.markerPath, retry);
+        const markerPaths = [
+            ...group.stateFiles.map(record => record.path),
+            ...group.temporaryFiles,
+            ...group.legacyFiles,
+        ].sort(compareText);
+        for (const markerPath of markerPaths) {
+            await retryUnlink(filesystem, markerPath, retry);
+        }
     }
 }
 
 export async function replaceDirectoryTransactional(plan, options = {}) {
     const expected = createDirectoryTransactionPlan(plan.parentDirectory, plan.targetName, plan.transactionId);
-    for (const field of ['targetDirectory', 'temporaryDirectory', 'backupDirectory', 'markerPath']) {
+    for (const field of ['targetDirectory', 'temporaryDirectory', 'backupDirectory', 'markerPath', 'markerPrefix']) {
         if (path.resolve(plan[field]) !== path.resolve(expected[field])) {
             throw new Error(`Directory transaction ${field} is not canonical.`);
         }
@@ -739,10 +912,10 @@ export async function replaceDirectoryTransactional(plan, options = {}) {
     if (await assertRegularDirectoryIfPresent(plan.backupDirectory, filesystem)) {
         throw new Error(`Directory transaction backup already exists: ${plan.backupDirectory}`);
     }
-    await writeTransactionMarker(plan, 'prepared', filesystem);
+    await writeTransactionMarker(plan, 'prepared', options);
     if (targetExists) {
         await retryRename(filesystem, plan.targetDirectory, plan.backupDirectory, retry);
-        await writeTransactionMarker(plan, 'backed-up', filesystem);
+        await writeTransactionMarker(plan, 'backed-up', options);
     }
     try {
         await retryRename(filesystem, plan.temporaryDirectory, plan.targetDirectory, retry);
@@ -752,16 +925,16 @@ export async function replaceDirectoryTransactional(plan, options = {}) {
         }
         try {
             await retryRename(filesystem, plan.backupDirectory, plan.targetDirectory, retry);
-            await writeTransactionMarker(plan, 'rolled-back', filesystem);
-            await retryUnlink(filesystem, plan.markerPath, retry);
+            await writeTransactionMarker(plan, 'rolled-back', options);
+            await removeTransactionMarkerFiles(plan, filesystem, retry);
         } catch (rollbackError) {
             throw new AggregateError([installError, rollbackError], 'Directory install and rollback both failed.');
         }
         throw installError;
     }
-    await writeTransactionMarker(plan, 'installed', filesystem);
+    await writeTransactionMarker(plan, 'installed', options);
     await retryRemove(filesystem, plan.backupDirectory, retry);
-    await retryUnlink(filesystem, plan.markerPath, retry);
+    await removeTransactionMarkerFiles(plan, filesystem, retry);
 }
 
 async function copyRegularTree(source, destination) {
@@ -1207,50 +1380,18 @@ function canonicalBuildSource(browserDirectory, buildId) {
     return path.join(path.resolve(browserDirectory), PROFILE_DIRECTORY_NAME, 'builds', buildId);
 }
 
-function createPublishLockFilesystem(lockDirectory) {
-    let acceptingLegacyCleanup = true;
-    const lockFilesystem = Object.create(fs);
-    lockFilesystem.rmdir = (candidate, callback) => {
-        fs.rmdir(candidate, error => {
-            if (!error || error.code !== 'ENOTEMPTY' || !acceptingLegacyCleanup
-                || path.resolve(candidate) !== path.resolve(lockDirectory)) {
-                callback(error);
-                return;
-            }
-            fs.lstat(candidate, (directoryError, directoryStat) => {
-                if (directoryError || !directoryStat.isDirectory() || directoryStat.isSymbolicLink()) {
-                    callback(directoryError ?? error);
-                    return;
-                }
-                fs.readdir(candidate, { withFileTypes: true }, (entriesError, entries) => {
-                    const legacyEntry = entries?.[0];
-                    if (entriesError || entries?.length !== 1 || legacyEntry.name !== 'owner.json'
-                        || !legacyEntry.isFile() || legacyEntry.isSymbolicLink()) {
-                        callback(entriesError ?? error);
-                        return;
-                    }
-                    const legacyPath = path.join(candidate, legacyEntry.name);
-                    fs.lstat(legacyPath, (legacyError, legacyStat) => {
-                        if (legacyError || !legacyStat.isFile() || legacyStat.isSymbolicLink()) {
-                            callback(legacyError ?? error);
-                            return;
-                        }
-                        fs.unlink(legacyPath, unlinkError => {
-                            if (unlinkError && unlinkError.code !== 'ENOENT') {
-                                callback(unlinkError);
-                                return;
-                            }
-                            fs.rmdir(candidate, callback);
-                        });
-                    });
-                });
-            });
-        });
-    };
-    return {
-        filesystem: lockFilesystem,
-        finishAcquisition: () => { acceptingLegacyCleanup = false; },
-    };
+async function assertProperPublishLockDirectory(lockDirectory) {
+    const state = await pathState(lockDirectory, fs.promises);
+    if (!state.exists) {
+        return;
+    }
+    if (!state.stat.isDirectory() || state.stat.isSymbolicLink()) {
+        throw new Error(`Refusing non-proper Tauri publish lock path ${lockDirectory}; remove it manually after confirming no publisher is running.`);
+    }
+    const entries = await fs.promises.readdir(lockDirectory);
+    if (entries.length > 0) {
+        throw new Error(`Refusing legacy or non-proper Tauri publish lock contents in ${lockDirectory}; remove the lock manually after confirming no legacy publisher is running.`);
+    }
 }
 
 export async function acquirePublishLock({
@@ -1263,30 +1404,24 @@ export async function acquirePublishLock({
     }
     const lockDirectory = path.join(resolvedBrowserDirectory, '.ride-tauri-publish.lock');
     assertProfilePath(resolvedBrowserDirectory, lockDirectory);
+    await assertProperPublishLockDirectory(lockDirectory);
     let compromisedError;
-    const legacyCompatibility = createPublishLockFilesystem(lockDirectory);
-    let providerRelease;
-    try {
-        providerRelease = await lockProvider.lock(resolvedBrowserDirectory, {
-            realpath: false,
-            lockfilePath: lockDirectory,
-            stale: PUBLISH_LOCK_STALE_MS,
-            update: PUBLISH_LOCK_UPDATE_MS,
-            retries: {
-                retries: PUBLISH_LOCK_RETRIES,
-                factor: 1,
-                minTimeout: PUBLISH_LOCK_RETRY_MS,
-                maxTimeout: PUBLISH_LOCK_RETRY_MS,
-                randomize: false,
-            },
-            fs: legacyCompatibility.filesystem,
-            onCompromised: error => {
-                compromisedError ??= error;
-            },
-        });
-    } finally {
-        legacyCompatibility.finishAcquisition();
-    }
+    const providerRelease = await lockProvider.lock(resolvedBrowserDirectory, {
+        realpath: false,
+        lockfilePath: lockDirectory,
+        stale: PUBLISH_LOCK_STALE_MS,
+        update: PUBLISH_LOCK_UPDATE_MS,
+        retries: {
+            retries: PUBLISH_LOCK_RETRIES,
+            factor: 1,
+            minTimeout: PUBLISH_LOCK_RETRY_MS,
+            maxTimeout: PUBLISH_LOCK_RETRY_MS,
+            randomize: false,
+        },
+        onCompromised: error => {
+            compromisedError ??= error;
+        },
+    });
     if (typeof providerRelease !== 'function') {
         throw new Error('Tauri publish lock provider did not return a release function.');
     }
@@ -1349,6 +1484,8 @@ export async function publishProfileBuild({
     });
     let result;
     let operationError;
+    let publishPlan;
+    let transactionStarted = false;
     try {
         const lockedIdentity = validateSourceIdentity(await sourceIdentity());
         if (lockedIdentity.commit !== identity.commit) {
@@ -1365,6 +1502,7 @@ export async function publishProfileBuild({
         }
         const unique = `${process.pid}-${crypto.randomBytes(6).toString('hex')}`;
         const plan = createDirectoryTransactionPlan(resolvedBrowserDirectory, 'lib', unique);
+        publishPlan = plan;
         await recoverDirectoryTransactions(
             { parentDirectory: resolvedBrowserDirectory, targetName: 'lib' },
             transactionOptions,
@@ -1377,12 +1515,24 @@ export async function publishProfileBuild({
             await fs.promises.writeFile(path.join(plan.temporaryDirectory, output, PROFILE_MANIFEST_NAME), manifestText);
         }
         lock.assertHealthy();
+        transactionStarted = true;
         await replaceDirectoryTransactional(plan, transactionOptions);
         lock.assertHealthy();
         await retryRemove(fs.promises, expectedSource, {});
         result = { profile: manifest.profile, buildId: manifest.buildId, digest: manifest.digest, destinationLib };
     } catch (error) {
-        operationError = error;
+        if (publishPlan && !transactionStarted) {
+            const { filesystem, retry } = filesystemOptions(transactionOptions);
+            try {
+                await retryRemove(filesystem, publishPlan.temporaryDirectory, retry);
+            } catch (cleanupError) {
+                operationError = new AggregateError(
+                    [error, cleanupError],
+                    'Tauri profile copy and temporary cleanup both failed.',
+                );
+            }
+        }
+        operationError ??= error;
     }
     let releaseError;
     try {
