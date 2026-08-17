@@ -278,10 +278,13 @@ function dependencyEntries(manifest) {
         entries.set(name, { spec, optional: false });
     }
     for (const [name, spec] of Object.entries(manifest.peerDependencies ?? {})) {
+        if (manifest.peerDependenciesMeta?.[name]?.optional === true) {
+            continue;
+        }
         if (!entries.has(name)) {
             entries.set(name, {
                 spec,
-                optional: manifest.peerDependenciesMeta?.[name]?.optional === true,
+                optional: false,
             });
         }
     }

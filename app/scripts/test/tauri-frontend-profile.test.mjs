@@ -105,6 +105,23 @@ test('follows dependencies and required peers while allowing missing optional pe
     assert.deepEqual(result.extensions, ['dependency', 'peer', 'product']);
 });
 
+test('excludes an installed optional peer from the required manifest closure', () => {
+    const result = resolveProfile(fixture({
+        roots: ['product'],
+        dependencies: { product: '^1.0.0' },
+        packages: {
+            product: manifest('product', {}, {
+                peerDependencies: { optionalPeer: '^1.0.0' },
+                peerDependenciesMeta: { optionalPeer: { optional: true } },
+            }),
+            optionalPeer: manifest('optionalPeer'),
+        },
+    }));
+
+    assert.deepEqual(result.extensions, ['product']);
+    assert.deepEqual(result.packages.map(entry => entry.requestName), ['product']);
+});
+
 test('rejects unknown roots', () => {
     assert.throws(
         () => resolveProfile(fixture({ roots: ['unknown'], packages: { product: manifest('product') } })),
