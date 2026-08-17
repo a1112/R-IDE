@@ -7,12 +7,17 @@ import { fileURLToPath } from 'node:url';
 
 const require = createRequire(import.meta.url);
 const semver = require('semver');
+const properLockfile = require('proper-lockfile');
 
 export const PROFILE_SCHEMA = 'ride.tauri-frontend-profile@2';
 export const PROFILE_DIRECTORY_NAME = '.ride-tauri-profile';
 const PROFILE_MANIFEST_NAME = 'ride-tauri-profile.json';
 const CUSTOM_FILES = ['esbuild.mjs', 'ride-esbuild-dedupe.mjs'];
 const CUSTOM_DIRECTORIES = ['resources', 'ico'];
+const PUBLISH_LOCK_STALE_MS = 5_000;
+const PUBLISH_LOCK_UPDATE_MS = 2_000;
+const PUBLISH_LOCK_RETRY_MS = 250;
+const PUBLISH_LOCK_RETRIES = 120;
 const repositoryDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 function compareText(left, right) {
@@ -1202,250 +1207,115 @@ function canonicalBuildSource(browserDirectory, buildId) {
     return path.join(path.resolve(browserDirectory), PROFILE_DIRECTORY_NAME, 'builds', buildId);
 }
 
-function defaultIsProcessAlive(pid) {
-    try {
-        process.kill(pid, 0);
-        return true;
-    } catch (error) {
-        return error.code === 'EPERM';
-    }
-}
-
-function parsePublishLockOwner(text, lockDirectory) {
-    let owner;
-    try {
-        owner = JSON.parse(text);
-    } catch (error) {
-        throw new Error(`Malformed Tauri publish lock owner in ${lockDirectory}: ${error.message}`);
-    }
-    const legacy = owner?.schema === 'ride.tauri-publish-lock@1';
-    const current = owner?.schema === 'ride.tauri-publish-lock@2';
-    assertExactObjectFields(
-        owner,
-        current
-            ? ['schema', 'pid', 'buildId', 'profile', 'commit', 'acquiredAt', 'leaseId']
-            : ['schema', 'pid', 'buildId', 'profile', 'commit', 'acquiredAt'],
-        'Tauri publish lock owner',
-    );
-    if ((!legacy && !current)
-        || !Number.isSafeInteger(owner.pid) || owner.pid <= 0
-        || !Number.isFinite(owner.acquiredAt) || owner.acquiredAt < 0
-        || !/^[0-9a-f]{40}$/.test(owner.commit ?? '')
-        || (current && !/^[0-9a-f]{32}$/.test(owner.leaseId ?? ''))) {
-        throw new Error(`Invalid Tauri publish lock owner in ${lockDirectory}.`);
-    }
-    assertPathSegment(owner.buildId, 'Tauri publish lock build id');
-    if (typeof owner.profile !== 'string' || !owner.profile || owner.profile !== owner.profile.trim()) {
-        throw new Error(`Invalid Tauri publish lock profile in ${lockDirectory}.`);
-    }
-    return owner;
-}
-
-function samePublishLockLease(left, right) {
-    return left?.schema === right?.schema
-        && left?.pid === right?.pid
-        && left?.buildId === right?.buildId
-        && left?.profile === right?.profile
-        && left?.commit === right?.commit
-        && left?.acquiredAt === right?.acquiredAt
-        && left?.leaseId === right?.leaseId;
-}
-
-async function readPublishLockOwner(lockDirectory, filesystem) {
-    const ownerPath = path.join(lockDirectory, 'owner.json');
-    const ownerState = await pathState(ownerPath, filesystem);
-    if (!ownerState.exists) {
-        throw Object.assign(new Error(`Tauri publish lock owner is not initialized in ${lockDirectory}.`), { code: 'ENOENT' });
-    }
-    if (!ownerState.stat.isFile() || ownerState.stat.isSymbolicLink()) {
-        throw new Error(`Refusing unsafe Tauri publish lock owner path: ${ownerPath}`);
-    }
-    return parsePublishLockOwner(await filesystem.readFile(ownerPath, 'utf8'), lockDirectory);
+function createPublishLockFilesystem(lockDirectory) {
+    let acceptingLegacyCleanup = true;
+    const lockFilesystem = Object.create(fs);
+    lockFilesystem.rmdir = (candidate, callback) => {
+        fs.rmdir(candidate, error => {
+            if (!error || error.code !== 'ENOTEMPTY' || !acceptingLegacyCleanup
+                || path.resolve(candidate) !== path.resolve(lockDirectory)) {
+                callback(error);
+                return;
+            }
+            fs.lstat(candidate, (directoryError, directoryStat) => {
+                if (directoryError || !directoryStat.isDirectory() || directoryStat.isSymbolicLink()) {
+                    callback(directoryError ?? error);
+                    return;
+                }
+                fs.readdir(candidate, { withFileTypes: true }, (entriesError, entries) => {
+                    const legacyEntry = entries?.[0];
+                    if (entriesError || entries?.length !== 1 || legacyEntry.name !== 'owner.json'
+                        || !legacyEntry.isFile() || legacyEntry.isSymbolicLink()) {
+                        callback(entriesError ?? error);
+                        return;
+                    }
+                    const legacyPath = path.join(candidate, legacyEntry.name);
+                    fs.lstat(legacyPath, (legacyError, legacyStat) => {
+                        if (legacyError || !legacyStat.isFile() || legacyStat.isSymbolicLink()) {
+                            callback(legacyError ?? error);
+                            return;
+                        }
+                        fs.unlink(legacyPath, unlinkError => {
+                            if (unlinkError && unlinkError.code !== 'ENOENT') {
+                                callback(unlinkError);
+                                return;
+                            }
+                            fs.rmdir(candidate, callback);
+                        });
+                    });
+                });
+            });
+        });
+    };
+    return {
+        filesystem: lockFilesystem,
+        finishAcquisition: () => { acceptingLegacyCleanup = false; },
+    };
 }
 
 export async function acquirePublishLock({
     browserDirectory,
-    owner,
-    filesystem = fs.promises,
-    now = Date.now,
-    sleep = defaultSleep,
-    timeoutMs = 30_000,
-    retryDelayMs = 50,
-    staleMs = 5 * 60_000,
-    isProcessAlive = defaultIsProcessAlive,
-    platform = process.platform,
-    createLeaseId = () => crypto.randomBytes(16).toString('hex'),
+    lockProvider = properLockfile,
 } = {}) {
     const resolvedBrowserDirectory = path.resolve(browserDirectory);
-    assertPathSegment(owner?.buildId, 'Tauri publish lock build id');
-    if (typeof owner?.profile !== 'string' || !owner.profile || !/^[0-9a-f]{40}$/.test(owner.commit ?? '')) {
-        throw new Error('Tauri publish lock owner identity is invalid.');
-    }
-    if (!Number.isFinite(timeoutMs) || timeoutMs < 0 || !Number.isFinite(staleMs) || staleMs < 0
-        || !Number.isFinite(retryDelayMs) || retryDelayMs < 0) {
-        throw new Error('Tauri publish lock timing is invalid.');
+    if (!lockProvider || typeof lockProvider.lock !== 'function') {
+        throw new Error('Tauri publish lock provider must expose lock().');
     }
     const lockDirectory = path.join(resolvedBrowserDirectory, '.ride-tauri-publish.lock');
     assertProfilePath(resolvedBrowserDirectory, lockDirectory);
-    const leaseId = createLeaseId();
-    if (!/^[0-9a-f]{32}$/.test(leaseId ?? '')) {
-        throw new Error('Tauri publish lock lease id is not canonical.');
+    let compromisedError;
+    const legacyCompatibility = createPublishLockFilesystem(lockDirectory);
+    let providerRelease;
+    try {
+        providerRelease = await lockProvider.lock(resolvedBrowserDirectory, {
+            realpath: false,
+            lockfilePath: lockDirectory,
+            stale: PUBLISH_LOCK_STALE_MS,
+            update: PUBLISH_LOCK_UPDATE_MS,
+            retries: {
+                retries: PUBLISH_LOCK_RETRIES,
+                factor: 1,
+                minTimeout: PUBLISH_LOCK_RETRY_MS,
+                maxTimeout: PUBLISH_LOCK_RETRY_MS,
+                randomize: false,
+            },
+            fs: legacyCompatibility.filesystem,
+            onCompromised: error => {
+                compromisedError ??= error;
+            },
+        });
+    } finally {
+        legacyCompatibility.finishAcquisition();
     }
-    const quarantineLock = async () => {
-        const staleDirectory = path.join(
-            resolvedBrowserDirectory,
-            `.ride-tauri-publish.lock.stale-${process.pid}-${crypto.randomBytes(6).toString('hex')}`,
-        );
-        assertProfilePath(resolvedBrowserDirectory, staleDirectory);
-        try {
-            await retryRename(filesystem, lockDirectory, staleDirectory, { platform, sleep });
-        } catch (error) {
-            if (error.code === 'ENOENT') {
-                return false;
-            }
-            throw error;
+    if (typeof providerRelease !== 'function') {
+        throw new Error('Tauri publish lock provider did not return a release function.');
+    }
+    const assertHealthy = () => {
+        if (compromisedError) {
+            throw compromisedError;
         }
-        return staleDirectory;
     };
-    const removeStaleLock = async () => {
-        const staleDirectory = await quarantineLock();
-        if (!staleDirectory) {
-            return false;
-        }
-        await retryRemove(filesystem, staleDirectory, { platform, sleep });
-        return true;
-    };
-    const removeCanonicalLockIfOwned = async expectedOwner => {
-        const state = await pathState(lockDirectory, filesystem);
-        if (!state.exists) {
-            return false;
-        }
-        if (!state.stat.isDirectory() || state.stat.isSymbolicLink()) {
-            throw new Error(`Refusing unsafe Tauri publish lock path: ${lockDirectory}`);
-        }
-        let currentOwner;
-        try {
-            currentOwner = await readPublishLockOwner(lockDirectory, filesystem);
-        } catch (error) {
-            if (error.code === 'ENOENT') {
-                return false;
-            }
-            throw error;
-        }
-        if (!samePublishLockLease(currentOwner, expectedOwner)) {
-            return false;
-        }
-        const quarantineDirectory = await quarantineLock();
-        if (!quarantineDirectory) {
-            return false;
-        }
-        const quarantinedOwner = await readPublishLockOwner(quarantineDirectory, filesystem);
-        if (!samePublishLockLease(quarantinedOwner, expectedOwner)) {
-            throw new Error(`Tauri publish lock ownership changed while quarantining ${quarantineDirectory}.`);
-        }
-        await retryRemove(filesystem, quarantineDirectory, { platform, sleep });
-        return true;
-    };
-    const startedAt = now();
-    while (true) {
-        const acquiredAt = now();
-        const lockOwner = {
-            schema: 'ride.tauri-publish-lock@2',
-            pid: process.pid,
-            buildId: owner.buildId,
-            profile: owner.profile,
-            commit: owner.commit,
-            acquiredAt,
-            leaseId,
-        };
-        let created = false;
-        try {
-            await filesystem.mkdir(lockDirectory);
-            created = true;
-        } catch (error) {
-            if (error.code !== 'EEXIST') {
-                throw error;
-            }
-        }
-        if (created) {
+    return {
+        assertHealthy,
+        release: async () => {
+            let releaseError;
             try {
-                await filesystem.writeFile(path.join(lockDirectory, 'owner.json'), `${JSON.stringify(lockOwner)}\n`, { flag: 'wx' });
-                const canonicalOwner = await readPublishLockOwner(lockDirectory, filesystem);
-                if (!samePublishLockLease(canonicalOwner, lockOwner)) {
-                    throw new Error('Tauri publish lock ownership changed before acquisition completed.');
-                }
+                await providerRelease();
             } catch (error) {
-                try {
-                    await removeCanonicalLockIfOwned(lockOwner);
-                } catch (cleanupError) {
-                    throw new AggregateError([error, cleanupError], 'Tauri publish lock acquisition and cleanup both failed.');
-                }
-                throw error;
+                releaseError = error;
             }
-            return async () => {
-                if (!await removeCanonicalLockIfOwned(lockOwner)) {
-                    throw new Error('Tauri publish lock ownership changed before release.');
-                }
-            };
-        }
-
-        const state = await pathState(lockDirectory, filesystem);
-        if (!state.exists) {
-            continue;
-        }
-        if (!state.stat.isDirectory() || state.stat.isSymbolicLink()) {
-            throw new Error(`Refusing unsafe Tauri publish lock path: ${lockDirectory}`);
-        }
-        const currentTime = now();
-        let currentOwner;
-        try {
-            currentOwner = await readPublishLockOwner(lockDirectory, filesystem);
-        } catch (error) {
-            if (error.code !== 'ENOENT') {
-                throw error;
+            if (releaseError && compromisedError) {
+                throw new AggregateError(
+                    [compromisedError, releaseError],
+                    'Tauri publish lock was compromised and release failed.',
+                );
             }
-            const lockMtime = state.stat.mtimeMs;
-            if (Number.isFinite(lockMtime) && currentTime - lockMtime >= staleMs) {
-                let ownerAppeared = false;
-                try {
-                    await readPublishLockOwner(lockDirectory, filesystem);
-                    ownerAppeared = true;
-                } catch (ownerError) {
-                    if (ownerError.code !== 'ENOENT') {
-                        throw ownerError;
-                    }
-                }
-                if (ownerAppeared) {
-                    continue;
-                }
-                const confirmedState = await pathState(lockDirectory, filesystem);
-                if (!confirmedState.exists) {
-                    continue;
-                }
-                if (!confirmedState.stat.isDirectory() || confirmedState.stat.isSymbolicLink()) {
-                    throw new Error(`Refusing unsafe Tauri publish lock path: ${lockDirectory}`);
-                }
-                if (confirmedState.stat.mtimeMs !== lockMtime) {
-                    continue;
-                }
-                await removeStaleLock();
-                continue;
+            if (releaseError) {
+                throw releaseError;
             }
-            if (currentTime - startedAt >= timeoutMs) {
-                throw new Error('Timed out waiting for Tauri publish lock owner initialization.');
-            }
-            await sleep(retryDelayMs);
-            continue;
-        }
-        if (currentTime - currentOwner.acquiredAt >= staleMs && !isProcessAlive(currentOwner.pid)) {
-            await removeStaleLock();
-            continue;
-        }
-        if (currentTime - startedAt >= timeoutMs) {
-            throw new Error(`Timed out waiting for Tauri publish lock owned by build "${currentOwner.buildId}".`);
-        }
-        await sleep(retryDelayMs);
-    }
+            assertHealthy();
+        },
+    };
 }
 
 export async function publishProfileBuild({
@@ -1473,11 +1343,12 @@ export async function publishProfileBuild({
     const destinationLib = path.join(resolvedBrowserDirectory, 'lib');
     const initialManifestText = await fs.promises.readFile(sourceManifest);
     validateProfileBuildManifest(initialManifestText, { expectedProfile, buildId, identity });
-    const release = await acquirePublishLock({
-        browserDirectory: resolvedBrowserDirectory,
-        owner: { buildId, profile: expectedProfile, commit: identity.commit },
+    const lock = await acquirePublishLock({
         ...lockOptions,
+        browserDirectory: resolvedBrowserDirectory,
     });
+    let result;
+    let operationError;
     try {
         const lockedIdentity = validateSourceIdentity(await sourceIdentity());
         if (lockedIdentity.commit !== identity.commit) {
@@ -1505,12 +1376,36 @@ export async function publishProfileBuild({
             await fs.promises.mkdir(path.join(plan.temporaryDirectory, output), { recursive: true });
             await fs.promises.writeFile(path.join(plan.temporaryDirectory, output, PROFILE_MANIFEST_NAME), manifestText);
         }
+        lock.assertHealthy();
         await replaceDirectoryTransactional(plan, transactionOptions);
+        lock.assertHealthy();
         await retryRemove(fs.promises, expectedSource, {});
-        return { profile: manifest.profile, buildId: manifest.buildId, digest: manifest.digest, destinationLib };
-    } finally {
-        await release();
+        result = { profile: manifest.profile, buildId: manifest.buildId, digest: manifest.digest, destinationLib };
+    } catch (error) {
+        operationError = error;
     }
+    let releaseError;
+    try {
+        await lock.release();
+    } catch (error) {
+        releaseError = error;
+    }
+    if (operationError && releaseError) {
+        if (operationError === releaseError) {
+            throw operationError;
+        }
+        throw new AggregateError(
+            [operationError, releaseError],
+            'Tauri profile publish and lock release both failed.',
+        );
+    }
+    if (operationError) {
+        throw operationError;
+    }
+    if (releaseError) {
+        throw releaseError;
+    }
+    return result;
 }
 
 export function parseProfileCliArguments(argv, environment = process.env) {

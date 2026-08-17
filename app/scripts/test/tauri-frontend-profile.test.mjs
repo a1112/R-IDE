@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { createRequire } from 'node:module';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import {
     acquirePublishLock,
@@ -21,6 +23,10 @@ import {
     resolveInstalledManifest,
     selectCanonicalPackageManifest,
 } from '../tauri-frontend-profile.mjs';
+
+const require = createRequire(import.meta.url);
+const properLockfile = require('proper-lockfile');
+const appDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 function manifest(name, dependencies = {}, extra = {}) {
     return {
@@ -916,278 +922,215 @@ test('publish rejects malformed manifest fields and a non-canonical source direc
     assert.equal(fs.existsSync(canonicalSource), true);
 });
 
-test('publish lock safely recovers a stale dead owner and writes canonical ownership', async t => {
-    const browserDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-publish-lock-'));
-    t.after(() => fs.promises.rm(browserDirectory, { recursive: true, force: true }));
-    const lockDirectory = path.join(browserDirectory, '.ride-tauri-publish.lock');
-    await fs.promises.mkdir(lockDirectory);
-    await fs.promises.writeFile(path.join(lockDirectory, 'owner.json'), `${JSON.stringify({
-        schema: 'ride.tauri-publish-lock@1',
-        pid: 999999,
-        buildId: 'dead-build',
-        profile: 'tauri-critical',
-        commit: '1'.repeat(40),
-        acquiredAt: 100,
-    })}\n`);
-
-    const release = await acquirePublishLock({
-        browserDirectory,
-        owner: {
-            buildId: 'live-build',
-            profile: 'full',
-            commit: '2'.repeat(40),
-        },
-        now: () => 10_000,
-        staleMs: 1_000,
-        timeoutMs: 2_000,
-        sleep: async () => {},
-        isProcessAlive: () => false,
-        createLeaseId: () => 'd'.repeat(32),
-    });
-
-    const owner = JSON.parse(await fs.promises.readFile(path.join(lockDirectory, 'owner.json'), 'utf8'));
-    assert.deepEqual(owner, {
-        schema: 'ride.tauri-publish-lock@2',
-        pid: process.pid,
-        buildId: 'live-build',
-        profile: 'full',
-        commit: '2'.repeat(40),
-        acquiredAt: 10_000,
-        leaseId: 'd'.repeat(32),
-    });
-    await release();
-    assert.equal(fs.existsSync(lockDirectory), false);
+test('proper-lockfile is a direct exact production dependency', async () => {
+    const packageManifest = JSON.parse(await fs.promises.readFile(path.join(appDirectory, 'package.json'), 'utf8'));
+    assert.equal(packageManifest.devDependencies?.['proper-lockfile'], '4.1.2');
+    const productionSource = await fs.promises.readFile(path.join(appDirectory, 'scripts', 'tauri-frontend-profile.mjs'), 'utf8');
+    assert.match(productionSource, /require\(['"]proper-lockfile['"]\)/);
+    assert.doesNotMatch(productionSource, /leaseId|quarantine|isProcessAlive|process\.kill\(pid|parsePublishLockOwner|readPublishLockOwner/);
 });
 
-test('publish lock waits for owner metadata initialization instead of failing ENOENT', async t => {
-    const browserDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-publish-lock-race-'));
+test('publish lock delegates fixed cross-process policy to proper-lockfile', async t => {
+    const browserDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-publish-lock-provider-'));
     t.after(() => fs.promises.rm(browserDirectory, { recursive: true, force: true }));
-    const lockDirectory = path.join(browserDirectory, '.ride-tauri-publish.lock');
-    await fs.promises.mkdir(lockDirectory);
-    let waits = 0;
-    const release = await acquirePublishLock({
+    let captured;
+    let released = false;
+    const lock = await acquirePublishLock({
         browserDirectory,
-        owner: { buildId: 'next-build', profile: 'full', commit: '4'.repeat(40) },
-        now: () => 10_000,
-        staleMs: 1_000,
-        timeoutMs: 2_000,
-        isProcessAlive: () => false,
-        sleep: async () => {
-            waits += 1;
-            if (waits === 1) {
-                await fs.promises.writeFile(path.join(lockDirectory, 'owner.json'), `${JSON.stringify({
-                    schema: 'ride.tauri-publish-lock@1',
-                    pid: 999999,
-                    buildId: 'initializing-build',
-                    profile: 'tauri-critical',
-                    commit: '4'.repeat(40),
-                    acquiredAt: 100,
-                })}\n`);
-            }
+        lockProvider: {
+            lock: async (target, options) => {
+                captured = { target, options };
+                return async () => { released = true; };
+            },
         },
     });
 
-    assert.ok(waits >= 1);
-    await release();
+    assert.equal(captured.target, path.resolve(browserDirectory));
+    assert.equal(captured.options.realpath, false);
+    assert.equal(captured.options.lockfilePath, path.join(path.resolve(browserDirectory), '.ride-tauri-publish.lock'));
+    assert.ok(captured.options.stale >= 5_000);
+    assert.ok(captured.options.update <= captured.options.stale / 2);
+    assert.ok(captured.options.retries.retries > 0);
+    assert.ok(captured.options.retries.retries * captured.options.retries.maxTimeout <= 31_000);
+    assert.equal(typeof captured.options.onCompromised, 'function');
+    lock.assertHealthy();
+    await lock.release();
+    assert.equal(released, true);
 });
 
-test('publish lock gives a fresh ownerless directory time to finish concurrent initialization', async t => {
-    const browserDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-publish-lock-ownerless-fresh-'));
+test('publish lock never swallows compromise or provider release errors', async t => {
+    const browserDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-publish-lock-errors-'));
     t.after(() => fs.promises.rm(browserDirectory, { recursive: true, force: true }));
-    const lockDirectory = path.join(browserDirectory, '.ride-tauri-publish.lock');
-    await fs.promises.mkdir(lockDirectory);
-    await fs.promises.utimes(lockDirectory, new Date(9_500), new Date(9_500));
-    let currentTime = 10_000;
-    let waits = 0;
-    let observedFreshDirectory = false;
-
-    const release = await acquirePublishLock({
+    let options;
+    let releaseCalls = 0;
+    const compromised = await acquirePublishLock({
         browserDirectory,
-        owner: { buildId: 'waiting-build', profile: 'full', commit: '5'.repeat(40) },
-        now: () => currentTime,
-        staleMs: 1_000,
-        timeoutMs: 2_000,
-        retryDelayMs: 100,
-        isProcessAlive: () => true,
-        sleep: async delay => {
-            waits += 1;
-            currentTime += delay;
-            if (waits === 1) {
-                observedFreshDirectory = fs.existsSync(lockDirectory)
-                    && !fs.existsSync(path.join(lockDirectory, 'owner.json'));
-                await fs.promises.writeFile(path.join(lockDirectory, 'owner.json'), `${JSON.stringify({
-                    schema: 'ride.tauri-publish-lock@1',
-                    pid: process.pid,
-                    buildId: 'initializing-build',
-                    profile: 'tauri-critical',
-                    commit: '5'.repeat(40),
-                    acquiredAt: currentTime,
-                })}\n`);
-            } else if (waits === 2) {
-                await fs.promises.rm(lockDirectory, { recursive: true });
-            }
+        lockProvider: {
+            lock: async (_target, value) => {
+                options = value;
+                return async () => { releaseCalls += 1; };
+            },
         },
     });
+    options.onCompromised(Object.assign(new Error('heartbeat lost'), { code: 'ECOMPROMISED' }));
+    assert.throws(() => compromised.assertHealthy(), /heartbeat lost/);
+    await assert.rejects(compromised.release(), /heartbeat lost/);
+    assert.equal(releaseCalls, 1);
 
-    assert.equal(observedFreshDirectory, true);
-    assert.ok(waits >= 2);
-    await release();
+    const releaseFailure = await acquirePublishLock({
+        browserDirectory,
+        lockProvider: {
+            lock: async () => async () => { throw new Error('release failed'); },
+        },
+    });
+    await assert.rejects(releaseFailure.release(), /release failed/);
 });
 
-test('publish lock keeps one canonical winner across creator, stale remover, and third contender', async t => {
-    const browserDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-publish-lock-three-contenders-'));
+test('publish fails closed before installation when its lock is compromised', async t => {
+    const browserDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-publish-lock-compromised-'));
     t.after(() => fs.promises.rm(browserDirectory, { recursive: true, force: true }));
-    const lockDirectory = path.join(browserDirectory, '.ride-tauri-publish.lock');
-    let signalCreatorMkdir;
-    const creatorMkdir = new Promise(resolve => { signalCreatorMkdir = resolve; });
-    let allowCreatorOwnerWrite;
-    const creatorOwnerWrite = new Promise(resolve => { allowCreatorOwnerWrite = resolve; });
-    let signalQuarantined;
-    const quarantined = new Promise(resolve => { signalQuarantined = resolve; });
-    let allowStaleRemover;
-    const staleRemover = new Promise(resolve => { allowStaleRemover = resolve; });
-    let quarantineDirectory;
-    const creatorFilesystem = {
-        ...fs.promises,
-        mkdir: async candidate => {
-            const result = await fs.promises.mkdir(candidate);
-            if (path.resolve(candidate) === path.resolve(lockDirectory)) {
-                signalCreatorMkdir();
-            }
-            return result;
-        },
-        writeFile: async (candidate, data, options) => {
-            if (path.resolve(candidate) === path.resolve(path.join(lockDirectory, 'owner.json'))) {
-                await creatorOwnerWrite;
-                return fs.promises.writeFile(path.join(quarantineDirectory, 'owner.json'), data, options);
-            }
-            return fs.promises.writeFile(candidate, data, options);
+    await writeSentinel(path.join(browserDirectory, 'lib'), 'previous');
+    const manifest = profileBuildManifest({ buildId: 'compromised-build' });
+    const sourceDirectory = await createPublishSource(browserDirectory, manifest);
+    let lockOptions;
+    const lockProvider = {
+        lock: async (_target, options) => {
+            lockOptions = options;
+            return async () => {};
         },
     };
-    const staleRemoverFilesystem = {
-        ...fs.promises,
-        rename: async (source, destination) => {
-            const result = await fs.promises.rename(source, destination);
-            if (path.resolve(source) === path.resolve(lockDirectory)
-                && path.basename(destination).startsWith('.ride-tauri-publish.lock.stale-')) {
-                quarantineDirectory = destination;
-                signalQuarantined();
-                await staleRemover;
-            }
-            return result;
+    const copyTree = async (source, destination) => {
+        await fs.promises.cp(source, destination, { recursive: true, errorOnExist: true });
+        lockOptions.onCompromised(Object.assign(new Error('publish heartbeat lost'), { code: 'ECOMPROMISED' }));
+    };
+
+    await assert.rejects(publishProfileBuild({
+        browserDirectory,
+        expectedProfile: manifest.profile,
+        buildId: manifest.buildId,
+        sourceDirectory,
+        sourceIdentity: async () => manifest.sourceIdentity,
+        copyTree,
+        lockOptions: { lockProvider },
+    }), /publish heartbeat lost/);
+    assert.equal(await fs.promises.readFile(path.join(browserDirectory, 'lib', 'sentinel.txt'), 'utf8'), 'previous');
+    assert.equal(fs.existsSync(sourceDirectory), true);
+});
+
+test('publish preserves both operation and lock release failures', async t => {
+    const browserDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-publish-lock-aggregate-'));
+    t.after(() => fs.promises.rm(browserDirectory, { recursive: true, force: true }));
+    const manifest = profileBuildManifest({ buildId: 'aggregate-build' });
+    const sourceDirectory = await createPublishSource(browserDirectory, manifest);
+
+    await assert.rejects(publishProfileBuild({
+        browserDirectory,
+        expectedProfile: manifest.profile,
+        buildId: manifest.buildId,
+        sourceDirectory,
+        sourceIdentity: async () => manifest.sourceIdentity,
+        copyTree: async () => { throw new Error('copy failed'); },
+        lockOptions: {
+            lockProvider: {
+                lock: async () => async () => { throw new Error('release failed'); },
+            },
         },
-    };
-
-    const creator = acquirePublishLock({
-        browserDirectory,
-        filesystem: creatorFilesystem,
-        owner: { buildId: 'creator-a', profile: 'tauri-critical', commit: '5'.repeat(40) },
-        createLeaseId: () => 'a'.repeat(32),
-        now: () => 100,
-        timeoutMs: 0,
+    }), error => {
+        assert.ok(error instanceof AggregateError);
+        assert.deepEqual(error.errors.map(item => item.message), ['copy failed', 'release failed']);
+        return true;
     });
-    await creatorMkdir;
-    await fs.promises.utimes(lockDirectory, new Date(100), new Date(100));
-
-    const remover = acquirePublishLock({
-        browserDirectory,
-        filesystem: staleRemoverFilesystem,
-        owner: { buildId: 'remover-b', profile: 'full', commit: '5'.repeat(40) },
-        createLeaseId: () => 'b'.repeat(32),
-        now: () => 10_000,
-        staleMs: 1_000,
-        timeoutMs: 0,
-    });
-    await quarantined;
-
-    const releaseWinner = await acquirePublishLock({
-        browserDirectory,
-        owner: { buildId: 'winner-c', profile: 'full', commit: '5'.repeat(40) },
-        createLeaseId: () => 'c'.repeat(32),
-        now: () => 10_000,
-        timeoutMs: 0,
-    });
-    allowCreatorOwnerWrite();
-    const creatorResult = await Promise.allSettled([creator]);
-    allowStaleRemover();
-    const removerResult = await Promise.allSettled([remover]);
-
-    assert.equal(creatorResult[0].status, 'rejected', 'quarantined creator A must not acquire canonical ownership');
-    assert.equal(removerResult[0].status, 'rejected', 'stale remover B must not replace canonical winner C');
-    const canonicalOwner = JSON.parse(await fs.promises.readFile(path.join(lockDirectory, 'owner.json'), 'utf8'));
-    assert.equal(canonicalOwner.buildId, 'winner-c');
-    assert.equal(canonicalOwner.leaseId, 'c'.repeat(32));
-    const quarantineEntries = (await fs.promises.readdir(browserDirectory))
-        .filter(name => name.startsWith('.ride-tauri-publish.lock.stale-'));
-    assert.deepEqual(quarantineEntries, []);
-    await releaseWinner();
 });
 
-test('publish lock release never deletes a later lease with otherwise identical owner fields', async t => {
-    const browserDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-publish-lock-release-lease-'));
+test('proper-lockfile heartbeat keeps an active publish lock from becoming stale', { timeout: 12_000 }, async t => {
+    const browserDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-publish-lock-heartbeat-'));
     t.after(() => fs.promises.rm(browserDirectory, { recursive: true, force: true }));
     const lockDirectory = path.join(browserDirectory, '.ride-tauri-publish.lock');
-    const owner = { buildId: 'same-build', profile: 'full', commit: '6'.repeat(40) };
-    const releaseOld = await acquirePublishLock({
-        browserDirectory,
-        owner,
-        createLeaseId: () => 'a'.repeat(32),
-        now: () => 1_000,
-    });
-    const oldLeaseDirectory = path.join(browserDirectory, '.old-lease-for-test');
-    await fs.promises.rename(lockDirectory, oldLeaseDirectory);
-    const releaseCurrent = await acquirePublishLock({
-        browserDirectory,
-        owner,
-        createLeaseId: () => 'c'.repeat(32),
-        now: () => 1_000,
-    });
-
-    await assert.rejects(releaseOld(), /ownership changed before release/i);
-    const currentOwner = JSON.parse(await fs.promises.readFile(path.join(lockDirectory, 'owner.json'), 'utf8'));
-    assert.equal(currentOwner.leaseId, 'c'.repeat(32));
-    await releaseCurrent();
+    const lock = await acquirePublishLock({ browserDirectory });
+    const initialMtime = (await fs.promises.stat(lockDirectory)).mtimeMs;
+    await new Promise(resolve => setTimeout(resolve, 5_500));
+    const refreshedMtime = (await fs.promises.stat(lockDirectory)).mtimeMs;
+    assert.ok(refreshedMtime > initialMtime, 'heartbeat must refresh lock directory mtime');
+    await assert.rejects(properLockfile.lock(browserDirectory, {
+        realpath: false,
+        lockfilePath: lockDirectory,
+        stale: 5_000,
+        update: 2_000,
+        retries: 0,
+    }), error => error?.code === 'ELOCKED');
+    await lock.release();
 });
 
-test('publish lock rejects non-directory and symbolic-link lock paths', async t => {
-    const browserDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-publish-lock-unsafe-'));
-    t.after(() => fs.promises.rm(browserDirectory, { recursive: true, force: true }));
-    const lockDirectory = path.join(browserDirectory, '.ride-tauri-publish.lock');
-    const options = {
-        browserDirectory,
-        owner: { buildId: 'safe-build', profile: 'full', commit: '5'.repeat(40) },
-        timeoutMs: 0,
-    };
-    await fs.promises.writeFile(lockDirectory, 'not a directory');
-    await assert.rejects(acquirePublishLock(options), /unsafe.*publish lock path/i);
-    await fs.promises.rm(lockDirectory);
-    const linkTarget = path.join(browserDirectory, 'lock-link-target');
-    await fs.promises.mkdir(linkTarget);
-    await fs.promises.symlink(linkTarget, lockDirectory, process.platform === 'win32' ? 'junction' : 'dir');
-    await assert.rejects(acquirePublishLock(options), /unsafe.*publish lock path/i);
+test('proper-lockfile recovers stale v1 and v2 lock directories and release allows a successor', async t => {
+    for (const schema of ['ride.tauri-publish-lock@1', 'ride.tauri-publish-lock@2']) {
+        const browserDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-publish-lock-stale-'));
+        t.after(() => fs.promises.rm(browserDirectory, { recursive: true, force: true }));
+        const lockDirectory = path.join(browserDirectory, '.ride-tauri-publish.lock');
+        await fs.promises.mkdir(lockDirectory);
+        await fs.promises.writeFile(path.join(lockDirectory, 'owner.json'), `${JSON.stringify({ schema })}\n`);
+        const staleTime = new Date(Date.now() - 60_000);
+        await fs.promises.utimes(lockDirectory, staleTime, staleTime);
+
+        const recovered = await acquirePublishLock({ browserDirectory });
+        assert.equal(fs.existsSync(lockDirectory), true);
+        await recovered.release();
+        assert.equal(fs.existsSync(lockDirectory), false);
+        const successor = await acquirePublishLock({ browserDirectory });
+        await successor.release();
+        assert.equal(fs.existsSync(lockDirectory), false);
+    }
 });
 
-test('publish lock recovers a stale ownerless directory using its own mtime', async t => {
-    const browserDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-publish-lock-ownerless-stale-'));
+test('proper-lockfile serializes three independent process critical sections', { timeout: 15_000 }, async t => {
+    const browserDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-publish-lock-processes-'));
     t.after(() => fs.promises.rm(browserDirectory, { recursive: true, force: true }));
-    const lockDirectory = path.join(browserDirectory, '.ride-tauri-publish.lock');
-    await fs.promises.mkdir(lockDirectory);
-    await fs.promises.utimes(lockDirectory, new Date(100), new Date(100));
-    let currentTime = 10_000;
-
-    const release = await acquirePublishLock({
-        browserDirectory,
-        owner: { buildId: 'ownerless-recovery', profile: 'full', commit: '5'.repeat(40) },
-        now: () => currentTime,
-        staleMs: 1_000,
-        timeoutMs: 2_000,
-        retryDelayMs: 100,
-        sleep: async delay => { currentTime += delay; },
+    const eventLog = path.join(browserDirectory, 'critical-sections.ndjson');
+    const moduleUrl = pathToFileURL(path.join(appDirectory, 'scripts', 'tauri-frontend-profile.mjs')).href;
+    const childScript = `
+        import fs from 'node:fs';
+        import { acquirePublishLock } from ${JSON.stringify(moduleUrl)};
+        const [browserDirectory, contender, eventLog] = process.argv.slice(1);
+        const lock = await acquirePublishLock({ browserDirectory });
+        fs.appendFileSync(eventLog, JSON.stringify({ contender, event: 'enter' }) + '\\n');
+        await new Promise(resolve => setTimeout(resolve, 150));
+        fs.appendFileSync(eventLog, JSON.stringify({ contender, event: 'exit' }) + '\\n');
+        await lock.release();
+    `;
+    const runContender = contender => new Promise((resolve, reject) => {
+        const child = spawn(process.execPath, [
+            '--input-type=module',
+            '--eval',
+            childScript,
+            browserDirectory,
+            contender,
+            eventLog,
+        ], { stdio: ['ignore', 'pipe', 'pipe'] });
+        let stderr = '';
+        child.stderr.setEncoding('utf8');
+        child.stderr.on('data', chunk => { stderr += chunk; });
+        child.on('error', reject);
+        child.on('exit', code => {
+            if (code === 0) {
+                resolve();
+            } else {
+                reject(new Error(`Lock contender ${contender} exited with ${code}: ${stderr}`));
+            }
+        });
     });
+    await Promise.all(['a', 'b', 'c'].map(runContender));
 
-    const owner = JSON.parse(await fs.promises.readFile(path.join(lockDirectory, 'owner.json'), 'utf8'));
-    assert.equal(owner.buildId, 'ownerless-recovery');
-    await release();
+    const events = (await fs.promises.readFile(eventLog, 'utf8')).trim().split(/\r?\n/).map(JSON.parse);
+    let active = 0;
+    let maximumActive = 0;
+    for (const event of events) {
+        active += event.event === 'enter' ? 1 : -1;
+        maximumActive = Math.max(maximumActive, active);
+        assert.ok(active >= 0, 'a contender cannot exit before entering');
+    }
+    assert.equal(events.length, 6);
+    assert.equal(active, 0);
+    assert.equal(maximumActive, 1);
+    assert.equal(fs.existsSync(path.join(browserDirectory, '.ride-tauri-publish.lock')), false);
 });
 
 test('concurrent publishes serialize and never mix profile outputs', async t => {
@@ -1215,7 +1158,6 @@ test('concurrent publishes serialize and never mix profile outputs', async t => 
         browserDirectory,
         sourceIdentity: async () => ({ commit: '3'.repeat(40), clean: true }),
         copyTree,
-        lockOptions: { retryDelayMs: 2, timeoutMs: 2_000 },
     };
     const first = publishProfileBuild({
         ...common,

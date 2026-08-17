@@ -30,6 +30,7 @@
     "eslint-plugin-react": "^7.37.5",
     "lerna": "^9.0.7",
     "node-gyp": "^11.5.0",
+    "proper-lockfile": "4.1.2",
     "rimraf": "^2.7.1",
     "ts-node": "^10.9.2",
     "type-fest": "^0.20.2",
