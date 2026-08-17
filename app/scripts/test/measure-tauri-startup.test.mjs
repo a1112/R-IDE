@@ -5284,7 +5284,7 @@ test('packaged metadata reader uses canonical profile and plugin resources', asy
   }
 });
 
-test('profile contract digest excludes commit and canonically includes every contract field', async () => {
+test('profile contract digest excludes provenance and canonically includes every contract field', async () => {
   const root = temporaryDirectory('profile-contract-digest');
   const executable = path.join(root, 'R-IDE.exe');
   const profileManifest = path.join(root, 'profile.json');
@@ -5307,48 +5307,71 @@ test('profile contract digest excludes commit and canonically includes every con
   };
 
   try {
-    const first = await readProfile({
+    const contract = {
       schema: 'ride.tauri-profile',
       version: 1,
       profile: 'tauri-critical',
-      commit: '4'.repeat(40),
+      digest: 'a'.repeat(64),
+      roots: ['@theia/core'],
       extensions: ['@theia/core', 'theia-ide-product-ext'],
+      packages: [{
+        requestName: '@theia/core',
+        packageName: '@theia/core',
+        version: '1.63.3',
+        dependencyPath: ['@theia/core'],
+      }],
+      featureGroups: { ai: { deferredRoots: ['@theia/ai-chat'], blockedRoots: [] } },
       launch: { mode: 'critical', flags: ['safe', 'bounded'] },
+    };
+    const first = await readProfile({
+      ...contract,
+      commit: '4'.repeat(40),
+      buildId: 'first-build',
+      sourceIdentity: { commit: '4'.repeat(40), clean: true },
     });
     const differentCommitAndKeyOrder = await readProfile({
-      launch: { flags: ['safe', 'bounded'], mode: 'critical' },
-      extensions: ['@theia/core', 'theia-ide-product-ext'],
+      launch: contract.launch,
+      featureGroups: contract.featureGroups,
+      packages: contract.packages,
+      extensions: contract.extensions,
+      roots: contract.roots,
+      digest: contract.digest,
       commit: '5'.repeat(40),
-      profile: 'tauri-critical',
-      version: 1,
-      schema: 'ride.tauri-profile',
+      sourceIdentity: { clean: true, commit: '5'.repeat(40) },
+      buildId: 'second-build',
+      profile: contract.profile,
+      version: contract.version,
+      schema: contract.schema,
     });
     assert.equal(
       differentCommitAndKeyOrder.build.profileSha256,
       first.build.profileSha256,
-      'commit and JSON object key order are not part of the profile contract identity',
+      'commit, buildId, sourceIdentity, and JSON object key order are not part of the profile contract identity',
     );
+    assert.equal(differentCommitAndKeyOrder.build.commit, '5'.repeat(40));
 
     const reorderedContractArray = await readProfile({
-      schema: 'ride.tauri-profile',
-      version: 1,
-      profile: 'tauri-critical',
+      ...contract,
       commit: '6'.repeat(40),
       extensions: ['theia-ide-product-ext', '@theia/core'],
-      launch: { mode: 'critical', flags: ['safe', 'bounded'] },
+      buildId: 'third-build',
+      sourceIdentity: { commit: '6'.repeat(40), clean: true },
     });
     assert.notEqual(reorderedContractArray.build.profileSha256, first.build.profileSha256);
 
     const extendedContract = await readProfile({
-      schema: 'ride.tauri-profile',
-      version: 1,
-      profile: 'tauri-critical',
+      ...contract,
       commit: '7'.repeat(40),
-      extensions: ['@theia/core', 'theia-ide-product-ext'],
-      launch: { mode: 'critical', flags: ['safe', 'bounded'] },
       futureConstraint: { enabled: true },
     });
     assert.notEqual(extendedContract.build.profileSha256, first.build.profileSha256);
+
+    const changedDigest = await readProfile({
+      ...contract,
+      commit: '8'.repeat(40),
+      digest: 'b'.repeat(64),
+    });
+    assert.notEqual(changedDigest.build.profileSha256, first.build.profileSha256);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

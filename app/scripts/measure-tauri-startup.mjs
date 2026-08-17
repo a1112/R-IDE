@@ -382,8 +382,9 @@ function canonicalJson(value) {
 }
 
 function profileContractSha256(manifest) {
+  const provenanceFields = new Set(['commit', 'buildId', 'sourceIdentity']);
   const contract = Object.fromEntries(
-    Object.entries(manifest).filter(([key]) => key !== 'commit'),
+    Object.entries(manifest).filter(([key]) => !provenanceFields.has(key)),
   );
   return sha256(canonicalJson(contract));
 }

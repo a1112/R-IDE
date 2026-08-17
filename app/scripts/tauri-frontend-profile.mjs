@@ -205,7 +205,7 @@ function normalizedFeatureGroups(featureGroups, browserDependencies) {
     return result;
 }
 
-function stableStronglyConnectedOrder(nodes, dependenciesByNode) {
+function stableStronglyConnectedOrder(nodes, dependenciesByNode, compareNodes = compareText) {
     let nextIndex = 0;
     const indexes = new Map();
     const lowLinks = new Map();
@@ -220,7 +220,7 @@ function stableStronglyConnectedOrder(nodes, dependenciesByNode) {
         stack.push(node);
         onStack.add(node);
 
-        for (const dependency of [...(dependenciesByNode.get(node) ?? [])].sort(compareText)) {
+        for (const dependency of [...(dependenciesByNode.get(node) ?? [])].sort(compareNodes)) {
             if (!indexes.has(dependency)) {
                 visit(dependency);
                 lowLinks.set(node, Math.min(lowLinks.get(node), lowLinks.get(dependency)));
@@ -237,11 +237,11 @@ function stableStronglyConnectedOrder(nodes, dependenciesByNode) {
                 onStack.delete(member);
                 component.push(member);
             } while (member !== node);
-            components.push(component.sort(compareText));
+            components.push(component.sort(compareNodes));
         }
     };
 
-    for (const node of [...nodes].sort(compareText)) {
+    for (const node of [...nodes].sort(compareNodes)) {
         if (!indexes.has(node)) {
             visit(node);
         }
@@ -268,13 +268,13 @@ function stableStronglyConnectedOrder(nodes, dependenciesByNode) {
         }
         visitedComponents.add(component);
         const dependencies = [...componentDependencies[component]].sort((left, right) => {
-            return compareText(components[left][0], components[right][0]);
+            return compareNodes(components[left][0], components[right][0]);
         });
         dependencies.forEach(visitComponent);
         ordered.push(...components[component]);
     };
     [...components.keys()]
-        .sort((left, right) => compareText(components[left][0], components[right][0]))
+        .sort((left, right) => compareNodes(components[left][0], components[right][0]))
         .forEach(visitComponent);
     return ordered;
 }
@@ -409,6 +409,10 @@ export function resolveProfile({
         const firstPathByNode = new Map();
         const firstPathByRequest = new Map();
         const requestNames = new Set();
+        const compareGraphNodes = (left, right) => compareText(
+            installedGraph.records.get(left)?.contextSortKey ?? left,
+            installedGraph.records.get(right)?.contextSortKey ?? right,
+        );
         const visit = (nodeId, ancestry) => {
             const record = installedGraph.records.get(nodeId);
             if (!record) {
@@ -428,7 +432,7 @@ export function resolveProfile({
             visited.add(nodeId);
             const dependencies = new Set(installedGraph.dependenciesByNode.get(nodeId) ?? []);
             dependenciesByNode.set(nodeId, dependencies);
-            for (const dependency of [...dependencies].sort(compareText)) {
+            for (const dependency of [...dependencies].sort(compareGraphNodes)) {
                 visit(dependency, dependencyPath);
             }
         };
@@ -439,7 +443,7 @@ export function resolveProfile({
             }
             visit(nodeId, []);
         }
-        return { visited, dependenciesByNode, firstPathByNode, firstPathByRequest, requestNames };
+        return { visited, dependenciesByNode, firstPathByNode, firstPathByRequest, requestNames, compareNodes: compareGraphNodes };
     };
 
     const resolveClosure = installedGraph ? resolveGraphClosure : resolveManifestClosure;
@@ -472,17 +476,19 @@ export function resolveProfile({
         };
     }
 
-    const closure = stableStronglyConnectedOrder(selectedClosure.visited, selectedClosure.dependenciesByNode);
-    const extensions = [];
+    const closure = stableStronglyConnectedOrder(
+        selectedClosure.visited,
+        selectedClosure.dependenciesByNode,
+        selectedClosure.compareNodes,
+    );
     const packages = [];
-    const emittedExtensions = new Set();
-    for (const node of closure) {
+    const lastExtensionIndex = new Map();
+    for (const [index, node] of closure.entries()) {
         const record = installedGraph?.records.get(node);
         const requestName = record?.requestName ?? node;
         const manifest = record?.manifest ?? packageManifests[requestName];
-        if (isTheiaExtension(manifest) && !emittedExtensions.has(requestName)) {
-            emittedExtensions.add(requestName);
-            extensions.push(requestName);
+        if (isTheiaExtension(manifest)) {
+            lastExtensionIndex.set(requestName, index);
         }
         packages.push({
             requestName,
@@ -491,6 +497,11 @@ export function resolveProfile({
             dependencyPath: selectedClosure.firstPathByNode.get(node),
         });
     }
+    const extensions = closure.flatMap((node, index) => {
+        const record = installedGraph?.records.get(node);
+        const requestName = record?.requestName ?? node;
+        return lastExtensionIndex.get(requestName) === index ? [requestName] : [];
+    });
     const contract = {
         schema: PROFILE_SCHEMA,
         profile: profileName,
@@ -677,8 +688,11 @@ export async function recoverDirectoryTransactions({ parentDirectory, targetName
         const backupExists = await assertRegularDirectoryIfPresent(plan.backupDirectory, filesystem);
         await assertRegularDirectoryIfPresent(plan.temporaryDirectory, filesystem);
         if (marker.state === 'backed-up') {
-            if (targetExists || !backupExists) {
+            if (!backupExists) {
                 throw new Error(`Cannot safely recover backed-up directory transaction ${transactionId}.`);
+            }
+            if (targetExists) {
+                await retryRemove(filesystem, plan.targetDirectory, retry);
             }
             await retryRename(filesystem, plan.backupDirectory, plan.targetDirectory, retry);
             await retryRemove(filesystem, plan.temporaryDirectory, retry);
@@ -839,7 +853,13 @@ export async function resolveInstalledManifest(requestName, fromDirectory) {
     };
 }
 
-export async function resolveInstalledPackageGraph({ browserManifest, roots, resolver, browserDirectory }) {
+export async function resolveInstalledPackageGraph({
+    browserManifest,
+    roots,
+    resolver,
+    browserDirectory,
+    canonicalizePackageDirectory = directory => fs.promises.realpath(directory),
+}) {
     const records = new Map();
     const dependenciesByNode = new Map();
     const rootNodeIds = new Map();
@@ -878,13 +898,21 @@ export async function resolveInstalledPackageGraph({ browserManifest, roots, res
                 'browser manifest',
             );
         }
+        const packageDirectory = await canonicalizePackageDirectory(installed.packageDirectory);
+        if (typeof packageDirectory !== 'string' || !path.isAbsolute(packageDirectory)) {
+            throw new Error(`${dependencyPath.join(' -> ')}: installed dependency has no canonical package directory.`);
+        }
+        const contextIdentity = canonicalDigest({ dependencyPath });
         const nodeId = canonicalDigest({
             requestName,
             packageName: installed.manifest.name,
             version: installed.manifest.version,
+            packageDirectory,
         });
         const existingExtension = extensionRecords.get(requestName);
-        if (isTheiaExtension(installed.manifest) && existingExtension && existingExtension.nodeId !== nodeId) {
+        if (isTheiaExtension(installed.manifest) && existingExtension
+            && (existingExtension.manifest.name !== installed.manifest.name
+                || existingExtension.manifest.version !== installed.manifest.version)) {
             throw new Error(
                 `Conflicting installed extension identity for "${requestName}": `
                 + `${existingExtension.dependencyPath.join(' -> ')} resolved ${existingExtension.manifest.name}@${existingExtension.manifest.version}, `
@@ -906,13 +934,15 @@ export async function resolveInstalledPackageGraph({ browserManifest, roots, res
         const record = {
             nodeId,
             requestName,
-            packageDirectory: path.resolve(installed.packageDirectory),
+            packageDirectory,
+            contextIdentity,
+            contextSortKey: dependencyPath.join('\0'),
             manifest: installed.manifest,
             dependencyPath,
         };
         records.set(nodeId, record);
         dependenciesByNode.set(nodeId, new Set());
-        if (isTheiaExtension(installed.manifest)) {
+        if (isTheiaExtension(installed.manifest) && !existingExtension) {
             extensionRecords.set(requestName, record);
         }
         for (const [dependencyName, dependency] of dependencyEntries(installed.manifest)) {
@@ -985,6 +1015,7 @@ export async function generateProfileTarget({
     buildId,
     sourceIdentity = defaultSourceIdentity,
     resolveInstalledManifest: installedManifestResolver = resolveInstalledManifest,
+    canonicalizePackageDirectory,
 } = {}) {
     const resolvedBrowserDirectory = path.resolve(browserDirectory);
     assertPathSegment(buildId, 'Tauri profile build id');
@@ -997,6 +1028,7 @@ export async function generateProfileTarget({
         roots,
         resolver: installedManifestResolver,
         browserDirectory: resolvedBrowserDirectory,
+        canonicalizePackageDirectory,
     });
     for (const devDependency of profileConfig.buildDevDependencies ?? []) {
         const installed = await installedManifestResolver(devDependency, resolvedBrowserDirectory);
@@ -1235,6 +1267,45 @@ export async function acquirePublishLock({
     }
     const lockDirectory = path.join(resolvedBrowserDirectory, '.ride-tauri-publish.lock');
     assertProfilePath(resolvedBrowserDirectory, lockDirectory);
+    const removeStaleLock = async ({ preserveConcurrentOwner = false } = {}) => {
+        const staleDirectory = path.join(
+            resolvedBrowserDirectory,
+            `.ride-tauri-publish.lock.stale-${process.pid}-${crypto.randomBytes(6).toString('hex')}`,
+        );
+        assertProfilePath(resolvedBrowserDirectory, staleDirectory);
+        try {
+            await retryRename(filesystem, lockDirectory, staleDirectory, { platform, sleep });
+        } catch (error) {
+            if (error.code === 'ENOENT') {
+                return false;
+            }
+            throw error;
+        }
+        if (preserveConcurrentOwner) {
+            let quarantinedOwner;
+            try {
+                quarantinedOwner = await readPublishLockOwner(staleDirectory, filesystem);
+            } catch (error) {
+                if (error.code !== 'ENOENT') {
+                    throw error;
+                }
+            }
+            if (quarantinedOwner
+                && (now() - quarantinedOwner.acquiredAt < staleMs || isProcessAlive(quarantinedOwner.pid))) {
+                try {
+                    await retryRename(filesystem, staleDirectory, lockDirectory, { platform, sleep });
+                } catch (restoreError) {
+                    throw new AggregateError(
+                        [restoreError],
+                        `A live Tauri publish lock was quarantined and could not be restored from ${staleDirectory}.`,
+                    );
+                }
+                return false;
+            }
+        }
+        await retryRemove(filesystem, staleDirectory, { platform, sleep });
+        return true;
+    };
     const startedAt = now();
     while (true) {
         const acquiredAt = now();
@@ -1284,6 +1355,33 @@ export async function acquirePublishLock({
             if (error.code !== 'ENOENT') {
                 throw error;
             }
+            const lockMtime = state.stat.mtimeMs;
+            if (Number.isFinite(lockMtime) && currentTime - lockMtime >= staleMs) {
+                let ownerAppeared = false;
+                try {
+                    await readPublishLockOwner(lockDirectory, filesystem);
+                    ownerAppeared = true;
+                } catch (ownerError) {
+                    if (ownerError.code !== 'ENOENT') {
+                        throw ownerError;
+                    }
+                }
+                if (ownerAppeared) {
+                    continue;
+                }
+                const confirmedState = await pathState(lockDirectory, filesystem);
+                if (!confirmedState.exists) {
+                    continue;
+                }
+                if (!confirmedState.stat.isDirectory() || confirmedState.stat.isSymbolicLink()) {
+                    throw new Error(`Refusing unsafe Tauri publish lock path: ${lockDirectory}`);
+                }
+                if (confirmedState.stat.mtimeMs !== lockMtime) {
+                    continue;
+                }
+                await removeStaleLock({ preserveConcurrentOwner: true });
+                continue;
+            }
             if (currentTime - startedAt >= timeoutMs) {
                 throw new Error('Timed out waiting for Tauri publish lock owner initialization.');
             }
@@ -1291,20 +1389,7 @@ export async function acquirePublishLock({
             continue;
         }
         if (currentTime - currentOwner.acquiredAt >= staleMs && !isProcessAlive(currentOwner.pid)) {
-            const staleDirectory = path.join(
-                resolvedBrowserDirectory,
-                `.ride-tauri-publish.lock.stale-${process.pid}-${crypto.randomBytes(6).toString('hex')}`,
-            );
-            assertProfilePath(resolvedBrowserDirectory, staleDirectory);
-            try {
-                await retryRename(filesystem, lockDirectory, staleDirectory, { platform, sleep });
-            } catch (error) {
-                if (error.code === 'ENOENT') {
-                    continue;
-                }
-                throw error;
-            }
-            await retryRemove(filesystem, staleDirectory, { platform, sleep });
+            await removeStaleLock({ preserveConcurrentOwner: true });
             continue;
         }
         if (currentTime - startedAt >= timeoutMs) {

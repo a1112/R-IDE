@@ -212,6 +212,7 @@ test('applies a browser root range only to the root request, not a nested packag
         browserManifest: { dependencies: { product: '^1.0.0', 'fs-extra': '^9.1.0' } },
         roots: ['product', 'fs-extra'],
         browserDirectory,
+        canonicalizePackageDirectory: async directory => path.resolve(directory),
         resolver: async (requestName, fromDirectory) => {
             const nested = requestName === 'fs-extra' && path.basename(fromDirectory) === 'helper';
             const packageKey = nested ? 'fs-extra-nested' : requestName;
@@ -505,6 +506,7 @@ test('records multiple runtime identities while retaining Theia extensions below
         browserManifest: { dependencies: { product: '^1.0.0' } },
         roots: ['product'],
         browserDirectory,
+        canonicalizePackageDirectory: async directory => path.resolve(directory),
         resolver: async (requestName, fromDirectory) => {
             const parent = path.basename(fromDirectory);
             const key = requestName === 'shared' ? `shared-${parent}` : requestName;
@@ -530,6 +532,54 @@ test('records multiple runtime identities while retaining Theia extensions below
         { version: '1.5.0', dependencyPath: ['product', 'left', 'shared'] },
         { version: '2.5.0', dependencyPath: ['product', 'right', 'shared'] },
     ]);
+});
+
+test('traverses same-version packages at different installation locations and unions their extension closures', async t => {
+    const installedRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-install-context-'));
+    t.after(() => fs.promises.rm(installedRoot, { recursive: true, force: true }));
+    const browserDirectory = path.join(installedRoot, 'browser-app');
+    const manifestsByContext = {
+        product: manifest('product', { left: '^1.0.0', right: '^1.0.0' }),
+        left: { name: 'left', version: '1.0.0', dependencies: { shared: '^1.0.0' } },
+        right: { name: 'right', version: '1.0.0', dependencies: { shared: '^1.0.0' } },
+        'shared-left': manifest('shared', { 'nested-left': '^1.0.0' }, { version: '1.5.0' }),
+        'shared-right': manifest('shared', { 'nested-right': '^1.0.0' }, { version: '1.5.0' }),
+        'nested-left': manifest('nested-left'),
+        'nested-right': manifest('nested-right'),
+    };
+    for (const key of Object.keys(manifestsByContext)) {
+        await fs.promises.mkdir(path.join(installedRoot, key), { recursive: true });
+    }
+    const graph = await resolveInstalledPackageGraph({
+        browserManifest: { dependencies: { product: '^1.0.0' } },
+        roots: ['product'],
+        browserDirectory,
+        resolver: async (requestName, fromDirectory) => {
+            const parent = path.basename(fromDirectory);
+            const key = requestName === 'shared' ? `shared-${parent}` : requestName;
+            return {
+                requestName,
+                packageDirectory: path.join(installedRoot, key),
+                manifest: manifestsByContext[key],
+            };
+        },
+    });
+    const result = resolveProfile({
+        ...fixture({
+            roots: ['product'],
+            dependencies: { product: '^1.0.0' },
+            packages: { product: manifestsByContext.product },
+        }),
+        installedGraph: graph,
+    });
+
+    assert.deepEqual(result.extensions, ['nested-left', 'nested-right', 'shared', 'product']);
+    assert.equal(result.extensions.filter(name => name === 'shared').length, 1);
+    assert.deepEqual(result.packages.filter(entry => entry.requestName === 'shared').map(entry => entry.dependencyPath), [
+        ['product', 'left', 'shared'],
+        ['product', 'right', 'shared'],
+    ]);
+    assert.equal(JSON.stringify(result).includes(path.resolve(installedRoot)), false);
 });
 
 test('finds the package root above nested module-format package metadata', async t => {
@@ -686,6 +736,27 @@ test('startup recovery restores a backed-up target when the target is missing', 
     await recoverDirectoryTransactions({ parentDirectory, targetName: 'lib' });
 
     assert.equal(await fs.promises.readFile(path.join(plan.targetDirectory, 'sentinel.txt'), 'utf8'), 'old');
+    assert.equal(fs.existsSync(plan.temporaryDirectory), false);
+    assert.equal(fs.existsSync(plan.markerPath), false);
+});
+
+test('startup recovery rolls back an installed target when a backed-up marker still has both directories', async t => {
+    const parentDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-transaction-crash-gap-'));
+    t.after(() => fs.promises.rm(parentDirectory, { recursive: true, force: true }));
+    const plan = createDirectoryTransactionPlan(parentDirectory, 'lib', 'install-before-marker');
+    await writeSentinel(plan.targetDirectory, 'complete-new-version');
+    await writeSentinel(plan.backupDirectory, 'complete-old-version');
+    await fs.promises.writeFile(plan.markerPath, `${JSON.stringify({
+        schema: 'ride.directory-transaction@1',
+        targetName: 'lib',
+        transactionId: 'install-before-marker',
+        state: 'backed-up',
+    })}\n`);
+
+    await recoverDirectoryTransactions({ parentDirectory, targetName: 'lib' });
+
+    assert.equal(await fs.promises.readFile(path.join(plan.targetDirectory, 'sentinel.txt'), 'utf8'), 'complete-old-version');
+    assert.equal(fs.existsSync(plan.backupDirectory), false);
     assert.equal(fs.existsSync(plan.temporaryDirectory), false);
     assert.equal(fs.existsSync(plan.markerPath), false);
 });
@@ -915,6 +986,141 @@ test('publish lock waits for owner metadata initialization instead of failing EN
     });
 
     assert.ok(waits >= 1);
+    await release();
+});
+
+test('publish lock gives a fresh ownerless directory time to finish concurrent initialization', async t => {
+    const browserDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-publish-lock-ownerless-fresh-'));
+    t.after(() => fs.promises.rm(browserDirectory, { recursive: true, force: true }));
+    const lockDirectory = path.join(browserDirectory, '.ride-tauri-publish.lock');
+    await fs.promises.mkdir(lockDirectory);
+    await fs.promises.utimes(lockDirectory, new Date(9_500), new Date(9_500));
+    let currentTime = 10_000;
+    let waits = 0;
+    let observedFreshDirectory = false;
+
+    const release = await acquirePublishLock({
+        browserDirectory,
+        owner: { buildId: 'waiting-build', profile: 'full', commit: '5'.repeat(40) },
+        now: () => currentTime,
+        staleMs: 1_000,
+        timeoutMs: 2_000,
+        retryDelayMs: 100,
+        isProcessAlive: () => true,
+        sleep: async delay => {
+            waits += 1;
+            currentTime += delay;
+            if (waits === 1) {
+                observedFreshDirectory = fs.existsSync(lockDirectory)
+                    && !fs.existsSync(path.join(lockDirectory, 'owner.json'));
+                await fs.promises.writeFile(path.join(lockDirectory, 'owner.json'), `${JSON.stringify({
+                    schema: 'ride.tauri-publish-lock@1',
+                    pid: process.pid,
+                    buildId: 'initializing-build',
+                    profile: 'tauri-critical',
+                    commit: '5'.repeat(40),
+                    acquiredAt: currentTime,
+                })}\n`);
+            } else if (waits === 2) {
+                await fs.promises.rm(lockDirectory, { recursive: true });
+            }
+        },
+    });
+
+    assert.equal(observedFreshDirectory, true);
+    assert.ok(waits >= 2);
+    await release();
+});
+
+test('publish lock preserves an owner initialized immediately before stale ownerless quarantine', async t => {
+    const browserDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-publish-lock-ownerless-quarantine-race-'));
+    t.after(() => fs.promises.rm(browserDirectory, { recursive: true, force: true }));
+    const lockDirectory = path.join(browserDirectory, '.ride-tauri-publish.lock');
+    await fs.promises.mkdir(lockDirectory);
+    await fs.promises.utimes(lockDirectory, new Date(100), new Date(100));
+    let currentTime = 10_000;
+    let initializedDuringQuarantine = false;
+    let preservedLiveOwner = false;
+    const filesystem = {
+        ...fs.promises,
+        rename: async (source, destination) => {
+            if (!initializedDuringQuarantine && path.resolve(source) === path.resolve(lockDirectory)
+                && path.basename(destination).startsWith('.ride-tauri-publish.lock.stale-')) {
+                initializedDuringQuarantine = true;
+                await fs.promises.writeFile(path.join(lockDirectory, 'owner.json'), `${JSON.stringify({
+                    schema: 'ride.tauri-publish-lock@1',
+                    pid: process.pid,
+                    buildId: 'initializing-build',
+                    profile: 'tauri-critical',
+                    commit: '5'.repeat(40),
+                    acquiredAt: currentTime,
+                })}\n`);
+            }
+            return fs.promises.rename(source, destination);
+        },
+    };
+
+    const release = await acquirePublishLock({
+        browserDirectory,
+        filesystem,
+        owner: { buildId: 'waiting-build', profile: 'full', commit: '5'.repeat(40) },
+        now: () => currentTime,
+        staleMs: 1_000,
+        timeoutMs: 2_000,
+        retryDelayMs: 100,
+        isProcessAlive: () => true,
+        sleep: async delay => {
+            currentTime += delay;
+            preservedLiveOwner = JSON.parse(
+                await fs.promises.readFile(path.join(lockDirectory, 'owner.json'), 'utf8'),
+            ).buildId === 'initializing-build';
+            await fs.promises.rm(lockDirectory, { recursive: true });
+        },
+    });
+
+    assert.equal(initializedDuringQuarantine, true);
+    assert.equal(preservedLiveOwner, true);
+    await release();
+});
+
+test('publish lock rejects non-directory and symbolic-link lock paths', async t => {
+    const browserDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-publish-lock-unsafe-'));
+    t.after(() => fs.promises.rm(browserDirectory, { recursive: true, force: true }));
+    const lockDirectory = path.join(browserDirectory, '.ride-tauri-publish.lock');
+    const options = {
+        browserDirectory,
+        owner: { buildId: 'safe-build', profile: 'full', commit: '5'.repeat(40) },
+        timeoutMs: 0,
+    };
+    await fs.promises.writeFile(lockDirectory, 'not a directory');
+    await assert.rejects(acquirePublishLock(options), /unsafe.*publish lock path/i);
+    await fs.promises.rm(lockDirectory);
+    const linkTarget = path.join(browserDirectory, 'lock-link-target');
+    await fs.promises.mkdir(linkTarget);
+    await fs.promises.symlink(linkTarget, lockDirectory, process.platform === 'win32' ? 'junction' : 'dir');
+    await assert.rejects(acquirePublishLock(options), /unsafe.*publish lock path/i);
+});
+
+test('publish lock recovers a stale ownerless directory using its own mtime', async t => {
+    const browserDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-publish-lock-ownerless-stale-'));
+    t.after(() => fs.promises.rm(browserDirectory, { recursive: true, force: true }));
+    const lockDirectory = path.join(browserDirectory, '.ride-tauri-publish.lock');
+    await fs.promises.mkdir(lockDirectory);
+    await fs.promises.utimes(lockDirectory, new Date(100), new Date(100));
+    let currentTime = 10_000;
+
+    const release = await acquirePublishLock({
+        browserDirectory,
+        owner: { buildId: 'ownerless-recovery', profile: 'full', commit: '5'.repeat(40) },
+        now: () => currentTime,
+        staleMs: 1_000,
+        timeoutMs: 2_000,
+        retryDelayMs: 100,
+        sleep: async delay => { currentTime += delay; },
+    });
+
+    const owner = JSON.parse(await fs.promises.readFile(path.join(lockDirectory, 'owner.json'), 'utf8'));
+    assert.equal(owner.buildId, 'ownerless-recovery');
     await release();
 });
 
@@ -1172,6 +1378,7 @@ test('rejects conflicting installed identities for one request name with both pa
         profileName: 'tauri-critical',
         buildId: 'conflict-build',
         sourceIdentity: async () => ({ commit: 'c'.repeat(40), clean: true }),
+        canonicalizePackageDirectory: async directory => path.resolve(directory),
         resolveInstalledManifest: async (requestName, fromDirectory) => {
             if (requestName === 'shared') {
                 const fromRight = path.basename(fromDirectory) === 'right';
