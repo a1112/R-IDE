@@ -31,7 +31,12 @@ function writeFileAtomic(file, content) {
             throw error;
         }
         if (backedUp) {
-            fs.rmSync(backup, { force: false });
+            try {
+                fs.rmSync(backup, { force: false });
+            } catch {
+                // The new metadata is already installed. A transient Windows
+                // lock on the obsolete backup must not fail the build.
+            }
         }
     } catch (error) {
         fs.rmSync(temporary, { force: true });

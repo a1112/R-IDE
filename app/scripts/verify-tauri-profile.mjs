@@ -99,16 +99,12 @@ function pathContainsPackage(input, packageName) {
   return false;
 }
 
-function loadExtensionContributions(browserDirectory, packageName) {
+function locateInstalledPackage(browserDirectory, packageName) {
   let directory = browserDirectory;
   while (true) {
     const manifestPath = path.join(directory, 'node_modules', ...packageName.split('/'), 'package.json');
     if (fs.existsSync(manifestPath)) {
-      const packageManifest = readJson(manifestPath, `Extension package manifest for ${packageName}`);
-      if (!Array.isArray(packageManifest.theiaExtensions)) {
-        throw new Error(`Profile package ${packageName} does not declare Theia extensions.`);
-      }
-      return packageManifest.theiaExtensions;
+      return { directory: path.dirname(manifestPath), manifestPath };
     }
     const parent = path.dirname(directory);
     if (parent === directory) {
@@ -118,9 +114,16 @@ function loadExtensionContributions(browserDirectory, packageName) {
   }
 }
 
-function verifyExtensionTargets(browserDirectory, expectedPackages, frontendMetadata, backendMetadata, label, deferredModules) {
-  const frontendInputs = Object.keys(frontendMetadata.inputs);
-  const backendInputs = Object.keys(backendMetadata.inputs);
+function loadExtensionContributions(browserDirectory, packageName) {
+  const { manifestPath } = locateInstalledPackage(browserDirectory, packageName);
+  const packageManifest = readJson(manifestPath, `Extension package manifest for ${packageName}`);
+  if (!Array.isArray(packageManifest.theiaExtensions)) {
+    throw new Error(`Profile package ${packageName} does not declare Theia extensions.`);
+  }
+  return packageManifest.theiaExtensions;
+}
+
+function verifyExtensionTargets(browserDirectory, expectedPackages, frontendInputs, backendInputs, label, deferredModules) {
   const missing = [];
   for (const packageName of expectedPackages) {
     const contributions = loadExtensionContributions(browserDirectory, packageName);
@@ -163,6 +166,40 @@ function verifyExtensionTargets(browserDirectory, expectedPackages, frontendMeta
   if (missing.length > 0) {
     throw new Error(`${label} missing profile inventory: ${missing.join(', ')}.`);
   }
+}
+
+function reachableOutputInputs(metafile, entryOutputPath) {
+  const outputs = metafile.outputs;
+  const pending = [normalize(entryOutputPath)];
+  const visited = new Set();
+  const inputs = new Set();
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (visited.has(current)) {
+      continue;
+    }
+    visited.add(current);
+    const detail = outputs[current];
+    if (!detail) {
+      continue;
+    }
+    for (const input of Object.keys(detail.inputs ?? {})) {
+      inputs.add(input);
+    }
+    for (const imported of detail.imports ?? []) {
+      if (imported.external || typeof imported.path !== 'string') {
+        continue;
+      }
+      const direct = normalize(imported.path);
+      const relative = normalize(path.posix.join(path.posix.dirname(current), imported.path));
+      if (outputs[direct]) {
+        pending.push(direct);
+      } else if (outputs[relative]) {
+        pending.push(relative);
+      }
+    }
+  }
+  return [...inputs];
 }
 
 function outputBySuffix(metafile, suffix) {
@@ -302,7 +339,17 @@ function countBundledPlugins(pluginsDirectory) {
     .filter(entry => entry.isDirectory() && !entry.name.startsWith('.')).length;
 }
 
-function verifyFullRootInventory(manifest) {
+function verifyFullRootInventory(manifest, browserDirectory) {
+  const browserManifest = readJson(path.join(browserDirectory, 'package.json'), 'Browser application manifest');
+  if (!browserManifest.dependencies || typeof browserManifest.dependencies !== 'object'
+    || Array.isArray(browserManifest.dependencies)) {
+    throw new Error('Browser application manifest has no dependency root inventory.');
+  }
+  const browserRoots = Object.keys(browserManifest.dependencies);
+  const missingBrowserRoots = browserRoots.filter(root => !manifest.roots.includes(root));
+  if (missingBrowserRoots.length > 0) {
+    throw new Error(`Full profile is missing browser dependency roots: ${missingBrowserRoots.join(', ')}.`);
+  }
   const resolvedPackages = new Set(manifest.extensions);
   for (const record of manifest.packages) {
     if (typeof record?.requestName === 'string') {
@@ -315,6 +362,27 @@ function verifyFullRootInventory(manifest) {
   const missing = manifest.roots.filter(root => !resolvedPackages.has(root));
   if (missing.length > 0) {
     throw new Error(`Full profile is missing browser root identities: ${missing.join(', ')}.`);
+  }
+}
+
+function verifyFrontendVsCodeInit(browserDirectory) {
+  const destination = path.join(browserDirectory, 'lib', 'frontend', 'context', 'plugin-vscode-init-fe.js');
+  const { directory: packageDirectory } = locateInstalledPackage(browserDirectory, '@theia/plugin-ext-vscode');
+  const source = path.join(packageDirectory, 'lib', 'node', 'context', 'plugin-vscode-init-fe.js');
+  for (const [file, label] of [[source, 'source'], [destination, 'asset']]) {
+    let stat;
+    try {
+      stat = fs.lstatSync(file);
+    } catch (error) {
+      throw new Error(`Frontend VS Code initialization ${label} is missing: ${error.message}.`);
+    }
+    if (stat.isSymbolicLink() || !stat.isFile()) {
+      throw new Error(`Frontend VS Code initialization ${label} is not a regular file.`);
+    }
+  }
+  const hash = file => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+  if (hash(source) !== hash(destination)) {
+    throw new Error('Frontend VS Code initialization asset hash mismatch.');
   }
 }
 
@@ -337,12 +405,12 @@ export function verifyTauriProfileInventory({
   for (const [target, record] of Object.entries(metadataRecords)) {
     verifyAllOutputHashes(record, resolvedBrowserDirectory, target);
   }
-  requireOutput(metadataRecords['frontend-main'], 'lib/frontend/bundle.js', 'Main frontend', resolvedBrowserDirectory, 'src-gen/frontend/index.js');
+  const [frontendMainOutput] = requireOutput(metadataRecords['frontend-main'], 'lib/frontend/bundle.js', 'Main frontend', resolvedBrowserDirectory, 'src-gen/frontend/index.js');
   requireOutput(metadataRecords['frontend-secondary-window'], 'lib/frontend/secondary-window.js', 'Secondary window', resolvedBrowserDirectory, 'src-gen/frontend/secondary-index.js');
   requireOutput(metadataRecords['frontend-editor.worker'], 'lib/frontend/editor.worker.js', 'Editor worker', resolvedBrowserDirectory, 'node_modules/@theia/monaco-editor-core/esm/vs/editor/common/services/editorWebWorkerMain.js');
   requireOutput(metadataRecords['frontend-plugin-worker'], 'lib/frontend/plugin-worker.js', 'Plugin worker', resolvedBrowserDirectory, 'node_modules/@theia/plugin-ext/lib/hosted/browser/worker/worker-main.js');
+  const [backendMainOutput] = requireOutput(metadataRecords.backend, 'lib/backend/main.js', 'Backend main', resolvedBrowserDirectory, 'src-gen/backend/main.js');
   for (const [suffix, label, entryPoint] of [
-    ['lib/backend/main.js', 'Backend main', 'src-gen/backend/main.js'],
     ['lib/backend/plugin-host.js', 'Plugin host', 'node_modules/@theia/plugin-ext/lib/hosted/node/plugin-host.js'],
     ['lib/backend/backend-init-theia.js', 'Theia plugin initialization', 'node_modules/@theia/plugin-ext/lib/hosted/node/scanners/backend-init-theia.js'],
     ['lib/backend/plugin-vscode-init.js', 'VS Code plugin initialization', 'node_modules/@theia/plugin-ext-vscode/lib/node/plugin-vscode-init.js'],
@@ -350,34 +418,28 @@ export function verifyTauriProfileInventory({
   ]) {
     requireOutput(metadataRecords.backend, suffix, label, resolvedBrowserDirectory, entryPoint);
   }
-  const frontendVsCodeInit = path.join(resolvedBrowserDirectory, 'lib', 'frontend', 'context', 'plugin-vscode-init-fe.js');
-  let frontendInitStat;
-  try {
-    frontendInitStat = fs.lstatSync(frontendVsCodeInit);
-  } catch (error) {
-    throw new Error(`Frontend VS Code initialization asset is missing: ${error.message}.`);
-  }
-  if (frontendInitStat.isSymbolicLink() || !frontendInitStat.isFile()) {
-    throw new Error('Frontend VS Code initialization asset is not a regular file.');
-  }
+  verifyFrontendVsCodeInit(resolvedBrowserDirectory);
 
   const expectedPackages = manifest.extensions;
-  const deferredModules = new Set(Object.values(manifest.featureGroups)
-    .flatMap(group => group.deferredFrontendModules ?? [])
-    .map(feature => feature.module)
-    .filter(module => typeof module === 'string' && module));
+  const deferredModules = manifest.profile === 'tauri-critical'
+    ? new Set(Object.values(manifest.featureGroups)
+      .flatMap(group => group.deferredFrontendModules ?? [])
+      .map(feature => feature.module)
+      .filter(module => typeof module === 'string' && module))
+    : new Set();
+  const frontendInputs = reachableOutputInputs(metadataRecords['frontend-main'].metafile, frontendMainOutput);
+  const backendInputs = reachableOutputInputs(metadataRecords.backend.metafile, backendMainOutput);
   verifyExtensionTargets(
     resolvedBrowserDirectory,
     expectedPackages,
-    metadataRecords['frontend-main'].metafile,
-    metadataRecords.backend.metafile,
+    frontendInputs,
+    backendInputs,
     `${manifest.profile} profile`,
     deferredModules,
   );
   if (manifest.profile === 'full') {
-    verifyFullRootInventory(manifest);
+    verifyFullRootInventory(manifest, resolvedBrowserDirectory);
   }
-  const frontendInputs = Object.keys(metadataRecords['frontend-main'].metafile.inputs);
   if (!frontendInputs.some(input => pathContainsPackage(input, 'theia-ide-product-ext'))) {
     throw new Error('R-IDE product extension is missing from the frontend inventory.');
   }

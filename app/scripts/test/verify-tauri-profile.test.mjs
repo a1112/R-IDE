@@ -37,6 +37,15 @@ function writeJson(file, value) {
   fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`);
 }
 
+function publishManifest(fixture) {
+  fixture.manifest.digest = digestContract(fixture.manifest);
+  writeJson(path.join(fixture.browserDirectory, 'lib', 'frontend', 'ride-tauri-profile.json'), fixture.manifest);
+  for (const [name, record] of Object.entries(fixture.records)) {
+    record.digest = fixture.manifest.digest;
+    writeJson(path.join(fixture.browserDirectory, 'lib', 'metadata', `${name}.json`), record);
+  }
+}
+
 function metadata(manifest, target, inputs, outputs) {
   const allInputs = [...new Set([
     ...inputs,
@@ -74,6 +83,7 @@ function createFixture(profile = 'tauri-critical') {
   const browserDirectory = path.join(root, 'applications', 'browser');
   const pluginsDirectory = path.join(root, 'plugins');
   fs.mkdirSync(path.join(pluginsDirectory, 'publisher.extension'), { recursive: true });
+  const extensionRoots = ['@theia/core', '@theia/plugin-ext', '@theia/plugin-ext-vscode', '@theia/filesystem', 'theia-ide-product-ext'];
   const manifest = {
     schema: 'ride.tauri-profile',
     version: 1,
@@ -81,18 +91,23 @@ function createFixture(profile = 'tauri-critical') {
     sourceIdentity: { commit: 'a'.repeat(40), clean: true },
     buildId: 'build-1',
     profile,
-    roots: ['@theia/core', '@theia/plugin-ext', '@theia/plugin-ext-vscode', '@theia/filesystem', 'theia-ide-product-ext'],
-    extensions: ['@theia/core', '@theia/plugin-ext', '@theia/plugin-ext-vscode', '@theia/filesystem', 'theia-ide-product-ext'],
-    packages: [],
-    featureGroups: profile === 'tauri-critical' ? {
+    roots: profile === 'full' ? [...extensionRoots, 'fs-extra'] : extensionRoots,
+    extensions: extensionRoots,
+    packages: profile === 'full' ? [{
+      requestName: 'fs-extra',
+      packageName: 'fs-extra',
+      version: '1.0.0',
+      dependencyPath: ['fs-extra'],
+    }] : [],
+    featureGroups: {
       deferred: {
-        deferredRoots: ['@theia/deferred-only'],
+        deferredRoots: profile === 'tauri-critical' ? ['@theia/deferred-only'] : [],
         deferredFrontendModules: [{
           module: '@theia/secondary-window/lib/browser/secondary-window-frontend-module',
           entry: 'tauri-src/secondary-window-feature.ts',
         }],
       },
-    } : {},
+    },
   };
   manifest.digest = digestContract(manifest);
   for (const extension of manifest.extensions) {
@@ -102,15 +117,22 @@ function createFixture(profile = 'tauri-critical') {
       theiaExtensions: [{ frontend: 'lib/browser/frontend-module', backend: 'lib/node/backend-module' }],
     });
   }
+  writeJson(path.join(browserDirectory, 'package.json'), {
+    name: 'fixture-browser-app',
+    dependencies: Object.fromEntries(manifest.roots.map(rootName => [rootName, '1.0.0'])),
+  });
+  const frontendVsCodeInitSource = path.join(root, 'node_modules', '@theia', 'plugin-ext-vscode', 'lib', 'node', 'context', 'plugin-vscode-init-fe.js');
+  fs.mkdirSync(path.dirname(frontendVsCodeInitSource), { recursive: true });
+  fs.writeFileSync(frontendVsCodeInitSource, 'init');
   writeJson(path.join(browserDirectory, 'lib', 'frontend', 'ride-tauri-profile.json'), manifest);
   fs.mkdirSync(path.join(browserDirectory, 'lib', 'frontend', 'context'), { recursive: true });
-  fs.writeFileSync(path.join(browserDirectory, 'lib', 'frontend', 'context', 'plugin-vscode-init-fe.js'), 'init');
+  fs.copyFileSync(frontendVsCodeInitSource, path.join(browserDirectory, 'lib', 'frontend', 'context', 'plugin-vscode-init-fe.js'));
 
   const frontendInputs = manifest.extensions.map(extension => `node_modules/${extension}/lib/browser/frontend-module.js`);
   const backendInputs = manifest.extensions.map(extension => `node_modules/${extension}/lib/node/backend-module.js`);
   const records = {
     'frontend-main': metadata(manifest, 'frontend-main', frontendInputs, [
-      { path: 'lib/frontend/bundle.js', entryPoint: 'src-gen/frontend/index.js' },
+      { path: 'lib/frontend/bundle.js', entryPoint: 'src-gen/frontend/index.js', additionalInputs: frontendInputs },
       {
         path: 'lib/frontend/chunks/secondary-window-feature-ABC123.js',
         entryPoint: 'tauri-src/secondary-window-feature.ts',
@@ -127,7 +149,7 @@ function createFixture(profile = 'tauri-critical') {
       { path: 'lib/frontend/plugin-worker.js', entryPoint: 'node_modules/@theia/plugin-ext/lib/hosted/browser/worker/worker-main.js' },
     ]),
     backend: metadata(manifest, 'backend', backendInputs, [
-      { path: 'lib/backend/main.js', entryPoint: 'src-gen/backend/main.js' },
+      { path: 'lib/backend/main.js', entryPoint: 'src-gen/backend/main.js', additionalInputs: backendInputs },
       { path: 'lib/backend/plugin-host.js', entryPoint: 'node_modules/@theia/plugin-ext/lib/hosted/node/plugin-host.js' },
       { path: 'lib/backend/backend-init-theia.js', entryPoint: 'node_modules/@theia/plugin-ext/lib/hosted/node/scanners/backend-init-theia.js' },
       { path: 'lib/backend/plugin-vscode-init.js', entryPoint: 'node_modules/@theia/plugin-ext-vscode/lib/node/plugin-vscode-init.js' },
@@ -162,21 +184,14 @@ test('verifies critical profile inventory, workers, plugin hosts, VS Code init, 
 test('rejects a missing deferred chunk and a deferred-only backend package', () => {
   const fixture = createFixture();
   try {
-    fixture.records['frontend-main'].metafile.outputs = {
-      'lib/frontend/bundle.js': {
-        bytes: 1,
-        inputs: { 'src-gen/frontend/index.js': { bytesInOutput: 1 } },
-        imports: [],
-        exports: [],
-        entryPoint: 'src-gen/frontend/index.js',
-      },
-    };
+    delete fixture.records['frontend-main'].metafile.outputs['lib/frontend/chunks/secondary-window-feature-ABC123.js'];
     delete fixture.records['frontend-main'].outputHashes['lib/frontend/chunks/secondary-window-feature-ABC123.js'];
     writeJson(path.join(fixture.browserDirectory, 'lib', 'metadata', 'frontend-main.json'), fixture.records['frontend-main']);
     assert.throws(() => verifyTauriProfileInventory(fixture), /deferred feature chunk/);
 
-    fixture.records['frontend-main'] = metadata(fixture.manifest, 'frontend-main', fixture.manifest.extensions.map(extension => `node_modules/${extension}/lib/browser/frontend-module.js`), [
-      { path: 'lib/frontend/bundle.js', entryPoint: 'src-gen/frontend/index.js' },
+    const rebuiltFrontendInputs = fixture.manifest.extensions.map(extension => `node_modules/${extension}/lib/browser/frontend-module.js`);
+    fixture.records['frontend-main'] = metadata(fixture.manifest, 'frontend-main', rebuiltFrontendInputs, [
+      { path: 'lib/frontend/bundle.js', entryPoint: 'src-gen/frontend/index.js', additionalInputs: rebuiltFrontendInputs },
       {
         path: 'lib/frontend/chunks/secondary-window-feature-ABC123.js',
         entryPoint: 'tauri-src/secondary-window-feature.ts',
@@ -204,17 +219,79 @@ test('full fallback requires every browser root and rejects stale metadata ident
   const fixture = createFixture('full');
   try {
     assert.equal(verifyTauriProfileInventory(fixture).profile, 'full');
-    delete fixture.records['frontend-main'].metafile.inputs['node_modules/@theia/core/lib/browser/frontend-module.js'];
+    const coreFrontendInput = 'node_modules/@theia/core/lib/browser/frontend-module.js';
+    delete fixture.records['frontend-main'].metafile.inputs[coreFrontendInput];
+    delete fixture.records['frontend-main'].metafile.outputs['lib/frontend/bundle.js'].inputs[coreFrontendInput];
     writeJson(path.join(fixture.browserDirectory, 'lib', 'metadata', 'frontend-main.json'), fixture.records['frontend-main']);
     assert.throws(() => verifyTauriProfileInventory(fixture), /missing profile inventory.*@theia\/core \(frontend-main\)/i);
 
-    delete fixture.records.backend.metafile.inputs['node_modules/@theia/core/lib/node/backend-module.js'];
+    fixture.records['frontend-main'].metafile.inputs[coreFrontendInput] = { bytes: 1, imports: [] };
+    fixture.records['frontend-main'].metafile.outputs['lib/frontend/bundle.js'].inputs[coreFrontendInput] = { bytesInOutput: 1 };
+    writeJson(path.join(fixture.browserDirectory, 'lib', 'metadata', 'frontend-main.json'), fixture.records['frontend-main']);
+    const coreBackendInput = 'node_modules/@theia/core/lib/node/backend-module.js';
+    delete fixture.records.backend.metafile.inputs[coreBackendInput];
+    delete fixture.records.backend.metafile.outputs['lib/backend/main.js'].inputs[coreBackendInput];
     writeJson(path.join(fixture.browserDirectory, 'lib', 'metadata', 'backend.json'), fixture.records.backend);
     assert.throws(() => verifyTauriProfileInventory(fixture), /missing profile inventory.*@theia\/core/i);
 
+    fixture.records.backend.metafile.inputs[coreBackendInput] = { bytes: 1, imports: [] };
+    fixture.records.backend.metafile.outputs['lib/backend/main.js'].inputs[coreBackendInput] = { bytesInOutput: 1 };
     fixture.records.backend.buildId = 'stale-build';
     writeJson(path.join(fixture.browserDirectory, 'lib', 'metadata', 'backend.json'), fixture.records.backend);
     assert.throws(() => verifyTauriProfileInventory(fixture), /metadata identity mismatch/);
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('full fallback is checked against every browser dependency root', () => {
+  const fixture = createFixture('full');
+  try {
+    fixture.manifest.roots = fixture.manifest.roots.filter(root => root !== 'fs-extra');
+    fixture.manifest.packages = fixture.manifest.packages.filter(record => record.requestName !== 'fs-extra');
+    publishManifest(fixture);
+
+    assert.throws(() => verifyTauriProfileInventory(fixture), /browser dependency roots.*fs-extra/i);
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('full fallback never skips a contribution merely because critical defers it', () => {
+  const fixture = createFixture('full');
+  try {
+    fixture.manifest.featureGroups.deferred.deferredFrontendModules[0].module = '@theia/core/lib/browser/frontend-module';
+    publishManifest(fixture);
+    const coreInput = 'node_modules/@theia/core/lib/browser/frontend-module.js';
+    delete fixture.records['frontend-main'].metafile.inputs[coreInput];
+    delete fixture.records['frontend-main'].metafile.outputs['lib/frontend/bundle.js'].inputs[coreInput];
+    writeJson(path.join(fixture.browserDirectory, 'lib', 'metadata', 'frontend-main.json'), fixture.records['frontend-main']);
+
+    assert.throws(() => verifyTauriProfileInventory(fixture), /missing profile inventory.*@theia\/core.*frontend-main/i);
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('backend contributions must belong to the backend main entry output', () => {
+  const fixture = createFixture();
+  try {
+    const coreInput = 'node_modules/@theia/core/lib/node/backend-module.js';
+    delete fixture.records.backend.metafile.outputs['lib/backend/main.js'].inputs[coreInput];
+    fixture.records.backend.metafile.outputs['lib/backend/plugin-host.js'].inputs[coreInput] = { bytesInOutput: 1 };
+    writeJson(path.join(fixture.browserDirectory, 'lib', 'metadata', 'backend.json'), fixture.records.backend);
+
+    assert.throws(() => verifyTauriProfileInventory(fixture), /missing profile inventory.*@theia\/core.*backend/i);
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('rejects a stale frontend VS Code initialization copy', () => {
+  const fixture = createFixture();
+  try {
+    fs.writeFileSync(path.join(fixture.browserDirectory, 'lib', 'frontend', 'context', 'plugin-vscode-init-fe.js'), 'stale');
+    assert.throws(() => verifyTauriProfileInventory(fixture), /VS Code initialization asset hash mismatch/i);
   } finally {
     fs.rmSync(fixture.root, { recursive: true, force: true });
   }
@@ -301,6 +378,52 @@ test('metadata plugin atomically hashes successful outputs and removes stale rec
     onEnd({ errors: [{ text: 'failed rebuild' }] });
     assert.equal(fs.existsSync(metadataFile), false);
   } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('metadata publication stays successful when obsolete backup cleanup is denied', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ride-metadata-backup-'));
+  const originalRemove = fs.rmSync;
+  try {
+    const output = 'lib/frontend/bundle.js';
+    fs.mkdirSync(path.join(root, 'lib', 'frontend'), { recursive: true });
+    fs.writeFileSync(path.join(root, output), 'first');
+    let onEnd;
+    const profileManifest = { profile: 'tauri-critical', buildId: 'build-1', digest: 'd'.repeat(64) };
+    createProfileMetadataPlugin({ target: 'frontend-main', profileManifest, baseDirectory: root }).setup({
+      onEnd(callback) {
+        onEnd = callback;
+      },
+    });
+    const metafile = {
+      inputs: { 'src-gen/frontend/index.js': { bytes: 1, imports: [] } },
+      outputs: {
+        [output]: {
+          bytes: 6,
+          inputs: { 'src-gen/frontend/index.js': { bytesInOutput: 6 } },
+          imports: [],
+          exports: [],
+          entryPoint: 'src-gen/frontend/index.js',
+        },
+      },
+    };
+    onEnd({ errors: [], metafile });
+    fs.writeFileSync(path.join(root, output), 'second');
+    fs.rmSync = (candidate, options) => {
+      if (String(candidate).includes('.backup-')) {
+        const error = new Error('backup is temporarily locked');
+        error.code = 'EPERM';
+        throw error;
+      }
+      return originalRemove(candidate, options);
+    };
+
+    assert.doesNotThrow(() => onEnd({ errors: [], metafile }));
+    const record = JSON.parse(fs.readFileSync(path.join(root, 'lib', 'metadata', 'frontend-main.json'), 'utf8'));
+    assert.equal(record.outputHashes[output], crypto.createHash('sha256').update('second').digest('hex'));
+  } finally {
+    fs.rmSync = originalRemove;
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
