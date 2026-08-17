@@ -130,9 +130,28 @@ test('packaged Tauri builds preserve the complete plugin dependency graph', () =
     'utf8'
   ));
   const packagedBuild = tauriPackage.scripts['build:prod'];
+  const frontendCopyIndex = packagedBuild.indexOf('copy:frontend');
+  const backendCopyIndex = packagedBuild.indexOf('copy:backend');
+  const nativeBuildIndex = packagedBuild.indexOf('npm run tauri -- build');
+  assert.ok(frontendCopyIndex >= 0 && backendCopyIndex > frontendCopyIndex,
+    'recursive frontend and backend assets must both be staged for packaging');
+  assert.ok(nativeBuildIndex > backendCopyIndex,
+    'profile manifests and chunks must be copied before native packaging');
   assert.ok(packagedBuild.indexOf('copy:plugins') >= 0);
   assert.ok(packagedBuild.indexOf('npm run tauri -- build') > packagedBuild.indexOf('copy:plugins'),
     'plugin resources must be copied before native packaging');
+
+  const verification = fs.readFileSync(
+    path.join(repositoryRoot, 'app', 'applications', 'tauri', 'verify-build.js'),
+    'utf8',
+  );
+  const copyHelper = fs.readFileSync(
+    path.join(repositoryRoot, 'app', 'applications', 'tauri', 'copy-build-tree.js'),
+    'utf8',
+  );
+  assert.match(`${verification}\n${copyHelper}`, /browser-frontend[\s\S]*ride-tauri-profile\.json/);
+  assert.match(verification, /resources[\\/]backend|resources', 'backend/);
+  assert.match(verification, /validatePackagedProfileAssets/);
 });
 
 test('package jobs measure startup after verification and upload the unsigned JSON report', () => {

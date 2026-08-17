@@ -2,14 +2,26 @@
 // SPDX-License-Identifier: MIT
 
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import { readdir, readFile } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
 const appDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const tauriDirectory = path.join(appDirectory, 'applications', 'tauri', 'src-tauri');
 const productDirectory = path.join(appDirectory, 'theia-extensions', 'product', 'src', 'browser');
+const require = createRequire(import.meta.url);
+const {
+  assertRequiredRegularFiles,
+  canonicalDigest,
+  copyRegularTree,
+  publishDirectoryAtomic,
+  rewriteDesktopHtml,
+  validatePackagedProfileAssets,
+} = require('../../applications/tauri/copy-build-tree.js');
 
 function invokedCommands(source) {
   const invokeNames = new Set(['invoke']);
@@ -114,7 +126,7 @@ test('remote Tauri frontend receives only audited per-command permissions', asyn
     path.join(appDirectory, 'applications', 'tauri', 'copy-frontend.js'),
     'utf8'
   );
-  const bootstrapMatch = /const tauriBootstrapScript = `([\s\S]*?)`;\r?\n\r?\nfs\.writeFileSync\(path\.join\(tauriFrontendDir, 'bootstrap\.js'\)/.exec(frontendGenerator);
+  const bootstrapMatch = /const tauriBootstrapScript = `([\s\S]*?)`;\r?\n/.exec(frontendGenerator);
   assert.ok(bootstrapMatch, 'expected the generated local bootstrap source');
   const localBootstrap = bootstrapMatch[1];
   assert.deepEqual(invokedCommands(localBootstrap), []);
@@ -132,4 +144,222 @@ test('rejects unauthorized literal commands invoked through an imported alias', 
     () => auditedCommands([aliasedInvokeFixture], ['ride_frontend_ready']),
     /ride_unauthorized/
   );
+});
+
+test('Tauri build copy recursively publishes profile chunks and omits source maps by default', () => {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'ride-tauri-copy-'));
+  try {
+    const source = path.join(fixture, 'source');
+    const target = path.join(fixture, 'browser-frontend');
+    fs.mkdirSync(path.join(source, 'chunks'), { recursive: true });
+    for (const file of ['index.html', 'bundle.js', 'bundle.css', 'ride-tauri-profile.json']) {
+      fs.writeFileSync(path.join(source, file), file);
+    }
+    fs.writeFileSync(path.join(source, 'chunks', 'secondary-window-feature-ABC123.js'), 'feature');
+    fs.writeFileSync(path.join(source, 'chunks', 'secondary-window-feature-ABC123.js.map'), 'map');
+    fs.mkdirSync(target);
+    fs.writeFileSync(path.join(target, 'old-build.txt'), 'old');
+
+    assertRequiredRegularFiles(source, ['index.html', 'bundle.js', 'bundle.css']);
+    publishDirectoryAtomic(target, staging => copyRegularTree(source, staging));
+
+    assert.equal(fs.readFileSync(path.join(target, 'ride-tauri-profile.json'), 'utf8'), 'ride-tauri-profile.json');
+    assert.equal(fs.readFileSync(path.join(target, 'chunks', 'secondary-window-feature-ABC123.js'), 'utf8'), 'feature');
+    assert.equal(fs.existsSync(path.join(target, 'chunks', 'secondary-window-feature-ABC123.js.map')), false);
+    assert.equal(fs.existsSync(path.join(target, 'old-build.txt')), false);
+  } finally {
+    fs.rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+test('Tauri build copy preserves its previous target on failure and only opts into source maps explicitly', () => {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'ride-tauri-copy-'));
+  try {
+    const source = path.join(fixture, 'source');
+    const target = path.join(fixture, 'target');
+    fs.mkdirSync(source);
+    fs.writeFileSync(path.join(source, 'bundle.js'), 'bundle');
+    fs.writeFileSync(path.join(source, 'bundle.js.map'), 'map');
+    fs.mkdirSync(target);
+    fs.writeFileSync(path.join(target, 'known-good.txt'), 'good');
+
+    assert.throws(
+      () => publishDirectoryAtomic(target, staging => {
+        copyRegularTree(source, staging, { includeSourceMaps: true });
+        throw new Error('simulated copy failure');
+      }),
+      /simulated copy failure/,
+    );
+    assert.equal(fs.readFileSync(path.join(target, 'known-good.txt'), 'utf8'), 'good');
+
+    publishDirectoryAtomic(target, staging => copyRegularTree(source, staging, { includeSourceMaps: true }));
+    assert.equal(fs.readFileSync(path.join(target, 'bundle.js.map'), 'utf8'), 'map');
+  } finally {
+    fs.rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+test('Tauri atomic publisher restores the previous target when installation rename fails', () => {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'ride-tauri-copy-'));
+  try {
+    const target = path.join(fixture, 'target');
+    fs.mkdirSync(target);
+    fs.writeFileSync(path.join(target, 'known-good.txt'), 'good');
+    let renameCalls = 0;
+    const renameSync = (source, destination) => {
+      renameCalls++;
+      if (renameCalls === 2) {
+        const error = new Error('simulated install rename failure');
+        error.code = 'EIO';
+        throw error;
+      }
+      fs.renameSync(source, destination);
+    };
+
+    assert.throws(
+      () => publishDirectoryAtomic(target, staging => {
+        fs.writeFileSync(path.join(staging, 'new-build.txt'), 'new');
+      }, { renameSync }),
+      /simulated install rename failure/,
+    );
+    assert.equal(renameCalls, 3);
+    assert.equal(fs.readFileSync(path.join(target, 'known-good.txt'), 'utf8'), 'good');
+    assert.equal(fs.existsSync(path.join(target, 'new-build.txt')), false);
+    assert.deepEqual(fs.readdirSync(fixture), ['target']);
+  } finally {
+    fs.rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+test('Tauri atomic publisher reports successful installation when old-backup cleanup is delayed', () => {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'ride-tauri-copy-'));
+  try {
+    const target = path.join(fixture, 'target');
+    fs.mkdirSync(target);
+    fs.writeFileSync(path.join(target, 'old.txt'), 'old');
+    const warnings = [];
+    assert.doesNotThrow(() => publishDirectoryAtomic(target, staging => {
+      fs.writeFileSync(path.join(staging, 'new.txt'), 'new');
+    }, {
+      rmSync() {
+        const error = new Error('simulated locked backup');
+        error.code = 'EIO';
+        throw error;
+      },
+      onCleanupError(message) {
+        warnings.push(message);
+      },
+    }));
+    assert.equal(fs.readFileSync(path.join(target, 'new.txt'), 'utf8'), 'new');
+    assert.equal(fs.existsSync(path.join(target, 'old.txt')), false);
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /could not remove old backup/);
+  } finally {
+    fs.rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+test('desktop HTML rewrite preserves module scripts and rejects remaining inline scripts', () => {
+  const source = `<!doctype html><html><head>
+    <script>if (document.head) { document.head.dataset.favicon = 'unused'; }</script>
+  </head><body><script type="module" src="./bundle.js" charset="utf-8"></script></body></html>`;
+  const html = rewriteDesktopHtml(source);
+  assert.match(html, /Content-Security-Policy/);
+  assert.match(html, /<script type="text\/javascript" src="\.\/ride-bootstrap\.js"/);
+  assert.match(html, /<script type="module" src="\.\/bundle\.js" charset="utf-8"><\/script>/);
+  assert.doesNotMatch(html, /<script\b(?![^>]*\bsrc=)[^>]*>/);
+  assert.throws(
+    () => rewriteDesktopHtml('<html><head></head><body><script src="./bundle.js"></script><script>alert(1)</script></body></html>'),
+    /inline script/,
+  );
+  assert.throws(
+    () => rewriteDesktopHtml('<html><head></head><body><script src="./bundle.js"></script><script data-src="later.js"></script></body></html>'),
+    /inline script/,
+  );
+});
+
+test('packaged profile validation rejects invalid identity, mismatch, and missing deferred chunks', () => {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'ride-tauri-profile-'));
+  try {
+    const frontend = path.join(fixture, 'frontend');
+    const backend = path.join(fixture, 'backend');
+    fs.mkdirSync(path.join(frontend, 'chunks'), { recursive: true });
+    fs.mkdirSync(backend);
+    const manifest = {
+      schema: 'ride.tauri-profile',
+      version: 1,
+      commit: 'a'.repeat(40),
+      buildId: 'build-1',
+      profile: 'tauri-critical',
+      sourceIdentity: { commit: 'a'.repeat(40), clean: true },
+      roots: ['@theia/core'],
+      extensions: ['@theia/core'],
+      packages: [],
+      featureGroups: {
+        'secondary-window': {
+          deferredFrontendModules: [{ entry: 'tauri-src/secondary-window-feature.ts' }],
+        },
+      },
+    };
+    manifest.digest = canonicalDigest({
+      schema: 'ride.tauri-frontend-profile@2',
+      profile: manifest.profile,
+      roots: manifest.roots,
+      extensions: manifest.extensions,
+      packages: manifest.packages,
+      featureGroups: manifest.featureGroups,
+    });
+    const writeManifests = (frontendManifest, backendManifest = frontendManifest) => {
+      fs.writeFileSync(path.join(frontend, 'ride-tauri-profile.json'), JSON.stringify(frontendManifest));
+      fs.writeFileSync(path.join(backend, 'ride-tauri-profile.json'), JSON.stringify(backendManifest));
+    };
+    fs.writeFileSync(path.join(frontend, 'chunks', 'secondary-window-feature-ABC123.js'), 'feature');
+    writeManifests(manifest);
+    assert.equal(validatePackagedProfileAssets(frontend, backend).chunks.length, 1);
+
+    writeManifests({ ...manifest, digest: '' });
+    assert.throws(() => validatePackagedProfileAssets(frontend, backend), /Invalid packaged profile identity/);
+
+    writeManifests({ ...manifest, roots: ['@theia/tampered'] });
+    assert.throws(() => validatePackagedProfileAssets(frontend, backend), /digest mismatch/);
+
+    writeManifests(manifest, { ...manifest, buildId: 'build-2' });
+    assert.throws(() => validatePackagedProfileAssets(frontend, backend), /identities do not match/);
+
+    writeManifests(manifest);
+    fs.rmSync(path.join(frontend, 'chunks', 'secondary-window-feature-ABC123.js'));
+    assert.throws(() => validatePackagedProfileAssets(frontend, backend), /Missing packaged deferred feature chunk/);
+
+    const emptyFeatures = { ...manifest, featureGroups: {} };
+    emptyFeatures.digest = canonicalDigest({
+      schema: 'ride.tauri-frontend-profile@2',
+      profile: emptyFeatures.profile,
+      roots: emptyFeatures.roots,
+      extensions: emptyFeatures.extensions,
+      packages: emptyFeatures.packages,
+      featureGroups: emptyFeatures.featureGroups,
+    });
+    writeManifests(emptyFeatures);
+    assert.throws(() => validatePackagedProfileAssets(frontend, backend), /does not contain a validated deferred feature/);
+  } finally {
+    fs.rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+test('Tauri build copy rejects traversal requirements and source links or reparse points', () => {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'ride-tauri-copy-'));
+  try {
+    const source = path.join(fixture, 'source');
+    const external = path.join(fixture, 'external');
+    const target = path.join(fixture, 'target');
+    fs.mkdirSync(source);
+    fs.mkdirSync(external);
+    fs.writeFileSync(path.join(external, 'payload.js'), 'payload');
+    fs.symlinkSync(external, path.join(source, 'linked'), process.platform === 'win32' ? 'junction' : 'dir');
+
+    assert.throws(() => assertRequiredRegularFiles(source, ['../external/payload.js']), /unsafe/);
+    assert.throws(() => copyRegularTree(source, target), /symbolic link|reparse point/);
+  } finally {
+    fs.rmSync(fixture, { recursive: true, force: true });
+  }
 });

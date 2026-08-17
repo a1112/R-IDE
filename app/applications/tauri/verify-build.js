@@ -16,6 +16,7 @@
 const fs = require('fs');
 const path = require('path');
 const { execSync } = require('child_process');
+const { validatePackagedProfileAssets } = require('./copy-build-tree');
 
 console.log('====================================');
 console.log('R-IDE Tauri Build Verification');
@@ -139,8 +140,25 @@ if (fs.existsSync(backendDir) && fs.existsSync(path.join(backendDir, 'main.js'))
 }
 console.log();
 
-// 6. 检查插件
-console.log('6. Checking VSCode plugins...');
+// 6. Check the packaged profile identity and deferred chunks.
+console.log('6. Checking packaged Tauri profile assets...');
+const packagedFrontendDir = path.join(__dirname, 'browser-frontend');
+const packagedBackendDir = path.join(__dirname, 'resources/backend');
+try {
+  const packagedProfile = validatePackagedProfileAssets(packagedFrontendDir, packagedBackendDir);
+  logSuccess('Packaged profile manifest: browser-frontend/ride-tauri-profile.json');
+  logSuccess('Packaged profile manifest: resources/backend/ride-tauri-profile.json');
+  logSuccess(`Frontend/backend profile identity matches: ${packagedProfile.manifest.profile}/${packagedProfile.manifest.buildId}`);
+  for (const chunk of packagedProfile.chunks) {
+    logSuccess(`Packaged deferred feature chunk: ${chunk.groupName}/${chunk.name}`);
+  }
+} catch (error) {
+  logError(error.message);
+}
+console.log();
+
+// 7. 检查插件
+console.log('7. Checking VSCode plugins...');
 const pluginsDir = path.join(__dirname, '../../plugins');
 if (fs.existsSync(pluginsDir)) {
   const pluginCount = fs.readdirSync(pluginsDir).filter(f => {
@@ -168,8 +186,8 @@ if (fs.existsSync(bundledLanguagePack)) {
 }
 console.log();
 
-// 7. 检查 Cargo 配置
-console.log('7. Checking Cargo.toml configuration...');
+// 8. 检查 Cargo 配置
+console.log('8. Checking Cargo.toml configuration...');
 const cargoPath = path.join(__dirname, 'src-tauri/Cargo.toml');
 if (fs.existsSync(cargoPath)) {
   const cargoContent = fs.readFileSync(cargoPath, 'utf8');
@@ -196,8 +214,8 @@ if (fs.existsSync(cargoPath)) {
 }
 console.log();
 
-// 8. 检查 Tauri 配置
-console.log('8. Checking tauri.conf.json configuration...');
+// 9. 检查 Tauri 配置
+console.log('9. Checking tauri.conf.json configuration...');
 const tauriConfigPath = path.join(__dirname, 'src-tauri/tauri.conf.json');
 if (fs.existsSync(tauriConfigPath)) {
   try {

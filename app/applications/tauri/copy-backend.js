@@ -15,6 +15,11 @@
 
 const fs = require('fs');
 const path = require('path');
+const {
+  assertRequiredRegularFiles,
+  copyRegularTree,
+  publishDirectoryAtomic,
+} = require('./copy-build-tree');
 
 const sourceDir = path.resolve(__dirname, '../browser/lib/backend');
 const targetDir = path.resolve(__dirname, 'resources/backend');
@@ -28,9 +33,9 @@ function bundledNodeName() {
   return process.platform === 'win32' ? 'node.exe' : 'node';
 }
 
-function copyBundledNodeRuntime() {
+function copyBundledNodeRuntime(destinationRoot) {
   const source = process.execPath;
-  const target = path.join(targetDir, 'runtime', bundledNodeName());
+  const target = path.join(destinationRoot, 'runtime', bundledNodeName());
 
   if (!source || !fs.existsSync(source)) {
     console.warn('Current Node.js executable was not found; desktop launches may require RIDE_NODE_PATH.');
@@ -58,24 +63,8 @@ const extraNativeResources = [
   },
 ];
 
-function copyDirectory(source, target) {
-  fs.mkdirSync(target, { recursive: true });
-
-  const entries = fs.readdirSync(source, { withFileTypes: true });
-  for (const entry of entries) {
-    const sourcePath = path.join(source, entry.name);
-    const targetPath = path.join(target, entry.name);
-
-    if (entry.isDirectory()) {
-      copyDirectory(sourcePath, targetPath);
-    } else {
-      fs.copyFileSync(sourcePath, targetPath);
-    }
-  }
-}
-
-function patchFrontendStaticPath() {
-  const mainPath = path.join(targetDir, 'main.js');
+function patchFrontendStaticPath(destinationRoot) {
+  const mainPath = path.join(destinationRoot, 'main.js');
   if (!fs.existsSync(mainPath)) {
     return;
   }
@@ -105,34 +94,43 @@ if (!fs.existsSync(sourceDir)) {
   process.exit(1);
 }
 
-const missingRequired = requiredFiles.filter(file => !fs.existsSync(path.join(sourceDir, file)));
-if (missingRequired.length > 0) {
+try {
+  assertRequiredRegularFiles(sourceDir, requiredFiles);
+} catch (error) {
   console.error('Required Theia backend build artifacts are missing:');
-  missingRequired.forEach(file => console.error(`  - ${path.join(sourceDir, file)}`));
+  console.error(`  - ${error.message}`);
   console.error('\nBuild the browser backend first from the app workspace:');
   console.error('  yarn --cwd applications/browser build:prod');
   process.exit(1);
 }
 
-fs.rmSync(targetDir, { recursive: true, force: true });
-copyDirectory(sourceDir, targetDir);
-patchFrontendStaticPath();
-copyBundledNodeRuntime();
+publishDirectoryAtomic(targetDir, stagingDirectory => {
+  copyRegularTree(sourceDir, stagingDirectory, {
+    includeSourceMaps: process.env.RIDE_COPY_SOURCEMAPS === '1',
+  });
+  patchFrontendStaticPath(stagingDirectory);
+  copyBundledNodeRuntime(stagingDirectory);
 
-for (const resource of extraNativeResources) {
-  if (fs.existsSync(resource.source)) {
-    copyDirectory(resource.source, resource.target);
-    console.log(`Copied native resource: ${resource.source} -> ${resource.target}`);
-  } else if (resource.required) {
-    console.error('Required native backend resource is missing:');
-    console.error(`  - ${resource.source}`);
-    console.error('\nRun from app/:');
-    console.error('  npm rebuild node-pty --foreground-scripts');
-    process.exit(1);
+  for (const resource of extraNativeResources) {
+    const relativeTarget = path.relative(targetDir, resource.target);
+    const stagingTarget = path.join(stagingDirectory, relativeTarget);
+    if (fs.existsSync(resource.source)) {
+      copyRegularTree(resource.source, stagingTarget, {
+        includeSourceMaps: process.env.RIDE_COPY_SOURCEMAPS === '1',
+      });
+      console.log(`Copied native resource: ${resource.source} -> ${stagingTarget}`);
+    } else if (resource.required) {
+      throw new Error([
+        'Required native backend resource is missing:',
+        `  - ${resource.source}`,
+        '',
+        'Run from app/:',
+        '  npm rebuild node-pty --foreground-scripts',
+      ].join('\n'));
+    }
   }
-}
-
-fs.writeFileSync(path.join(targetDir, '.gitkeep'), '\n');
+  fs.writeFileSync(path.join(stagingDirectory, '.gitkeep'), '\n');
+});
 
 console.log('Backend resources copied successfully!');
 console.log('Source:', sourceDir);
