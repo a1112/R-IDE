@@ -1149,7 +1149,9 @@ fn accepts_an_existing_relative_native_path_containing_a_colon() {
     assert_eq!(actual.files, vec![canonical(file.path())]);
 }
 
-#[cfg(unix)]
+// Apple filesystems reject this byte sequence while creating the fixture, before
+// the launch-intent policy can inspect it.
+#[cfg(all(unix, not(target_vendor = "apple")))]
 #[test]
 fn rejects_an_existing_non_utf8_filename_before_building_an_intent() {
     use std::os::unix::ffi::OsStringExt;

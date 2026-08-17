@@ -652,11 +652,29 @@ fn resolve_existing_file(path: PathBuf) -> Option<PathBuf> {
         return None;
     }
 
+    if parent_traversal_crosses_non_directory(&path) {
+        return None;
+    }
+
     let canonical = std::fs::canonicalize(path).ok()?;
     if !canonical.is_file() || canonical.to_str().is_none() {
         return None;
     }
     Some(canonical)
+}
+
+fn parent_traversal_crosses_non_directory(path: &Path) -> bool {
+    let mut prefix = PathBuf::new();
+    for component in path.components() {
+        if component == std::path::Component::ParentDir
+            && !prefix.as_os_str().is_empty()
+            && !std::fs::metadata(&prefix).is_ok_and(|metadata| metadata.is_dir())
+        {
+            return true;
+        }
+        prefix.push(component.as_os_str());
+    }
+    false
 }
 
 fn build_intent(paths: Vec<PathBuf>, source: LaunchSource, next_id: u64) -> Option<LaunchIntent> {
