@@ -688,6 +688,7 @@ test('Linux marked discovery tolerates unreadable exact descendants of tracked i
       throw unreadable;
     },
     allowedUnreadableIdentities: [root],
+    runStartIdentity: root,
   });
 
   assert.deepEqual(
@@ -706,13 +707,17 @@ test('Linux marked discovery tolerates unreadable exact descendants of tracked i
   const olderGroupMember = {
     ...reparented, creationTime: 'linux:123455', startedAt: 500,
   };
-  assert.throws(
-    () => discoverMarkedProcessSnapshot(
+  assert.deepEqual(
+    discoverMarkedProcessSnapshot(
       runId,
       'linux',
       dependencies([root, olderGroupMember]),
     ),
-    /Linux proc environment query failed/,
+    {
+      rows: [root, olderGroupMember],
+      markedRows: [],
+      trustedUnreadableRows: [root],
+    },
   );
   const leaderlessReusedGroupMember = {
     ...foreign, pgid: root.pgid, creationTime: 'linux:223456', startedAt: 4_000,
@@ -727,6 +732,107 @@ test('Linux marked discovery tolerates unreadable exact descendants of tracked i
   );
   assert.throws(
     () => discoverMarkedProcessSnapshot(runId, 'linux', dependencies([root, child, foreign])),
+    /Linux proc environment query failed/,
+  );
+});
+
+test('Linux unreadable discovery preserves the captured root baseline across PID reuse', () => {
+  const runId = '7f7df1aa-a324-4fd4-b11c-4cc260a94d8f';
+  const capturedRoot = {
+    pid: 100, ppid: 1, pgid: 100, rssBytes: 1_024,
+    creationTime: 'linux:100', startedAt: 1_000,
+  };
+  const escapedRunChild = {
+    pid: 200, ppid: 1, pgid: 200, rssBytes: 2_048,
+    creationTime: 'linux:200', startedAt: 2_000,
+  };
+  const trackedSeed = {
+    pid: 300, ppid: 1, pgid: 300, rssBytes: 4_096,
+    creationTime: 'linux:300', startedAt: 3_000,
+  };
+  const reusedRoot = {
+    ...capturedRoot, creationTime: 'linux:1000', startedAt: 10_000,
+  };
+  const rows = [reusedRoot, escapedRunChild, trackedSeed];
+  const unreadable = Object.assign(
+    new Error('Linux proc environment query failed'),
+    { code: 'RIDE_PROC_ENVIRONMENT_UNREADABLE' },
+  );
+
+  assert.throws(
+    () => discoverMarkedProcessSnapshot(runId, 'linux', {
+      read: () => rows,
+      listLinuxPids: () => rows.map(row => row.pid),
+      readLinuxEnvironment: pid => {
+        if (pid === escapedRunChild.pid) {
+          throw unreadable;
+        }
+        return Buffer.from('SAFE=1\0');
+      },
+      allowedUnreadableIdentities: [capturedRoot, trackedSeed],
+      runStartIdentity: capturedRoot,
+    }),
+    /Linux proc environment query failed/,
+  );
+});
+
+test('Linux unreadable discovery fails closed at the captured root tick boundary', () => {
+  const runId = '7f7df1aa-a324-4fd4-b11c-4cc260a94d8f';
+  const capturedRoot = {
+    pid: 100, ppid: 1, pgid: 100, rssBytes: 1_024,
+    creationTime: 'linux:100', startedAt: 1_000,
+  };
+  const equalTickUnknown = {
+    pid: 200, ppid: 1, pgid: 200, rssBytes: 2_048,
+    creationTime: 'linux:100', startedAt: 1_000,
+  };
+  const rows = [capturedRoot, equalTickUnknown];
+  const unreadable = Object.assign(
+    new Error('Linux proc environment query failed'),
+    { code: 'RIDE_PROC_ENVIRONMENT_UNREADABLE' },
+  );
+
+  assert.throws(
+    () => discoverMarkedProcessSnapshot(runId, 'linux', {
+      read: () => rows,
+      listLinuxPids: () => rows.map(row => row.pid),
+      readLinuxEnvironment: pid => {
+        if (pid === equalTickUnknown.pid) {
+          throw unreadable;
+        }
+        return Buffer.from('SAFE=1\0');
+      },
+      allowedUnreadableIdentities: [capturedRoot],
+      runStartIdentity: capturedRoot,
+    }),
+    /Linux proc environment query failed/,
+  );
+});
+
+test('Linux unreadable discovery never authorizes a reused root PID', () => {
+  const runId = '7f7df1aa-a324-4fd4-b11c-4cc260a94d8f';
+  const capturedRoot = {
+    pid: 100, ppid: 1, pgid: 100, rssBytes: 1_024,
+    creationTime: 'linux:100', startedAt: 1_000,
+  };
+  const reusedRoot = {
+    ...capturedRoot, creationTime: 'linux:1000', startedAt: 10_000,
+  };
+  const unreadable = Object.assign(
+    new Error('Linux proc environment query failed'),
+    { code: 'RIDE_PROC_ENVIRONMENT_UNREADABLE' },
+  );
+
+  assert.throws(
+    () => discoverMarkedProcessSnapshot(runId, 'linux', {
+      read: () => [reusedRoot],
+      listLinuxPids: () => [reusedRoot.pid],
+      readLinuxEnvironment: () => {
+        throw unreadable;
+      },
+      allowedUnreadableIdentities: [capturedRoot],
+      runStartIdentity: capturedRoot,
+    }),
     /Linux proc environment query failed/,
   );
 });
@@ -1101,6 +1207,7 @@ test('idle RSS sampling includes an escaped marked process exactly once', () => 
   });
 
   assert.deepEqual(discoveryOptions.allowedUnreadableIdentities, [root, escaped]);
+  assert.strictEqual(discoveryOptions.runStartIdentity, root);
   assert.deepEqual(metrics.processIds, [100, 101, 202]);
   assert.equal(metrics.processCount, 3);
   assert.equal(metrics.rssBytes, 7_168);
@@ -2974,6 +3081,7 @@ test('POSIX run marker cleanup augments tracked setsid processes that exec witho
   for (const options of discoveryOptions) {
     assert.ok(options.allowedUnreadableIdentities.includes(root));
     assert.ok(options.allowedUnreadableIdentities.includes(trackedSetsid));
+    assert.strictEqual(options.runStartIdentity, root);
   }
   assert.deepEqual(rows, []);
 });

@@ -903,6 +903,7 @@ export function discoverMarkedProcessSnapshot(
     listLinuxPids = defaultLinuxProcessIds,
     readLinuxEnvironment = readLinuxProcEnvironment,
     allowedUnreadableIdentities = [],
+    runStartIdentity,
     run = (command, args, options) => spawnSync(command, args, options),
   } = {},
 ) {
@@ -916,6 +917,19 @@ export function discoverMarkedProcessSnapshot(
   if (!Array.isArray(allowedUnreadableIdentities)) {
     throw new Error('allowed unreadable identities must be an array');
   }
+  if (platform === 'linux'
+      && runStartIdentity !== undefined
+      && !hasExactLinuxProcessIdentity(runStartIdentity)) {
+    throw new Error('Linux run start identity must be exact');
+  }
+  // This immutable identity is captured immediately after launch. It is used
+  // only as a chronology boundary: processes that started before it cannot
+  // have inherited this run's freshly generated marker. Do not derive the
+  // boundary from the current table or later tracked children, because the
+  // root PID may already have been reused.
+  const runStartTicks = platform === 'linux' && runStartIdentity !== undefined
+    ? linuxProcessStartTicks(runStartIdentity)
+    : undefined;
   let allowedUnreadableRows = expandExactLinuxProcessScope(
     beforeRows,
     allowedUnreadableIdentities,
@@ -935,12 +949,18 @@ export function discoverMarkedProcessSnapshot(
     try {
       return readLinuxEnvironment(pid);
     } catch (error) {
-      if (error?.code === 'RIDE_PROC_ENVIRONMENT_UNREADABLE'
-          && allowedUnreadableRows.some(
+      if (error?.code === 'RIDE_PROC_ENVIRONMENT_UNREADABLE') {
+        if (allowedUnreadableRows.some(
             identity => sameExactLinuxProcessIdentity(row, identity),
-          )) {
-        toleratedUnreadableIdentities.set(trackedProcessKey(row), row);
-        return null;
+        )) {
+          toleratedUnreadableIdentities.set(trackedProcessKey(row), row);
+          return null;
+        }
+        if (hasExactLinuxProcessIdentity(row)
+            && runStartTicks !== undefined
+            && linuxProcessStartTicks(row) < runStartTicks) {
+          return null;
+        }
       }
       throw error;
     }
@@ -1470,6 +1490,7 @@ export function sampleProcessTree(
   }
   const snapshot = discover(validateRunId(runId), platform, {
     allowedUnreadableIdentities: [rootIdentity, ...trackedProcesses],
+    runStartIdentity: rootIdentity,
   });
   const exactTrackedRows = platform === 'linux'
     ? expandExactLinuxProcessScope(snapshot.rows, [rootIdentity, ...trackedProcesses])
@@ -1954,6 +1975,7 @@ export async function terminateMeasuredTree(
         try {
           const snapshot = validateMarkedSnapshot(discoverMarked(verifiedRunId, platform, {
             allowedUnreadableIdentities,
+            runStartIdentity: rootIdentity,
           }));
           latestMarkedProcesses = snapshot.markedRows;
           latestTrustedUnreadableProcesses = snapshot.trustedUnreadableRows;
