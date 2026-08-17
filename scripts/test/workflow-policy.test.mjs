@@ -73,14 +73,58 @@ test('packaged Tauri builds preserve the complete plugin dependency graph', () =
   const packageJob = jobBlocks(workflow).find(({ name }) => name === 'package');
   assert.ok(packageJob, 'package job is required');
   assert.match(packageJob.text, /run: yarn build:tauri/);
+  const downloadIndex = packageJob.text.indexOf('yarn download:plugins');
+  const workflowBuildIndex = packageJob.text.indexOf('run: yarn build:tauri');
+  assert.ok(downloadIndex >= 0 && workflowBuildIndex > downloadIndex,
+    'the complete plugin download must precede the packaged build');
 
   const buildHelper = fs.readFileSync(
     path.join(repositoryRoot, 'app', 'scripts', 'build-tauri-backend.js'),
     'utf8'
   );
-  assert.match(buildHelper, /RIDE_TAURI_ENABLE_PLUGINS:\s*['"]1['"]/);
-  assert.match(buildHelper, /RIDE_TAURI_LEAN:\s*['"]0['"]/);
-  assert.doesNotMatch(buildHelper, /RIDE_TAURI_LEAN:\s*['"](?:1|true)['"]/);
+  assert.match(buildHelper, /environment\.RIDE_TAURI_FRONTEND_PROFILE\s*\?\?\s*['"]tauri-critical['"]/);
+  assert.match(buildHelper, /RIDE_TAURI_FRONTEND_PROFILE:\s*selectedProfile/);
+  assert.match(buildHelper, /profileDirectory\s*=\s*path\.join\(browserDirectory,\s*['"]\.ride-tauri-profile['"]\)/);
+  const prepareIndex = buildHelper.indexOf("args: [profileScript, 'prepare'");
+  const rebuildIndex = buildHelper.indexOf("'rebuild:browser'");
+  const theiaBuildIndex = buildHelper.indexOf("'build', '--app-target=browser'");
+  const publishIndex = buildHelper.indexOf("args: [profileScript, 'publish'");
+  assert.ok(prepareIndex >= 0 && rebuildIndex > prepareIndex,
+    'the isolated profile must be prepared before Theia rebuild');
+  assert.ok(theiaBuildIndex > rebuildIndex, 'Theia build must follow isolated rebuild');
+  assert.ok(publishIndex > theiaBuildIndex, 'atomic publish must follow the isolated build');
+  assert.match(buildHelper.slice(rebuildIndex, theiaBuildIndex), /cwd:\s*profileDirectory/);
+  assert.match(buildHelper.slice(theiaBuildIndex, publishIndex), /cwd:\s*profileDirectory/);
+  for (const obsolete of ['RIDE_TAURI_' + 'ENABLE_PLUGINS', 'RIDE_TAURI_' + 'LEAN']) {
+    assert.doesNotMatch(buildHelper, new RegExp(obsolete));
+  }
+
+  const profileGenerator = fs.readFileSync(
+    path.join(repositoryRoot, 'app', 'scripts', 'tauri-frontend-profile.mjs'),
+    'utf8'
+  );
+  assert.match(profileGenerator, /export async function publishProfileBuild/);
+  assert.match(profileGenerator, /\.ride-tauri-lib\.tmp-/);
+  assert.match(profileGenerator, /rename\(temporaryLib,\s*destinationLib\)/);
+
+  const profile = JSON.parse(fs.readFileSync(
+    path.join(repositoryRoot, 'app', 'applications', 'browser', 'tauri-profile.json'),
+    'utf8'
+  ));
+  assert.equal(profile.schema, 'ride.tauri-frontend-profile@2');
+  const criticalRoots = new Set(profile.profiles['tauri-critical'].roots);
+  for (const requiredRoot of ['@theia/plugin-ext', '@theia/plugin-ext-vscode', 'theia-ide-product-ext']) {
+    assert.ok(criticalRoots.has(requiredRoot), `critical plugin closure must retain ${requiredRoot}`);
+  }
+
+  const tauriPackage = JSON.parse(fs.readFileSync(
+    path.join(repositoryRoot, 'app', 'applications', 'tauri', 'package.json'),
+    'utf8'
+  ));
+  const packagedBuild = tauriPackage.scripts['build:prod'];
+  assert.ok(packagedBuild.indexOf('copy:plugins') >= 0);
+  assert.ok(packagedBuild.indexOf('npm run tauri -- build') > packagedBuild.indexOf('copy:plugins'),
+    'plugin resources must be copied before native packaging');
 });
 
 test('package jobs measure startup after verification and upload the unsigned JSON report', () => {
