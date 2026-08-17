@@ -489,6 +489,7 @@ test('Tauri browser build splits only the ESM main entry and keeps classic worke
     assert.equal(plans.main.format, 'esm');
     assert.equal(plans.main.splitting, true);
     assert.equal(plans.main.chunkNames, 'chunks/[name]-[hash]');
+    assert.equal(plans.main.plugins[0].name, 'ride-tauri-deferred-frontend-alias');
     assert.equal(
         plans.main.alias['@theia/secondary-window/lib/browser/secondary-window-frontend-module'],
         path.resolve('generated-target', 'tauri-src/secondary-window-proxy-frontend-module.ts')
@@ -596,6 +597,18 @@ test('secondary-window proxy splits from the initial bundle and executes the rea
             },
         },
     };
+    const simulatedTheiaDedupe = {
+        name: 'simulated-theia-dedupe',
+        setup(build) {
+            build.onResolve({ filter: /^@theia\/secondary-window\/lib\/browser\/secondary-window-frontend-module$/ }, () => ({
+                path: path.join(
+                    appDirectory,
+                    'node_modules', '@theia', 'secondary-window',
+                    'lib', 'browser', 'secondary-window-frontend-module.js'
+                )
+            }));
+        }
+    };
     const commonOptions = {
         entryPoints,
         outdir: path.join(directory, 'critical'),
@@ -603,6 +616,7 @@ test('secondary-window proxy splits from the initial bundle and executes the rea
         packages: 'external',
         write: true,
         logLevel: 'silent',
+        plugins: [simulatedTheiaDedupe],
     };
     const generatedHtml = '<body><script type="text/javascript" src="./bundle.js" charset="utf-8"></script></body>';
     await fs.promises.mkdir(commonOptions.outdir, { recursive: true });

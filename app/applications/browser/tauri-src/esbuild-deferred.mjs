@@ -16,6 +16,18 @@ function deferredFrontendAliases(profileManifest, baseDirectory) {
     return aliases;
 }
 
+function createDeferredFrontendAliasPlugin(aliases) {
+    return {
+        name: 'ride-tauri-deferred-frontend-alias',
+        setup(build) {
+            build.onResolve({ filter: /^@theia\/[^/]+(?:\/|$)/ }, args => {
+                const replacement = aliases[args.path];
+                return replacement ? { path: replacement } : undefined;
+            });
+        }
+    };
+}
+
 function createModuleScriptPlugin(baseDirectory, outdir) {
     const indexPath = path.join(path.resolve(baseDirectory, outdir), 'index.html');
     return {
@@ -57,6 +69,7 @@ export function createTauriBrowserBuildPlans(browserOptions, profileManifest, ba
         splitting: true,
         chunkNames: 'chunks/[name]-[hash]',
         plugins: [
+            ...(Object.keys(aliases).length > 0 ? [createDeferredFrontendAliasPlugin(aliases)] : []),
             ...(browserOptions.plugins ?? []),
             createModuleScriptPlugin(baseDirectory, browserOptions.outdir),
         ],
