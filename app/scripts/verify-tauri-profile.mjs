@@ -302,6 +302,22 @@ function countBundledPlugins(pluginsDirectory) {
     .filter(entry => entry.isDirectory() && !entry.name.startsWith('.')).length;
 }
 
+function verifyFullRootInventory(manifest) {
+  const resolvedPackages = new Set(manifest.extensions);
+  for (const record of manifest.packages) {
+    if (typeof record?.requestName === 'string') {
+      resolvedPackages.add(record.requestName);
+    }
+    if (typeof record?.packageName === 'string') {
+      resolvedPackages.add(record.packageName);
+    }
+  }
+  const missing = manifest.roots.filter(root => !resolvedPackages.has(root));
+  if (missing.length > 0) {
+    throw new Error(`Full profile is missing browser root identities: ${missing.join(', ')}.`);
+  }
+}
+
 export function verifyTauriProfileInventory({
   browserDirectory,
   pluginsDirectory,
@@ -345,7 +361,7 @@ export function verifyTauriProfileInventory({
     throw new Error('Frontend VS Code initialization asset is not a regular file.');
   }
 
-  const expectedPackages = manifest.profile === 'full' ? manifest.roots : manifest.extensions;
+  const expectedPackages = manifest.extensions;
   const deferredModules = new Set(Object.values(manifest.featureGroups)
     .flatMap(group => group.deferredFrontendModules ?? [])
     .map(feature => feature.module)
@@ -358,6 +374,9 @@ export function verifyTauriProfileInventory({
     `${manifest.profile} profile`,
     deferredModules,
   );
+  if (manifest.profile === 'full') {
+    verifyFullRootInventory(manifest);
+  }
   const frontendInputs = Object.keys(metadataRecords['frontend-main'].metafile.inputs);
   if (!frontendInputs.some(input => pathContainsPackage(input, 'theia-ide-product-ext'))) {
     throw new Error('R-IDE product extension is missing from the frontend inventory.');
