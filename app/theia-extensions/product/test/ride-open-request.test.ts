@@ -701,6 +701,115 @@ test('restored queue cancels a failed target fallback while the next target is s
     assert.equal(deferredWork.scheduledDelays.length, 0, 'the queue must not schedule a fallback between targets');
 });
 
+test('restored queue handoff after a failed local target does not schedule plugin fallback', async () => {
+    const events: string[] = [];
+    const storage = new MemoryStorage();
+    storage.setItem(RIDE_OPEN_REQUEST_STATE_KEY, JSON.stringify(stateEnvelope('69', {
+        id: '68', source: 'initial', workspace: '/project', files: ['/project/local-fails.R']
+    }, {
+        id: '69', source: 'initial', workspace: '/next-project', files: ['/next-project/handoff.R']
+    })));
+    const { scheduler: deployment } = createPluginDeploymentScheduler(events);
+    const deferredWork = new FakeDeferredWorkScheduler();
+    const context = createContribution(
+        '/project', storage,
+        uri => {
+            events.push(`open:${uri.path.toString()}`);
+            throw new Error('local editor unavailable');
+        },
+        async () => undefined,
+        new FakeApplicationStateService(), new FakeHostedPluginSupport(), deployment,
+        new FakeNativeChrome(), deferredWork,
+        () => { events.push('resolve:hosted-plugins'); }
+    );
+
+    context.contribution.onStart();
+    await flushLifecycle();
+    assert.deepEqual(events, ['open:/project/local-fails.R']);
+    assert.equal(context.workspace.opened.length, 1);
+    assert.equal(context.workspace.opened[0].uri.toString(), 'file:///next-project');
+
+    deferredWork.fireTimer();
+    await flushLifecycle();
+    assert.deepEqual(events, ['open:/project/local-fails.R']);
+    assert.deepEqual(deferredWork.scheduledDelays, []);
+});
+
+test('restored queue commit failure after a failed target does not schedule plugin fallback', async () => {
+    const events: string[] = [];
+    const storage = new FaultyStorage();
+    storage.setItem(RIDE_OPEN_REQUEST_STATE_KEY, JSON.stringify(stateEnvelope('71', {
+        id: '70', source: 'initial', workspace: '/project', files: ['/project/first-fails.R']
+    }, {
+        id: '71', source: 'initial', workspace: '/project', files: ['/project/not-committed.R']
+    })));
+    const { scheduler: deployment } = createPluginDeploymentScheduler(events);
+    const deferredWork = new FakeDeferredWorkScheduler();
+    const context = createContribution(
+        '/project', storage,
+        uri => {
+            events.push(`open:${uri.path.toString()}`);
+            storage.failNextSet = true;
+            throw new Error('first editor unavailable');
+        },
+        async () => undefined,
+        new FakeApplicationStateService(), new FakeHostedPluginSupport(), deployment,
+        new FakeNativeChrome(), deferredWork,
+        () => { events.push('resolve:hosted-plugins'); }
+    );
+
+    context.contribution.onStart();
+    await flushLifecycle();
+    assert.deepEqual(events, ['open:/project/first-fails.R']);
+    assert.match(context.messages.errors[context.messages.errors.length - 1] ?? '', /storage commit failed/);
+
+    deferredWork.fireTimer();
+    await flushLifecycle();
+    assert.deepEqual(events, ['open:/project/first-fails.R']);
+    assert.deepEqual(deferredWork.scheduledDelays, []);
+});
+
+test('exhausted restored queue with only failed local targets schedules one bounded fallback', async () => {
+    const events: string[] = [];
+    const storage = new MemoryStorage();
+    storage.setItem(RIDE_OPEN_REQUEST_STATE_KEY, JSON.stringify(stateEnvelope('73', {
+        id: '72', source: 'initial', workspace: '/project', files: ['/project/first-fails.R']
+    }, {
+        id: '73', source: 'initial', workspace: '/project', files: ['/project/second-fails.R']
+    })));
+    const { scheduler: deployment } = createPluginDeploymentScheduler(events);
+    const deferredWork = new FakeDeferredWorkScheduler();
+    const context = createContribution(
+        '/project', storage,
+        uri => {
+            events.push(`open:${uri.path.toString()}`);
+            throw new Error('editor unavailable');
+        },
+        async () => undefined,
+        new FakeApplicationStateService(), new FakeHostedPluginSupport(), deployment,
+        new FakeNativeChrome(), deferredWork,
+        () => { events.push('resolve:hosted-plugins'); }
+    );
+
+    context.contribution.onStart();
+    await flushLifecycle();
+    assert.deepEqual(deferredWork.scheduledDelays, [1_500]);
+    assert.deepEqual(events, [
+        'open:/project/first-fails.R',
+        'open:/project/second-fails.R'
+    ]);
+
+    deferredWork.fireTimer();
+    await flushLifecycle();
+    assert.equal(deferredWork.scheduledDelays.length, 1);
+    assert.deepEqual(events, [
+        'open:/project/first-fails.R',
+        'open:/project/second-fails.R',
+        'resolve:hosted-plugins',
+        `install:local-dir:C:\\R-IDE\\plugins:${PluginType.System}`
+    ]);
+});
+
 test('target milestone reporting failure cannot block deferred plugin startup', async () => {
     const events: string[] = [];
     const deferredWork = new FakeDeferredWorkScheduler(events);

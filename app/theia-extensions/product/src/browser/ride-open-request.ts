@@ -167,7 +167,6 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
     protected unlisten: (() => void) | undefined;
     protected requestChain = Promise.resolve();
     protected acceptedOpenRequest = false;
-    protected targetOpenAttempted = false;
     protected targetFileOpened = false;
     protected pluginObservationStarted = false;
     protected hostedPluginResolutionStarted = false;
@@ -248,8 +247,6 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
             if (!this.disposed && !this.acceptedOpenRequest) {
                 this.schedulePluginFallback();
             }
-        } else if (this.targetOpenAttempted && !this.targetFileOpened) {
-            this.schedulePluginFallback();
         }
     }
 
@@ -374,7 +371,6 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
 
     protected async openFiles(request: RideOpenRequest): Promise<void> {
         this.cancelPluginFallback();
-        this.targetOpenAttempted = true;
         let targetWidgetId: string | undefined;
         let openedTarget = false;
         const options: WidgetOpenerOptions = { mode: 'open' };
@@ -387,7 +383,11 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
                         targetWidgetId = opened.id;
                     }
                 } catch (error) {
-                    await this.messageService.error(`R-IDE could not open ${file}: ${errorMessage(error)}`);
+                    try {
+                        await this.messageService.error(`R-IDE could not open ${file}: ${errorMessage(error)}`);
+                    } catch (notificationError) {
+                        console.warn('[R-IDE] Failed to report a file-open failure.', notificationError);
+                    }
                 }
             }
             if (targetWidgetId) {
@@ -610,10 +610,14 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
     protected async dispatchPendingRequests(initialState: RideOpenRequestState): Promise<void> {
         let state = initialState;
         let attemptedTarget = false;
+        let queueExhausted = false;
         this.dispatchingPendingTargets = true;
         this.cancelPluginFallback();
         try {
             while (state.requests.length > 0) {
+                if (this.disposed) {
+                    return;
+                }
                 const request = state.requests[0];
                 if (!this.isCurrentWorkspace(request.workspace)) {
                     try {
@@ -635,9 +639,10 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
                 await this.openFiles(request);
                 state = nextState;
             }
+            queueExhausted = true;
         } finally {
             this.dispatchingPendingTargets = false;
-            if (attemptedTarget && !this.targetFileOpened) {
+            if (queueExhausted && attemptedTarget && !this.targetFileOpened) {
                 this.schedulePluginFallback();
             }
         }
