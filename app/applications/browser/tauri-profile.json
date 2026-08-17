@@ -1,5 +1,5 @@
 {
-  "schema": "ride.tauri-frontend-profile@1",
+  "schema": "ride.tauri-frontend-profile@2",
   "profiles": {
     "tauri-critical": {
       "roots": [
@@ -29,9 +29,9 @@
       "includeAllBrowserRoots": true
     }
   },
-  "deferredGroups": {
+  "featureGroups": {
     "ai": {
-      "roots": [
+      "deferredRoots": [
         "@theia/ai-anthropic",
         "@theia/ai-chat",
         "@theia/ai-chat-ui",
@@ -54,37 +54,55 @@
         "@theia/ai-terminal",
         "@theia/ai-vercel-ai"
       ],
-      "retainedRoots": [
-        "@theia/ai-core",
-        "@theia/ai-mcp",
-        "@theia/ai-registry"
-      ],
-      "deferBlockedReason": "The product and hosted-plugin dependency closure requires these roots during initial application generation."
+      "blockedRoots": [
+        {
+          "name": "@theia/ai-core",
+          "reason": "The hosted-plugin AI MCP dependency requires the AI core services during initial generation."
+        },
+        {
+          "name": "@theia/ai-mcp",
+          "reason": "The hosted-plugin extension has a required dependency on AI MCP services."
+        },
+        {
+          "name": "@theia/ai-registry",
+          "reason": "The R-IDE product extension requires the AI registry during initial generation."
+        }
+      ]
     },
     "collaboration": {
-      "roots": [
+      "deferredRoots": [
         "@theia/collaboration"
       ],
-      "retainedRoots": []
+      "blockedRoots": []
     },
     "notebook": {
-      "roots": [],
-      "retainedRoots": [
-        "@theia/notebook"
-      ],
-      "deferBlockedReason": "@theia/plugin-ext has a required dependency on @theia/notebook."
+      "deferredRoots": [],
+      "blockedRoots": [
+        {
+          "name": "@theia/notebook",
+          "reason": "The hosted-plugin extension has a required dependency on notebook services."
+        }
+      ]
     },
     "preview-getting-started": {
-      "roots": [],
-      "retainedRoots": [
-        "@theia/editor-preview",
-        "@theia/getting-started",
-        "@theia/preview"
-      ],
-      "deferBlockedReason": "The product requires getting-started and hosted plugins require editor-preview; getting-started in turn requires preview."
+      "deferredRoots": [],
+      "blockedRoots": [
+        {
+          "name": "@theia/editor-preview",
+          "reason": "The hosted-plugin extension has a required dependency on editor preview services."
+        },
+        {
+          "name": "@theia/getting-started",
+          "reason": "The R-IDE product extension directly requires getting-started contributions."
+        },
+        {
+          "name": "@theia/preview",
+          "reason": "The required getting-started extension depends on preview services."
+        }
+      ]
     },
     "auxiliary": {
-      "roots": [
+      "deferredRoots": [
         "@theia/dev-container",
         "@theia/external-terminal",
         "@theia/memory-inspector",
@@ -96,22 +114,60 @@
         "@theia/secondary-window",
         "@theia/toolbar"
       ],
-      "retainedRoots": [
-        "@theia/bulk-edit",
-        "@theia/callhierarchy",
-        "@theia/console",
-        "@theia/debug",
-        "@theia/file-search",
-        "@theia/keymaps",
-        "@theia/mini-browser",
-        "@theia/outline-view",
-        "@theia/terminal-manager",
-        "@theia/test",
-        "@theia/timeline",
-        "@theia/typehierarchy",
-        "@theia/vsx-registry"
-      ],
-      "deferBlockedReason": "These roots are transitive requirements of the critical editor, task, product, or hosted-plugin graph."
+      "blockedRoots": [
+        {
+          "name": "@theia/bulk-edit",
+          "reason": "The hosted-plugin extension directly requires bulk-edit services."
+        },
+        {
+          "name": "@theia/callhierarchy",
+          "reason": "The hosted-plugin extension directly requires call hierarchy services."
+        },
+        {
+          "name": "@theia/console",
+          "reason": "The hosted-plugin extension directly requires console services."
+        },
+        {
+          "name": "@theia/debug",
+          "reason": "The hosted-plugin extension directly requires debug services."
+        },
+        {
+          "name": "@theia/file-search",
+          "reason": "The hosted-plugin extension directly requires file-search services."
+        },
+        {
+          "name": "@theia/keymaps",
+          "reason": "The required getting-started extension depends on keymap services."
+        },
+        {
+          "name": "@theia/mini-browser",
+          "reason": "The required preview extension depends on mini-browser services."
+        },
+        {
+          "name": "@theia/outline-view",
+          "reason": "The critical Monaco extension depends on outline-view services."
+        },
+        {
+          "name": "@theia/terminal-manager",
+          "reason": "The critical task extension depends on terminal-manager services."
+        },
+        {
+          "name": "@theia/test",
+          "reason": "The hosted-plugin extension directly requires test services."
+        },
+        {
+          "name": "@theia/timeline",
+          "reason": "The hosted-plugin extension directly requires timeline services."
+        },
+        {
+          "name": "@theia/typehierarchy",
+          "reason": "The hosted-plugin extension directly requires type hierarchy services."
+        },
+        {
+          "name": "@theia/vsx-registry",
+          "reason": "The R-IDE product extension directly requires the VSX registry."
+        }
+      ]
     }
   },
   "buildDevDependencies": [

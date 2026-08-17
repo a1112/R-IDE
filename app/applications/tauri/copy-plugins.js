@@ -239,7 +239,7 @@ try {
   if (pluginProfile === 'lean') {
     console.log('  - Set RIDE_PLUGIN_PROFILE=full to include every downloaded plugin.');
   }
-  console.log('  - Build the browser bundle with RIDE_TAURI_ENABLE_PLUGINS=1 to enable these plugins at runtime.');
+  console.log('  - Bundled plugins are supported by both RIDE_TAURI_FRONTEND_PROFILE=tauri-critical and full.');
 
 } catch (error) {
   console.error('✗ Failed to copy plugins:', error.message);

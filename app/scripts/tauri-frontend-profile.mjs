@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 const require = createRequire(import.meta.url);
 const semver = require('semver');
 
-export const PROFILE_SCHEMA = 'ride.tauri-frontend-profile@1';
+export const PROFILE_SCHEMA = 'ride.tauri-frontend-profile@2';
 export const PROFILE_DIRECTORY_NAME = '.ride-tauri-profile';
 const PROFILE_MANIFEST_NAME = 'ride-tauri-profile.json';
 const CUSTOM_FILES = ['esbuild.mjs', 'ride-esbuild-dedupe.mjs'];
@@ -78,7 +78,7 @@ function parseDependencySpec(requestName, spec) {
     };
 }
 
-function validateInstalledManifest(requestName, spec, manifest, dependencyPath) {
+function validateInstalledManifest(requestName, spec, manifest, dependencyPath, constraint = 'dependency') {
     if (!manifest || typeof manifest !== 'object') {
         throw new Error(`${dependencyPath.join(' -> ')}: required dependency is not installed.`);
     }
@@ -90,28 +90,85 @@ function validateInstalledManifest(requestName, spec, manifest, dependencyPath) 
         throw new Error(`${dependencyPath.join(' -> ')}: installed package has invalid version "${manifest.version ?? '<missing>'}".`);
     }
     const validRange = semver.validRange(expected.range);
-    if (validRange && !semver.satisfies(manifest.version, validRange, { includePrerelease: true })) {
-        throw new Error(`${dependencyPath.join(' -> ')}: installed version ${manifest.version} does not satisfy ${expected.range}.`);
+    if (!validRange) {
+        throw new Error(`${dependencyPath.join(' -> ')}: dependency "${requestName}" has invalid ${constraint} range "${expected.range}".`);
+    }
+    if (!semver.satisfies(manifest.version, validRange, { includePrerelease: true })) {
+        throw new Error(`${dependencyPath.join(' -> ')}: installed version ${manifest.version} does not satisfy ${constraint} range ${expected.range}.`);
     }
     return expected;
 }
 
-function normalizedDeferredGroups(deferredGroups = {}) {
+function normalizedFeatureGroups(featureGroups, browserDependencies) {
+    if (!featureGroups || typeof featureGroups !== 'object' || Array.isArray(featureGroups)) {
+        throw new Error('Profile configuration must declare a featureGroups inventory.');
+    }
     const result = {};
-    for (const groupName of Object.keys(deferredGroups).sort(compareText)) {
-        const value = deferredGroups[groupName];
-        const roots = Array.isArray(value) ? value : value?.roots;
-        const retainedRoots = Array.isArray(value) ? [] : value?.retainedRoots ?? [];
-        if (!Array.isArray(roots) || roots.some(root => typeof root !== 'string' || !root)) {
-            throw new Error(`Deferred group "${groupName}" must contain exact package-name roots.`);
+    const classifiedRoots = new Map();
+    for (const groupName of Object.keys(featureGroups).sort(compareText)) {
+        const value = featureGroups[groupName];
+        if (!value || typeof value !== 'object' || Array.isArray(value)) {
+            throw new Error(`Feature group "${groupName}" must be an object.`);
         }
-        if (!Array.isArray(retainedRoots) || retainedRoots.some(root => typeof root !== 'string' || !root)) {
-            throw new Error(`Deferred group "${groupName}" must contain exact retained package-name roots.`);
+        const unexpectedFields = Object.keys(value).filter(key => key !== 'deferredRoots' && key !== 'blockedRoots');
+        if (unexpectedFields.length > 0) {
+            throw new Error(`Feature group "${groupName}" has unsupported field "${unexpectedFields.sort(compareText)[0]}".`);
+        }
+        const deferredRoots = value.deferredRoots;
+        const blockedRoots = value.blockedRoots;
+        if (!Array.isArray(deferredRoots) || deferredRoots.some(root => typeof root !== 'string' || !root)) {
+            throw new Error(`Feature group "${groupName}" must contain exact deferredRoots package names.`);
+        }
+        if (!Array.isArray(blockedRoots)) {
+            throw new Error(`Feature group "${groupName}" must contain blockedRoots evidence entries.`);
+        }
+        const duplicateDeferred = deferredRoots.find((name, index) => deferredRoots.indexOf(name) !== index);
+        if (duplicateDeferred) {
+            throw new Error(`Feature root "${duplicateDeferred}" is duplicated in group "${groupName}".`);
+        }
+        const normalizedBlocked = blockedRoots.map(entry => {
+            if (!entry || typeof entry !== 'object' || Array.isArray(entry)
+                || typeof entry.name !== 'string' || !entry.name) {
+                throw new Error(`Feature group "${groupName}" has an invalid blocked root entry.`);
+            }
+            const unexpected = Object.keys(entry).filter(key => key !== 'name' && key !== 'reason');
+            if (unexpected.length > 0) {
+                throw new Error(`Blocked root "${entry.name}" has unsupported field "${unexpected.sort(compareText)[0]}".`);
+            }
+            if (typeof entry.reason !== 'string' || !entry.reason.trim()) {
+                throw new Error(`Blocked root "${entry.name}" must have an explicit reason.`);
+            }
+            if (entry.reason !== entry.reason.trim()) {
+                throw new Error(`Blocked root "${entry.name}" reason must be canonical.`);
+            }
+            return { name: entry.name, reason: entry.reason };
+        });
+        const duplicateBlocked = normalizedBlocked.find((entry, index) => (
+            normalizedBlocked.findIndex(candidate => candidate.name === entry.name) !== index
+        ));
+        if (duplicateBlocked) {
+            throw new Error(`Feature root "${duplicateBlocked.name}" is duplicated in group "${groupName}".`);
+        }
+        const localBlocked = new Set(normalizedBlocked.map(entry => entry.name));
+        const ambiguous = deferredRoots.find(name => localBlocked.has(name));
+        if (ambiguous) {
+            throw new Error(`Feature root "${ambiguous}" cannot be both deferred and blocked.`);
+        }
+        for (const [name, classification] of [
+            ...deferredRoots.map(name => [name, 'deferred']),
+            ...normalizedBlocked.map(entry => [entry.name, 'blocked']),
+        ]) {
+            if (!Object.hasOwn(browserDependencies, name)) {
+                throw new Error(`Unknown feature root "${name}" in group "${groupName}".`);
+            }
+            if (classifiedRoots.has(name)) {
+                throw new Error(`Feature root "${name}" is declared in more than one feature group.`);
+            }
+            classifiedRoots.set(name, { groupName, classification });
         }
         result[groupName] = {
-            roots: [...new Set(roots)].sort(compareText),
-            retainedRoots: [...new Set(retainedRoots)].sort(compareText),
-            ...(typeof value?.deferBlockedReason === 'string' ? { deferBlockedReason: value.deferBlockedReason } : {}),
+            deferredRoots: [...deferredRoots].sort(compareText),
+            blockedRoots: normalizedBlocked.sort((left, right) => compareText(left.name, right.name)),
         };
     }
     return result;
@@ -215,86 +272,113 @@ export function resolveProfile({ profileName = 'tauri-critical', profileConfig, 
     if (!profileConfig || profileConfig.schema !== PROFILE_SCHEMA) {
         throw new Error(`Profile configuration must use schema ${PROFILE_SCHEMA}.`);
     }
-    const profile = profileConfig.profiles?.[profileName];
-    if (!profile) {
+    const selectedProfile = profileConfig.profiles?.[profileName];
+    const criticalProfile = profileConfig.profiles?.['tauri-critical'];
+    if (!selectedProfile) {
         throw new Error(`Unknown Tauri frontend profile "${profileName}".`);
     }
+    if (!criticalProfile || !Array.isArray(criticalProfile.roots)) {
+        throw new Error('Profile configuration must declare tauri-critical roots.');
+    }
+    if (Object.hasOwn(profileConfig, 'deferredGroups')) {
+        throw new Error('Profile configuration must use featureGroups; deferredGroups is ambiguous and unsupported.');
+    }
     const browserDependencies = browserManifest?.dependencies ?? {};
-    const roots = profile.includeAllBrowserRoots === true
+    const roots = selectedProfile.includeAllBrowserRoots === true
         ? Object.keys(browserDependencies).sort(compareText)
-        : [...new Set(profile.roots ?? [])].sort(compareText);
-    if (roots.length === 0) {
-        throw new Error(`Tauri frontend profile "${profileName}" has no roots.`);
-    }
-    for (const root of roots) {
-        if (!Object.hasOwn(browserDependencies, root) || !Object.hasOwn(packageManifests, root)) {
-            throw new Error(`Unknown profile root "${root}".`);
-        }
-    }
+        : [...new Set(selectedProfile.roots ?? [])].sort(compareText);
+    const criticalRoots = [...new Set(criticalProfile.roots)].sort(compareText);
 
-    const deferredGroups = normalizedDeferredGroups(profileConfig.deferredGroups);
-    const deferredRoots = new Map();
-    for (const [group, descriptor] of Object.entries(deferredGroups)) {
-        for (const name of descriptor.roots) {
-            if (deferredRoots.has(name)) {
-                throw new Error(`Deferred root "${name}" is declared in more than one group.`);
-            }
-            deferredRoots.set(name, group);
+    const resolveClosure = (closureRoots, label) => {
+        if (closureRoots.length === 0) {
+            throw new Error(`Tauri frontend profile "${label}" has no roots.`);
         }
-    }
-
-    const visited = new Set();
-    const dependenciesByNode = new Map();
-    const firstPath = new Map();
-    const visit = (requestName, spec, ancestry) => {
-        const dependencyPath = [...ancestry, requestName];
-        const manifest = packageManifests[requestName];
-        if (!manifest) {
-            throw new Error(`${dependencyPath.join(' -> ')}: required dependency is not installed.`);
-        }
-        validateInstalledManifest(requestName, spec, manifest, dependencyPath);
-        if (!firstPath.has(requestName)) {
-            firstPath.set(requestName, dependencyPath);
-        }
-        if (visited.has(requestName)) {
-            return;
-        }
-        visited.add(requestName);
-        const dependencies = new Set();
-        dependenciesByNode.set(requestName, dependencies);
-        for (const [dependencyName, dependency] of dependencyEntries(manifest)) {
-            if (!Object.hasOwn(browserDependencies, dependencyName)) {
-                continue;
+        for (const root of closureRoots) {
+            if (!Object.hasOwn(browserDependencies, root) || !Object.hasOwn(packageManifests, root)) {
+                throw new Error(`Unknown profile root "${root}".`);
             }
-            const installed = packageManifests[dependencyName];
-            if (!installed && dependency.optional) {
-                continue;
-            }
-            if (!installed) {
-                throw new Error(`${[...dependencyPath, dependencyName].join(' -> ')}: required dependency is not installed.`);
-            }
-            if (!isTheiaExtension(installed)) {
-                continue;
-            }
-            validateInstalledManifest(dependencyName, dependency.spec, installed, [...dependencyPath, dependencyName]);
-            dependencies.add(dependencyName);
-            visit(dependencyName, dependency.spec, dependencyPath);
         }
+        const visited = new Set();
+        const dependenciesByNode = new Map();
+        const firstPath = new Map();
+        const visit = (requestName, parentSpec, ancestry) => {
+            const dependencyPath = [...ancestry, requestName];
+            const manifest = packageManifests[requestName];
+            if (!manifest) {
+                throw new Error(`${dependencyPath.join(' -> ')}: required dependency is not installed.`);
+            }
+            validateInstalledManifest(
+                requestName,
+                browserDependencies[requestName],
+                manifest,
+                dependencyPath,
+                'browser manifest',
+            );
+            if (ancestry.length > 0) {
+                validateInstalledManifest(requestName, parentSpec, manifest, dependencyPath, 'parent dependency');
+            }
+            if (!firstPath.has(requestName)) {
+                firstPath.set(requestName, dependencyPath);
+            }
+            if (visited.has(requestName)) {
+                return;
+            }
+            visited.add(requestName);
+            const dependencies = new Set();
+            dependenciesByNode.set(requestName, dependencies);
+            for (const [dependencyName, dependency] of dependencyEntries(manifest)) {
+                if (!Object.hasOwn(browserDependencies, dependencyName)) {
+                    continue;
+                }
+                const installed = packageManifests[dependencyName];
+                if (!installed && dependency.optional) {
+                    continue;
+                }
+                if (!installed) {
+                    throw new Error(`${[...dependencyPath, dependencyName].join(' -> ')}: required dependency is not installed.`);
+                }
+                if (!isTheiaExtension(installed)) {
+                    continue;
+                }
+                dependencies.add(dependencyName);
+                visit(dependencyName, dependency.spec, dependencyPath);
+            }
+        };
+        for (const root of closureRoots) {
+            visit(root, browserDependencies[root], []);
+        }
+        return { visited, dependenciesByNode, firstPath };
     };
 
-    for (const root of roots) {
-        visit(root, browserDependencies[root], []);
-    }
-
-    if (profileName !== 'full') {
-        const conflicts = [...visited].filter(name => deferredRoots.has(name)).sort(compareText);
-        if (conflicts.length > 0) {
-            const conflict = conflicts[0];
-            throw new Error(`Deferred root "${conflict}" from group "${deferredRoots.get(conflict)}" is required by the critical dependency path ${firstPath.get(conflict).join(' -> ')}.`);
+    const criticalClosure = resolveClosure(criticalRoots, 'tauri-critical');
+    const selectedClosure = profileName === 'tauri-critical'
+        ? criticalClosure
+        : resolveClosure(roots, profileName);
+    const featureGroups = normalizedFeatureGroups(profileConfig.featureGroups, browserDependencies);
+    const resolvedFeatureGroups = {};
+    for (const [groupName, group] of Object.entries(featureGroups)) {
+        const blockedRoots = group.blockedRoots.map(entry => {
+            if (!criticalClosure.visited.has(entry.name)) {
+                throw new Error(`Blocked root "${entry.name}" from group "${groupName}" is not in the critical closure.`);
+            }
+            const dependencyPath = criticalClosure.firstPath.get(entry.name);
+            if (!Array.isArray(dependencyPath) || dependencyPath.length === 0 || !criticalRoots.includes(dependencyPath[0])) {
+                throw new Error(`Blocked root "${entry.name}" from group "${groupName}" is missing a critical dependency path.`);
+            }
+            return { ...entry, dependencyPath };
+        });
+        for (const deferredRoot of group.deferredRoots) {
+            if (criticalClosure.visited.has(deferredRoot)) {
+                throw new Error(`Deferred root "${deferredRoot}" from group "${groupName}" is required by the critical dependency path ${criticalClosure.firstPath.get(deferredRoot).join(' -> ')}.`);
+            }
         }
+        resolvedFeatureGroups[groupName] = {
+            deferredRoots: group.deferredRoots,
+            blockedRoots,
+        };
     }
 
-    const closure = stableStronglyConnectedOrder(visited, dependenciesByNode);
+    const closure = stableStronglyConnectedOrder(selectedClosure.visited, selectedClosure.dependenciesByNode);
     const extensions = closure.filter(name => Object.hasOwn(browserDependencies, name));
     const packages = closure.map(requestName => ({
         requestName,
@@ -307,7 +391,7 @@ export function resolveProfile({ profileName = 'tauri-critical', profileConfig, 
         roots,
         extensions,
         packages,
-        deferredGroups,
+        featureGroups: resolvedFeatureGroups,
     };
     return { ...contract, digest: canonicalDigest(contract) };
 }
@@ -511,7 +595,7 @@ export async function generateProfileTarget({
             roots: resolved.roots,
             extensions: resolved.extensions,
             packages: resolved.packages,
-            deferredGroups: resolved.deferredGroups,
+            featureGroups: resolved.featureGroups,
         };
         await fs.promises.writeFile(path.join(plan.temporaryDirectory, PROFILE_MANIFEST_NAME), `${JSON.stringify(profileManifest, null, 2)}\n`);
         await replaceDirectoryAtomically(plan);

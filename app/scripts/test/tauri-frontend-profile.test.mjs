@@ -21,17 +21,17 @@ function manifest(name, dependencies = {}, extra = {}) {
     };
 }
 
-function fixture({ roots = ['product'], deferredGroups = {}, dependencies, packages, profileName = 'tauri-critical' }) {
+function fixture({ roots = ['product'], featureGroups = {}, dependencies, packages, profileName = 'tauri-critical' }) {
     const browserDependencies = dependencies ?? Object.fromEntries(Object.keys(packages).map(name => [name, '^1.0.0']));
     return {
         profileName,
         profileConfig: {
-            schema: 'ride.tauri-frontend-profile@1',
+            schema: 'ride.tauri-frontend-profile@2',
             profiles: {
                 'tauri-critical': { roots },
                 full: { includeAllBrowserRoots: true },
             },
-            deferredGroups,
+            featureGroups,
         },
         browserManifest: {
             name: 'browser-app',
@@ -139,26 +139,129 @@ test('does not collapse nested runtime versions into the Theia extension graph',
     assert.deepEqual(result.extensions, ['product']);
 });
 
-test('fails closed on exact critical/deferred conflicts without prefix matching', () => {
+test('uses exact package names for deferred conflicts without prefix matching', () => {
     const packages = {
         product: manifest('product', { '@theia/notebook': '^1.0.0', '@theia/ai-core': '^1.0.0' }),
         '@theia/notebook': manifest('@theia/notebook'),
         '@theia/ai-core': manifest('@theia/ai-core'),
+        '@theia/ai': manifest('@theia/ai'),
     };
 
     assert.throws(
         () => resolveProfile(fixture({
             packages,
-            deferredGroups: { notebook: ['@theia/notebook'] },
+            featureGroups: {
+                notebook: { deferredRoots: ['@theia/notebook'], blockedRoots: [] },
+            },
         })),
         /Deferred root "@theia\/notebook".*product -> @theia\/notebook/i,
     );
 
     const result = resolveProfile(fixture({
         packages,
-        deferredGroups: { ai: ['@theia/ai'] },
+        featureGroups: {
+            ai: { deferredRoots: ['@theia/ai'], blockedRoots: [] },
+        },
     }));
     assert.ok(result.extensions.includes('@theia/ai-core'));
+});
+
+test('emits evidence-backed blocked roots separately from true deferred roots', () => {
+    const result = resolveProfile(fixture({
+        packages: {
+            product: manifest('product', { notebook: '^1.0.0' }),
+            notebook: manifest('notebook'),
+            collaboration: manifest('collaboration'),
+        },
+        featureGroups: {
+            notebook: {
+                deferredRoots: [],
+                blockedRoots: [{ name: 'notebook', reason: 'plugin host requires notebook' }],
+            },
+            collaboration: {
+                deferredRoots: ['collaboration'],
+                blockedRoots: [],
+            },
+        },
+    }));
+
+    assert.deepEqual(result.featureGroups, {
+        collaboration: {
+            deferredRoots: ['collaboration'],
+            blockedRoots: [],
+        },
+        notebook: {
+            deferredRoots: [],
+            blockedRoots: [{
+                name: 'notebook',
+                reason: 'plugin host requires notebook',
+                dependencyPath: ['product', 'notebook'],
+            }],
+        },
+    });
+});
+
+test('rejects blocked roots that lack critical-closure evidence or a reason', () => {
+    const packages = {
+        product: manifest('product'),
+        notebook: manifest('notebook'),
+    };
+    assert.throws(() => resolveProfile(fixture({
+        packages,
+        featureGroups: {
+            notebook: {
+                deferredRoots: [],
+                blockedRoots: [{ name: 'notebook', reason: 'not actually required' }],
+            },
+        },
+    })), /Blocked root "notebook".*not in the critical closure/i);
+    assert.throws(() => resolveProfile(fixture({
+        packages: {
+            product: manifest('product', { notebook: '^1.0.0' }),
+            notebook: manifest('notebook'),
+        },
+        featureGroups: {
+            notebook: {
+                deferredRoots: [],
+                blockedRoots: [{ name: 'notebook', reason: '   ' }],
+            },
+        },
+    })), /Blocked root "notebook".*reason/i);
+});
+
+test('rejects roots that are deferred and blocked or duplicated across feature groups', () => {
+    const packages = {
+        product: manifest('product', { notebook: '^1.0.0' }),
+        notebook: manifest('notebook'),
+    };
+    assert.throws(() => resolveProfile(fixture({
+        packages,
+        featureGroups: {
+            notebook: {
+                deferredRoots: ['notebook'],
+                blockedRoots: [{ name: 'notebook', reason: 'required' }],
+            },
+        },
+    })), /both deferred and blocked/i);
+    assert.throws(() => resolveProfile(fixture({
+        packages,
+        featureGroups: {
+            first: { deferredRoots: ['notebook'], blockedRoots: [] },
+            second: { deferredRoots: ['notebook'], blockedRoots: [] },
+        },
+    })), /more than one feature group/i);
+});
+
+test('fails closed when a true deferred root enters the critical closure', () => {
+    assert.throws(() => resolveProfile(fixture({
+        packages: {
+            product: manifest('product', { notebook: '^1.0.0' }),
+            notebook: manifest('notebook'),
+        },
+        featureGroups: {
+            notebook: { deferredRoots: ['notebook'], blockedRoots: [] },
+        },
+    })), /Deferred root "notebook".*product -> notebook/i);
 });
 
 test('resolves npm aliases and validates alias target name and version', () => {
@@ -188,6 +291,24 @@ test('resolves npm aliases and validates alias target name and version', () => {
     assert.throws(() => resolveProfile(input), /core-alias.*expected package name "@theia\/core"/i);
 });
 
+test('requires every selected root to satisfy both browser and parent ranges', () => {
+    assert.throws(() => resolveProfile(fixture({
+        roots: ['product'],
+        dependencies: { product: '^1.0.0', child: '^2.0.0' },
+        packages: {
+            product: manifest('product', { child: '^1.0.0' }),
+            child: manifest('child', {}, { version: '1.5.0' }),
+        },
+    })), /child.*1\.5\.0.*browser manifest.*\^2\.0\.0/i);
+});
+
+test('rejects invalid semver ranges instead of silently skipping validation', () => {
+    assert.throws(() => resolveProfile(fixture({
+        dependencies: { product: 'not-a-semver-range' },
+        packages: { product: manifest('product') },
+    })), /product.*invalid.*not-a-semver-range/i);
+});
+
 test('uses a canonical digest independent of object key order and sensitive to contract changes', () => {
     const left = canonicalDigest({ schema: 1, nested: { b: 2, a: 1 }, list: ['x', 'y'] });
     const reordered = canonicalDigest({ list: ['x', 'y'], nested: { a: 1, b: 2 }, schema: 1 });
@@ -204,7 +325,7 @@ test('full profile selects every browser dependency root', () => {
         beta: manifest('beta'),
         gamma: manifest('gamma'),
     };
-    const result = resolveProfile(fixture({ profileName: 'full', packages }));
+    const result = resolveProfile(fixture({ profileName: 'full', roots: ['alpha'], packages }));
 
     assert.deepEqual(result.roots, ['alpha', 'beta', 'gamma']);
     assert.deepEqual(result.extensions, ['alpha', 'beta', 'gamma']);
@@ -259,9 +380,9 @@ test('generates an isolated target without writing tracked package.json or src-g
         theia: { generator: { config: { preloadTemplate: './resources/preload.html' } } },
     }, null, 2));
     await fs.promises.writeFile(path.join(browserDirectory, 'tauri-profile.json'), JSON.stringify({
-        schema: 'ride.tauri-frontend-profile@1',
+        schema: 'ride.tauri-frontend-profile@2',
         profiles: { 'tauri-critical': { roots: ['product'] }, full: { includeAllBrowserRoots: true } },
-        deferredGroups: {},
+        featureGroups: {},
         buildDevDependencies: ['@theia/cli'],
     }, null, 2));
     await fs.promises.writeFile(path.join(browserDirectory, 'esbuild.mjs'), 'export {};\n');
@@ -304,5 +425,6 @@ test('generates an isolated target without writing tracked package.json or src-g
     assert.equal(profileManifest.profile, 'tauri-critical');
     assert.match(profileManifest.commit, /^[0-9a-f]{40}$/);
     assert.match(profileManifest.digest, /^[0-9a-f]{64}$/);
+    assert.deepEqual(profileManifest.featureGroups, result.featureGroups);
     assert.equal(fs.existsSync(path.join(result.targetDirectory, 'src-gen', 'sentinel.txt')), false);
 });
