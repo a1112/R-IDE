@@ -295,7 +295,13 @@ function isTheiaExtension(manifest) {
     return Array.isArray(manifest?.theiaExtensions) && manifest.theiaExtensions.length > 0;
 }
 
-export function resolveProfile({ profileName = 'tauri-critical', profileConfig, browserManifest, packageManifests }) {
+export function resolveProfile({
+    profileName = 'tauri-critical',
+    profileConfig,
+    browserManifest,
+    packageManifests,
+    installedGraph,
+}) {
     if (!profileConfig || profileConfig.schema !== PROFILE_SCHEMA) {
         throw new Error(`Profile configuration must use schema ${PROFILE_SCHEMA}.`);
     }
@@ -316,7 +322,7 @@ export function resolveProfile({ profileName = 'tauri-critical', profileConfig, 
         : [...new Set(selectedProfile.roots ?? [])].sort(compareText);
     const criticalRoots = [...new Set(criticalProfile.roots)].sort(compareText);
 
-    const resolveClosure = (closureRoots, label) => {
+    const resolveManifestClosure = (closureRoots, label) => {
         if (closureRoots.length === 0) {
             throw new Error(`Tauri frontend profile "${label}" has no roots.`);
         }
@@ -371,8 +377,58 @@ export function resolveProfile({ profileName = 'tauri-critical', profileConfig, 
         for (const root of closureRoots) {
             visit(root, browserDependencies[root], []);
         }
-        return { visited, dependenciesByNode, firstPath };
+        return {
+            visited,
+            dependenciesByNode,
+            firstPathByNode: firstPath,
+            firstPathByRequest: firstPath,
+            requestNames: visited,
+        };
     };
+
+    const resolveGraphClosure = (closureRoots, label) => {
+        if (closureRoots.length === 0) {
+            throw new Error(`Tauri frontend profile "${label}" has no roots.`);
+        }
+        const visited = new Set();
+        const dependenciesByNode = new Map();
+        const firstPathByNode = new Map();
+        const firstPathByRequest = new Map();
+        const requestNames = new Set();
+        const visit = (nodeId, ancestry) => {
+            const record = installedGraph.records.get(nodeId);
+            if (!record) {
+                throw new Error(`${ancestry.join(' -> ')}: installed graph node is missing.`);
+            }
+            const dependencyPath = [...ancestry, record.requestName];
+            if (!firstPathByNode.has(nodeId)) {
+                firstPathByNode.set(nodeId, dependencyPath);
+            }
+            if (!firstPathByRequest.has(record.requestName)) {
+                firstPathByRequest.set(record.requestName, dependencyPath);
+            }
+            requestNames.add(record.requestName);
+            if (visited.has(nodeId)) {
+                return;
+            }
+            visited.add(nodeId);
+            const dependencies = new Set(installedGraph.dependenciesByNode.get(nodeId) ?? []);
+            dependenciesByNode.set(nodeId, dependencies);
+            for (const dependency of [...dependencies].sort(compareText)) {
+                visit(dependency, dependencyPath);
+            }
+        };
+        for (const root of closureRoots) {
+            const nodeId = installedGraph.rootNodeIds.get(root);
+            if (!nodeId) {
+                throw new Error(`Unknown profile root "${root}".`);
+            }
+            visit(nodeId, []);
+        }
+        return { visited, dependenciesByNode, firstPathByNode, firstPathByRequest, requestNames };
+    };
+
+    const resolveClosure = installedGraph ? resolveGraphClosure : resolveManifestClosure;
 
     const criticalClosure = resolveClosure(criticalRoots, 'tauri-critical');
     const selectedClosure = profileName === 'tauri-critical'
@@ -382,18 +438,18 @@ export function resolveProfile({ profileName = 'tauri-critical', profileConfig, 
     const resolvedFeatureGroups = {};
     for (const [groupName, group] of Object.entries(featureGroups)) {
         const blockedRoots = group.blockedRoots.map(entry => {
-            if (!criticalClosure.visited.has(entry.name)) {
+            if (!criticalClosure.requestNames.has(entry.name)) {
                 throw new Error(`Blocked root "${entry.name}" from group "${groupName}" is not in the critical closure.`);
             }
-            const dependencyPath = criticalClosure.firstPath.get(entry.name);
+            const dependencyPath = criticalClosure.firstPathByRequest.get(entry.name);
             if (!Array.isArray(dependencyPath) || dependencyPath.length === 0 || !criticalRoots.includes(dependencyPath[0])) {
                 throw new Error(`Blocked root "${entry.name}" from group "${groupName}" is missing a critical dependency path.`);
             }
             return { ...entry, dependencyPath };
         });
         for (const deferredRoot of group.deferredRoots) {
-            if (criticalClosure.visited.has(deferredRoot)) {
-                throw new Error(`Deferred root "${deferredRoot}" from group "${groupName}" is required by the critical dependency path ${criticalClosure.firstPath.get(deferredRoot).join(' -> ')}.`);
+            if (criticalClosure.requestNames.has(deferredRoot)) {
+                throw new Error(`Deferred root "${deferredRoot}" from group "${groupName}" is required by the critical dependency path ${criticalClosure.firstPathByRequest.get(deferredRoot).join(' -> ')}.`);
             }
         }
         resolvedFeatureGroups[groupName] = {
@@ -403,13 +459,24 @@ export function resolveProfile({ profileName = 'tauri-critical', profileConfig, 
     }
 
     const closure = stableStronglyConnectedOrder(selectedClosure.visited, selectedClosure.dependenciesByNode);
-    const extensions = closure.filter(name => isTheiaExtension(packageManifests[name]));
-    const packages = closure.map(requestName => ({
-        requestName,
-        packageName: packageManifests[requestName].name,
-        version: packageManifests[requestName].version,
-        dependencyPath: selectedClosure.firstPath.get(requestName),
-    }));
+    const extensions = [];
+    const packages = [];
+    const emittedExtensions = new Set();
+    for (const node of closure) {
+        const record = installedGraph?.records.get(node);
+        const requestName = record?.requestName ?? node;
+        const manifest = record?.manifest ?? packageManifests[requestName];
+        if (isTheiaExtension(manifest) && !emittedExtensions.has(requestName)) {
+            emittedExtensions.add(requestName);
+            extensions.push(requestName);
+        }
+        packages.push({
+            requestName,
+            packageName: manifest.name,
+            version: manifest.version,
+            dependencyPath: selectedClosure.firstPathByNode.get(node),
+        });
+    }
     const contract = {
         schema: PROFILE_SCHEMA,
         profile: profileName,
@@ -715,9 +782,11 @@ async function defaultResolveInstalledManifest(requestName, fromDirectory) {
     };
 }
 
-async function loadInstalledClosure(browserManifest, roots, resolver, browserDirectory) {
-    const manifests = {};
+export async function resolveInstalledPackageGraph({ browserManifest, roots, resolver, browserDirectory }) {
     const records = new Map();
+    const dependenciesByNode = new Map();
+    const rootNodeIds = new Map();
+    const extensionRecords = new Map();
     const rootSet = new Set(roots);
     const load = async (requestName, spec, fromDirectory, dependencyPath, optional = false) => {
         const expected = parseDependencySpec(requestName, spec);
@@ -733,7 +802,7 @@ async function loadInstalledClosure(browserManifest, roots, resolver, browserDir
             }
             throw new Error(`${dependencyPath.join(' -> ')}: required dependency is not installed: ${error.message}`);
         }
-        if (!installed || typeof installed.packageDirectory !== 'string' || !path.isAbsolute(path.resolve(installed.packageDirectory))) {
+        if (!installed || typeof installed.packageDirectory !== 'string' || !path.isAbsolute(installed.packageDirectory)) {
             throw new Error(`${dependencyPath.join(' -> ')}: installed dependency has no package directory.`);
         }
         validateInstalledManifest(requestName, spec, installed.manifest, dependencyPath, 'parent dependency');
@@ -746,43 +815,65 @@ async function loadInstalledClosure(browserManifest, roots, resolver, browserDir
                 'browser manifest',
             );
         }
-        const existing = records.get(requestName);
+        const nodeId = canonicalDigest({
+            requestName,
+            packageName: installed.manifest.name,
+            version: installed.manifest.version,
+        });
+        const existingExtension = extensionRecords.get(requestName);
+        if (isTheiaExtension(installed.manifest) && existingExtension && existingExtension.nodeId !== nodeId) {
+            throw new Error(
+                `Conflicting installed extension identity for "${requestName}": `
+                + `${existingExtension.dependencyPath.join(' -> ')} resolved ${existingExtension.manifest.name}@${existingExtension.manifest.version}, `
+                + `but ${dependencyPath.join(' -> ')} resolved ${installed.manifest.name}@${installed.manifest.version}.`,
+            );
+        }
+        const existing = records.get(nodeId);
         if (existing) {
-            if (existing.manifest.name !== installed.manifest.name || existing.manifest.version !== installed.manifest.version) {
+            if (existing.manifest.name !== installed.manifest.name || existing.manifest.version !== installed.manifest.version
+                || existing.requestName !== requestName) {
                 throw new Error(
                     `Conflicting installed identity for "${requestName}": `
                     + `${existing.dependencyPath.join(' -> ')} resolved ${existing.manifest.name}@${existing.manifest.version}, `
                     + `but ${dependencyPath.join(' -> ')} resolved ${installed.manifest.name}@${installed.manifest.version}.`,
                 );
             }
-            return;
+            return nodeId;
         }
         const record = {
+            nodeId,
             requestName,
             packageDirectory: path.resolve(installed.packageDirectory),
             manifest: installed.manifest,
             dependencyPath,
         };
-        records.set(requestName, record);
-        manifests[requestName] = installed.manifest;
+        records.set(nodeId, record);
+        dependenciesByNode.set(nodeId, new Set());
+        if (isTheiaExtension(installed.manifest)) {
+            extensionRecords.set(requestName, record);
+        }
         for (const [dependencyName, dependency] of dependencyEntries(installed.manifest)) {
-            await load(
+            const dependencyNode = await load(
                 dependencyName,
                 dependency.spec,
                 record.packageDirectory,
                 [...dependencyPath, dependencyName],
                 dependency.optional,
             );
+            if (dependencyNode) {
+                dependenciesByNode.get(nodeId).add(dependencyNode);
+            }
         }
+        return nodeId;
     };
     for (const root of roots) {
         const spec = browserManifest.dependencies?.[root];
         if (typeof spec !== 'string') {
             throw new Error(`Unknown profile root "${root}".`);
         }
-        await load(root, spec, browserDirectory, [root]);
+        rootNodeIds.set(root, await load(root, spec, browserDirectory, [root]));
     }
-    return { manifests, records };
+    return { records, dependenciesByNode, rootNodeIds, extensionRecords };
 }
 
 function selectedRoots(profileName, profileConfig, browserManifest) {
@@ -838,12 +929,17 @@ export async function generateProfileTarget({
     const browserManifest = JSON.parse(await fs.promises.readFile(path.join(resolvedBrowserDirectory, 'package.json'), 'utf8'));
     const profileConfig = JSON.parse(await fs.promises.readFile(path.join(resolvedBrowserDirectory, 'tauri-profile.json'), 'utf8'));
     const roots = selectedRoots(profileName, profileConfig, browserManifest);
-    const { manifests, records } = await loadInstalledClosure(browserManifest, roots, resolveInstalledManifest, resolvedBrowserDirectory);
+    const installedGraph = await resolveInstalledPackageGraph({
+        browserManifest,
+        roots,
+        resolver: resolveInstalledManifest,
+        browserDirectory: resolvedBrowserDirectory,
+    });
     for (const devDependency of profileConfig.buildDevDependencies ?? []) {
         const installed = await resolveInstalledManifest(devDependency, resolvedBrowserDirectory);
         validateInstalledManifest(devDependency, browserManifest.devDependencies?.[devDependency], installed.manifest, [devDependency]);
     }
-    const resolved = resolveProfile({ profileName, profileConfig, browserManifest, packageManifests: manifests });
+    const resolved = resolveProfile({ profileName, profileConfig, browserManifest, installedGraph });
     const buildsDirectory = path.join(resolvedBrowserDirectory, PROFILE_DIRECTORY_NAME, 'builds');
     await fs.promises.mkdir(buildsDirectory, { recursive: true });
     await recoverDirectoryTransactions({ parentDirectory: buildsDirectory, targetName: buildId });
@@ -858,7 +954,7 @@ export async function generateProfileTarget({
         const rootSet = new Set(roots);
         const dependencies = Object.fromEntries(resolved.extensions.map(name => [
             name,
-            generatedExtensionSpec(name, browserManifest, records.get(name), rootSet),
+            generatedExtensionSpec(name, browserManifest, installedGraph.extensionRecords.get(name), rootSet),
         ]));
         const devDependencies = Object.fromEntries((profileConfig.buildDevDependencies ?? []).map(name => {
             const spec = browserManifest.devDependencies?.[name];
@@ -879,7 +975,11 @@ export async function generateProfileTarget({
         };
         await fs.promises.writeFile(path.join(plan.temporaryDirectory, 'package.json'), `${JSON.stringify(generatedPackage, null, 2)}\n`);
         for (const requestName of resolved.extensions) {
-            await linkInstalledPackage(plan.temporaryDirectory, requestName, records.get(requestName).packageDirectory);
+            await linkInstalledPackage(
+                plan.temporaryDirectory,
+                requestName,
+                installedGraph.extensionRecords.get(requestName).packageDirectory,
+            );
         }
         for (const file of CUSTOM_FILES) {
             await copyRegularTree(path.join(resolvedBrowserDirectory, file), path.join(plan.temporaryDirectory, file));
@@ -904,7 +1004,7 @@ export async function generateProfileTarget({
             featureGroups: resolved.featureGroups,
         };
         await fs.promises.writeFile(path.join(plan.temporaryDirectory, PROFILE_MANIFEST_NAME), `${JSON.stringify(profileManifest, null, 2)}\n`);
-        await verifyGeneratedExtensions(plan.temporaryDirectory, dependencies, records);
+        await verifyGeneratedExtensions(plan.temporaryDirectory, dependencies, installedGraph.extensionRecords);
         await replaceDirectoryTransactional(plan);
     } catch (error) {
         await retryRemove(fs.promises, plan.temporaryDirectory, {}).catch(() => {});

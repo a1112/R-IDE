@@ -14,6 +14,7 @@ import {
     parseProfileCliArguments,
     recoverDirectoryTransactions,
     replaceDirectoryTransactional,
+    resolveInstalledPackageGraph,
     resolveProfile,
     retryFilesystemOperation,
 } from '../tauri-frontend-profile.mjs';
@@ -443,6 +444,48 @@ test('uses npm default prerelease range semantics', () => {
         packages: { product: manifest('product', {}, { version: '1.3.0-beta.2' }) },
     }));
     assert.deepEqual(explicit.extensions, ['product']);
+});
+
+test('records multiple runtime identities while retaining Theia extensions below each path', async () => {
+    const browserDirectory = path.resolve('browser-app');
+    const manifestsByContext = {
+        product: manifest('product', { left: '^1.0.0', right: '^1.0.0' }),
+        left: { name: 'left', version: '1.0.0', dependencies: { shared: '^1.0.0' } },
+        right: { name: 'right', version: '1.0.0', dependencies: { shared: '^2.0.0' } },
+        'shared-left': { name: 'shared', version: '1.5.0', dependencies: { 'nested-left': '^1.0.0' } },
+        'shared-right': { name: 'shared', version: '2.5.0', dependencies: { 'nested-right': '^1.0.0' } },
+        'nested-left': manifest('nested-left'),
+        'nested-right': manifest('nested-right'),
+    };
+    const graph = await resolveInstalledPackageGraph({
+        browserManifest: { dependencies: { product: '^1.0.0' } },
+        roots: ['product'],
+        browserDirectory,
+        resolver: async (requestName, fromDirectory) => {
+            const parent = path.basename(fromDirectory);
+            const key = requestName === 'shared' ? `shared-${parent}` : requestName;
+            return {
+                requestName,
+                packageDirectory: path.join(path.resolve('installed'), key),
+                manifest: manifestsByContext[key],
+            };
+        },
+    });
+    const input = fixture({
+        roots: ['product'],
+        dependencies: { product: '^1.0.0' },
+        packages: { product: manifestsByContext.product },
+    });
+    const result = resolveProfile({ ...input, installedGraph: graph });
+
+    assert.deepEqual(result.extensions, ['nested-left', 'nested-right', 'product']);
+    assert.deepEqual(result.packages.filter(entry => entry.requestName === 'shared').map(entry => ({
+        version: entry.version,
+        dependencyPath: entry.dependencyPath,
+    })), [
+        { version: '1.5.0', dependencyPath: ['product', 'left', 'shared'] },
+        { version: '2.5.0', dependencyPath: ['product', 'right', 'shared'] },
+    ]);
 });
 
 async function writeSentinel(directory, value) {
@@ -1055,7 +1098,7 @@ test('rejects conflicting installed identities for one request name with both pa
                 return {
                     requestName,
                     packageDirectory: path.join(root, fromRight ? 'other' : 'shared'),
-                    manifest: { name: fromRight ? 'other' : 'shared', version: '1.2.0' },
+                    manifest: manifest(fromRight ? 'other' : 'shared', {}, { version: '1.2.0' }),
                 };
             }
             return {
