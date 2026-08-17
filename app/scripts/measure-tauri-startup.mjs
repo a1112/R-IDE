@@ -8,7 +8,7 @@
  ********************************************************************************/
 
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -18,7 +18,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const REPORT_SCHEMA = 'ride.startup-report';
 const REPORT_VERSION = 1;
 const MEASUREMENT_SCHEMA = 'ride.startup-measurement';
-const MEASUREMENT_VERSION = 1;
+const MEASUREMENT_VERSION = 2;
 const DIAGNOSTICS_OWNER_SCHEMA = 'ride.startup-diagnostics-owner';
 const DIAGNOSTICS_OWNER_VERSION = 1;
 const DIAGNOSTICS_OWNER_FILE = '.ride-startup-diagnostics-owner.json';
@@ -32,6 +32,20 @@ const PROC_STAT_MAX_BYTES = 64 * 1024;
 const SENSITIVE_FRAGMENT_LENGTH = 16;
 const SENSITIVE_ENVIRONMENT_KEY = /(?:TOKEN|SECRET|PASSWORD|PASSWD|KEY|CREDENTIAL|COOKIE|AUTH)/i;
 const SENSITIVE_DESKTOP_PASSTHROUGH_KEYS = new Set(['XAUTHORITY']);
+const SHA256_PATTERN = /^[0-9a-f]{64}$/;
+const COMMIT_PATTERN = /^[0-9a-f]{40}$/;
+const PROFILE_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const METADATA_MAX_BYTES = 4 * 1024 * 1024;
+const PROCESS_ROLES = [
+  'main',
+  'backend',
+  'pluginHost',
+  'webviewRenderer',
+  'webviewGpu',
+  'webviewUtility',
+  'terminal',
+  'other',
+];
 const MILESTONES = [
   'process_started',
   'native_window_visible',
@@ -335,6 +349,29 @@ function assertExactKeys(value, allowed, name) {
   }
 }
 
+function canonicalJson(value) {
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalJson).join(',')}]`;
+  }
+  if (value !== null && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map(key => (
+      `${JSON.stringify(key)}:${canonicalJson(value[key])}`
+    )).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function sha256(value) {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+function normalizedText(value, name) {
+  if (typeof value !== 'string' || !value.trim()) {
+    throw new Error(`${name} must be a non-empty string`);
+  }
+  return value.trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
 function currentRustTarget() {
   const platform = NODE_TO_RUST_PLATFORM[process.platform];
   const arch = NODE_TO_RUST_ARCHITECTURE[process.arch];
@@ -555,7 +592,16 @@ export function parsePosixProcessTable(output) {
     if (!line.trim()) {
       continue;
     }
-    const match = line.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(.+)$/);
+    const serialized = line.trim();
+    let match = serialized.match(
+      /^(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+((?:Sun|Mon|Tue|Wed|Thu|Fri|Sat)\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})(?:\s+(\S+)(?:\s+(.*))?)?$/,
+    );
+    if (!match) {
+      const legacy = serialized.match(/^(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(.+)$/);
+      if (legacy) {
+        match = [...legacy, undefined, undefined];
+      }
+    }
     if (!match) {
       throw new Error(`invalid ps process row: ${line}`);
     }
@@ -576,6 +622,8 @@ export function parsePosixProcessTable(output) {
     if (rssKiB > Math.floor(Number.MAX_SAFE_INTEGER / 1024)) {
       throw new Error('ps RSS bytes must be a non-negative safe integer');
     }
+    const executable = match[6];
+    const commandLine = match[7];
     rows.push({
       pid,
       ppid,
@@ -583,6 +631,11 @@ export function parsePosixProcessTable(output) {
       rssBytes: rssKiB * 1024,
       creationTime,
       startedAt: parseProcessStartedAt(creationTime),
+      ...(executable === undefined ? {} : {
+        name: executable.split(/[\\/]/).at(-1),
+        executable,
+        commandLine: commandLine ?? executable,
+      }),
     });
   }
   return rows;
@@ -608,6 +661,13 @@ export function parseWindowsProcessTable(output) {
     if (typeof creationTime !== 'string' || !creationTime.trim()) {
       throw new Error('PowerShell CreationDate must be a non-empty string');
     }
+    const hasProcessText = ['Name', 'ExecutablePath', 'CommandLine']
+      .some(key => Object.hasOwn(candidate, key));
+    const processText = hasProcessText ? {
+      name: typeof candidate.Name === 'string' ? candidate.Name : '',
+      executable: typeof candidate.ExecutablePath === 'string' ? candidate.ExecutablePath : '',
+      commandLine: typeof candidate.CommandLine === 'string' ? candidate.CommandLine : '',
+    } : {};
     return [{
       pid,
       ppid,
@@ -615,6 +675,7 @@ export function parseWindowsProcessTable(output) {
       rssBytes,
       creationTime,
       startedAt: parseProcessStartedAt(creationTime),
+      ...processText,
     }];
   });
 }
@@ -1251,6 +1312,107 @@ function chronologicalProcessTree(rows, rootIdentity) {
   };
 }
 
+function processText(row) {
+  return [row.name, row.executable, row.commandLine]
+    .filter(value => typeof value === 'string')
+    .join(' ');
+}
+
+function executableName(row) {
+  const candidate = typeof row.executable === 'string' && row.executable
+    ? row.executable
+    : row.name;
+  return typeof candidate === 'string'
+    ? candidate.split(/[\\/]/).at(-1).toLowerCase()
+    : '';
+}
+
+function isDescendantOf(pid, ancestorPid, rowsByPid) {
+  const visited = new Set();
+  let current = rowsByPid.get(pid);
+  while (current && !visited.has(current.pid)) {
+    if (current.ppid === ancestorPid) {
+      return true;
+    }
+    visited.add(current.pid);
+    current = rowsByPid.get(current.ppid);
+  }
+  return false;
+}
+
+export function classifyProcessRoles(processes, rootIdentity) {
+  if (!Array.isArray(processes)) {
+    throw new Error('process role rows must be an array');
+  }
+  const tree = chronologicalProcessTree(processes, rootIdentity);
+  const rowsByPid = new Map(processes.map(row => [row.pid, row]));
+  const nodeExecutables = new Set(['node', 'node.exe']);
+  const shellExecutables = new Set([
+    'bash',
+    'cmd.exe',
+    'dash',
+    'fish',
+    'ksh',
+    'nu',
+    'nu.exe',
+    'powershell.exe',
+    'pwsh',
+    'pwsh.exe',
+    'sh',
+    'wsl.exe',
+    'zsh',
+  ]);
+  const backend = tree.selected
+    .filter(row => row.pid !== tree.verifiedRoot
+      && nodeExecutables.has(executableName(row))
+      && /(?:^|[\\/])resources[\\/]backend[\\/]main\.js(?:[\s"']|$)/i.test(row.commandLine ?? ''))
+    .sort((left, right) => {
+      const depthDelta = tree.discovered.get(left.pid).depth - tree.discovered.get(right.pid).depth;
+      if (depthDelta !== 0) {
+        return depthDelta;
+      }
+      const timeDelta = (comparableStartedAt(left) ?? Number.MAX_SAFE_INTEGER)
+        - (comparableStartedAt(right) ?? Number.MAX_SAFE_INTEGER);
+      return timeDelta || left.pid - right.pid;
+    })[0];
+  const roles = Object.fromEntries(PROCESS_ROLES.map(role => [role, {
+    processCount: 0,
+    rssBytes: 0,
+  }]));
+
+  for (const row of processes) {
+    const rssBytes = positiveInteger(row.rssBytes, `process ${row.pid} RSS bytes`);
+    let role = 'other';
+    if (sameProcessIdentity(row, tree.verifiedIdentity)) {
+      role = 'main';
+    } else if (backend && sameProcessIdentity(row, backend)) {
+      role = 'backend';
+    } else if (/plugin[-_]?host/i.test(processText(row))) {
+      role = 'pluginHost';
+    } else if (/msedgewebview2(?:\.exe)?/i.test(`${row.name ?? ''} ${row.executable ?? ''}`)) {
+      const type = String(row.commandLine ?? '').match(/(?:^|\s)--type=(renderer|gpu-process|utility)(?=\s|$)/i)?.[1]
+        ?.toLowerCase();
+      if (type === 'renderer') {
+        role = 'webviewRenderer';
+      } else if (type === 'gpu-process') {
+        role = 'webviewGpu';
+      } else if (type === 'utility') {
+        role = 'webviewUtility';
+      }
+    } else if (backend
+        && shellExecutables.has(executableName(row))
+        && isDescendantOf(row.pid, backend.pid, rowsByPid)) {
+      role = 'terminal';
+    }
+    if (roles[role].rssBytes > Number.MAX_SAFE_INTEGER - rssBytes) {
+      throw new Error(`${role} RSS bytes must be a non-negative safe integer`);
+    }
+    roles[role].processCount++;
+    roles[role].rssBytes += rssBytes;
+  }
+  return roles;
+}
+
 export function aggregateProcessTree(rows, rootIdentity) {
   const {
     verifiedIdentity,
@@ -1273,6 +1435,7 @@ export function aggregateProcessTree(rows, rootIdentity) {
     processIds: orderedIds,
     processCount: orderedIds.length,
     rssBytes,
+    roles: classifyProcessRoles(selected, verifiedIdentity),
     processes: selected
       .map(row => ({
         pid: row.pid,
@@ -1391,7 +1554,7 @@ function readProcessTable(platform = process.platform) {
         '-NoProfile',
         '-NonInteractive',
         '-Command',
-        'Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,WorkingSetSize,CreationDate | ConvertTo-Json -Compress',
+        'Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,WorkingSetSize,CreationDate,Name,ExecutablePath,CommandLine | ConvertTo-Json -Compress',
       ],
       {
         encoding: 'utf8',
@@ -1406,7 +1569,7 @@ function readProcessTable(platform = process.platform) {
     return parseWindowsProcessTable(result.stdout);
   }
 
-  const result = spawnSync('ps', ['-axo', 'pid=,ppid=,pgid=,rss=,lstart='], {
+  const result = spawnSync('ps', ['-axo', 'pid=,ppid=,pgid=,rss=,lstart=,comm=,args='], {
     encoding: 'utf8',
     env: { ...process.env, LANG: 'C', LC_ALL: 'C' },
     timeout: SYNC_COMMAND_TIMEOUT_MS,
@@ -1465,6 +1628,7 @@ function aggregateMarkedProcessTree(rows, rootIdentity, markedRows) {
     processIds: processes.map(({ row }) => row.pid),
     processCount: processes.length,
     rssBytes,
+    roles: classifyProcessRoles(processes.map(({ row }) => row), tree.rootIdentity),
     processes: processes.map(({ row, depth }) => ({
       pid: row.pid,
       ppid: row.ppid,
@@ -2602,6 +2766,7 @@ function parseArguments(argv) {
       case '--timeout-ms': options.timeoutMs = positiveInteger(value, '--timeout-ms'); break;
       case '--poll-ms': options.pollMs = positiveInteger(value, '--poll-ms'); break;
       case '--output': options.output = path.resolve(value); break;
+      case '--profile-manifest': options.profileManifest = path.resolve(value); break;
       default: throw new Error(`unsupported option ${argument}`);
     }
   }
@@ -2626,6 +2791,220 @@ function currentCommit() {
   } catch {
     return null;
   }
+}
+
+async function readBoundedMetadataFile(filePath, label) {
+  let stat;
+  try {
+    stat = await fs.promises.lstat(filePath);
+  } catch (error) {
+    throw new Error(`${label} is missing: ${error.message}`);
+  }
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size > METADATA_MAX_BYTES) {
+    throw new Error(`${label} must be a bounded regular file`);
+  }
+  return fs.promises.readFile(filePath, 'utf8');
+}
+
+async function readJsonMetadata(filePath, label) {
+  const serialized = await readBoundedMetadataFile(filePath, label);
+  try {
+    return JSON.parse(serialized);
+  } catch (error) {
+    throw new Error(`${label} is not valid JSON: ${error.message}`);
+  }
+}
+
+function executableResourceRoots(executable) {
+  const executableDirectory = path.dirname(path.resolve(executable));
+  return [...new Set([
+    executableDirectory,
+    path.join(executableDirectory, 'resources'),
+    path.resolve(executableDirectory, '..', 'Resources'),
+  ])];
+}
+
+function firstExistingPath(candidates, predicate) {
+  for (const candidate of candidates) {
+    try {
+      if (predicate(fs.lstatSync(candidate))) {
+        return candidate;
+      }
+    } catch {
+      // Continue through the finite packaged-resource candidates.
+    }
+  }
+  return undefined;
+}
+
+async function readProfileBuildMetadata(options, executable) {
+  const candidates = options.profileManifest ? [options.profileManifest] : executableResourceRoots(executable)
+    .flatMap(root => [
+      path.join(root, 'resources', 'backend', 'ride-tauri-profile.json'),
+      path.join(root, 'backend', 'ride-tauri-profile.json'),
+      path.join(root, 'lib', 'frontend', 'ride-tauri-profile.json'),
+    ]);
+  const manifestPath = firstExistingPath(candidates, stat => stat.isFile() && !stat.isSymbolicLink());
+  if (!manifestPath) {
+    throw new Error('Tauri profile manifest is missing from the packaged bundle');
+  }
+  const manifest = await readJsonMetadata(manifestPath, 'Tauri profile manifest');
+  assertPlainObject(manifest, 'Tauri profile manifest');
+  if (manifest.schema !== 'ride.tauri-profile' || manifest.version !== 1) {
+    throw new Error('Tauri profile manifest schema must be ride.tauri-profile@1');
+  }
+  if (typeof manifest.profile !== 'string'
+      || !PROFILE_PATTERN.test(manifest.profile)
+      || manifest.profile !== manifest.profile.trim()) {
+    throw new Error('Tauri profile manifest profile is not canonical');
+  }
+  if (!COMMIT_PATTERN.test(manifest.commit ?? '')) {
+    throw new Error('Tauri profile manifest commit is not canonical');
+  }
+  return {
+    commit: manifest.commit,
+    profile: manifest.profile,
+    profileSha256: sha256(canonicalJson(manifest)),
+  };
+}
+
+async function readPluginBuildMetadata(executable) {
+  const candidates = executableResourceRoots(executable).flatMap(root => [
+    path.join(root, 'resources', 'plugins'),
+    path.join(root, 'plugins'),
+  ]);
+  const pluginsDirectory = firstExistingPath(
+    candidates,
+    stat => stat.isDirectory() && !stat.isSymbolicLink(),
+  );
+  if (!pluginsDirectory) {
+    throw new Error('packaged plugin resources are missing');
+  }
+  const entries = await fs.promises.readdir(pluginsDirectory, { withFileTypes: true });
+  const plugins = [];
+  const ids = new Set();
+  for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name, 'en'))) {
+    if (entry.name.startsWith('.')) {
+      if (entry.name !== '.gitkeep' || !entry.isFile() || entry.isSymbolicLink()) {
+        throw new Error(`hidden packaged plugin entry ${entry.name} is not canonical`);
+      }
+      continue;
+    }
+    if (!entry.isDirectory() || entry.isSymbolicLink()) {
+      throw new Error(`packaged plugin entry ${entry.name} is not canonical`);
+    }
+    const pluginRoot = path.join(pluginsDirectory, entry.name);
+    const manifest = await readJsonMetadata(
+      path.join(pluginRoot, 'extension', 'package.json'),
+      `packaged plugin ${entry.name} manifest`,
+    );
+    assertPlainObject(manifest, `packaged plugin ${entry.name} manifest`);
+    const publisher = normalizedText(manifest.publisher, `packaged plugin ${entry.name} publisher`);
+    const name = normalizedText(manifest.name, `packaged plugin ${entry.name} name`);
+    const version = normalizedText(manifest.version, `packaged plugin ${entry.name} version`);
+    const id = `${publisher}.${name}`;
+    if (entry.name.toLowerCase() !== id || ids.has(id)) {
+      throw new Error(`packaged plugin ${entry.name} identity is not canonical`);
+    }
+    ids.add(id);
+    plugins.push({ id, version });
+  }
+  if (plugins.length === 0) {
+    throw new Error('packaged plugin manifest must contain at least one plugin');
+  }
+  plugins.sort((left, right) => left.id.localeCompare(right.id, 'en'));
+  return {
+    pluginManifestSha256: sha256(canonicalJson({ plugins })),
+    pluginCount: plugins.length,
+  };
+}
+
+export function createHostMetadata({
+  platform = process.platform,
+  arch = process.arch,
+  release = os.release(),
+  cpuModel = os.cpus()[0]?.model,
+  logicalCpuCount = os.cpus().length,
+  totalMemory = os.totalmem(),
+} = {}) {
+  const normalizedPlatform = normalizedText(platform, 'host platform');
+  const normalizedArch = normalizedText(arch, 'host architecture');
+  const normalizedRelease = normalizedText(release, 'host OS release');
+  const normalizedCpuModel = normalizedText(cpuModel, 'host CPU model');
+  const cpuCount = positiveInteger(logicalCpuCount, 'host logical CPU count');
+  const memory = positiveInteger(totalMemory, 'host total memory');
+  if (cpuCount < 1 || memory < 1) {
+    throw new Error('host CPU and memory values must be positive');
+  }
+  const fourGiB = 4 * 1024 * 1024 * 1024;
+  const totalMemoryBucketGiB = Math.max(4, Math.round(memory / fourGiB) * 4);
+  return {
+    platform: normalizedPlatform,
+    arch: normalizedArch,
+    fingerprint: sha256(canonicalJson({
+      platform: normalizedPlatform,
+      arch: normalizedArch,
+      release: normalizedRelease,
+      cpuModel: normalizedCpuModel,
+      logicalCpuCount: cpuCount,
+      totalMemoryBucketGiB,
+    })),
+  };
+}
+
+function validateCampaignMetadata(metadata) {
+  assertPlainObject(metadata, 'campaign metadata');
+  assertExactKeys(metadata, new Set(['build', 'host']), 'campaign metadata');
+  assertPlainObject(metadata.build, 'campaign build metadata');
+  assertExactKeys(
+    metadata.build,
+    new Set(['commit', 'profile', 'profileSha256', 'pluginManifestSha256', 'pluginCount']),
+    'campaign build metadata',
+  );
+  if (!COMMIT_PATTERN.test(metadata.build.commit ?? '')) {
+    throw new Error('campaign build commit must be a canonical 40-character SHA-1');
+  }
+  if (!PROFILE_PATTERN.test(metadata.build.profile ?? '')) {
+    throw new Error('campaign build profile must be canonical');
+  }
+  for (const field of ['profileSha256', 'pluginManifestSha256']) {
+    if (!SHA256_PATTERN.test(metadata.build[field] ?? '')) {
+      throw new Error(`campaign build ${field} must be a canonical SHA-256`);
+    }
+  }
+  if (!Number.isSafeInteger(metadata.build.pluginCount) || metadata.build.pluginCount < 1) {
+    throw new Error('campaign build pluginCount must be a positive safe integer');
+  }
+  assertPlainObject(metadata.host, 'campaign host metadata');
+  assertExactKeys(metadata.host, new Set(['platform', 'arch', 'fingerprint']), 'campaign host metadata');
+  if (metadata.host.platform !== process.platform || metadata.host.arch !== process.arch) {
+    throw new Error('campaign host metadata does not match the measurement runner');
+  }
+  if (!SHA256_PATTERN.test(metadata.host.fingerprint ?? '')) {
+    throw new Error('campaign host fingerprint must be a canonical SHA-256');
+  }
+  return metadata;
+}
+
+export async function readCampaignMetadata(
+  { options, executable },
+  { readCommit = currentCommit, readHost = createHostMetadata } = {},
+) {
+  const commit = readCommit();
+  if (!COMMIT_PATTERN.test(commit ?? '')) {
+    throw new Error('could not resolve a canonical build commit');
+  }
+  const [profile, plugins] = await Promise.all([
+    readProfileBuildMetadata(options, executable),
+    readPluginBuildMetadata(executable),
+  ]);
+  if (profile.commit !== commit) {
+    throw new Error('Tauri profile manifest commit does not match the measurement checkout');
+  }
+  return validateCampaignMetadata({
+    build: { ...profile, ...plugins },
+    host: readHost(),
+  });
 }
 
 async function writeJsonAtomically(output, value) {
@@ -2820,13 +3199,37 @@ async function preserveFailureDiagnostic({
   return diagnostic;
 }
 
+function validateRoleMetrics(roles, label) {
+  assertPlainObject(roles, `${label} roles`);
+  assertExactKeys(roles, new Set(PROCESS_ROLES), `${label} roles`);
+  for (const role of PROCESS_ROLES) {
+    assertPlainObject(roles[role], `${label} ${role} role`);
+    assertExactKeys(
+      roles[role],
+      new Set(['processCount', 'rssBytes']),
+      `${label} ${role} role`,
+    );
+    for (const field of ['processCount', 'rssBytes']) {
+      if (!Number.isSafeInteger(roles[role][field]) || roles[role][field] < 0) {
+        throw new Error(`${label} ${role} ${field} must be a non-negative safe integer`);
+      }
+    }
+  }
+  return roles;
+}
+
 export async function runMeasurementCampaign(
   options,
-  { measure = measureOnce, environment = process.env } = {},
+  {
+    measure = measureOnce,
+    environment = process.env,
+    readCampaignMetadata: readMetadata = readCampaignMetadata,
+  } = {},
 ) {
   const executable = path.resolve(options.executable);
   const campaignId = randomUUID();
   const { sensitiveValues } = filterSpawnEnvironment(environment, 'diagnostic-redaction');
+  const { build, host } = validateCampaignMetadata(await readMetadata({ options, executable }));
   await clearPreviousCampaignArtifacts(options.output);
   const rawRuns = [];
   for (let runIndex = 1; runIndex <= options.runs; runIndex++) {
@@ -2861,6 +3264,7 @@ export async function runMeasurementCampaign(
           runId = verifiedRunId;
         },
       }));
+      validateRoleMetrics(rawRuns.at(-1)?.metrics?.roles, `measurement run ${runIndex}`);
     } catch (error) {
       const runSensitiveValues = [
         ...sensitiveValues,
@@ -2892,7 +3296,8 @@ export async function runMeasurementCampaign(
     platform: process.platform,
     arch: process.arch,
     executable,
-    commit: currentCommit(),
+    build,
+    host,
     runs: rawRuns,
     median: {
       targetFileOpenedMs: median(
@@ -2900,6 +3305,10 @@ export async function runMeasurementCampaign(
       ),
       rssBytes: median(rawRuns.map(run => run.metrics.rssBytes)),
       processCount: median(rawRuns.map(run => run.metrics.processCount)),
+      roles: Object.fromEntries(PROCESS_ROLES.map(role => [role, {
+        processCount: median(rawRuns.map(run => run.metrics.roles[role].processCount)),
+        rssBytes: median(rawRuns.map(run => run.metrics.roles[role].rssBytes)),
+      }])),
     },
   };
   await writeJsonAtomically(options.output, measurement);
