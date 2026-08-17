@@ -2371,6 +2371,53 @@ test('POSIX owned group rejects a new owned-looking child after TERM', async () 
   assert.deepEqual(rows, [newChild]);
 });
 
+test('POSIX owned group adopts a newly marked member after TERM', async () => {
+  const runId = '7f7df1aa-a324-4fd4-b11c-4cc260a94d8f';
+  const rootIdentity = {
+    pid: 100,
+    pgid: 100,
+    creationTime: 'root-start',
+    startedAt: 1_000,
+  };
+  const newChild = {
+    pid: 203,
+    ppid: 1,
+    pgid: 100,
+    creationTime: 'late-child',
+    startedAt: 2_000,
+  };
+  let rows = [{ ...rootIdentity, ppid: 1 }];
+  const signals = [];
+
+  await terminateMeasuredTree({
+    rootPid: 100,
+    rootIdentity,
+    ownedGroup: { pgid: 100, rootIdentity, startedAt: 1_000 },
+    runId,
+  }, 'linux', {
+    read: () => rows,
+    discoverMarked: () => ({ rows, markedRows: [...rows] }),
+    kill: (pid, signal) => {
+      signals.push([pid, signal]);
+      if (signal === 'SIGTERM' && pid === 100) {
+        rows = [newChild];
+        return true;
+      }
+      if (signal === 'SIGKILL' && pid === 203) {
+        rows = [];
+        return true;
+      }
+      return false;
+    },
+    delay: async () => undefined,
+    cleanupReadAttempts: 1,
+    cleanupVerifyAttempts: 1,
+  });
+
+  assert.deepEqual(signals, [[100, 'SIGTERM'], [203, 'SIGKILL']]);
+  assert.deepEqual(rows, []);
+});
+
 test('POSIX owned group rejects a frozen PID whose process identity changes after TERM', async () => {
   const rootIdentity = {
     pid: 100,

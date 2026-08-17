@@ -2178,6 +2178,12 @@ export async function terminateMeasuredTree(
   const stableOwnedGroupMemberKey = processRow => (
     `${processRow.pid}\0${processRow.creationTime}`
   );
+  const hasVerifiedRunProvenance = processRow => markerEnabled && (
+    latestMarkedProcesses.some(identity => sameProcessIdentity(processRow, identity))
+      || latestTrustedUnreadableProcesses.some(
+        identity => sameProcessIdentity(processRow, identity),
+      )
+  );
   const inspectOwnedGroup = currentRows => {
     if (!trustedOwnedGroup) {
       return undefined;
@@ -2197,11 +2203,23 @@ export async function terminateMeasuredTree(
     if (eligibleMembers.length !== allMembers.length) {
       ownedGroupHasUntrustedChronology = true;
     }
-    if (frozenOwnedGroupMembers !== undefined
-        && allMembers.some(processRow => !frozenOwnedGroupMembers.has(
-          trackedProcessKey(processRow),
-        ))) {
-      ownedGroupMembershipChanged = true;
+    if (frozenOwnedGroupMembers !== undefined) {
+      for (const processRow of allMembers) {
+        const key = trackedProcessKey(processRow);
+        if (frozenOwnedGroupMembers.has(key)) {
+          continue;
+        }
+        // Marker discovery runs immediately before this inspection. A new
+        // exact member carrying this run's UUID (or its reattested unreadable
+        // identity) belongs to the measured launch and may be included in the
+        // SIGKILL pass. Unmarked additions still latch fail-closed.
+        if (hasVerifiedRunProvenance(processRow)) {
+          frozenOwnedGroupMembers.add(key);
+          frozenOwnedGroupStableMembers?.add(stableOwnedGroupMemberKey(processRow));
+        } else {
+          ownedGroupMembershipChanged = true;
+        }
+      }
     }
     if (frozenOwnedGroupStableMembers !== undefined
         && currentRows.some(processRow => (
