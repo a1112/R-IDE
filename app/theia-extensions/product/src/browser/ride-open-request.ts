@@ -52,6 +52,13 @@ export const DEFAULT_RIDE_DEFERRED_WORK_SCHEDULER: RideDeferredWorkScheduler = {
     clearTimeout: handle => globalThis.clearTimeout(handle as ReturnType<typeof setTimeout>)
 };
 
+export const DEFAULT_RIDE_STARTUP_MEMORY_RELEASE = (): void => {
+    const collector = (globalThis as typeof globalThis & { gc?: () => void }).gc;
+    if (typeof collector === 'function') {
+        collector();
+    }
+};
+
 const NO_FILE_PLUGIN_FALLBACK_DELAY_MS = 1_500;
 
 export class RidePluginDeploymentScheduler implements Disposable {
@@ -160,7 +167,8 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
         protected readonly startupMilestoneReporter: StartupMilestoneReporter = reportRideStartupMilestone,
         protected readonly startHostedPluginResolution: () => void = () => undefined,
         protected readonly pluginDeployment?: RidePluginDeploymentScheduler,
-        protected readonly deferredWorkScheduler: RideDeferredWorkScheduler = DEFAULT_RIDE_DEFERRED_WORK_SCHEDULER
+        protected readonly deferredWorkScheduler: RideDeferredWorkScheduler = DEFAULT_RIDE_DEFERRED_WORK_SCHEDULER,
+        protected readonly releaseStartupMemory: () => void = DEFAULT_RIDE_STARTUP_MEMORY_RELEASE
     ) {
         this.storage = storage ?? window.sessionStorage;
         this.initializationComplete = new Promise(resolve => {
@@ -480,6 +488,11 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
             return;
         }
         await this.reportStartupMilestone('plugins_ready');
+        try {
+            this.releaseStartupMemory();
+        } catch (error) {
+            console.warn('[R-IDE] Failed to release startup memory.', error);
+        }
     }
 
     protected async reportStartupMilestone(milestone: RideStartupMilestone): Promise<void> {
