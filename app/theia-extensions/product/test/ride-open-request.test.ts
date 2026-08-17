@@ -629,6 +629,78 @@ test('failed target still schedules fallback when error notification also fails'
     }
 });
 
+test('restored queue cancels a failed target fallback while the next target is still opening', async () => {
+    const events: string[] = [];
+    const secondTargetOpened = deferred<void>();
+    const storage = new MemoryStorage();
+    storage.setItem(RIDE_OPEN_REQUEST_STATE_KEY, JSON.stringify(stateEnvelope('67', {
+        id: '66', source: 'initial', workspace: '/project', files: ['/project/first-fails.R']
+    }, {
+        id: '67', source: 'initial', workspace: '/project', files: ['/project/second-slow.R']
+    })));
+    const pluginServer = deferred<{ install(entry: string, type?: PluginType): Promise<void> }>();
+    const deployment = new RidePluginDeploymentScheduler(
+        pluginServer.promise,
+        async () => ['/plugins'],
+        undefined,
+        () => {
+            events.push('resolve:plugin-server');
+            pluginServer.resolve({ install: async () => { events.push('deploy:plugins'); } });
+        }
+    );
+    const deferredWork = new FakeDeferredWorkScheduler(events);
+    const context = createContribution(
+        '/project',
+        storage,
+        async uri => {
+            events.push(`open:${uri.path.toString()}`);
+            if (uri.path.toString().endsWith('/first-fails.R')) {
+                throw new Error('first editor unavailable');
+            }
+            await secondTargetOpened.promise;
+        },
+        async milestone => { events.push(`milestone:${milestone}`); },
+        new FakeApplicationStateService(),
+        new FakeHostedPluginSupport(),
+        deployment,
+        new FakeNativeChrome(),
+        deferredWork,
+        () => { events.push('resolve:hosted-plugins'); },
+        () => { events.push('activate:target-widget'); }
+    );
+
+    context.contribution.onStart();
+    await flushLifecycle();
+    assert.deepEqual(events, [
+        'milestone:frontend_shell_attached',
+        'open:/project/first-fails.R',
+        'open:/project/second-slow.R'
+    ]);
+
+    deferredWork.fireTimer();
+    await flushLifecycle();
+    assert.deepEqual(events, [
+        'milestone:frontend_shell_attached',
+        'open:/project/first-fails.R',
+        'open:/project/second-slow.R'
+    ], 'a fallback from the failed queue head must not start plugins during the next target open');
+
+    secondTargetOpened.resolve();
+    await flushLifecycle();
+    assert.deepEqual(events, [
+        'milestone:frontend_shell_attached',
+        'open:/project/first-fails.R',
+        'open:/project/second-slow.R',
+        'activate:target-widget',
+        'milestone:target_file_opened',
+        'yield',
+        'resolve:hosted-plugins',
+        'resolve:plugin-server',
+        'deploy:plugins'
+    ]);
+    assert.equal(deferredWork.scheduledDelays.length, 0, 'the queue must not schedule a fallback between targets');
+});
+
 test('target milestone reporting failure cannot block deferred plugin startup', async () => {
     const events: string[] = [];
     const deferredWork = new FakeDeferredWorkScheduler(events);

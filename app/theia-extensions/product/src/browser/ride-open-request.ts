@@ -172,6 +172,7 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
     protected pluginObservationStarted = false;
     protected hostedPluginResolutionStarted = false;
     protected pluginActivationScheduled = false;
+    protected dispatchingPendingTargets = false;
     protected pluginFallbackTimer: unknown | undefined;
     protected pluginActivation: Promise<boolean> | undefined;
     protected readonly pluginWillStart: Promise<ObservedPluginPromise>;
@@ -372,6 +373,7 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
     }
 
     protected async openFiles(request: RideOpenRequest): Promise<void> {
+        this.cancelPluginFallback();
         this.targetOpenAttempted = true;
         let targetWidgetId: string | undefined;
         let openedTarget = false;
@@ -440,7 +442,7 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
     }
 
     protected schedulePluginFallback(): void {
-        if (this.disposed || this.pluginFallbackTimer !== undefined
+        if (this.disposed || this.dispatchingPendingTargets || this.pluginFallbackTimer !== undefined
             || this.pluginActivation || this.pluginActivationScheduled) {
             return;
         }
@@ -607,26 +609,37 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
 
     protected async dispatchPendingRequests(initialState: RideOpenRequestState): Promise<void> {
         let state = initialState;
-        while (state.requests.length > 0) {
-            const request = state.requests[0];
-            if (!this.isCurrentWorkspace(request.workspace)) {
-                try {
-                    this.workspaceService.open(FileUri.create(request.workspace), { preserveWindow: true });
-                } catch (error) {
-                    await this.messageService.error(`R-IDE could not switch workspace: ${errorMessage(error)}`);
+        let attemptedTarget = false;
+        this.dispatchingPendingTargets = true;
+        this.cancelPluginFallback();
+        try {
+            while (state.requests.length > 0) {
+                const request = state.requests[0];
+                if (!this.isCurrentWorkspace(request.workspace)) {
+                    try {
+                        this.workspaceService.open(FileUri.create(request.workspace), { preserveWindow: true });
+                    } catch (error) {
+                        await this.messageService.error(`R-IDE could not switch workspace: ${errorMessage(error)}`);
+                    }
+                    return;
                 }
-                return;
-            }
 
-            const nextState: RideOpenRequestState = {
-                ...state,
-                requests: state.requests.slice(1)
-            };
-            if (!await this.commitState(nextState)) {
-                return;
+                const nextState: RideOpenRequestState = {
+                    ...state,
+                    requests: state.requests.slice(1)
+                };
+                if (!await this.commitState(nextState)) {
+                    return;
+                }
+                attemptedTarget = true;
+                await this.openFiles(request);
+                state = nextState;
             }
-            await this.openFiles(request);
-            state = nextState;
+        } finally {
+            this.dispatchingPendingTargets = false;
+            if (attemptedTarget && !this.targetFileOpened) {
+                this.schedulePluginFallback();
+            }
         }
     }
 
