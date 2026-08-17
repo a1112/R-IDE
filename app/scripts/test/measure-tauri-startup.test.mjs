@@ -448,6 +448,23 @@ test('parses POSIX ps and Windows PowerShell process table fixtures', () => {
   );
 });
 
+test('POSIX process parsing ignores kernel rows without a signalable process group', () => {
+  assert.deepEqual(
+    parsePosixProcessTable(`
+      2 0 0 0 Sat Aug 15 12:34:55 2026
+      10 1 10 1 Sat Aug 15 12:34:56 2026
+    `),
+    [{
+      pid: 10,
+      ppid: 1,
+      pgid: 10,
+      rssBytes: 1_024,
+      creationTime: 'Sat Aug 15 12:34:56 2026',
+      startedAt: Date.parse('Sat Aug 15 12:34:56 2026'),
+    }],
+  );
+});
+
 test('Linux proc environment parsing matches only the exact startup run marker entry', () => {
   const runId = '7f7df1aa-a324-4fd4-b11c-4cc260a94d8f';
   assert.equal(parseLinuxProcEnvironment(Buffer.from(

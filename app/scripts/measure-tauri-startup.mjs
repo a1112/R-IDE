@@ -567,7 +567,7 @@ export function parsePosixProcessTable(output) {
       throw new Error('ps pid must be positive');
     }
     if (pgid === 0) {
-      throw new Error('ps pgid must be positive');
+      continue;
     }
     if (!creationTime) {
       throw new Error('ps lstart must not be empty');
