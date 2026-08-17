@@ -83,7 +83,7 @@ function measurement({
   runs = 5,
   platform = 'win32',
   arch = 'x64',
-  fingerprint = 'a'.repeat(64),
+  fingerprint = HISTORICAL_BASELINE_MIGRATION.hostFingerprint,
   commit = '0123456789abcdef0123456789abcdef01234567',
 } = {}) {
   const samples = Array.from(
@@ -95,7 +95,6 @@ function measurement({
     version: 2,
     platform,
     arch,
-    executable: 'C:\\Program Files\\R-IDE\\ride-tauri.exe',
     build: {
       commit,
       profile: 'tauri-critical',
@@ -122,12 +121,8 @@ function legacyBaseline() {
     version: 1,
     platform: 'win32',
     arch: 'x64',
-    executable: 'C:\\historical\\ride-tauri.exe',
     commit: 'd034943b7a6094808b2ffe56eea2b41c3666b613',
-    migration: {
-      ...HISTORICAL_BASELINE_MIGRATION,
-      hostFingerprint: 'a'.repeat(64),
-    },
+    migration: { ...HISTORICAL_BASELINE_MIGRATION },
     runs: Array.from(
       { length: 5 },
       (_, index) => startupRun(targetFileOpenedMs, rssBytes, 8_300 + index),
@@ -197,6 +192,41 @@ test('rejects incompatible platform, architecture, and host identity', () => {
   }
 });
 
+test('requires matching v2 build contracts while allowing the candidate commit to change', () => {
+  const baseline = measurement({
+    targetFileOpenedMs: 5_310,
+    rssBytes: 1_154_154_496,
+    commit: '1'.repeat(40),
+  });
+  const compatible = measurement({
+    targetFileOpenedMs: 3_717,
+    rssBytes: 1_038_739_046,
+    commit: '2'.repeat(40),
+  });
+  assert.equal(compareTauriPerformance(baseline, compatible, {
+    minStartupGain: 30,
+    minMemoryGain: 10,
+  }).runs, 5);
+
+  const incompatible = [
+    ['profile', 'full'],
+    ['profileSha256', 'd'.repeat(64)],
+    ['pluginManifestSha256', 'e'.repeat(64)],
+    ['pluginCount', 70],
+  ];
+  for (const [field, value] of incompatible) {
+    const candidate = structuredClone(compatible);
+    candidate.build[field] = value;
+    assert.throws(
+      () => compareTauriPerformance(baseline, candidate, {
+        minStartupGain: 30,
+        minMemoryGain: 10,
+      }),
+      new RegExp(`build.*${field}|${field}.*build`, 'i'),
+    );
+  }
+});
+
 test('rejects missing build identity and non-strict v2 role data', () => {
   const baseline = measurement({ targetFileOpenedMs: 5_310, rssBytes: 1_154_154_496 });
   const missingBuild = measurement({ targetFileOpenedMs: 3_000, rssBytes: 900_000_000 });
@@ -217,6 +247,19 @@ test('rejects missing build identity and non-strict v2 role data', () => {
       minMemoryGain: 10,
     }),
     /webviewGpu/,
+  );
+});
+
+test('strict v2 schema rejects persisted executable paths', () => {
+  const baseline = measurement({ targetFileOpenedMs: 5_310, rssBytes: 1_154_154_496 });
+  const candidate = measurement({ targetFileOpenedMs: 3_717, rssBytes: 1_038_739_046 });
+  candidate.executable = 'C:\\sensitive\\ride-tauri.exe';
+  assert.throws(
+    () => compareTauriPerformance(baseline, candidate, {
+      minStartupGain: 30,
+      minMemoryGain: 10,
+    }),
+    /unexpected field executable/,
   );
 });
 
@@ -288,6 +331,22 @@ test('accepts v1 only with the explicit historical d034943 migration marker', ()
     }),
     /historical d034943 migration marker/,
   );
+
+  const tamperedFingerprint = 'f'.repeat(64);
+  const tamperedMarker = legacyBaseline();
+  tamperedMarker.migration.hostFingerprint = tamperedFingerprint;
+  const matchingTamperedCandidate = measurement({
+    targetFileOpenedMs: 3_717,
+    rssBytes: 1_038_739_046,
+    fingerprint: tamperedFingerprint,
+  });
+  assert.throws(
+    () => compareTauriPerformance(tamperedMarker, matchingTamperedCandidate, {
+      minStartupGain: 30,
+      minMemoryGain: 10,
+    }),
+    /historical d034943 migration marker/,
+  );
 });
 
 test('checked-in historical baseline carries the one-time migration marker', () => {
@@ -302,11 +361,9 @@ test('checked-in historical baseline carries the one-time migration marker', () 
     'pre-optimization-windows-x64-d034943.json',
   );
   const baseline = JSON.parse(fs.readFileSync(baselinePath, 'utf8'));
-  assert.deepEqual(
-    Object.fromEntries(Object.entries(baseline.migration ?? {}).filter(([key]) => key !== 'hostFingerprint')),
-    HISTORICAL_BASELINE_MIGRATION,
-  );
-  assert.match(baseline.migration.hostFingerprint, /^[0-9a-f]{64}$/);
+  assert.deepEqual(baseline.migration, HISTORICAL_BASELINE_MIGRATION);
+  assert.equal(Object.hasOwn(baseline, 'executable'), false);
+  assert.doesNotMatch(JSON.stringify(baseline), /ride-open-with-startup-target|"commandLine"/i);
 });
 
 test('package script pins the historical baseline and required gains', () => {

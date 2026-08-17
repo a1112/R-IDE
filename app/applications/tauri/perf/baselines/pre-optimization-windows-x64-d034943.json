@@ -3,7 +3,6 @@
   "version": 1,
   "platform": "win32",
   "arch": "x64",
-  "executable": "L:\\project\\ride-open-with-startup-target\\release\\ride-tauri.exe",
   "commit": "d034943b7a6094808b2ffe56eea2b41c3666b613",
   "migration": {
     "schema": "ride.startup-measurement-v1-baseline-migration",

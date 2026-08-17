@@ -45,6 +45,7 @@ export const HISTORICAL_BASELINE_MIGRATION = Object.freeze({
   version: 1,
   id: 'pre-optimization-windows-x64-d034943',
   commit: 'd034943b7a6094808b2ffe56eea2b41c3666b613',
+  hostFingerprint: 'c9d29a9892dd025c849e37d6217666e51451ce32c3c3a57390aa8d2dd1f98c37',
 });
 
 function fail(message) {
@@ -289,7 +290,6 @@ function validateV2Measurement(measurement, label, { exactlyFive }) {
     'version',
     'platform',
     'arch',
-    'executable',
     'build',
     'host',
     'runs',
@@ -300,7 +300,6 @@ function validateV2Measurement(measurement, label, { exactlyFive }) {
   }
   nonEmptyString(measurement.platform, `${label} platform`);
   nonEmptyString(measurement.arch, `${label} architecture`);
-  nonEmptyString(measurement.executable, `${label} executable`);
   validateBuild(measurement.build, label);
   validateHost(measurement.host, measurement, label);
   if (!Array.isArray(measurement.runs)) {
@@ -323,16 +322,13 @@ function validateV2Measurement(measurement, label, { exactlyFive }) {
 function validateMigration(migration) {
   exactKeys(
     migration,
-    [...Object.keys(HISTORICAL_BASELINE_MIGRATION), 'hostFingerprint'],
+    Object.keys(HISTORICAL_BASELINE_MIGRATION),
     'historical d034943 migration marker',
   );
   for (const [key, value] of Object.entries(HISTORICAL_BASELINE_MIGRATION)) {
     if (migration[key] !== value) {
       fail('baseline v1 requires the explicit historical d034943 migration marker');
     }
-  }
-  if (!SHA256_PATTERN.test(migration.hostFingerprint)) {
-    fail('historical d034943 migration marker hostFingerprint must be a canonical SHA-256');
   }
 }
 
@@ -410,6 +406,18 @@ export function compareTauriPerformance(
   }
   if (baseline.hostFingerprint !== candidate.hostFingerprint) {
     fail('baseline and candidate host fingerprint are incompatible');
+  }
+  if (baseline.measurement.version === 2) {
+    for (const field of [
+      'profile',
+      'profileSha256',
+      'pluginManifestSha256',
+      'pluginCount',
+    ]) {
+      if (baseline.measurement.build[field] !== candidate.measurement.build[field]) {
+        fail(`baseline and candidate build ${field} are incompatible`);
+      }
+    }
   }
 
   const startupTarget = gainTarget(baseline.medians.targetFileOpenedMs, startupGain);

@@ -3131,7 +3131,6 @@ async function readBoundedLogFile(logPath, sensitiveValues) {
 
 async function preserveFailureDiagnostic({
   options,
-  executable,
   campaignId,
   runIndex,
   completedRuns,
@@ -3182,7 +3181,6 @@ async function preserveFailureDiagnostic({
     completedRuns,
     platform: process.platform,
     arch: process.arch,
-    executable: path.resolve(executable),
     output: resolvedOutput,
     campaignId,
     runIndex,
@@ -3268,11 +3266,11 @@ export async function runMeasurementCampaign(
     } catch (error) {
       const runSensitiveValues = [
         ...sensitiveValues,
+        executable,
         ...(runId === undefined ? [] : [runId]),
       ];
       const diagnostic = await preserveFailureDiagnostic({
         options,
-        executable,
         campaignId,
         runIndex,
         completedRuns: [...rawRuns],
@@ -3295,7 +3293,6 @@ export async function runMeasurementCampaign(
     version: MEASUREMENT_VERSION,
     platform: process.platform,
     arch: process.arch,
-    executable,
     build,
     host,
     runs: rawRuns,

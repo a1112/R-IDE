@@ -582,7 +582,10 @@ test('classifies verified process roles by precedence without persisting process
 
   const aggregate = aggregateProcessTree(rows, rootIdentity);
   assert.deepEqual(aggregate.roles, classifyProcessRoles(rows, rootIdentity));
-  assert.doesNotMatch(JSON.stringify(aggregate), /commandLine|plugin-host|msedgewebview2/i);
+  assert.doesNotMatch(
+    JSON.stringify(aggregate),
+    /"executable"|"commandLine"|C:\\R-IDE|plugin-host|msedgewebview2/i,
+  );
 });
 
 test('Linux proc environment parsing matches only the exact startup run marker entry', () => {
@@ -4681,11 +4684,14 @@ test('failed campaign atomically preserves diagnostics, report, and unique copie
       }, campaignDependencies({
         measure: async options => {
           calls++;
-          fs.writeFileSync(options.stdoutLogPath, `stdout run ${calls}\n`);
+          fs.writeFileSync(
+            options.stdoutLogPath,
+            `stdout run ${calls} executable ${path.resolve(executable)}\n`,
+          );
           fs.writeFileSync(options.stderrLogPath, `stderr run ${calls}\n`);
           if (calls === 2) {
             fs.writeFileSync(options.reportPath, JSON.stringify(startupReport(finalMilestones)));
-            throw new Error('fixture startup failed');
+            throw new Error(`fixture startup failed at ${path.resolve(executable)}`);
           }
           return completedRun;
         },
@@ -4694,14 +4700,17 @@ test('failed campaign atomically preserves diagnostics, report, and unique copie
     );
 
     const failurePath = path.join(root, 'startup-metrics.failure.json');
-    const diagnostic = JSON.parse(fs.readFileSync(failurePath, 'utf8'));
+    const serializedDiagnostic = fs.readFileSync(failurePath, 'utf8');
+    const diagnostic = JSON.parse(serializedDiagnostic);
     assert.equal(diagnostic.status, 'failed');
-    assert.equal(diagnostic.error.message, 'fixture startup failed');
+    assert.equal(diagnostic.error.message, 'fixture startup failed at [REDACTED]');
     assert.deepEqual(diagnostic.completedRuns, [completedRun]);
     assert.equal(diagnostic.runIndex, 2);
     assert.equal(diagnostic.platform, process.platform);
     assert.equal(diagnostic.arch, process.arch);
-    assert.equal(diagnostic.executable, path.resolve(executable));
+    assert.equal(Object.hasOwn(diagnostic, 'executable'), false);
+    assert.equal(serializedDiagnostic.includes(path.resolve(executable)), false);
+    assert.doesNotMatch(serializedDiagnostic, /"commandLine"|"executable"/);
     assert.equal(diagnostic.output, path.resolve(output));
     assert.match(diagnostic.campaignId, /^[0-9a-f-]{36}$/i);
     assert.deepEqual(diagnostic.startupReport, startupReport(finalMilestones));
@@ -4721,7 +4730,7 @@ test('failed campaign atomically preserves diagnostics, report, and unique copie
     const stderrCopy = path.resolve(root, diagnostic.logs.stderr);
     assert.equal(path.dirname(stdoutCopy), path.dirname(stderrCopy));
     assert.equal(path.dirname(stdoutCopy), ownedDiagnostics);
-    assert.equal(fs.readFileSync(stdoutCopy, 'utf8'), 'stdout run 2\n');
+    assert.equal(fs.readFileSync(stdoutCopy, 'utf8'), 'stdout run 2 executable [REDACTED]\n');
     assert.equal(fs.readFileSync(stderrCopy, 'utf8'), 'stderr run 2\n');
     assert.equal(fs.existsSync(output), false);
     assert.equal(fs.existsSync(staleDiagnostics), true);
@@ -5113,6 +5122,8 @@ test('campaign v2 records build and host identity plus per-role medians', async 
     assert.deepEqual(measurement.build, build);
     assert.deepEqual(measurement.host, host);
     assert.equal(measurement.runs[0].startupReport.version, 1);
+    assert.equal(Object.hasOwn(measurement, 'executable'), false);
+    assert.doesNotMatch(JSON.stringify(measurement), /"commandLine"|"executable"/);
     assert.deepEqual(measurement.median.roles.backend, {
       processCount: 1,
       rssBytes: 30,
@@ -5300,7 +5311,11 @@ test('successful campaign writes only the measurement artifact', async () => {
     }));
 
     assert.equal(measurement.runs.length, 1);
-    assert.deepEqual(JSON.parse(fs.readFileSync(output, 'utf8')), measurement);
+    const serializedMeasurement = fs.readFileSync(output, 'utf8');
+    assert.deepEqual(JSON.parse(serializedMeasurement), measurement);
+    assert.equal(Object.hasOwn(measurement, 'executable'), false);
+    assert.equal(serializedMeasurement.includes(path.resolve(executable)), false);
+    assert.doesNotMatch(serializedMeasurement, /"commandLine"|"executable"/);
     assert.equal(fs.existsSync(path.join(root, 'startup-metrics.failure.json')), false);
     assert.equal(fs.existsSync(staleDiagnostics), true);
     assert.equal(fs.readFileSync(similarlyNamedFile, 'utf8'), 'keep file');
