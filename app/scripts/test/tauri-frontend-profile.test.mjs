@@ -205,6 +205,35 @@ test('does not apply an unselected browser root range to a nested runtime depend
     assert.deepEqual(result.packages.map(entry => entry.requestName), ['fs-extra', 'helper', 'product']);
 });
 
+test('applies a browser root range only to the root request, not a nested package with the same name', async () => {
+    const browserDirectory = path.resolve('browser-app');
+    const graph = await resolveInstalledPackageGraph({
+        browserManifest: { dependencies: { product: '^1.0.0', 'fs-extra': '^9.1.0' } },
+        roots: ['product', 'fs-extra'],
+        browserDirectory,
+        resolver: async (requestName, fromDirectory) => {
+            const nested = requestName === 'fs-extra' && path.basename(fromDirectory) === 'helper';
+            const packageKey = nested ? 'fs-extra-nested' : requestName;
+            const manifests = {
+                product: manifest('product', { helper: '^1.0.0' }),
+                helper: { name: 'helper', version: '1.0.0', dependencies: { 'fs-extra': '^4.0.0' } },
+                'fs-extra': { name: 'fs-extra', version: '9.1.0' },
+                'fs-extra-nested': { name: 'fs-extra', version: '4.0.3' },
+            };
+            return {
+                requestName,
+                packageDirectory: path.join(path.resolve('installed'), packageKey),
+                manifest: manifests[packageKey],
+            };
+        },
+    });
+
+    assert.deepEqual(
+        [...graph.records.values()].filter(record => record.requestName === 'fs-extra').map(record => record.manifest.version).sort(),
+        ['4.0.3', '9.1.0'],
+    );
+});
+
 test('uses exact package names for deferred conflicts without prefix matching', () => {
     const packages = {
         product: manifest('product', { '@theia/notebook': '^1.0.0', '@theia/ai-core': '^1.0.0' }),

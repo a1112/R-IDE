@@ -823,8 +823,7 @@ export async function resolveInstalledPackageGraph({ browserManifest, roots, res
     const dependenciesByNode = new Map();
     const rootNodeIds = new Map();
     const extensionRecords = new Map();
-    const rootSet = new Set(roots);
-    const load = async (requestName, spec, fromDirectory, dependencyPath, optional = false) => {
+    const load = async (requestName, spec, fromDirectory, dependencyPath, optional = false, rootRequest = false) => {
         const expected = parseDependencySpec(requestName, spec);
         if (!semver.validRange(expected.range)) {
             throw new Error(`${dependencyPath.join(' -> ')}: dependency "${requestName}" has invalid dependency range "${expected.range}".`);
@@ -847,9 +846,9 @@ export async function resolveInstalledPackageGraph({ browserManifest, roots, res
             installed.manifest,
             dependencyPath,
             'parent dependency',
-            rootSet.has(requestName) || isTheiaExtension(installed.manifest),
+            rootRequest || isTheiaExtension(installed.manifest),
         );
-        if (rootSet.has(requestName)) {
+        if (rootRequest) {
             validateInstalledManifest(
                 requestName,
                 browserManifest.dependencies[requestName],
@@ -914,7 +913,7 @@ export async function resolveInstalledPackageGraph({ browserManifest, roots, res
         if (typeof spec !== 'string') {
             throw new Error(`Unknown profile root "${root}".`);
         }
-        rootNodeIds.set(root, await load(root, spec, browserDirectory, [root]));
+        rootNodeIds.set(root, await load(root, spec, browserDirectory, [root], false, true));
     }
     return { records, dependenciesByNode, rootNodeIds, extensionRecords };
 }
