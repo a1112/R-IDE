@@ -1,6 +1,7 @@
 /**
- * This file can be edited to adjust the ESBuild build process.
- * To reset, delete this file and rerun theia build again.
+ * Custom build hooks shared by the tracked browser app and generated Tauri
+ * profile targets. Profile selection happens before Theia generation, so this
+ * file never edits generated source files or removes modules by string match.
  */
 import { browserOptions, watch, __dirname, join } from './gen-esbuild.browser.mjs';
 import { nodeOptions } from './gen-esbuild.node.mjs';
@@ -11,134 +12,19 @@ import { createTheiaModuleDedupePlugin } from './ride-esbuild-dedupe.mjs';
 
 import esbuild from 'esbuild';
 
-const leanTauriModulePrefixes = [
-    '@theia/ai-',
-    '@theia/bulk-edit/',
-    '@theia/callhierarchy/',
-    '@theia/console/',
-    '@theia/collaboration/',
-    '@theia/editor-preview/',
-    '@theia/getting-started/',
-    '@theia/keymaps/',
-    '@theia/memory-inspector/',
-    '@theia/metrics/',
-    '@theia/mini-browser/',
-    '@theia/notebook/',
-    '@theia/plugin-dev/',
-    '@theia/preview/',
-    '@theia/property-view/',
-    '@theia/scanoss/',
-    '@theia/secondary-window/',
-    '@theia/timeline/',
-    '@theia/toolbar/',
-    '@theia/typehierarchy/',
-    '@theia/vsx-registry/'
-];
-
-const leanTauriPluginModulePrefixes = [
-    '@theia/plugin-ext/',
-    '@theia/plugin-ext-vscode/'
-];
-
-const leanTauriExtensionNames = [
-    '@theia/ai-',
-    '@theia/bulk-edit',
-    '@theia/callhierarchy',
-    '@theia/console',
-    '@theia/collaboration',
-    '@theia/editor-preview',
-    '@theia/getting-started',
-    '@theia/keymaps',
-    '@theia/memory-inspector',
-    '@theia/metrics',
-    '@theia/mini-browser',
-    '@theia/notebook',
-    '@theia/plugin-dev',
-    '@theia/preview',
-    '@theia/property-view',
-    '@theia/scanoss',
-    '@theia/secondary-window',
-    '@theia/timeline',
-    '@theia/toolbar',
-    '@theia/typehierarchy',
-    '@theia/vsx-registry'
-];
-
-const leanTauriPluginExtensionNames = [
-    '@theia/plugin-ext',
-    '@theia/plugin-ext-vscode'
-];
-
-function shouldKeepTauriPlugins() {
-    return process.env.RIDE_TAURI_ENABLE_PLUGINS === '1' || process.env.RIDE_TAURI_ENABLE_PLUGINS === 'true';
-}
-
-function shouldFilterLeanTauriRequire(line) {
-    return leanTauriModulePrefixes.some(prefix => line.includes(`require('${prefix}`))
-        || (!shouldKeepTauriPlugins() && leanTauriPluginModulePrefixes.some(prefix => line.includes(`require('${prefix}`)));
-}
-
-function shouldFilterLeanTauriExtension(name) {
-    return leanTauriExtensionNames.some(prefix => name.startsWith(prefix))
-        || (!shouldKeepTauriPlugins() && leanTauriPluginExtensionNames.some(prefix => name.startsWith(prefix)));
-}
-
-function patchGeneratedFilesForLeanTauri() {
-    const enabled = process.env.RIDE_TAURI_LEAN === '1' || process.env.RIDE_TAURI_LEAN === 'true';
-    if (!enabled) {
-        return;
-    }
-
-    const generatedFiles = [
-        path.join(__dirname, 'src-gen', 'frontend', 'index.js'),
-        path.join(__dirname, 'src-gen', 'frontend', 'secondary-index.js'),
-        path.join(__dirname, 'src-gen', 'backend', 'server.js')
-    ];
-
-    for (const file of generatedFiles) {
-        if (!fs.existsSync(file)) {
-            continue;
-        }
-        const source = fs.readFileSync(file, 'utf8');
-        const filtered = source
-            .split('\n')
-            .filter(line => !shouldFilterLeanTauriRequire(line))
-            .join('\n');
-        if (filtered !== source) {
-            fs.writeFileSync(file, filtered);
-        }
-    }
-
-    const backendMain = path.join(__dirname, 'src-gen', 'backend', 'main.js');
-    if (fs.existsSync(backendMain)) {
-        const source = fs.readFileSync(backendMain, 'utf8');
-        const filtered = source
-            .replace(/    \{\n        "name": "([^"]+)",\n        "version": "[^"]+"\n    \},?\n/g, (entry, name) => shouldFilterLeanTauriExtension(name) ? '' : entry)
-            .replace(/,\n\];/g, '\n];');
-        if (filtered !== source) {
-            fs.writeFileSync(backendMain, filtered);
-        }
-    }
-}
-
-function patchBuiltFilesForLeanTauri() {
-    const enabled = process.env.RIDE_TAURI_LEAN === '1' || process.env.RIDE_TAURI_LEAN === 'true';
-    if (!enabled) {
-        return;
-    }
-
+function patchBuiltRpcNotificationTarget() {
     const backendBundle = path.join(__dirname, 'lib', 'backend', 'main.js');
     if (!fs.existsSync(backendBundle)) {
         return;
     }
 
     const source = fs.readFileSync(backendBundle, 'utf8');
-    const filtered = source.replace(
+    const patched = source.replace(
         /onNotification\((\w+),\.\.\.(\w+)\)\{this\.target&&this\.target\[\1\]\(\.\.\.\2\)\}/,
         'onNotification($1,...$2){if(!this.target)return;const targetMethod=this.target[$1];typeof targetMethod==="function"?targetMethod.apply(this.target,$2):console.warn(`Ignoring RPC notification without target method: ${$1}`)}'
     );
-    if (filtered !== source) {
-        fs.writeFileSync(backendBundle, filtered);
+    if (patched !== source) {
+        fs.writeFileSync(backendBundle, patched);
     }
 }
 
@@ -164,14 +50,13 @@ function patchBuiltParcelWatcherLoad() {
     }
 }
 
-patchGeneratedFilesForLeanTauri();
-
 // Prevent Inversify service identifiers from being split across duplicate
-// @theia package copies in the mixed-version workspace.
+// @theia package copies in the mixed-version workspace. createRequire resolves
+// upward from an isolated profile target on every supported platform.
 browserOptions.plugins.push(createTheiaModuleDedupePlugin(__dirname));
 nodeOptions.plugins.push(createTheiaModuleDedupePlugin(__dirname));
 
-// serve favicon from root and inject link tag into index.html
+// Serve the favicon from the root and inject its link into generated HTML.
 browserOptions.plugins.push(
     copy({
         assets: [{
@@ -199,7 +84,6 @@ browserOptions.plugins.push(
 const browserContext = await esbuild.context(browserOptions);
 const nodeContext = await esbuild.context(nodeOptions);
 
-
 if (watch) {
     await Promise.all([
         browserContext.watch(),
@@ -212,8 +96,9 @@ if (watch) {
         await nodeContext.rebuild();
         await nodeContext.dispose();
         patchBuiltParcelWatcherLoad();
-        patchBuiltFilesForLeanTauri();
-    } catch {
+        patchBuiltRpcNotificationTarget();
+    } catch (error) {
+        console.error(error);
         process.exit(1);
     }
 }

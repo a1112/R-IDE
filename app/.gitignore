@@ -17,6 +17,11 @@ license-check-summary.txt*
 **/target/
 **/browser-frontend/
 **/tauri-frontend/
+**/.ride-tauri-profile/
+**/.ride-tauri-profile.tmp-*/
+**/.ride-tauri-profile.old-*/
+**/.ride-tauri-lib.tmp-*/
+**/.ride-tauri-lib.old-*/
 **/resources/backend/*
 **/resources/plugins/*
 !**/resources/backend/

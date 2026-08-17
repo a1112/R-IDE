@@ -1,0 +1,121 @@
+{
+  "schema": "ride.tauri-frontend-profile@1",
+  "profiles": {
+    "tauri-critical": {
+      "roots": [
+        "@theia/core",
+        "@theia/editor",
+        "@theia/filesystem",
+        "@theia/workspace",
+        "@theia/monaco",
+        "@theia/navigator",
+        "@theia/preferences",
+        "@theia/terminal",
+        "@theia/process",
+        "@theia/task",
+        "@theia/search-in-workspace",
+        "@theia/scm",
+        "@theia/markers",
+        "@theia/messages",
+        "@theia/output",
+        "@theia/userstorage",
+        "@theia/variable-resolver",
+        "@theia/plugin-ext",
+        "@theia/plugin-ext-vscode",
+        "theia-ide-product-ext"
+      ]
+    },
+    "full": {
+      "includeAllBrowserRoots": true
+    }
+  },
+  "deferredGroups": {
+    "ai": {
+      "roots": [
+        "@theia/ai-anthropic",
+        "@theia/ai-chat",
+        "@theia/ai-chat-ui",
+        "@theia/ai-claude-code",
+        "@theia/ai-code-completion",
+        "@theia/ai-codex",
+        "@theia/ai-copilot",
+        "@theia/ai-core-ui",
+        "@theia/ai-editor",
+        "@theia/ai-google",
+        "@theia/ai-history",
+        "@theia/ai-huggingface",
+        "@theia/ai-ide",
+        "@theia/ai-llamafile",
+        "@theia/ai-mcp-server",
+        "@theia/ai-mcp-ui",
+        "@theia/ai-ollama",
+        "@theia/ai-openai",
+        "@theia/ai-scanoss",
+        "@theia/ai-terminal",
+        "@theia/ai-vercel-ai"
+      ],
+      "retainedRoots": [
+        "@theia/ai-core",
+        "@theia/ai-mcp",
+        "@theia/ai-registry"
+      ],
+      "deferBlockedReason": "The product and hosted-plugin dependency closure requires these roots during initial application generation."
+    },
+    "collaboration": {
+      "roots": [
+        "@theia/collaboration"
+      ],
+      "retainedRoots": []
+    },
+    "notebook": {
+      "roots": [],
+      "retainedRoots": [
+        "@theia/notebook"
+      ],
+      "deferBlockedReason": "@theia/plugin-ext has a required dependency on @theia/notebook."
+    },
+    "preview-getting-started": {
+      "roots": [],
+      "retainedRoots": [
+        "@theia/editor-preview",
+        "@theia/getting-started",
+        "@theia/preview"
+      ],
+      "deferBlockedReason": "The product requires getting-started and hosted plugins require editor-preview; getting-started in turn requires preview."
+    },
+    "auxiliary": {
+      "roots": [
+        "@theia/dev-container",
+        "@theia/external-terminal",
+        "@theia/memory-inspector",
+        "@theia/metrics",
+        "@theia/plugin-dev",
+        "@theia/property-view",
+        "@theia/remote",
+        "@theia/scanoss",
+        "@theia/secondary-window",
+        "@theia/toolbar"
+      ],
+      "retainedRoots": [
+        "@theia/bulk-edit",
+        "@theia/callhierarchy",
+        "@theia/console",
+        "@theia/debug",
+        "@theia/file-search",
+        "@theia/keymaps",
+        "@theia/mini-browser",
+        "@theia/outline-view",
+        "@theia/terminal-manager",
+        "@theia/test",
+        "@theia/timeline",
+        "@theia/typehierarchy",
+        "@theia/vsx-registry"
+      ],
+      "deferBlockedReason": "These roots are transitive requirements of the critical editor, task, product, or hosted-plugin graph."
+    }
+  },
+  "buildDevDependencies": [
+    "@theia/bundle-plugin",
+    "@theia/cli"
+  ]
+}
