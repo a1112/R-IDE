@@ -18,6 +18,7 @@ import {
     resolveInstalledPackageGraph,
     resolveProfile,
     retryFilesystemOperation,
+    resolveInstalledManifest,
     selectCanonicalPackageManifest,
 } from '../tauri-frontend-profile.mjs';
 
@@ -548,6 +549,23 @@ test('finds the package root above nested module-format package metadata', async
         selectCanonicalPackageManifest(path.join(nestedDirectory, 'package.json')),
         path.join(packageDirectory, 'package.json'),
     );
+});
+
+test('resolves an installed package manifest when exports hide package metadata and the main entry', async t => {
+    const applicationDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-hidden-manifest-'));
+    t.after(() => fs.promises.rm(applicationDirectory, { recursive: true, force: true }));
+    const packageDirectory = path.join(applicationDirectory, 'node_modules', '@openai', 'codex-sdk');
+    await fs.promises.mkdir(packageDirectory, { recursive: true });
+    await fs.promises.writeFile(path.join(applicationDirectory, 'package.json'), '{}');
+    await fs.promises.writeFile(path.join(packageDirectory, 'package.json'), JSON.stringify({
+        name: '@openai/codex-sdk',
+        version: '0.1.0',
+        exports: { './types': './types.js' },
+    }));
+
+    const installed = await resolveInstalledManifest('@openai/codex-sdk', applicationDirectory);
+    assert.equal(installed.packageDirectory, packageDirectory);
+    assert.equal(installed.manifest.name, '@openai/codex-sdk');
 });
 
 async function writeSentinel(directory, value) {

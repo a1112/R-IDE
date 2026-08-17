@@ -801,14 +801,35 @@ export function selectCanonicalPackageManifest(manifestPath) {
     return findPackageManifest(manifestPath);
 }
 
-async function defaultResolveInstalledManifest(requestName, fromDirectory) {
+function findManifestOnPackageSearchPath(requestName, searchPaths) {
+    const segments = requestName.split('/');
+    const validSegments = requestName.startsWith('@')
+        ? segments.length === 2
+        : segments.length === 1;
+    if (!validSegments || segments.some(segment => !segment || segment === '.' || segment === '..' || segment.includes('\\'))) {
+        throw new Error(`Invalid installed package request name "${requestName}".`);
+    }
+    for (const searchPath of searchPaths ?? []) {
+        const candidate = path.join(searchPath, ...segments, 'package.json');
+        if (fs.existsSync(candidate)) {
+            return selectCanonicalPackageManifest(candidate);
+        }
+    }
+    throw new Error(`Unable to locate installed package manifest for "${requestName}".`);
+}
+
+export async function resolveInstalledManifest(requestName, fromDirectory) {
     const localRequire = createRequire(path.join(fromDirectory, 'package.json'));
     let manifestPath;
     try {
         manifestPath = localRequire.resolve(`${requestName}/package.json`);
     } catch {
-        const entry = localRequire.resolve(requestName);
-        manifestPath = findPackageManifest(entry);
+        try {
+            const entry = localRequire.resolve(requestName);
+            manifestPath = findPackageManifest(entry);
+        } catch {
+            manifestPath = findManifestOnPackageSearchPath(requestName, localRequire.resolve.paths(requestName));
+        }
     }
     manifestPath = selectCanonicalPackageManifest(manifestPath);
     return {
@@ -949,7 +970,7 @@ async function linkInstalledPackage(targetDirectory, requestName, packageDirecto
 
 async function verifyGeneratedExtensions(targetDirectory, dependencies, records) {
     for (const [requestName, spec] of Object.entries(dependencies).sort(([left], [right]) => compareText(left, right))) {
-        const installed = await defaultResolveInstalledManifest(requestName, targetDirectory);
+        const installed = await resolveInstalledManifest(requestName, targetDirectory);
         validateInstalledManifest(requestName, spec, installed.manifest, [requestName], 'generated application');
         const expected = records.get(requestName);
         if (!expected || expected.manifest.name !== installed.manifest.name || expected.manifest.version !== installed.manifest.version) {
@@ -963,7 +984,7 @@ export async function generateProfileTarget({
     profileName = 'tauri-critical',
     buildId,
     sourceIdentity = defaultSourceIdentity,
-    resolveInstalledManifest = defaultResolveInstalledManifest,
+    resolveInstalledManifest: installedManifestResolver = resolveInstalledManifest,
 } = {}) {
     const resolvedBrowserDirectory = path.resolve(browserDirectory);
     assertPathSegment(buildId, 'Tauri profile build id');
@@ -974,11 +995,11 @@ export async function generateProfileTarget({
     const installedGraph = await resolveInstalledPackageGraph({
         browserManifest,
         roots,
-        resolver: resolveInstalledManifest,
+        resolver: installedManifestResolver,
         browserDirectory: resolvedBrowserDirectory,
     });
     for (const devDependency of profileConfig.buildDevDependencies ?? []) {
-        const installed = await resolveInstalledManifest(devDependency, resolvedBrowserDirectory);
+        const installed = await installedManifestResolver(devDependency, resolvedBrowserDirectory);
         validateInstalledManifest(devDependency, browserManifest.devDependencies?.[devDependency], installed.manifest, [devDependency]);
     }
     const resolved = resolveProfile({ profileName, profileConfig, browserManifest, installedGraph });
