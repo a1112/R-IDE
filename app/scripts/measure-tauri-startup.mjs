@@ -627,15 +627,9 @@ export function parsePosixProcessTable(output) {
       continue;
     }
     const serialized = line.trim();
-    let match = serialized.match(
+    const match = serialized.match(
       /^(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+((?:Sun|Mon|Tue|Wed|Thu|Fri|Sat)\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})(?:\s+(\S+)(?:\s+(.*))?)?$/,
     );
-    if (!match) {
-      const legacy = serialized.match(/^(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(.+)$/);
-      if (legacy) {
-        match = [...legacy, undefined, undefined];
-      }
-    }
     if (!match) {
       throw new Error(
         `invalid ps process row ${lineIndex + 1}: expected numeric process fields`,
@@ -658,6 +652,12 @@ export function parsePosixProcessTable(output) {
     if (rssKiB > Math.floor(Number.MAX_SAFE_INTEGER / 1024)) {
       throw new Error('ps RSS bytes must be a non-negative safe integer');
     }
+    const startedAt = parseProcessStartedAt(creationTime);
+    if (startedAt === null) {
+      throw new Error(
+        `invalid ps process row ${lineIndex + 1}: expected valid lstart field`,
+      );
+    }
     const executable = match[6];
     const commandLine = match[7];
     rows.push({
@@ -666,7 +666,7 @@ export function parsePosixProcessTable(output) {
       pgid,
       rssBytes: rssKiB * 1024,
       creationTime,
-      startedAt: parseProcessStartedAt(creationTime),
+      startedAt,
       ...(executable === undefined ? {} : {
         name: executable.split(/[\\/]/).at(-1),
         executable,

@@ -552,27 +552,32 @@ test('POSIX process parsing ignores kernel rows without a signalable process gro
 });
 
 test('malformed POSIX process rows report only a safe line number and field shape', () => {
-  const secretRow = [
-    '11 10 BROKEN 20',
-    'token=token-secret-value',
-    'password=password-secret-value',
-    'Authorization: Bearer authorization-secret-value',
-    'TOPSECRETCOMMANDLINE',
-  ].join(' ');
-  assert.throws(
-    () => parsePosixProcessTable([
-      '10 1 10 1 Sat Aug 15 12:34:56 2026 /opt/ride/R-IDE /opt/ride/R-IDE',
-      secretRow,
-    ].join('\n')),
-    error => {
-      assert.match(error.message, /ps process row 2.*field/i);
-      assert.doesNotMatch(
-        `${error.name}\n${error.message}\n${error.stack}`,
-        /token|password|authorization|TOPSECRETCOMMANDLINE|BROKEN/i,
-      );
-      return true;
-    },
-  );
+  for (const unsafeTimestamp of [
+    'malformed-timestamp',
+    'Sat Aug 99 99:99:99 2026',
+  ]) {
+    const secretRow = [
+      `10 1 10 1 ${unsafeTimestamp}`,
+      'token=token-secret-value',
+      'password=password-secret-value',
+      'Authorization: Bearer authorization-secret-value',
+      'TOPSECRETCOMMANDLINE',
+    ].join(' ');
+    assert.throws(
+      () => parsePosixProcessTable([
+        '10 1 10 1 Sat Aug 15 12:34:56 2026 /opt/ride/R-IDE /opt/ride/R-IDE',
+        secretRow,
+      ].join('\n')),
+      error => {
+        assert.match(error.message, /ps process row 2.*field/i);
+        assert.doesNotMatch(
+          `${error.name}\n${error.message}\n${error.stack}`,
+          /token|password|authorization|TOPSECRETCOMMANDLINE|malformed-timestamp|Aug 99/i,
+        );
+        return true;
+      },
+    );
+  }
 });
 
 test('classifies verified process roles by precedence without persisting process command text', () => {
@@ -1514,14 +1519,18 @@ test('process table parsers preserve comparable creation chronology and reject m
   assert.equal(windowsRows[5].startedAt, null);
   assert.equal(windowsRows[6].startedAt, null);
 
-  const posixRows = parsePosixProcessTable(`
-    20 1 20 1 Sat Aug 15 12:34:56 2026
-    21 20 20 1 malformed timestamp
-    22 20 20 1 2026-08-15
-  `);
-  assert.equal(posixRows[0].startedAt, Date.parse('Sat Aug 15 12:34:56 2026'));
-  assert.equal(posixRows[1].startedAt, null);
-  assert.equal(posixRows[2].startedAt, null);
+  const [posixRow] = parsePosixProcessTable(
+    '20 1 20 1 Sat Aug 15 12:34:56 2026',
+  );
+  assert.equal(posixRow.startedAt, Date.parse('Sat Aug 15 12:34:56 2026'));
+  assert.throws(
+    () => parsePosixProcessTable('21 20 20 1 malformed timestamp'),
+    /ps process row 1.*field/i,
+  );
+  assert.throws(
+    () => parsePosixProcessTable('22 20 20 1 2026-08-15'),
+    /ps process row 1.*field/i,
+  );
 
   const malformedCleanupRows = parseWindowsProcessTable(JSON.stringify([
     {
@@ -4694,7 +4703,7 @@ test('malformed POSIX process rows persist no command-line secrets in failure di
   const executable = path.join(root, 'R-IDE');
   const output = path.join(root, 'startup-metrics.json');
   const secretRow = [
-    '11 10 BROKEN 20',
+    '10 1 10 1 malformed-timestamp',
     'token=token-secret-value',
     'password=password-secret-value',
     'Authorization: Bearer authorization-secret-value',
@@ -4702,8 +4711,9 @@ test('malformed POSIX process rows persist no command-line secrets in failure di
   ].join(' ');
   touch(executable);
   try {
-    await assert.rejects(
-      runMeasurementCampaign({
+    let failure;
+    try {
+      await runMeasurementCampaign({
         executable,
         output,
         runs: 1,
@@ -4712,15 +4722,16 @@ test('malformed POSIX process rows persist no command-line secrets in failure di
         pollMs: 1,
       }, campaignDependencies({
         measure: async () => parsePosixProcessTable(secretRow),
-      })),
-      error => {
-        assert.match(error.message, /ps process row 1.*field/i);
-        assert.doesNotMatch(
-          `${error.name}\n${error.message}\n${error.stack}`,
-          /token|password|authorization|TOPSECRETCOMMANDLINE|BROKEN/i,
-        );
-        return true;
-      },
+      }));
+    } catch (error) {
+      failure = error;
+    }
+    assert.ok(failure, 'ambiguous POSIX row must fail the campaign');
+    assert.equal(fs.existsSync(output), false);
+    const serializedFailure = `${failure.name}\n${failure.message}\n${failure.stack}`;
+    assert.doesNotMatch(
+      serializedFailure,
+      /token|password|authorization|TOPSECRETCOMMANDLINE|malformed-timestamp/i,
     );
     const serializedDiagnostic = fs.readFileSync(
       path.join(root, 'startup-metrics.failure.json'),
@@ -4728,8 +4739,9 @@ test('malformed POSIX process rows persist no command-line secrets in failure di
     );
     assert.doesNotMatch(
       serializedDiagnostic,
-      /token|password|authorization|TOPSECRETCOMMANDLINE|BROKEN/i,
+      /token|password|authorization|TOPSECRETCOMMANDLINE|malformed-timestamp/i,
     );
+    assert.match(failure.message, /ps process row 1.*field/i);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
