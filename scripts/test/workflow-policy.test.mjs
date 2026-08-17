@@ -98,11 +98,22 @@ test('package jobs measure startup after verification and upload the unsigned JS
     'startup reports must be generated before artifact upload');
 
   const measurementBlock = packageJob.text.slice(linuxMeasureIndex, uploadIndex);
+  const linuxMeasurementBlock = packageJob.text.slice(linuxMeasureIndex, desktopMeasureIndex);
   assert.match(measurementBlock, /if:\s*runner\.os\s*==\s*['"]Linux['"]/);
   assert.match(measurementBlock, /if:\s*runner\.os\s*!=\s*['"]Linux['"]/);
   assert.match(measurementBlock, /xvfb-run\s+-a\s+npm\s+run\s+measure:tauri-startup/);
   assert.match(measurementBlock, /npm\s+run\s+measure:tauri-startup/);
-  assert.match(measurementBlock, /--output\s+applications\/tauri\/src-tauri\/target\/release\/bundle\/startup-metrics\.json/);
+  assert.match(measurementBlock, /applications\/tauri\/src-tauri\/target\/release\/bundle\/startup-metrics\.json/);
+  assert.match(linuxMeasurementBlock, /useradd\s+--system/);
+  assert.match(linuxMeasurementBlock, /sudo\s+-H\s+-u\s+"\$measure_user"/);
+  assert.match(linuxMeasurementBlock, /sudo\s+chown\s+"\$measure_user:\$measure_user"[\s\S]*"\$bundle_directory"/);
+  assert.match(linuxMeasurementBlock, /status=\$\?/);
+  assert.match(linuxMeasurementBlock, /sudo\s+chown\s+"\$runner_uid:\$runner_gid"\s+"\$bundle_directory"/);
+  assert.match(linuxMeasurementBlock, /exit\s+"\$status"/);
+  assert.match(linuxMeasurementBlock, /--output\s+"\$bundle_output"/);
+  assert.doesNotMatch(linuxMeasurementBlock, /measure_output|cp\s+-a/);
+  assert.match(packageJob.text, /!app\/applications\/tauri\/src-tauri\/target\/release\/bundle/);
+  assert.match(packageJob.text, /key:\s*package-v2-/);
 
   const uploadBlock = packageJob.text.slice(uploadIndex);
   assert.match(uploadBlock, /if:\s*always\(\)/);
@@ -234,6 +245,8 @@ test('Linux Tauri prerequisites avoid conflicting AppIndicator development packa
     'package job must define the Linux measurement block');
   const linuxMeasurement = packageJob.text.slice(measurementIndex, nonLinuxIndex);
   assert.match(linuxMeasurement, /xvfb-run\s+-a\s+npm\s+run\s+measure:tauri-startup/);
+  assert.match(linuxMeasurement, /useradd\s+--system/);
+  assert.match(linuxMeasurement, /sudo\s+-H\s+-u\s+"\$measure_user"/);
 });
 
 test('quality job installs Linux Tauri prerequisites before Rust checks', () => {
