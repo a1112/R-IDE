@@ -9,6 +9,7 @@ import {
     acquirePublishLock,
     canonicalDigest,
     createDirectoryTransactionPlan,
+    findPackageManifest,
     generateProfileTarget,
     publishProfileBuild,
     parseProfileCliArguments,
@@ -498,6 +499,21 @@ test('records multiple runtime identities while retaining Theia extensions below
         { version: '1.5.0', dependencyPath: ['product', 'left', 'shared'] },
         { version: '2.5.0', dependencyPath: ['product', 'right', 'shared'] },
     ]);
+});
+
+test('finds the package root above nested module-format package metadata', async t => {
+    const packageDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-package-root-'));
+    t.after(() => fs.promises.rm(packageDirectory, { recursive: true, force: true }));
+    const nestedDirectory = path.join(packageDirectory, 'lib', 'cjs');
+    await fs.promises.mkdir(nestedDirectory, { recursive: true });
+    await fs.promises.writeFile(path.join(packageDirectory, 'package.json'), JSON.stringify({
+        name: 'inversify', version: '6.2.2',
+    }));
+    await fs.promises.writeFile(path.join(nestedDirectory, 'package.json'), JSON.stringify({ type: 'commonjs' }));
+    const entry = path.join(nestedDirectory, 'index.js');
+    await fs.promises.writeFile(entry, 'module.exports = {};\n');
+
+    assert.equal(findPackageManifest(entry), path.join(packageDirectory, 'package.json'));
 });
 
 async function writeSentinel(directory, value) {

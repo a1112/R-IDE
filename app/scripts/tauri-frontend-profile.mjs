@@ -765,12 +765,20 @@ async function copyRegularTree(source, destination) {
     }
 }
 
-function findPackageManifest(packageEntry) {
+export function findPackageManifest(packageEntry) {
     let directory = path.dirname(packageEntry);
     while (true) {
         const candidate = path.join(directory, 'package.json');
         if (fs.existsSync(candidate)) {
-            return candidate;
+            try {
+                const manifest = JSON.parse(fs.readFileSync(candidate, 'utf8'));
+                if (typeof manifest.name === 'string' && manifest.name && semver.valid(manifest.version)) {
+                    return candidate;
+                }
+            } catch {
+                // Nested package metadata may describe only the module format.
+                // Continue upward until a canonical package identity is found.
+            }
         }
         const parent = path.dirname(directory);
         if (parent === directory) {
