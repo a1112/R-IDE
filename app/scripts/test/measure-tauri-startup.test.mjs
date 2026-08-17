@@ -16,6 +16,7 @@ import test from 'node:test';
 
 import {
   aggregateProcessTree,
+  attachLinuxProcIdentities,
   attachBoundedLogCapture,
   captureProcessIdentity,
   createBoundedLogSink,
@@ -26,6 +27,7 @@ import {
   measureOnce,
   median,
   parseLinuxProcEnvironment,
+  parseLinuxProcStatIdentity,
   parseMacOsProcessEnvironments,
   parsePosixProcessTable,
   parseStartupReport,
@@ -162,7 +164,7 @@ test('every synchronous external command has explicit timeout and buffer bounds'
   };
 
   boundedCall("spawnSync(\n      'powershell.exe'", 'return parseWindowsProcessTable', 'CIM query');
-  const psQuery = boundedCall("spawnSync('ps'", 'return parsePosixProcessTable', 'ps query');
+  const psQuery = boundedCall("spawnSync('ps'", 'const posixRows = parsePosixProcessTable', 'ps query');
   assert.match(psQuery, /LANG:\s*'C'/);
   assert.match(psQuery, /LC_ALL:\s*'C'/);
   const macMarkerQuery = boundedCall(
@@ -609,17 +611,225 @@ test('marked process discovery joins marker PIDs to exact process-table identiti
 
   assert.strictEqual(snapshot.rows, rows);
   assert.deepEqual(snapshot.markedRows, [rows[1]]);
+});
+
+test('Linux proc stat identities distinguish same-second same-group PID reuse', () => {
+  const stat = Buffer.from(
+    `202 (ride worker) S 1 202 ${Array(16).fill('0').join(' ')} 123456\n`,
+  );
+  assert.deepEqual(parseLinuxProcStatIdentity(stat, 202), {
+    pid: 202,
+    ppid: 1,
+    pgid: 202,
+    creationTime: 'linux:123456',
+  });
+
+  const [coarseRow] = parsePosixProcessTable(
+    '202 1 202 1 Sat Aug 15 12:34:56 2026',
+  );
+  const [original] = attachLinuxProcIdentities([coarseRow], {
+    readIdentity: () => ({
+      pid: 202, ppid: 1, pgid: 202, creationTime: 'linux:123456',
+    }),
+  });
+  const [reused] = attachLinuxProcIdentities([coarseRow], {
+    readIdentity: () => ({
+      pid: 202, ppid: 1, pgid: 202, creationTime: 'linux:123457',
+    }),
+  });
+
+  assert.equal(original.startedAt, reused.startedAt);
+  assert.notEqual(original.creationTime, reused.creationTime);
+
+  const [moved] = attachLinuxProcIdentities([coarseRow], {
+    readIdentity: () => ({
+      pid: 202, ppid: 1, pgid: 303, creationTime: 'linux:123456',
+    }),
+  });
+  assert.equal(moved.pgid, 303);
+  assert.equal(moved.creationTime, original.creationTime);
+});
+
+test('Linux marked discovery skips proc PIDs absent from the attested process table', () => {
+  const runId = '7f7df1aa-a324-4fd4-b11c-4cc260a94d8f';
+  const root = {
+    pid: 100,
+    ppid: 1,
+    pgid: 100,
+    rssBytes: 1_024,
+    creationTime: 'root-start',
+    startedAt: 1_000,
+  };
+  const environmentReads = [];
+
+  const snapshot = discoverMarkedProcessSnapshot(runId, 'linux', {
+    read: () => [root],
+    listLinuxPids: () => [100, 404],
+    readLinuxEnvironment: pid => {
+      environmentReads.push(pid);
+      if (pid === 404) {
+        throw new Error('unattested proc PID must not be queried');
+      }
+      return Buffer.from('SAFE=1\0');
+    },
+  });
+
+  assert.deepEqual(environmentReads, [100]);
+  assert.deepEqual(snapshot, { rows: [root], markedRows: [] });
   assert.throws(
     () => discoverMarkedProcessSnapshot(runId, 'linux', {
-      read: () => rows,
-      listLinuxPids: () => [404],
-      readLinuxEnvironment: () => Buffer.from(`RIDE_STARTUP_RUN_ID=${runId}\0`),
+      read: () => [root],
+      listLinuxPids: () => [100],
+      readLinuxEnvironment: () => {
+        throw new Error('attested environment query failed');
+      },
     }),
-    /marker process 404 is missing from the process table/,
+    /attested environment query failed/,
   );
 });
 
-test('marked process discovery fails closed when a marker PID is reused mid-query', () => {
+test('Linux marked discovery attests a marked proc PID born after the pre-query table', () => {
+  const runId = '7f7df1aa-a324-4fd4-b11c-4cc260a94d8f';
+  const root = {
+    pid: 100,
+    ppid: 1,
+    pgid: 100,
+    rssBytes: 1_024,
+    creationTime: 'root-start',
+    startedAt: 1_000,
+  };
+  const newborn = {
+    pid: 202,
+    ppid: 1,
+    pgid: 202,
+    rssBytes: 2_048,
+    creationTime: 'newborn-start',
+    startedAt: 2_000,
+  };
+  let reads = 0;
+
+  const snapshot = discoverMarkedProcessSnapshot(runId, 'linux', {
+    read: () => (++reads === 1 ? [root] : [root, newborn]),
+    listLinuxPids: () => [100],
+    readLinuxEnvironment: pid => Buffer.from(
+      `RIDE_STARTUP_RUN_ID=${pid === 202 ? runId : 'foreign'}\0`,
+    ),
+  });
+  assert.equal(reads, 3);
+  assert.deepEqual(snapshot.rows, [root, newborn]);
+  assert.deepEqual(snapshot.markedRows, [newborn]);
+});
+
+test('Linux marked discovery reattests a marker after an unmarked PID is reused', () => {
+  const runId = '7f7df1aa-a324-4fd4-b11c-4cc260a94d8f';
+  const coarseRows = parsePosixProcessTable(
+    '202 1 202 1 Sat Aug 15 12:34:56 2026',
+  );
+  const [original] = attachLinuxProcIdentities(coarseRows, {
+    readIdentity: () => ({
+      pid: 202, ppid: 1, pgid: 202, creationTime: 'linux:123456',
+    }),
+  });
+  const [reused] = attachLinuxProcIdentities(coarseRows, {
+    readIdentity: () => ({
+      pid: 202, ppid: 1, pgid: 202, creationTime: 'linux:123457',
+    }),
+  });
+  let tableReads = 0;
+  let environmentReads = 0;
+
+  const snapshot = discoverMarkedProcessSnapshot(runId, 'linux', {
+    read: () => (++tableReads === 1 ? [original] : [reused]),
+    listLinuxPids: () => [202],
+    readLinuxEnvironment: () => Buffer.from(
+      `RIDE_STARTUP_RUN_ID=${++environmentReads === 1 ? 'foreign' : runId}\0`,
+    ),
+  });
+
+  assert.equal(tableReads, 3);
+  assert.equal(environmentReads, 2);
+  assert.deepEqual(snapshot.markedRows, [reused]);
+});
+
+test('Linux marked discovery retains provenance when an exact process changes group', () => {
+  const runId = '7f7df1aa-a324-4fd4-b11c-4cc260a94d8f';
+  const original = {
+    pid: 202, ppid: 100, pgid: 100, rssBytes: 1_024,
+    creationTime: 'linux:123456', startedAt: 1_000,
+  };
+  const moved = {
+    ...original, ppid: 1, pgid: 202,
+  };
+  let tableReads = 0;
+  let environmentReads = 0;
+
+  const snapshot = discoverMarkedProcessSnapshot(runId, 'linux', {
+    read: () => (++tableReads === 1 ? [original] : [moved]),
+    listLinuxPids: () => [202],
+    readLinuxEnvironment: () => Buffer.from(
+      `RIDE_STARTUP_RUN_ID=${++environmentReads === 1 ? runId : 'foreign'}\0`,
+    ),
+  });
+
+  assert.equal(tableReads, 2);
+  assert.equal(environmentReads, 1);
+  assert.deepEqual(snapshot.markedRows, [moved]);
+});
+
+test('Linux marked discovery tolerates an unmarked process born during the query', () => {
+  const runId = '7f7df1aa-a324-4fd4-b11c-4cc260a94d8f';
+  const root = {
+    pid: 100, ppid: 1, pgid: 100, rssBytes: 1_024,
+    creationTime: 'root-start', startedAt: 1_000,
+  };
+  const foreign = {
+    pid: 303, ppid: 1, pgid: 303, rssBytes: 2_048,
+    creationTime: 'foreign-start', startedAt: 2_000,
+  };
+  let reads = 0;
+
+  const snapshot = discoverMarkedProcessSnapshot(runId, 'linux', {
+    read: () => (++reads === 1 ? [root] : [root, foreign]),
+    listLinuxPids: () => [100],
+    readLinuxEnvironment: () => Buffer.from('SAFE=1\0'),
+  });
+
+  assert.equal(reads, 2);
+  assert.deepEqual(snapshot, { rows: [root, foreign], markedRows: [] });
+});
+
+test('Linux marked discovery rejects a newborn marker PID reused during attestation', () => {
+  const runId = '7f7df1aa-a324-4fd4-b11c-4cc260a94d8f';
+  const root = {
+    pid: 100, ppid: 1, pgid: 100, rssBytes: 1_024,
+    creationTime: 'root-start', startedAt: 1_000,
+  };
+  const newborn = {
+    pid: 202, ppid: 1, pgid: 202, rssBytes: 2_048,
+    creationTime: 'newborn-start', startedAt: 2_000,
+  };
+  const reused = {
+    ...newborn, creationTime: 'reused-start', startedAt: 3_000,
+  };
+  let reads = 0;
+
+  assert.throws(
+    () => discoverMarkedProcessSnapshot(runId, 'linux', {
+      read: () => {
+        reads++;
+        return reads === 1 ? [root] : [root, reads === 2 ? newborn : reused];
+      },
+      listLinuxPids: () => [100],
+      readLinuxEnvironment: pid => Buffer.from(
+        `RIDE_STARTUP_RUN_ID=${pid === 202 ? runId : 'foreign'}\0`,
+      ),
+    }),
+    /marker process 202 changed identity during discovery/,
+  );
+  assert.equal(reads, 3);
+});
+
+test('marked process discovery reattests a marker PID reused mid-query', () => {
   const runId = '7f7df1aa-a324-4fd4-b11c-4cc260a94d8f';
   const original = {
     pid: 202,
@@ -638,15 +848,14 @@ test('marked process discovery fails closed when a marker PID is reused mid-quer
   };
   let reads = 0;
 
-  assert.throws(
-    () => discoverMarkedProcessSnapshot(runId, 'linux', {
-      read: () => (++reads === 1 ? [original] : [reused]),
-      listLinuxPids: () => [202],
-      readLinuxEnvironment: () => Buffer.from(`RIDE_STARTUP_RUN_ID=${runId}\0`),
-    }),
-    /marker process 202 changed identity during discovery/,
-  );
-  assert.equal(reads, 2);
+  const snapshot = discoverMarkedProcessSnapshot(runId, 'linux', {
+    read: () => (++reads === 1 ? [original] : [reused]),
+    listLinuxPids: () => [202],
+    readLinuxEnvironment: () => Buffer.from(`RIDE_STARTUP_RUN_ID=${runId}\0`),
+  });
+
+  assert.equal(reads, 3);
+  assert.deepEqual(snapshot.markedRows, [reused]);
 });
 
 test('macOS marked discovery fails closed for a marker process born after the pre-table snapshot', () => {
@@ -2275,6 +2484,132 @@ test('POSIX run marker cleanup terminates same-group, reparented, and setsid pro
   ]);
   assert.ok(markerQueries >= 7, 'every action and posterior must use a fresh marker query');
   assert.deepEqual(rows, [foreign]);
+});
+
+test('POSIX cleanup retains a reattested marker identity after its environment marker clears', async () => {
+  const runId = '7f7df1aa-a324-4fd4-b11c-4cc260a94d8f';
+  const root = {
+    pid: 100, ppid: 1, pgid: 100, rssBytes: 1_024,
+    creationTime: 'root-start', startedAt: 1_000,
+  };
+  const coarseRows = parsePosixProcessTable(
+    '202 1 202 2 Sat Aug 15 12:34:56 2026',
+  );
+  const [oldProcess] = attachLinuxProcIdentities(coarseRows, {
+    readIdentity: () => ({
+      pid: 202, ppid: 1, pgid: 202, creationTime: 'linux:123456',
+    }),
+  });
+  const [newborn] = attachLinuxProcIdentities(coarseRows, {
+    readIdentity: () => ({
+      pid: 202, ppid: 1, pgid: 202, creationTime: 'linux:123457',
+    }),
+  });
+  let rows = [root, oldProcess];
+  let firstDiscovery = true;
+  let newbornMarked = true;
+  const signals = [];
+
+  const discoverMarked = () => {
+    let reads = 0;
+    const snapshot = discoverMarkedProcessSnapshot(runId, 'linux', {
+      read: () => {
+        reads++;
+        if (firstDiscovery && reads > 1) {
+          rows = [root, newborn];
+        }
+        return rows;
+      },
+      listLinuxPids: () => rows.map(row => row.pid),
+      readLinuxEnvironment: pid => Buffer.from(
+        `RIDE_STARTUP_RUN_ID=${pid === root.pid || (pid === newborn.pid
+          && rows.some(row => row.pid === newborn.pid
+            && row.pgid === newborn.pgid
+            && row.creationTime === newborn.creationTime)
+          && newbornMarked)
+          ? runId
+          : 'foreign'}\0`,
+      ),
+    });
+    if (firstDiscovery) {
+      firstDiscovery = false;
+      newbornMarked = false;
+    }
+    return snapshot;
+  };
+
+  await terminateMeasuredTree({ rootPid: root.pid, rootIdentity: root, runId }, 'linux', {
+    discoverMarked,
+    kill: (pid, signal) => {
+      signals.push([pid, signal]);
+      rows = rows.filter(row => row.pid !== pid);
+      return true;
+    },
+    delay: async () => undefined,
+    cleanupReadAttempts: 1,
+    cleanupVerifyAttempts: 1,
+  });
+
+  assert.deepEqual(signals, [[root.pid, 'SIGTERM'], [newborn.pid, 'SIGTERM']]);
+  assert.deepEqual(rows, []);
+});
+
+test('POSIX cleanup retains an exact marker identity across a process group change', async () => {
+  const runId = '7f7df1aa-a324-4fd4-b11c-4cc260a94d8f';
+  const root = {
+    pid: 100, ppid: 1, pgid: 100, rssBytes: 1_024,
+    creationTime: 'root-start', startedAt: 1_000,
+  };
+  const original = {
+    pid: 202, ppid: 100, pgid: 100, rssBytes: 2_048,
+    creationTime: 'linux:123456', startedAt: 2_000,
+  };
+  const moved = {
+    ...original, ppid: 1, pgid: 202,
+  };
+  let rows = [root, original];
+  let firstDiscovery = true;
+  let daemonMarked = true;
+  const signals = [];
+
+  const discoverMarked = () => {
+    let reads = 0;
+    const snapshot = discoverMarkedProcessSnapshot(runId, 'linux', {
+      read: () => {
+        reads++;
+        if (firstDiscovery && reads > 1) {
+          rows = [root, moved];
+        }
+        return rows;
+      },
+      listLinuxPids: () => rows.map(row => row.pid),
+      readLinuxEnvironment: pid => Buffer.from(
+        `RIDE_STARTUP_RUN_ID=${pid === root.pid || (pid === moved.pid && daemonMarked)
+          ? runId
+          : 'foreign'}\0`,
+      ),
+    });
+    if (firstDiscovery) {
+      firstDiscovery = false;
+      daemonMarked = false;
+    }
+    return snapshot;
+  };
+
+  await terminateMeasuredTree({ rootPid: root.pid, rootIdentity: root, runId }, 'linux', {
+    discoverMarked,
+    kill: (pid, signal) => {
+      signals.push([pid, signal]);
+      rows = rows.filter(row => row.pid !== pid);
+      return true;
+    },
+    delay: async () => undefined,
+    cleanupReadAttempts: 1,
+    cleanupVerifyAttempts: 1,
+  });
+
+  assert.deepEqual(signals, [[root.pid, 'SIGTERM'], [moved.pid, 'SIGTERM']]);
+  assert.deepEqual(rows, []);
 });
 
 test('POSIX run marker cleanup never signals a foreign process without the marker', async () => {
