@@ -3,35 +3,6 @@
   "profiles": {
     "tauri-critical": {
       "roots": [
-        "@theia/core",
-        "@theia/editor",
-        "@theia/filesystem",
-        "@theia/workspace",
-        "@theia/monaco",
-        "@theia/navigator",
-        "@theia/preferences",
-        "@theia/terminal",
-        "@theia/process",
-        "@theia/task",
-        "@theia/search-in-workspace",
-        "@theia/scm",
-        "@theia/markers",
-        "@theia/messages",
-        "@theia/output",
-        "@theia/userstorage",
-        "@theia/variable-resolver",
-        "@theia/plugin-ext",
-        "@theia/plugin-ext-vscode",
-        "theia-ide-product-ext"
-      ]
-    },
-    "full": {
-      "includeAllBrowserRoots": true
-    }
-  },
-  "featureGroups": {
-    "ai": {
-      "deferredRoots": [
         "@theia/ai-anthropic",
         "@theia/ai-chat",
         "@theia/ai-chat-ui",
@@ -52,122 +23,139 @@
         "@theia/ai-openai",
         "@theia/ai-scanoss",
         "@theia/ai-terminal",
-        "@theia/ai-vercel-ai"
-      ],
-      "blockedRoots": [
-        {
-          "name": "@theia/ai-core",
-          "reason": "The hosted-plugin AI MCP dependency requires the AI core services during initial generation."
-        },
-        {
-          "name": "@theia/ai-mcp",
-          "reason": "The hosted-plugin extension has a required dependency on AI MCP services."
-        },
-        {
-          "name": "@theia/ai-registry",
-          "reason": "The R-IDE product extension requires the AI registry during initial generation."
-        }
+        "@theia/ai-vercel-ai",
+        "@theia/collaboration",
+        "@theia/core",
+        "@theia/dev-container",
+        "@theia/editor",
+        "@theia/external-terminal",
+        "@theia/filesystem",
+        "@theia/memory-inspector",
+        "@theia/messages",
+        "@theia/metrics",
+        "@theia/monaco",
+        "@theia/navigator",
+        "@theia/output",
+        "@theia/plugin-dev",
+        "@theia/plugin-ext",
+        "@theia/plugin-ext-vscode",
+        "@theia/preferences",
+        "@theia/process",
+        "@theia/property-view",
+        "@theia/remote",
+        "@theia/scanoss",
+        "@theia/scm",
+        "@theia/search-in-workspace",
+        "@theia/secondary-window",
+        "@theia/task",
+        "@theia/terminal",
+        "@theia/toolbar",
+        "@theia/userstorage",
+        "@theia/variable-resolver",
+        "@theia/workspace",
+        "theia-ide-product-ext"
       ]
     },
-    "collaboration": {
-      "deferredRoots": [
-        "@theia/collaboration"
+    "full": {
+      "includeAllBrowserRoots": true
+    }
+  },
+  "featureGroups": {
+    "ai": {
+      "deferredRoots": [],
+      "blockedRoots": [
+        { "name": "@theia/ai-anthropic", "reason": "The frontend registers preferences and lifecycle services and the package requires backend services." },
+        { "name": "@theia/ai-chat", "reason": "The frontend registers preferences and lifecycle services and the package requires backend services." },
+        { "name": "@theia/ai-chat-ui", "reason": "The frontend registers view, widget-factory, toolbar, and lifecycle contribution types without deferred adapters." },
+        { "name": "@theia/ai-claude-code", "reason": "The frontend registers preferences and lifecycle services and the package requires backend services." },
+        { "name": "@theia/ai-code-completion", "reason": "The frontend registers preferences and lifecycle services and the package requires backend services." },
+        { "name": "@theia/ai-codex", "reason": "The frontend registers preference contributions without a deferred adapter and the package requires backend services." },
+        { "name": "@theia/ai-copilot", "reason": "The frontend registers preferences and lifecycle services and the package requires backend services." },
+        { "name": "@theia/ai-core", "reason": "The hosted-plugin AI MCP dependency requires the AI core services during initial generation." },
+        { "name": "@theia/ai-core-ui", "reason": "The frontend registers preference contributions without a deferred adapter." },
+        { "name": "@theia/ai-editor", "reason": "The frontend registers an AI variable provider and a widget factory without deferred adapters." },
+        { "name": "@theia/ai-google", "reason": "The frontend registers preferences and lifecycle services and the package requires backend services." },
+        { "name": "@theia/ai-history", "reason": "The frontend registers view, widget-factory, and toolbar contribution types without deferred adapters." },
+        { "name": "@theia/ai-huggingface", "reason": "The frontend registers preferences and lifecycle services and the package requires backend services." },
+        { "name": "@theia/ai-ide", "reason": "The frontend rebinds services and registers view, widget-factory, toolbar, and preference contribution types." },
+        { "name": "@theia/ai-llamafile", "reason": "The package requires backend services and has no tested isolated secondary activation." },
+        { "name": "@theia/ai-mcp", "reason": "The hosted-plugin extension has a required dependency on AI MCP services." },
+        { "name": "@theia/ai-mcp-server", "reason": "The package requires backend services and has no tested isolated secondary activation." },
+        { "name": "@theia/ai-mcp-ui", "reason": "The frontend registers preference contributions without a deferred adapter." },
+        { "name": "@theia/ai-ollama", "reason": "The frontend registers preferences and lifecycle services and the package requires backend services." },
+        { "name": "@theia/ai-openai", "reason": "The frontend registers preferences and lifecycle services and the package requires backend services." },
+        { "name": "@theia/ai-registry", "reason": "The R-IDE product extension requires the AI registry during initial generation." },
+        { "name": "@theia/ai-scanoss", "reason": "The frontend registers preference contributions without a deferred adapter and the package requires backend services." },
+        { "name": "@theia/ai-terminal", "reason": "The frontend registers preference contributions without a deferred adapter and the package requires backend services." },
+        { "name": "@theia/ai-vercel-ai", "reason": "The frontend registers preferences and lifecycle services and the package requires backend services." }
       ],
-      "blockedRoots": []
+      "deferBlockedReason": "The group fails the explicit-adapter and isolated-backend gates; no complete real-action smoke and initial-entry inventory exists."
+    },
+    "collaboration": {
+      "deferredRoots": [],
+      "blockedRoots": [
+        { "name": "@theia/collaboration", "reason": "The frontend rebinds WorkspaceService and the package requires backend services." }
+      ],
+      "deferBlockedReason": "WorkspaceService rebind and backend activation prevent safe post-start activation; no delayed smoke or inventory proof exists."
     },
     "notebook": {
       "deferredRoots": [],
       "blockedRoots": [
-        {
-          "name": "@theia/notebook",
-          "reason": "The hosted-plugin extension has a required dependency on notebook services."
-        }
-      ]
+        { "name": "@theia/notebook", "reason": "The hosted-plugin extension has a required dependency on notebook services." }
+      ],
+      "deferBlockedReason": "The critical plugin provider requires notebook startup services and no isolated backend or delayed renderer smoke exists."
     },
     "preview-getting-started": {
       "deferredRoots": [],
       "blockedRoots": [
+        { "name": "@theia/editor-preview", "reason": "The hosted-plugin extension has a required dependency on editor preview services." },
+        { "name": "@theia/getting-started", "reason": "The R-IDE product extension directly requires getting-started contributions." },
+        { "name": "@theia/preview", "reason": "The required getting-started extension depends on preview services." }
+      ],
+      "deferBlockedReason": "Backend modules, widget factories, open handlers, toolbar providers, and startup-layout hooks lack explicit deferred adapters."
+    },
+    "secondary-window": {
+      "deferredRoots": [],
+      "blockedRoots": [
+        { "name": "@theia/secondary-window", "reason": "The package remains in the critical graph for the generated secondary-window entry while its main-window contribution is explicitly deferred." }
+      ],
+      "deferredFrontendModules": [
         {
-          "name": "@theia/editor-preview",
-          "reason": "The hosted-plugin extension has a required dependency on editor preview services."
-        },
-        {
-          "name": "@theia/getting-started",
-          "reason": "The R-IDE product extension directly requires getting-started contributions."
-        },
-        {
-          "name": "@theia/preview",
-          "reason": "The required getting-started extension depends on preview services."
+          "package": "@theia/secondary-window",
+          "module": "@theia/secondary-window/lib/browser/secondary-window-frontend-module",
+          "proxy": "tauri-src/secondary-window-proxy-frontend-module.ts",
+          "entry": "tauri-src/secondary-window-feature.ts",
+          "action": "extract-widget"
         }
       ]
     },
     "auxiliary": {
-      "deferredRoots": [
-        "@theia/dev-container",
-        "@theia/external-terminal",
-        "@theia/memory-inspector",
-        "@theia/metrics",
-        "@theia/plugin-dev",
-        "@theia/property-view",
-        "@theia/remote",
-        "@theia/scanoss",
-        "@theia/secondary-window",
-        "@theia/toolbar"
-      ],
+      "deferredRoots": [],
       "blockedRoots": [
-        {
-          "name": "@theia/bulk-edit",
-          "reason": "The hosted-plugin extension directly requires bulk-edit services."
-        },
-        {
-          "name": "@theia/callhierarchy",
-          "reason": "The hosted-plugin extension directly requires call hierarchy services."
-        },
-        {
-          "name": "@theia/console",
-          "reason": "The hosted-plugin extension directly requires console services."
-        },
-        {
-          "name": "@theia/debug",
-          "reason": "The hosted-plugin extension directly requires debug services."
-        },
-        {
-          "name": "@theia/file-search",
-          "reason": "The hosted-plugin extension directly requires file-search services."
-        },
-        {
-          "name": "@theia/keymaps",
-          "reason": "The required getting-started extension depends on keymap services."
-        },
-        {
-          "name": "@theia/mini-browser",
-          "reason": "The required preview extension depends on mini-browser services."
-        },
-        {
-          "name": "@theia/outline-view",
-          "reason": "The critical Monaco extension depends on outline-view services."
-        },
-        {
-          "name": "@theia/terminal-manager",
-          "reason": "The critical task extension depends on terminal-manager services."
-        },
-        {
-          "name": "@theia/test",
-          "reason": "The hosted-plugin extension directly requires test services."
-        },
-        {
-          "name": "@theia/timeline",
-          "reason": "The hosted-plugin extension directly requires timeline services."
-        },
-        {
-          "name": "@theia/typehierarchy",
-          "reason": "The hosted-plugin extension directly requires type hierarchy services."
-        },
-        {
-          "name": "@theia/vsx-registry",
-          "reason": "The R-IDE product extension directly requires the VSX registry."
-        }
-      ]
+        { "name": "@theia/bulk-edit", "reason": "The hosted-plugin extension directly requires bulk-edit services." },
+        { "name": "@theia/callhierarchy", "reason": "The hosted-plugin extension directly requires call hierarchy services." },
+        { "name": "@theia/console", "reason": "The hosted-plugin extension directly requires console services." },
+        { "name": "@theia/debug", "reason": "The hosted-plugin extension directly requires debug services." },
+        { "name": "@theia/dev-container", "reason": "The package exposes Electron-only frontend and backend modules without a tested Tauri activation path." },
+        { "name": "@theia/external-terminal", "reason": "The package exposes an Electron-only frontend module without a tested Tauri activation path." },
+        { "name": "@theia/file-search", "reason": "The hosted-plugin extension directly requires file-search services." },
+        { "name": "@theia/keymaps", "reason": "The required getting-started extension depends on keymap services." },
+        { "name": "@theia/memory-inspector", "reason": "The frontend registers view, widget-factory, toolbar, and lifecycle contribution types without deferred adapters." },
+        { "name": "@theia/metrics", "reason": "The frontend requires a backend notification service and has no real delayed user action for smoke validation." },
+        { "name": "@theia/mini-browser", "reason": "The required preview extension depends on mini-browser services." },
+        { "name": "@theia/outline-view", "reason": "The critical Monaco extension depends on outline-view services." },
+        { "name": "@theia/plugin-dev", "reason": "The package requires backend services and has no tested isolated secondary activation." },
+        { "name": "@theia/property-view", "reason": "The frontend registers a widget factory, view contribution, and custom provider without deferred adapters." },
+        { "name": "@theia/remote", "reason": "The package exposes Electron-only frontend and backend modules without a tested Tauri activation path." },
+        { "name": "@theia/scanoss", "reason": "The frontend registers preferences and the package requires backend services." },
+        { "name": "@theia/terminal-manager", "reason": "The critical task extension depends on terminal-manager services." },
+        { "name": "@theia/test", "reason": "The hosted-plugin extension directly requires test services." },
+        { "name": "@theia/timeline", "reason": "The hosted-plugin extension directly requires timeline services." },
+        { "name": "@theia/toolbar", "reason": "The frontend has custom toolbar bindings without a complete explicit adapter or delayed smoke test." },
+        { "name": "@theia/typehierarchy", "reason": "The hosted-plugin extension directly requires type hierarchy services." },
+        { "name": "@theia/vsx-registry", "reason": "The R-IDE product extension directly requires the VSX registry." }
+      ],
+      "deferBlockedReason": "The remaining packages fail adapter, backend, smoke-action, or initial-inventory gates and therefore stay critical."
     }
   },
   "buildDevDependencies": [

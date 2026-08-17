@@ -13,7 +13,7 @@ export const PROFILE_SCHEMA = 'ride.tauri-frontend-profile@2';
 export const PROFILE_DIRECTORY_NAME = '.ride-tauri-profile';
 const PROFILE_MANIFEST_NAME = 'ride-tauri-profile.json';
 const CUSTOM_FILES = ['esbuild.mjs', 'ride-esbuild-dedupe.mjs', 'tauri-esbuild-profile-audit.mjs'];
-const CUSTOM_DIRECTORIES = ['resources', 'ico'];
+const CUSTOM_DIRECTORIES = ['resources', 'ico', 'tauri-src'];
 const PUBLISH_LOCK_STALE_MS = 5_000;
 const PUBLISH_LOCK_UPDATE_MS = 2_000;
 const PUBLISH_LOCK_RETRY_MS = 250;
@@ -141,22 +141,38 @@ function normalizedFeatureGroups(featureGroups, browserDependencies) {
     }
     const result = {};
     const classifiedRoots = new Map();
+    const classifiedFrontendModules = new Set();
     for (const groupName of Object.keys(featureGroups).sort(compareText)) {
         const value = featureGroups[groupName];
         if (!value || typeof value !== 'object' || Array.isArray(value)) {
             throw new Error(`Feature group "${groupName}" must be an object.`);
         }
-        const unexpectedFields = Object.keys(value).filter(key => key !== 'deferredRoots' && key !== 'blockedRoots');
+        const unexpectedFields = Object.keys(value).filter(key => (
+            key !== 'deferredRoots'
+            && key !== 'blockedRoots'
+            && key !== 'deferredFrontendModules'
+            && key !== 'deferBlockedReason'
+        ));
         if (unexpectedFields.length > 0) {
             throw new Error(`Feature group "${groupName}" has unsupported field "${unexpectedFields.sort(compareText)[0]}".`);
         }
         const deferredRoots = value.deferredRoots;
         const blockedRoots = value.blockedRoots;
+        const deferredFrontendModules = value.deferredFrontendModules;
         if (!Array.isArray(deferredRoots) || deferredRoots.some(root => typeof root !== 'string' || !root)) {
             throw new Error(`Feature group "${groupName}" must contain exact deferredRoots package names.`);
         }
         if (!Array.isArray(blockedRoots)) {
             throw new Error(`Feature group "${groupName}" must contain blockedRoots evidence entries.`);
+        }
+        if (deferredFrontendModules !== undefined && !Array.isArray(deferredFrontendModules)) {
+            throw new Error(`Feature group "${groupName}" deferredFrontendModules must be an array.`);
+        }
+        if (value.deferBlockedReason !== undefined
+            && (typeof value.deferBlockedReason !== 'string'
+                || !value.deferBlockedReason.trim()
+                || value.deferBlockedReason !== value.deferBlockedReason.trim())) {
+            throw new Error(`Feature group "${groupName}" deferBlockedReason must be canonical.`);
         }
         const duplicateDeferred = deferredRoots.find((name, index) => deferredRoots.indexOf(name) !== index);
         if (duplicateDeferred) {
@@ -202,10 +218,58 @@ function normalizedFeatureGroups(featureGroups, browserDependencies) {
             }
             classifiedRoots.set(name, { groupName, classification });
         }
-        result[groupName] = {
+        const normalizedFrontendModules = (deferredFrontendModules ?? []).map(entry => {
+            const fields = entry && typeof entry === 'object' && !Array.isArray(entry)
+                ? Object.keys(entry).sort(compareText)
+                : [];
+            const expectedFields = ['action', 'entry', 'module', 'package', 'proxy'].sort(compareText);
+            if (fields.join('\0') !== expectedFields.join('\0')) {
+                throw new Error(`Feature group "${groupName}" has an invalid deferred frontend module entry.`);
+            }
+            if (!Object.hasOwn(browserDependencies, entry.package)) {
+                throw new Error(`Unknown deferred frontend package "${entry.package}" in group "${groupName}".`);
+            }
+            if (typeof entry.module !== 'string'
+                || !entry.module.startsWith(`${entry.package}/`)
+                || entry.module.includes('\\')
+                || entry.module.split('/').some(segment => !segment || segment === '.' || segment === '..')) {
+                throw new Error(`Deferred frontend module in group "${groupName}" must use a canonical module request.`);
+            }
+            for (const field of ['proxy', 'entry']) {
+                const candidate = entry[field];
+                if (typeof candidate !== 'string'
+                    || !candidate.startsWith('tauri-src/')
+                    || candidate.includes('\\')
+                    || candidate.split('/').some(segment => !segment || segment === '.' || segment === '..')) {
+                    throw new Error(`Deferred frontend module ${field} in group "${groupName}" must use a canonical tauri-src path.`);
+                }
+            }
+            if (typeof entry.action !== 'string' || !entry.action || entry.action !== entry.action.trim()) {
+                throw new Error(`Deferred frontend module action in group "${groupName}" must be canonical.`);
+            }
+            if (classifiedFrontendModules.has(entry.module)) {
+                throw new Error(`Deferred frontend module "${entry.module}" is duplicated.`);
+            }
+            classifiedFrontendModules.add(entry.module);
+            return {
+                package: entry.package,
+                module: entry.module,
+                proxy: entry.proxy,
+                entry: entry.entry,
+                action: entry.action,
+            };
+        }).sort((left, right) => compareText(left.module, right.module));
+        const normalizedGroup = {
             deferredRoots: [...deferredRoots].sort(compareText),
             blockedRoots: normalizedBlocked.sort((left, right) => compareText(left.name, right.name)),
         };
+        if (deferredFrontendModules !== undefined) {
+            normalizedGroup.deferredFrontendModules = normalizedFrontendModules;
+        }
+        if (value.deferBlockedReason !== undefined) {
+            normalizedGroup.deferBlockedReason = value.deferBlockedReason;
+        }
+        result[groupName] = normalizedGroup;
     }
     return result;
 }
@@ -475,10 +539,21 @@ export function resolveProfile({
                 throw new Error(`Deferred root "${deferredRoot}" from group "${groupName}" is required by the critical dependency path ${criticalClosure.firstPathByRequest.get(deferredRoot).join(' -> ')}.`);
             }
         }
+        for (const deferredModule of group.deferredFrontendModules ?? []) {
+            if (!criticalClosure.requestNames.has(deferredModule.package)) {
+                throw new Error(`Deferred frontend package "${deferredModule.package}" from group "${groupName}" must remain in the critical closure.`);
+            }
+        }
         resolvedFeatureGroups[groupName] = {
             deferredRoots: group.deferredRoots,
             blockedRoots,
         };
+        if (group.deferredFrontendModules !== undefined) {
+            resolvedFeatureGroups[groupName].deferredFrontendModules = group.deferredFrontendModules;
+        }
+        if (group.deferBlockedReason !== undefined) {
+            resolvedFeatureGroups[groupName].deferBlockedReason = group.deferBlockedReason;
+        }
     }
 
     const closure = stableStronglyConnectedOrder(

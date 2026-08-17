@@ -14,6 +14,9 @@ import {
     createTauriProfileAuditPlugin,
     loadTauriProfileManifest,
 } from './tauri-esbuild-profile-audit.mjs';
+import {
+    createTauriBrowserBuildPlans,
+} from './tauri-src/esbuild-deferred.mjs';
 
 import esbuild from 'esbuild';
 
@@ -101,18 +104,26 @@ browserOptions.plugins.push(
     }
 );
 
-const browserContext = await esbuild.context(browserOptions);
+const browserBuildPlans = profileManifest
+    ? createTauriBrowserBuildPlans(browserOptions, profileManifest, __dirname)
+    : { main: browserOptions, classic: [] };
+const browserContexts = [];
+for (const options of [browserBuildPlans.main, ...browserBuildPlans.classic]) {
+    browserContexts.push(await esbuild.context(options));
+}
 const nodeContext = await esbuild.context(nodeOptions);
 
 if (watch) {
     await Promise.all([
-        browserContext.watch(),
+        ...browserContexts.map(context => context.watch()),
         nodeContext.watch(),
     ]);
 } else {
     try {
-        await browserContext.rebuild();
-        await browserContext.dispose();
+        for (const browserContext of browserContexts) {
+            await browserContext.rebuild();
+            await browserContext.dispose();
+        }
         await nodeContext.rebuild();
         await nodeContext.dispose();
         patchBuiltParcelWatcherLoad();

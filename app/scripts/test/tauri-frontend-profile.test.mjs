@@ -29,8 +29,13 @@ import {
     createTauriProfileAuditPlugin,
     loadTauriProfileManifest,
 } from '../../applications/browser/tauri-esbuild-profile-audit.mjs';
+import {
+    createTauriBrowserBuildPlans,
+    ensureModuleScript
+} from '../../applications/browser/tauri-src/esbuild-deferred.mjs';
 
 const require = createRequire(import.meta.url);
+const esbuild = require('esbuild');
 const properLockfile = require('proper-lockfile');
 const appDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -362,6 +367,430 @@ test('emits evidence-backed blocked roots separately from true deferred roots', 
                 dependencyPath: ['product', 'notebook'],
             }],
         },
+    });
+});
+
+test('emits an explicit deferred frontend module contract without treating its package as absent', () => {
+    const result = resolveProfile(fixture({
+        roots: ['product', 'secondary-window'],
+        packages: {
+            product: manifest('product'),
+            'secondary-window': manifest('secondary-window'),
+        },
+        featureGroups: {
+            'secondary-window': {
+                deferredRoots: [],
+                blockedRoots: [{
+                    name: 'secondary-window',
+                    reason: 'The package remains critical for the generated secondary-window entry.',
+                }],
+                deferredFrontendModules: [{
+                    package: 'secondary-window',
+                    module: 'secondary-window/lib/browser/secondary-window-frontend-module',
+                    proxy: 'tauri-src/secondary-window-proxy-frontend-module.ts',
+                    entry: 'tauri-src/secondary-window-feature.ts',
+                    action: 'extract-widget',
+                }],
+            },
+        },
+    }));
+
+    assert.deepEqual(result.featureGroups['secondary-window'].deferredFrontendModules, [{
+        package: 'secondary-window',
+        module: 'secondary-window/lib/browser/secondary-window-frontend-module',
+        proxy: 'tauri-src/secondary-window-proxy-frontend-module.ts',
+        entry: 'tauri-src/secondary-window-feature.ts',
+        action: 'extract-widget',
+    }]);
+    assert.ok(result.extensions.includes('secondary-window'));
+});
+
+test('rejects ambiguous or non-canonical deferred frontend module declarations', () => {
+    const packages = {
+        product: manifest('product'),
+        'secondary-window': manifest('secondary-window'),
+    };
+    const group = deferredFrontendModules => ({
+        'secondary-window': {
+            deferredRoots: [],
+            blockedRoots: [],
+            deferredFrontendModules,
+        },
+    });
+    const valid = {
+        package: 'secondary-window',
+        module: 'secondary-window/lib/browser/secondary-window-frontend-module',
+        proxy: 'tauri-src/secondary-window-proxy-frontend-module.ts',
+        entry: 'tauri-src/secondary-window-feature.ts',
+        action: 'extract-widget',
+    };
+
+    assert.throws(() => resolveProfile(fixture({
+        roots: ['product'], packages, featureGroups: group([{ ...valid, package: 'missing' }]),
+    })), /unknown deferred frontend package "missing"/i);
+    assert.throws(() => resolveProfile(fixture({
+        roots: ['product'], packages, featureGroups: group([{ ...valid, module: '../escape' }]),
+    })), /canonical module request/i);
+    assert.throws(() => resolveProfile(fixture({
+        roots: ['product'], packages, featureGroups: group([valid, valid]),
+    })), /deferred frontend module.*duplicated/i);
+});
+
+test('tracked profile defers only secondary-window and records every other group gate failure', async () => {
+    const browserDirectory = path.join(appDirectory, 'applications', 'browser');
+    const profile = JSON.parse(await fs.promises.readFile(path.join(browserDirectory, 'tauri-profile.json'), 'utf8'));
+    const deferredGroups = Object.entries(profile.featureGroups)
+        .filter(([, group]) => (group.deferredFrontendModules?.length ?? 0) > 0);
+
+    assert.deepEqual(deferredGroups.map(([name]) => name), ['secondary-window']);
+    assert.deepEqual(profile.featureGroups['secondary-window'].deferredFrontendModules, [{
+        package: '@theia/secondary-window',
+        module: '@theia/secondary-window/lib/browser/secondary-window-frontend-module',
+        proxy: 'tauri-src/secondary-window-proxy-frontend-module.ts',
+        entry: 'tauri-src/secondary-window-feature.ts',
+        action: 'extract-widget',
+    }]);
+    for (const [name, group] of Object.entries(profile.featureGroups)) {
+        assert.deepEqual(group.deferredRoots, [], `${name} must not silently omit package roots`);
+        if (name !== 'secondary-window') {
+            assert.match(group.deferBlockedReason, /adapter|backend|smoke|inventory|startup|provider|rebind|widget/i);
+        }
+    }
+});
+
+test('Tauri browser build splits only the ESM main entry and keeps classic worker names intact', () => {
+    const options = {
+        entryPoints: {
+            bundle: './src-gen/frontend/index.js',
+            'secondary-window': './src-gen/frontend/secondary-index.js',
+            'editor.worker': 'editor-worker.js',
+            'plugin-worker': 'plugin-worker.js',
+        },
+        outdir: 'lib/frontend',
+        plugins: [],
+    };
+    const criticalManifest = {
+        profile: 'tauri-critical',
+        featureGroups: {
+            'secondary-window': {
+                deferredFrontendModules: [{
+                    package: '@theia/secondary-window',
+                    module: '@theia/secondary-window/lib/browser/secondary-window-frontend-module',
+                    proxy: 'tauri-src/secondary-window-proxy-frontend-module.ts',
+                    entry: 'tauri-src/secondary-window-feature.ts',
+                    action: 'extract-widget',
+                }],
+            },
+        },
+    };
+    const plans = createTauriBrowserBuildPlans(options, criticalManifest, path.resolve('generated-target'));
+
+    assert.deepEqual(Object.keys(plans.main.entryPoints), ['bundle']);
+    assert.equal(plans.main.format, 'esm');
+    assert.equal(plans.main.splitting, true);
+    assert.equal(plans.main.chunkNames, 'chunks/[name]-[hash]');
+    assert.equal(
+        plans.main.alias['@theia/secondary-window/lib/browser/secondary-window-frontend-module'],
+        path.resolve('generated-target', 'tauri-src/secondary-window-proxy-frontend-module.ts')
+    );
+    assert.deepEqual(plans.classic.map(plan => ({
+        entries: Object.keys(plan.entryPoints),
+        format: plan.format,
+        splitting: plan.splitting,
+    })), [
+        { entries: ['secondary-window'], format: 'iife', splitting: false },
+        { entries: ['editor.worker'], format: 'iife', splitting: false },
+        { entries: ['plugin-worker'], format: 'iife', splitting: false },
+    ]);
+
+    const full = createTauriBrowserBuildPlans(options, { ...criticalManifest, profile: 'full' }, path.resolve('full-target'));
+    assert.deepEqual(full.main.alias ?? {}, {});
+});
+
+test('generated frontend HTML uses one external module script in build and watch mode', async t => {
+    const html = '<body><script type="text/javascript" src="./bundle.js" charset="utf-8"></script></body>';
+    const moduleHtml = '<body><script type="module" src="./bundle.js" charset="utf-8"></script></body>';
+    assert.equal(ensureModuleScript(html), moduleHtml);
+    assert.equal(ensureModuleScript(moduleHtml), moduleHtml);
+    assert.throws(() => ensureModuleScript('<body></body>'), /bundle script/i);
+    assert.throws(
+        () => ensureModuleScript(`${html}${html}`),
+        /exactly one bundle script/i
+    );
+
+    const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-module-script-watch-'));
+    t.after(() => fs.promises.rm(directory, { recursive: true, force: true }));
+    const indexPath = path.join(directory, 'lib', 'frontend', 'index.html');
+    await fs.promises.mkdir(path.dirname(indexPath), { recursive: true });
+    await fs.promises.writeFile(indexPath, html);
+    const plans = createTauriBrowserBuildPlans({
+        entryPoints: {
+            bundle: 'bundle.js',
+            'secondary-window': 'secondary-window.js',
+            'editor.worker': 'editor.worker.js',
+            'plugin-worker': 'plugin-worker.js',
+        },
+        outdir: path.dirname(indexPath),
+        plugins: [],
+    }, { profile: 'tauri-critical', featureGroups: {} }, directory);
+    const moduleScriptPlugin = plans.main.plugins.find(plugin => plugin.name === 'ride-tauri-module-script');
+    assert.ok(moduleScriptPlugin, 'main ESM build must patch index.html after every build, including watch rebuilds');
+    assert.ok(plans.classic.every(plan => !plan.plugins.some(plugin => plugin.name === 'ride-tauri-module-script')));
+    let onEnd;
+    moduleScriptPlugin.setup({
+        onEnd(callback) {
+            onEnd = callback;
+        }
+    });
+    assert.equal(typeof onEnd, 'function');
+    await onEnd({ errors: [] });
+    assert.equal(await fs.promises.readFile(indexPath, 'utf8'), moduleHtml);
+    await onEnd({ errors: [] });
+    assert.equal(await fs.promises.readFile(indexPath, 'utf8'), moduleHtml);
+});
+
+test('secondary-window source uses a dynamic proxy and a concrete disposable adapter', async () => {
+    const sourceDirectory = path.join(appDirectory, 'applications', 'browser', 'tauri-src');
+    const proxy = await fs.promises.readFile(path.join(sourceDirectory, 'secondary-window-proxy-frontend-module.ts'), 'utf8');
+    const feature = await fs.promises.readFile(path.join(sourceDirectory, 'secondary-window-feature.ts'), 'utf8');
+
+    assert.match(proxy, /import\(['"]\.\/secondary-window-feature['"]\)/);
+    assert.doesNotMatch(proxy, /@theia\/secondary-window\/lib\/browser\/secondary-window-frontend-(?:module|contribution)/);
+    assert.match(feature, /SecondaryWindowContribution/);
+    assert.match(feature, /class RideSecondaryWindowContributionAdapter/);
+    assert.doesNotMatch(feature, /\.secondaryWindowHandler\s*=/);
+    assert.match(feature, /registerCommands/);
+    assert.match(feature, /registerToolbarItems/);
+    assert.match(feature, /return commandRegistration/);
+    assert.match(feature, /return toolbarRegistration/);
+});
+
+test('secondary-window proxy splits from the initial bundle and executes the real contribution action', async t => {
+    const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-secondary-window-e2e-'));
+    t.after(() => fs.promises.rm(directory, { recursive: true, force: true }));
+    const sourceDirectory = path.join(appDirectory, 'applications', 'browser', 'tauri-src');
+    const deferredModule = '@theia/secondary-window/lib/browser/secondary-window-frontend-module';
+    const entryPoints = {
+        bundle: path.join(directory, 'frontend-entry.mjs'),
+        'secondary-window': path.join(directory, 'secondary-window-entry.mjs'),
+        'editor.worker': path.join(directory, 'editor-worker.mjs'),
+        'plugin-worker': path.join(directory, 'plugin-worker.mjs'),
+    };
+    await Promise.all([
+        fs.promises.writeFile(entryPoints.bundle, `import frontendModule from ${JSON.stringify(deferredModule)};\nexport default frontendModule;\n`),
+        fs.promises.writeFile(entryPoints['secondary-window'], 'globalThis.secondaryWindowEntry = true;\n'),
+        fs.promises.writeFile(entryPoints['editor.worker'], 'globalThis.editorWorkerEntry = true;\n'),
+        fs.promises.writeFile(entryPoints['plugin-worker'], 'globalThis.pluginWorkerEntry = true;\n'),
+    ]);
+    const manifest = {
+        profile: 'tauri-critical',
+        featureGroups: {
+            'secondary-window': {
+                deferredFrontendModules: [{
+                    package: '@theia/secondary-window',
+                    module: deferredModule,
+                    proxy: 'tauri-src/secondary-window-proxy-frontend-module.ts',
+                    entry: 'tauri-src/secondary-window-feature.ts',
+                    action: 'extract-widget',
+                }],
+            },
+        },
+    };
+    const commonOptions = {
+        entryPoints,
+        outdir: path.join(directory, 'critical'),
+        bundle: true,
+        packages: 'external',
+        write: true,
+        logLevel: 'silent',
+    };
+    const generatedHtml = '<body><script type="text/javascript" src="./bundle.js" charset="utf-8"></script></body>';
+    await fs.promises.mkdir(commonOptions.outdir, { recursive: true });
+    await fs.promises.writeFile(path.join(commonOptions.outdir, 'index.html'), generatedHtml);
+    const criticalPlans = createTauriBrowserBuildPlans(commonOptions, manifest, path.join(appDirectory, 'applications', 'browser'));
+    await esbuild.build(criticalPlans.main);
+    for (const plan of criticalPlans.classic) {
+        await esbuild.build(plan);
+    }
+
+    const initialBundle = await fs.promises.readFile(path.join(directory, 'critical', 'bundle.js'), 'utf8');
+    const chunkDirectory = path.join(directory, 'critical', 'chunks');
+    const chunkNames = (await fs.promises.readdir(chunkDirectory)).sort();
+    const chunks = await Promise.all(chunkNames.map(async name => ({
+        name,
+        source: await fs.promises.readFile(path.join(chunkDirectory, name), 'utf8'),
+    })));
+    assert.doesNotMatch(initialBundle, /secondary-window-frontend-contribution/);
+    assert.doesNotMatch(initialBundle, /SecondaryWindowContribution/);
+    assert.ok(chunks.some(({ source }) => source.includes('secondary-window-frontend-contribution')));
+    assert.ok(chunks.some(({ source }) => source.includes('SecondaryWindowContribution')));
+    assert.ok(chunkNames.every(name => /^secondary-window-feature-[A-Z0-9]+\.js$/.test(name)));
+    for (const name of ['secondary-window.js', 'editor.worker.js', 'plugin-worker.js']) {
+        assert.equal(fs.existsSync(path.join(directory, 'critical', name)), true, `${name} must retain its fixed classic-worker name`);
+    }
+
+    const fullDirectory = path.join(directory, 'full');
+    await fs.promises.mkdir(fullDirectory, { recursive: true });
+    await fs.promises.writeFile(path.join(fullDirectory, 'index.html'), generatedHtml);
+    const fullPlans = createTauriBrowserBuildPlans(
+        { ...commonOptions, outdir: fullDirectory },
+        { ...manifest, profile: 'full' },
+        path.join(appDirectory, 'applications', 'browser')
+    );
+    await esbuild.build(fullPlans.main);
+    const fullBundle = await fs.promises.readFile(path.join(fullDirectory, 'bundle.js'), 'utf8');
+    assert.match(fullBundle, /secondary-window-frontend-module/);
+    assert.doesNotMatch(fullBundle, /RideSecondaryWindowProxy|secondary-window-feature/);
+
+    const featureBundle = path.join(directory, 'secondary-window-feature.cjs');
+    const fullModuleBundle = path.join(directory, 'secondary-window-full-module.cjs');
+    const fullModuleEntry = path.join(directory, 'secondary-window-full-entry.mjs');
+    const widgetsShim = path.join(directory, 'widgets-shim.cjs');
+    const handlerShim = path.join(directory, 'secondary-window-handler-shim.cjs');
+    const commandShim = path.join(directory, 'command-shim.cjs');
+    const toolbarShim = path.join(directory, 'toolbar-shim.cjs');
+    await Promise.all([
+        fs.promises.writeFile(widgetsShim, String.raw`
+            exports.codicon = name => 'codicon codicon-' + name;
+            exports.ExtractableWidget = { is: widget => Boolean(widget) };
+        `),
+        fs.promises.writeFile(handlerShim, 'exports.SecondaryWindowHandler = class SecondaryWindowHandler {};\n'),
+        fs.promises.writeFile(commandShim, String.raw`
+            exports.Command = { toLocalizedCommand: command => command };
+            exports.CommandContribution = Symbol.for('ride.test.CommandContribution');
+        `),
+        fs.promises.writeFile(toolbarShim, String.raw`
+            exports.TabBarToolbarContribution = Symbol.for('ride.test.TabBarToolbarContribution');
+        `),
+        fs.promises.writeFile(fullModuleEntry, `
+            import frontendModule from ${JSON.stringify(deferredModule)};
+            export { frontendModule };
+            export { SecondaryWindowHandler } from '@theia/core/lib/browser/secondary-window-handler';
+            export { CommandContribution } from '@theia/core/lib/common/command';
+        `),
+    ]);
+    await esbuild.build({
+        entryPoints: [path.join(sourceDirectory, 'secondary-window-feature.ts')],
+        outfile: featureBundle,
+        bundle: true,
+        platform: 'node',
+        format: 'cjs',
+        nodePaths: [path.join(appDirectory, 'node_modules')],
+        alias: {
+            '@theia/core/lib/browser/widgets': widgetsShim,
+            '@theia/core/lib/browser/secondary-window-handler': handlerShim,
+        },
+        external: [
+            '@theia/core/shared/inversify',
+            '@theia/core/lib/common/command',
+            'theia-ide-product-ext/*',
+        ],
+        logLevel: 'silent',
+    });
+    await esbuild.build({
+        entryPoints: [fullModuleEntry],
+        outfile: fullModuleBundle,
+        bundle: true,
+        platform: 'node',
+        format: 'cjs',
+        nodePaths: [path.join(appDirectory, 'node_modules')],
+        alias: {
+            '@theia/core/lib/browser/widgets': widgetsShim,
+            '@theia/core/lib/browser/secondary-window-handler': handlerShim,
+            '@theia/core/lib/browser/shell/tab-bar-toolbar': toolbarShim,
+            '@theia/core/lib/common/command': commandShim,
+        },
+        external: ['@theia/core/shared/inversify'],
+        logLevel: 'silent',
+    });
+    const fullSmokeScript = String.raw`
+        const assert = require('node:assert/strict');
+        const { Container } = require('@theia/core/shared/inversify');
+        const bundled = require(process.argv[1]);
+        const frontendModule = bundled.frontendModule.default ?? bundled.frontendModule;
+        const { SecondaryWindowHandler, CommandContribution } = bundled;
+        const moved = [];
+        const container = new Container();
+        container.bind(SecondaryWindowHandler).toConstantValue({
+            moveWidgetToSecondaryWindow: async widget => moved.push(widget)
+        });
+        container.load(frontendModule);
+        container.getAllAsync(CommandContribution).then(async contributions => {
+            assert.equal(contributions.length, 1);
+            const handlers = new Map();
+            contributions[0].registerCommands({
+                registerCommand(command, handler) {
+                    handlers.set(command.id, handler);
+                    return { dispose: () => handlers.delete(command.id) };
+                }
+            });
+            const widget = { id: 'full-profile-widget' };
+            await handlers.get('extract-widget').execute(widget);
+            assert.deepEqual(moved, [widget]);
+        }).catch(error => {
+            console.error(error);
+            process.exitCode = 1;
+        });
+    `;
+    execFileSync(process.execPath, [
+        '--input-type=commonjs', '--eval', fullSmokeScript,
+        fullModuleBundle
+    ], {
+        cwd: appDirectory,
+        env: { ...process.env, NODE_PATH: path.join(appDirectory, 'node_modules') },
+        stdio: 'pipe',
+    });
+    const smokeScript = String.raw`
+        const assert = require('node:assert/strict');
+        const { RideDeferredCommandProxy, RideDeferredFeatureLoader } = require('theia-ide-product-ext/lib/browser/ride-deferred-feature-loader');
+        const { createSecondaryWindowFeature } = require(process.argv[1]);
+        const handlers = new Map();
+        const toolbarItems = new Map();
+        const commands = {
+            registerCommand(command, handler) {
+                if (handlers.has(command.id)) throw new Error('duplicate command ' + command.id);
+                handlers.set(command.id, handler);
+                return { dispose: () => handlers.delete(command.id) };
+            },
+            executeCommand(id, ...args) {
+                return handlers.get(id)?.execute(...args);
+            },
+        };
+        const toolbar = {
+            registerItem(item) {
+                if (toolbarItems.has(item.id)) throw new Error('duplicate toolbar ' + item.id);
+                toolbarItems.set(item.id, item);
+                return { dispose: () => toolbarItems.delete(item.id) };
+            },
+        };
+        const moved = [];
+        const secondaryWindowHandler = { moveWidgetToSecondaryWindow: async widget => moved.push(widget) };
+        const loader = new RideDeferredFeatureLoader(commands, {}, {}, toolbar, {}, { error: async () => undefined });
+        const proxy = new RideDeferredCommandProxy(loader, {
+            id: 'secondary-window',
+            command: { id: 'extract-widget', label: 'Move View to Secondary Window' },
+            toolbarItem: { id: 'extract-widget', command: 'extract-widget' },
+            load: async () => createSecondaryWindowFeature(secondaryWindowHandler),
+        });
+        proxy.registerCommands(commands);
+        proxy.registerToolbarItems(toolbar);
+        const widget = { id: 'e2e-extractable-widget' };
+        Promise.resolve(commands.executeCommand('extract-widget', widget)).then(() => {
+            assert.deepEqual(moved, [widget]);
+            assert.equal(handlers.has('extract-widget'), true);
+            assert.equal(toolbarItems.has('extract-widget'), true);
+            loader.dispose();
+            assert.equal(handlers.has('extract-widget'), false);
+            assert.equal(toolbarItems.has('extract-widget'), false);
+        }).catch(error => {
+            console.error(error);
+            process.exitCode = 1;
+        });
+    `;
+    execFileSync(process.execPath, ['--input-type=commonjs', '--eval', smokeScript, featureBundle], {
+        cwd: appDirectory,
+        env: { ...process.env, NODE_PATH: path.join(appDirectory, 'node_modules') },
+        stdio: 'pipe',
     });
 });
 
@@ -1546,6 +1975,7 @@ test('generates an isolated target without writing tracked package.json or src-g
     };
     await fs.promises.mkdir(path.join(browserDirectory, 'resources'), { recursive: true });
     await fs.promises.mkdir(path.join(browserDirectory, 'ico'), { recursive: true });
+    await fs.promises.mkdir(path.join(browserDirectory, 'tauri-src'), { recursive: true });
     await fs.promises.mkdir(path.join(browserDirectory, 'src-gen'), { recursive: true });
     await Promise.all(Object.values(packageDirectories).map(directory => fs.promises.mkdir(directory, { recursive: true })));
     await fs.promises.writeFile(path.join(browserDirectory, 'package.json'), JSON.stringify({
@@ -1566,6 +1996,7 @@ test('generates an isolated target without writing tracked package.json or src-g
     await fs.promises.writeFile(path.join(browserDirectory, 'tauri-esbuild-profile-audit.mjs'), 'export {};\n');
     await fs.promises.writeFile(path.join(browserDirectory, 'resources', 'preload.html'), '<main></main>\n');
     await fs.promises.writeFile(path.join(browserDirectory, 'ico', 'favicon.ico'), 'ico');
+    await fs.promises.writeFile(path.join(browserDirectory, 'tauri-src', 'deferred.ts'), 'export {};\n');
     await fs.promises.writeFile(path.join(browserDirectory, 'src-gen', 'sentinel.txt'), 'tracked generated sentinel');
     const installedManifests = {
         product: manifest('product', { shared: '^1.0.0' }),
@@ -1602,6 +2033,10 @@ test('generates an isolated target without writing tracked package.json or src-g
     assert.ok(fs.existsSync(path.join(result.targetDirectory, 'ride-esbuild-dedupe.mjs')));
     assert.ok(fs.existsSync(path.join(result.targetDirectory, 'resources', 'preload.html')));
     assert.ok(fs.existsSync(path.join(result.targetDirectory, 'ico', 'favicon.ico')));
+    assert.equal(
+        await fs.promises.readFile(path.join(result.targetDirectory, 'tauri-src', 'deferred.ts'), 'utf8'),
+        'export {};\n'
+    );
     const profileManifest = JSON.parse(await fs.promises.readFile(path.join(result.targetDirectory, 'ride-tauri-profile.json'), 'utf8'));
     assert.equal(profileManifest.schema, 'ride.tauri-profile');
     assert.equal(profileManifest.version, 1);

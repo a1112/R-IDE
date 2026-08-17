@@ -130,6 +130,7 @@ test('declares the exact browser-root inventory for every feature group', () => 
     'collaboration',
     'notebook',
     'preview-getting-started',
+    'secondary-window',
   ]);
   const classifiedRoots = new Set();
   for (const group of Object.values(profile.featureGroups)) {
@@ -158,6 +159,7 @@ test('declares the exact browser-root inventory for every feature group', () => 
     '@theia/getting-started',
     '@theia/preview',
   ]);
+  assert.deepEqual(groupRoots('secondary-window'), ['@theia/secondary-window']);
   assert.deepEqual(groupRoots('auxiliary'), [
     '@theia/bulk-edit',
     '@theia/callhierarchy',
@@ -175,7 +177,6 @@ test('declares the exact browser-root inventory for every feature group', () => 
     '@theia/property-view',
     '@theia/remote',
     '@theia/scanoss',
-    '@theia/secondary-window',
     '@theia/terminal-manager',
     '@theia/test',
     '@theia/timeline',
