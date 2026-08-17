@@ -18,6 +18,7 @@ import {
     resolveInstalledPackageGraph,
     resolveProfile,
     retryFilesystemOperation,
+    selectCanonicalPackageManifest,
 } from '../tauri-frontend-profile.mjs';
 
 function manifest(name, dependencies = {}, extra = {}) {
@@ -514,6 +515,10 @@ test('finds the package root above nested module-format package metadata', async
     await fs.promises.writeFile(entry, 'module.exports = {};\n');
 
     assert.equal(findPackageManifest(entry), path.join(packageDirectory, 'package.json'));
+    assert.equal(
+        selectCanonicalPackageManifest(path.join(nestedDirectory, 'package.json')),
+        path.join(packageDirectory, 'package.json'),
+    );
 });
 
 async function writeSentinel(directory, value) {

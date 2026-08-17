@@ -788,6 +788,19 @@ export function findPackageManifest(packageEntry) {
     }
 }
 
+export function selectCanonicalPackageManifest(manifestPath) {
+    try {
+        const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+        if (typeof manifest.name === 'string' && manifest.name && semver.valid(manifest.version)) {
+            return manifestPath;
+        }
+    } catch {
+        // A package export can resolve to nested or incomplete metadata. Search
+        // upward for the manifest that carries the installed package identity.
+    }
+    return findPackageManifest(manifestPath);
+}
+
 async function defaultResolveInstalledManifest(requestName, fromDirectory) {
     const localRequire = createRequire(path.join(fromDirectory, 'package.json'));
     let manifestPath;
@@ -797,6 +810,7 @@ async function defaultResolveInstalledManifest(requestName, fromDirectory) {
         const entry = localRequire.resolve(requestName);
         manifestPath = findPackageManifest(entry);
     }
+    manifestPath = selectCanonicalPackageManifest(manifestPath);
     return {
         requestName,
         packageDirectory: path.dirname(manifestPath),
