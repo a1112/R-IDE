@@ -366,11 +366,8 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
         }
         if (openedTarget) {
             await this.reportStartupMilestone('target_file_opened');
-            this.requestPluginDeployment().then(deployed => {
-                if (deployed) {
-                    this.startPluginObservation();
-                }
-            });
+            this.startPluginObservation();
+            this.requestPluginDeployment();
         }
     }
 

@@ -2,7 +2,11 @@ name: CI
 
 on:
   push:
+    branches:
+      - main
   pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
@@ -142,6 +146,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
       - name: Set up Node.js 22
         uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238
         with:
@@ -155,9 +161,10 @@ jobs:
             ~/.cargo/git
             app/plugins
             app/applications/tauri/src-tauri/target
-          key: package-${{ matrix.platform }}-${{ matrix.arch }}-${{ hashFiles('app/yarn.lock', 'app/applications/tauri/src-tauri/Cargo.lock') }}
+            !app/applications/tauri/src-tauri/target/release/bundle
+          key: package-v2-${{ matrix.platform }}-${{ matrix.arch }}-${{ hashFiles('app/yarn.lock', 'app/applications/tauri/src-tauri/Cargo.lock') }}
           restore-keys: |
-            package-${{ matrix.platform }}-${{ matrix.arch }}-
+            package-v2-${{ matrix.platform }}-${{ matrix.arch }}-
       - name: Install Linux Tauri prerequisites
         if: runner.os == 'Linux'
         shell: bash
@@ -167,6 +174,7 @@ jobs:
             sudo apt-get install -y libwebkit2gtk-4.0-dev
           fi
           sudo apt-get install -y \
+            acl \
             build-essential \
             curl \
             file \
@@ -219,7 +227,40 @@ jobs:
       - name: Measure packaged Tauri startup on Linux
         if: runner.os == 'Linux'
         working-directory: app
-        run: xvfb-run -a npm run measure:tauri-startup -- --output applications/tauri/src-tauri/target/release/bundle/startup-metrics.json
+        shell: bash
+        run: |
+          set -u
+          measure_user='ride-startup-ci'
+          measure_home="$(mktemp -d)"
+          bundle_output='applications/tauri/src-tauri/target/release/bundle/startup-metrics.json'
+          bundle_directory="$(dirname "$bundle_output")"
+          runner_uid="$(id -u)"
+          runner_gid="$(id -g)"
+          sudo useradd --system --user-group --home-dir "$measure_home" --shell /usr/sbin/nologin "$measure_user"
+          app_path="$(pwd -P)"
+          workspace_path="$(dirname "$app_path")"
+          acl_paths=()
+          while [[ "$workspace_path" != '/' ]]; do
+            acl_paths+=("$workspace_path")
+            workspace_path="$(dirname "$workspace_path")"
+          done
+          cleanup_measure_user() {
+            status=$?
+            sudo setfacl -x "u:$measure_user" "$app_path" || true
+            for acl_path in "${acl_paths[@]}"; do
+              sudo setfacl -x "u:$measure_user" "$acl_path" || true
+            done
+            sudo chown "$runner_uid:$runner_gid" "$bundle_directory" || true
+            sudo userdel "$measure_user" >/dev/null 2>&1 || true
+            exit "$status"
+          }
+          trap cleanup_measure_user EXIT
+          sudo chown "$measure_user:$measure_user" "$measure_home" "$bundle_directory"
+          sudo setfacl -m "u:$measure_user:r-x" "$app_path"
+          for acl_path in "${acl_paths[@]}"; do
+            sudo setfacl -m "u:$measure_user:--x" "$acl_path"
+          done
+          sudo -H -u "$measure_user" env "PATH=$PATH" xvfb-run -a npm run measure:tauri-startup -- --output "$bundle_output"
       - name: Measure packaged Tauri startup on non-Linux
         if: runner.os != 'Linux'
         working-directory: app

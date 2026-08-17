@@ -9,12 +9,16 @@
 
 use std::io;
 
+// These abstractions have production callers only on Windows, while the
+// cross-platform integration tests import this module directly with fakes.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) trait StartupJobFactory {
     type Guard;
 
     fn create(&self) -> io::Result<Self::Guard>;
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn create_if_requested_with<Factory: StartupJobFactory>(
     requested: bool,
     factory: &Factory,
@@ -26,6 +30,7 @@ pub(crate) fn create_if_requested_with<Factory: StartupJobFactory>(
     }
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) trait JobApi {
     type Handle;
 
@@ -34,6 +39,7 @@ pub(crate) trait JobApi {
     fn assign_current_process(&self, handle: &Self::Handle) -> io::Result<()>;
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn create_job_with<Api: JobApi>(api: &Api) -> io::Result<Api::Handle> {
     let handle = api.create_job()?;
     api.set_kill_on_close(&handle)?;

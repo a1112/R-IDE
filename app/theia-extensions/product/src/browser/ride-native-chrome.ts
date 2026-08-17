@@ -7,9 +7,11 @@
  * SPDX-License-Identifier: MIT
  ********************************************************************************/
 
-import { invoke, isTauri as isTauriRuntime } from '@tauri-apps/api/core';
+import { invoke as tauriInvoke, isTauri as isTauriRuntime } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { injectable, unmanaged } from '@theia/core/shared/inversify';
 import type { RideOpenRequest } from './ride-open-request';
+import type { RidePerformanceSnapshot, RideUsageGroup } from './ride-performance';
 
 export interface RideMenuAction {
     label: string;
@@ -27,7 +29,26 @@ interface NativeMenuPayload {
     command: string;
 }
 
-type RidePlatform = 'macos' | 'windows' | 'linux' | 'unknown';
+export type RidePlatform = 'macos' | 'windows' | 'linux' | 'unknown';
+export type RideWindowControlAction = 'close' | 'minimize' | 'toggleMaximize';
+
+export interface RideWindowControlLayout {
+    placement: 'left' | 'right';
+    actions: RideWindowControlAction[];
+}
+
+export function getRideWindowControls(platform: RidePlatform): RideWindowControlLayout {
+    if (platform === 'macos') {
+        return {
+            placement: 'left',
+            actions: ['close', 'minimize', 'toggleMaximize']
+        };
+    }
+    return {
+        placement: 'right',
+        actions: ['minimize', 'toggleMaximize', 'close']
+    };
+}
 type RideOpenRequestListener = (
     event: string,
     handler: (event: { payload: RideOpenRequest }) => void
@@ -42,7 +63,10 @@ export interface RideNativeChromeOptions {
     isTauri?: boolean;
     platform?: RidePlatform;
     listen?: RideOpenRequestListener;
+    invoke?: RideNativeInvoke;
 }
+
+export type RideNativeInvoke = (command: string, args?: Record<string, unknown>) => Promise<unknown>;
 
 export const RIDE_LANGUAGE_STORAGE_KEY = 'localeId';
 
@@ -60,6 +84,7 @@ export const RIDE_TEXT = {
         askAssistant: 'Ask R-IDE Assistant...',
         bottomPanel: 'Bottom Panel',
         cacheSuggestion: 'Use caching to reduce database queries',
+        close: 'Close',
         closeAllEditors: 'Close All Editors',
         closeEditor: 'Close Editor',
         commandPalette: 'Command Palette...',
@@ -131,6 +156,7 @@ export const RIDE_TEXT = {
         askAssistant: '询问 R-IDE Assistant...',
         bottomPanel: '底部栏',
         cacheSuggestion: '使用缓存减少数据库查询',
+        close: '关闭',
         closeAllEditors: '关闭所有编辑器',
         closeEditor: '关闭编辑器',
         commandPalette: '命令面板...',
@@ -319,16 +345,50 @@ export function getRideMainMenu(language: RideLanguage = getStoredRideLanguage()
     ];
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === 'object' && Object(value) === value && !Array.isArray(value);
+}
+
+function isNonNegativeSafeInteger(value: unknown): value is number {
+    return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isUsageGroup(value: unknown): value is RideUsageGroup {
+    if (!isRecord(value)) {
+        return false;
+    }
+    return typeof value.cpuPercent === 'number'
+        && Number.isFinite(value.cpuPercent)
+        && value.cpuPercent >= 0
+        && value.cpuPercent <= 100
+        && isNonNegativeSafeInteger(value.memoryBytes)
+        && isNonNegativeSafeInteger(value.processCount);
+}
+
+function isPerformanceSnapshot(value: unknown): value is RidePerformanceSnapshot {
+    if (!isRecord(value) || !isNonNegativeSafeInteger(value.sampledAtMs)) {
+        return false;
+    }
+    return isUsageGroup(value.total)
+        && isUsageGroup(value.main)
+        && isUsageGroup(value.backend)
+        && isUsageGroup(value.pluginHost)
+        && isUsageGroup(value.other);
+}
+
+@injectable()
 export class RideNativeChrome {
     readonly isTauri: boolean;
     readonly platform: RidePlatform;
 
     protected readonly openRequestListener: RideOpenRequestListener;
+    protected readonly invoke: RideNativeInvoke;
 
-    constructor(options: RideNativeChromeOptions = {}) {
+    constructor(@unmanaged() options: RideNativeChromeOptions = {}) {
         this.isTauri = options.isTauri ?? (typeof window === 'object' && isTauriRuntime());
         this.platform = options.platform ?? this.resolvePlatform();
         this.openRequestListener = options.listen ?? ((event, handler) => listen<RideOpenRequest>(event, handler));
+        this.invoke = options.invoke ?? ((command, args) => tauriInvoke<unknown>(command, args));
     }
 
     async showNativeMenu(anchor: HTMLElement, language: RideLanguage = getStoredRideLanguage()): Promise<boolean> {
@@ -338,7 +398,7 @@ export class RideNativeChrome {
 
         const rect = anchor.getBoundingClientRect();
         try {
-            await invoke('ride_show_main_menu', {
+            await this.invoke('ride_show_main_menu', {
                 request: {
                     x: Math.round(rect.left),
                     y: Math.round(rect.bottom + 2),
@@ -363,7 +423,7 @@ export class RideNativeChrome {
         }
 
         try {
-            await invoke('ride_start_window_drag');
+            await this.invoke('ride_start_window_drag');
         } catch {
             // Browser preview and non-Tauri shells do not expose native dragging.
         }
@@ -374,7 +434,7 @@ export class RideNativeChrome {
             return;
         }
 
-        await invoke('ride_window_control', { action }).catch(error => {
+        await this.invoke('ride_window_control', { action }).catch(error => {
             console.warn(`[R-IDE] Window action failed: ${action}`, error);
         });
     }
@@ -385,7 +445,7 @@ export class RideNativeChrome {
                 return;
             }
 
-            await invoke('ride_frontend_ready', { locale }).catch(error => {
+            await this.invoke('ride_frontend_ready', { locale }).catch(error => {
                 console.warn('[R-IDE] Failed to report frontend readiness.', error);
             });
         } finally {
@@ -404,11 +464,22 @@ export class RideNativeChrome {
         if (!this.isTauri) {
             return [];
         }
-        const directories = await invoke<unknown>('ride_plugin_directories');
+        const directories = await this.invoke('ride_plugin_directories');
         if (!Array.isArray(directories) || directories.some(directory => typeof directory !== 'string')) {
             throw new Error('R-IDE received invalid native plugin directories.');
         }
         return directories;
+    }
+
+    async getPerformanceSnapshot(): Promise<RidePerformanceSnapshot | undefined> {
+        if (!this.isTauri) {
+            return undefined;
+        }
+        const snapshot = await this.invoke('ride_performance_snapshot');
+        if (!isPerformanceSnapshot(snapshot)) {
+            throw new Error('R-IDE received an invalid native performance snapshot.');
+        }
+        return snapshot;
     }
 
     async listenForNativeMenuCommands(handler: (command: string) => void): Promise<() => void> {

@@ -8,9 +8,10 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { Container, ContainerModule } from '@theia/core/shared/inversify';
 import type { ApplicationShell } from '@theia/core/lib/browser';
-import type { FrontendApplicationStateService } from '@theia/core/lib/browser/frontend-application-state';
-import type { FrontendApplicationContribution } from '@theia/core/lib/browser/frontend-application-contribution';
+import { FrontendApplicationStateService } from '@theia/core/lib/browser/frontend-application-state';
+import { FrontendApplicationContribution } from '@theia/core/lib/browser/frontend-application-contribution';
 import type { OpenerService } from '@theia/core/lib/browser/opener-service';
+import { StatusBar, type StatusBar as StatusBarService } from '@theia/core/lib/browser/status-bar/status-bar-types';
 import type { MessageService } from '@theia/core/lib/common/message-service';
 import type { HostedPluginSupport } from '@theia/plugin-ext/lib/hosted/browser/hosted-plugin';
 import { PluginServer } from '@theia/plugin-ext/lib/common/plugin-protocol';
@@ -20,6 +21,11 @@ import {
     RideOpenRequestBindingIdentifiers
 } from '../src/browser/ride-open-request-bindings';
 import { RideOpenRequestContribution } from '../src/browser/ride-open-request';
+import { RideNativeChrome } from '../src/browser/ride-native-chrome';
+import {
+    bindRidePerformanceContribution,
+    RidePerformanceContribution
+} from '../src/browser/ride-performance-contribution';
 
 class MemoryStorage implements Storage {
     protected readonly values = new Map<string, string>();
@@ -191,4 +197,65 @@ test('frontend contribution remains synchronously constructible with async hoste
         Object.defineProperty(globalThis, 'window', { configurable: true, value: previousWindow });
         Object.defineProperty(globalThis, 'navigator', { configurable: true, value: previousNavigator });
     }
+});
+
+test('open-request and performance contributions share one native chrome binding', context => {
+    const previousWindow = globalThis.window;
+    Object.defineProperty(globalThis, 'window', {
+        configurable: true,
+        value: { sessionStorage: new MemoryStorage() }
+    });
+    context.after(() => {
+        Object.defineProperty(globalThis, 'window', { configurable: true, value: previousWindow });
+    });
+    const container = new Container();
+    const identifiers: RideOpenRequestBindingIdentifiers = {
+        applicationShell: Symbol('ApplicationShell'),
+        applicationState: Symbol('FrontendApplicationStateService'),
+        contribution: FrontendApplicationContribution,
+        hostedPlugins: Symbol('HostedPluginSupport'),
+        messageService: Symbol('MessageService'),
+        openerService: Symbol('OpenerService'),
+        workspaceService: Symbol('WorkspaceService')
+    };
+    const applicationState = {
+        reachedState: async () => undefined
+    } as unknown as FrontendApplicationStateService;
+    const statusBar = {
+        setBackgroundColor: async () => undefined,
+        setColor: async () => undefined,
+        setElement: async () => undefined,
+        removeElement: async () => undefined
+    } as StatusBarService;
+
+    container.bind(identifiers.workspaceService).toConstantValue({ ready: Promise.resolve() } as WorkspaceService);
+    container.bind(identifiers.openerService).toConstantValue({} as OpenerService);
+    container.bind(identifiers.messageService).toConstantValue({} as MessageService);
+    container.bind(identifiers.applicationShell).toConstantValue({} as ApplicationShell);
+    container.bind(identifiers.applicationState).toConstantValue(applicationState);
+    container.bind(identifiers.hostedPlugins).toConstantValue({
+        willStart: Promise.resolve(),
+        didStart: Promise.resolve()
+    } as HostedPluginSupport);
+    container.bind(PluginServer).toConstantValue({ install: async () => undefined } as unknown as PluginServer);
+    container.bind(StatusBar).toConstantValue(statusBar);
+    container.bind(FrontendApplicationStateService).toConstantValue(applicationState);
+    container.load(new ContainerModule(bind => {
+        bindRidePerformanceContribution(bind);
+        bindRideOpenRequestContribution(bind, identifiers);
+    }));
+
+    const nativeBindings = container.getAll(RideNativeChrome);
+    assert.equal(nativeBindings.length, 1);
+    const performanceContribution = container.get(RidePerformanceContribution);
+    const openRequestContribution = container.get(RideOpenRequestContribution);
+    assert.ok(performanceContribution instanceof RidePerformanceContribution);
+    assert.strictEqual(
+        (performanceContribution as unknown as { nativeChrome: RideNativeChrome }).nativeChrome,
+        nativeBindings[0]
+    );
+    assert.strictEqual(
+        (openRequestContribution as unknown as { nativeChrome: RideNativeChrome }).nativeChrome,
+        nativeBindings[0]
+    );
 });

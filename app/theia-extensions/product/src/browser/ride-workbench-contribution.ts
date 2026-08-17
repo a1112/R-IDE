@@ -22,8 +22,10 @@ import {
     RIDE_LANGUAGE_COMMANDS,
     RIDE_LANGUAGE_STORAGE_KEY,
     RideNativeChrome,
+    RideWindowControlAction,
     rideText,
-    RideTextKey
+    RideTextKey,
+    getRideWindowControls
 } from './ride-native-chrome';
 
 const GETTING_STARTED_WIDGET_ID = 'getting.started.widget';
@@ -137,11 +139,6 @@ export class RideWorkbenchContribution implements FrontendApplicationContributio
         topPanel.addEventListener('mousedown', event => this.nativeChrome.startWindowDrag(event));
         topPanel.addEventListener('dblclick', event => this.toggleWindowFromChrome(event));
 
-        const nativeWindowSpacer = document.createElement('div');
-        nativeWindowSpacer.className = 'ride-native-window-spacer';
-        nativeWindowSpacer.setAttribute('aria-hidden', 'true');
-        nativeWindowSpacer.setAttribute('data-tauri-drag-region', '');
-
         const brand = document.createElement('button');
         brand.type = 'button';
         brand.className = 'ride-brand ride-menu-button';
@@ -203,8 +200,14 @@ export class RideWorkbenchContribution implements FrontendApplicationContributio
             rightSidebarControl
         );
 
-        topPanel.prepend(nativeWindowSpacer, brand, leftSidebarControl);
-        topPanel.append(commandCenter, runButton, layoutActions);
+        const windowControls = this.createWindowControls();
+        if (windowControls.dataset.placement === 'left') {
+            topPanel.prepend(windowControls, brand, leftSidebarControl);
+            topPanel.append(commandCenter, runButton, layoutActions);
+        } else {
+            topPanel.prepend(brand, leftSidebarControl);
+            topPanel.append(commandCenter, runButton, layoutActions, windowControls);
+        }
     }
 
     protected releaseStartupOverlay(): void {
@@ -226,6 +229,40 @@ export class RideWorkbenchContribution implements FrontendApplicationContributio
             button.addEventListener('click', () => this.execute(command));
         }
         return button;
+    }
+
+    protected createWindowControls(): HTMLElement {
+        const layout = getRideWindowControls(this.nativeChrome.platform);
+        const controls = document.createElement('div');
+        controls.className = 'ride-window-controls';
+        controls.dataset.placement = layout.placement;
+        controls.setAttribute('role', 'group');
+        controls.setAttribute('aria-label', this.t('window'));
+        controls.setAttribute('data-no-drag', 'true');
+
+        const icons: Record<RideWindowControlAction, string> = {
+            close: 'codicon-chrome-close',
+            minimize: 'codicon-chrome-minimize',
+            toggleMaximize: 'codicon-chrome-maximize'
+        };
+        for (const action of layout.actions) {
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.className = `ride-window-control ${action}`;
+            button.title = this.t(action);
+            button.setAttribute('aria-label', this.t(action));
+            button.setAttribute('data-no-drag', 'true');
+            button.appendChild(this.createIcon(icons[action]));
+            button.addEventListener('click', event => {
+                event.preventDefault();
+                event.stopPropagation();
+                this.nativeChrome.runWindowAction(action).catch(error => {
+                    console.warn(`[R-IDE] Window action failed: ${action}`, error);
+                });
+            });
+            controls.appendChild(button);
+        }
+        return controls;
     }
 
     protected createIcon(iconClass: string): HTMLSpanElement {

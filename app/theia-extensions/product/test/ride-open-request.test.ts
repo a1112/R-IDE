@@ -305,6 +305,17 @@ function readState(storage: Storage): { version: 2; lastConsumed: string; reques
     return serialized === null ? undefined : JSON.parse(serialized);
 }
 
+function createTestFileUri(nativePath: string): URI {
+    const portablePath = /^[A-Za-z]:[\\/]/.test(nativePath) || /^\\\\/.test(nativePath)
+        ? nativePath.replace(/\\/g, '/')
+        : nativePath;
+    return FileUri.create(portablePath);
+}
+
+function comparableFilePath(uri: URI): string {
+    return FileUri.fsPath(uri).replace(/\\/g, '/').toLowerCase();
+}
+
 async function flushRequestChain(): Promise<void> {
     await new Promise<void>(resolve => setImmediate(resolve));
 }
@@ -337,7 +348,7 @@ function createContribution(
     hostedPlugins: FakeHostedPluginSupport | Promise<FakeHostedPluginSupport>;
     events: string[];
 } {
-    const workspace = new FakeWorkspaceService({ resource: FileUri.create(workspacePath) });
+    const workspace = new FakeWorkspaceService({ resource: createTestFileUri(workspacePath) });
     const events: string[] = [];
     const openers = new FakeOpenerService(async uri => {
         events.push(`open:${uri.path.toString()}`);
@@ -624,6 +635,31 @@ test('plugin deployment failure remains non-blocking and leaves the editor open'
     }
 });
 
+test('unresolved plugin deployment does not block plugin lifecycle reporting', async () => {
+    const deployment = deferred<void>();
+    const { scheduler } = createPluginDeploymentScheduler([], new FakePluginDeploymentTimer(), async () => {
+        await deployment.promise;
+    });
+    const hostedPlugins = new FakeHostedPluginSupport();
+    hostedPlugins.resolveWillStart();
+    hostedPlugins.resolveDidStart();
+    const context = createContribution(
+        '/project', new MemoryStorage(), () => undefined, async () => undefined,
+        new FakeApplicationStateService(), hostedPlugins, scheduler
+    );
+
+    await context.contribution.handleOpenRequest({
+        id: '54', source: 'initial', workspace: '/project', files: ['/project/deployment-pending.R']
+    });
+    await flushLifecycle();
+
+    assert.deepEqual(context.milestones, [
+        'target_file_opened',
+        'plugins_started',
+        'plugins_ready'
+    ]);
+});
+
 test('same-workspace requests open files in order, activate the target editor, and consume duplicate IDs once', async () => {
     const { contribution, workspace, openers, messages, shell } = createContribution();
     const request = {
@@ -636,9 +672,9 @@ test('same-workspace requests open files in order, activate the target editor, a
     await contribution.handleOpenRequest(request);
     await contribution.handleOpenRequest(request);
 
-    assert.deepEqual(openers.opened.map(entry => FileUri.fsPath(entry.uri).toLowerCase()), [
-        String.raw`c:\project\first.r`,
-        String.raw`c:\project\second.r`
+    assert.deepEqual(openers.opened.map(entry => comparableFilePath(entry.uri)), [
+        'c:/project/first.r',
+        'c:/project/second.r'
     ]);
     assert.deepEqual(openers.handlerActivations, []);
     assert.deepEqual(shell.activated, ['editor-2']);
@@ -682,7 +718,7 @@ test('different-workspace requests persist only the typed handoff and switch wit
         files: ['D:/new-project/analysis.R']
     }));
     assert.equal(workspace.opened.length, 1);
-    assert.equal(FileUri.fsPath(workspace.opened[0].uri).toLowerCase(), String.raw`d:\new-project`);
+    assert.equal(comparableFilePath(workspace.opened[0].uri), 'd:/new-project');
     assert.deepEqual(workspace.opened[0].options, { preserveWindow: true });
     assert.deepEqual(messages.errors, []);
 });
@@ -1000,7 +1036,7 @@ test('reload rejects request queues that are not exactly authorized by their emb
 
 test('a failed file reports an error, continues opening, and does not poison later requests', async () => {
     const context = createContribution(String.raw`C:\project`, new MemoryStorage(), uri => {
-        if (FileUri.fsPath(uri).toLowerCase().endsWith('broken.r')) {
+        if (comparableFilePath(uri).endsWith('broken.r')) {
             throw new Error('editor failed');
         }
     });
@@ -1018,9 +1054,9 @@ test('a failed file reports an error, continues opening, and does not poison lat
         files: [String.raw`C:\project\later.R`]
     });
 
-    assert.deepEqual(context.openers.opened.map(entry => FileUri.fsPath(entry.uri).toLowerCase()), [
-        String.raw`c:\project\healthy.r`,
-        String.raw`c:\project\later.r`
+    assert.deepEqual(context.openers.opened.map(entry => comparableFilePath(entry.uri)), [
+        'c:/project/healthy.r',
+        'c:/project/later.r'
     ]);
     assert.deepEqual(context.openers.handlerActivations, []);
     assert.deepEqual(context.shell.activated, ['editor-1', 'editor-2']);
@@ -1068,9 +1104,9 @@ test('an observable workspace switch failure retains the ordered handoff without
 
     const restarted = createContribution(String.raw`D:\other`, context.storage);
     await restarted.contribution.restorePendingRequest();
-    assert.deepEqual(restarted.openers.opened.map(entry => FileUri.fsPath(entry.uri).toLowerCase()), [String.raw`d:\other\file.r`]);
+    assert.deepEqual(restarted.openers.opened.map(entry => comparableFilePath(entry.uri)), ['d:/other/file.r']);
     assert.equal(restarted.workspace.opened.length, 1);
-    assert.equal(FileUri.fsPath(restarted.workspace.opened[0].uri).toLowerCase(), String.raw`c:\project`);
+    assert.equal(comparableFilePath(restarted.workspace.opened[0].uri), 'c:/project');
     assert.deepEqual(readState(context.storage), stateEnvelope('6',
         { id: '6', source: 'singleInstance', workspace: 'C:/project', files: ['C:/project/later.R'] }
     ));
@@ -1216,7 +1252,7 @@ test('Windows drive root is a valid workspace for a root-level file', async () =
         id: '11', source: 'initial', workspace: 'C:/', files: [String.raw`C:\root.R`]
     });
 
-    assert.deepEqual(context.openers.opened.map(entry => FileUri.fsPath(entry.uri).toLowerCase()), [String.raw`c:\root.r`]);
+    assert.deepEqual(context.openers.opened.map(entry => comparableFilePath(entry.uri)), ['c:/root.r']);
     assert.deepEqual(context.workspace.opened, []);
     assert.deepEqual(context.messages.errors, []);
 });
@@ -1229,7 +1265,7 @@ test('Windows drive roots with redundant separators remain same-workspace reques
             id: '12', source: 'initial', workspace, files: [String.raw`C:\root.R`]
         });
 
-        assert.deepEqual(context.openers.opened.map(entry => FileUri.fsPath(entry.uri).toLowerCase()), [String.raw`c:\root.r`]);
+        assert.deepEqual(context.openers.opened.map(entry => comparableFilePath(entry.uri)), ['c:/root.r']);
         assert.deepEqual(context.workspace.opened, []);
         assert.deepEqual(readState(context.storage), stateEnvelope('12'));
         assert.deepEqual(context.messages.errors, []);
@@ -1247,14 +1283,14 @@ test('redundant drive-root separators are canonical across handoff and reload', 
     assert.deepEqual(readState(storage), stateEnvelope('13', {
         id: '13', source: 'singleInstance', workspace: 'C:/', files: ['C:/root.R']
     }));
-    assert.equal(FileUri.fsPath(firstWindow.workspace.opened[0].uri).toLowerCase(), 'c:\\');
+    assert.equal(comparableFilePath(firstWindow.workspace.opened[0].uri), 'c:/');
     assert.deepEqual(firstWindow.workspace.opened[0].options, { preserveWindow: true });
     assert.deepEqual(firstWindow.openers.opened, []);
 
     const reloadedWindow = createContribution('C:\\', storage);
     await reloadedWindow.contribution.restorePendingRequest();
 
-    assert.deepEqual(reloadedWindow.openers.opened.map(entry => FileUri.fsPath(entry.uri).toLowerCase()), [String.raw`c:\root.r`]);
+    assert.deepEqual(reloadedWindow.openers.opened.map(entry => comparableFilePath(entry.uri)), ['c:/root.r']);
     assert.deepEqual(readState(storage), stateEnvelope('13'));
 });
 
@@ -1424,7 +1460,7 @@ test('UNC share root is valid while empty segments and traversal remain rejected
         id: '11', source: 'initial', workspace: String.raw`\\SERVER\SHARE`, files: [String.raw`\\server\share\root.R`]
     });
 
-    assert.deepEqual(valid.openers.opened.map(entry => FileUri.fsPath(entry.uri).toLowerCase()), [String.raw`\\server\share\root.r`]);
+    assert.deepEqual(valid.openers.opened.map(entry => comparableFilePath(entry.uri)), ['//server/share/root.r']);
     assert.deepEqual(valid.workspace.opened, []);
 
     const invalid = createContribution(workspace);

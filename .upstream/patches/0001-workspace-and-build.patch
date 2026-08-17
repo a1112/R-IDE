@@ -48,7 +48,7 @@ index 882bfac..7573561 100644
 \ No newline at end of file
 +}
 diff --git a/package.json b/package.json
-index 95188d1..ae123a0 100644
+index 95188d1..dad46b8 100644
 --- a/package.json
 +++ b/package.json
 @@ -1,6 +1,6 @@
@@ -90,13 +90,15 @@ index 95188d1..ae123a0 100644
      "package:applications": "lerna run --scope=\"theia-ide*app\" --ignore=\"theia-ide-next*\" package --concurrency 1",
      "package:applications:preview": "lerna run --scope=\"theia-ide*app\" --ignore=\"theia-ide-next*\" package:preview --concurrency 1",
      "package:applications:prod": "lerna run --scope=\"theia-ide*app\" --ignore=\"theia-ide-next*\" package:prod --concurrency 1",
-@@ -53,22 +53,28 @@
+@@ -53,22 +53,30 @@
      "permissions:writeable": "ts-node scripts/make-files-writeable.ts plugins",
      "watch": "lerna run --parallel watch",
      "test": "lerna run test",
 +    "test:sync": "node --test ../scripts/test/upstream-sync/*.test.mjs",
 +    "check:sync": "node ../scripts/sync-upstream.mjs check",
 +    "check:rust": "node scripts/check-rust.js",
++    "test:tauri-rust": "node scripts/run-tauri-tests.js",
++    "measure:tauri-startup": "node scripts/measure-tauri-startup.mjs",
      "electron": "yarn --cwd applications/electron",
      "electron-next": "yarn --cwd applications/electron-next",
      "browser": "yarn --cwd applications/browser",
@@ -122,7 +124,7 @@ index 95188d1..ae123a0 100644
      "vscjava.vscode-java-pack": "https://open-vsx.org/api/vscjava/vscode-java-pack/0.30.5/file/vscjava.vscode-java-pack-0.30.5.vsix",
      "vscjava.vscode-java-dependency": "https://open-vsx.org/api/vscjava/vscode-java-dependency/0.27.0/file/vscjava.vscode-java-dependency-0.27.0.vsix"
    },
-@@ -82,25 +88,42 @@
+@@ -82,25 +90,42 @@
      "theia-extensions/*"
    ],
    "resolutions": {

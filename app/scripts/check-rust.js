@@ -1,11 +1,11 @@
 /* Run the Rust quality gates without shell-specific command chaining. */
 
 const { spawnSync } = require('node:child_process');
+const { runTauriTests } = require('./run-tauri-tests');
 
 const cargoArguments = [
   ['fmt', '--manifest-path', 'applications/tauri/src-tauri/Cargo.toml', '--check'],
   ['clippy', '--manifest-path', 'applications/tauri/src-tauri/Cargo.toml', '--all-targets', '--', '-D', 'warnings'],
-  ['test', '--manifest-path', 'applications/tauri/src-tauri/Cargo.toml'],
 ];
 
 function run() {
@@ -24,7 +24,7 @@ function run() {
       return result.status;
     }
   }
-  return 0;
+  return runTauriTests();
 }
 
 if (require.main === module) {

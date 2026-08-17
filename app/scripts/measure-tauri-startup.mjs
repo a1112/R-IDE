@@ -28,6 +28,7 @@ const STREAM_SETTLE_TIMEOUT_MS = 2_000;
 const SYNC_COMMAND_TIMEOUT_MS = 10_000;
 const SYNC_COMMAND_MAX_BUFFER_BYTES = 16 * 1024 * 1024;
 const PROC_ENVIRONMENT_MAX_BYTES = 4 * 1024 * 1024;
+const PROC_STAT_MAX_BYTES = 64 * 1024;
 const SENSITIVE_FRAGMENT_LENGTH = 16;
 const SENSITIVE_ENVIRONMENT_KEY = /(?:TOKEN|SECRET|PASSWORD|PASSWD|KEY|CREDENTIAL|COOKIE|AUTH)/i;
 const SENSITIVE_DESKTOP_PASSTHROUGH_KEYS = new Set(['XAUTHORITY']);
@@ -567,7 +568,7 @@ export function parsePosixProcessTable(output) {
       throw new Error('ps pid must be positive');
     }
     if (pgid === 0) {
-      throw new Error('ps pgid must be positive');
+      continue;
     }
     if (!creationTime) {
       throw new Error('ps lstart must not be empty');
@@ -738,6 +739,91 @@ function readBoundedFile(filePath, maximumBytes) {
   }
 }
 
+export function parseLinuxProcStatIdentity(stat, expectedPid) {
+  const pid = positiveInteger(expectedPid, 'Linux proc stat pid');
+  if (pid === 0) {
+    throw new Error('Linux proc stat pid must be positive');
+  }
+  const serialized = Buffer.isBuffer(stat) ? stat.toString('utf8') : stat;
+  if (typeof serialized !== 'string' || serialized.includes('\0')) {
+    throw new Error('Linux proc stat is invalid');
+  }
+  const value = serialized.trimEnd();
+  const prefix = `${pid} (`;
+  const closingParenthesis = value.lastIndexOf(')');
+  if (!value.startsWith(prefix)
+      || closingParenthesis < prefix.length
+      || value[closingParenthesis + 1] !== ' ') {
+    throw new Error('Linux proc stat is invalid');
+  }
+  const fields = value.slice(closingParenthesis + 2).split(/\s+/);
+  if (fields.length < 20) {
+    throw new Error('Linux proc stat is invalid');
+  }
+  const ppid = positiveInteger(fields[1], 'Linux proc stat ppid');
+  const pgid = positiveInteger(fields[2], 'Linux proc stat pgid');
+  const startTimeTicks = fields[19];
+  if (pgid === 0 || !/^\d+$/.test(startTimeTicks) || BigInt(startTimeTicks) === 0n) {
+    throw new Error('Linux proc stat is invalid');
+  }
+  return {
+    pid,
+    ppid,
+    pgid,
+    creationTime: `linux:${startTimeTicks}`,
+  };
+}
+
+function readLinuxProcIdentity(pid) {
+  try {
+    return parseLinuxProcStatIdentity(
+      readBoundedFile(`/proc/${pid}/stat`, PROC_STAT_MAX_BYTES),
+      pid,
+    );
+  } catch (error) {
+    if (error?.code === 'ENOENT' || error?.code === 'ESRCH') {
+      return null;
+    }
+    throw new Error('Linux proc stat query failed');
+  }
+}
+
+export function attachLinuxProcIdentities(
+  rows,
+  { readIdentity = readLinuxProcIdentity } = {},
+) {
+  if (!Array.isArray(rows)) {
+    throw new Error('Linux process rows must be an array');
+  }
+  const attached = [];
+  for (const row of rows) {
+    const identity = readIdentity(row.pid);
+    if (identity === null) {
+      continue;
+    }
+    assertPlainObject(identity, 'Linux proc identity');
+    const identityPid = positiveInteger(identity.pid, 'Linux proc identity pid');
+    const identityPpid = positiveInteger(identity.ppid, 'Linux proc identity ppid');
+    const identityPgid = positiveInteger(identity.pgid, 'Linux proc identity pgid');
+    if (identityPid === 0
+        || identityPgid === 0
+        || typeof identity.creationTime !== 'string'
+        || !/^linux:[1-9]\d*$/.test(identity.creationTime)) {
+      throw new Error('Linux proc identity is invalid');
+    }
+    if (identityPid !== row.pid) {
+      continue;
+    }
+    attached.push({
+      ...row,
+      ppid: identityPpid,
+      pgid: identityPgid,
+      creationTime: identity.creationTime,
+    });
+  }
+  return attached;
+}
+
 function defaultLinuxProcessIds() {
   return fs.readdirSync('/proc', { withFileTypes: true })
     .filter(entry => entry.isDirectory() && /^\d+$/.test(entry.name))
@@ -801,7 +887,11 @@ export function readLinuxProcEnvironment(
     if (error?.message === 'Linux proc environment exceeds the size limit') {
       throw error;
     }
-    throw new Error('Linux proc environment query failed');
+    const queryError = new Error('Linux proc environment query failed');
+    if (error?.code === 'EACCES' || error?.code === 'EPERM') {
+      queryError.code = 'RIDE_PROC_ENVIRONMENT_UNREADABLE';
+    }
+    throw queryError;
   }
 }
 
@@ -812,6 +902,8 @@ export function discoverMarkedProcessSnapshot(
     read = readProcessTable,
     listLinuxPids = defaultLinuxProcessIds,
     readLinuxEnvironment = readLinuxProcEnvironment,
+    allowedUnreadableIdentities = [],
+    runStartIdentity,
     run = (command, args, options) => spawnSync(command, args, options),
   } = {},
 ) {
@@ -822,6 +914,57 @@ export function discoverMarkedProcessSnapshot(
 
   const beforeRows = read(platform);
   const beforeByPid = new Map(beforeRows.map(row => [row.pid, row]));
+  if (!Array.isArray(allowedUnreadableIdentities)) {
+    throw new Error('allowed unreadable identities must be an array');
+  }
+  if (platform === 'linux'
+      && runStartIdentity !== undefined
+      && !hasExactLinuxProcessIdentity(runStartIdentity)) {
+    throw new Error('Linux run start identity must be exact');
+  }
+  // This immutable identity is captured immediately after launch. It is used
+  // only as a chronology boundary: processes that started before it cannot
+  // have inherited this run's freshly generated marker. Do not derive the
+  // boundary from the current table or later tracked children, because the
+  // root PID may already have been reused.
+  const runStartTicks = platform === 'linux' && runStartIdentity !== undefined
+    ? linuxProcessStartTicks(runStartIdentity)
+    : undefined;
+  let allowedUnreadableRows = expandExactLinuxProcessScope(
+    beforeRows,
+    allowedUnreadableIdentities,
+  );
+  const toleratedUnreadableIdentities = new Map();
+  const reattestToleratedUnreadableRows = rowsByPid => {
+    const reattested = new Map();
+    for (const identity of toleratedUnreadableIdentities.values()) {
+      const current = rowsByPid.get(identity.pid);
+      if (current && sameExactLinuxProcessIdentity(current, identity)) {
+        reattested.set(trackedProcessKey(current), current);
+      }
+    }
+    return [...reattested.values()];
+  };
+  const readMarkedEnvironment = (pid, row) => {
+    try {
+      return readLinuxEnvironment(pid);
+    } catch (error) {
+      if (error?.code === 'RIDE_PROC_ENVIRONMENT_UNREADABLE') {
+        if (allowedUnreadableRows.some(
+            identity => sameExactLinuxProcessIdentity(row, identity),
+        )) {
+          toleratedUnreadableIdentities.set(trackedProcessKey(row), row);
+          return null;
+        }
+        if (hasExactLinuxProcessIdentity(row)
+            && runStartTicks !== undefined
+            && linuxProcessStartTicks(row) < runStartTicks) {
+          return null;
+        }
+      }
+      throw error;
+    }
+  };
   let markedPids;
   let macCommandOutput;
   let macEnvironmentOutput;
@@ -834,7 +977,13 @@ export function discoverMarkedProcessSnapshot(
         throw new Error('Linux proc process list is invalid');
       }
       seen.add(verifiedPid);
-      const environment = readLinuxEnvironment(verifiedPid);
+      // Rows absent from the first table are revisited from the post-/proc
+      // process table below. That table excludes unsignalable kernel rows and
+      // also catches user processes born after this /proc enumeration.
+      if (!beforeByPid.has(verifiedPid)) {
+        continue;
+      }
+      const environment = readMarkedEnvironment(verifiedPid, beforeByPid.get(verifiedPid));
       if (environment !== null && parseLinuxProcEnvironment(environment, verifiedRunId)) {
         markedPids.push(verifiedPid);
       }
@@ -858,15 +1007,47 @@ export function discoverMarkedProcessSnapshot(
     throw new Error(`unsupported marker discovery platform ${platform}`);
   }
 
-  const rows = read(platform);
-  const rowsByPid = new Map();
-  for (const row of rows) {
-    if (rowsByPid.has(row.pid)) {
-      throw new Error(`duplicate process-table pid ${row.pid}`);
+  const indexRows = processRows => {
+    const byPid = new Map();
+    for (const row of processRows) {
+      if (byPid.has(row.pid)) {
+        throw new Error(`duplicate process-table pid ${row.pid}`);
+      }
+      byPid.set(row.pid, row);
     }
-    rowsByPid.set(row.pid, row);
-  }
-  if (platform === 'darwin') {
+    return byPid;
+  };
+  let rows = read(platform);
+  let rowsByPid = indexRows(rows);
+  allowedUnreadableRows = mergeTrackedProcesses(
+    expandExactLinuxProcessScope(rows, allowedUnreadableIdentities),
+    reattestToleratedUnreadableRows(rowsByPid),
+  );
+  const markerIdentities = new Map();
+  if (platform === 'linux') {
+    for (const pid of markedPids) {
+      const before = beforeByPid.get(pid);
+      const row = rowsByPid.get(pid);
+      if (before && row && sameProcessIdentity(row, before)) {
+        markerIdentities.set(pid, before);
+      }
+    }
+    let newMarkerIdentityFound = false;
+    for (const [pid, row] of rowsByPid) {
+      if (sameProcessIdentity(row, beforeByPid.get(pid) ?? {})) {
+        continue;
+      }
+      const environment = readMarkedEnvironment(pid, row);
+      if (environment !== null && parseLinuxProcEnvironment(environment, verifiedRunId)) {
+        markerIdentities.set(pid, row);
+        newMarkerIdentityFound = true;
+      }
+    }
+    if (newMarkerIdentityFound) {
+      rows = read(platform);
+      rowsByPid = indexRows(rows);
+    }
+  } else {
     const stablePids = new Set(rows
       .filter(row => sameProcessIdentity(row, beforeByPid.get(row.pid) ?? {}))
       .map(row => row.pid));
@@ -876,19 +1057,26 @@ export function discoverMarkedProcessSnapshot(
       verifiedRunId,
       stablePids,
     );
+    for (const pid of markedPids) {
+      markerIdentities.set(pid, beforeByPid.get(pid));
+    }
   }
-  const markedRows = markedPids.map(pid => {
-    const before = beforeByPid.get(pid);
+  const markedRows = [...markerIdentities].map(([pid, identity]) => {
     const row = rowsByPid.get(pid);
-    if (!before || !row) {
+    if (!identity || !row) {
       throw new Error(`marker process ${pid} is missing from the process table`);
     }
-    if (!sameProcessIdentity(row, before)) {
+    if (!sameProcessIdentity(row, identity)) {
       throw new Error(`marker process ${pid} changed identity during discovery`);
     }
     return row;
   });
-  return { rows, markedRows };
+  const trustedUnreadableRows = platform === 'linux'
+    ? reattestToleratedUnreadableRows(rowsByPid)
+    : [];
+  return trustedUnreadableRows.length > 0
+    ? { rows, markedRows, trustedUnreadableRows }
+    : { rows, markedRows };
 }
 
 function processIdentity(row) {
@@ -904,9 +1092,85 @@ function processIdentity(row) {
 }
 
 function sameProcessIdentity(row, identity) {
+  const sameCreationTime = row.creationTime === identity.creationTime;
+  const exactLinuxIdentity = sameExactLinuxProcessIdentity(row, identity);
   return row.pid === identity.pid
-    && row.pgid === identity.pgid
+    && sameCreationTime
+    && (exactLinuxIdentity || row.pgid === identity.pgid);
+}
+
+function hasExactLinuxProcessIdentity(identity) {
+  return Number.isSafeInteger(identity?.pid)
+    && identity.pid > 0
+    && typeof identity.creationTime === 'string'
+    && /^linux:[1-9]\d*$/.test(identity.creationTime);
+}
+
+function sameExactLinuxProcessIdentity(row, identity) {
+  return hasExactLinuxProcessIdentity(row)
+    && hasExactLinuxProcessIdentity(identity)
+    && row.pid === identity.pid
     && row.creationTime === identity.creationTime;
+}
+
+function linuxProcessStartTicks(identity) {
+  return BigInt(identity.creationTime.slice('linux:'.length));
+}
+
+function expandExactLinuxProcessScope(rows, seedIdentities) {
+  const exactRows = rows.filter(hasExactLinuxProcessIdentity);
+  const records = exactRows.map(row => ({
+    row,
+    startTicks: linuxProcessStartTicks(row),
+  }));
+  const currentByPid = new Map(records.map(record => [record.row.pid, record]));
+  const childrenByParent = new Map();
+  for (const record of records) {
+    const children = childrenByParent.get(record.row.ppid) ?? [];
+    children.push(record);
+    childrenByParent.set(record.row.ppid, children);
+  }
+  const trustedByPid = new Map();
+  const pending = [];
+  const trust = record => {
+    if (!record || trustedByPid.has(record.row.pid)) {
+      return;
+    }
+    trustedByPid.set(record.row.pid, record.row);
+    pending.push(record);
+  };
+  for (const seed of seedIdentities) {
+    const current = currentByPid.get(seed?.pid);
+    if (current && sameExactLinuxProcessIdentity(current.row, seed)) {
+      trust(current);
+    }
+  }
+  const ownedGroups = new Map();
+  for (const seed of seedIdentities) {
+    if (!hasExactLinuxProcessIdentity(seed) || seed.pid !== seed.pgid) {
+      continue;
+    }
+    const currentLeader = currentByPid.get(seed.pid);
+    if (currentLeader && sameExactLinuxProcessIdentity(currentLeader.row, seed)) {
+      ownedGroups.set(seed.pgid, currentLeader.startTicks);
+    }
+  }
+  for (const record of records) {
+    const groupStartTicks = ownedGroups.get(record.row.pgid);
+    if (groupStartTicks !== undefined && record.startTicks >= groupStartTicks) {
+      trust(record);
+    }
+  }
+
+  for (let index = 0; index < pending.length; index++) {
+    const parent = pending[index];
+    for (const child of childrenByParent.get(parent.row.pid) ?? []) {
+      if (child.startTicks >= parent.startTicks) {
+        trust(child);
+      }
+    }
+  }
+  return [...trustedByPid.values()];
 }
 
 function validateProcessIdentity(identity, name = 'process identity') {
@@ -1151,7 +1415,8 @@ function readProcessTable(platform = process.platform) {
   if (result.error || result.status !== 0) {
     throw new Error(`ps process query failed: ${result.error?.message ?? result.stderr}`);
   }
-  return parsePosixProcessTable(result.stdout);
+  const posixRows = parsePosixProcessTable(result.stdout);
+  return platform === 'linux' ? attachLinuxProcIdentities(posixRows) : posixRows;
 }
 
 function aggregateMarkedProcessTree(rows, rootIdentity, markedRows) {
@@ -1214,13 +1479,31 @@ function aggregateMarkedProcessTree(rows, rootIdentity, markedRows) {
 export function sampleProcessTree(
   rootIdentity,
   platform = process.platform,
-  { runId, discover = discoverMarkedProcessSnapshot } = {},
+  {
+    runId,
+    discover = discoverMarkedProcessSnapshot,
+    trackedProcesses = [],
+  } = {},
 ) {
   if (platform === 'win32' || runId === undefined) {
     return aggregateProcessTree(readProcessTable(platform), rootIdentity);
   }
-  const snapshot = discover(validateRunId(runId), platform);
-  return aggregateMarkedProcessTree(snapshot.rows, rootIdentity, snapshot.markedRows);
+  const snapshot = discover(validateRunId(runId), platform, {
+    allowedUnreadableIdentities: [rootIdentity, ...trackedProcesses],
+    runStartIdentity: rootIdentity,
+  });
+  const exactTrackedRows = platform === 'linux'
+    ? expandExactLinuxProcessScope(snapshot.rows, [rootIdentity, ...trackedProcesses])
+    : [];
+  return aggregateMarkedProcessTree(
+    snapshot.rows,
+    rootIdentity,
+    mergeTrackedProcesses(
+      snapshot.markedRows,
+      snapshot.trustedUnreadableRows,
+      exactTrackedRows,
+    ),
+  );
 }
 
 export async function captureProcessIdentity(
@@ -1278,6 +1561,10 @@ function captureOwnedProcessGroup(rootIdentity, platform) {
 }
 
 function trackedProcessKey(processRow) {
+  if (typeof processRow.creationTime === 'string'
+      && /^linux:[1-9]\d*$/.test(processRow.creationTime)) {
+    return `${processRow.pid}\0${processRow.creationTime}`;
+  }
   return `${processRow.pid}\0${processRow.pgid ?? ''}\0${processRow.creationTime}`;
 }
 
@@ -1646,9 +1933,16 @@ export async function terminateMeasuredTree(
   const markerEnabled = platform !== 'win32' && runId !== undefined;
   const verifiedRunId = markerEnabled ? validateRunId(runId) : undefined;
   let latestMarkedProcesses = [];
+  let latestTrustedUnreadableProcesses = [];
   let markerQueryFailed = false;
+  let markerQueryFailureCode;
+  let allowedUnreadableIdentities = [rootIdentity, ...trackedProcesses].filter(Boolean);
   const validateMarkedSnapshot = snapshot => {
-    if (!snapshot || !Array.isArray(snapshot.rows) || !Array.isArray(snapshot.markedRows)) {
+    if (!snapshot
+        || !Array.isArray(snapshot.rows)
+        || !Array.isArray(snapshot.markedRows)
+        || (snapshot.trustedUnreadableRows !== undefined
+          && !Array.isArray(snapshot.trustedUnreadableRows))) {
       throw new Error('invalid marked process snapshot');
     }
     const seen = new Set();
@@ -1660,15 +1954,36 @@ export async function terminateMeasuredTree(
       }
       seen.add(key);
     }
-    return snapshot;
+    const trustedUnreadableRows = snapshot.trustedUnreadableRows ?? [];
+    for (const trustedRow of trustedUnreadableRows) {
+      validateProcessIdentity(trustedRow, 'trusted unreadable process identity');
+      const key = trackedProcessKey(trustedRow);
+      if (platform !== 'linux'
+          || !hasExactLinuxProcessIdentity(trustedRow)
+          || seen.has(key)
+          || !snapshot.rows.some(row => sameExactLinuxProcessIdentity(row, trustedRow))) {
+        throw new Error('invalid marked process snapshot');
+      }
+      seen.add(key);
+    }
+    return { ...snapshot, trustedUnreadableRows };
   };
   const readWithRetry = async () => {
     let lastError;
     if (markerEnabled) {
       for (let attempt = 1; attempt <= readAttempts; attempt++) {
         try {
-          const snapshot = validateMarkedSnapshot(discoverMarked(verifiedRunId, platform));
+          const snapshot = validateMarkedSnapshot(discoverMarked(verifiedRunId, platform, {
+            allowedUnreadableIdentities,
+            runStartIdentity: rootIdentity,
+          }));
           latestMarkedProcesses = snapshot.markedRows;
+          latestTrustedUnreadableProcesses = snapshot.trustedUnreadableRows;
+          allowedUnreadableIdentities = mergeTrackedProcesses(
+            allowedUnreadableIdentities,
+            snapshot.markedRows,
+            snapshot.trustedUnreadableRows,
+          );
           return snapshot.rows;
         } catch (error) {
           lastError = error;
@@ -1681,6 +1996,9 @@ export async function terminateMeasuredTree(
       // the campaign incomplete, but must not skip best-effort cleanup of the
       // independently verified process tree, tracked identities, or owned group.
       markerQueryFailed = true;
+      markerQueryFailureCode = lastError?.code === 'RIDE_PROC_ENVIRONMENT_UNREADABLE'
+        ? 'RIDE_PROC_ENVIRONMENT_UNREADABLE'
+        : 'RIDE_MARKER_QUERY_FAILED';
     }
     for (let attempt = 1; attempt <= readAttempts; attempt++) {
       try {
@@ -1775,11 +2093,12 @@ export async function terminateMeasuredTree(
   let cleanupTrackedProcesses = mergeTrackedProcesses(
     trackedProcesses,
     latestMarkedProcesses,
+    latestTrustedUnreadableProcesses,
   );
   if (rows.some(row => sameProcessIdentity(row, trustedRootIdentity))) {
     const chronological = chronologicalProcessTree(rows, trustedRootIdentity);
     cleanupTrackedProcesses = mergeTrackedProcesses(
-      trackedProcesses,
+      cleanupTrackedProcesses,
       chronological.selected.map(processRow => ({
         pid: processRow.pid,
         ppid: processRow.ppid,
@@ -1798,16 +2117,19 @@ export async function terminateMeasuredTree(
   };
   const rememberSafeDescendants = currentRows => {
     const rootStartedAt = comparableStartedAt(trustedRootIdentity);
-    const currentMarkers = latestMarkedProcesses.filter(marked => {
-      const current = currentRows.find(row => sameProcessIdentity(row, marked));
+    const currentProvenance = mergeTrackedProcesses(
+      latestMarkedProcesses,
+      latestTrustedUnreadableProcesses,
+    ).filter(identity => {
+      const current = currentRows.find(row => sameProcessIdentity(row, identity));
       const startedAt = comparableStartedAt(current);
       return current !== undefined
         && rootStartedAt !== null
         && startedAt !== null
         && startedAt >= rootStartedAt;
     });
-    cleanupTrackedProcesses = mergeTrackedProcesses(cleanupTrackedProcesses, currentMarkers);
-    rememberIdentities(currentMarkers);
+    cleanupTrackedProcesses = mergeTrackedProcesses(cleanupTrackedProcesses, currentProvenance);
+    rememberIdentities(currentProvenance);
     if (!currentRows.some(row => sameProcessIdentity(row, trustedRootIdentity))) {
       return;
     }
@@ -1856,6 +2178,12 @@ export async function terminateMeasuredTree(
   const stableOwnedGroupMemberKey = processRow => (
     `${processRow.pid}\0${processRow.creationTime}`
   );
+  const hasVerifiedRunProvenance = processRow => markerEnabled && (
+    latestMarkedProcesses.some(identity => sameProcessIdentity(processRow, identity))
+      || latestTrustedUnreadableProcesses.some(
+        identity => sameProcessIdentity(processRow, identity),
+      )
+  );
   const inspectOwnedGroup = currentRows => {
     if (!trustedOwnedGroup) {
       return undefined;
@@ -1875,11 +2203,23 @@ export async function terminateMeasuredTree(
     if (eligibleMembers.length !== allMembers.length) {
       ownedGroupHasUntrustedChronology = true;
     }
-    if (frozenOwnedGroupMembers !== undefined
-        && allMembers.some(processRow => !frozenOwnedGroupMembers.has(
-          trackedProcessKey(processRow),
-        ))) {
-      ownedGroupMembershipChanged = true;
+    if (frozenOwnedGroupMembers !== undefined) {
+      for (const processRow of allMembers) {
+        const key = trackedProcessKey(processRow);
+        if (frozenOwnedGroupMembers.has(key)) {
+          continue;
+        }
+        // Marker discovery runs immediately before this inspection. A new
+        // exact member carrying this run's UUID (or its reattested unreadable
+        // identity) belongs to the measured launch and may be included in the
+        // SIGKILL pass. Unmarked additions still latch fail-closed.
+        if (hasVerifiedRunProvenance(processRow)) {
+          frozenOwnedGroupMembers.add(key);
+          frozenOwnedGroupStableMembers?.add(stableOwnedGroupMemberKey(processRow));
+        } else {
+          ownedGroupMembershipChanged = true;
+        }
+      }
     }
     if (frozenOwnedGroupStableMembers !== undefined
         && currentRows.some(processRow => (
@@ -2072,7 +2412,10 @@ export async function terminateMeasuredTree(
     // A cooperative child can clear the marker between verification rounds.
     // Preserve every exact identity while it is observable so a later marker
     // disappearance cannot turn a surviving process into a false success.
-    rememberIdentities(latestMarkedProcesses);
+    rememberIdentities(mergeTrackedProcesses(
+      latestMarkedProcesses,
+      latestTrustedUnreadableProcesses,
+    ));
     survivors = [...exactIdentities.values()].filter(identity => verificationRows.some(
       processRow => sameProcessIdentity(processRow, identity),
     ));
@@ -2109,7 +2452,9 @@ export async function terminateMeasuredTree(
     );
   }
   if (markerQueryFailed) {
-    throw incomplete('startup run marker query could not be verified');
+    throw incomplete(
+      `startup run marker query could not be verified [${markerQueryFailureCode}]`,
+    );
   }
   if (markerSurvivors.length > 0) {
     throw incomplete(
@@ -2125,10 +2470,10 @@ const defaultMeasurementDependencies = {
   startMonitor: (rootIdentity, { child }) => startProcessTreeMonitor(rootIdentity, { child }),
   waitForReport: waitForStartupReport,
   delay: milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds)),
-  sample: (rootIdentity, { platform, runId }) => sampleProcessTree(
+  sample: (rootIdentity, { platform, runId, trackedProcesses }) => sampleProcessTree(
     rootIdentity,
     platform,
-    { runId },
+    { runId, trackedProcesses },
   ),
   terminate: terminateMeasuredTree,
 };
@@ -2185,9 +2530,13 @@ export async function measureOnce(options, dependencies = defaultMeasurementDepe
       );
     }
     containmentVerified = true;
-    await stopMonitorOnce();
+    const sampleTrackedProcesses = await stopMonitorOnce();
     await dependencies.delay(options.idleMs);
-    metrics = dependencies.sample(rootIdentity, { platform, runId });
+    metrics = dependencies.sample(rootIdentity, {
+      platform,
+      runId,
+      trackedProcesses: sampleTrackedProcesses,
+    });
     const finalStartupReport = await dependencies.waitForReport(options.reportPath, {
       timeoutMs: Math.max(0, deadline - now()),
       pollMs: options.pollMs,

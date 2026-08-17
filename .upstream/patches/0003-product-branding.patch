@@ -1,8 +1,8 @@
 diff --git a/theia-extensions/product/package.json b/theia-extensions/product/package.json
-index a4e00d2..ebbe0e6 100644
+index a4e00d2..34d7cea 100644
 --- a/theia-extensions/product/package.json
 +++ b/theia-extensions/product/package.json
-@@ -1,14 +1,16 @@
+@@ -1,14 +1,17 @@
  {
    "private": true,
    "name": "theia-ide-product-ext",
@@ -19,13 +19,21 @@ index a4e00d2..ebbe0e6 100644
 +    "@theia/ai-registry": "1.73.0-next.2",
 +    "@theia/core": "1.73.0-next.2",
 +    "@theia/getting-started": "1.73.0-next.2",
++    "@theia/plugin-ext": "1.73.0-next.2",
 +    "@theia/terminal": "1.73.0-next.2",
 +    "@theia/vsx-registry": "1.73.0-next.2",
 +    "@theia/workspace": "1.73.0-next.2",
      "inversify": "^6.2.2"
    },
    "devDependencies": {
-@@ -47,6 +49,6 @@
+@@ -41,12 +44,13 @@
+   "scripts": {
+     "clean": "rimraf lib *.tsbuildinfo",
+     "build": "tsc -b",
++    "test": "rimraf test/dist && tsc -p tsconfig.test.json && node --test test/dist/test/*.test.js",
+     "lint": "eslint --ext js,jsx,ts,tsx src",
+     "lint:fix": "eslint --ext js,jsx,ts,tsx src --fix",
+     "update:theia": "ts-node ../../scripts/update-theia-version.ts",
      "update:next": "ts-node ../../scripts/update-theia-version.ts next"
    },
    "peerDependencies": {
@@ -34,10 +42,10 @@ index a4e00d2..ebbe0e6 100644
    }
  }
 diff --git a/theia-extensions/product/src/browser/style/index.css b/theia-extensions/product/src/browser/style/index.css
-index e5373f6..6888432 100644
+index e5373f6..e368092 100644
 --- a/theia-extensions/product/src/browser/style/index.css
 +++ b/theia-extensions/product/src/browser/style/index.css
-@@ -82,4 +82,1517 @@ ul.theia-aboutExtensions {
+@@ -82,4 +82,1522 @@ ul.theia-aboutExtensions {
      list-style-type: none;
      padding: 0;
      margin-left: 10px;
@@ -871,80 +879,89 @@ index e5373f6..6888432 100644
 +body[data-product-shell="r-ide"] .ride-window-controls {
 +    display: none !important;
 +    align-items: center;
-+    gap: 8px;
++    flex: 0 0 auto;
++    gap: 6px;
 +    height: 100%;
-+    padding: 0 5px 0 4px;
++    padding: 0 2px;
 +}
 +
 +body[data-product-shell="r-ide"][data-ride-runtime="tauri"] .ride-window-controls {
-+    display: none !important;
-+}
-+
-+body[data-product-shell="r-ide"] .ride-native-window-spacer {
-+    display: none;
-+    flex: 0 0 auto;
-+    height: 100%;
-+}
-+
-+body[data-product-shell="r-ide"][data-ride-runtime="tauri"][data-ride-platform="macos"] .ride-native-window-spacer {
-+    display: block;
-+    width: 78px;
++    display: flex !important;
 +}
 +
 +body[data-product-shell="r-ide"] .ride-window-control {
 +    position: relative;
-+    width: 13px;
-+    height: 13px;
++    display: grid;
++    place-items: center;
++    flex: 0 0 auto;
++    width: 34px;
++    height: 30px;
 +    padding: 0;
-+    border: 1px solid rgba(0, 0, 0, 0.18);
-+    border-radius: 50%;
-+    background: #8f98a3;
++    border: 0;
++    border-radius: 5px;
++    color: #cbd3df;
++    background: transparent;
 +    cursor: default;
 +}
 +
-+body[data-product-shell="r-ide"] .ride-window-control.close {
-+    background: #ff5f57;
-+}
-+
-+body[data-product-shell="r-ide"] .ride-window-control.minimize {
-+    background: #ffbd2e;
-+}
-+
-+body[data-product-shell="r-ide"] .ride-window-control.toggleMaximize {
-+    background: #28c840;
-+}
-+
-+body[data-product-shell="r-ide"] .ride-window-controls:hover .ride-window-control::before {
-+    opacity: 1;
-+}
-+
-+body[data-product-shell="r-ide"] .ride-window-control::before {
-+    position: absolute;
-+    inset: 0;
-+    display: grid;
-+    place-items: center;
-+    color: rgba(47, 31, 31, 0.76);
-+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
-+    font-size: 9px;
-+    font-weight: 800;
++body[data-product-shell="r-ide"] .ride-window-control > .codicon {
++    font-size: 14px;
 +    line-height: 1;
++}
++
++body[data-product-shell="r-ide"] .ride-window-control:hover,
++body[data-product-shell="r-ide"] .ride-window-control:focus-visible {
++    color: #ffffff;
++    background: rgba(255, 255, 255, 0.12);
++    outline: none;
++}
++
++body[data-product-shell="r-ide"] .ride-window-control:focus-visible {
++    box-shadow: inset 0 0 0 2px rgba(83, 184, 255, 0.8);
++}
++
++body[data-product-shell="r-ide"] .ride-window-control.close:hover,
++body[data-product-shell="r-ide"] .ride-window-control.close:focus-visible {
++    background: #c42b1c;
++}
++
++body[data-product-shell="r-ide"][data-ride-platform="macos"] .ride-window-controls {
++    gap: 8px;
++    padding: 0 4px 0 2px;
++}
++
++body[data-product-shell="r-ide"][data-ride-platform="macos"] .ride-window-control {
++    width: 13px;
++    height: 13px;
++    border: 1px solid rgba(0, 0, 0, 0.18);
++    border-radius: 50%;
++    color: rgba(47, 31, 31, 0.76);
++}
++
++body[data-product-shell="r-ide"][data-ride-platform="macos"] .ride-window-control > .codicon {
++    font-size: 9px;
 +    opacity: 0;
 +}
 +
-+body[data-product-shell="r-ide"] .ride-window-control.close::before {
-+    content: "×";
++body[data-product-shell="r-ide"][data-ride-platform="macos"] .ride-window-controls:hover .ride-window-control > .codicon,
++body[data-product-shell="r-ide"][data-ride-platform="macos"] .ride-window-control:focus-visible > .codicon {
++    opacity: 1;
 +}
 +
-+body[data-product-shell="r-ide"] .ride-window-control.minimize::before {
-+    content: "−";
-+    color: rgba(91, 57, 8, 0.78);
-+    transform: translateY(-1px);
++body[data-product-shell="r-ide"][data-ride-platform="macos"] .ride-window-control.close {
++    background: #ff5f57;
 +}
 +
-+body[data-product-shell="r-ide"] .ride-window-control.toggleMaximize::before {
-+    content: "+";
-+    color: rgba(18, 73, 27, 0.78);
-+    transform: translateY(-0.5px);
++body[data-product-shell="r-ide"][data-ride-platform="macos"] .ride-window-control.minimize {
++    background: #ffbd2e;
++}
++
++body[data-product-shell="r-ide"][data-ride-platform="macos"] .ride-window-control.toggleMaximize {
++    background: #28c840;
++}
++
++body[data-product-shell="r-ide"][data-ride-platform="macos"] .ride-window-control:hover {
++    filter: brightness(1.08);
 +}
 +
 +body[data-product-shell="r-ide"] .ride-brand,
@@ -1290,10 +1307,6 @@ index e5373f6..6888432 100644
 +    -webkit-backdrop-filter: blur(36px) saturate(1.35) !important;
 +}
 +
-+body[data-product-shell="r-ide"][data-ride-runtime="tauri"][data-ride-platform="macos"] .ride-native-window-spacer {
-+    width: 76px;
-+}
-+
 +body[data-product-shell="r-ide"] .ride-brand,
 +body[data-product-shell="r-ide"] .ride-command-center,
 +body[data-product-shell="r-ide"] .ride-run-button,
@@ -1604,27 +1617,35 @@ index 388697a..dec36d4 100644
      }
  }
 diff --git a/theia-extensions/product/src/browser/theia-ide-frontend-module.ts b/theia-extensions/product/src/browser/theia-ide-frontend-module.ts
-index d3c3ed3..c9a8687 100644
+index d3c3ed3..9cbd979 100644
 --- a/theia-extensions/product/src/browser/theia-ide-frontend-module.ts
 +++ b/theia-extensions/product/src/browser/theia-ide-frontend-module.ts
-@@ -9,27 +9,19 @@
+@@ -9,27 +9,27 @@
  
  import '../../src/browser/style/index.css';
  
 -import { AIRegistryConfiguration } from '@theia/ai-registry/lib/common/ai-registry-configuration';
 -import { WidgetFactory } from '@theia/core/lib/browser';
++import { ApplicationShell } from '@theia/core/lib/browser';
++import { FrontendApplicationStateService } from '@theia/core/lib/browser/frontend-application-state';
 +import { FrontendApplicationContribution } from '@theia/core/lib/browser/frontend-application-contribution';
  import { AboutDialog } from '@theia/core/lib/browser/about-dialog';
  import { applyBranding } from './theia-ide-config';
  import { CommandContribution } from '@theia/core/lib/common/command';
  import { ContainerModule } from '@theia/core/shared/inversify';
 -import { GettingStartedWidget } from '@theia/getting-started/lib/browser/getting-started-widget';
++import { MessageService } from '@theia/core/lib/common/message-service';
  import { MenuContribution } from '@theia/core/lib/common/menu';
++import { OpenerService } from '@theia/core/lib/browser/opener-service';
++import { WorkspaceService } from '@theia/workspace/lib/browser';
++import { HostedPluginSupport } from '@theia/plugin-ext/lib/hosted/browser/hosted-plugin';
  import { TheiaIDEAboutDialog } from './theia-ide-about-dialog';
 -import { TheiaIDEAIRegistryConfiguration } from './theia-ide-ai-registry-configuration';
  import { TheiaIDEContribution } from './theia-ide-contribution';
 -import { TheiaIDEGettingStartedWidget } from './theia-ide-getting-started-widget';
++import { bindRideOpenRequestContribution } from './ride-open-request-bindings';
 +import { RideWorkbenchContribution } from './ride-workbench-contribution';
++import { bindRidePerformanceContribution } from './ride-performance-contribution';
  
  export default new ContainerModule((bind, _unbind, isBound, rebind) => {
      applyBranding();
@@ -1637,7 +1658,7 @@ index d3c3ed3..c9a8687 100644
      if (isBound(AboutDialog)) {
          rebind(AboutDialog).to(TheiaIDEAboutDialog).inSingletonScope();
      } else {
-@@ -41,9 +33,7 @@ export default new ContainerModule((bind, _unbind, isBound, rebind) => {
+@@ -41,9 +41,19 @@ export default new ContainerModule((bind, _unbind, isBound, rebind) => {
          bind(serviceIdentifier).toService(TheiaIDEContribution)
      );
  
@@ -1649,4 +1670,16 @@ index d3c3ed3..c9a8687 100644
 +    bind(RideWorkbenchContribution).toSelf().inSingletonScope();
 +    bind(FrontendApplicationContribution).toService(RideWorkbenchContribution);
 +    bind(CommandContribution).toService(RideWorkbenchContribution);
++
++    bindRidePerformanceContribution(bind);
++
++    bindRideOpenRequestContribution(bind, {
++        applicationShell: ApplicationShell,
++        applicationState: FrontendApplicationStateService,
++        contribution: FrontendApplicationContribution,
++        hostedPlugins: HostedPluginSupport,
++        messageService: MessageService,
++        openerService: OpenerService,
++        workspaceService: WorkspaceService
++    });
  });
