@@ -139,11 +139,15 @@ class FakeOpenerService implements OpenerService {
 class FakeMessageService {
     readonly errors: string[] = [];
     errorToThrow: Error | undefined;
+    errorToReject: Error | undefined;
 
     error(message: string): Promise<undefined> {
         this.errors.push(message);
         if (this.errorToThrow) {
             throw this.errorToThrow;
+        }
+        if (this.errorToReject) {
+            return Promise.reject(this.errorToReject);
         }
         return Promise.resolve(undefined);
     }
@@ -854,6 +858,67 @@ test('restored queue commit failure after a failed target schedules one plugin f
         'resolve:hosted-plugins',
         `install:local-dir:C:\\R-IDE\\plugins:${PluginType.System}`
     ]);
+});
+
+async function verifyCommitNotificationFailureKeepsFallback(kind: 'throw' | 'reject'): Promise<void> {
+    const events: string[] = [];
+    const storage = new FaultyStorage();
+    const pendingRequest: RideOpenRequest = {
+        id: '79', source: 'initial', workspace: '/project', files: ['/project/not-committed.R']
+    };
+    storage.setItem(RIDE_OPEN_REQUEST_STATE_KEY, JSON.stringify(stateEnvelope('79', {
+        id: '78', source: 'initial', workspace: '/project', files: ['/project/first-fails.R']
+    }, pendingRequest)));
+    const { scheduler: deployment } = createPluginDeploymentScheduler(events);
+    const deferredWork = new FakeDeferredWorkScheduler();
+    const context = createContribution(
+        '/project', storage,
+        uri => {
+            events.push(`open:${uri.path.toString()}`);
+            storage.failNextSet = true;
+            throw new Error('first editor unavailable');
+        },
+        async () => undefined,
+        new FakeApplicationStateService(), new FakeHostedPluginSupport(), deployment,
+        new FakeNativeChrome(), deferredWork,
+        () => { events.push('resolve:hosted-plugins'); }
+    );
+    const notificationFailure = new Error(`notification ${kind} failure`);
+    if (kind === 'throw') {
+        context.messages.errorToThrow = notificationFailure;
+    } else {
+        context.messages.errorToReject = notificationFailure;
+    }
+    const warnings: unknown[][] = [];
+    const originalWarn = console.warn;
+    console.warn = (...values: unknown[]) => { warnings.push(values); };
+    try {
+        await assert.doesNotReject(context.contribution.restorePendingRequest());
+
+        assert.deepEqual(readState(storage), stateEnvelope('79', pendingRequest));
+        assert.deepEqual(deferredWork.scheduledDelays, [1_500]);
+        assert.equal(warnings.some(values => String(values[0]).includes('file-open state error')), true);
+
+        deferredWork.fireTimer();
+        deferredWork.fireTimer();
+        await flushLifecycle();
+        assert.deepEqual(events, [
+            'open:/project/first-fails.R',
+            'resolve:hosted-plugins',
+            `install:local-dir:C:\\R-IDE\\plugins:${PluginType.System}`
+        ]);
+    } finally {
+        console.warn = originalWarn;
+        context.contribution.dispose();
+    }
+}
+
+test('restored commit failure keeps one plugin fallback when error notification throws synchronously', async () => {
+    await verifyCommitNotificationFailureKeepsFallback('throw');
+});
+
+test('restored commit failure keeps one plugin fallback when error notification rejects asynchronously', async () => {
+    await verifyCommitNotificationFailureKeepsFallback('reject');
 });
 
 test('exhausted restored queue with only failed local targets schedules one bounded fallback', async () => {

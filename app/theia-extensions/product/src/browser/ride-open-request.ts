@@ -560,24 +560,36 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
 
     protected async commitState(state: RideOpenRequestState): Promise<boolean> {
         if (state.requests.length > MAX_PENDING_REQUESTS) {
-            await this.messageService.error(`R-IDE cannot queue more than ${MAX_PENDING_REQUESTS} file-open requests.`);
+            await this.reportErrorSafely(
+                `R-IDE cannot queue more than ${MAX_PENDING_REQUESTS} file-open requests.`,
+                '[R-IDE] Failed to report a file-open state error.'
+            );
             return false;
         }
         let serialized: string;
         try {
             serialized = JSON.stringify(state);
         } catch (error) {
-            await this.messageService.error(`R-IDE could not serialize file-open state: ${errorMessage(error)}`);
+            await this.reportErrorSafely(
+                `R-IDE could not serialize file-open state: ${errorMessage(error)}`,
+                '[R-IDE] Failed to report a file-open state error.'
+            );
             return false;
         }
         if (serialized.length > MAX_STATE_CHARS) {
-            await this.messageService.error('R-IDE could not save an oversized file-open state.');
+            await this.reportErrorSafely(
+                'R-IDE could not save an oversized file-open state.',
+                '[R-IDE] Failed to report a file-open state error.'
+            );
             return false;
         }
         try {
             this.storage.setItem(RIDE_OPEN_REQUEST_STATE_KEY, serialized);
         } catch (error) {
-            await this.messageService.error(`R-IDE could not save file-open state: ${errorMessage(error)}`);
+            await this.reportErrorSafely(
+                `R-IDE could not save file-open state: ${errorMessage(error)}`,
+                '[R-IDE] Failed to report a file-open state error.'
+            );
             return false;
         }
         return true;
