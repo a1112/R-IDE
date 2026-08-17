@@ -361,6 +361,13 @@ function canonicalJson(value) {
   return JSON.stringify(value);
 }
 
+function profileContractSha256(manifest) {
+  const contract = Object.fromEntries(
+    Object.entries(manifest).filter(([key]) => key !== 'commit'),
+  );
+  return sha256(canonicalJson(contract));
+}
+
 function sha256(value) {
   return createHash('sha256').update(value).digest('hex');
 }
@@ -2797,21 +2804,25 @@ async function readBoundedMetadataFile(filePath, label) {
   let stat;
   try {
     stat = await fs.promises.lstat(filePath);
-  } catch (error) {
-    throw new Error(`${label} is missing: ${error.message}`);
+  } catch {
+    throw new Error(`${label} is missing or unreadable`);
   }
   if (!stat.isFile() || stat.isSymbolicLink() || stat.size > METADATA_MAX_BYTES) {
     throw new Error(`${label} must be a bounded regular file`);
   }
-  return fs.promises.readFile(filePath, 'utf8');
+  try {
+    return await fs.promises.readFile(filePath, 'utf8');
+  } catch {
+    throw new Error(`${label} could not be read`);
+  }
 }
 
 async function readJsonMetadata(filePath, label) {
   const serialized = await readBoundedMetadataFile(filePath, label);
   try {
     return JSON.parse(serialized);
-  } catch (error) {
-    throw new Error(`${label} is not valid JSON: ${error.message}`);
+  } catch {
+    throw new Error(`${label} is not valid JSON`);
   }
 }
 
@@ -2864,7 +2875,7 @@ async function readProfileBuildMetadata(options, executable) {
   return {
     commit: manifest.commit,
     profile: manifest.profile,
-    profileSha256: sha256(canonicalJson(manifest)),
+    profileSha256: profileContractSha256(manifest),
   };
 }
 
@@ -2880,7 +2891,12 @@ async function readPluginBuildMetadata(executable) {
   if (!pluginsDirectory) {
     throw new Error('packaged plugin resources are missing');
   }
-  const entries = await fs.promises.readdir(pluginsDirectory, { withFileTypes: true });
+  let entries;
+  try {
+    entries = await fs.promises.readdir(pluginsDirectory, { withFileTypes: true });
+  } catch {
+    throw new Error('packaged plugin resources could not be read');
+  }
   const plugins = [];
   const ids = new Set();
   for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name, 'en'))) {
@@ -2896,7 +2912,7 @@ async function readPluginBuildMetadata(executable) {
     const pluginRoot = path.join(pluginsDirectory, entry.name);
     const manifest = await readJsonMetadata(
       path.join(pluginRoot, 'extension', 'package.json'),
-      `packaged plugin ${entry.name} manifest`,
+      'packaged plugin manifest',
     );
     assertPlainObject(manifest, `packaged plugin ${entry.name} manifest`);
     const publisher = normalizedText(manifest.publisher, `packaged plugin ${entry.name} publisher`);
@@ -3324,9 +3340,30 @@ async function main(argv) {
   process.stdout.write(`${JSON.stringify(measurement, null, 2)}\n`);
 }
 
+function cliSensitivePaths(argv) {
+  const sensitivePaths = [defaultBundleRoot];
+  for (let index = 0; index < argv.length - 1; index++) {
+    const option = argv[index];
+    if (!['--bundle-root', '--executable', '--profile-manifest'].includes(option)) {
+      continue;
+    }
+    const resolved = path.resolve(argv[index + 1]);
+    sensitivePaths.push(resolved);
+    if (option === '--executable') {
+      sensitivePaths.push(path.dirname(resolved), ...executableResourceRoots(resolved));
+    } else if (option === '--profile-manifest') {
+      sensitivePaths.push(path.dirname(resolved));
+    }
+    index++;
+  }
+  return [...new Set(sensitivePaths)];
+}
+
 if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) {
-  main(process.argv.slice(2)).catch(error => {
-    process.stderr.write(`${error.stack ?? error}\n`);
+  const cliArguments = process.argv.slice(2);
+  main(cliArguments).catch(error => {
+    const serializedError = typeof error?.stack === 'string' ? error.stack : String(error);
+    process.stderr.write(`${redactDiagnosticText(serializedError, cliSensitivePaths(cliArguments))}\n`);
     process.exitCode = 1;
   });
 }

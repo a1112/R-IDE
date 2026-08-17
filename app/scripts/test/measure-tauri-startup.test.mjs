@@ -8,6 +8,7 @@
  ********************************************************************************/
 
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { EventEmitter, once } from 'node:events';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -62,6 +63,19 @@ function assertNoSensitiveWindows(output, secret, windowLength = 16) {
       `secret window at offset ${index} must not be present`,
     );
   }
+}
+
+function runMeasurementCli(args) {
+  return spawnSync(
+    process.execPath,
+    [path.resolve(import.meta.dirname, '..', 'measure-tauri-startup.mjs'), ...args],
+    {
+      cwd: path.resolve(import.meta.dirname, '..', '..'),
+      encoding: 'utf8',
+      timeout: 10_000,
+      maxBuffer: 4 * 1024 * 1024,
+    },
+  );
 }
 
 function currentRustTarget() {
@@ -5183,6 +5197,179 @@ test('packaged metadata reader uses canonical profile and plugin resources', asy
     assert.match(metadata.build.pluginManifestSha256, /^[0-9a-f]{64}$/);
     assert.deepEqual(Object.keys(metadata.host).sort(), ['arch', 'fingerprint', 'platform']);
     assert.match(metadata.host.fingerprint, /^[0-9a-f]{64}$/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('profile contract digest excludes commit and canonically includes every contract field', async () => {
+  const root = temporaryDirectory('profile-contract-digest');
+  const executable = path.join(root, 'R-IDE.exe');
+  const profileManifest = path.join(root, 'profile.json');
+  const extension = path.join(root, 'resources', 'plugins', 'acme.tool', 'extension');
+  touch(executable);
+  fs.mkdirSync(extension, { recursive: true });
+  fs.writeFileSync(path.join(extension, 'package.json'), JSON.stringify({
+    publisher: 'acme',
+    name: 'tool',
+    version: '1.0.0',
+  }));
+  const readProfile = async manifest => {
+    fs.writeFileSync(profileManifest, JSON.stringify(manifest));
+    return readCampaignMetadata({
+      executable,
+      options: { profileManifest },
+    }, {
+      readCommit: () => manifest.commit,
+    });
+  };
+
+  try {
+    const first = await readProfile({
+      schema: 'ride.tauri-profile',
+      version: 1,
+      profile: 'tauri-critical',
+      commit: '4'.repeat(40),
+      extensions: ['@theia/core', 'theia-ide-product-ext'],
+      launch: { mode: 'critical', flags: ['safe', 'bounded'] },
+    });
+    const differentCommitAndKeyOrder = await readProfile({
+      launch: { flags: ['safe', 'bounded'], mode: 'critical' },
+      extensions: ['@theia/core', 'theia-ide-product-ext'],
+      commit: '5'.repeat(40),
+      profile: 'tauri-critical',
+      version: 1,
+      schema: 'ride.tauri-profile',
+    });
+    assert.equal(
+      differentCommitAndKeyOrder.build.profileSha256,
+      first.build.profileSha256,
+      'commit and JSON object key order are not part of the profile contract identity',
+    );
+
+    const reorderedContractArray = await readProfile({
+      schema: 'ride.tauri-profile',
+      version: 1,
+      profile: 'tauri-critical',
+      commit: '6'.repeat(40),
+      extensions: ['theia-ide-product-ext', '@theia/core'],
+      launch: { mode: 'critical', flags: ['safe', 'bounded'] },
+    });
+    assert.notEqual(reorderedContractArray.build.profileSha256, first.build.profileSha256);
+
+    const extendedContract = await readProfile({
+      schema: 'ride.tauri-profile',
+      version: 1,
+      profile: 'tauri-critical',
+      commit: '7'.repeat(40),
+      extensions: ['@theia/core', 'theia-ide-product-ext'],
+      launch: { mode: 'critical', flags: ['safe', 'bounded'] },
+      futureConstraint: { enabled: true },
+    });
+    assert.notEqual(extendedContract.build.profileSha256, first.build.profileSha256);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('CLI missing-executable errors redact the executable path and its fragments', () => {
+  const root = temporaryDirectory('cli-private-executable');
+  const executable = path.join(root, 'sensitive-binary-name.exe');
+  try {
+    const result = runMeasurementCli(['--executable', executable]);
+    assert.equal(result.status, 1);
+    assert.equal(result.stdout, '');
+    assertNoSensitiveWindows(result.stderr, path.resolve(executable));
+    assertNoSensitiveWindows(result.stderr, path.dirname(path.resolve(executable)));
+    assert.doesNotMatch(result.stderr, /cli-private-executable|sensitive-binary-name/i);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('CLI metadata parse errors do not expose the explicit profile manifest path', () => {
+  const root = temporaryDirectory('cli-private-profile-manifest');
+  const executable = path.join(root, 'sensitive-binary-name.exe');
+  const profileManifest = path.join(root, 'private-profile-manifest.json');
+  const extension = path.join(root, 'resources', 'plugins', 'acme.tool', 'extension');
+  touch(executable);
+  fs.writeFileSync(profileManifest, '{"schema":');
+  fs.mkdirSync(extension, { recursive: true });
+  fs.writeFileSync(path.join(extension, 'package.json'), JSON.stringify({
+    publisher: 'acme',
+    name: 'tool',
+    version: '1.0.0',
+  }));
+  try {
+    const result = runMeasurementCli([
+      '--executable', executable,
+      '--profile-manifest', profileManifest,
+    ]);
+    assert.equal(result.status, 1);
+    assertNoSensitiveWindows(result.stderr, path.resolve(executable));
+    assertNoSensitiveWindows(result.stderr, path.resolve(profileManifest));
+    assertNoSensitiveWindows(result.stderr, root);
+    assert.doesNotMatch(result.stderr, /cli-private-profile-manifest|private-profile-manifest/i);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('CLI packaged-plugin fs errors redact executable resource roots', () => {
+  const root = temporaryDirectory('cli-private-plugin-resources');
+  const executable = path.join(root, 'sensitive-binary-name.exe');
+  const profileManifest = path.join(root, 'private-profile-manifest.json');
+  const pluginRoot = path.join(root, 'resources', 'plugins', 'acme.tool');
+  const commitResult = spawnSync('git', ['rev-parse', 'HEAD'], {
+    cwd: path.resolve(import.meta.dirname, '..', '..', '..'),
+    encoding: 'utf8',
+    timeout: 10_000,
+    maxBuffer: 1024 * 1024,
+  });
+  assert.equal(commitResult.status, 0);
+  touch(executable);
+  fs.writeFileSync(profileManifest, JSON.stringify({
+    schema: 'ride.tauri-profile',
+    version: 1,
+    profile: 'tauri-critical',
+    commit: commitResult.stdout.trim(),
+  }));
+  fs.mkdirSync(pluginRoot, { recursive: true });
+  try {
+    const result = runMeasurementCli([
+      '--executable', executable,
+      '--profile-manifest', profileManifest,
+    ]);
+    assert.equal(result.status, 1);
+    assertNoSensitiveWindows(result.stderr, path.resolve(executable));
+    assertNoSensitiveWindows(result.stderr, path.resolve(profileManifest));
+    assertNoSensitiveWindows(result.stderr, root);
+    assertNoSensitiveWindows(result.stderr, pluginRoot);
+    assert.doesNotMatch(result.stderr, /cli-private-plugin-resources|acme\.tool/i);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('CLI default bundle discovery errors redact paths without explicit path options', () => {
+  const root = temporaryDirectory('cli-private-default-bundle');
+  const copiedScript = path.join(root, 'scripts', 'measure-tauri-startup.mjs');
+  fs.mkdirSync(path.dirname(copiedScript), { recursive: true });
+  fs.copyFileSync(
+    path.resolve(import.meta.dirname, '..', 'measure-tauri-startup.mjs'),
+    copiedScript,
+  );
+  try {
+    const result = spawnSync(process.execPath, [copiedScript], {
+      cwd: root,
+      encoding: 'utf8',
+      timeout: 10_000,
+      maxBuffer: 4 * 1024 * 1024,
+    });
+    assert.equal(result.status, 1);
+    assert.equal(result.stdout, '');
+    assertNoSensitiveWindows(result.stderr, root);
+    assert.doesNotMatch(result.stderr, /cli-private-default-bundle|applications[\\/]tauri/i);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
