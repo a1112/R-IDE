@@ -40,6 +40,20 @@ export type RideStartupMilestone =
 
 type StartupMilestoneReporter = (milestone: RideStartupMilestone) => Promise<void>;
 
+export interface RideDeferredWorkScheduler {
+    yield(): Promise<void>;
+    setTimeout(callback: () => void, delayMs: number): unknown;
+    clearTimeout(handle: unknown): void;
+}
+
+export const DEFAULT_RIDE_DEFERRED_WORK_SCHEDULER: RideDeferredWorkScheduler = {
+    yield: () => new Promise<void>(resolve => globalThis.setTimeout(resolve, 0)),
+    setTimeout: (callback, delayMs) => globalThis.setTimeout(callback, delayMs),
+    clearTimeout: handle => globalThis.clearTimeout(handle as ReturnType<typeof setTimeout>)
+};
+
+const NO_FILE_PLUGIN_FALLBACK_DELAY_MS = 1_500;
+
 interface RidePluginDeploymentSchedulerOptions {
     readonly delayMs: number;
     readonly setTimeout: (callback: () => void, delay: number) => unknown;
@@ -153,7 +167,13 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
     protected unlisten: (() => void) | undefined;
     protected requestChain = Promise.resolve();
     protected acceptedOpenRequest = false;
+    protected targetOpenAttempted = false;
+    protected targetFileOpened = false;
     protected pluginObservationStarted = false;
+    protected hostedPluginResolutionStarted = false;
+    protected pluginActivationScheduled = false;
+    protected pluginFallbackTimer: unknown | undefined;
+    protected pluginActivation: Promise<boolean> | undefined;
     protected readonly pluginWillStart: Promise<ObservedPluginPromise>;
     protected readonly pluginDidStart: Promise<ObservedPluginPromise>;
 
@@ -168,7 +188,8 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
         storage?: Storage,
         protected readonly startupMilestoneReporter: StartupMilestoneReporter = reportRideStartupMilestone,
         protected readonly startHostedPluginResolution: () => void = () => undefined,
-        protected readonly pluginDeployment?: RidePluginDeploymentScheduler
+        protected readonly pluginDeployment?: RidePluginDeploymentScheduler,
+        protected readonly deferredWorkScheduler: RideDeferredWorkScheduler = DEFAULT_RIDE_DEFERRED_WORK_SCHEDULER
     ) {
         this.storage = storage ?? window.sessionStorage;
         this.initializationComplete = new Promise(resolve => {
@@ -191,7 +212,6 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
         if (this.disposed) {
             return;
         }
-        this.startHostedPluginResolution();
         await this.reportStartupMilestone('frontend_shell_attached');
         if (this.disposed) {
             return;
@@ -225,8 +245,10 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
         if (!restoredPending && !this.disposed) {
             await this.nativeChrome.waitForFrontendReadyNotification();
             if (!this.disposed && !this.acceptedOpenRequest) {
-                this.pluginDeployment?.scheduleFallback();
+                this.schedulePluginFallback();
             }
+        } else if (this.targetOpenAttempted && !this.targetFileOpened) {
+            this.schedulePluginFallback();
         }
     }
 
@@ -252,6 +274,7 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
         }
         this.disposed = true;
         this.finishInitialization();
+        this.cancelPluginFallback();
         this.pluginDeployment?.dispose();
         this.unlisten?.();
         this.unlisten = undefined;
@@ -280,6 +303,7 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
             });
             if (committed) {
                 this.acceptedOpenRequest = true;
+                this.cancelPluginFallback();
                 this.pluginDeployment?.cancelFallback();
             }
             return;
@@ -296,6 +320,7 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
         }
 
         this.acceptedOpenRequest = true;
+        this.cancelPluginFallback();
         this.pluginDeployment?.cancelFallback();
         if (!currentWorkspace) {
             try {
@@ -347,32 +372,103 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
     }
 
     protected async openFiles(request: RideOpenRequest): Promise<void> {
+        this.targetOpenAttempted = true;
         let targetWidgetId: string | undefined;
         let openedTarget = false;
         const options: WidgetOpenerOptions = { mode: 'open' };
-        for (const file of request.files) {
-            try {
-                const opened = await open(this.openerService, FileUri.create(file), options);
-                openedTarget = true;
-                if (hasWidgetId(opened)) {
-                    targetWidgetId = opened.id;
+        try {
+            for (const file of request.files) {
+                try {
+                    const opened = await open(this.openerService, FileUri.create(file), options);
+                    openedTarget = true;
+                    if (hasWidgetId(opened)) {
+                        targetWidgetId = opened.id;
+                    }
+                } catch (error) {
+                    await this.messageService.error(`R-IDE could not open ${file}: ${errorMessage(error)}`);
                 }
-            } catch (error) {
-                await this.messageService.error(`R-IDE could not open ${file}: ${errorMessage(error)}`);
             }
-        }
-        if (targetWidgetId) {
-            await this.shell.activateWidget(targetWidgetId);
-        }
-        if (openedTarget) {
-            await this.reportStartupMilestone('target_file_opened');
-            this.startPluginObservation();
-            this.requestPluginDeployment();
+            if (targetWidgetId) {
+                await this.shell.activateWidget(targetWidgetId);
+            }
+            if (openedTarget) {
+                this.targetFileOpened = true;
+                await this.reportStartupMilestone('target_file_opened');
+                this.schedulePluginActivationAfterYield();
+            }
+        } finally {
+            if (!openedTarget) {
+                this.schedulePluginFallback();
+            }
         }
     }
 
-    async requestPluginDeployment(): Promise<boolean> {
-        return this.pluginDeployment?.deployNow() ?? true;
+    requestPluginDeployment(): Promise<boolean> {
+        if (this.disposed) {
+            return Promise.resolve(false);
+        }
+        this.cancelPluginFallback();
+        if (!this.pluginActivation) {
+            this.startHostedPluginResolutionOnce();
+            this.startPluginObservation();
+            this.pluginActivation = this.pluginDeployment?.deployNow() ?? Promise.resolve(true);
+        }
+        return this.pluginActivation;
+    }
+
+    protected schedulePluginActivationAfterYield(): void {
+        this.cancelPluginFallback();
+        if (this.disposed || this.pluginActivation || this.pluginActivationScheduled) {
+            return;
+        }
+        this.pluginActivationScheduled = true;
+        this.deferredWorkScheduler.yield().then(
+            () => {
+                this.pluginActivationScheduled = false;
+                if (!this.disposed) {
+                    this.requestPluginDeployment();
+                }
+            },
+            error => {
+                this.pluginActivationScheduled = false;
+                console.warn('[R-IDE] Failed to yield before plugin activation.', error);
+                if (!this.disposed) {
+                    this.requestPluginDeployment();
+                }
+            }
+        );
+    }
+
+    protected schedulePluginFallback(): void {
+        if (this.disposed || this.pluginFallbackTimer !== undefined
+            || this.pluginActivation || this.pluginActivationScheduled) {
+            return;
+        }
+        this.pluginFallbackTimer = this.deferredWorkScheduler.setTimeout(() => {
+            this.pluginFallbackTimer = undefined;
+            if (!this.disposed) {
+                this.requestPluginDeployment();
+            }
+        }, NO_FILE_PLUGIN_FALLBACK_DELAY_MS);
+    }
+
+    protected cancelPluginFallback(): void {
+        if (this.pluginFallbackTimer !== undefined) {
+            this.deferredWorkScheduler.clearTimeout(this.pluginFallbackTimer);
+            this.pluginFallbackTimer = undefined;
+        }
+    }
+
+    protected startHostedPluginResolutionOnce(): void {
+        if (this.hostedPluginResolutionStarted || this.disposed) {
+            return;
+        }
+        this.hostedPluginResolutionStarted = true;
+        try {
+            this.startHostedPluginResolution();
+        } catch (error) {
+            console.warn('[R-IDE] Failed to start hosted plugin resolution.', error);
+        }
     }
 
     protected startPluginObservation(): void {

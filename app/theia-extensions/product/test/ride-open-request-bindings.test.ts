@@ -20,7 +20,7 @@ import {
     bindRideOpenRequestContribution,
     RideOpenRequestBindingIdentifiers
 } from '../src/browser/ride-open-request-bindings';
-import { RideOpenRequestContribution } from '../src/browser/ride-open-request';
+import { RideDeferredWorkScheduler, RideOpenRequestContribution } from '../src/browser/ride-open-request';
 import { RideNativeChrome } from '../src/browser/ride-native-chrome';
 import {
     bindRidePerformanceContribution,
@@ -58,8 +58,15 @@ test('frontend contribution remains synchronously constructible with async hoste
             hostedPlugins: Symbol('HostedPluginSupport'),
             messageService: Symbol('MessageService'),
             openerService: Symbol('OpenerService'),
-            workspaceService: Symbol('WorkspaceService')
+            workspaceService: Symbol('WorkspaceService'),
+            deferredWorkScheduler: Symbol('RideDeferredWorkScheduler')
         };
+        const deferredWorkScheduler: RideDeferredWorkScheduler = {
+            yield: async () => undefined,
+            setTimeout: () => ({ kind: 'test-timer' }),
+            clearTimeout: () => undefined
+        };
+        container.bind(identifiers.deferredWorkScheduler!).toConstantValue(deferredWorkScheduler);
         const bindSynchronousDependencies = (
             target: Container,
             applicationState: FrontendApplicationStateService
@@ -100,6 +107,11 @@ test('frontend contribution remains synchronously constructible with async hoste
         });
         assert.equal(contributions.length, 1);
         assert.ok(contributions[0] instanceof RideOpenRequestContribution);
+        assert.strictEqual(
+            (contributions[0] as unknown as { deferredWorkScheduler: RideDeferredWorkScheduler }).deferredWorkScheduler,
+            deferredWorkScheduler,
+            'the binding must inject the configured scheduler'
+        );
         assert.equal(
             hostedResolutionStarts,
             0,
@@ -123,13 +135,14 @@ test('frontend contribution remains synchronously constructible with async hoste
         assert.equal(pluginServerResolutionStarts, 0, 'plugin server resolution must wait for the attached shell');
         attachShell();
         await new Promise<void>(resolve => setImmediate(resolve));
-        assert.equal(hostedResolutionStarts, 1);
+        assert.equal(hostedResolutionStarts, 0, 'attached_shell alone must not resolve hosted plugins');
         assert.equal(
             pluginServerResolutionStarts,
             0,
             'plugin server resolution must wait for target, demand, or the no-file timer'
         );
         await (contributions[0] as RideOpenRequestContribution).requestPluginDeployment();
+        assert.equal(hostedResolutionStarts, 1, 'plugin demand must resolve hosted plugins immediately');
         assert.equal(pluginServerResolutionStarts, 1);
 
         resolveHostedPlugins({
@@ -158,6 +171,7 @@ test('frontend contribution remains synchronously constructible with async hoste
                 failingContribution = failingContainer.get(identifiers.contribution) as RideOpenRequestContribution;
             });
             failingContribution.onStart();
+            await failingContribution.requestPluginDeployment();
             const observations = failingContribution as unknown as {
                 pluginWillStart: Promise<{ succeeded: boolean; error?: unknown }>;
                 pluginDidStart: Promise<{ succeeded: boolean; error?: unknown }>;
@@ -250,6 +264,12 @@ test('open-request and performance contributions share one native chrome binding
     const performanceContribution = container.get(RidePerformanceContribution);
     const openRequestContribution = container.get(RideOpenRequestContribution);
     assert.ok(performanceContribution instanceof RidePerformanceContribution);
+    const defaultScheduler = (openRequestContribution as unknown as {
+        deferredWorkScheduler: RideDeferredWorkScheduler;
+    }).deferredWorkScheduler;
+    assert.equal(typeof defaultScheduler.yield, 'function');
+    assert.equal(typeof defaultScheduler.setTimeout, 'function');
+    assert.equal(typeof defaultScheduler.clearTimeout, 'function');
     assert.strictEqual(
         (performanceContribution as unknown as { nativeChrome: RideNativeChrome }).nativeChrome,
         nativeBindings[0]
