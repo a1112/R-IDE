@@ -26,8 +26,8 @@ test('CI workflow has least-privilege triggers and concurrency controls', () => 
   const workflow = readWorkflow();
   assert.match(workflow, /^permissions:\s*\n\s+contents:\s*read\s*$/m);
   assert.match(workflow, /^on:\s*$/m);
-  assert.match(workflow, /^\s+push:\s*$/m);
-  assert.match(workflow, /^\s+pull_request:\s*$/m);
+  assert.match(workflow, /^\s+push:\s*\n\s+branches:\s*\n\s+- main\s*$/m);
+  assert.match(workflow, /^\s+pull_request:\s*\n\s+branches:\s*\n\s+- main\s*$/m);
   assert.match(workflow, /^\s+workflow_dispatch:\s*$/m);
   assert.match(workflow, /^concurrency:\s*\n\s+group:/m);
   assert.match(workflow, /cancel-in-progress:\s*true/);
