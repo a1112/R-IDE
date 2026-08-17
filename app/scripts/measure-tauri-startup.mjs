@@ -887,7 +887,11 @@ export function readLinuxProcEnvironment(
     if (error?.message === 'Linux proc environment exceeds the size limit') {
       throw error;
     }
-    throw new Error('Linux proc environment query failed');
+    const queryError = new Error('Linux proc environment query failed');
+    if (error?.code === 'EACCES' || error?.code === 'EPERM') {
+      queryError.code = 'RIDE_PROC_ENVIRONMENT_UNREADABLE';
+    }
+    throw queryError;
   }
 }
 
@@ -898,6 +902,7 @@ export function discoverMarkedProcessSnapshot(
     read = readProcessTable,
     listLinuxPids = defaultLinuxProcessIds,
     readLinuxEnvironment = readLinuxProcEnvironment,
+    allowedUnreadableIdentities = [],
     run = (command, args, options) => spawnSync(command, args, options),
   } = {},
 ) {
@@ -908,6 +913,22 @@ export function discoverMarkedProcessSnapshot(
 
   const beforeRows = read(platform);
   const beforeByPid = new Map(beforeRows.map(row => [row.pid, row]));
+  if (!Array.isArray(allowedUnreadableIdentities)) {
+    throw new Error('allowed unreadable identities must be an array');
+  }
+  const readMarkedEnvironment = (pid, row) => {
+    try {
+      return readLinuxEnvironment(pid);
+    } catch (error) {
+      if (error?.code === 'RIDE_PROC_ENVIRONMENT_UNREADABLE'
+          && allowedUnreadableIdentities.some(
+            identity => sameExactLinuxProcessIdentity(row, identity),
+          )) {
+        return null;
+      }
+      throw error;
+    }
+  };
   let markedPids;
   let macCommandOutput;
   let macEnvironmentOutput;
@@ -926,7 +947,7 @@ export function discoverMarkedProcessSnapshot(
       if (!beforeByPid.has(verifiedPid)) {
         continue;
       }
-      const environment = readLinuxEnvironment(verifiedPid);
+      const environment = readMarkedEnvironment(verifiedPid, beforeByPid.get(verifiedPid));
       if (environment !== null && parseLinuxProcEnvironment(environment, verifiedRunId)) {
         markedPids.push(verifiedPid);
       }
@@ -976,7 +997,7 @@ export function discoverMarkedProcessSnapshot(
       if (sameProcessIdentity(row, beforeByPid.get(pid) ?? {})) {
         continue;
       }
-      const environment = readLinuxEnvironment(pid);
+      const environment = readMarkedEnvironment(pid, row);
       if (environment !== null && parseLinuxProcEnvironment(environment, verifiedRunId)) {
         markerIdentities.set(pid, row);
         newMarkerIdentityFound = true;
@@ -1027,12 +1048,24 @@ function processIdentity(row) {
 
 function sameProcessIdentity(row, identity) {
   const sameCreationTime = row.creationTime === identity.creationTime;
-  const exactLinuxIdentity = sameCreationTime
-    && typeof row.creationTime === 'string'
-    && /^linux:[1-9]\d*$/.test(row.creationTime);
+  const exactLinuxIdentity = sameExactLinuxProcessIdentity(row, identity);
   return row.pid === identity.pid
     && sameCreationTime
     && (exactLinuxIdentity || row.pgid === identity.pgid);
+}
+
+function hasExactLinuxProcessIdentity(identity) {
+  return Number.isSafeInteger(identity?.pid)
+    && identity.pid > 0
+    && typeof identity.creationTime === 'string'
+    && /^linux:[1-9]\d*$/.test(identity.creationTime);
+}
+
+function sameExactLinuxProcessIdentity(row, identity) {
+  return hasExactLinuxProcessIdentity(row)
+    && hasExactLinuxProcessIdentity(identity)
+    && row.pid === identity.pid
+    && row.creationTime === identity.creationTime;
 }
 
 function validateProcessIdentity(identity, name = 'process identity') {
@@ -1341,13 +1374,28 @@ function aggregateMarkedProcessTree(rows, rootIdentity, markedRows) {
 export function sampleProcessTree(
   rootIdentity,
   platform = process.platform,
-  { runId, discover = discoverMarkedProcessSnapshot } = {},
+  {
+    runId,
+    discover = discoverMarkedProcessSnapshot,
+    trackedProcesses = [],
+  } = {},
 ) {
   if (platform === 'win32' || runId === undefined) {
     return aggregateProcessTree(readProcessTable(platform), rootIdentity);
   }
-  const snapshot = discover(validateRunId(runId), platform);
-  return aggregateMarkedProcessTree(snapshot.rows, rootIdentity, snapshot.markedRows);
+  const snapshot = discover(validateRunId(runId), platform, {
+    allowedUnreadableIdentities: [rootIdentity, ...trackedProcesses],
+  });
+  const exactTrackedRows = platform === 'linux'
+    ? [rootIdentity, ...trackedProcesses]
+      .map(identity => snapshot.rows.find(row => sameExactLinuxProcessIdentity(row, identity)))
+      .filter(Boolean)
+    : [];
+  return aggregateMarkedProcessTree(
+    snapshot.rows,
+    rootIdentity,
+    mergeTrackedProcesses(snapshot.markedRows, exactTrackedRows),
+  );
 }
 
 export async function captureProcessIdentity(
@@ -1778,6 +1826,7 @@ export async function terminateMeasuredTree(
   const verifiedRunId = markerEnabled ? validateRunId(runId) : undefined;
   let latestMarkedProcesses = [];
   let markerQueryFailed = false;
+  let allowedUnreadableIdentities = [rootIdentity, ...trackedProcesses].filter(Boolean);
   const validateMarkedSnapshot = snapshot => {
     if (!snapshot || !Array.isArray(snapshot.rows) || !Array.isArray(snapshot.markedRows)) {
       throw new Error('invalid marked process snapshot');
@@ -1798,8 +1847,14 @@ export async function terminateMeasuredTree(
     if (markerEnabled) {
       for (let attempt = 1; attempt <= readAttempts; attempt++) {
         try {
-          const snapshot = validateMarkedSnapshot(discoverMarked(verifiedRunId, platform));
+          const snapshot = validateMarkedSnapshot(discoverMarked(verifiedRunId, platform, {
+            allowedUnreadableIdentities,
+          }));
           latestMarkedProcesses = snapshot.markedRows;
+          allowedUnreadableIdentities = mergeTrackedProcesses(
+            allowedUnreadableIdentities,
+            snapshot.markedRows,
+          );
           return snapshot.rows;
         } catch (error) {
           lastError = error;
@@ -2256,10 +2311,10 @@ const defaultMeasurementDependencies = {
   startMonitor: (rootIdentity, { child }) => startProcessTreeMonitor(rootIdentity, { child }),
   waitForReport: waitForStartupReport,
   delay: milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds)),
-  sample: (rootIdentity, { platform, runId }) => sampleProcessTree(
+  sample: (rootIdentity, { platform, runId, trackedProcesses }) => sampleProcessTree(
     rootIdentity,
     platform,
-    { runId },
+    { runId, trackedProcesses },
   ),
   terminate: terminateMeasuredTree,
 };
@@ -2316,9 +2371,13 @@ export async function measureOnce(options, dependencies = defaultMeasurementDepe
       );
     }
     containmentVerified = true;
-    await stopMonitorOnce();
+    const sampleTrackedProcesses = await stopMonitorOnce();
     await dependencies.delay(options.idleMs);
-    metrics = dependencies.sample(rootIdentity, { platform, runId });
+    metrics = dependencies.sample(rootIdentity, {
+      platform,
+      runId,
+      trackedProcesses: sampleTrackedProcesses,
+    });
     const finalStartupReport = await dependencies.waitForReport(options.reportPath, {
       timeoutMs: Math.max(0, deadline - now()),
       pollMs: options.pollMs,

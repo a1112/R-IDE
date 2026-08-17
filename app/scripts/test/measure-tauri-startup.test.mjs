@@ -486,17 +486,20 @@ test('Linux proc environment parsing matches only the exact startup run marker e
 
 test('Linux proc discovery ignores nondumpable environ ownership and fails closed for same-UID access errors', () => {
   let reads = 0;
-  const accessError = Object.assign(new Error('denied'), { code: 'EACCES' });
-  assert.throws(() => readLinuxProcEnvironment(202, {
-    stat: () => ({ uid: 0 }),
-    readStatus: () => Buffer.from('Name:\tride\nUid:\t1000\t1000\t1000\t1000\n'),
-    getuid: () => 1000,
-    readFile: () => {
-      reads++;
-      throw accessError;
-    },
-  }), /Linux proc environment query failed/);
-  assert.equal(reads, 1, 'same-UID nondumpable processes must not be skipped by environ owner');
+  for (const code of ['EACCES', 'EPERM']) {
+    const accessError = Object.assign(new Error('denied'), { code });
+    assert.throws(() => readLinuxProcEnvironment(202, {
+      stat: () => ({ uid: 0 }),
+      readStatus: () => Buffer.from('Name:\tride\nUid:\t1000\t1000\t1000\t1000\n'),
+      getuid: () => 1000,
+      readFile: () => {
+        reads++;
+        throw accessError;
+      },
+    }), error => error.message === 'Linux proc environment query failed'
+      && error.code === 'RIDE_PROC_ENVIRONMENT_UNREADABLE');
+  }
+  assert.equal(reads, 2, 'same-UID nondumpable processes must not be skipped by environ owner');
 
   reads = 0;
   assert.equal(readLinuxProcEnvironment(202, {
@@ -611,6 +614,51 @@ test('marked process discovery joins marker PIDs to exact process-table identiti
 
   assert.strictEqual(snapshot.rows, rows);
   assert.deepEqual(snapshot.markedRows, [rows[1]]);
+});
+
+test('Linux marked discovery tolerates unreadable environments only for tracked identities', () => {
+  const runId = '7f7df1aa-a324-4fd4-b11c-4cc260a94d8f';
+  const tracked = {
+    pid: 202, ppid: 100, pgid: 100, rssBytes: 1_024,
+    creationTime: 'linux:123456', startedAt: 2_000,
+  };
+  const unreadable = Object.assign(
+    new Error('Linux proc environment query failed'),
+    { code: 'RIDE_PROC_ENVIRONMENT_UNREADABLE' },
+  );
+  const dependencies = {
+    read: () => [tracked],
+    listLinuxPids: () => [tracked.pid],
+    readLinuxEnvironment: () => {
+      throw unreadable;
+    },
+  };
+
+  const snapshot = discoverMarkedProcessSnapshot(runId, 'linux', {
+    ...dependencies,
+    allowedUnreadableIdentities: [tracked],
+  });
+  assert.deepEqual(snapshot, { rows: [tracked], markedRows: [] });
+
+  assert.throws(
+    () => discoverMarkedProcessSnapshot(runId, 'linux', {
+      ...dependencies,
+      allowedUnreadableIdentities: [{
+        ...tracked, creationTime: 'linux:654321',
+      }],
+    }),
+    /Linux proc environment query failed/,
+  );
+
+  const coarseTracked = { ...tracked, creationTime: 'coarse-second' };
+  assert.throws(
+    () => discoverMarkedProcessSnapshot(runId, 'linux', {
+      ...dependencies,
+      read: () => [coarseTracked],
+      allowedUnreadableIdentities: [coarseTracked],
+    }),
+    /Linux proc environment query failed/,
+  );
 });
 
 test('Linux proc stat identities distinguish same-second same-group PID reuse', () => {
@@ -932,16 +980,61 @@ test('idle RSS sampling includes an escaped marked process exactly once', () => 
     startedAt: 4_000,
   };
   const rows = [root, child, escaped, foreign];
+  let discoveryOptions;
 
   const metrics = sampleProcessTree(root, 'linux', {
     runId,
-    discover: () => ({ rows, markedRows: [root, child, escaped] }),
+    trackedProcesses: [escaped],
+    discover: (_runId, _platform, options) => {
+      discoveryOptions = options;
+      return { rows, markedRows: [root, child, escaped] };
+    },
   });
 
+  assert.deepEqual(discoveryOptions.allowedUnreadableIdentities, [root, escaped]);
   assert.deepEqual(metrics.processIds, [100, 101, 202]);
   assert.equal(metrics.processCount, 3);
   assert.equal(metrics.rssBytes, 7_168);
   assert.equal(metrics.processes.find(processRow => processRow.pid === 202).depth, null);
+});
+
+test('idle RSS sampling includes exact tracked Linux processes with unreadable environments', () => {
+  const runId = '7f7df1aa-a324-4fd4-b11c-4cc260a94d8f';
+  const root = {
+    pid: 100, ppid: 1, pgid: 100, rssBytes: 1_024,
+    creationTime: 'linux:123456', startedAt: 1_000,
+  };
+  const escaped = {
+    pid: 202, ppid: 1, pgid: 202, rssBytes: 4_096,
+    creationTime: 'linux:123457', startedAt: 2_000,
+  };
+  const rows = [root, escaped];
+  const unreadable = Object.assign(
+    new Error('Linux proc environment query failed'),
+    { code: 'RIDE_PROC_ENVIRONMENT_UNREADABLE' },
+  );
+
+  const metrics = sampleProcessTree(root, 'linux', {
+    runId,
+    trackedProcesses: [escaped],
+    discover: (verifiedRunId, platform, options) => discoverMarkedProcessSnapshot(
+      verifiedRunId,
+      platform,
+      {
+        ...options,
+        read: () => rows,
+        listLinuxPids: () => rows.map(row => row.pid),
+        readLinuxEnvironment: () => {
+          throw unreadable;
+        },
+      },
+    ),
+  });
+
+  assert.deepEqual(metrics.processIds, [100, 202]);
+  assert.equal(metrics.processCount, 2);
+  assert.equal(metrics.rssBytes, 5_120);
+  assert.equal(metrics.processes.find(row => row.pid === 202).depth, null);
 });
 
 test('process table parsers preserve comparable creation chronology and reject malformed clocks', () => {
@@ -2655,6 +2748,7 @@ test('POSIX run marker cleanup augments tracked setsid processes that exec witho
   };
   let rows = [root, chronologicalChild, trackedSetsid];
   const signals = [];
+  const discoveryOptions = [];
 
   await terminateMeasuredTree({
     rootPid: 100,
@@ -2663,10 +2757,13 @@ test('POSIX run marker cleanup augments tracked setsid processes that exec witho
     runId,
   }, 'linux', {
     read: () => rows,
-    discoverMarked: () => ({
-      rows,
-      markedRows: rows.filter(row => row.pid === 100),
-    }),
+    discoverMarked: (_runId, _platform, options) => {
+      discoveryOptions.push(options);
+      return {
+        rows,
+        markedRows: rows.filter(row => row.pid === 100),
+      };
+    },
     kill: (pid, signal) => {
       signals.push([pid, signal]);
       rows = rows.filter(row => row.pid !== pid);
@@ -2681,6 +2778,11 @@ test('POSIX run marker cleanup augments tracked setsid processes that exec witho
   assert.deepEqual(signals.slice(1).sort((left, right) => left[0] - right[0]), [
     [101, 'SIGTERM'], [202, 'SIGTERM'],
   ]);
+  assert.ok(discoveryOptions.length > 0);
+  for (const options of discoveryOptions) {
+    assert.ok(options.allowedUnreadableIdentities.includes(root));
+    assert.ok(options.allowedUnreadableIdentities.includes(trackedSetsid));
+  }
   assert.deepEqual(rows, []);
 });
 
@@ -3356,7 +3458,16 @@ test('each measurement generates one run marker and threads it through launch, s
     creationTime: 'root-start',
     startedAt: 1_000,
   };
+  const monitoredBackend = {
+    pid: 7442,
+    ppid: 7331,
+    pgid: 7331,
+    creationTime: 'backend-start',
+    startedAt: 2_000,
+  };
   const observed = [];
+  let sampleContext;
+  let cleanupContext;
   let generated = 0;
   const result = await measureOnce({
     executable: '/fixture/R-IDE',
@@ -3377,13 +3488,14 @@ test('each measurement generates one run marker and threads it through launch, s
       return { pid: 7331 };
     },
     capture: async () => rootIdentity,
-    startMonitor: () => ({ stop: async () => [] }),
+    startMonitor: () => ({ stop: async () => [monitoredBackend] }),
     waitForReport: async (_reportPath, options) => ({
       ...(options.phase === 'final' ? startupReport(finalMilestones) : startupReport(targetMilestones)),
       pid: 7331,
     }),
     delay: async () => undefined,
     sample: (identity, context) => {
+      sampleContext = context;
       observed.push(['sample', context.runId, context.platform]);
       return {
         rootPid: identity.pid,
@@ -3395,6 +3507,7 @@ test('each measurement generates one run marker and threads it through launch, s
       };
     },
     terminate: async cleanup => {
+      cleanupContext = cleanup;
       observed.push(['terminate', cleanup.runId]);
     },
   });
@@ -3405,6 +3518,9 @@ test('each measurement generates one run marker and threads it through launch, s
     ['sample', runId, 'linux'],
     ['terminate', runId],
   ]);
+  assert.deepEqual(sampleContext.trackedProcesses, [monitoredBackend]);
+  assert.deepEqual(cleanupContext.trackedProcesses.map(row => row.pid), [7331, 7442]);
+  assert.deepEqual(cleanupContext.trackedProcesses[1], monitoredBackend);
   assert.equal(JSON.stringify(result).includes(runId), false);
 });
 
