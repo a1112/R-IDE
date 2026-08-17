@@ -942,16 +942,18 @@ test('publish lock safely recovers a stale dead owner and writes canonical owner
         timeoutMs: 2_000,
         sleep: async () => {},
         isProcessAlive: () => false,
+        createLeaseId: () => 'd'.repeat(32),
     });
 
     const owner = JSON.parse(await fs.promises.readFile(path.join(lockDirectory, 'owner.json'), 'utf8'));
     assert.deepEqual(owner, {
-        schema: 'ride.tauri-publish-lock@1',
+        schema: 'ride.tauri-publish-lock@2',
         pid: process.pid,
         buildId: 'live-build',
         profile: 'full',
         commit: '2'.repeat(40),
         acquiredAt: 10_000,
+        leaseId: 'd'.repeat(32),
     });
     await release();
     assert.equal(fs.existsSync(lockDirectory), false);
@@ -1032,55 +1034,119 @@ test('publish lock gives a fresh ownerless directory time to finish concurrent i
     await release();
 });
 
-test('publish lock preserves an owner initialized immediately before stale ownerless quarantine', async t => {
-    const browserDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-publish-lock-ownerless-quarantine-race-'));
+test('publish lock keeps one canonical winner across creator, stale remover, and third contender', async t => {
+    const browserDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-publish-lock-three-contenders-'));
     t.after(() => fs.promises.rm(browserDirectory, { recursive: true, force: true }));
     const lockDirectory = path.join(browserDirectory, '.ride-tauri-publish.lock');
-    await fs.promises.mkdir(lockDirectory);
-    await fs.promises.utimes(lockDirectory, new Date(100), new Date(100));
-    let currentTime = 10_000;
-    let initializedDuringQuarantine = false;
-    let preservedLiveOwner = false;
-    const filesystem = {
+    let signalCreatorMkdir;
+    const creatorMkdir = new Promise(resolve => { signalCreatorMkdir = resolve; });
+    let allowCreatorOwnerWrite;
+    const creatorOwnerWrite = new Promise(resolve => { allowCreatorOwnerWrite = resolve; });
+    let signalQuarantined;
+    const quarantined = new Promise(resolve => { signalQuarantined = resolve; });
+    let allowStaleRemover;
+    const staleRemover = new Promise(resolve => { allowStaleRemover = resolve; });
+    let quarantineDirectory;
+    const creatorFilesystem = {
+        ...fs.promises,
+        mkdir: async candidate => {
+            const result = await fs.promises.mkdir(candidate);
+            if (path.resolve(candidate) === path.resolve(lockDirectory)) {
+                signalCreatorMkdir();
+            }
+            return result;
+        },
+        writeFile: async (candidate, data, options) => {
+            if (path.resolve(candidate) === path.resolve(path.join(lockDirectory, 'owner.json'))) {
+                await creatorOwnerWrite;
+                return fs.promises.writeFile(path.join(quarantineDirectory, 'owner.json'), data, options);
+            }
+            return fs.promises.writeFile(candidate, data, options);
+        },
+    };
+    const staleRemoverFilesystem = {
         ...fs.promises,
         rename: async (source, destination) => {
-            if (!initializedDuringQuarantine && path.resolve(source) === path.resolve(lockDirectory)
+            const result = await fs.promises.rename(source, destination);
+            if (path.resolve(source) === path.resolve(lockDirectory)
                 && path.basename(destination).startsWith('.ride-tauri-publish.lock.stale-')) {
-                initializedDuringQuarantine = true;
-                await fs.promises.writeFile(path.join(lockDirectory, 'owner.json'), `${JSON.stringify({
-                    schema: 'ride.tauri-publish-lock@1',
-                    pid: process.pid,
-                    buildId: 'initializing-build',
-                    profile: 'tauri-critical',
-                    commit: '5'.repeat(40),
-                    acquiredAt: currentTime,
-                })}\n`);
+                quarantineDirectory = destination;
+                signalQuarantined();
+                await staleRemover;
             }
-            return fs.promises.rename(source, destination);
+            return result;
         },
     };
 
-    const release = await acquirePublishLock({
+    const creator = acquirePublishLock({
         browserDirectory,
-        filesystem,
-        owner: { buildId: 'waiting-build', profile: 'full', commit: '5'.repeat(40) },
-        now: () => currentTime,
+        filesystem: creatorFilesystem,
+        owner: { buildId: 'creator-a', profile: 'tauri-critical', commit: '5'.repeat(40) },
+        createLeaseId: () => 'a'.repeat(32),
+        now: () => 100,
+        timeoutMs: 0,
+    });
+    await creatorMkdir;
+    await fs.promises.utimes(lockDirectory, new Date(100), new Date(100));
+
+    const remover = acquirePublishLock({
+        browserDirectory,
+        filesystem: staleRemoverFilesystem,
+        owner: { buildId: 'remover-b', profile: 'full', commit: '5'.repeat(40) },
+        createLeaseId: () => 'b'.repeat(32),
+        now: () => 10_000,
         staleMs: 1_000,
-        timeoutMs: 2_000,
-        retryDelayMs: 100,
-        isProcessAlive: () => true,
-        sleep: async delay => {
-            currentTime += delay;
-            preservedLiveOwner = JSON.parse(
-                await fs.promises.readFile(path.join(lockDirectory, 'owner.json'), 'utf8'),
-            ).buildId === 'initializing-build';
-            await fs.promises.rm(lockDirectory, { recursive: true });
-        },
+        timeoutMs: 0,
+    });
+    await quarantined;
+
+    const releaseWinner = await acquirePublishLock({
+        browserDirectory,
+        owner: { buildId: 'winner-c', profile: 'full', commit: '5'.repeat(40) },
+        createLeaseId: () => 'c'.repeat(32),
+        now: () => 10_000,
+        timeoutMs: 0,
+    });
+    allowCreatorOwnerWrite();
+    const creatorResult = await Promise.allSettled([creator]);
+    allowStaleRemover();
+    const removerResult = await Promise.allSettled([remover]);
+
+    assert.equal(creatorResult[0].status, 'rejected', 'quarantined creator A must not acquire canonical ownership');
+    assert.equal(removerResult[0].status, 'rejected', 'stale remover B must not replace canonical winner C');
+    const canonicalOwner = JSON.parse(await fs.promises.readFile(path.join(lockDirectory, 'owner.json'), 'utf8'));
+    assert.equal(canonicalOwner.buildId, 'winner-c');
+    assert.equal(canonicalOwner.leaseId, 'c'.repeat(32));
+    const quarantineEntries = (await fs.promises.readdir(browserDirectory))
+        .filter(name => name.startsWith('.ride-tauri-publish.lock.stale-'));
+    assert.deepEqual(quarantineEntries, []);
+    await releaseWinner();
+});
+
+test('publish lock release never deletes a later lease with otherwise identical owner fields', async t => {
+    const browserDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-publish-lock-release-lease-'));
+    t.after(() => fs.promises.rm(browserDirectory, { recursive: true, force: true }));
+    const lockDirectory = path.join(browserDirectory, '.ride-tauri-publish.lock');
+    const owner = { buildId: 'same-build', profile: 'full', commit: '6'.repeat(40) };
+    const releaseOld = await acquirePublishLock({
+        browserDirectory,
+        owner,
+        createLeaseId: () => 'a'.repeat(32),
+        now: () => 1_000,
+    });
+    const oldLeaseDirectory = path.join(browserDirectory, '.old-lease-for-test');
+    await fs.promises.rename(lockDirectory, oldLeaseDirectory);
+    const releaseCurrent = await acquirePublishLock({
+        browserDirectory,
+        owner,
+        createLeaseId: () => 'c'.repeat(32),
+        now: () => 1_000,
     });
 
-    assert.equal(initializedDuringQuarantine, true);
-    assert.equal(preservedLiveOwner, true);
-    await release();
+    await assert.rejects(releaseOld(), /ownership changed before release/i);
+    const currentOwner = JSON.parse(await fs.promises.readFile(path.join(lockDirectory, 'owner.json'), 'utf8'));
+    assert.equal(currentOwner.leaseId, 'c'.repeat(32));
+    await releaseCurrent();
 });
 
 test('publish lock rejects non-directory and symbolic-link lock paths', async t => {

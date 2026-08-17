@@ -1218,11 +1218,20 @@ function parsePublishLockOwner(text, lockDirectory) {
     } catch (error) {
         throw new Error(`Malformed Tauri publish lock owner in ${lockDirectory}: ${error.message}`);
     }
-    assertExactObjectFields(owner, ['schema', 'pid', 'buildId', 'profile', 'commit', 'acquiredAt'], 'Tauri publish lock owner');
-    if (owner.schema !== 'ride.tauri-publish-lock@1'
+    const legacy = owner?.schema === 'ride.tauri-publish-lock@1';
+    const current = owner?.schema === 'ride.tauri-publish-lock@2';
+    assertExactObjectFields(
+        owner,
+        current
+            ? ['schema', 'pid', 'buildId', 'profile', 'commit', 'acquiredAt', 'leaseId']
+            : ['schema', 'pid', 'buildId', 'profile', 'commit', 'acquiredAt'],
+        'Tauri publish lock owner',
+    );
+    if ((!legacy && !current)
         || !Number.isSafeInteger(owner.pid) || owner.pid <= 0
         || !Number.isFinite(owner.acquiredAt) || owner.acquiredAt < 0
-        || !/^[0-9a-f]{40}$/.test(owner.commit ?? '')) {
+        || !/^[0-9a-f]{40}$/.test(owner.commit ?? '')
+        || (current && !/^[0-9a-f]{32}$/.test(owner.leaseId ?? ''))) {
         throw new Error(`Invalid Tauri publish lock owner in ${lockDirectory}.`);
     }
     assertPathSegment(owner.buildId, 'Tauri publish lock build id');
@@ -1230,6 +1239,16 @@ function parsePublishLockOwner(text, lockDirectory) {
         throw new Error(`Invalid Tauri publish lock profile in ${lockDirectory}.`);
     }
     return owner;
+}
+
+function samePublishLockLease(left, right) {
+    return left?.schema === right?.schema
+        && left?.pid === right?.pid
+        && left?.buildId === right?.buildId
+        && left?.profile === right?.profile
+        && left?.commit === right?.commit
+        && left?.acquiredAt === right?.acquiredAt
+        && left?.leaseId === right?.leaseId;
 }
 
 async function readPublishLockOwner(lockDirectory, filesystem) {
@@ -1255,6 +1274,7 @@ export async function acquirePublishLock({
     staleMs = 5 * 60_000,
     isProcessAlive = defaultIsProcessAlive,
     platform = process.platform,
+    createLeaseId = () => crypto.randomBytes(16).toString('hex'),
 } = {}) {
     const resolvedBrowserDirectory = path.resolve(browserDirectory);
     assertPathSegment(owner?.buildId, 'Tauri publish lock build id');
@@ -1267,7 +1287,11 @@ export async function acquirePublishLock({
     }
     const lockDirectory = path.join(resolvedBrowserDirectory, '.ride-tauri-publish.lock');
     assertProfilePath(resolvedBrowserDirectory, lockDirectory);
-    const removeStaleLock = async ({ preserveConcurrentOwner = false } = {}) => {
+    const leaseId = createLeaseId();
+    if (!/^[0-9a-f]{32}$/.test(leaseId ?? '')) {
+        throw new Error('Tauri publish lock lease id is not canonical.');
+    }
+    const quarantineLock = async () => {
         const staleDirectory = path.join(
             resolvedBrowserDirectory,
             `.ride-tauri-publish.lock.stale-${process.pid}-${crypto.randomBytes(6).toString('hex')}`,
@@ -1281,63 +1305,88 @@ export async function acquirePublishLock({
             }
             throw error;
         }
-        if (preserveConcurrentOwner) {
-            let quarantinedOwner;
-            try {
-                quarantinedOwner = await readPublishLockOwner(staleDirectory, filesystem);
-            } catch (error) {
-                if (error.code !== 'ENOENT') {
-                    throw error;
-                }
-            }
-            if (quarantinedOwner
-                && (now() - quarantinedOwner.acquiredAt < staleMs || isProcessAlive(quarantinedOwner.pid))) {
-                try {
-                    await retryRename(filesystem, staleDirectory, lockDirectory, { platform, sleep });
-                } catch (restoreError) {
-                    throw new AggregateError(
-                        [restoreError],
-                        `A live Tauri publish lock was quarantined and could not be restored from ${staleDirectory}.`,
-                    );
-                }
-                return false;
-            }
+        return staleDirectory;
+    };
+    const removeStaleLock = async () => {
+        const staleDirectory = await quarantineLock();
+        if (!staleDirectory) {
+            return false;
         }
         await retryRemove(filesystem, staleDirectory, { platform, sleep });
+        return true;
+    };
+    const removeCanonicalLockIfOwned = async expectedOwner => {
+        const state = await pathState(lockDirectory, filesystem);
+        if (!state.exists) {
+            return false;
+        }
+        if (!state.stat.isDirectory() || state.stat.isSymbolicLink()) {
+            throw new Error(`Refusing unsafe Tauri publish lock path: ${lockDirectory}`);
+        }
+        let currentOwner;
+        try {
+            currentOwner = await readPublishLockOwner(lockDirectory, filesystem);
+        } catch (error) {
+            if (error.code === 'ENOENT') {
+                return false;
+            }
+            throw error;
+        }
+        if (!samePublishLockLease(currentOwner, expectedOwner)) {
+            return false;
+        }
+        const quarantineDirectory = await quarantineLock();
+        if (!quarantineDirectory) {
+            return false;
+        }
+        const quarantinedOwner = await readPublishLockOwner(quarantineDirectory, filesystem);
+        if (!samePublishLockLease(quarantinedOwner, expectedOwner)) {
+            throw new Error(`Tauri publish lock ownership changed while quarantining ${quarantineDirectory}.`);
+        }
+        await retryRemove(filesystem, quarantineDirectory, { platform, sleep });
         return true;
     };
     const startedAt = now();
     while (true) {
         const acquiredAt = now();
         const lockOwner = {
-            schema: 'ride.tauri-publish-lock@1',
+            schema: 'ride.tauri-publish-lock@2',
             pid: process.pid,
             buildId: owner.buildId,
             profile: owner.profile,
             commit: owner.commit,
             acquiredAt,
+            leaseId,
         };
+        let created = false;
         try {
             await filesystem.mkdir(lockDirectory);
-            try {
-                await filesystem.writeFile(path.join(lockDirectory, 'owner.json'), `${JSON.stringify(lockOwner)}\n`, { flag: 'wx' });
-            } catch (error) {
-                await retryRemove(filesystem, lockDirectory, { platform, sleep }).catch(() => {});
-                throw error;
-            }
-            return async () => {
-                const current = await readPublishLockOwner(lockDirectory, filesystem);
-                if (current.pid !== lockOwner.pid || current.buildId !== lockOwner.buildId
-                    || current.profile !== lockOwner.profile || current.commit !== lockOwner.commit
-                    || current.acquiredAt !== lockOwner.acquiredAt) {
-                    throw new Error('Tauri publish lock ownership changed before release.');
-                }
-                await retryRemove(filesystem, lockDirectory, { platform, sleep });
-            };
+            created = true;
         } catch (error) {
             if (error.code !== 'EEXIST') {
                 throw error;
             }
+        }
+        if (created) {
+            try {
+                await filesystem.writeFile(path.join(lockDirectory, 'owner.json'), `${JSON.stringify(lockOwner)}\n`, { flag: 'wx' });
+                const canonicalOwner = await readPublishLockOwner(lockDirectory, filesystem);
+                if (!samePublishLockLease(canonicalOwner, lockOwner)) {
+                    throw new Error('Tauri publish lock ownership changed before acquisition completed.');
+                }
+            } catch (error) {
+                try {
+                    await removeCanonicalLockIfOwned(lockOwner);
+                } catch (cleanupError) {
+                    throw new AggregateError([error, cleanupError], 'Tauri publish lock acquisition and cleanup both failed.');
+                }
+                throw error;
+            }
+            return async () => {
+                if (!await removeCanonicalLockIfOwned(lockOwner)) {
+                    throw new Error('Tauri publish lock ownership changed before release.');
+                }
+            };
         }
 
         const state = await pathState(lockDirectory, filesystem);
@@ -1379,7 +1428,7 @@ export async function acquirePublishLock({
                 if (confirmedState.stat.mtimeMs !== lockMtime) {
                     continue;
                 }
-                await removeStaleLock({ preserveConcurrentOwner: true });
+                await removeStaleLock();
                 continue;
             }
             if (currentTime - startedAt >= timeoutMs) {
@@ -1389,7 +1438,7 @@ export async function acquirePublishLock({
             continue;
         }
         if (currentTime - currentOwner.acquiredAt >= staleMs && !isProcessAlive(currentOwner.pid)) {
-            await removeStaleLock({ preserveConcurrentOwner: true });
+            await removeStaleLock();
             continue;
         }
         if (currentTime - startedAt >= timeoutMs) {
