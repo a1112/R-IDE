@@ -43,8 +43,8 @@
   ],
   "scripts": {
     "clean": "rimraf lib *.tsbuildinfo",
-    "build": "node ./node_modules/typescript/bin/tsc -b",
-    "test": "rimraf test/dist && node ./node_modules/typescript/bin/tsc -p tsconfig.test.json && node --test test/dist/test/*.test.js",
+    "build": "tsc -b",
+    "test": "rimraf test/dist && tsc -p tsconfig.test.json && node --test test/dist/test/*.test.js",
     "lint": "eslint --ext js,jsx,ts,tsx src",
     "lint:fix": "eslint --ext js,jsx,ts,tsx src --fix",
     "update:theia": "ts-node ../../scripts/update-theia-version.ts",

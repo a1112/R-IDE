@@ -291,3 +291,22 @@ test('product extension compiler supports the locked d3 type declarations', () =
     `${packageFile} must use TypeScript 5.x for the locked @types/d3-dispatch declarations`,
   );
 });
+
+test('product extension scripts resolve TypeScript through the workspace executable path', () => {
+  const packageFile = path.join(repositoryRoot, 'app', 'theia-extensions', 'product', 'package.json');
+  const packageJson = JSON.parse(fs.readFileSync(packageFile, 'utf8'));
+
+  for (const scriptName of ['build', 'test']) {
+    const script = packageJson.scripts?.[scriptName] ?? '';
+    assert.doesNotMatch(
+      script,
+      /node\s+\.\/node_modules\/typescript\/bin\/tsc/,
+      `${packageFile} ${scriptName} must not assume dependencies are installed inside the package`,
+    );
+    assert.match(
+      script,
+      /(?:^|&&\s*)tsc(?:\s|$)/,
+      `${packageFile} ${scriptName} must resolve tsc through the workspace script PATH`,
+    );
+  }
+});
