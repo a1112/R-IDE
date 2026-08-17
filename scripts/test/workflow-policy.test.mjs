@@ -99,6 +99,9 @@ test('package jobs measure startup after verification and upload the unsigned JS
 
   const measurementBlock = packageJob.text.slice(linuxMeasureIndex, uploadIndex);
   const linuxMeasurementBlock = packageJob.text.slice(linuxMeasureIndex, desktopMeasureIndex);
+  const checkoutIndex = packageJob.text.indexOf('- name: Check out source');
+  const setupNodeIndex = packageJob.text.indexOf('- name: Set up Node.js 22');
+  const checkoutBlock = packageJob.text.slice(checkoutIndex, setupNodeIndex);
   assert.match(measurementBlock, /if:\s*runner\.os\s*==\s*['"]Linux['"]/);
   assert.match(measurementBlock, /if:\s*runner\.os\s*!=\s*['"]Linux['"]/);
   assert.match(measurementBlock, /xvfb-run\s+-a\s+npm\s+run\s+measure:tauri-startup/);
@@ -107,6 +110,9 @@ test('package jobs measure startup after verification and upload the unsigned JS
   assert.match(linuxMeasurementBlock, /useradd\s+--system/);
   assert.match(linuxMeasurementBlock, /sudo\s+-H\s+-u\s+"\$measure_user"/);
   assert.match(linuxMeasurementBlock, /sudo\s+chown\s+"\$measure_user:\$measure_user"[\s\S]*"\$bundle_directory"/);
+  assert.match(linuxMeasurementBlock, /setfacl\s+-m\s+"u:\$measure_user:r-x"\s+"\$app_path"/);
+  assert.match(linuxMeasurementBlock, /setfacl\s+-m\s+"u:\$measure_user:--x"\s+"\$acl_path"/);
+  assert.match(linuxMeasurementBlock, /setfacl\s+-x\s+"u:\$measure_user"/);
   assert.match(linuxMeasurementBlock, /status=\$\?/);
   assert.match(linuxMeasurementBlock, /sudo\s+chown\s+"\$runner_uid:\$runner_gid"\s+"\$bundle_directory"/);
   assert.match(linuxMeasurementBlock, /exit\s+"\$status"/);
@@ -114,6 +120,15 @@ test('package jobs measure startup after verification and upload the unsigned JS
   assert.doesNotMatch(linuxMeasurementBlock, /measure_output|cp\s+-a/);
   assert.match(packageJob.text, /!app\/applications\/tauri\/src-tauri\/target\/release\/bundle/);
   assert.match(packageJob.text, /key:\s*package-v2-/);
+  assert.match(checkoutBlock, /persist-credentials:\s*false/);
+  const cleanupTrapIndex = linuxMeasurementBlock.indexOf('trap cleanup_measure_user EXIT');
+  const ownershipMutationIndex = linuxMeasurementBlock.indexOf(
+    'sudo chown "$measure_user:$measure_user"',
+  );
+  assert.ok(cleanupTrapIndex >= 0 && ownershipMutationIndex >= 0
+      && cleanupTrapIndex < ownershipMutationIndex,
+    'cleanup trap must be armed before ownership and ACL mutations',
+  );
 
   const uploadBlock = packageJob.text.slice(uploadIndex);
   assert.match(uploadBlock, /if:\s*always\(\)/);
@@ -237,6 +252,7 @@ test('Linux Tauri prerequisites avoid conflicting AppIndicator development packa
   assert.ok(prerequisiteIndex >= 0, 'package job must install Linux prerequisites');
   assert.ok(rustIndex > prerequisiteIndex, 'package prerequisites must precede Rust setup');
   const packagePrerequisites = packageJob.text.slice(prerequisiteIndex, rustIndex);
+  assert.match(packagePrerequisites, /\bacl\b/);
   assert.match(packagePrerequisites, /\bxvfb\b/);
 
   const measurementIndex = packageJob.text.indexOf('- name: Measure packaged Tauri startup on Linux');
