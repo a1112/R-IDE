@@ -323,6 +323,7 @@ export function resolveProfile({ profileName = 'tauri-critical', profileConfig, 
             }
         }
         const visited = new Set();
+        const rootSet = new Set(closureRoots);
         const dependenciesByNode = new Map();
         const firstPath = new Map();
         const visit = (requestName, parentSpec, ancestry) => {
@@ -331,7 +332,7 @@ export function resolveProfile({ profileName = 'tauri-critical', profileConfig, 
             if (!manifest) {
                 throw new Error(`${dependencyPath.join(' -> ')}: required dependency is not installed.`);
             }
-            if (Object.hasOwn(browserDependencies, requestName)) {
+            if (rootSet.has(requestName)) {
                 validateInstalledManifest(
                     requestName,
                     browserDependencies[requestName],
@@ -714,6 +715,7 @@ async function defaultResolveInstalledManifest(requestName, fromDirectory) {
 async function loadInstalledClosure(browserManifest, roots, resolver, browserDirectory) {
     const manifests = {};
     const records = new Map();
+    const rootSet = new Set(roots);
     const load = async (requestName, spec, fromDirectory, dependencyPath, optional = false) => {
         const expected = parseDependencySpec(requestName, spec);
         if (!semver.validRange(expected.range)) {
@@ -732,7 +734,7 @@ async function loadInstalledClosure(browserManifest, roots, resolver, browserDir
             throw new Error(`${dependencyPath.join(' -> ')}: installed dependency has no package directory.`);
         }
         validateInstalledManifest(requestName, spec, installed.manifest, dependencyPath, 'parent dependency');
-        if (Object.hasOwn(browserManifest.dependencies ?? {}, requestName)) {
+        if (rootSet.has(requestName)) {
             validateInstalledManifest(
                 requestName,
                 browserManifest.dependencies[requestName],
@@ -790,8 +792,8 @@ function selectedRoots(profileName, profileConfig, browserManifest) {
         : [...new Set(profile.roots ?? [])].sort(compareText);
 }
 
-function generatedExtensionSpec(requestName, browserManifest, record) {
-    if (Object.hasOwn(browserManifest.dependencies ?? {}, requestName)) {
+function generatedExtensionSpec(requestName, browserManifest, record, rootSet) {
+    if (rootSet.has(requestName)) {
         return browserManifest.dependencies[requestName];
     }
     return requestName === record.manifest.name
@@ -850,9 +852,10 @@ export async function generateProfileTarget({
     await retryRemove(fs.promises, plan.temporaryDirectory, {});
     await fs.promises.mkdir(plan.temporaryDirectory, { recursive: true });
     try {
+        const rootSet = new Set(roots);
         const dependencies = Object.fromEntries(resolved.extensions.map(name => [
             name,
-            generatedExtensionSpec(name, browserManifest, records.get(name)),
+            generatedExtensionSpec(name, browserManifest, records.get(name), rootSet),
         ]));
         const devDependencies = Object.fromEntries((profileConfig.buildDevDependencies ?? []).map(name => {
             const spec = browserManifest.devDependencies?.[name];

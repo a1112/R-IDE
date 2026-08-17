@@ -158,6 +158,21 @@ test('rejects an installed runtime that violates its parent dependency range', (
     })), /product -> utility.*9\.1\.0.*parent dependency.*\^4\.0\.0/i);
 });
 
+test('does not apply an unselected browser root range to a nested runtime dependency', () => {
+    const result = resolveProfile(fixture({
+        roots: ['product'],
+        dependencies: { product: '^1.0.0', 'fs-extra': '^9.1.0' },
+        packages: {
+            product: manifest('product', { helper: '^1.0.0' }),
+            helper: { name: 'helper', version: '1.0.0', dependencies: { 'fs-extra': '^4.0.0' } },
+            'fs-extra': { name: 'fs-extra', version: '4.0.3' },
+        },
+    }));
+
+    assert.deepEqual(result.extensions, ['product']);
+    assert.deepEqual(result.packages.map(entry => entry.requestName), ['fs-extra', 'helper', 'product']);
+});
+
 test('uses exact package names for deferred conflicts without prefix matching', () => {
     const packages = {
         product: manifest('product', { '@theia/notebook': '^1.0.0', '@theia/ai-core': '^1.0.0' }),
@@ -313,7 +328,7 @@ test('resolves npm aliases and validates alias target name and version', () => {
 
 test('requires every selected root to satisfy both browser and parent ranges', () => {
     assert.throws(() => resolveProfile(fixture({
-        roots: ['product'],
+        roots: ['product', 'child'],
         dependencies: { product: '^1.0.0', child: '^2.0.0' },
         packages: {
             product: manifest('product', { child: '^1.0.0' }),
@@ -900,7 +915,7 @@ test('generates an isolated target without writing tracked package.json or src-g
     assert.equal(await fs.promises.readFile(path.join(browserDirectory, 'src-gen', 'sentinel.txt'), 'utf8'), 'tracked generated sentinel');
     assert.equal(result.targetDirectory, path.join(browserDirectory, '.ride-tauri-profile', 'builds', 'isolated-build'));
     const generatedPackage = JSON.parse(await fs.promises.readFile(path.join(result.targetDirectory, 'package.json'), 'utf8'));
-    assert.deepEqual(generatedPackage.dependencies, { shared: '^1.0.0', product: '^1.0.0' });
+    assert.deepEqual(generatedPackage.dependencies, { shared: '1.2.3', product: '^1.0.0' });
     assert.deepEqual(generatedPackage.devDependencies, { '@theia/cli': '^1.0.0' });
     assert.deepEqual(generatedPackage.theia, { generator: { config: { preloadTemplate: './resources/preload.html' } } });
     assert.equal(generatedPackage.scripts, undefined);
