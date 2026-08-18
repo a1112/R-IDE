@@ -269,14 +269,12 @@ export class RidePackagedSmokeActionService implements RidePackagedSmokeActions,
                 run.assertActive();
                 const startedTerminal = terminal;
                 const start = Promise.resolve(startedTerminal.start());
-                start.then(
-                    () => {
-                        if (run.aborted) {
-                            disposeAfterLateStart(startedTerminal);
-                        }
-                    },
-                    () => undefined
-                );
+                const cleanupAfterStartSettlement = (): void => {
+                    if (run.aborted) {
+                        disposeAfterLateStart(startedTerminal);
+                    }
+                };
+                start.then(cleanupAfterStartSettlement, cleanupAfterStartSettlement);
                 await run.wait(start);
                 run.assertActive();
                 terminal.sendText(windows ? RIDE_SMOKE_WINDOWS_COMMAND : RIDE_SMOKE_UNIX_COMMAND);
