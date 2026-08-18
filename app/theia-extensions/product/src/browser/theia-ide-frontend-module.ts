@@ -29,6 +29,7 @@ import { bindRideOpenRequestContribution } from './ride-open-request-bindings';
 import { RideWorkbenchContribution } from './ride-workbench-contribution';
 import { bindRidePerformanceContribution } from './ride-performance-contribution';
 import { bindRideDeferredFeatureLoader } from './ride-deferred-feature-loader';
+import { bindRidePackagedSmokeContribution } from './ride-packaged-smoke-bindings';
 
 export default new ContainerModule((bind, _unbind, isBound, rebind) => {
     applyBranding();
@@ -49,6 +50,11 @@ export default new ContainerModule((bind, _unbind, isBound, rebind) => {
     bind(CommandContribution).toService(RideWorkbenchContribution);
 
     bindRidePerformanceContribution(bind);
+
+    bindRidePackagedSmokeContribution(bind, {
+        applicationState: FrontendApplicationStateService,
+        contribution: FrontendApplicationContribution
+    });
 
     bindRideDeferredFeatureLoader(bind, {
         commands: CommandRegistry,
