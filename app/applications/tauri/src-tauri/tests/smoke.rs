@@ -10,7 +10,7 @@
 use ride_tauri::smoke::{
     CompleteRequest, FailurePhase, RecordStepRequest, SmokeAction, SmokeDiagnostic, SmokeMode,
     SmokeProfile, SmokeProtocol, SmokeScenario, SmokeStepState, SmokeTerminalStatus,
-    SmokeUpdateStatus,
+    SmokeUpdateResponse, SmokeUpdateStatus,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -133,15 +133,15 @@ fn complete_passed(duration_ms: u64) -> CompleteRequest {
     }
 }
 
-fn complete_actions(protocol: &SmokeProtocol, actions: &[SmokeAction]) {
+fn complete_actions(protocol: &SmokeProtocol, proof: &str, actions: &[SmokeAction]) {
     let mut duration_ms = 0;
     for action in actions {
         protocol
-            .record_step(step(*action, SmokeStepState::Started, duration_ms))
+            .record_step(proof, step(*action, SmokeStepState::Started, duration_ms))
             .expect("start smoke action");
         duration_ms += 1;
         protocol
-            .record_step(step(*action, SmokeStepState::Passed, duration_ms))
+            .record_step(proof, step(*action, SmokeStepState::Passed, duration_ms))
             .expect("pass smoke action");
         duration_ms += 1;
     }
@@ -413,14 +413,17 @@ fn smoke_protocol_disabled_and_rejected_updates_are_safe_noops() {
     let disabled = SmokeProtocol::from_environment(&BTreeMap::new(), &fixture.root);
     assert_eq!(
         disabled
-            .record_step(step(SmokeAction::EditorSave, SmokeStepState::Started, 0))
+            .record_step(
+                "",
+                step(SmokeAction::EditorSave, SmokeStepState::Started, 0)
+            )
             .expect("disabled update")
             .status,
         SmokeUpdateStatus::Disabled
     );
     assert_eq!(
         disabled
-            .complete(complete_passed(0))
+            .complete("", complete_passed(0))
             .expect("disabled completion")
             .status,
         SmokeUpdateStatus::Disabled
@@ -431,7 +434,10 @@ fn smoke_protocol_disabled_and_rejected_updates_are_safe_noops() {
         &fixture.root,
     );
     let response = rejected
-        .record_step(step(SmokeAction::EditorSave, SmokeStepState::Started, 0))
+        .record_step(
+            "",
+            step(SmokeAction::EditorSave, SmokeStepState::Started, 0),
+        )
         .expect("rejected update response");
     assert_eq!(response.status, SmokeUpdateStatus::Rejected);
     assert_eq!(
@@ -450,25 +456,37 @@ fn smoke_protocol_rejects_duplicate_out_of_order_and_non_monotonic_steps() {
         ),
         &fixture.root,
     );
+    let proof = active_session_proof(&protocol);
 
     assert!(protocol
-        .record_step(step(
-            SmokeAction::TerminalSentinel,
-            SmokeStepState::Started,
-            0
-        ))
+        .record_step(
+            &proof,
+            step(SmokeAction::TerminalSentinel, SmokeStepState::Started, 0)
+        )
         .is_err());
     protocol
-        .record_step(step(SmokeAction::EditorSave, SmokeStepState::Started, 2))
+        .record_step(
+            &proof,
+            step(SmokeAction::EditorSave, SmokeStepState::Started, 2),
+        )
         .expect("start first action");
     assert!(protocol
-        .record_step(step(SmokeAction::EditorSave, SmokeStepState::Started, 2))
+        .record_step(
+            &proof,
+            step(SmokeAction::EditorSave, SmokeStepState::Started, 2)
+        )
         .is_err());
     assert!(protocol
-        .record_step(step(SmokeAction::EditorSave, SmokeStepState::Passed, 1))
+        .record_step(
+            &proof,
+            step(SmokeAction::EditorSave, SmokeStepState::Passed, 1)
+        )
         .is_err());
     protocol
-        .record_step(step(SmokeAction::EditorSave, SmokeStepState::Passed, 3))
+        .record_step(
+            &proof,
+            step(SmokeAction::EditorSave, SmokeStepState::Passed, 3),
+        )
         .expect("pass first action");
 }
 
@@ -480,13 +498,17 @@ fn smoke_protocol_rejects_durations_beyond_the_node_safe_integer_limit() {
         &fixture.environment("duration-token", json!({ "actions": ["editor-save"] })),
         &fixture.root,
     );
+    let proof = active_session_proof(&protocol);
 
     assert!(protocol
-        .record_step(step(
-            SmokeAction::EditorSave,
-            SmokeStepState::Started,
-            ABOVE_NODE_SAFE_INTEGER,
-        ))
+        .record_step(
+            &proof,
+            step(
+                SmokeAction::EditorSave,
+                SmokeStepState::Started,
+                ABOVE_NODE_SAFE_INTEGER,
+            )
+        )
         .is_err());
 
     let empty_fixture = Fixture::new();
@@ -494,8 +516,9 @@ fn smoke_protocol_rejects_durations_beyond_the_node_safe_integer_limit() {
         &empty_fixture.environment("empty-duration-token", json!({ "actions": [] })),
         &empty_fixture.root,
     );
+    let empty_proof = active_session_proof(&empty);
     assert!(empty
-        .complete(complete_passed(ABOVE_NODE_SAFE_INTEGER))
+        .complete(&empty_proof, complete_passed(ABOVE_NODE_SAFE_INTEGER))
         .is_err());
 }
 
@@ -509,8 +532,12 @@ fn smoke_protocol_enforces_closed_diagnostics_and_action_failure_semantics() {
         ),
         &fixture.root,
     );
+    let proof = active_session_proof(&protocol);
     protocol
-        .record_step(step(SmokeAction::EditorSave, SmokeStepState::Started, 0))
+        .record_step(
+            &proof,
+            step(SmokeAction::EditorSave, SmokeStepState::Started, 0),
+        )
         .expect("start action");
 
     for invalid in [
@@ -520,41 +547,49 @@ fn smoke_protocol_enforces_closed_diagnostics_and_action_failure_semantics() {
     ] {
         let mut request = step(SmokeAction::EditorSave, SmokeStepState::Failed, 1);
         request.diagnostic = Some(invalid);
-        assert!(protocol.record_step(request).is_err());
+        assert!(protocol.record_step(&proof, request).is_err());
     }
 
     let failure = diagnostic("action-timeout", "Smoke action timed out.");
     protocol
-        .record_step(RecordStepRequest {
-            action: SmokeAction::EditorSave,
-            state: SmokeStepState::Failed,
-            duration_ms: 1,
-            diagnostic: Some(failure.clone()),
-        })
+        .record_step(
+            &proof,
+            RecordStepRequest {
+                action: SmokeAction::EditorSave,
+                state: SmokeStepState::Failed,
+                duration_ms: 1,
+                diagnostic: Some(failure.clone()),
+            },
+        )
         .expect("record action timeout");
     assert!(protocol
-        .record_step(step(
-            SmokeAction::TerminalSentinel,
-            SmokeStepState::Started,
-            2
-        ))
+        .record_step(
+            &proof,
+            step(SmokeAction::TerminalSentinel, SmokeStepState::Started, 2)
+        )
         .is_err());
-    assert!(protocol.complete(complete_passed(2)).is_err());
+    assert!(protocol.complete(&proof, complete_passed(2)).is_err());
     protocol
-        .complete(CompleteRequest {
-            status: SmokeTerminalStatus::Failed,
-            failure_phase: Some(FailurePhase::Action),
-            duration_ms: 2,
-            diagnostic: Some(failure),
-        })
+        .complete(
+            &proof,
+            CompleteRequest {
+                status: SmokeTerminalStatus::Failed,
+                failure_phase: Some(FailurePhase::Action),
+                duration_ms: 2,
+                diagnostic: Some(failure),
+            },
+        )
         .expect("complete action failure");
     assert!(protocol
-        .complete(CompleteRequest {
-            status: SmokeTerminalStatus::Failed,
-            failure_phase: Some(FailurePhase::Action),
-            duration_ms: 2,
-            diagnostic: Some(diagnostic("action-timeout", "Smoke action timed out.")),
-        })
+        .complete(
+            &proof,
+            CompleteRequest {
+                status: SmokeTerminalStatus::Failed,
+                failure_phase: Some(FailurePhase::Action),
+                duration_ms: 2,
+                diagnostic: Some(diagnostic("action-timeout", "Smoke action timed out.")),
+            }
+        )
         .is_err());
 }
 
@@ -565,11 +600,12 @@ fn smoke_protocol_enforces_passed_pre_action_and_cleanup_terminal_shapes() {
         &fixture.environment("passed-token", json!({ "actions": ["editor-save"] })),
         &fixture.root,
     );
-    assert!(passed.complete(complete_passed(0)).is_err());
-    complete_actions(&passed, &[SmokeAction::EditorSave]);
+    let passed_proof = active_session_proof(&passed);
+    assert!(passed.complete(&passed_proof, complete_passed(0)).is_err());
+    complete_actions(&passed, &passed_proof, &[SmokeAction::EditorSave]);
     assert_eq!(
         passed
-            .complete(complete_passed(2))
+            .complete(&passed_proof, complete_passed(2))
             .expect("complete passed report")
             .status,
         SmokeUpdateStatus::Completed
@@ -580,13 +616,17 @@ fn smoke_protocol_enforces_passed_pre_action_and_cleanup_terminal_shapes() {
         &pre_action_fixture.environment("pre-action-token", json!({ "actions": ["editor-save"] })),
         &pre_action_fixture.root,
     );
+    let pre_action_proof = active_session_proof(&pre_action);
     pre_action
-        .complete(CompleteRequest {
-            status: SmokeTerminalStatus::Failed,
-            failure_phase: Some(FailurePhase::Startup),
-            duration_ms: 0,
-            diagnostic: Some(diagnostic("startup-failed", "Application startup failed.")),
-        })
+        .complete(
+            &pre_action_proof,
+            CompleteRequest {
+                status: SmokeTerminalStatus::Failed,
+                failure_phase: Some(FailurePhase::Startup),
+                duration_ms: 0,
+                diagnostic: Some(diagnostic("startup-failed", "Application startup failed.")),
+            },
+        )
         .expect("complete startup failure");
 
     let cleanup_fixture = Fixture::new();
@@ -594,14 +634,18 @@ fn smoke_protocol_enforces_passed_pre_action_and_cleanup_terminal_shapes() {
         &cleanup_fixture.environment("cleanup-token", json!({ "actions": ["editor-save"] })),
         &cleanup_fixture.root,
     );
-    complete_actions(&cleanup, &[SmokeAction::EditorSave]);
+    let cleanup_proof = active_session_proof(&cleanup);
+    complete_actions(&cleanup, &cleanup_proof, &[SmokeAction::EditorSave]);
     cleanup
-        .complete(CompleteRequest {
-            status: SmokeTerminalStatus::Failed,
-            failure_phase: Some(FailurePhase::Cleanup),
-            duration_ms: 2,
-            diagnostic: Some(diagnostic("cleanup-failed", "Process cleanup failed.")),
-        })
+        .complete(
+            &cleanup_proof,
+            CompleteRequest {
+                status: SmokeTerminalStatus::Failed,
+                failure_phase: Some(FailurePhase::Cleanup),
+                duration_ms: 2,
+                diagnostic: Some(diagnostic("cleanup-failed", "Process cleanup failed.")),
+            },
+        )
         .expect("complete cleanup failure");
 }
 
@@ -613,9 +657,10 @@ fn smoke_protocol_persists_only_bounded_closed_atomic_terminal_reports() {
     let spec_path = PathBuf::from(environment.get(OsStr::new(SPEC_ENV)).expect("spec env"));
     let expected_spec_sha = sha256(&fs::read(spec_path).expect("read spec fixture"));
     let protocol = SmokeProtocol::from_environment(&environment, &fixture.root);
-    complete_actions(&protocol, &[SmokeAction::EditorSave]);
+    let proof = active_session_proof(&protocol);
+    complete_actions(&protocol, &proof, &[SmokeAction::EditorSave]);
     protocol
-        .complete(complete_passed(2))
+        .complete(&proof, complete_passed(2))
         .expect("persist terminal report");
 
     let bytes = fs::read(fixture.report_path()).expect("read smoke report");
@@ -646,14 +691,19 @@ fn smoke_protocol_serializes_concurrent_updates() {
         &fixture.environment("concurrency-token", json!({ "actions": ["editor-save"] })),
         &fixture.root,
     ));
+    let proof = Arc::new(active_session_proof(&protocol));
     let barrier = Arc::new(Barrier::new(9));
     let handles = (0..8)
         .map(|_| {
             let protocol = Arc::clone(&protocol);
+            let proof = Arc::clone(&proof);
             let barrier = Arc::clone(&barrier);
             thread::spawn(move || {
                 barrier.wait();
-                protocol.record_step(step(SmokeAction::EditorSave, SmokeStepState::Started, 0))
+                protocol.record_step(
+                    proof.as_str(),
+                    step(SmokeAction::EditorSave, SmokeStepState::Started, 0),
+                )
             })
         })
         .collect::<Vec<_>>();
@@ -666,10 +716,13 @@ fn smoke_protocol_serializes_concurrent_updates() {
 
     assert_eq!(successes, 1);
     protocol
-        .record_step(step(SmokeAction::EditorSave, SmokeStepState::Passed, 1))
+        .record_step(
+            proof.as_str(),
+            step(SmokeAction::EditorSave, SmokeStepState::Passed, 1),
+        )
         .expect("finish serialized action");
     protocol
-        .complete(complete_passed(2))
+        .complete(proof.as_str(), complete_passed(2))
         .expect("complete serialized report");
 }
 
@@ -722,6 +775,72 @@ fn smoke_commands_require_matching_session_proof_without_state_change() {
             .expect("correct proof records unchanged first transition")
             .status,
         SmokeUpdateStatus::Recorded
+    );
+}
+
+#[test]
+fn smoke_public_mutation_api_requires_proof_and_rejection_preserves_state() {
+    let _: fn(
+        &SmokeProtocol,
+        &str,
+        RecordStepRequest,
+    ) -> Result<SmokeUpdateResponse, ride_tauri::smoke::SmokeError> = SmokeProtocol::record_step;
+    let _: fn(
+        &SmokeProtocol,
+        &str,
+        CompleteRequest,
+    ) -> Result<SmokeUpdateResponse, ride_tauri::smoke::SmokeError> = SmokeProtocol::complete;
+
+    let fixture = Fixture::new();
+    let protocol = SmokeProtocol::from_environment(
+        &fixture.environment("public-proof-token", json!({ "actions": ["editor-save"] })),
+        &fixture.root,
+    );
+    let proof = active_session_proof(&protocol);
+    let started = step(SmokeAction::EditorSave, SmokeStepState::Started, 0);
+
+    let error = protocol
+        .record_step_command(json!({ "request": started.clone() }))
+        .expect_err("raw public mutation rejects missing proof");
+    assert_static_rejection(&error, &proof);
+
+    let error = protocol
+        .record_step("missing-or-mismatched-proof", started)
+        .expect_err("public mutation rejects mismatched proof");
+    assert_static_rejection(&error, &proof);
+
+    assert_eq!(
+        protocol
+            .record_step(
+                &proof,
+                step(SmokeAction::EditorSave, SmokeStepState::Started, 0),
+            )
+            .expect("rejected mutation did not advance state")
+            .status,
+        SmokeUpdateStatus::Recorded
+    );
+    protocol
+        .record_step(
+            &proof,
+            step(SmokeAction::EditorSave, SmokeStepState::Passed, 1),
+        )
+        .expect("finish authenticated action");
+
+    let completion = complete_passed(2);
+    let error = protocol
+        .complete_command(json!({ "request": completion.clone() }))
+        .expect_err("raw public completion rejects missing proof");
+    assert_static_rejection(&error, &proof);
+    let error = protocol
+        .complete("missing-or-mismatched-proof", completion.clone())
+        .expect_err("typed public completion rejects mismatched proof");
+    assert_static_rejection(&error, &proof);
+    assert_eq!(
+        protocol
+            .complete(&proof, completion)
+            .expect("rejected completions did not make state terminal")
+            .status,
+        SmokeUpdateStatus::Completed
     );
 }
 
@@ -1000,9 +1119,10 @@ fn smoke_atomic_publish_replaces_an_existing_valid_report() {
         &fixture.environment("replacement-token", json!({ "actions": [] })),
         &fixture.root,
     );
+    let proof = active_session_proof(&protocol);
 
     protocol
-        .complete(complete_passed(0))
+        .complete(&proof, complete_passed(0))
         .expect("replace existing report");
     let new: Value =
         serde_json::from_slice(&fs::read(fixture.report_path()).expect("read replacement report"))
@@ -1026,6 +1146,7 @@ fn smoke_atomic_publish_is_old_or_new_json_for_concurrent_readers() {
         &fixture.environment("reader-token", json!({ "actions": [] })),
         &fixture.root,
     );
+    let proof = active_session_proof(&protocol);
     let report_path = fixture.report_path();
     let running = Arc::new(AtomicBool::new(true));
     let observations = Arc::new(Mutex::new(Vec::<Value>::new()));
@@ -1045,7 +1166,7 @@ fn smoke_atomic_publish_is_old_or_new_json_for_concurrent_readers() {
 
     thread::sleep(Duration::from_millis(10));
     protocol
-        .complete(complete_passed(0))
+        .complete(&proof, complete_passed(0))
         .expect("publish while reader is active");
     let new: Value =
         serde_json::from_slice(&fs::read(fixture.report_path()).expect("read new report"))
@@ -1218,31 +1339,44 @@ fn terminal_report_fixture(kind: &str) -> Value {
         ),
         &fixture.root,
     );
-    let plan = protocol.plan().plan.expect("terminal fixture plan");
+    let plan_response = protocol.plan();
+    let proof = plan_response
+        .session_proof
+        .expect("terminal fixture session proof");
+    let plan = plan_response.plan.expect("terminal fixture plan");
     match kind {
         "passed" => protocol
-            .complete(complete_passed(0))
+            .complete(&proof, complete_passed(0))
             .expect("complete passed fixture"),
         "action" => {
             protocol
-                .record_step(step(SmokeAction::EditorSave, SmokeStepState::Started, 0))
+                .record_step(
+                    &proof,
+                    step(SmokeAction::EditorSave, SmokeStepState::Started, 0),
+                )
                 .expect("start failed action fixture");
             let failure = diagnostic("action-failed", "Smoke action failed.");
             protocol
-                .record_step(RecordStepRequest {
-                    action: SmokeAction::EditorSave,
-                    state: SmokeStepState::Failed,
-                    duration_ms: 1,
-                    diagnostic: Some(failure.clone()),
-                })
+                .record_step(
+                    &proof,
+                    RecordStepRequest {
+                        action: SmokeAction::EditorSave,
+                        state: SmokeStepState::Failed,
+                        duration_ms: 1,
+                        diagnostic: Some(failure.clone()),
+                    },
+                )
                 .expect("fail action fixture");
             protocol
-                .complete(CompleteRequest {
-                    status: SmokeTerminalStatus::Failed,
-                    failure_phase: Some(FailurePhase::Action),
-                    duration_ms: 1,
-                    diagnostic: Some(failure),
-                })
+                .complete(
+                    &proof,
+                    CompleteRequest {
+                        status: SmokeTerminalStatus::Failed,
+                        failure_phase: Some(FailurePhase::Action),
+                        duration_ms: 1,
+                        diagnostic: Some(failure),
+                    },
+                )
                 .expect("complete action failure fixture")
         }
         "startup" | "sidecar" | "protocol" | "cleanup" => {
@@ -1270,12 +1404,15 @@ fn terminal_report_fixture(kind: &str) -> Value {
                 _ => unreachable!("closed terminal fixture kind"),
             };
             protocol
-                .complete(CompleteRequest {
-                    status: SmokeTerminalStatus::Failed,
-                    failure_phase: Some(phase),
-                    duration_ms: 0,
-                    diagnostic: Some(diagnostic(code, message)),
-                })
+                .complete(
+                    &proof,
+                    CompleteRequest {
+                        status: SmokeTerminalStatus::Failed,
+                        failure_phase: Some(phase),
+                        duration_ms: 0,
+                        diagnostic: Some(diagnostic(code, message)),
+                    },
+                )
                 .expect("complete terminal failure fixture")
         }
         _ => unreachable!("closed terminal fixture kind"),

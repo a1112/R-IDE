@@ -412,40 +412,29 @@ impl SmokeProtocol {
         &self,
         value: serde_json::Value,
     ) -> Result<SmokeUpdateResponse, SmokeError> {
-        let mut state = self.state.lock().map_err(|_| SmokeError::rejected())?;
-        let active = match &mut *state {
-            ProtocolState::Disabled => return Ok(disabled_update()),
-            ProtocolState::Rejected => return Ok(rejected_update()),
-            ProtocolState::Active(active) => active,
-        };
+        if let Some(response) = self.non_active_update()? {
+            return Ok(response);
+        }
         let envelope = serde_json::from_value::<SmokeCommandEnvelope<RecordStepRequest>>(value)
             .map_err(|_| SmokeError::rejected())?;
-        if !constant_time_proof_matches(&active.session_proof, &envelope.session_proof) {
-            return Err(SmokeError::rejected());
-        }
-        record_step_active(active, envelope.request)
+        self.record_step(&envelope.session_proof, envelope.request)
     }
 
     pub fn complete_command(
         &self,
         value: serde_json::Value,
     ) -> Result<SmokeUpdateResponse, SmokeError> {
-        let mut state = self.state.lock().map_err(|_| SmokeError::rejected())?;
-        let active = match &mut *state {
-            ProtocolState::Disabled => return Ok(disabled_update()),
-            ProtocolState::Rejected => return Ok(rejected_update()),
-            ProtocolState::Active(active) => active,
-        };
+        if let Some(response) = self.non_active_update()? {
+            return Ok(response);
+        }
         let envelope = serde_json::from_value::<SmokeCommandEnvelope<CompleteRequest>>(value)
             .map_err(|_| SmokeError::rejected())?;
-        if !constant_time_proof_matches(&active.session_proof, &envelope.session_proof) {
-            return Err(SmokeError::rejected());
-        }
-        complete_active(active, envelope.request)
+        self.complete(&envelope.session_proof, envelope.request)
     }
 
     pub fn record_step(
         &self,
+        session_proof: &str,
         request: RecordStepRequest,
     ) -> Result<SmokeUpdateResponse, SmokeError> {
         let mut state = self.state.lock().map_err(|_| SmokeError::rejected())?;
@@ -454,17 +443,36 @@ impl SmokeProtocol {
             ProtocolState::Rejected => return Ok(rejected_update()),
             ProtocolState::Active(active) => active,
         };
+        if !constant_time_proof_matches(&active.session_proof, session_proof) {
+            return Err(SmokeError::rejected());
+        }
         record_step_active(active, request)
     }
 
-    pub fn complete(&self, request: CompleteRequest) -> Result<SmokeUpdateResponse, SmokeError> {
+    pub fn complete(
+        &self,
+        session_proof: &str,
+        request: CompleteRequest,
+    ) -> Result<SmokeUpdateResponse, SmokeError> {
         let mut state = self.state.lock().map_err(|_| SmokeError::rejected())?;
         let active = match &mut *state {
             ProtocolState::Disabled => return Ok(disabled_update()),
             ProtocolState::Rejected => return Ok(rejected_update()),
             ProtocolState::Active(active) => active,
         };
+        if !constant_time_proof_matches(&active.session_proof, session_proof) {
+            return Err(SmokeError::rejected());
+        }
         complete_active(active, request)
+    }
+
+    fn non_active_update(&self) -> Result<Option<SmokeUpdateResponse>, SmokeError> {
+        let state = self.state.lock().map_err(|_| SmokeError::rejected())?;
+        Ok(match &*state {
+            ProtocolState::Disabled => Some(disabled_update()),
+            ProtocolState::Rejected => Some(rejected_update()),
+            ProtocolState::Active(_) => None,
+        })
     }
 }
 
@@ -1836,14 +1844,21 @@ mod tests {
             &fixture.root,
             Arc::new(FailingReplacer),
         );
+        let proof = protocol
+            .plan()
+            .session_proof
+            .expect("active smoke session proof");
 
         let error = protocol
-            .complete(CompleteRequest {
-                status: SmokeTerminalStatus::Passed,
-                failure_phase: None,
-                duration_ms: 0,
-                diagnostic: None,
-            })
+            .complete(
+                &proof,
+                CompleteRequest {
+                    status: SmokeTerminalStatus::Passed,
+                    failure_phase: None,
+                    duration_ms: 0,
+                    diagnostic: None,
+                },
+            )
             .expect_err("injected replacement failure is static");
 
         assert_eq!(error, SmokeError::rejected());
