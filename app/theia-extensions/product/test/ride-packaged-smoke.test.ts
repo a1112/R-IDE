@@ -12,7 +12,9 @@ import {
     RidePackagedSmokeContribution,
     RidePackagedSmokeProtocol,
     RideSmokeAction,
+    RideSmokeCompleteRequest,
     RideSmokePlan,
+    RideSmokeStepRequest,
     RideTauriPackagedSmokeProtocol
 } from '../src/browser/ride-packaged-smoke';
 
@@ -62,6 +64,20 @@ function deferredValue<T>(): { promise: Promise<T>; resolve: (value: T) => void 
     return { promise, resolve };
 }
 
+function deferredOutcome<T>(): {
+    promise: Promise<T>;
+    resolve: (value: T) => void;
+    reject: (error: unknown) => void;
+} {
+    let resolve!: (value: T) => void;
+    let reject!: (error: unknown) => void;
+    const promise = new Promise<T>((done, fail) => {
+        resolve = done;
+        reject = fail;
+    });
+    return { promise, resolve, reject };
+}
+
 async function waitUntil(predicate: () => boolean, message: string): Promise<void> {
     for (let attempt = 0; attempt < 40; attempt++) {
         if (predicate()) {
@@ -104,6 +120,92 @@ class FakeProtocol implements RidePackagedSmokeProtocol {
     async complete(sessionProof: string, request: unknown): Promise<unknown> {
         this.calls.push({ method: 'complete', proof: sessionProof, request });
         return this.update('complete', request);
+    }
+}
+
+class ReplayAwareProtocol implements RidePackagedSmokeProtocol {
+    readonly calls: ProtocolCall[] = [];
+    readonly transitions: RideSmokeStepRequest[] = [];
+    completion: RideSmokeCompleteRequest | undefined;
+    protected lastTransition: RideSmokeStepRequest | undefined;
+    protected pending: RideSmokeAction | undefined;
+    protected nextAction = 0;
+    protected actionFailed = false;
+
+    constructor(
+        protected readonly plannedActions: RideSmokeAction[],
+        protected readonly dropFirstResponses: Set<'started' | 'passed' | 'failed' | 'complete'>
+    ) { }
+
+    isTauri(): boolean {
+        return true;
+    }
+
+    async plan(): Promise<unknown> {
+        this.calls.push({ method: 'plan' });
+        return activePlan(this.plannedActions);
+    }
+
+    async recordStep(sessionProof: string, request: RideSmokeStepRequest): Promise<unknown> {
+        this.calls.push({ method: 'recordStep', proof: sessionProof, request });
+        if (!this.sameRequest(this.lastTransition, request)) {
+            this.applyTransition(request);
+            this.lastTransition = request;
+            this.transitions.push(request);
+            if (this.dropFirstResponses.delete(request.state)) {
+                throw new Error('response lost after transition commit');
+            }
+        }
+        return { status: 'recorded', diagnostic: null };
+    }
+
+    async complete(sessionProof: string, request: RideSmokeCompleteRequest): Promise<unknown> {
+        this.calls.push({ method: 'complete', proof: sessionProof, request });
+        if (this.completion !== undefined) {
+            if (!this.sameRequest(this.completion, request)) {
+                throw new Error('different request after terminal');
+            }
+            return { status: 'completed', diagnostic: null };
+        }
+        if (this.pending !== undefined
+            || (request.status === 'passed' && (this.actionFailed || this.nextAction !== this.plannedActions.length))
+            || (request.status === 'failed' && !this.actionFailed)) {
+            throw new Error('illegal terminal request');
+        }
+        this.completion = request;
+        if (this.dropFirstResponses.delete('complete')) {
+            throw new Error('response lost after completion commit');
+        }
+        return { status: 'completed', diagnostic: null };
+    }
+
+    protected applyTransition(request: RideSmokeStepRequest): void {
+        if (this.completion !== undefined) {
+            throw new Error('transition after terminal');
+        }
+        if (request.state === 'started') {
+            if (this.pending !== undefined || this.plannedActions[this.nextAction] !== request.action) {
+                throw new Error('illegal started transition');
+            }
+            this.pending = request.action;
+            return;
+        }
+        if (this.pending !== request.action) {
+            throw new Error('illegal terminal transition');
+        }
+        this.pending = undefined;
+        if (request.state === 'passed') {
+            this.nextAction++;
+        } else {
+            this.actionFailed = true;
+        }
+    }
+
+    protected sameRequest(
+        first: RideSmokeStepRequest | RideSmokeCompleteRequest | undefined,
+        second: RideSmokeStepRequest | RideSmokeCompleteRequest
+    ): boolean {
+        return first !== undefined && JSON.stringify(first) === JSON.stringify(second);
     }
 }
 
@@ -334,6 +436,56 @@ test('packaged smoke reports a bounded timeout and does not await the stuck acti
     assert.doesNotMatch(serialized, /status":"passed/);
 });
 
+test('packaged smoke contains timer setup and cleanup failures and consumes late action rejection', async () => {
+    for (const timerFailure of ['set', 'clear', 'late-reject'] as const) {
+        const protocol = new FakeProtocol(true, activePlan(['editor-save']));
+        const operation = deferredOutcome<void>();
+        const unhandled: unknown[] = [];
+        const onUnhandled = (error: unknown) => unhandled.push(error);
+        process.on('unhandledRejection', onUnhandled);
+        try {
+            const contribution = new RidePackagedSmokeContribution(
+                immediateState(), protocol, () => actions([], { editorSave: () => operation.promise }),
+                {
+                    now: (() => { let now = 0; return () => now++; })(),
+                    setTimeout: callback => {
+                        if (timerFailure === 'set') {
+                            throw new Error('timer setup failed with private details');
+                        }
+                        if (timerFailure === 'late-reject') {
+                            queueMicrotask(callback);
+                        } else {
+                            queueMicrotask(() => operation.resolve());
+                        }
+                        return callback;
+                    },
+                    clearTimeout: () => {
+                        if (timerFailure === 'clear') {
+                            throw new Error('timer cleanup failed with private details');
+                        }
+                    }
+                }
+            );
+
+            contribution.onStart();
+            await waitUntil(() => protocol.calls.some(call => call.method === 'complete'),
+                `${timerFailure} did not settle the smoke sequence`);
+            if (timerFailure !== 'clear') {
+                operation.reject(new Error('late action rejection with private details'));
+            }
+            await new Promise<void>(resolve => setImmediate(resolve));
+
+            assert.deepEqual(unhandled, []);
+            const completion = protocol.calls.find(call => call.method === 'complete')
+                ?.request as RideSmokeCompleteRequest;
+            assert.equal(completion.status, 'failed');
+            assert.equal(completion.failurePhase, 'action');
+        } finally {
+            process.off('unhandledRejection', onUnhandled);
+        }
+    }
+});
+
 test('packaged smoke safely contains malformed, rejected, and failed IPC responses', async () => {
     const malformed = new FakeProtocol(true, {
         mode: 'active',
@@ -363,14 +515,14 @@ test('packaged smoke safely contains malformed, rejected, and failed IPC respons
     new RidePackagedSmokeContribution(immediateState(), rejectedUpdate, () => actions([], {
         editorSave: async () => { rejectedActionCalls++; }
     }), { now: () => 0 }).onStart();
-    await waitUntil(() => rejectedUpdate.calls.some(call => call.method === 'recordStep'), 'step was not attempted');
+    await waitUntil(() => rejectedUpdate.calls.filter(call => call.method === 'recordStep').length === 2,
+        'step was not retried once');
     await new Promise<void>(resolve => setImmediate(resolve));
     assert.equal(rejectedActionCalls, 0);
-    assert.equal(rejectedUpdate.calls.filter(call => call.method === 'recordStep').length, 1);
-    assert.deepEqual(rejectedUpdate.calls.filter(call => call.method === 'complete').map(call => call.request), [{
-        status: 'failed', failurePhase: 'protocol', durationMs: 0,
-        diagnostic: { code: 'protocol-failed', message: 'Smoke protocol failed.' }
-    }]);
+    const rejectedRecords = rejectedUpdate.calls.filter(call => call.method === 'recordStep');
+    assert.equal(rejectedRecords.length, 2);
+    assert.strictEqual(rejectedRecords[0].request, rejectedRecords[1].request);
+    assert.equal(rejectedUpdate.calls.some(call => call.method === 'complete'), false);
 
     const failedPlan = new FakeProtocol(true, new Error('IPC failure with secret path C:\\private'));
     new RidePackagedSmokeContribution(immediateState(), failedPlan, () => actions([])).onStart();
@@ -379,115 +531,103 @@ test('packaged smoke safely contains malformed, rejected, and failed IPC respons
     assert.deepEqual(failedPlan.calls, [{ method: 'plan' }]);
 });
 
-test('packaged smoke started IPC failure attempts one protocol completion without replay', async () => {
+test('packaged smoke retries response-loss mutations with the identical request and reaches a legal passed terminal', async () => {
     const actionCalls: string[] = [];
-    const protocol = new FakeProtocol(true, activePlan(['editor-save']), (method, request) => {
-        if (method === 'recordStep') {
-            throw new Error('ambiguous started mutation with C:\\private\\secret');
-        }
-        return { status: 'completed', diagnostic: null };
-    });
-    const contribution = new RidePackagedSmokeContribution(
-        immediateState(), protocol, () => actions(actionCalls), { now: () => 0 }
+    const protocol = new ReplayAwareProtocol(
+        ['editor-save'], new Set(['started', 'passed', 'complete'])
     );
-
-    contribution.onStart();
-    await waitUntil(() => protocol.calls.some(call => call.method === 'complete'), 'started failure compensation was not attempted');
-
-    assert.deepEqual(actionCalls, []);
-    assert.deepEqual(protocol.calls.filter(call => call.method !== 'plan'), [
-        {
-            method: 'recordStep', proof: PROOF, request: {
-                action: 'editor-save', state: 'started', durationMs: 0, diagnostic: null
-            }
-        },
-        {
-            method: 'complete', proof: PROOF, request: {
-                status: 'failed', failurePhase: 'protocol', durationMs: 0,
-                diagnostic: { code: 'protocol-failed', message: 'Smoke protocol failed.' }
-            }
-        }
-    ]);
-});
-
-test('packaged smoke passed IPC failure attempts failed transition and action completion once', async () => {
-    const actionCalls: string[] = [];
-    const protocol = new FakeProtocol(true, activePlan(['editor-save']), (method, request) => {
-        if (method === 'recordStep' && (request as { state?: string }).state === 'passed') {
-            return { status: 'rejected', diagnostic: { code: 'protocol-failed', message: 'Smoke protocol failed.' } };
-        }
-        return { status: method === 'complete' ? 'completed' : 'recorded', diagnostic: null };
-    });
     const contribution = new RidePackagedSmokeContribution(
         immediateState(), protocol, () => actions(actionCalls),
         { now: (() => { let now = 0; return () => now++; })() }
     );
 
     contribution.onStart();
-    await waitUntil(() => protocol.calls.some(call => call.method === 'complete'), 'passed failure compensation was not attempted');
+    await waitUntil(() => protocol.completion !== undefined, 'response-loss sequence did not reach terminal');
 
     assert.deepEqual(actionCalls, ['editor-save']);
-    assert.deepEqual(protocol.calls.filter(call => call.method !== 'plan').map(call => [
-        call.method,
-        (call.request as { state?: string; status?: string }).state ?? (call.request as { status?: string }).status
-    ]), [
-        ['recordStep', 'started'],
-        ['recordStep', 'passed'],
-        ['recordStep', 'failed'],
-        ['complete', 'failed']
-    ]);
-    assert.equal(protocol.calls.filter(call =>
-        call.method === 'recordStep' && (call.request as { state?: string }).state === 'passed'
-    ).length, 1);
-    assert.equal(protocol.calls.some(call =>
-        call.method === 'complete' && (call.request as { status?: string }).status === 'passed'
-    ), false);
+    assert.deepEqual(protocol.transitions.map(transition => transition.state), ['started', 'passed']);
+    assert.equal(protocol.completion?.status, 'passed');
+    for (const state of ['started', 'passed'] as const) {
+        const attempts = protocol.calls.filter(call => call.method === 'recordStep'
+            && (call.request as RideSmokeStepRequest).state === state);
+        assert.equal(attempts.length, 2);
+        assert.strictEqual(attempts[0].request, attempts[1].request);
+    }
+    const completions = protocol.calls.filter(call => call.method === 'complete');
+    assert.equal(completions.length, 2);
+    assert.strictEqual(completions[0].request, completions[1].request);
 });
 
-test('packaged smoke failed transition IPC failure cannot suppress one action completion attempt', async () => {
-    const protocol = new FakeProtocol(true, activePlan(['editor-save']), (method, request) => {
-        if (method === 'recordStep' && (request as { state?: string }).state === 'failed') {
-            throw new Error('failed transition was ambiguous');
-        }
-        return { status: method === 'complete' ? 'completed' : 'recorded', diagnostic: null };
-    });
+test('packaged smoke retries failed transition and failed completion response loss without duplicate state', async () => {
+    let actionCalls = 0;
+    const protocol = new ReplayAwareProtocol(['editor-save'], new Set(['failed', 'complete']));
     const contribution = new RidePackagedSmokeContribution(
-        immediateState(),
-        protocol,
-        () => actions([], { editorSave: async () => { throw new Error('unsafe action details'); } }),
+        immediateState(), protocol, () => actions([], {
+            editorSave: async () => {
+                actionCalls++;
+                throw new Error('bounded action failure');
+            }
+        }),
         { now: (() => { let now = 0; return () => now++; })() }
     );
 
     contribution.onStart();
-    await waitUntil(() => protocol.calls.some(call => call.method === 'complete'), 'action completion was suppressed');
+    await waitUntil(() => protocol.completion !== undefined, 'failed response-loss sequence did not reach terminal');
 
-    assert.deepEqual(protocol.calls.filter(call => call.method !== 'plan').map(call => [
-        call.method,
-        (call.request as { state?: string; status?: string }).state ?? (call.request as { status?: string }).status
-    ]), [
-        ['recordStep', 'started'],
-        ['recordStep', 'failed'],
-        ['complete', 'failed']
-    ]);
+    assert.equal(actionCalls, 1);
+    assert.deepEqual(protocol.transitions.map(transition => transition.state), ['started', 'failed']);
+    assert.equal(protocol.completion?.status, 'failed');
+    const failures = protocol.calls.filter(call => call.method === 'recordStep'
+        && (call.request as RideSmokeStepRequest).state === 'failed');
+    assert.equal(failures.length, 2);
+    assert.strictEqual(failures[0].request, failures[1].request);
+    const completions = protocol.calls.filter(call => call.method === 'complete');
+    assert.equal(completions.length, 2);
+    assert.strictEqual(completions[0].request, completions[1].request);
 });
 
-test('packaged smoke terminal completion failure is consumed without retry', async () => {
-    for (const terminalFailure of ['throw', 'malformed'] as const) {
-        const protocol = new FakeProtocol(true, activePlan([]), method => {
-            assert.equal(method, 'complete');
-            if (terminalFailure === 'throw') {
-                throw new Error('terminal result unknown with secret');
-            }
-            return { status: 'completed' };
-        });
-        const contribution = new RidePackagedSmokeContribution(immediateState(), protocol, () => actions([]));
+test('packaged smoke stops after two identical failed mutation attempts without compensating or rejecting', async () => {
+    for (const failedMutation of ['started', 'passed', 'failed', 'complete'] as const) {
+        const actionCalls: string[] = [];
+        const protocol = new FakeProtocol(true, activePlan(failedMutation === 'complete' ? [] : ['editor-save']),
+            (method, request) => {
+                const state = (request as RideSmokeStepRequest).state;
+                if ((method === 'recordStep' && state === failedMutation) || method === failedMutation) {
+                    throw new Error('ambiguous mutation with private details');
+                }
+                return { status: method === 'complete' ? 'completed' : 'recorded', diagnostic: null };
+            });
+        const unhandled: unknown[] = [];
+        const onUnhandled = (error: unknown) => unhandled.push(error);
+        process.on('unhandledRejection', onUnhandled);
+        try {
+            new RidePackagedSmokeContribution(
+                immediateState(), protocol, () => actions(actionCalls, {
+                    editorSave: failedMutation === 'failed'
+                        ? async () => { throw new Error('action failure'); }
+                        : async () => { actionCalls.push('editor-save'); }
+                }), { now: () => 0 }
+            ).onStart();
+            await waitUntil(() => protocol.calls.filter(call => {
+                if (failedMutation === 'complete') {
+                    return call.method === 'complete';
+                }
+                return call.method === 'recordStep'
+                    && (call.request as RideSmokeStepRequest).state === failedMutation;
+            }).length === 2, `${failedMutation} was not attempted exactly twice`);
+            await new Promise<void>(resolve => setImmediate(resolve));
 
-        contribution.onStart();
-        await waitUntil(() => protocol.calls.some(call => call.method === 'complete'), `${terminalFailure} completion was not attempted`);
-        await new Promise<void>(resolve => setImmediate(resolve));
-
-        assert.equal(protocol.calls.filter(call => call.method === 'complete').length, 1);
-        assert.equal(protocol.calls.filter(call => call.method === 'recordStep').length, 0);
+            const failedCalls = protocol.calls.filter(call => failedMutation === 'complete'
+                ? call.method === 'complete'
+                : call.method === 'recordStep' && (call.request as RideSmokeStepRequest).state === failedMutation);
+            assert.equal(failedCalls.length, 2);
+            assert.strictEqual(failedCalls[0].request, failedCalls[1].request);
+            const failedIndex = protocol.calls.indexOf(failedCalls[0]);
+            assert.equal(protocol.calls.slice(failedIndex + 2).length, 0);
+            assert.deepEqual(unhandled, []);
+        } finally {
+            process.off('unhandledRejection', onUnhandled);
+        }
     }
 });
 
@@ -576,6 +716,68 @@ test('packaged smoke rejects non-canonical or non-portable workspace and file pa
     }
 });
 
+test('packaged smoke rejects sparse file arrays before resolving actions', async () => {
+    const sparseFiles = Array<string>(1);
+    const deletedFiles = ['first.txt', 'second.txt'];
+    delete deletedFiles[0];
+    for (const files of [sparseFiles, deletedFiles]) {
+        const response = activePlan([]) as Record<string, unknown>;
+        response.plan = { ...smokePlan([]), files };
+        const protocol = new FakeProtocol(true, response);
+        let actionResolutions = 0;
+        new RidePackagedSmokeContribution(immediateState(), protocol, () => {
+            actionResolutions++;
+            return actions([]);
+        }, { now: () => 0 }).onStart();
+        await waitUntil(() => protocol.calls.some(call => call.method === 'complete'),
+            'sparse files were not rejected');
+
+        assert.equal(actionResolutions, 0);
+        assert.equal((protocol.calls.find(call => call.method === 'complete')
+            ?.request as RideSmokeCompleteRequest).failurePhase, 'protocol');
+    }
+});
+
+test('packaged smoke deeply freezes the plan so actions cannot alter remaining sequencing', async () => {
+    const protocol = new FakeProtocol(true, activePlan(['editor-save', 'terminal-sentinel']));
+    const actionCalls: string[] = [];
+    const mutationResults: string[] = [];
+    new RidePackagedSmokeContribution(immediateState(), protocol, () => actions(actionCalls, {
+        editorSave: async plan => {
+            actionCalls.push('editor-save');
+            assert.equal(Object.isFrozen(plan), true);
+            assert.equal(Object.isFrozen(plan.files), true);
+            assert.equal(Object.isFrozen(plan.actions), true);
+            for (const mutate of [
+                () => (plan.actions as RideSmokeAction[]).splice(1, 1),
+                () => { (plan.files as string[])[0] = 'mutated.txt'; },
+                () => { (plan as { workspace: string }).workspace = 'mutated'; }
+            ]) {
+                try {
+                    mutate();
+                    mutationResults.push('ignored');
+                } catch (error) {
+                    assert.equal(error instanceof TypeError, true);
+                    mutationResults.push('threw');
+                }
+            }
+        }
+    }), { now: () => 0 }).onStart();
+    await waitUntil(() => protocol.calls.some(call => call.method === 'complete'), 'frozen plan did not complete');
+
+    assert.deepEqual(actionCalls, ['editor-save', 'terminal-sentinel']);
+    assert.equal(mutationResults.length, 3);
+    assert.deepEqual(protocol.calls.filter(call => call.method === 'recordStep')
+        .map(call => [(call.request as RideSmokeStepRequest).action, (call.request as RideSmokeStepRequest).state]), [
+        ['editor-save', 'started'],
+        ['editor-save', 'passed'],
+        ['terminal-sentinel', 'started'],
+        ['terminal-sentinel', 'passed']
+    ]);
+    assert.equal((protocol.calls.find(call => call.method === 'complete')
+        ?.request as RideSmokeCompleteRequest).status, 'passed');
+});
+
 test('packaged smoke path control-character boundary matches the canonical contract', async () => {
     const boundaries = [
         { codePoint: 0x001F, accepted: false },
@@ -644,11 +846,14 @@ test('packaged smoke rejects loosely shaped recorded updates instead of treating
         new RidePackagedSmokeContribution(
             immediateState(), protocol, () => actions(actionCalls), { now: () => 0 }
         ).onStart();
-        await waitUntil(() => protocol.calls.some(call => call.method === 'complete'), 'invalid recorded update was not compensated');
+        await waitUntil(() => protocol.calls.filter(call => call.method === 'recordStep').length === 2,
+            'invalid recorded update was not retried once');
 
         assert.deepEqual(actionCalls, []);
-        assert.equal(protocol.calls.filter(call => call.method === 'recordStep').length, 1);
-        assert.equal((protocol.calls.find(call => call.method === 'complete')?.request as { failurePhase?: string }).failurePhase, 'protocol');
+        const records = protocol.calls.filter(call => call.method === 'recordStep');
+        assert.equal(records.length, 2);
+        assert.strictEqual(records[0].request, records[1].request);
+        assert.equal(protocol.calls.some(call => call.method === 'complete'), false);
     }
 });
 

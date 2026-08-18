@@ -489,7 +489,7 @@ fn smoke_protocol_disabled_and_rejected_updates_are_safe_noops() {
 }
 
 #[test]
-fn smoke_protocol_rejects_duplicate_out_of_order_and_non_monotonic_steps() {
+fn smoke_protocol_replays_identical_steps_but_rejects_different_out_of_order_requests() {
     let fixture = Fixture::new();
     let protocol = SmokeProtocol::from_environment(
         &fixture.environment(
@@ -512,10 +512,22 @@ fn smoke_protocol_rejects_duplicate_out_of_order_and_non_monotonic_steps() {
             step(SmokeAction::EditorSave, SmokeStepState::Started, 2),
         )
         .expect("start first action");
+    assert_eq!(
+        protocol
+            .record_step(
+                &proof,
+                step(SmokeAction::EditorSave, SmokeStepState::Started, 2)
+            )
+            .expect("identical started response replay"),
+        SmokeUpdateResponse {
+            status: SmokeUpdateStatus::Recorded,
+            diagnostic: None,
+        }
+    );
     assert!(protocol
         .record_step(
             &proof,
-            step(SmokeAction::EditorSave, SmokeStepState::Started, 2)
+            step(SmokeAction::EditorSave, SmokeStepState::Started, 3)
         )
         .is_err());
     assert!(protocol
@@ -530,6 +542,131 @@ fn smoke_protocol_rejects_duplicate_out_of_order_and_non_monotonic_steps() {
             step(SmokeAction::EditorSave, SmokeStepState::Passed, 3),
         )
         .expect("pass first action");
+    protocol
+        .record_step(
+            &proof,
+            step(SmokeAction::EditorSave, SmokeStepState::Passed, 3),
+        )
+        .expect("identical passed response replay");
+}
+
+#[test]
+fn smoke_protocol_replays_identical_started_passed_and_complete_without_report_side_effects() {
+    let fixture = Fixture::new();
+    let protocol = SmokeProtocol::from_environment(
+        &fixture.environment(
+            "replay-success-token",
+            json!({ "actions": ["editor-save"] }),
+        ),
+        &fixture.root,
+    );
+    let proof = active_session_proof(&protocol);
+    let started = step(SmokeAction::EditorSave, SmokeStepState::Started, 0);
+    let passed = step(SmokeAction::EditorSave, SmokeStepState::Passed, 1);
+    let completion = complete_passed(2);
+
+    for request in [started.clone(), started] {
+        assert_eq!(
+            protocol
+                .record_step(&proof, request)
+                .expect("started request or response-loss replay"),
+            SmokeUpdateResponse {
+                status: SmokeUpdateStatus::Recorded,
+                diagnostic: None,
+            }
+        );
+    }
+    for request in [passed.clone(), passed] {
+        assert_eq!(
+            protocol
+                .record_step(&proof, request)
+                .expect("passed request or response-loss replay"),
+            SmokeUpdateResponse {
+                status: SmokeUpdateStatus::Recorded,
+                diagnostic: None,
+            }
+        );
+    }
+
+    let first_response = protocol
+        .complete(&proof, completion.clone())
+        .expect("first completion");
+    let first_report = fs::read(fixture.report_path()).expect("read first report");
+    let replayed_response = protocol
+        .complete(&proof, completion)
+        .expect("identical completion response replay");
+    let replayed_report = fs::read(fixture.report_path()).expect("read replayed report");
+
+    assert_eq!(replayed_response, first_response);
+    assert_eq!(replayed_report, first_report);
+    assert_eq!(temporary_report_count(&fixture.root), 0);
+    let report: Value = serde_json::from_slice(&replayed_report).expect("parse replayed report");
+    assert_eq!(report["steps"].as_array().expect("report steps").len(), 2);
+    assert!(protocol.complete(&proof, complete_passed(3)).is_err());
+    assert!(protocol
+        .record_step(
+            &proof,
+            step(SmokeAction::EditorSave, SmokeStepState::Passed, 1)
+        )
+        .is_err());
+}
+
+#[test]
+fn smoke_protocol_replays_identical_failed_step_without_duplicate_failure_state() {
+    let fixture = Fixture::new();
+    let protocol = SmokeProtocol::from_environment(
+        &fixture.environment(
+            "replay-failure-token",
+            json!({ "actions": ["editor-save"] }),
+        ),
+        &fixture.root,
+    );
+    let proof = active_session_proof(&protocol);
+    protocol
+        .record_step(
+            &proof,
+            step(SmokeAction::EditorSave, SmokeStepState::Started, 0),
+        )
+        .expect("start failed action");
+    let failure = diagnostic("action-failed", "Smoke action failed.");
+    let failed = RecordStepRequest {
+        action: SmokeAction::EditorSave,
+        state: SmokeStepState::Failed,
+        duration_ms: 1,
+        diagnostic: Some(failure.clone()),
+    };
+
+    for request in [failed.clone(), failed] {
+        assert_eq!(
+            protocol
+                .record_step(&proof, request)
+                .expect("failed request or response-loss replay")
+                .status,
+            SmokeUpdateStatus::Recorded
+        );
+    }
+    protocol
+        .complete(
+            &proof,
+            CompleteRequest {
+                status: SmokeTerminalStatus::Failed,
+                failure_phase: Some(FailurePhase::Action),
+                duration_ms: 2,
+                diagnostic: Some(failure),
+            },
+        )
+        .expect("complete replayed action failure");
+
+    let report: Value =
+        serde_json::from_slice(&fs::read(fixture.report_path()).expect("read failed report"))
+            .expect("parse failed report");
+    assert_eq!(
+        report["steps"]
+            .as_array()
+            .expect("failed report steps")
+            .len(),
+        2
+    );
 }
 
 #[test]
@@ -611,24 +748,25 @@ fn smoke_protocol_enforces_closed_diagnostics_and_action_failure_semantics() {
         )
         .is_err());
     assert!(protocol.complete(&proof, complete_passed(2)).is_err());
+    let completion = CompleteRequest {
+        status: SmokeTerminalStatus::Failed,
+        failure_phase: Some(FailurePhase::Action),
+        duration_ms: 2,
+        diagnostic: Some(failure),
+    };
     protocol
-        .complete(
-            &proof,
-            CompleteRequest {
-                status: SmokeTerminalStatus::Failed,
-                failure_phase: Some(FailurePhase::Action),
-                duration_ms: 2,
-                diagnostic: Some(failure),
-            },
-        )
+        .complete(&proof, completion.clone())
         .expect("complete action failure");
+    protocol
+        .complete(&proof, completion)
+        .expect("replay identical action completion");
     assert!(protocol
         .complete(
             &proof,
             CompleteRequest {
                 status: SmokeTerminalStatus::Failed,
                 failure_phase: Some(FailurePhase::Action),
-                duration_ms: 2,
+                duration_ms: 3,
                 diagnostic: Some(diagnostic("action-timeout", "Smoke action timed out.")),
             }
         )
@@ -756,16 +894,62 @@ fn smoke_protocol_serializes_concurrent_updates() {
         .filter(Result::is_ok)
         .count();
 
-    assert_eq!(successes, 1);
-    protocol
-        .record_step(
-            proof.as_str(),
-            step(SmokeAction::EditorSave, SmokeStepState::Passed, 1),
-        )
-        .expect("finish serialized action");
-    protocol
-        .complete(proof.as_str(), complete_passed(2))
-        .expect("complete serialized report");
+    assert_eq!(successes, 8);
+    let barrier = Arc::new(Barrier::new(9));
+    let handles = (0..8)
+        .map(|_| {
+            let protocol = Arc::clone(&protocol);
+            let proof = Arc::clone(&proof);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                protocol.record_step(
+                    proof.as_str(),
+                    step(SmokeAction::EditorSave, SmokeStepState::Passed, 1),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    barrier.wait();
+    assert_eq!(
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("join concurrent passed update"))
+            .filter(Result::is_ok)
+            .count(),
+        8
+    );
+
+    let barrier = Arc::new(Barrier::new(9));
+    let handles = (0..8)
+        .map(|_| {
+            let protocol = Arc::clone(&protocol);
+            let proof = Arc::clone(&proof);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                protocol.complete(proof.as_str(), complete_passed(2))
+            })
+        })
+        .collect::<Vec<_>>();
+    barrier.wait();
+    let responses = handles
+        .into_iter()
+        .map(|handle| {
+            handle
+                .join()
+                .expect("join concurrent completion")
+                .expect("identical concurrent completion")
+        })
+        .collect::<Vec<_>>();
+    assert!(responses.windows(2).all(|pair| pair[0] == pair[1]));
+    let report: Value =
+        serde_json::from_slice(&fs::read(fixture.report_path()).expect("read concurrent report"))
+            .expect("parse concurrent report");
+    assert_eq!(
+        report["steps"].as_array().expect("concurrent steps").len(),
+        2
+    );
 }
 
 #[test]

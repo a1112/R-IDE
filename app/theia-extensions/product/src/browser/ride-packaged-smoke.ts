@@ -244,7 +244,6 @@ export class RidePackagedSmokeContribution implements FrontendApplicationContrib
                     diagnostic: JSON_NULL
                 });
             } catch {
-                await this.completeProtocolFailure(session.sessionProof, elapsed);
                 return;
             }
 
@@ -267,7 +266,6 @@ export class RidePackagedSmokeContribution implements FrontendApplicationContrib
                     diagnostic: JSON_NULL
                 });
             } catch {
-                await this.reportActionFailure(session.sessionProof, action, ACTION_FAILED, elapsed);
                 return;
             }
         }
@@ -310,7 +308,7 @@ export class RidePackagedSmokeContribution implements FrontendApplicationContrib
                 diagnostic
             });
         } catch {
-            // A mutation may have reached the server. Never replay it.
+            return;
         }
         try {
             await this.complete(sessionProof, {
@@ -320,7 +318,7 @@ export class RidePackagedSmokeContribution implements FrontendApplicationContrib
                 diagnostic
             });
         } catch {
-            // Completion is also a single best-effort mutation.
+            // The external runner owns the terminal timeout after bounded retries fail.
         }
     }
 
@@ -338,17 +336,31 @@ export class RidePackagedSmokeContribution implements FrontendApplicationContrib
     }
 
     protected async record(sessionProof: string, request: RideSmokeStepRequest): Promise<void> {
-        const response = await this.protocol.recordStep(sessionProof, request);
-        if (!isUpdateResponse(response, 'recorded')) {
-            throw new SmokeProtocolFailure();
+        for (let attempt = 0; attempt < 2; attempt++) {
+            try {
+                const response = await this.protocol.recordStep(sessionProof, request);
+                if (isUpdateResponse(response, 'recorded')) {
+                    return;
+                }
+            } catch {
+                // Rust replays the exact last committed mutation without applying it twice.
+            }
         }
+        throw new SmokeProtocolFailure();
     }
 
     protected async complete(sessionProof: string, request: RideSmokeCompleteRequest): Promise<void> {
-        const response = await this.protocol.complete(sessionProof, request);
-        if (!isUpdateResponse(response, 'completed')) {
-            throw new SmokeProtocolFailure();
+        for (let attempt = 0; attempt < 2; attempt++) {
+            try {
+                const response = await this.protocol.complete(sessionProof, request);
+                if (isUpdateResponse(response, 'completed')) {
+                    return;
+                }
+            } catch {
+                // Rust caches the exact committed completion response for one bounded replay.
+            }
         }
+        throw new SmokeProtocolFailure();
     }
 
     protected createElapsedClock(): () => number {
@@ -371,28 +383,46 @@ export class RidePackagedSmokeContribution implements FrontendApplicationContrib
     protected withTimeout(operation: Promise<void>, timeoutMs: number): Promise<void> {
         return new Promise<void>((resolve, reject) => {
             let settled = false;
-            const handle = this.scheduleTimeout(() => {
+            let timerCreated = false;
+            let handle: unknown;
+            const settleFromOperation = (failed: boolean, error?: unknown): void => {
                 if (!settled) {
                     settled = true;
-                    reject(new SmokeActionTimeout());
-                }
-            }, timeoutMs);
-            operation.then(
-                () => {
-                    if (!settled) {
-                        settled = true;
-                        this.cancelTimeout(handle);
+                    let cleanupFailed = false;
+                    if (timerCreated) {
+                        try {
+                            this.cancelTimeout(handle);
+                        } catch {
+                            cleanupFailed = true;
+                        }
+                    }
+                    if (failed) {
+                        reject(error);
+                    } else if (cleanupFailed) {
+                        reject(new SmokeProtocolFailure());
+                    } else {
                         resolve();
                     }
-                },
-                error => {
+                }
+            };
+            operation.then(
+                () => settleFromOperation(false),
+                error => settleFromOperation(true, error)
+            );
+            try {
+                handle = this.scheduleTimeout(() => {
                     if (!settled) {
                         settled = true;
-                        this.cancelTimeout(handle);
-                        reject(error);
+                        reject(new SmokeActionTimeout());
                     }
+                }, timeoutMs);
+                timerCreated = true;
+            } catch {
+                if (!settled) {
+                    settled = true;
+                    reject(new SmokeProtocolFailure());
                 }
-            );
+            }
         });
     }
 }
@@ -440,15 +470,17 @@ function parseActivePlan(value: unknown): RideSmokePlan | undefined {
         || (value.actionTimeoutMs as number) < 1_000 || (value.actionTimeoutMs as number) > 300_000) {
         return undefined;
     }
-    return {
+    const files = Object.freeze([...value.files]);
+    const actions = Object.freeze([...value.actions]);
+    return Object.freeze({
         specSha256: value.specSha256,
         scenario: value.scenario,
         profile: value.profile,
         workspace: value.workspace,
-        files: [...value.files],
-        actions: [...value.actions],
+        files,
+        actions,
         actionTimeoutMs: value.actionTimeoutMs as number
-    };
+    });
 }
 
 function isScenario(value: unknown): value is RideSmokePlan['scenario'] {
@@ -468,8 +500,14 @@ function isCanonicalSha256(value: unknown): value is string {
 }
 
 function isCanonicalFiles(value: unknown): value is string[] {
-    if (!Array.isArray(value) || !value.every(item => isCanonicalPortablePath(item, false))) {
+    if (!Array.isArray(value)) {
         return false;
+    }
+    for (let index = 0; index < value.length; index++) {
+        if (!Object.prototype.hasOwnProperty.call(value, index)
+            || !isCanonicalPortablePath(value[index], false)) {
+            return false;
+        }
     }
     const keys = value.map(windowsOrdinalCaseKey);
     return new Set(keys).size === keys.length;

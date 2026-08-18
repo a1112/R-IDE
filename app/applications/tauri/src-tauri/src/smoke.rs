@@ -287,10 +287,12 @@ struct ActiveProtocol {
     session_proof: String,
     proof_delivered: bool,
     transitions: Vec<SmokeTransition>,
+    last_record_request: Option<RecordStepRequest>,
     next_action: usize,
     pending_action: Option<SmokeAction>,
     action_failure: Option<SmokeDiagnostic>,
     terminal: bool,
+    completion: Option<(CompleteRequest, SmokeUpdateResponse)>,
 }
 
 enum ProtocolState {
@@ -507,7 +509,16 @@ fn record_step_active(
     active: &mut ActiveProtocol,
     request: RecordStepRequest,
 ) -> Result<SmokeUpdateResponse, SmokeError> {
-    if active.terminal || active.action_failure.is_some() {
+    if active.terminal {
+        return Err(SmokeError::rejected());
+    }
+    if active.last_record_request.as_ref() == Some(&request) {
+        return Ok(SmokeUpdateResponse {
+            status: SmokeUpdateStatus::Recorded,
+            diagnostic: None,
+        });
+    }
+    if active.action_failure.is_some() {
         return Err(SmokeError::rejected());
     }
     let last_duration = active
@@ -550,6 +561,7 @@ fn record_step_active(
         }
     }
 
+    active.last_record_request = Some(request.clone());
     active.transitions.push(SmokeTransition {
         action: request.action,
         state: request.state,
@@ -566,6 +578,13 @@ fn complete_active(
     active: &mut ActiveProtocol,
     request: CompleteRequest,
 ) -> Result<SmokeUpdateResponse, SmokeError> {
+    if let Some((completed_request, response)) = active.completion.as_ref() {
+        return if completed_request == &request {
+            Ok(response.clone())
+        } else {
+            Err(SmokeError::rejected())
+        };
+    }
     if active.terminal || active.pending_action.is_some() {
         return Err(SmokeError::rejected());
     }
@@ -587,13 +606,12 @@ fn complete_active(
         status: request.status,
         failure_phase: request.failure_phase,
         duration_ms: request.duration_ms,
-        diagnostic: request.diagnostic,
+        diagnostic: request.diagnostic.clone(),
         steps: active.transitions.clone(),
     };
     let publish = write_report_atomically(&active.report_target, &report, active.replacer.as_ref())
         .map_err(|_| SmokeError::rejected())?;
-    active.terminal = true;
-    Ok(SmokeUpdateResponse {
+    let response = SmokeUpdateResponse {
         status: SmokeUpdateStatus::Completed,
         diagnostic: match publish {
             PublishOutcome::Durable => None,
@@ -601,7 +619,10 @@ fn complete_active(
                 Some(SmokeDiagnostic::report_durability_warning())
             }
         },
-    })
+    };
+    active.terminal = true;
+    active.completion = Some((request, response.clone()));
+    Ok(response)
 }
 
 fn constant_time_proof_matches(expected: &str, actual: &str) -> bool {
@@ -867,10 +888,12 @@ fn build_active_protocol(
         session_proof: new_session_proof(),
         proof_delivered: false,
         transitions: Vec::new(),
+        last_record_request: None,
         next_action: 0,
         pending_action: None,
         action_failure: None,
         terminal: false,
+        completion: None,
     })
 }
 
@@ -2004,7 +2027,7 @@ mod tests {
     }
 
     #[test]
-    fn smoke_post_commit_sync_failure_is_terminal_and_does_not_invite_retry() {
+    fn smoke_post_commit_sync_failure_replays_cached_warning_without_rewrite() {
         let fixture = TestFixture::new();
         let protocol = SmokeProtocol::from_environment_with_replacer(
             &fixture.environment("post-commit-sync-token"),
@@ -2042,6 +2065,7 @@ mod tests {
         .expect("visible report is valid JSON");
         assert_eq!(report["status"], "passed");
         assert_eq!(temporary_report_count(&fixture.root), 0);
+        let bytes = fs::read(fixture.report_path()).expect("read committed report bytes");
         assert_eq!(
             protocol
                 .complete(
@@ -2053,9 +2077,14 @@ mod tests {
                         diagnostic: None,
                     },
                 )
-                .expect_err("committed protocol is terminal"),
-            SmokeError::rejected()
+                .expect("identical completion replays committed warning"),
+            response
         );
+        assert_eq!(
+            fs::read(fixture.report_path()).expect("read report after replay"),
+            bytes
+        );
+        assert_eq!(temporary_report_count(&fixture.root), 0);
     }
 
     #[test]
