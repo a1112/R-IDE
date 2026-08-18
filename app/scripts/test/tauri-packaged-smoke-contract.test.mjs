@@ -72,6 +72,14 @@ const REPORT_CONTEXT = Object.freeze({
   scenario: 'critical-file',
   profile: 'tauri-critical',
 });
+const SAFE_DIAGNOSTIC_MESSAGES = Object.freeze([
+  'Startup failed.',
+  'Action failed.',
+  'Action timed out.',
+  'Sidecar startup failed.',
+  'Cleanup failed.',
+  'Protocol validation failed.',
+]);
 
 test('exports immutable canonical schemas, scenarios, and ordered actions', () => {
   assert.deepEqual(SMOKE_SCHEMAS, {
@@ -255,10 +263,10 @@ test('requires exact report, transition, diagnostic, and context keys', () => {
   assert.throws(
     () => validateSmokeReport(smokeReport({
       status: 'failed',
-      diagnostic: { code: 'action-failed', message: 'Action failed', environment: {} },
+      diagnostic: { code: 'action-failed', message: 'Action failed.', environment: {} },
       steps: [
         transition('editor-save', 'started', 0),
-        transition('editor-save', 'failed', 10, { code: 'action-failed', message: 'Action failed' }),
+        transition('editor-save', 'failed', 10, { code: 'action-failed', message: 'Action failed.' }),
       ],
       durationMs: 10,
     }), REPORT_CONTEXT),
@@ -321,7 +329,7 @@ test('requires each action to transition from started to exactly one terminal st
 });
 
 test('stops at the first failed transition and matches the single report completion status', () => {
-  const failure = { code: 'terminal-timeout', message: 'Terminal action timed out' };
+  const failure = { code: 'terminal-timeout', message: 'Action timed out.' };
   const failed = smokeReport({
     status: 'failed',
     durationMs: 40,
@@ -379,7 +387,7 @@ test('requires safe monotonic transition and completion durations', () => {
 });
 
 test('requires bounded canonical diagnostics only for failures', () => {
-  const baseFailure = { code: 'action-failed', message: 'Action failed safely' };
+  const baseFailure = { code: 'action-failed', message: 'Action failed.' };
   const failedReport = (diagnostic, stepDiagnostic = diagnostic) => smokeReport({
     status: 'failed',
     durationMs: 10,
@@ -404,8 +412,8 @@ test('requires bounded canonical diagnostics only for failures', () => {
   );
 
   const invalidDiagnostics = [
-    { code: 'UPPER_CASE', message: 'Action failed' },
-    { code: `a${'-b'.repeat(32)}`, message: 'Action failed' },
+    { code: 'UPPER_CASE', message: 'Action failed.' },
+    { code: `a${'-b'.repeat(32)}`, message: 'Action failed.' },
     { code: 'action-failed', message: '' },
     { code: 'action-failed', message: 'x'.repeat(257) },
     { code: 'action-failed', message: 'Line one\nLine two' },
@@ -449,6 +457,11 @@ test('rejects host paths, environment data, and command lines in diagnostic mess
     'npm test',
     'whoami',
     'tool.exe argument',
+    'Terminal whoami',
+    'Editor Rscript secret',
+    'Application npm test',
+    'Backend TOKEN secret-value',
+    'Process API-KEY secret-value',
   ];
   for (const message of unsafeMessages) {
     const diagnostic = { code: 'unsafe-diagnostic', message };
@@ -462,20 +475,13 @@ test('rejects host paths, environment data, and command lines in diagnostic mess
           transition('editor-save', 'failed', 10, diagnostic),
         ],
       }), REPORT_CONTEXT),
-      /diagnostic message.*host paths, environment data, or command lines/i,
+      /diagnostic message.*catalog/i,
     );
   }
 });
 
-test('accepts canonical bounded human-readable diagnostic messages', () => {
-  const safeMessages = [
-    'Terminal action timed out',
-    'Plugin command was not registered',
-    'R-IDE workspace search returned no matching result',
-    'Editor save failed: resource was unavailable',
-    'Cleanup failed, owned process remained.',
-  ];
-  for (const message of safeMessages) {
+test('accepts every exact generic diagnostic catalog message', () => {
+  for (const message of SAFE_DIAGNOSTIC_MESSAGES) {
     const diagnostic = { code: 'safe-diagnostic', message };
     const report = validateSmokeReport(smokeReport({
       status: 'failed',
@@ -487,5 +493,35 @@ test('accepts canonical bounded human-readable diagnostic messages', () => {
       ],
     }), REPORT_CONTEXT);
     assert.equal(report.diagnostic.message, message);
+  }
+});
+
+test('rejects details and non-exact variants of every diagnostic catalog message', () => {
+  for (const message of SAFE_DIAGNOSTIC_MESSAGES) {
+    const variants = [
+      `Unexpected ${message}`,
+      `${message} secret details`,
+      message.toLowerCase(),
+      message.slice(0, -1),
+      `${message.slice(0, -1)}!`,
+      message.replace(' ', '\u00a0'),
+      ` ${message}`,
+      `${message} `,
+    ];
+    for (const variant of variants) {
+      const diagnostic = { code: 'unsafe-diagnostic', message: variant };
+      assert.throws(
+        () => validateSmokeReport(smokeReport({
+          status: 'failed',
+          durationMs: 10,
+          diagnostic,
+          steps: [
+            transition('editor-save', 'started', 0),
+            transition('editor-save', 'failed', 10, diagnostic),
+          ],
+        }), REPORT_CONTEXT),
+        /diagnostic message/i,
+      );
+    }
   }
 });

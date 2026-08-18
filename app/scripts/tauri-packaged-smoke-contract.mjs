@@ -62,38 +62,13 @@ const TRANSITION_STATES = Object.freeze(['started', 'passed', 'failed']);
 const MAX_DIAGNOSTIC_CODE_LENGTH = 64;
 const MAX_DIAGNOSTIC_MESSAGE_LENGTH = 256;
 const DIAGNOSTIC_CODE_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
-const DIAGNOSTIC_WORD = String.raw`[\p{L}\p{N}]+(?:-[\p{L}\p{N}]+)*`;
-const DIAGNOSTIC_CLAUSE = String.raw`${DIAGNOSTIC_WORD}(?: ${DIAGNOSTIC_WORD})*`;
-const CANONICAL_DIAGNOSTIC_MESSAGE_PATTERN = new RegExp(
-  String.raw`^${DIAGNOSTIC_CLAUSE}(?:(?:,|:) ${DIAGNOSTIC_CLAUSE})*[.!?]?$`,
-  'u',
-);
-const DIAGNOSTIC_SUBJECT_PATTERN = new RegExp(String.raw`^${DIAGNOSTIC_WORD}`, 'u');
-const SAFE_DIAGNOSTIC_SUBJECTS = Object.freeze([
-  'Action',
-  'Application',
-  'Backend',
-  'Cleanup',
-  'Editor',
-  'Expected',
-  'File',
-  'Forwarding',
-  'Invalid',
-  'Missing',
-  'Plugin',
-  'Process',
-  'Report',
-  'R-IDE',
-  'SCM',
-  'Search',
-  'Secondary',
-  'Smoke',
-  'Startup',
-  'Terminal',
-  'Unable',
-  'Unsupported',
-  'Validation',
-  'Workspace',
+const DIAGNOSTIC_MESSAGE_CATALOG = Object.freeze([
+  'Startup failed.',
+  'Action failed.',
+  'Action timed out.',
+  'Sidecar startup failed.',
+  'Cleanup failed.',
+  'Protocol validation failed.',
 ]);
 
 function fail(message) {
@@ -214,14 +189,6 @@ function nonNegativeSafeInteger(value, label) {
   return value;
 }
 
-function isCanonicalDiagnosticMessage(value) {
-  if (!CANONICAL_DIAGNOSTIC_MESSAGE_PATTERN.test(value)) {
-    return false;
-  }
-  const subject = DIAGNOSTIC_SUBJECT_PATTERN.exec(value)?.[0];
-  return SAFE_DIAGNOSTIC_SUBJECTS.includes(subject);
-}
-
 function validateDiagnostic(value, label) {
   exactKeys(value, DIAGNOSTIC_KEYS, label);
   if (typeof value.code !== 'string'
@@ -236,8 +203,8 @@ function validateDiagnostic(value, label) {
     || /[\u0000-\u001f\u007f]/.test(value.message)) {
     fail(`${label} message must be a bounded single-line string of at most ${MAX_DIAGNOSTIC_MESSAGE_LENGTH} characters`);
   }
-  if (!isCanonicalDiagnosticMessage(value.message)) {
-    fail(`${label} message must not contain host paths, environment data, or command lines`);
+  if (!DIAGNOSTIC_MESSAGE_CATALOG.includes(value.message)) {
+    fail(`${label} message must be an exact diagnostic catalog entry`);
   }
   return { code: value.code, message: value.message };
 }
