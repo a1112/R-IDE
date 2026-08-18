@@ -266,7 +266,7 @@ fn publish_backend_listening(app_handle: &AppHandle, pid: u32, port: u16) -> boo
         return false;
     }
     let mut published_port = state.backend_port.lock().unwrap();
-    record_startup_milestone(app_handle, StartupMilestone::BackendListening);
+    record_backend_listening_before_window(app_handle);
     *published_port = Some(port);
     drop(published_port);
     drop(ownership);
@@ -1454,20 +1454,21 @@ pub async fn start_backend_process(
     .await
 }
 
-fn record_startup_milestone(app_handle: &AppHandle, milestone: StartupMilestone) {
-    if let Some(state) = app_handle.try_state::<crate::AppState>() {
-        state.startup_metrics.record_or_warn(milestone);
-    } else {
-        log::warn!(
-            "Cannot record startup milestone {milestone:?}: application state is unavailable"
-        );
-    }
-}
-
 fn record_backend_spawned_before_window(app_handle: &AppHandle) {
     if let Some(state) = app_handle.try_state::<crate::AppState>() {
         if let Err(error) = state.startup_metrics.record_backend_spawned_before_window() {
             log::warn!("Failed to record overlapped backend spawn: {error}");
+        }
+    }
+}
+
+fn record_backend_listening_before_window(app_handle: &AppHandle) {
+    if let Some(state) = app_handle.try_state::<crate::AppState>() {
+        if let Err(error) = state
+            .startup_metrics
+            .record_backend_listening_before_window()
+        {
+            log::warn!("Failed to record overlapped backend readiness: {error}");
         }
     }
 }

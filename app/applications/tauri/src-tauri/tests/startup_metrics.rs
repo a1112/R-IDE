@@ -330,6 +330,41 @@ fn overlapped_backend_spawn_is_published_in_canonical_order_after_window_visibil
 }
 
 #[test]
+fn overlapped_backend_readiness_waits_for_window_visibility_without_losing_v1_order() {
+    let output = unique_report_path("overlapped-listening");
+    let metrics = StartupMetrics::with_clock(
+        Some(output.clone()),
+        "test-platform",
+        "test-arch",
+        78,
+        Arc::new(SequenceClock::new(vec![0, 100, 200, 700])),
+    );
+
+    metrics
+        .record(StartupMilestone::ProcessStarted)
+        .expect("publish process start");
+    metrics
+        .record_backend_spawned_before_window()
+        .expect("hold overlapped backend spawn");
+    metrics
+        .record_backend_listening_before_window()
+        .expect("hold overlapped backend readiness");
+    let before_window = wait_for_report_milestone(&output, "process_started");
+    assert_eq!(before_window["milestones"].get("backend_spawned"), None);
+    assert_eq!(before_window["milestones"].get("backend_listening"), None);
+
+    metrics
+        .record(StartupMilestone::NativeWindowVisible)
+        .expect("publish all held backend phases");
+    let visible = wait_for_report_milestone(&output, "backend_listening");
+    assert_eq!(visible["milestones"]["native_window_visible"], 700);
+    assert_eq!(visible["milestones"]["backend_spawned"], 700);
+    assert_eq!(visible["milestones"]["backend_listening"], 700);
+
+    fs::remove_file(output).expect("remove report");
+}
+
+#[test]
 fn blocked_writer_does_not_block_recording_and_preserves_snapshot_order() {
     let (started_tx, started_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();

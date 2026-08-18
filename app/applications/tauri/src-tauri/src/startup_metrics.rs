@@ -244,6 +244,7 @@ struct StartupRecorderState {
     report: StartupReport,
     clock: Arc<dyn ElapsedClock>,
     backend_spawned_before_window: bool,
+    backend_listening_before_window: bool,
 }
 
 #[derive(Debug)]
@@ -316,6 +317,7 @@ impl StartupMetrics {
                     report: StartupReport::new(platform, arch, pid),
                     clock,
                     backend_spawned_before_window: false,
+                    backend_listening_before_window: false,
                 }),
                 snapshots,
             })),
@@ -337,10 +339,22 @@ impl StartupMetrics {
                 if milestone == StartupMilestone::NativeWindowVisible
                     && state.backend_spawned_before_window
                 {
+                    // Report v1 is a canonical phase sequence rather than an
+                    // unordered event trace. Parallel backend phases are
+                    // published at the first instant their complete prefix is
+                    // observable, without delaying the actual backend work.
                     state
                         .report
                         .record(StartupMilestone::BackendSpawned, elapsed_ms)?;
                     state.backend_spawned_before_window = false;
+                }
+                if milestone == StartupMilestone::NativeWindowVisible
+                    && state.backend_listening_before_window
+                {
+                    state
+                        .report
+                        .record(StartupMilestone::BackendListening, elapsed_ms)?;
+                    state.backend_listening_before_window = false;
                 }
                 // The unbounded send cannot wait for disk I/O. Keeping it in this
                 // critical section preserves mutation order for concurrent callers.
@@ -392,6 +406,47 @@ impl StartupMetrics {
             return Ok(outcome);
         }
         state.backend_spawned_before_window = true;
+        Ok(RecordOutcome::Recorded)
+    }
+
+    pub fn record_backend_listening_before_window(
+        &self,
+    ) -> Result<RecordOutcome, StartupMetricError> {
+        let Some(recorder) = &self.recorder else {
+            return Ok(RecordOutcome::Disabled);
+        };
+        let mut state = recorder
+            .state
+            .lock()
+            .map_err(|_| StartupMetricError::RecorderPoisoned)?;
+        let elapsed_ms = state.clock.elapsed_ms();
+        if state
+            .report
+            .milestones
+            .get(StartupMilestone::BackendListening)
+            .is_some()
+            || state.backend_listening_before_window
+        {
+            return Ok(RecordOutcome::Duplicate);
+        }
+        if state
+            .report
+            .milestones
+            .get(StartupMilestone::NativeWindowVisible)
+            .is_some()
+        {
+            let outcome = state
+                .report
+                .record(StartupMilestone::BackendListening, elapsed_ms)?;
+            if outcome == RecordOutcome::Recorded {
+                recorder
+                    .snapshots
+                    .send(state.report.clone())
+                    .map_err(|error| StartupMetricError::Write(error.to_string()))?;
+            }
+            return Ok(outcome);
+        }
+        state.backend_listening_before_window = true;
         Ok(RecordOutcome::Recorded)
     }
 
