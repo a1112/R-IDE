@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 const SPEC_ENV: &str = "RIDE_TAURI_SMOKE_SPEC";
 const REPORT_ENV: &str = "RIDE_TAURI_SMOKE_REPORT";
 const TOKEN_ENV: &str = "RIDE_TAURI_SMOKE_TOKEN";
+pub(crate) const SMOKE_ENV_NAMES: [&str; 3] = [SPEC_ENV, REPORT_ENV, TOKEN_ENV];
 const SPEC_SCHEMA: &str = "ride.tauri-packaged-smoke-spec";
 const REPORT_SCHEMA: &str = "ride.tauri-packaged-smoke";
 const PROTOCOL_VERSION: u32 = 1;
@@ -132,6 +133,13 @@ pub struct SmokeDiagnostic {
 impl SmokeDiagnostic {
     fn protocol_failed() -> Self {
         Self::catalog("protocol-failed").expect("protocol diagnostic is in the catalog")
+    }
+
+    fn report_durability_warning() -> Self {
+        Self {
+            code: "report-durability-warning".to_string(),
+            message: "Smoke report was committed but durability sync failed.".to_string(),
+        }
     }
 
     fn catalog(code: &str) -> Option<Self> {
@@ -314,8 +322,23 @@ impl fmt::Debug for SmokeProtocol {
 
 impl SmokeProtocol {
     pub fn from_process_environment() -> Self {
-        let environment = std::env::vars_os().collect::<BTreeMap<_, _>>();
-        match std::env::current_dir() {
+        Self::from_process_sources(|name| std::env::var_os(name), std::env::current_dir)
+    }
+
+    fn from_process_sources(
+        mut environment_value: impl FnMut(&str) -> Option<OsString>,
+        current_dir: impl FnOnce() -> io::Result<PathBuf>,
+    ) -> Self {
+        let values = SMOKE_ENV_NAMES.map(&mut environment_value);
+        if values.iter().all(Option::is_none) {
+            return Self::disabled();
+        }
+        let environment = SMOKE_ENV_NAMES
+            .into_iter()
+            .zip(values)
+            .filter_map(|(name, value)| value.map(|value| (OsString::from(name), value)))
+            .collect::<BTreeMap<_, _>>();
+        match current_dir() {
             Ok(cwd) => Self::from_environment(&environment, &cwd),
             Err(_) => Self::rejected(),
         }
@@ -343,9 +366,7 @@ impl SmokeProtocol {
             [SPEC_ENV, REPORT_ENV, TOKEN_ENV].map(|name| environment.get(OsStr::new(name)));
         let present = values.iter().filter(|value| value.is_some()).count();
         if present == 0 {
-            return Self {
-                state: Mutex::new(ProtocolState::Disabled),
-            };
+            return Self::disabled();
         }
         if present != values.len() {
             return Self::rejected();
@@ -368,6 +389,12 @@ impl SmokeProtocol {
     fn rejected() -> Self {
         Self {
             state: Mutex::new(ProtocolState::Rejected),
+        }
+    }
+
+    fn disabled() -> Self {
+        Self {
+            state: Mutex::new(ProtocolState::Disabled),
         }
     }
 
@@ -563,12 +590,17 @@ fn complete_active(
         diagnostic: request.diagnostic,
         steps: active.transitions.clone(),
     };
-    write_report_atomically(&active.report_target, &report, active.replacer.as_ref())
+    let publish = write_report_atomically(&active.report_target, &report, active.replacer.as_ref())
         .map_err(|_| SmokeError::rejected())?;
     active.terminal = true;
     Ok(SmokeUpdateResponse {
         status: SmokeUpdateStatus::Completed,
-        diagnostic: None,
+        diagnostic: match publish {
+            PublishOutcome::Durable => None,
+            PublishOutcome::CommittedWithDurabilityWarning => {
+                Some(SmokeDiagnostic::report_durability_warning())
+            }
+        },
     })
 }
 
@@ -745,6 +777,14 @@ fn verify_parent_identity(expected: FileIdentity, actual: FileIdentity) -> Resul
     }
 }
 
+fn verify_distinct_file_identity(spec: FileIdentity, report: FileIdentity) -> Result<(), ()> {
+    if spec == report {
+        Err(())
+    } else {
+        Ok(())
+    }
+}
+
 fn read_bounded_handle(
     reader: &mut impl Read,
     declared_size: u64,
@@ -772,8 +812,18 @@ struct TemporaryReport {
     path: PathBuf,
 }
 
+struct OpenedSpec {
+    path: PathBuf,
+    bytes: Vec<u8>,
+    identity: FileIdentity,
+}
+
 trait ReportReplacer: Send + Sync {
     fn replace(&self, temporary: &mut TemporaryReport, target: &ReportTarget) -> io::Result<()>;
+
+    fn sync_parent(&self, target: &ReportTarget) -> io::Result<()> {
+        sync_report_parent(target)
+    }
 }
 
 struct SystemReplacer;
@@ -786,31 +836,31 @@ fn build_active_protocol(
     replacer: Arc<dyn ReportReplacer>,
 ) -> Result<ActiveProtocol, ()> {
     let owned_root = canonical_owned_root(cwd)?;
-    let (spec_path, spec_bytes) = open_spec_and_read(spec_value, &owned_root)?;
-    let report_target = open_report_target(report_value, &owned_root)?;
-    if platform_paths_equal(&spec_path, &report_target.path_key) {
+    let spec = open_spec_and_read(spec_value, &owned_root)?;
+    let report_target = open_report_target(report_value, &owned_root, spec.identity)?;
+    if platform_paths_equal(&spec.path, &report_target.path_key) {
         return Err(());
     }
 
-    let spec: SmokeSpec = serde_json::from_slice(&spec_bytes).map_err(|_| ())?;
-    validate_spec(&spec)?;
+    let parsed_spec: SmokeSpec = serde_json::from_slice(&spec.bytes).map_err(|_| ())?;
+    validate_spec(&parsed_spec)?;
     let token = token_value
         .to_str()
         .filter(|token| !token.is_empty())
         .ok_or(())?;
-    if token.len() > 4_096 || sha256(token.as_bytes()) != spec.token_sha256 {
+    if token.len() > 4_096 || sha256(token.as_bytes()) != parsed_spec.token_sha256 {
         return Err(());
     }
 
     Ok(ActiveProtocol {
         plan: SmokePlan {
-            spec_sha256: sha256(&spec_bytes),
-            scenario: spec.scenario,
-            profile: spec.profile,
-            workspace: normalize_relative_path(&spec.workspace, true)?,
-            files: validate_files(&spec.files)?,
-            actions: validate_actions(&spec.actions)?,
-            action_timeout_ms: spec.action_timeout_ms,
+            spec_sha256: sha256(&spec.bytes),
+            scenario: parsed_spec.scenario,
+            profile: parsed_spec.profile,
+            workspace: normalize_relative_path(&parsed_spec.workspace, true)?,
+            files: validate_files(&parsed_spec.files)?,
+            actions: validate_actions(&parsed_spec.actions)?,
+            action_timeout_ms: parsed_spec.action_timeout_ms,
         },
         report_target,
         replacer,
@@ -855,6 +905,7 @@ struct ReportTarget {
     file_name: OsString,
     path_key: PathBuf,
     parent_identity: FileIdentity,
+    spec_identity: FileIdentity,
 }
 
 #[cfg(windows)]
@@ -864,10 +915,11 @@ struct ReportTarget {
     file_name: OsString,
     path_key: PathBuf,
     parent_identity: FileIdentity,
+    spec_identity: FileIdentity,
 }
 
 #[cfg(unix)]
-fn open_spec_and_read(value: &OsString, owned_root: &Path) -> Result<(PathBuf, Vec<u8>), ()> {
+fn open_spec_and_read(value: &OsString, owned_root: &Path) -> Result<OpenedSpec, ()> {
     use std::os::fd::AsRawFd;
 
     let path = PathBuf::from(value);
@@ -883,12 +935,21 @@ fn open_spec_and_read(value: &OsString, owned_root: &Path) -> Result<(PathBuf, V
     .map_err(|_| ())?;
     let facts = unix_file_facts(&file).map_err(|_| ())?;
     validate_capability_facts(CapabilityRole::Spec, facts)?;
+    let identity = unix_file_identity(&file).map_err(|_| ())?;
     let bytes = read_bounded_handle(&mut file, facts.size, MAX_SPEC_BYTES)?;
-    Ok((path, bytes))
+    Ok(OpenedSpec {
+        path,
+        bytes,
+        identity,
+    })
 }
 
 #[cfg(unix)]
-fn open_report_target(value: &OsString, owned_root: &Path) -> Result<ReportTarget, ()> {
+fn open_report_target(
+    value: &OsString,
+    owned_root: &Path,
+    spec_identity: FileIdentity,
+) -> Result<ReportTarget, ()> {
     let path = PathBuf::from(value);
     let components = relative_components(&path, owned_root)?;
     let (parents, file_name) = components.split_at(components.len().checked_sub(1).ok_or(())?);
@@ -900,6 +961,7 @@ fn open_report_target(value: &OsString, owned_root: &Path) -> Result<ReportTarge
         parent,
         file_name: file_name[0].clone(),
         path_key: path,
+        spec_identity,
     };
     validate_report_destination(&target).map_err(|_| ())?;
     Ok(target)
@@ -1017,7 +1079,7 @@ fn platform_paths_equal(left: &Path, right: &Path) -> bool {
 }
 
 #[cfg(windows)]
-fn open_spec_and_read(value: &OsString, owned_root: &Path) -> Result<(PathBuf, Vec<u8>), ()> {
+fn open_spec_and_read(value: &OsString, owned_root: &Path) -> Result<OpenedSpec, ()> {
     use windows_sys::Win32::Foundation::GENERIC_READ;
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, OPEN_EXISTING,
@@ -1046,12 +1108,21 @@ fn open_spec_and_read(value: &OsString, owned_root: &Path) -> Result<(PathBuf, V
     {
         return Err(());
     }
+    let identity = windows_file_identity(&file).map_err(|_| ())?;
     let bytes = read_bounded_handle(&mut file, facts.size, MAX_SPEC_BYTES)?;
-    Ok((final_path, bytes))
+    Ok(OpenedSpec {
+        path: final_path,
+        bytes,
+        identity,
+    })
 }
 
 #[cfg(windows)]
-fn open_report_target(value: &OsString, owned_root: &Path) -> Result<ReportTarget, ()> {
+fn open_report_target(
+    value: &OsString,
+    owned_root: &Path,
+    spec_identity: FileIdentity,
+) -> Result<ReportTarget, ()> {
     let path = PathBuf::from(value);
     if !path.is_absolute() {
         return Err(());
@@ -1087,6 +1158,7 @@ fn open_report_target(value: &OsString, owned_root: &Path) -> Result<ReportTarge
         parent_path,
         file_name: file_name.to_os_string(),
         path_key,
+        spec_identity,
     };
     validate_report_destination(&target).map_err(|_| ())?;
     Ok(target)
@@ -1480,19 +1552,25 @@ fn diagnostic_message(code: &str) -> Option<&'static str> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PublishOutcome {
+    Durable,
+    CommittedWithDurabilityWarning,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PublishNotCommitted;
+
 fn write_report_atomically(
     target: &ReportTarget,
     report: &SmokeReport,
     replacer: &dyn ReportReplacer,
-) -> io::Result<()> {
-    validate_report_destination(target)?;
-    let mut bytes = serde_json::to_vec_pretty(report).map_err(io::Error::other)?;
+) -> Result<PublishOutcome, PublishNotCommitted> {
+    validate_report_destination(target).map_err(|_| PublishNotCommitted)?;
+    let mut bytes = serde_json::to_vec_pretty(report).map_err(|_| PublishNotCommitted)?;
     bytes.push(b'\n');
     if bytes.len() as u64 > MAX_REPORT_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "smoke report exceeds size limit",
-        ));
+        return Err(PublishNotCommitted);
     }
 
     let temporary_name = OsString::from(format!(
@@ -1500,19 +1578,23 @@ fn write_report_atomically(
         target.file_name.to_string_lossy(),
         uuid::Uuid::new_v4()
     ));
-    let mut temporary = create_temporary_report(target, temporary_name)?;
-    let result = (|| {
+    let mut temporary =
+        create_temporary_report(target, temporary_name).map_err(|_| PublishNotCommitted)?;
+    let before_commit = (|| -> io::Result<()> {
         temporary.file.write_all(&bytes)?;
         temporary.file.flush()?;
         temporary.file.sync_all()?;
-        replacer.replace(&mut temporary, target)?;
-        sync_report_parent(target)?;
-        Ok(())
+        replacer.replace(&mut temporary, target)
     })();
-    if result.is_err() {
+    if before_commit.is_err() {
         cleanup_temporary_report(target, temporary);
+        return Err(PublishNotCommitted);
     }
-    result
+    if replacer.sync_parent(target).is_err() {
+        Ok(PublishOutcome::CommittedWithDurabilityWarning)
+    } else {
+        Ok(PublishOutcome::Durable)
+    }
 }
 
 fn invalid_report_path() -> io::Error {
@@ -1522,40 +1604,23 @@ fn invalid_report_path() -> io::Error {
 #[cfg(unix)]
 fn validate_report_destination(target: &ReportTarget) -> io::Result<()> {
     use std::os::fd::AsRawFd;
-    use std::os::unix::ffi::OsStrExt;
 
     verify_parent_identity(target.parent_identity, unix_file_identity(&target.parent)?)
         .map_err(|_| invalid_report_path())?;
-    let name =
-        std::ffi::CString::new(target.file_name.as_bytes()).map_err(|_| invalid_report_path())?;
-    let mut status = std::mem::MaybeUninit::<libc::stat>::zeroed();
-    let result = unsafe {
-        libc::fstatat(
-            target.parent.as_raw_fd(),
-            name.as_ptr(),
-            status.as_mut_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
-    if result == 0 {
-        let status = unsafe { status.assume_init() };
-        validate_capability_facts(
-            CapabilityRole::ExistingReport,
-            CapabilityFacts {
-                is_file: status.st_mode & libc::S_IFMT == libc::S_IFREG,
-                is_directory: status.st_mode & libc::S_IFMT == libc::S_IFDIR,
-                is_reparse_point: status.st_mode & libc::S_IFMT == libc::S_IFLNK,
-                size: status.st_size.try_into().unwrap_or(u64::MAX),
-            },
-        )
-        .map_err(|_| invalid_report_path())
-    } else {
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ENOENT) {
-            Ok(())
-        } else {
-            Err(error)
+    match unix_open_at(
+        target.parent.as_raw_fd(),
+        &target.file_name,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0,
+    ) {
+        Ok(file) => {
+            validate_capability_facts(CapabilityRole::ExistingReport, unix_file_facts(&file)?)
+                .map_err(|_| invalid_report_path())?;
+            verify_distinct_file_identity(target.spec_identity, unix_file_identity(&file)?)
+                .map_err(|_| invalid_report_path())
         }
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
@@ -1582,6 +1647,8 @@ fn validate_report_destination(target: &ReportTarget) -> io::Result<()> {
     ) {
         Ok(file) => {
             validate_capability_facts(CapabilityRole::ExistingReport, windows_file_facts(&file)?)
+                .map_err(|_| invalid_report_path())?;
+            verify_distinct_file_identity(target.spec_identity, windows_file_identity(&file)?)
                 .map_err(|_| invalid_report_path())
         }
         Err(error)
@@ -1710,12 +1777,41 @@ impl ReportReplacer for SystemReplacer {
 }
 
 #[cfg(windows)]
+fn windows_rename_buffer_layout(name_units: usize) -> io::Result<(usize, u32, u32, usize)> {
+    use windows_sys::Win32::Storage::FileSystem::FILE_RENAME_INFO;
+
+    let name_bytes = name_units
+        .checked_mul(std::mem::size_of::<u16>())
+        .ok_or_else(invalid_report_path)?;
+    let name_bytes_u32 = u32::try_from(name_bytes).map_err(|_| invalid_report_path())?;
+    let total_bytes = std::mem::offset_of!(FILE_RENAME_INFO, FileName)
+        .checked_add(name_bytes)
+        .ok_or_else(invalid_report_path)?;
+    u32::try_from(total_bytes).map_err(|_| invalid_report_path())?;
+    // SetFileInformationByHandle requires the ABI structure size plus FileNameLength even
+    // though the logical flexible-array payload starts at FileName. Keep the two checked sizes
+    // distinct: using the payload size as dwBufferSize can report success while producing a
+    // filename with trailing garbage on Windows filesystems.
+    let api_bytes = std::mem::size_of::<FILE_RENAME_INFO>()
+        .checked_add(name_bytes)
+        .ok_or_else(invalid_report_path)?;
+    let api_bytes_u32 = u32::try_from(api_bytes).map_err(|_| invalid_report_path())?;
+    let unit_bytes = std::mem::size_of::<FILE_RENAME_INFO>();
+    let storage_units = api_bytes
+        .checked_add(unit_bytes - 1)
+        .ok_or_else(invalid_report_path)?
+        / unit_bytes;
+    Ok((total_bytes, name_bytes_u32, api_bytes_u32, storage_units))
+}
+
+#[cfg(windows)]
 fn windows_rename_by_handle(
     file: &fs::File,
     target: &ReportTarget,
     name: &Path,
     relative_to_parent: bool,
 ) -> io::Result<()> {
+    use std::mem::MaybeUninit;
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
@@ -1723,21 +1819,25 @@ fn windows_rename_by_handle(
     };
 
     let name = name.as_os_str().encode_wide().collect::<Vec<_>>();
-    let total_size =
-        std::mem::size_of::<FILE_RENAME_INFO>() + name.len() * std::mem::size_of::<u16>();
-    let mut buffer = vec![0_u8; total_size];
-    let information = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    let (_payload_size, name_bytes, api_size, storage_units) =
+        windows_rename_buffer_layout(name.len())?;
+    let mut storage = Vec::<MaybeUninit<FILE_RENAME_INFO>>::new();
+    storage.resize_with(storage_units, MaybeUninit::zeroed);
+    let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
     unsafe {
-        (*information).Anonymous.ReplaceIfExists = true;
-        (*information).RootDirectory = if relative_to_parent {
+        std::ptr::addr_of_mut!((*information).Anonymous.ReplaceIfExists).write(true);
+        std::ptr::addr_of_mut!((*information).RootDirectory).write(if relative_to_parent {
             target.parent.as_raw_handle()
         } else {
             std::ptr::null_mut()
-        };
-        (*information).FileNameLength = (name.len() * std::mem::size_of::<u16>()) as u32;
+        });
+        std::ptr::addr_of_mut!((*information).FileNameLength).write(name_bytes);
         std::ptr::copy_nonoverlapping(
             name.as_ptr(),
-            std::ptr::addr_of_mut!((*information).FileName).cast::<u16>(),
+            information
+                .cast::<u8>()
+                .add(std::mem::offset_of!(FILE_RENAME_INFO, FileName))
+                .cast::<u16>(),
             name.len(),
         );
     }
@@ -1745,8 +1845,8 @@ fn windows_rename_by_handle(
         SetFileInformationByHandle(
             file.as_raw_handle(),
             FileRenameInfo,
-            buffer.as_ptr().cast(),
-            total_size as u32,
+            storage.as_ptr().cast(),
+            api_size,
         )
     };
     if success == 0 {
@@ -1791,6 +1891,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::io::Cursor;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
     #[test]
@@ -1811,6 +1912,39 @@ mod tests {
 
         assert!(verify_parent_identity(expected, substituted).is_err());
         assert!(verify_parent_identity(expected, expected).is_ok());
+    }
+
+    #[test]
+    fn smoke_spec_and_report_require_distinct_file_identities() {
+        let spec = FileIdentity::for_test(7, 11);
+
+        assert!(verify_distinct_file_identity(spec, spec).is_err());
+        assert!(verify_distinct_file_identity(spec, FileIdentity::for_test(7, 12)).is_ok());
+    }
+
+    #[test]
+    fn smoke_process_environment_disabled_fast_path_does_not_resolve_cwd() {
+        use std::cell::{Cell, RefCell};
+
+        let requested = RefCell::new(Vec::new());
+        let cwd_called = Cell::new(false);
+        let protocol = SmokeProtocol::from_process_sources(
+            |name| {
+                requested.borrow_mut().push(name.to_string());
+                None
+            },
+            || {
+                cwd_called.set(true);
+                Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "injected current directory failure",
+                ))
+            },
+        );
+
+        assert_eq!(protocol.plan().mode, SmokeMode::Disabled);
+        assert_eq!(requested.into_inner(), SMOKE_ENV_NAMES);
+        assert!(!cwd_called.get(), "disabled fast path must not resolve cwd");
     }
 
     #[test]
@@ -1869,6 +2003,102 @@ mod tests {
         assert_eq!(temporary_report_count(&fixture.root), 0);
     }
 
+    #[test]
+    fn smoke_post_commit_sync_failure_is_terminal_and_does_not_invite_retry() {
+        let fixture = TestFixture::new();
+        let protocol = SmokeProtocol::from_environment_with_replacer(
+            &fixture.environment("post-commit-sync-token"),
+            &fixture.root,
+            Arc::new(SyncFailingReplacer),
+        );
+        let proof = protocol
+            .plan()
+            .session_proof
+            .expect("active smoke session proof");
+
+        let response = protocol
+            .complete(
+                &proof,
+                CompleteRequest {
+                    status: SmokeTerminalStatus::Passed,
+                    failure_phase: None,
+                    duration_ms: 0,
+                    diagnostic: None,
+                },
+            )
+            .expect("visible report remains a completed command");
+
+        assert_eq!(response.status, SmokeUpdateStatus::Completed);
+        assert_eq!(
+            response.diagnostic,
+            Some(SmokeDiagnostic {
+                code: "report-durability-warning".to_string(),
+                message: "Smoke report was committed but durability sync failed.".to_string(),
+            })
+        );
+        let report: serde_json::Value = serde_json::from_slice(
+            &fs::read(fixture.report_path()).expect("committed report is visible"),
+        )
+        .expect("visible report is valid JSON");
+        assert_eq!(report["status"], "passed");
+        assert_eq!(temporary_report_count(&fixture.root), 0);
+        assert_eq!(
+            protocol
+                .complete(
+                    &proof,
+                    CompleteRequest {
+                        status: SmokeTerminalStatus::Passed,
+                        failure_phase: None,
+                        duration_ms: 0,
+                        diagnostic: None,
+                    },
+                )
+                .expect_err("committed protocol is terminal"),
+            SmokeError::rejected()
+        );
+    }
+
+    #[test]
+    fn smoke_pre_commit_failure_preserves_report_and_state_for_retry() {
+        let fixture = TestFixture::new();
+        let old = b"{\"generation\":\"old\"}\n";
+        fs::write(fixture.report_path(), old).expect("write old report");
+        let protocol = SmokeProtocol::from_environment_with_replacer(
+            &fixture.environment("pre-commit-retry-token"),
+            &fixture.root,
+            Arc::new(FailOnceReplacer(AtomicBool::new(false))),
+        );
+        let proof = protocol
+            .plan()
+            .session_proof
+            .expect("active smoke session proof");
+        let request = CompleteRequest {
+            status: SmokeTerminalStatus::Passed,
+            failure_phase: None,
+            duration_ms: 0,
+            diagnostic: None,
+        };
+
+        assert_eq!(
+            protocol
+                .complete(&proof, request.clone())
+                .expect_err("first replacement fails before commit"),
+            SmokeError::rejected()
+        );
+        assert_eq!(
+            fs::read(fixture.report_path()).expect("read old report"),
+            old
+        );
+        assert_eq!(temporary_report_count(&fixture.root), 0);
+        assert_eq!(
+            protocol
+                .complete(&proof, request)
+                .expect("pre-commit failure leaves protocol retryable")
+                .status,
+            SmokeUpdateStatus::Completed
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_path_identity_does_not_collapse_unpaired_utf16() {
@@ -1890,6 +2120,29 @@ mod tests {
         assert_ne!(windows_path_key(&first), windows_path_key(&second));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_rename_buffer_layout_is_aligned_and_checked() {
+        use windows_sys::Win32::Storage::FileSystem::FILE_RENAME_INFO;
+
+        let (total_bytes, name_bytes, api_bytes, storage_units) =
+            windows_rename_buffer_layout(3).expect("small rename buffer layout");
+        assert_eq!(name_bytes, 6);
+        assert_eq!(
+            total_bytes,
+            std::mem::offset_of!(FILE_RENAME_INFO, FileName) + name_bytes as usize
+        );
+        assert!(
+            storage_units * std::mem::size_of::<FILE_RENAME_INFO>() >= api_bytes as usize,
+            "aligned storage covers the checked Win32 ABI length"
+        );
+        assert_eq!(
+            api_bytes as usize,
+            std::mem::size_of::<FILE_RENAME_INFO>() + name_bytes as usize
+        );
+        assert!(windows_rename_buffer_layout(usize::MAX).is_err());
+    }
+
     #[derive(Debug)]
     struct FailingReplacer;
 
@@ -1903,6 +2156,40 @@ mod tests {
                 io::ErrorKind::PermissionDenied,
                 "injected static replacement failure",
             ))
+        }
+    }
+
+    #[derive(Debug)]
+    struct SyncFailingReplacer;
+
+    impl ReportReplacer for SyncFailingReplacer {
+        fn replace(
+            &self,
+            temporary: &mut TemporaryReport,
+            target: &ReportTarget,
+        ) -> io::Result<()> {
+            SystemReplacer.replace(temporary, target)
+        }
+
+        fn sync_parent(&self, _target: &ReportTarget) -> io::Result<()> {
+            Err(io::Error::other("injected post-commit sync failure"))
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailOnceReplacer(AtomicBool);
+
+    impl ReportReplacer for FailOnceReplacer {
+        fn replace(
+            &self,
+            temporary: &mut TemporaryReport,
+            target: &ReportTarget,
+        ) -> io::Result<()> {
+            if !self.0.swap(true, Ordering::SeqCst) {
+                Err(io::Error::other("injected pre-commit replacement failure"))
+            } else {
+                SystemReplacer.replace(temporary, target)
+            }
         }
     }
 

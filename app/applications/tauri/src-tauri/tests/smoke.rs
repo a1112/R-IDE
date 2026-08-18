@@ -21,7 +21,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{mpsc, Arc, Barrier, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -247,6 +247,48 @@ fn smoke_protocol_rejects_token_mismatch_and_unsafe_owned_paths() {
     relative_report.insert(OsString::from(REPORT_ENV), OsString::from("report.json"));
     assert_eq!(
         SmokeProtocol::from_environment(&relative_report, &fixture.root)
+            .plan()
+            .mode,
+        SmokeMode::Rejected
+    );
+}
+
+#[test]
+fn smoke_protocol_rejects_report_hard_linked_to_the_spec() {
+    let fixture = Fixture::new();
+    let environment = fixture.environment("hard-link-token", json!({ "actions": [] }));
+    let spec_path = PathBuf::from(
+        environment
+            .get(OsStr::new(SPEC_ENV))
+            .expect("spec environment path"),
+    );
+    fs::hard_link(&spec_path, fixture.report_path())
+        .expect("create deterministic spec/report hard link");
+
+    assert_eq!(
+        SmokeProtocol::from_environment(&environment, &fixture.root)
+            .plan()
+            .mode,
+        SmokeMode::Rejected
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn smoke_protocol_rejects_windows_case_alias_of_the_spec_as_report() {
+    let fixture = Fixture::new();
+    let mut environment = fixture.environment("case-alias-token", json!({ "actions": [] }));
+    let spec_path = PathBuf::from(
+        environment
+            .get(OsStr::new(SPEC_ENV))
+            .expect("spec environment path"),
+    );
+    let alias = spec_path.parent().expect("spec parent").join("SPEC.JSON");
+    fs::metadata(&alias).expect("Windows filesystem resolves the explicit case alias");
+    environment.insert(OsString::from(REPORT_ENV), alias.into_os_string());
+
+    assert_eq!(
+        SmokeProtocol::from_environment(&environment, &fixture.root)
             .plan()
             .mode,
         SmokeMode::Rejected
@@ -1249,6 +1291,91 @@ fn run_node_contract(input: &Value) -> Result<Value, &'static str> {
     run_node_contract_with_program("node", input)
 }
 
+enum CapturedStream {
+    Stdout(Result<Vec<u8>, ()>),
+    Stderr(Result<(), ()>),
+}
+
+fn run_bounded_child(
+    mut command: Command,
+    timeout: Duration,
+    max_stream_bytes: usize,
+) -> Result<Vec<u8>, &'static str> {
+    const STATIC_ERROR: &str = "Node smoke parity runner failed.";
+    let read_limit = max_stream_bytes.checked_add(1).ok_or(STATIC_ERROR)?;
+
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|_| STATIC_ERROR)?;
+    let stdout = child.stdout.take().ok_or(STATIC_ERROR)?;
+    let stderr = child.stderr.take().ok_or(STATIC_ERROR)?;
+    let (stream_tx, stream_rx) = mpsc::channel();
+    let stdout_tx = stream_tx.clone();
+    let stdout_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = stdout
+            .take(read_limit as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|_| ())
+            .and_then(|_| (bytes.len() <= max_stream_bytes).then_some(bytes).ok_or(()));
+        let _ = stdout_tx.send(CapturedStream::Stdout(result));
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = stderr
+            .take(read_limit as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|_| ())
+            .and_then(|_| (bytes.len() <= max_stream_bytes).then_some(()).ok_or(()));
+        let _ = stream_tx.send(CapturedStream::Stderr(result));
+    });
+
+    let deadline = Instant::now() + timeout;
+    let mut status = None;
+    let mut stdout = None;
+    let mut stderr_done = false;
+    let result = 'wait: loop {
+        while let Ok(stream) = stream_rx.try_recv() {
+            match stream {
+                CapturedStream::Stdout(Ok(bytes)) => stdout = Some(bytes),
+                CapturedStream::Stderr(Ok(())) => stderr_done = true,
+                CapturedStream::Stdout(Err(())) | CapturedStream::Stderr(Err(())) => {
+                    break 'wait Err(STATIC_ERROR);
+                }
+            }
+        }
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(current) => status = current,
+                Err(_) => break Err(STATIC_ERROR),
+            }
+        }
+        if let (Some(status), Some(stdout)) = (status.as_ref(), stdout.as_ref()) {
+            if stderr_done {
+                break if status.success() {
+                    Ok(stdout.clone())
+                } else {
+                    Err(STATIC_ERROR)
+                };
+            }
+        }
+        if Instant::now() >= deadline {
+            break Err(STATIC_ERROR);
+        }
+        thread::sleep(Duration::from_millis(5));
+    };
+
+    if result.is_err() && status.is_none() {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    let _ = stdout_reader.join();
+    let _ = stderr_reader.join();
+    result
+}
+
 fn run_node_contract_with_program(program: &str, input: &Value) -> Result<Value, &'static str> {
     const STATIC_ERROR: &str = "Node smoke parity runner failed.";
     const MAX_INPUT_BYTES: usize = 64 * 1024;
@@ -1278,41 +1405,12 @@ process.stdout.write(JSON.stringify(result));
     fs::write(&fixture_path, input).map_err(|_| STATIC_ERROR)?;
     let contract_path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../../scripts/tauri-packaged-smoke-contract.mjs");
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(["--input-type=module", "-e", SCRIPT])
         .arg(&contract_path)
-        .arg(&fixture_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|_| STATIC_ERROR)?;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let status = loop {
-        if let Some(status) = child.try_wait().map_err(|_| STATIC_ERROR)? {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(STATIC_ERROR);
-        }
-        thread::sleep(Duration::from_millis(10));
-    };
-    if !status.success() {
-        return Err(STATIC_ERROR);
-    }
-    let mut output = Vec::new();
-    child
-        .stdout
-        .take()
-        .ok_or(STATIC_ERROR)?
-        .take((MAX_OUTPUT_BYTES + 1) as u64)
-        .read_to_end(&mut output)
-        .map_err(|_| STATIC_ERROR)?;
-    if output.len() > MAX_OUTPUT_BYTES {
-        return Err(STATIC_ERROR);
-    }
+        .arg(&fixture_path);
+    let output = run_bounded_child(command, Duration::from_secs(10), MAX_OUTPUT_BYTES)?;
     serde_json::from_slice(&output).map_err(|_| STATIC_ERROR)
 }
 
@@ -1495,4 +1593,54 @@ fn smoke_node_runner_is_bounded_and_non_echoing() {
     .expect_err("oversized Node fixture is rejected before spawning");
     assert_eq!(oversized_error, "Node smoke parity runner failed.");
     assert!(!oversized_error.contains(secret));
+}
+
+#[test]
+fn smoke_node_runner_accepts_each_stream_at_the_limit() {
+    let mut command = Command::new("node");
+    command.args([
+        "-e",
+        "process.stdout.write('o'.repeat(4096)); process.stderr.write('e'.repeat(4096));",
+    ]);
+
+    let output = run_bounded_child(command, Duration::from_secs(2), 4096)
+        .expect("stdout and stderr at the exact cap are accepted");
+
+    assert_eq!(output, vec![b'o'; 4096]);
+}
+
+#[test]
+fn smoke_node_runner_terminates_on_stdout_or_stderr_overflow_with_static_errors() {
+    for stream in ["stdout", "stderr"] {
+        let secret = format!("private-{stream}-overflow");
+        let script = format!(
+            "process.{stream}.write('{secret}'); process.{stream}.write('x'.repeat(4097)); setTimeout(() => {{}}, 10000);"
+        );
+        let mut command = Command::new("node");
+        command.args(["-e", &script]);
+
+        let started = Instant::now();
+        let error = run_bounded_child(command, Duration::from_secs(5), 4096)
+            .expect_err("stream overflow is rejected");
+
+        assert_eq!(error, "Node smoke parity runner failed.");
+        assert!(!error.contains(&secret));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+}
+
+#[test]
+fn smoke_node_runner_terminates_on_timeout_without_echoing_child_text() {
+    let secret = "private-timeout-stderr";
+    let script = format!("process.stderr.write('{secret}'); setTimeout(() => {{}}, 10000);");
+    let mut command = Command::new("node");
+    command.args(["-e", &script]);
+
+    let started = Instant::now();
+    let error = run_bounded_child(command, Duration::from_millis(100), 4096)
+        .expect_err("parity child timeout is rejected");
+
+    assert_eq!(error, "Node smoke parity runner failed.");
+    assert!(!error.contains(secret));
+    assert!(started.elapsed() < Duration::from_secs(2));
 }

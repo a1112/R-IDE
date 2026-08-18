@@ -31,6 +31,28 @@ const BACKEND_PORT: u16 = 3000;
 const BACKEND_PROBE_INTERVAL: Duration = Duration::from_millis(50);
 const BACKEND_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 
+trait BackendChildEnvironment {
+    fn remove_environment(&mut self, name: &str);
+}
+
+impl BackendChildEnvironment for CommandBuilder {
+    fn remove_environment(&mut self, name: &str) {
+        self.env_remove(name);
+    }
+}
+
+impl BackendChildEnvironment for Command {
+    fn remove_environment(&mut self, name: &str) {
+        self.env_remove(name);
+    }
+}
+
+fn remove_smoke_environment(command: &mut impl BackendChildEnvironment) {
+    for name in crate::smoke::SMOKE_ENV_NAMES {
+        command.remove_environment(name);
+    }
+}
+
 fn resolve_runtime_paths(app_handle: &AppHandle) -> Result<RuntimePaths, String> {
     let state = app_handle.state::<crate::AppState>();
     state
@@ -706,6 +728,7 @@ async fn start_node_backend_process(
         .map_err(|e| format!("Failed to create backend PTY: {}", e))?;
 
     let mut command = CommandBuilder::new(&config.node_exe);
+    remove_smoke_environment(&mut command);
     command.arg(&script_path);
     command.arg("--log-level=info");
     command.arg(format!("--port={BACKEND_PORT}"));
@@ -1145,6 +1168,7 @@ async fn start_backend_direct_process(
     let config_dir = node_runtime_path(&config_dir);
     let frontend_dir = frontend_dir.map(|path| node_runtime_path(&path));
     let mut command = Command::new(&config.node_exe);
+    remove_smoke_environment(&mut command);
     if config.use_node {
         command.arg(&script_path);
     }
@@ -1614,6 +1638,47 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn backend_child_environment_removes_smoke_secrets_and_preserves_unrelated_values() {
+        const UNRELATED_ENV: &str = "RIDE_SIDECAR_TEST_UNRELATED";
+        let mut pty = portable_pty::CommandBuilder::new("backend");
+        let mut direct = tokio::process::Command::new("backend");
+        for name in crate::smoke::SMOKE_ENV_NAMES {
+            pty.env(name, "secret");
+            direct.env(name, "secret");
+        }
+        pty.env(UNRELATED_ENV, "preserved");
+        direct.env(UNRELATED_ENV, "preserved");
+
+        super::remove_smoke_environment(&mut pty);
+        super::remove_smoke_environment(&mut direct);
+
+        for name in crate::smoke::SMOKE_ENV_NAMES {
+            assert!(pty.get_env(name).is_none(), "PTY retained {name}");
+            assert_eq!(
+                direct
+                    .as_std()
+                    .get_envs()
+                    .find(|(key, _)| *key == std::ffi::OsStr::new(name))
+                    .map(|(_, value)| value),
+                Some(None),
+                "direct command did not explicitly remove {name}"
+            );
+        }
+        assert_eq!(
+            pty.get_env(UNRELATED_ENV),
+            Some(std::ffi::OsStr::new("preserved"))
+        );
+        assert_eq!(
+            direct
+                .as_std()
+                .get_envs()
+                .find(|(key, _)| *key == std::ffi::OsStr::new(UNRELATED_ENV))
+                .and_then(|(_, value)| value),
+            Some(std::ffi::OsStr::new("preserved"))
+        );
+    }
 
     struct PluginFixture(PathBuf);
 
