@@ -62,15 +62,17 @@ const TRANSITION_STATES = Object.freeze(['started', 'passed', 'failed']);
 const MAX_DIAGNOSTIC_CODE_LENGTH = 64;
 const MAX_DIAGNOSTIC_MESSAGE_LENGTH = 256;
 const DIAGNOSTIC_CODE_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
-const UNSAFE_DIAGNOSTIC_PATTERNS = Object.freeze([
-  /[A-Za-z]:[\\/]/,
-  /(?:^|\s)\/[^\s]/,
-  /\\\\[^\\\s]+\\/,
-  /\b[A-Za-z_][A-Za-z0-9_]*=\S/,
-  /\$[A-Za-z_{]/,
-  /%[A-Za-z_][A-Za-z0-9_]*%/,
-  /\b(?:cmd(?:\.exe)?\s+\/[ck]|powershell(?:\.exe)?\s+-|pwsh(?:\.exe)?\s+-|(?:ba|z)?sh\s+-(?:c|lc))\b/i,
-]);
+const DIAGNOSTIC_WORD = String.raw`[\p{L}\p{N}]+(?:-[\p{L}\p{N}]+)*`;
+const DIAGNOSTIC_CLAUSE = String.raw`${DIAGNOSTIC_WORD}(?: ${DIAGNOSTIC_WORD})*`;
+const CANONICAL_DIAGNOSTIC_MESSAGE_PATTERN = new RegExp(
+  String.raw`^${DIAGNOSTIC_CLAUSE}(?:(?:,|:) ${DIAGNOSTIC_CLAUSE})*[.!?]?$`,
+  'u',
+);
+const COMMAND_LINE_PREFIX_PATTERN = new RegExp(
+  '^(?:command(?: line)?|execut(?:e|ed|ing)|invok(?:e|ed|ing)|launch(?:ed|ing)?'
+    + '|run|ran|running|spawn(?:ed|ing)?|start(?:ed|ing)?)(?: |:)',
+  'i',
+);
 
 function fail(message) {
   throw new Error(message);
@@ -204,7 +206,8 @@ function validateDiagnostic(value, label) {
     || /[\u0000-\u001f\u007f]/.test(value.message)) {
     fail(`${label} message must be a bounded single-line string of at most ${MAX_DIAGNOSTIC_MESSAGE_LENGTH} characters`);
   }
-  if (UNSAFE_DIAGNOSTIC_PATTERNS.some(pattern => pattern.test(value.message))) {
+  if (!CANONICAL_DIAGNOSTIC_MESSAGE_PATTERN.test(value.message)
+    || COMMAND_LINE_PREFIX_PATTERN.test(value.message)) {
     fail(`${label} message must not contain host paths, environment data, or command lines`);
   }
   return { code: value.code, message: value.message };

@@ -423,12 +423,25 @@ test('rejects host paths, environment data, and command lines in diagnostic mess
     'Failed at C:\\Users\\runner\\workspace',
     'Failed at /home/runner/workspace',
     'Failed at \\\\server\\share',
+    'Failed at "/home/runner/secret"',
+    'Failed at "\\Users\\runner\\secret"',
     'Observed TOKEN=secret-value',
+    'Observed TOKEN = secret-value',
     'Observed $HOME value',
     'Observed %PATH% value',
     'Executed cmd.exe /c whoami',
     'Executed powershell -Command Get-ChildItem',
     'Executed bash -lc pwd',
+    'Executed git status --porcelain',
+    'Executed Rscript.exe secret.R',
+    'Failed at `/home/runner/secret`',
+    'Failed at `C:\\Users\\runner\\secret`',
+    'Observed TOKEN   =   secret-value',
+    'Running git status',
+    'Ran Rscript secret.R',
+    'Executing git status',
+    'Invoked git status',
+    'Invoking git status',
   ];
   for (const message of unsafeMessages) {
     const diagnostic = { code: 'unsafe-diagnostic', message };
@@ -444,5 +457,28 @@ test('rejects host paths, environment data, and command lines in diagnostic mess
       }), REPORT_CONTEXT),
       /diagnostic message.*host paths, environment data, or command lines/i,
     );
+  }
+});
+
+test('accepts canonical bounded human-readable diagnostic messages', () => {
+  const safeMessages = [
+    'Terminal action timed out',
+    'Plugin command was not registered',
+    'R-IDE workspace search returned no matching result',
+    'Editor save failed: resource was unavailable',
+    'Cleanup failed, owned process remained.',
+  ];
+  for (const message of safeMessages) {
+    const diagnostic = { code: 'safe-diagnostic', message };
+    const report = validateSmokeReport(smokeReport({
+      status: 'failed',
+      durationMs: 10,
+      diagnostic,
+      steps: [
+        transition('editor-save', 'started', 0),
+        transition('editor-save', 'failed', 10, diagnostic),
+      ],
+    }), REPORT_CONTEXT);
+    assert.equal(report.diagnostic.message, message);
   }
 });
