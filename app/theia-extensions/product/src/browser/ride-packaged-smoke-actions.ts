@@ -222,16 +222,27 @@ export class RidePackagedSmokeActionService implements RidePackagedSmokeActions,
             const windows = this.backendIsWindows;
             let terminal: TerminalWidgetLike | undefined;
             let terminalDisposed = false;
-            const disposeTerminal = (candidate: TerminalWidgetLike | undefined): void => {
-                if (!candidate || terminalDisposed) {
-                    return;
-                }
-                terminalDisposed = true;
+            let lateStartCleanupDone = false;
+            const tryDisposeTerminal = (candidate: TerminalWidgetLike): void => {
                 try {
                     candidate.dispose();
                 } catch {
                     // Cleanup failures must not expose implementation details or replace the terminal outcome.
                 }
+            };
+            const disposeTerminal = (candidate: TerminalWidgetLike | undefined): void => {
+                if (!candidate || terminalDisposed) {
+                    return;
+                }
+                terminalDisposed = true;
+                tryDisposeTerminal(candidate);
+            };
+            const disposeAfterLateStart = (candidate: TerminalWidgetLike): void => {
+                if (lateStartCleanupDone) {
+                    return;
+                }
+                lateStartCleanupDone = true;
+                tryDisposeTerminal(candidate);
             };
             const stopOnAbort = run.onAbort(() => disposeTerminal(terminal));
             try {
@@ -256,7 +267,17 @@ export class RidePackagedSmokeActionService implements RidePackagedSmokeActions,
                 );
                 terminal = await run.wait(creation);
                 run.assertActive();
-                await run.wait(terminal.start());
+                const startedTerminal = terminal;
+                const start = Promise.resolve(startedTerminal.start());
+                start.then(
+                    () => {
+                        if (run.aborted) {
+                            disposeAfterLateStart(startedTerminal);
+                        }
+                    },
+                    () => undefined
+                );
+                await run.wait(start);
                 run.assertActive();
                 terminal.sendText(windows ? RIDE_SMOKE_WINDOWS_COMMAND : RIDE_SMOKE_UNIX_COMMAND);
                 while (true) {

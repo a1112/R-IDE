@@ -438,6 +438,49 @@ function lateTerminalFixture(create: Promise<{
     };
 }
 
+function theiaTerminalLifecycleFixture(start: Promise<number>): {
+    readonly services: RidePackagedSmokeActionServices;
+    readonly commands: string[];
+    readonly backendOpen: boolean;
+    readonly backendCloses: number;
+    readonly widgetDisposals: number;
+    readonly exitEvents: number;
+    readonly sends: number;
+} {
+    let terminalId: number | undefined;
+    let backendOpen = false;
+    let backendCloses = 0;
+    let widgetDisposals = 0;
+    let exitEvents = 0;
+    let sends = 0;
+    const fixture = lateTerminalFixture(Promise.resolve({
+        start: async () => {
+            const id = await start;
+            terminalId = id;
+            backendOpen = true;
+            return id;
+        },
+        sendText: command => { sends++; fixture.commands.push(command); },
+        dispose: () => {
+            widgetDisposals++;
+            if (terminalId !== undefined && backendOpen) {
+                backendOpen = false;
+                backendCloses++;
+                exitEvents++;
+            }
+        }
+    }));
+    return {
+        services: fixture.services,
+        commands: fixture.commands,
+        get backendOpen() { return backendOpen; },
+        get backendCloses() { return backendCloses; },
+        get widgetDisposals() { return widgetDisposals; },
+        get exitEvents() { return exitEvents; },
+        get sends() { return sends; }
+    };
+}
+
 test('smoke action terminal-sentinel bounds pending creation and disposes a late terminal without starting it', async () => {
     const creation = deferred<{
         start(): Promise<number>;
@@ -480,31 +523,43 @@ test('smoke action terminal-sentinel consumes a late creation rejection after ti
     assert.deepEqual(fixture.commands, []);
 });
 
-test('smoke action terminal-sentinel bounds pending start and disposes exactly once before late completion', async t => {
-    for (const late of ['resolve', 'reject'] as const) {
-        await t.test(late, async () => {
-            const start = deferred<number>();
-            let disposals = 0;
-            const fixture = lateTerminalFixture(Promise.resolve({
-                start: () => start.promise,
-                sendText: command => fixture.commands.push(command),
-                dispose: () => { disposals++; }
-            }));
-            const operation = new RidePackagedSmokeActionService(fixture.services).terminalSentinel(plan());
+test('smoke action terminal-sentinel closes a backend that opens after its first widget disposal', async () => {
+    const start = deferred<number>();
+    const fixture = theiaTerminalLifecycleFixture(start.promise);
+    const operation = new RidePackagedSmokeActionService(fixture.services).terminalSentinel(plan());
 
-            const result = await outcomeWithin(operation);
-            if (late === 'resolve') {
-                start.resolve(1);
-            } else {
-                start.reject(new Error('sensitive late start failure'));
-            }
-            await turn();
+    const result = await outcomeWithin(operation);
+    assert.equal((result as Error).message, 'Smoke action timed out.');
+    assert.equal(fixture.widgetDisposals, 1);
+    assert.equal(fixture.backendOpen, false);
+    assert.equal(fixture.backendCloses, 0);
 
-            assert.equal((result as Error).message, 'Smoke action timed out.');
-            assert.deepEqual(fixture.commands, []);
-            assert.equal(disposals, 1);
-        });
-    }
+    start.resolve(71);
+    await turn();
+
+    assert.equal(fixture.backendOpen, false);
+    assert.equal(fixture.backendCloses, 1);
+    assert.equal(fixture.exitEvents, 1);
+    assert.equal(fixture.widgetDisposals, 2);
+    assert.equal(fixture.sends, 0);
+    assert.deepEqual(fixture.commands, []);
+});
+
+test('smoke action terminal-sentinel consumes a late start rejection without duplicate backend close', async () => {
+    const start = deferred<number>();
+    const fixture = theiaTerminalLifecycleFixture(start.promise);
+    const operation = new RidePackagedSmokeActionService(fixture.services).terminalSentinel(plan());
+
+    const result = await outcomeWithin(operation);
+    start.reject(new Error('sensitive late start failure'));
+    await turn();
+
+    assert.equal((result as Error).message, 'Smoke action timed out.');
+    assert.equal(fixture.backendOpen, false);
+    assert.equal(fixture.widgetDisposals, 1);
+    assert.equal(fixture.backendCloses, 0);
+    assert.equal(fixture.exitEvents, 0);
+    assert.equal(fixture.sends, 0);
 });
 
 test('smoke action terminal-sentinel handles a synchronous timeout callback without TDZ failure', async () => {
