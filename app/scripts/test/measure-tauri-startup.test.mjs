@@ -480,6 +480,24 @@ test('report waiter tolerates canonical partial snapshots until the target prefi
   }
 });
 
+test('report waiter can attest process_started before a fast process exits', async () => {
+  const root = temporaryDirectory('process-attestation');
+  const reportPath = path.join(root, 'startup-report.json');
+  try {
+    fs.writeFileSync(reportPath, JSON.stringify(startupReport({ process_started: 0 })));
+    const report = await waitForStartupReport(reportPath, {
+      timeoutMs: 100,
+      pollMs: 1,
+      phase: 'process',
+      expectedPlatform: currentRustTarget().platform,
+      expectedArch: currentRustTarget().arch,
+    });
+    assert.equal(report.milestones.process_started, 0);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('median handles odd and even samples without mutating input', () => {
   const values = [9, 1, 5, 3];
   assert.equal(median(values), 4);

@@ -16,17 +16,20 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import {
   attachBoundedLogCapture,
   captureProcessIdentity,
+  discoverMarkedProcessSnapshot,
   discoverExecutable,
+  filterSpawnEnvironment,
   readCampaignMetadata,
   redactDiagnosticText,
   requestGracefulProcessClose,
   startProcessTreeMonitor,
   terminateMeasuredTree,
+  waitForStartupReport,
 } from './measure-tauri-startup.mjs';
 import {
   SMOKE_ACTIONS,
@@ -50,6 +53,9 @@ const SIDECAR_FAILURE_PATTERN = /(?:Failed to start backend|Backend process exit
 const FAILURE_SCHEMA = 'ride.tauri-packaged-smoke-runner-failure';
 const OWNER_SCHEMA = 'ride.tauri-packaged-smoke-owner';
 const OWNER_FILE = '.ride-tauri-packaged-smoke-owner.json';
+const STARTUP_ATTESTATION_TIMEOUT_MS = 2_000;
+const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
+const applicationRoot = path.resolve(scriptDirectory, '..');
 
 function sha256(value) {
   return createHash('sha256').update(value).digest('hex');
@@ -169,7 +175,11 @@ export async function createSmokeRunArtifacts({
       `# R-IDE packaged smoke ${index + 1}\n`,
       { flag: 'wx' },
     )));
-    initializeGitWorkspace(workspace, definition.files, sourceEnvironment);
+    const preparedSourceEnvironment = filterSpawnEnvironment(
+      sourceEnvironment,
+      path.join(authorityDirectory, 'startup-unused.json'),
+    );
+    initializeGitWorkspace(workspace, definition.files, preparedSourceEnvironment.environment);
     const spec = validateSmokeSpec({
       schema: 'ride.tauri-packaged-smoke-spec',
       version: 1,
@@ -184,11 +194,14 @@ export async function createSmokeRunArtifacts({
     const serializedSpec = `${JSON.stringify(spec)}\n`;
     await fs.promises.writeFile(specPath, serializedSpec, { flag: 'wx' });
     const specSha256 = sha256(serializedSpec);
-    const childEnvironment = {
-      ...sourceEnvironment,
+    const smokeEnvironment = {
       RIDE_TAURI_SMOKE_SPEC: specPath,
       RIDE_TAURI_SMOKE_REPORT: reportPath,
       RIDE_TAURI_SMOKE_TOKEN: token,
+    };
+    const childEnvironment = {
+      ...preparedSourceEnvironment.environment,
+      ...smokeEnvironment,
     };
     return {
       executable: path.resolve(executable),
@@ -207,8 +220,15 @@ export async function createSmokeRunArtifacts({
       logsDirectory,
       outputPath: path.resolve(output),
       token,
-      sensitiveValues: [token, runRoot, path.resolve(executable), path.resolve(output)],
+      sensitiveValues: [...new Set([
+        ...preparedSourceEnvironment.sensitiveValues,
+        token,
+        runRoot,
+        path.resolve(executable),
+        path.resolve(output),
+      ])],
       childEnvironment,
+      smokeEnvironment,
       launchArguments: absoluteFiles.length > 0 ? [absoluteFiles[0]] : [],
       context: {
         specSha256,
@@ -274,6 +294,15 @@ function waitForSpawn(child) {
   });
 }
 
+function observeChildExit(child) {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return Promise.resolve({ type: 'exit', code: child.exitCode, signal: child.signalCode });
+  }
+  return new Promise(resolve => {
+    child.once('exit', (code, signal) => resolve({ type: 'exit', code, signal }));
+  });
+}
+
 export function packagedSmokeLaunchArguments(run, kind) {
   if (!['first', 'second'].includes(kind)) {
     throw new Error('packaged smoke instance kind must be first or second');
@@ -282,12 +311,33 @@ export function packagedSmokeLaunchArguments(run, kind) {
   return run.absoluteFiles[fileIndex] === undefined ? [] : [run.absoluteFiles[fileIndex]];
 }
 
-async function launchDefaultInstance({ run, kind }) {
+export async function launchPackagedSmokeInstance(
+  { run, kind },
+  {
+    spawnProcess = spawn,
+    capture = captureProcessIdentity,
+    waitForReport = waitForStartupReport,
+    startMonitor = startProcessTreeMonitor,
+    createRunId = randomUUID,
+    platform = process.platform,
+  } = {},
+) {
   const launchArguments = packagedSmokeLaunchArguments(run, kind);
-  const child = spawn(run.executable, launchArguments, {
+  const runId = createRunId();
+  const startupReportPath = path.join(run.logsDirectory, `${kind}-startup-report.json`);
+  const preparedEnvironment = filterSpawnEnvironment(
+    run.childEnvironment,
+    startupReportPath,
+    runId,
+  );
+  const sensitiveValues = [...new Set([
+    ...run.sensitiveValues,
+    ...preparedEnvironment.sensitiveValues,
+  ])];
+  const child = spawnProcess(run.executable, launchArguments, {
     cwd: run.workspace,
-    detached: process.platform !== 'win32',
-    env: run.childEnvironment,
+    detached: platform !== 'win32',
+    env: { ...preparedEnvironment.environment, ...run.smokeEnvironment },
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
   });
@@ -296,25 +346,71 @@ async function launchDefaultInstance({ run, kind }) {
   const logCapture = attachBoundedLogCapture(
     child,
     { stdoutLogPath, stderrLogPath },
-    run.sensitiveValues,
+    sensitiveValues,
   );
+  const instance = {
+    kind,
+    child,
+    identity: undefined,
+    monitor: undefined,
+    logCapture,
+    stdoutLogPath,
+    stderrLogPath,
+    startupReportPath,
+    runId,
+    platform,
+    containmentVerified: false,
+    cleanupComplete: false,
+  };
   try {
+    const exitObservation = observeChildExit(child);
     await waitForSpawn(child);
-    const identity = await captureProcessIdentity(child.pid);
-    const monitor = startProcessTreeMonitor(identity, { child });
-    return {
-      kind,
-      child,
-      identity,
-      monitor,
-      logCapture,
-      stdoutLogPath,
-      stderrLogPath,
-      cleanupComplete: false,
+    const identityObservation = Promise.resolve()
+      .then(() => capture(child.pid))
+      .then(
+        identity => ({ type: 'identity', identity }),
+        error => ({ type: 'identity-error', error }),
+      );
+    const reportObservation = waitForReport(startupReportPath, {
+      timeoutMs: Math.min(run.timeoutMs, STARTUP_ATTESTATION_TIMEOUT_MS),
+      pollMs: 10,
+      phase: 'process',
+    }).then(
+      report => ({ report }),
+      error => ({ error }),
+    );
+    const attestContainment = async () => {
+      const observation = await reportObservation;
+      if (observation.error) {
+        throw observation.error;
+      }
+      const { report } = observation;
+      if (report.pid !== child.pid) {
+        throw new Error(`${kind} startup report pid does not match the spawned process`);
+      }
+      instance.containmentVerified = true;
     };
+    const firstObservation = await Promise.race([identityObservation, exitObservation]);
+    if (firstObservation.type === 'exit') {
+      await attestContainment();
+      if (firstObservation.code !== 0) {
+        throw new Error(`${kind} instance failed with exit code ${firstObservation.code}`);
+      }
+      if (kind === 'first') {
+        throw new Error('first instance exited before identity capture');
+      }
+      return instance;
+    }
+    if (firstObservation.type === 'identity-error') {
+      throw firstObservation.error;
+    }
+    instance.identity = firstObservation.identity;
+    instance.monitor = startMonitor(instance.identity, { child });
+    await attestContainment();
+    return instance;
   } catch (error) {
     try {
-      child.kill();
+      await cleanupPackagedSmokeInstances([instance]);
       await logCapture.persist();
     } catch (cleanupError) {
       error.cause ??= cleanupError;
@@ -412,7 +508,13 @@ async function waitForInstanceExitDefault(instance, { run, phase }) {
   }
 }
 
-async function cleanupDefaultInstances(instances) {
+export async function cleanupPackagedSmokeInstances(
+  instances,
+  {
+    terminate = terminateMeasuredTree,
+    discoverMarked = discoverMarkedProcessSnapshot,
+  } = {},
+) {
   const failures = [];
   for (const instance of [...instances].reverse()) {
     if (instance.cleanupComplete) {
@@ -420,11 +522,27 @@ async function cleanupDefaultInstances(instances) {
     }
     try {
       const trackedProcesses = await instance.monitor?.stop() ?? [];
-      await terminateMeasuredTree({
+      let rootIdentity = instance.identity;
+      let cleanupTrackedProcesses = trackedProcesses;
+      if (!rootIdentity
+          && instance.containmentVerified
+          && instance.platform !== 'win32') {
+        const snapshot = discoverMarked(instance.runId, instance.platform);
+        rootIdentity = snapshot.markedRows.find(row => row.pid === instance.child.pid)
+          ?? snapshot.markedRows[0];
+        cleanupTrackedProcesses = snapshot.markedRows;
+        if (!rootIdentity) {
+          instance.cleanupComplete = true;
+          continue;
+        }
+      }
+      await terminate({
         child: instance.child,
-        rootPid: instance.identity.pid,
-        rootIdentity: instance.identity,
-        trackedProcesses,
+        rootPid: rootIdentity?.pid ?? instance.child.pid,
+        rootIdentity,
+        trackedProcesses: cleanupTrackedProcesses,
+        containmentVerified: instance.containmentVerified,
+        runId: instance.runId,
       });
       instance.cleanupComplete = true;
     } catch (error) {
@@ -514,12 +632,12 @@ function defaultDependencies(options) {
       }
     },
     createRun: () => createSmokeRunArtifacts(options),
-    launchInstance: launchDefaultInstance,
+    launchInstance: launchPackagedSmokeInstance,
     waitForForwardingStarted: waitForForwardingStartedDefault,
     waitForInstanceExit: waitForInstanceExitDefault,
     waitForFinalReport: waitForFinalReportDefault,
     requestGracefulClose: instance => requestGracefulProcessClose(instance.identity),
-    cleanupInstances: cleanupDefaultInstances,
+    cleanupInstances: cleanupPackagedSmokeInstances,
     validateLogs: validatePackagedSmokeLogs,
     publishResult: ({ run, report }) => writeFileAtomically(
       run.outputPath,
@@ -670,6 +788,20 @@ export function parsePackagedSmokeArguments(argv) {
   return parsed;
 }
 
+function cliSensitivePaths(argv) {
+  const sensitivePaths = [applicationRoot, scriptDirectory];
+  const pathOptions = new Set(['--bundle-root', '--executable', '--output']);
+  for (let index = 0; index < argv.length - 1; index += 1) {
+    if (!pathOptions.has(argv[index]) || argv[index + 1].startsWith('--')) {
+      continue;
+    }
+    const resolved = path.resolve(argv[index + 1]);
+    sensitivePaths.push(resolved, path.dirname(resolved));
+    index += 1;
+  }
+  return [...new Set(sensitivePaths)];
+}
+
 async function main(argv) {
   const options = parsePackagedSmokeArguments(argv);
   const executable = options.executable ?? discoverExecutable(options.bundleRoot);
@@ -686,8 +818,12 @@ async function main(argv) {
 }
 
 if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) {
-  main(process.argv.slice(2)).catch(error => {
-    process.stderr.write(`${redactDiagnosticText(error?.stack ?? String(error))}\n`);
+  const cliArguments = process.argv.slice(2);
+  main(cliArguments).catch(error => {
+    process.stderr.write(`${redactDiagnosticText(
+      error?.stack ?? String(error),
+      cliSensitivePaths(cliArguments),
+    )}\n`);
     process.exitCode = 1;
   });
 }

@@ -1973,6 +1973,9 @@ export async function waitForStartupReport(
         phase: 'incremental',
       });
       const milestoneCount = Object.keys(report.milestones).length;
+      if (phase === 'process') {
+        return report;
+      }
       if (phase === 'target') {
         if (milestoneCount >= 6) {
           return parseStartupReport(serialized, {

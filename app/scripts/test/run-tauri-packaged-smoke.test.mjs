@@ -11,6 +11,7 @@
 /* eslint-disable no-null/no-null -- Smoke protocol fixtures require explicit nulls. */
 
 import assert from 'node:assert/strict';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -19,6 +20,8 @@ import test from 'node:test';
 import { SMOKE_ACTIONS } from '../tauri-packaged-smoke-contract.mjs';
 import {
   createSmokeRunArtifacts,
+  cleanupPackagedSmokeInstances,
+  launchPackagedSmokeInstance,
   packagedSmokeLaunchArguments,
   parsePackagedSmokeArguments,
   removeSmokeRunArtifacts,
@@ -27,6 +30,9 @@ import {
 } from '../run-tauri-packaged-smoke.mjs';
 
 const digest = 'a'.repeat(64);
+
+const RUST_PLATFORM = { win32: 'windows', darwin: 'macos', linux: 'linux' }[process.platform];
+const RUST_ARCH = { x64: 'x86_64', arm64: 'aarch64' }[process.arch];
 
 function transitionSteps({ forwardingStarted = false } = {}) {
   const steps = [];
@@ -301,6 +307,239 @@ test('artifact creation rejects inherited smoke authority variables', async () =
   }), /RIDE_TAURI_SMOKE_TOKEN/);
 });
 
+test('artifact environment removes inherited CI secrets, retains XAUTHORITY, and tracks redaction values', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ride-smoke-environment-'));
+  const executable = path.join(root, 'R-IDE.exe');
+  fs.writeFileSync(executable, 'fixture');
+  const secrets = {
+    CI_ACCESS_TOKEN: 'ci-access-token-value-with-enough-entropy',
+    DB_PASSWORD: 'database-password-value-with-enough-entropy',
+    XAUTHORITY: '/tmp/xauthority-sensitive-desktop-value',
+  };
+  let run;
+  try {
+    run = await createSmokeRunArtifacts({
+      executable,
+      scenario: 'critical-file',
+      output: path.join(root, 'result.json'),
+      timeoutMs: 30_000,
+      keepWorkspace: true,
+      sourceEnvironment: { PATH: process.env.PATH ?? '', ...secrets },
+    });
+    assert.equal(Object.hasOwn(run.childEnvironment, 'CI_ACCESS_TOKEN'), false);
+    assert.equal(Object.hasOwn(run.childEnvironment, 'DB_PASSWORD'), false);
+    assert.equal(run.childEnvironment.XAUTHORITY, secrets.XAUTHORITY);
+    for (const value of Object.values(secrets)) {
+      assert.equal(run.sensitiveValues.includes(value), true);
+    }
+  } finally {
+    if (run) {
+      fs.rmSync(run.runRoot, { recursive: true, force: true });
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+function writeStartupFixture(file, exitCode, linger = false) {
+  fs.writeFileSync(file, [
+    'const fs = require(\'node:fs\');',
+    'const report = {',
+    "  schema: 'ride.startup-report', version: 1,",
+    `  platform: '${RUST_PLATFORM}', arch: '${RUST_ARCH}', pid: process.pid,`,
+    '  milestones: { process_started: 0 },',
+    '};',
+    'fs.writeFileSync(process.env.RIDE_STARTUP_REPORT, JSON.stringify(report));',
+    linger ? 'setInterval(() => undefined, 1000);' : `process.exit(${exitCode});`,
+  ].join('\n'));
+}
+
+test('default launcher accepts a real fast second-instance exit without waiting for identity timeout', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ride-smoke-fast-second-'));
+  const script = path.join(root, 'second.js');
+  writeStartupFixture(script, 0);
+  const run = {
+    executable: process.execPath,
+    absoluteFiles: ['unused', script],
+    workspace: root,
+    logsDirectory: root,
+    timeoutMs: 3_000,
+    childEnvironment: { PATH: process.env.PATH ?? '' },
+    smokeEnvironment: {},
+    sensitiveValues: [],
+  };
+  const started = Date.now();
+  try {
+    const instance = await launchPackagedSmokeInstance({ run, kind: 'second' }, {
+      capture: async () => new Promise((_, reject) => setTimeout(
+        () => reject(new Error('delayed identity capture')),
+        2_500,
+      )),
+    });
+    assert.equal(instance.child.exitCode, 0);
+    assert.equal(instance.identity, undefined);
+    assert.equal(instance.containmentVerified, true);
+    assert.ok(Date.now() - started < 1_500);
+    await instance.logCapture.persist();
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('default launcher filters the actual child environment while retaining desktop authority', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ride-smoke-launch-environment-'));
+  const script = path.join(root, 'second.js');
+  writeStartupFixture(script, 0);
+  const secret = 'actual-child-ci-secret-value-with-enough-entropy';
+  const xauthority = '/tmp/ride-desktop-xauthority';
+  let spawnedEnvironment;
+  const run = {
+    executable: process.execPath,
+    absoluteFiles: ['unused', script],
+    workspace: root,
+    logsDirectory: root,
+    timeoutMs: 3_000,
+    childEnvironment: {
+      PATH: process.env.PATH ?? '',
+      CI_ACCESS_TOKEN: secret,
+      XAUTHORITY: xauthority,
+    },
+    smokeEnvironment: { RIDE_TAURI_SMOKE_TOKEN: 'smoke-token-for-child-only' },
+    sensitiveValues: [secret],
+  };
+  try {
+    const instance = await launchPackagedSmokeInstance({ run, kind: 'second' }, {
+      spawnProcess: (executable, arguments_, spawnOptions) => {
+        spawnedEnvironment = spawnOptions.env;
+        return spawn(executable, arguments_, spawnOptions);
+      },
+      capture: async () => new Promise((_, reject) => setTimeout(
+        () => reject(new Error('delayed identity capture')),
+        2_500,
+      )),
+    });
+    assert.equal(Object.hasOwn(spawnedEnvironment, 'CI_ACCESS_TOKEN'), false);
+    assert.equal(spawnedEnvironment.XAUTHORITY, xauthority);
+    assert.equal(spawnedEnvironment.RIDE_TAURI_SMOKE_TOKEN, 'smoke-token-for-child-only');
+    await instance.logCapture.persist();
+    const persistedLogs = [instance.stdoutLogPath, instance.stderrLogPath]
+      .map(file => fs.readFileSync(file, 'utf8'))
+      .join('\n');
+    assert.equal(persistedLogs.includes(secret), false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('default launcher keeps first-instance identity strict and rejects fast nonzero second exits', async () => {
+  for (const [kind, exitCode, expected] of [
+    ['first', 0, /first instance exited before identity/i],
+    ['second', 7, /second instance failed with exit code 7/i],
+  ]) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), `ride-smoke-fast-${kind}-`));
+    const script = path.join(root, `${kind}.js`);
+    writeStartupFixture(script, exitCode);
+    const run = {
+      executable: process.execPath,
+      absoluteFiles: kind === 'first' ? [script] : ['unused', script],
+      workspace: root,
+      logsDirectory: root,
+      timeoutMs: 3_000,
+      childEnvironment: { PATH: process.env.PATH ?? '' },
+      smokeEnvironment: {},
+      sensitiveValues: [],
+    };
+    try {
+      await assert.rejects(launchPackagedSmokeInstance({ run, kind }, {
+        capture: async () => new Promise((_, reject) => setTimeout(
+          () => reject(new Error('delayed identity capture')),
+          2_500,
+        )),
+      }), expected);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test('default cleanup forwards attested containment, run marker, and tracked identities', async () => {
+  const terminated = [];
+  const identity = {
+    pid: 7331,
+    ppid: 1,
+    pgid: null,
+    creationTime: 'windows:fixture',
+  };
+  const tracked = [{ ...identity, pid: 7332, ppid: 7331 }];
+  await cleanupPackagedSmokeInstances([{
+    kind: 'first',
+    child: { pid: 7331 },
+    identity,
+    containmentVerified: true,
+    runId: '7f7df1aa-a324-4fd4-b11c-4cc260a94d8f',
+    monitor: { stop: async () => tracked },
+    cleanupComplete: false,
+  }], {
+    terminate: async value => terminated.push(value),
+  });
+  assert.equal(terminated.length, 1);
+  assert.equal(terminated[0].containmentVerified, true);
+  assert.equal(terminated[0].runId, '7f7df1aa-a324-4fd4-b11c-4cc260a94d8f');
+  assert.deepEqual(terminated[0].trackedProcesses, tracked);
+});
+
+test('default cleanup reattests marker-owned descendants after a fast POSIX root exit', async () => {
+  const runId = '5e77ce9f-3215-4cc4-a2b7-38f3398493ad';
+  const descendant = {
+    pid: 7442,
+    ppid: 1,
+    pgid: 7442,
+    creationTime: 'linux:200',
+    startedAt: 200,
+  };
+  const terminated = [];
+  await cleanupPackagedSmokeInstances([{
+    kind: 'second',
+    child: { pid: 7441, killed: false, exitCode: 0, signalCode: null },
+    identity: undefined,
+    containmentVerified: true,
+    platform: 'linux',
+    runId,
+    cleanupComplete: false,
+  }], {
+    discoverMarked: marker => {
+      assert.equal(marker, runId);
+      return { rows: [descendant], markedRows: [descendant] };
+    },
+    terminate: async value => terminated.push(value),
+  });
+  assert.equal(terminated.length, 1);
+  assert.equal(terminated[0].rootPid, descendant.pid);
+  assert.equal(terminated[0].rootIdentity, descendant);
+  assert.deepEqual(terminated[0].trackedProcesses, [descendant]);
+  assert.equal(terminated[0].containmentVerified, true);
+  assert.equal(terminated[0].runId, runId);
+});
+
+test('CLI redacts explicit executable and worktree paths before run creation', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ride-smoke-cli-secret-path-'));
+  const executable = path.join(root, 'PRIVATE-WORKTREE-MARKER', 'missing-R-IDE.exe');
+  try {
+    const result = spawnSync(process.execPath, [
+      path.resolve(import.meta.dirname, '..', 'run-tauri-packaged-smoke.mjs'),
+      '--scenario', 'critical-file',
+      '--executable', executable,
+      '--output', path.join(root, 'result.json'),
+    ], { encoding: 'utf8', timeout: 10_000 });
+    assert.notEqual(result.status, 0);
+    assert.doesNotMatch(result.stderr, /PRIVATE-WORKTREE-MARKER|missing-R-IDE/i);
+    for (let index = 0; index <= executable.length - 16; index += 1) {
+      assert.equal(result.stderr.includes(executable.slice(index, index + 16)), false);
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('default log validation rejects sidecar failure text without exposing the token', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ride-smoke-logs-'));
   const stdoutLogPath = path.join(root, 'stdout.log');
@@ -372,13 +611,17 @@ test('failed orchestration preserves bounded redacted diagnostics before tempora
   fs.writeFileSync(executable, 'fixture');
   let runRoot;
   let token;
+  const inheritedSecret = 'failure-artifact-ci-secret-value-with-enough-entropy';
   try {
     await assert.rejects(runPackagedSmoke({
       executable,
       scenario: 'critical-file',
       output,
       timeoutMs: 30_000,
-      sourceEnvironment: { PATH: process.env.PATH ?? '' },
+      sourceEnvironment: {
+        PATH: process.env.PATH ?? '',
+        CI_ACCESS_TOKEN: inheritedSecret,
+      },
     }, {
       verifyProfile: async () => undefined,
       launchInstance: async ({ run, kind }) => {
@@ -391,7 +634,9 @@ test('failed orchestration preserves bounded redacted diagnostics before tempora
         specSha256: run.context.specSha256,
       }),
       waitForInstanceExit: async () => undefined,
-      waitForFinalReport: async () => { throw new Error(`runner failed ${token}`); },
+      waitForFinalReport: async () => {
+        throw new Error(`runner failed ${token} inherited ${inheritedSecret}`);
+      },
       cleanupInstances: async () => undefined,
     }), /\[REDACTED\]/);
     const pointerPath = path.join(root, 'result.failure.json');
@@ -399,6 +644,7 @@ test('failed orchestration preserves bounded redacted diagnostics before tempora
     const diagnosticsDirectory = path.join(root, pointer.diagnostics.directory);
     const serializedFailure = fs.readFileSync(path.join(diagnosticsDirectory, 'failure.json'), 'utf8');
     assert.equal(serializedFailure.includes(token), false);
+    assert.equal(serializedFailure.includes(inheritedSecret), false);
     assert.match(serializedFailure, /\[REDACTED\]/);
     assert.equal(fs.existsSync(runRoot), false);
   } finally {
