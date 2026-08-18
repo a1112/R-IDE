@@ -15,6 +15,7 @@ pub mod launch_intent;
 pub mod native_chrome;
 pub mod performance;
 pub mod sidecar;
+pub mod smoke;
 pub mod startup;
 mod startup_job;
 pub mod startup_metrics;
@@ -54,6 +55,7 @@ pub struct AppState {
     pub downloads: download::DownloadManager,
     pub launch_intent_router: launch_intent::LaunchIntentRouter,
     pub performance: performance::PerformanceSampler,
+    pub smoke: smoke::SmokeProtocol,
     pub startup_metrics: startup_metrics::StartupMetrics,
     pub runtime_paths: startup::RuntimePathsCache,
 }
@@ -73,6 +75,7 @@ impl AppState {
                 initial_launch_intent,
             ),
             performance: performance::PerformanceSampler::default(),
+            smoke: smoke::SmokeProtocol::from_process_environment(),
             startup_metrics,
             runtime_paths: startup::RuntimePathsCache::default(),
         }
@@ -282,6 +285,9 @@ pub fn run() {
             native_chrome::ride_frontend_ready,
             native_chrome::ride_record_startup_milestone,
             performance::ride_performance_snapshot,
+            smoke::ride_smoke_plan,
+            smoke::ride_smoke_record_step,
+            smoke::ride_smoke_complete,
             commands::open_directory,
             commands::save_file,
             commands::show_in_folder,
