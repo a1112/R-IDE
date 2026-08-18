@@ -48,13 +48,15 @@ function transition(action, state, durationMs, diagnostic = null) {
 }
 
 function smokeReport(overrides = {}) {
+  const status = overrides.status ?? 'passed';
   return {
     schema: 'ride.tauri-packaged-smoke',
     version: 1,
     specSha256: 'b'.repeat(64),
     scenario: 'critical-file',
     profile: 'tauri-critical',
-    status: 'passed',
+    status,
+    failurePhase: status === 'failed' ? 'action' : null,
     durationMs: 80,
     diagnostic: null,
     steps: [
@@ -67,19 +69,61 @@ function smokeReport(overrides = {}) {
   };
 }
 
+function failedSmokeReport(code, message) {
+  if (code === 'cleanup-failed') {
+    return smokeReport({
+      status: 'failed',
+      failurePhase: 'cleanup',
+      diagnostic: { code, message },
+    });
+  }
+  if (code === 'startup-failed' || code === 'sidecar-failed' || code === 'protocol-failed') {
+    return smokeReport({
+      status: 'failed',
+      failurePhase: code.slice(0, -'-failed'.length),
+      durationMs: 0,
+      diagnostic: { code, message },
+      steps: [],
+    });
+  }
+  const diagnostic = { code, message };
+  return smokeReport({
+    status: 'failed',
+    failurePhase: 'action',
+    durationMs: 10,
+    diagnostic,
+    steps: [
+      transition('editor-save', 'started', 0),
+      transition('editor-save', 'failed', 10, diagnostic),
+    ],
+  });
+}
+
+function captureValidationError(callback) {
+  let caught;
+  try {
+    callback();
+  } catch (error) {
+    caught = error;
+  }
+  assert.ok(caught instanceof Error);
+  return caught;
+}
+
 const REPORT_CONTEXT = Object.freeze({
   specSha256: 'b'.repeat(64),
   scenario: 'critical-file',
   profile: 'tauri-critical',
+  actions: ['editor-save', 'terminal-sentinel'],
 });
-const SAFE_DIAGNOSTIC_MESSAGES = Object.freeze([
-  'Startup failed.',
-  'Action failed.',
-  'Action timed out.',
-  'Sidecar startup failed.',
-  'Cleanup failed.',
-  'Protocol validation failed.',
-]);
+const DIAGNOSTIC_CATALOG = Object.freeze({
+  'startup-failed': 'Application startup failed.',
+  'action-failed': 'Smoke action failed.',
+  'action-timeout': 'Smoke action timed out.',
+  'sidecar-failed': 'Backend sidecar failed.',
+  'protocol-failed': 'Smoke protocol failed.',
+  'cleanup-failed': 'Process cleanup failed.',
+});
 
 test('exports immutable canonical schemas, scenarios, and ordered actions', () => {
   assert.deepEqual(SMOKE_SCHEMAS, {
@@ -129,12 +173,12 @@ test('accepts each exact scenario and returns a normalized copy', () => {
 test('rejects unknown or missing spec fields', () => {
   assert.throws(
     () => validateSmokeSpec({ ...smokeSpec(), commandLine: 'cmd.exe /c whoami' }),
-    /unexpected field commandLine/,
+    /unexpected field at index/,
   );
 
   const missing = smokeSpec();
   delete missing.files;
-  assert.throws(() => validateSmokeSpec(missing), /missing field files/);
+  assert.throws(() => validateSmokeSpec(missing), /missing a required field/);
 });
 
 test('rejects unsupported schema, version, scenario, and profile values without coercion', () => {
@@ -192,6 +236,41 @@ test('rejects empty, duplicate, and non-string file paths', () => {
   }
 });
 
+test('requires Windows-portable relative workspace and file paths', () => {
+  const unsafePaths = [
+    'nested/file.R:secret',
+    'CON',
+    'con.R',
+    'Aux.txt',
+    'NUL.data',
+    'com1.log',
+    'LPT9.R',
+    'folder./file.R',
+    'folder /file.R',
+    'nested/file.R.',
+    'nested/file.R ',
+  ];
+  for (const unsafePath of unsafePaths) {
+    assert.throws(
+      () => validateSmokeSpec(smokeSpec({ workspace: unsafePath })),
+      /workspace.*portable|workspace.*relative path/i,
+    );
+    assert.throws(
+      () => validateSmokeSpec(smokeSpec({ files: [unsafePath] })),
+      /files\[0\].*portable|files\[0\].*relative path/i,
+    );
+  }
+
+  assert.throws(
+    () => validateSmokeSpec(smokeSpec({ files: ['Startup.R', 'startup.r'] })),
+    /files.*case-insensitive.*unique/i,
+  );
+  assert.deepEqual(validateSmokeSpec(smokeSpec({
+    workspace: 'console',
+    files: ['com10.R', 'auxiliary.R'],
+  })).files, ['com10.R', 'auxiliary.R']);
+});
+
 test('requires actions to be known, unique, and in canonical order', () => {
   assert.deepEqual(
     validateSmokeSpec(smokeSpec({ actions: ['editor-save', 'scm-status', 'secondary-window'] })).actions,
@@ -203,11 +282,11 @@ test('requires actions to be known, unique, and in canonical order', () => {
   );
   assert.throws(
     () => validateSmokeSpec(smokeSpec({ actions: ['editor-save', 'editor-save'] })),
-    /duplicate action editor-save/i,
+    /duplicate action at index/i,
   );
   assert.throws(
     () => validateSmokeSpec(smokeSpec({ actions: ['editor-save', 'arbitrary-command'] })),
-    /unsupported action arbitrary-command/i,
+    /unsupported action at index/i,
   );
 });
 
@@ -252,34 +331,37 @@ test('accepts a completed ordered report and returns a normalized copy', () => {
 test('requires exact report, transition, diagnostic, and context keys', () => {
   assert.throws(
     () => validateSmokeReport({ ...smokeReport(), executablePath: 'R-IDE.exe' }, REPORT_CONTEXT),
-    /report.*unexpected field executablePath/i,
+    /report.*unexpected field at index/i,
   );
   assert.throws(
     () => validateSmokeReport(smokeReport({
       steps: [{ ...transition('editor-save', 'started', 0), commandLine: 'git status' }],
     }), REPORT_CONTEXT),
-    /transition.*unexpected field commandLine/i,
+    /transition.*unexpected field at index/i,
   );
   assert.throws(
     () => validateSmokeReport(smokeReport({
       status: 'failed',
-      diagnostic: { code: 'action-failed', message: 'Action failed.', environment: {} },
+      diagnostic: { code: 'action-failed', message: DIAGNOSTIC_CATALOG['action-failed'], environment: {} },
       steps: [
         transition('editor-save', 'started', 0),
-        transition('editor-save', 'failed', 10, { code: 'action-failed', message: 'Action failed.' }),
+        transition('editor-save', 'failed', 10, {
+          code: 'action-failed',
+          message: DIAGNOSTIC_CATALOG['action-failed'],
+        }),
       ],
       durationMs: 10,
     }), REPORT_CONTEXT),
-    /diagnostic.*unexpected field environment/i,
+    /diagnostic.*unexpected field at index/i,
   );
   assert.throws(
     () => validateSmokeReport(smokeReport(), { ...REPORT_CONTEXT, commandLine: 'git status' }),
-    /context.*unexpected field commandLine/i,
+    /context.*unexpected field at index/i,
   );
 
   const missing = smokeReport();
   delete missing.status;
-  assert.throws(() => validateSmokeReport(missing, REPORT_CONTEXT), /missing field status/i);
+  assert.throws(() => validateSmokeReport(missing, REPORT_CONTEXT), /missing a required field/i);
 });
 
 test('requires report identity to match the expected spec digest, scenario, and profile', () => {
@@ -298,6 +380,36 @@ test('requires report identity to match the expected spec digest, scenario, and 
   assert.throws(
     () => validateSmokeReport(smokeReport(), { ...REPORT_CONTEXT, specSha256: 'not-a-digest' }),
     /context specSha256.*64-character.*SHA-256/i,
+  );
+});
+
+test('binds passed reports to the complete expected action list', () => {
+  const expected = { ...REPORT_CONTEXT, actions: ['editor-save', 'terminal-sentinel'] };
+  assert.equal(validateSmokeReport(smokeReport(), expected).status, 'passed');
+
+  assert.throws(
+    () => validateSmokeReport(smokeReport({
+      steps: [
+        transition('editor-save', 'started', 0),
+        transition('editor-save', 'passed', 20),
+      ],
+      durationMs: 20,
+    }), expected),
+    /expected actions|complete/i,
+  );
+  assert.throws(
+    () => validateSmokeReport(smokeReport(), {
+      ...REPORT_CONTEXT,
+      actions: ['editor-save'],
+    }),
+    /expected actions|unexpected action/i,
+  );
+  assert.throws(
+    () => validateSmokeReport(smokeReport(), {
+      ...REPORT_CONTEXT,
+      actions: ['terminal-sentinel', 'editor-save'],
+    }),
+    /expected actions.*canonical order/i,
   );
 });
 
@@ -329,7 +441,7 @@ test('requires each action to transition from started to exactly one terminal st
 });
 
 test('stops at the first failed transition and matches the single report completion status', () => {
-  const failure = { code: 'terminal-timeout', message: 'Action timed out.' };
+  const failure = { code: 'action-timeout', message: DIAGNOSTIC_CATALOG['action-timeout'] };
   const failed = smokeReport({
     status: 'failed',
     durationMs: 40,
@@ -344,12 +456,17 @@ test('stops at the first failed transition and matches the single report complet
   assert.equal(validateSmokeReport(failed, REPORT_CONTEXT).status, 'failed');
 
   assert.throws(
-    () => validateSmokeReport({ ...failed, status: 'passed', diagnostic: null }, REPORT_CONTEXT),
+    () => validateSmokeReport({
+      ...failed,
+      status: 'passed',
+      failurePhase: null,
+      diagnostic: null,
+    }, REPORT_CONTEXT),
     /passed report.*failed transition/i,
   );
   assert.throws(
     () => validateSmokeReport(smokeReport({ status: 'failed', diagnostic: failure }), REPORT_CONTEXT),
-    /failed report.*failed transition/i,
+    /action failure phase.*failed expected action/i,
   );
   assert.throws(
     () => validateSmokeReport({
@@ -363,6 +480,91 @@ test('stops at the first failed transition and matches the single report complet
     () => validateSmokeReport(smokeReport({ status: 'started' }), REPORT_CONTEXT),
     /status.*passed or failed/i,
   );
+});
+
+test('enforces explicit canonical failure phases and terminal state shapes', () => {
+  assert.equal(validateSmokeReport({
+    ...smokeReport(),
+    failurePhase: null,
+  }, REPORT_CONTEXT).status, 'passed');
+
+  for (const [failurePhase, code] of [
+    ['startup', 'startup-failed'],
+    ['sidecar', 'sidecar-failed'],
+    ['protocol', 'protocol-failed'],
+  ]) {
+    const report = validateSmokeReport(failedSmokeReport(
+      code,
+      DIAGNOSTIC_CATALOG[code],
+    ), REPORT_CONTEXT);
+    assert.equal(report.failurePhase, failurePhase);
+    assert.deepEqual(report.steps, []);
+  }
+
+  const actionFailure = validateSmokeReport(failedSmokeReport(
+    'action-failed',
+    DIAGNOSTIC_CATALOG['action-failed'],
+  ), REPORT_CONTEXT);
+  assert.equal(actionFailure.failurePhase, 'action');
+  assert.equal(actionFailure.steps.at(-1).state, 'failed');
+
+  const cleanupFailure = validateSmokeReport(failedSmokeReport(
+    'cleanup-failed',
+    DIAGNOSTIC_CATALOG['cleanup-failed'],
+  ), REPORT_CONTEXT);
+  assert.equal(cleanupFailure.failurePhase, 'cleanup');
+  assert.equal(cleanupFailure.steps.at(-1).state, 'passed');
+});
+
+test('rejects failure phases that do not match their action progress or diagnostic', () => {
+  const actionDiagnostic = {
+    code: 'action-failed',
+    message: DIAGNOSTIC_CATALOG['action-failed'],
+  };
+  const invalid = [
+    { ...smokeReport(), failurePhase: 'action' },
+    failedSmokeReport('startup-failed', DIAGNOSTIC_CATALOG['startup-failed']),
+    {
+      ...failedSmokeReport('protocol-failed', DIAGNOSTIC_CATALOG['protocol-failed']),
+      steps: [
+        transition('editor-save', 'started', 0),
+        transition('editor-save', 'passed', 1),
+      ],
+      durationMs: 1,
+    },
+    {
+      ...failedSmokeReport('cleanup-failed', DIAGNOSTIC_CATALOG['cleanup-failed']),
+      steps: [
+        transition('editor-save', 'started', 0),
+        transition('editor-save', 'passed', 1),
+      ],
+      durationMs: 1,
+    },
+    {
+      ...failedSmokeReport('action-failed', DIAGNOSTIC_CATALOG['action-failed']),
+      failurePhase: 'cleanup',
+      diagnostic: actionDiagnostic,
+    },
+    {
+      ...failedSmokeReport('action-failed', DIAGNOSTIC_CATALOG['action-failed']),
+      failurePhase: 'unknown',
+    },
+    {
+      ...failedSmokeReport('action-failed', DIAGNOSTIC_CATALOG['action-failed']),
+      diagnostic: {
+        code: 'action-timeout',
+        message: DIAGNOSTIC_CATALOG['action-timeout'],
+      },
+    },
+  ];
+  invalid[1].failurePhase = 'action';
+
+  for (const candidate of invalid) {
+    assert.throws(
+      () => validateSmokeReport(candidate, REPORT_CONTEXT),
+      /failure phase|failurePhase|terminal state|expected actions|diagnostics/i,
+    );
+  }
 });
 
 test('requires safe monotonic transition and completion durations', () => {
@@ -387,7 +589,7 @@ test('requires safe monotonic transition and completion durations', () => {
 });
 
 test('requires bounded canonical diagnostics only for failures', () => {
-  const baseFailure = { code: 'action-failed', message: 'Action failed.' };
+  const baseFailure = { code: 'action-failed', message: DIAGNOSTIC_CATALOG['action-failed'] };
   const failedReport = (diagnostic, stepDiagnostic = diagnostic) => smokeReport({
     status: 'failed',
     durationMs: 10,
@@ -412,8 +614,8 @@ test('requires bounded canonical diagnostics only for failures', () => {
   );
 
   const invalidDiagnostics = [
-    { code: 'UPPER_CASE', message: 'Action failed.' },
-    { code: `a${'-b'.repeat(32)}`, message: 'Action failed.' },
+    { code: 'UPPER_CASE', message: DIAGNOSTIC_CATALOG['action-failed'] },
+    { code: `a${'-b'.repeat(32)}`, message: DIAGNOSTIC_CATALOG['action-failed'] },
     { code: 'action-failed', message: '' },
     { code: 'action-failed', message: 'x'.repeat(257) },
     { code: 'action-failed', message: 'Line one\nLine two' },
@@ -464,7 +666,7 @@ test('rejects host paths, environment data, and command lines in diagnostic mess
     'Process API-KEY secret-value',
   ];
   for (const message of unsafeMessages) {
-    const diagnostic = { code: 'unsafe-diagnostic', message };
+    const diagnostic = { code: 'action-failed', message };
     assert.throws(
       () => validateSmokeReport(smokeReport({
         status: 'failed',
@@ -475,29 +677,20 @@ test('rejects host paths, environment data, and command lines in diagnostic mess
           transition('editor-save', 'failed', 10, diagnostic),
         ],
       }), REPORT_CONTEXT),
-      /diagnostic message.*catalog/i,
+      /diagnostic message.*(catalog|code)/i,
     );
   }
 });
 
-test('accepts every exact generic diagnostic catalog message', () => {
-  for (const message of SAFE_DIAGNOSTIC_MESSAGES) {
-    const diagnostic = { code: 'safe-diagnostic', message };
-    const report = validateSmokeReport(smokeReport({
-      status: 'failed',
-      durationMs: 10,
-      diagnostic,
-      steps: [
-        transition('editor-save', 'started', 0),
-        transition('editor-save', 'failed', 10, diagnostic),
-      ],
-    }), REPORT_CONTEXT);
+test('accepts every exact diagnostic code and message mapping', () => {
+  for (const [code, message] of Object.entries(DIAGNOSTIC_CATALOG)) {
+    const report = validateSmokeReport(failedSmokeReport(code, message), REPORT_CONTEXT);
     assert.equal(report.diagnostic.message, message);
   }
 });
 
 test('rejects details and non-exact variants of every diagnostic catalog message', () => {
-  for (const message of SAFE_DIAGNOSTIC_MESSAGES) {
+  for (const [code, message] of Object.entries(DIAGNOSTIC_CATALOG)) {
     const variants = [
       `Unexpected ${message}`,
       `${message} secret details`,
@@ -509,7 +702,7 @@ test('rejects details and non-exact variants of every diagnostic catalog message
       `${message} `,
     ];
     for (const variant of variants) {
-      const diagnostic = { code: 'unsafe-diagnostic', message: variant };
+      const diagnostic = { code, message: variant };
       assert.throws(
         () => validateSmokeReport(smokeReport({
           status: 'failed',
@@ -522,6 +715,102 @@ test('rejects details and non-exact variants of every diagnostic catalog message
         }), REPORT_CONTEXT),
         /diagnostic message/i,
       );
+    }
+  }
+});
+
+test('rejects unknown diagnostic codes and mismatched catalog pairs', () => {
+  const unknown = {
+    code: 'token-secret-value',
+    message: DIAGNOSTIC_CATALOG['action-failed'],
+  };
+  const mismatched = {
+    code: 'action-failed',
+    message: DIAGNOSTIC_CATALOG['cleanup-failed'],
+  };
+  for (const diagnostic of [unknown, mismatched]) {
+    assert.throws(
+      () => validateSmokeReport(smokeReport({
+        status: 'failed',
+        durationMs: 10,
+        diagnostic,
+        steps: [
+          transition('editor-save', 'started', 0),
+          transition('editor-save', 'failed', 10, diagnostic),
+        ],
+      }), REPORT_CONTEXT),
+      /diagnostic (code|message|catalog)/i,
+    );
+  }
+});
+
+test('deep-freezes every normalized spec and report structure', () => {
+  const spec = validateSmokeSpec(smokeSpec());
+  const report = validateSmokeReport(failedSmokeReport(
+    'action-failed',
+    DIAGNOSTIC_CATALOG['action-failed'],
+  ), REPORT_CONTEXT);
+
+  for (const value of [
+    spec,
+    spec.files,
+    spec.actions,
+    report,
+    report.steps,
+    report.steps[0],
+    report.steps.at(-1).diagnostic,
+    report.diagnostic,
+  ]) {
+    assert.equal(Object.isFrozen(value), true);
+  }
+
+  assert.throws(() => { spec.workspace = 'other'; }, TypeError);
+  assert.throws(() => spec.files.push('other.R'), TypeError);
+  assert.throws(() => { spec.actions[0] = 'terminal-sentinel'; }, TypeError);
+  assert.throws(() => { report.status = 'passed'; }, TypeError);
+  assert.throws(() => report.steps.push(transition('terminal-sentinel', 'started', 11)), TypeError);
+  assert.throws(() => { report.steps[0].state = 'passed'; }, TypeError);
+  assert.throws(() => { report.diagnostic.message = 'Smoke action timed out.'; }, TypeError);
+  assert.throws(() => { report.steps.at(-1).diagnostic.code = 'action-timeout'; }, TypeError);
+});
+
+test('never echoes untrusted field names, action values, or path values in errors', () => {
+  const fieldMarker = 'FIELD_TOKEN_SECRET_VALUE';
+  const actionMarker = 'action-token-secret-value';
+  const pathMarker = 'path-token-secret-value';
+  const errors = [
+    captureValidationError(() => validateSmokeSpec({
+      ...smokeSpec(),
+      [fieldMarker]: true,
+    })),
+    captureValidationError(() => validateSmokeSpec(smokeSpec({ actions: [actionMarker] }))),
+    captureValidationError(() => validateSmokeSpec(smokeSpec({
+      files: [`${pathMarker}/../startup.R`],
+    }))),
+    captureValidationError(() => validateSmokeReport({
+      ...smokeReport(),
+      [fieldMarker]: true,
+    }, REPORT_CONTEXT)),
+    captureValidationError(() => validateSmokeReport(smokeReport({
+      steps: [transition(actionMarker, 'started', 0)],
+      durationMs: 0,
+    }), REPORT_CONTEXT)),
+    captureValidationError(() => validateSmokeReport(smokeReport(), {
+      ...REPORT_CONTEXT,
+      actions: [actionMarker],
+    })),
+    captureValidationError(() => validateSmokeReport(failedSmokeReport(
+      'action-failed',
+      DIAGNOSTIC_CATALOG['action-failed'],
+    ), {
+      ...REPORT_CONTEXT,
+      [fieldMarker]: true,
+    })),
+  ];
+
+  for (const error of errors) {
+    for (const marker of [fieldMarker, actionMarker, pathMarker]) {
+      assert.doesNotMatch(error.message, new RegExp(marker, 'i'));
     }
   }
 });

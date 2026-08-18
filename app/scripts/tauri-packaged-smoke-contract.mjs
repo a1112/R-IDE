@@ -50,29 +50,48 @@ const REPORT_KEYS = Object.freeze([
   'scenario',
   'profile',
   'status',
+  'failurePhase',
   'durationMs',
   'diagnostic',
   'steps',
 ]);
-const REPORT_CONTEXT_KEYS = Object.freeze(['specSha256', 'scenario', 'profile']);
+const REPORT_CONTEXT_KEYS = Object.freeze(['specSha256', 'scenario', 'profile', 'actions']);
 const TRANSITION_KEYS = Object.freeze(['action', 'state', 'durationMs', 'diagnostic']);
 const DIAGNOSTIC_KEYS = Object.freeze(['code', 'message']);
 const REPORT_STATUSES = Object.freeze(['passed', 'failed']);
 const TRANSITION_STATES = Object.freeze(['started', 'passed', 'failed']);
+const FAILURE_PHASES = Object.freeze(['action', 'startup', 'sidecar', 'protocol', 'cleanup']);
+const NON_ACTION_FAILURE_CODES = Object.freeze({
+  startup: 'startup-failed',
+  sidecar: 'sidecar-failed',
+  protocol: 'protocol-failed',
+  cleanup: 'cleanup-failed',
+});
+const ACTION_FAILURE_CODES = Object.freeze(['action-failed', 'action-timeout']);
 const MAX_DIAGNOSTIC_CODE_LENGTH = 64;
 const MAX_DIAGNOSTIC_MESSAGE_LENGTH = 256;
 const DIAGNOSTIC_CODE_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
-const DIAGNOSTIC_MESSAGE_CATALOG = Object.freeze([
-  'Startup failed.',
-  'Action failed.',
-  'Action timed out.',
-  'Sidecar startup failed.',
-  'Cleanup failed.',
-  'Protocol validation failed.',
-]);
+const DIAGNOSTIC_CATALOG = Object.freeze({
+  'startup-failed': 'Application startup failed.',
+  'action-failed': 'Smoke action failed.',
+  'action-timeout': 'Smoke action timed out.',
+  'sidecar-failed': 'Backend sidecar failed.',
+  'protocol-failed': 'Smoke protocol failed.',
+  'cleanup-failed': 'Process cleanup failed.',
+});
 
 function fail(message) {
   throw new Error(message);
+}
+
+function deepFreeze(value) {
+  if (value !== null && typeof value === 'object' && !Object.isFrozen(value)) {
+    for (const nested of Object.values(value)) {
+      deepFreeze(nested);
+    }
+    Object.freeze(value);
+  }
+  return value;
 }
 
 function exactKeys(value, keys, label) {
@@ -80,14 +99,14 @@ function exactKeys(value, keys, label) {
     fail(`${label} must be an object`);
   }
   const expected = new Set(keys);
-  for (const key of Object.keys(value)) {
+  for (const [index, key] of Object.keys(value).entries()) {
     if (!expected.has(key)) {
-      fail(`${label} has unexpected field ${key}`);
+      fail(`${label} has unexpected field at index ${index}`);
     }
   }
   for (const key of expected) {
     if (!Object.hasOwn(value, key)) {
-      fail(`${label} is missing field ${key}`);
+      fail(`${label} is missing a required field`);
     }
   }
 }
@@ -97,6 +116,16 @@ function enumValue(value, allowed, label) {
     fail(`${label} is unsupported`);
   }
   return value;
+}
+
+function validateWindowsPortableSegment(segment, label, index) {
+  if (segment.includes(':') || segment.endsWith('.') || segment.endsWith(' ')) {
+    fail(`${label} must be Windows-portable at segment ${index}`);
+  }
+  const deviceName = segment.split('.', 1)[0].toUpperCase();
+  if (/^(?:CON|PRN|AUX|NUL|CLOCK\$|CONIN\$|CONOUT\$|COM[1-9¹²³]|LPT[1-9¹²³])$/u.test(deviceName)) {
+    fail(`${label} must be Windows-portable at segment ${index}`);
+  }
 }
 
 function relativePath(value, label, { allowDot = false } = {}) {
@@ -116,6 +145,11 @@ function relativePath(value, label, { allowDot = false } = {}) {
   if (segments.some((segment, index) => segment === '' && index !== segments.length - 1)) {
     fail(`${label} must be a canonical relative path`);
   }
+  segments.forEach((segment, index) => {
+    if (segment !== '' && segment !== '.') {
+      validateWindowsPortableSegment(segment, label, index);
+    }
+  });
   const normalizedSegments = segments.filter(segment => segment !== '' && segment !== '.');
   if (normalizedSegments.length === 0) {
     if (allowDot && segments.every(segment => segment === '' || segment === '.')) {
@@ -137,27 +171,28 @@ function validateFiles(value) {
   const files = stringArray(value, 'Smoke spec files').map((file, index) => (
     relativePath(file, `Smoke spec files[${index}]`)
   ));
-  if (new Set(files).size !== files.length) {
-    fail('Smoke spec files must be unique');
+  if (new Set(files.map(file => file.toLowerCase())).size !== files.length) {
+    fail('Smoke spec files must be case-insensitive unique');
   }
   return files;
 }
 
-function validateActions(value) {
-  const actions = stringArray(value, 'Smoke spec actions');
+function validateActions(value, label = 'Smoke spec actions') {
+  const actions = stringArray(value, label);
   const normalized = [];
   const seen = new Set();
   let previousIndex = -1;
-  for (const action of actions) {
+  for (let index = 0; index < actions.length; index += 1) {
+    const action = actions[index];
     const actionIndex = SMOKE_ACTIONS.indexOf(action);
     if (actionIndex < 0) {
-      fail(`Smoke spec has unsupported action ${String(action)}`);
+      fail(`${label} has unsupported action at index ${index}`);
     }
     if (seen.has(action)) {
-      fail(`Smoke spec has duplicate action ${action}`);
+      fail(`${label} has duplicate action at index ${index}`);
     }
     if (actionIndex <= previousIndex) {
-      fail('Smoke spec actions must follow canonical order');
+      fail(`${label} must follow canonical order`);
     }
     seen.add(action);
     normalized.push(action);
@@ -193,8 +228,9 @@ function validateDiagnostic(value, label) {
   exactKeys(value, DIAGNOSTIC_KEYS, label);
   if (typeof value.code !== 'string'
     || value.code.length > MAX_DIAGNOSTIC_CODE_LENGTH
-    || !DIAGNOSTIC_CODE_PATTERN.test(value.code)) {
-    fail(`${label} code must be a canonical lowercase identifier of at most ${MAX_DIAGNOSTIC_CODE_LENGTH} characters`);
+    || !DIAGNOSTIC_CODE_PATTERN.test(value.code)
+    || !Object.hasOwn(DIAGNOSTIC_CATALOG, value.code)) {
+    fail(`${label} code must be a supported diagnostic code`);
   }
   if (typeof value.message !== 'string'
     || value.message.length === 0
@@ -203,8 +239,8 @@ function validateDiagnostic(value, label) {
     || /[\u0000-\u001f\u007f]/.test(value.message)) {
     fail(`${label} message must be a bounded single-line string of at most ${MAX_DIAGNOSTIC_MESSAGE_LENGTH} characters`);
   }
-  if (!DIAGNOSTIC_MESSAGE_CATALOG.includes(value.message)) {
-    fail(`${label} message must be an exact diagnostic catalog entry`);
+  if (value.message !== DIAGNOSTIC_CATALOG[value.code]) {
+    fail(`${label} message must match its diagnostic code`);
   }
   return { code: value.code, message: value.message };
 }
@@ -215,10 +251,11 @@ function validateReportContext(value) {
     specSha256: validateSha256(value.specSha256, 'Smoke report context specSha256'),
     scenario: enumValue(value.scenario, SMOKE_SCENARIOS, 'Smoke report context scenario'),
     profile: enumValue(value.profile, SMOKE_PROFILES, 'Smoke report context profile'),
+    actions: validateActions(value.actions, 'Smoke report expected actions'),
   };
 }
 
-function validateReportTransitions(value) {
+function validateReportTransitions(value, expectedActions) {
   const transitions = stringArray(value, 'Smoke report steps');
   const normalized = [];
   const seenActions = new Set();
@@ -226,6 +263,7 @@ function validateReportTransitions(value) {
   let previousActionIndex = -1;
   let previousDuration = 0;
   let failed = false;
+  let passedCount = 0;
 
   for (let index = 0; index < transitions.length; index += 1) {
     const transition = transitions[index];
@@ -233,7 +271,7 @@ function validateReportTransitions(value) {
     exactKeys(transition, TRANSITION_KEYS, label);
     const actionIndex = SMOKE_ACTIONS.indexOf(transition.action);
     if (actionIndex < 0) {
-      fail(`${label} has unsupported action ${String(transition.action)}`);
+      fail(`${label} has unsupported action`);
     }
     const state = enumValue(transition.state, TRANSITION_STATES, `${label} state`);
     const durationMs = nonNegativeSafeInteger(transition.durationMs, `${label} durationMs`);
@@ -247,13 +285,16 @@ function validateReportTransitions(value) {
     let diagnostic = null;
     if (state === 'started') {
       if (pendingAction !== undefined) {
-        fail(`Smoke report action ${pendingAction} must complete before another started transition`);
+        fail(`Smoke report action at transition ${index} must wait for the prior terminal transition`);
       }
       if (seenActions.has(transition.action)) {
-        fail(`Smoke report has duplicate action ${transition.action}`);
+        fail(`Smoke report has duplicate action at transition ${index}`);
       }
       if (actionIndex <= previousActionIndex) {
         fail('Smoke report actions must follow canonical order');
+      }
+      if (expectedActions[seenActions.size] !== transition.action) {
+        fail(`Smoke report has unexpected action at transition ${index}`);
       }
       if (transition.diagnostic !== null) {
         fail('Smoke report started transition diagnostic must be null');
@@ -263,13 +304,15 @@ function validateReportTransitions(value) {
       previousActionIndex = actionIndex;
     } else {
       if (pendingAction !== transition.action) {
-        fail(`Smoke report ${state} transition must follow started for ${transition.action}`);
+        fail(`Smoke report terminal transition at index ${index} must follow its started transition`);
       }
       if (state === 'failed') {
         diagnostic = validateDiagnostic(transition.diagnostic, 'Smoke report failed transition diagnostic');
         failed = true;
       } else if (transition.diagnostic !== null) {
         fail('Smoke report passed transition diagnostic must be null');
+      } else {
+        passedCount += 1;
       }
       pendingAction = undefined;
     }
@@ -278,9 +321,14 @@ function validateReportTransitions(value) {
   }
 
   if (pendingAction !== undefined) {
-    fail(`Smoke report started transition for ${pendingAction} must complete`);
+    fail('Smoke report final started transition must complete');
   }
-  return { transitions: normalized, failed, lastDurationMs: previousDuration };
+  return {
+    transitions: normalized,
+    failed,
+    lastDurationMs: previousDuration,
+    passedCount,
+  };
 }
 
 export function validateSmokeSpec(value) {
@@ -292,7 +340,7 @@ export function validateSmokeSpec(value) {
     fail('Smoke spec version must be 1');
   }
 
-  return {
+  return deepFreeze({
     schema: value.schema,
     version: value.version,
     scenario: enumValue(value.scenario, SMOKE_SCENARIOS, 'Smoke spec scenario'),
@@ -302,7 +350,7 @@ export function validateSmokeSpec(value) {
     actions: validateActions(value.actions),
     tokenSha256: validateSha256(value.tokenSha256, 'Smoke spec tokenSha256'),
     actionTimeoutMs: validateActionTimeout(value.actionTimeoutMs),
-  };
+  });
 }
 
 export function validateSmokeReport(value, expected) {
@@ -328,6 +376,10 @@ export function validateSmokeReport(value, expected) {
     fail('Smoke report status must be passed or failed');
   }
   const status = value.status;
+  const failurePhase = value.failurePhase;
+  if (failurePhase !== null && !FAILURE_PHASES.includes(failurePhase)) {
+    fail('Smoke report failurePhase must be null or a supported failure phase');
+  }
   const durationMs = nonNegativeSafeInteger(value.durationMs, 'Smoke report durationMs');
   let diagnostic = null;
   if (status === 'passed') {
@@ -337,30 +389,60 @@ export function validateSmokeReport(value, expected) {
   } else {
     diagnostic = validateDiagnostic(value.diagnostic, 'Smoke report failed report diagnostic');
   }
-  const { transitions, failed, lastDurationMs } = validateReportTransitions(value.steps);
+  const {
+    transitions,
+    failed,
+    lastDurationMs,
+    passedCount,
+  } = validateReportTransitions(value.steps, context.actions);
   if (durationMs < lastDurationMs) {
     fail('Smoke report durationMs must not precede its final transition');
   }
 
   if (status === 'passed') {
+    if (failurePhase !== null) {
+      fail('Smoke report passed terminal state requires a null failure phase');
+    }
     if (failed) {
       fail('Smoke report passed report must not contain a failed transition');
     }
+    if (passedCount !== context.actions.length) {
+      fail('Smoke report passed report must complete all expected actions');
+    }
   } else {
-    if (!failed) {
-      fail('Smoke report failed report must contain a failed transition');
+    if (failurePhase === null) {
+      fail('Smoke report failed terminal state requires a failure phase');
+    }
+    if (failurePhase === 'action') {
+      if (!failed || !ACTION_FAILURE_CODES.includes(diagnostic.code)) {
+        fail('Smoke report action failure phase requires one failed expected action');
+      }
+      const stepDiagnostic = transitions.at(-1)?.diagnostic;
+      if (stepDiagnostic?.code !== diagnostic.code || stepDiagnostic.message !== diagnostic.message) {
+        fail('Smoke report action failure diagnostics must match');
+      }
+    } else if (failurePhase === 'cleanup') {
+      if (failed
+        || passedCount !== context.actions.length
+        || diagnostic.code !== NON_ACTION_FAILURE_CODES.cleanup) {
+        fail('Smoke report cleanup failure phase requires all expected actions');
+      }
+    } else if (transitions.length !== 0
+      || diagnostic.code !== NON_ACTION_FAILURE_CODES[failurePhase]) {
+      fail('Smoke report pre-action failure phase requires no action transitions');
     }
   }
 
-  return {
+  return deepFreeze({
     schema: value.schema,
     version: value.version,
     specSha256,
     scenario,
     profile,
     status,
+    failurePhase,
     durationMs,
     diagnostic,
     steps: transitions,
-  };
+  });
 }
