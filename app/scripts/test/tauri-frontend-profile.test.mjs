@@ -1128,6 +1128,35 @@ test('resolves an installed package manifest when exports hide package metadata 
     assert.equal(installed.manifest.name, '@openai/codex-sdk');
 });
 
+test('resolves a range-compatible installed copy past an unrelated Yarn hoist', async t => {
+    const applicationDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-hoist-range-'));
+    t.after(() => fs.promises.rm(applicationDirectory, { recursive: true, force: true }));
+    const parentDirectory = path.join(applicationDirectory, 'node_modules', 'parent');
+    const hoistedDependency = path.join(applicationDirectory, 'node_modules', 'dependency');
+    const unrelatedNestedDependency = path.join(parentDirectory, 'node_modules', 'dependency');
+    await Promise.all([
+        fs.promises.mkdir(parentDirectory, { recursive: true }),
+        fs.promises.mkdir(hoistedDependency, { recursive: true }),
+        fs.promises.mkdir(unrelatedNestedDependency, { recursive: true }),
+    ]);
+    await Promise.all([
+        fs.promises.writeFile(path.join(applicationDirectory, 'package.json'), '{}'),
+        fs.promises.writeFile(path.join(parentDirectory, 'package.json'), JSON.stringify({
+            name: 'parent', version: '1.0.0', dependencies: { dependency: '^1.0.0' },
+        })),
+        fs.promises.writeFile(path.join(hoistedDependency, 'package.json'), JSON.stringify({
+            name: 'dependency', version: '1.5.0',
+        })),
+        fs.promises.writeFile(path.join(unrelatedNestedDependency, 'package.json'), JSON.stringify({
+            name: 'dependency', version: '2.0.0',
+        })),
+    ]);
+
+    const installed = await resolveInstalledManifest('dependency', parentDirectory, '^1.0.0');
+    assert.equal(installed.packageDirectory, hoistedDependency);
+    assert.equal(installed.manifest.version, '1.5.0');
+});
+
 async function writeSentinel(directory, value) {
     await fs.promises.mkdir(directory, { recursive: true });
     await fs.promises.writeFile(path.join(directory, 'sentinel.txt'), value);
