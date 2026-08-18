@@ -322,6 +322,23 @@ test('accepts valid Unicode filenames on Windows-portable paths', () => {
   assert.deepEqual(spec.files, ['分析/启动.R', 'café/数据📊.R']);
 });
 
+test('rejects Windows ordinal-style single-code-point case collisions', () => {
+  assert.throws(
+    () => validateSmokeSpec(smokeSpec({ files: ['σ.R', 'ς.R'] })),
+    /files.*case-insensitive.*unique/i,
+  );
+  assert.throws(
+    () => validateSmokeSpec(smokeSpec({ files: ['nested/σ.R', 'nested/ς.R'] })),
+    /files.*case-insensitive.*unique/i,
+  );
+});
+
+test('preserves expanding uppercase and normalization-distinct Unicode filenames', () => {
+  const files = ['ß.R', 'SS.R', 'é.R', 'e\u0301.R'];
+
+  assert.deepEqual(validateSmokeSpec(smokeSpec({ files })).files, files);
+});
+
 test('requires actions to be known, unique, and in canonical order', () => {
   assert.deepEqual(
     validateSmokeSpec(smokeSpec({ actions: ['editor-save', 'scm-status', 'secondary-window'] })).actions,

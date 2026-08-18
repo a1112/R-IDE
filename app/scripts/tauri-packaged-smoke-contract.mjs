@@ -167,11 +167,22 @@ function stringArray(value, label) {
   return value;
 }
 
+function windowsOrdinalCaseKey(path) {
+  return path.split('/').map(segment => {
+    let key = '';
+    for (const codePoint of segment) {
+      const uppercase = codePoint.toUpperCase();
+      key += [...uppercase].length === 1 ? uppercase : codePoint;
+    }
+    return key;
+  }).join('/');
+}
+
 function validateFiles(value) {
   const files = stringArray(value, 'Smoke spec files').map((file, index) => (
     relativePath(file, `Smoke spec files[${index}]`)
   ));
-  if (new Set(files.map(file => file.toLowerCase())).size !== files.length) {
+  if (new Set(files.map(windowsOrdinalCaseKey)).size !== files.length) {
     fail('Smoke spec files must be case-insensitive unique');
   }
   return files;
