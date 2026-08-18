@@ -54,6 +54,14 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
     return { promise, resolve };
 }
 
+function deferredValue<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>(done => {
+        resolve = done;
+    });
+    return { promise, resolve };
+}
+
 async function waitUntil(predicate: () => boolean, message: string): Promise<void> {
     for (let attempt = 0; attempt < 40; attempt++) {
         if (predicate()) {
@@ -568,6 +576,36 @@ test('packaged smoke rejects non-canonical or non-portable workspace and file pa
     }
 });
 
+test('packaged smoke path control-character boundary matches the canonical contract', async () => {
+    const boundaries = [
+        { codePoint: 0x001F, accepted: false },
+        { codePoint: 0x0020, accepted: true },
+        { codePoint: 0x007F, accepted: true },
+        { codePoint: 0x0080, accepted: true },
+        { codePoint: 0x009F, accepted: true },
+        { codePoint: 0x00A0, accepted: true }
+    ];
+
+    for (const boundary of boundaries) {
+        const character = String.fromCodePoint(boundary.codePoint);
+        const response = activePlan(['editor-save']) as Record<string, unknown>;
+        response.plan = { ...smokePlan(['editor-save']), files: [`safe/file${character}name.txt`] };
+        const protocol = new FakeProtocol(true, response);
+        const actionCalls: string[] = [];
+        new RidePackagedSmokeContribution(
+            immediateState(), protocol, () => actions(actionCalls), { now: () => 0 }
+        ).onStart();
+        await waitUntil(() => protocol.calls.some(call => call.method === 'complete'),
+            `U+${boundary.codePoint.toString(16).padStart(4, '0')} did not reach terminal`);
+
+        assert.deepEqual(actionCalls, boundary.accepted ? ['editor-save'] : []);
+        assert.equal(
+            (protocol.calls.find(call => call.method === 'complete')?.request as { failurePhase?: string | null }).failurePhase,
+            boundary.accepted ? null : 'protocol'
+        );
+    }
+});
+
 test('packaged smoke validates complete disabled and rejected plan response shapes', async () => {
     const malformedResponses: unknown[] = [
         { mode: 'disabled', plan: null, sessionProof: null },
@@ -652,6 +690,46 @@ test('packaged smoke disposal and repeated startup never execute twice', async (
     await waitUntil(() => protocol.calls.some(call => call.method === 'complete'), 'empty smoke did not complete');
     assert.equal(protocol.calls.filter(call => call.method === 'plan').length, 1);
     assert.equal(protocol.calls.filter(call => call.method === 'complete').length, 1);
+});
+
+test('packaged smoke plan already in flight reaches terminal when disposed before active response resumes', async () => {
+    const pendingPlan = deferredValue<unknown>();
+    const protocol = new FakeProtocol(true, pendingPlan.promise);
+    let actionResolutions = 0;
+    const contribution = new RidePackagedSmokeContribution(immediateState(), protocol, () => {
+        actionResolutions++;
+        return actions([]);
+    }, { now: () => 0 });
+
+    contribution.onStart();
+    await waitUntil(() => protocol.calls.some(call => call.method === 'plan'), 'plan IPC was not issued');
+    contribution.dispose();
+    pendingPlan.resolve(activePlan([]));
+    await waitUntil(() => protocol.calls.some(call => call.method === 'complete'), 'in-flight active plan did not reach terminal');
+
+    assert.equal(actionResolutions, 1);
+    assert.deepEqual(protocol.calls.filter(call => call.method === 'complete').map(call => call.request), [{
+        status: 'passed', failurePhase: null, durationMs: 0, diagnostic: null
+    }]);
+});
+
+test('packaged smoke plan already in flight remains lazy when disposed response is disabled', async () => {
+    const pendingPlan = deferredValue<unknown>();
+    const protocol = new FakeProtocol(true, pendingPlan.promise);
+    let actionResolutions = 0;
+    const contribution = new RidePackagedSmokeContribution(immediateState(), protocol, () => {
+        actionResolutions++;
+        return actions([]);
+    });
+
+    contribution.onStart();
+    await waitUntil(() => protocol.calls.some(call => call.method === 'plan'), 'plan IPC was not issued');
+    contribution.dispose();
+    pendingPlan.resolve({ mode: 'disabled', plan: null, sessionProof: null, diagnostic: null });
+    await new Promise<void>(resolve => setImmediate(resolve));
+
+    assert.equal(actionResolutions, 0);
+    assert.deepEqual(protocol.calls, [{ method: 'plan' }]);
 });
 
 test('packaged smoke active session reaches failed terminal when disposed during a stuck action', async () => {

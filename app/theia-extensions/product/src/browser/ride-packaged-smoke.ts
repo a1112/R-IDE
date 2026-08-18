@@ -210,9 +210,6 @@ export class RidePackagedSmokeContribution implements FrontendApplicationContrib
         }
 
         const response = await this.protocol.plan();
-        if (this.disposed) {
-            return;
-        }
         const parsed = parsePlanResponse(response);
         if (parsed.kind === 'inactive') {
             return;
@@ -496,7 +493,7 @@ function isCanonicalPortablePath(value: unknown, allowDot: boolean): value is st
 }
 
 function isWindowsPortableSegment(segment: string): boolean {
-    if (/[<>:"|?*\u0000-\u001f\u007f-\u009f]/u.test(segment)
+    if (/[<>:"|?*\u0000-\u001f]/u.test(segment)
         || segment.endsWith('.') || segment.endsWith(' ')) {
         return false;
     }
