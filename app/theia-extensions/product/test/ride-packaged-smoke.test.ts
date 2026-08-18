@@ -21,6 +21,16 @@ import { RidePackagedSmokeActionService } from '../src/browser/ride-packaged-smo
 
 const PROOF = 'b'.repeat(64);
 const PROTOCOL_DIAGNOSTIC = { code: 'protocol-failed', message: 'Smoke protocol failed.' } as const;
+const FULL_ACTIONS: readonly RideSmokeAction[] = [
+    'editor-save',
+    'terminal-sentinel',
+    'workspace-search',
+    'scm-status',
+    'packaged-plugin-command',
+    'secondary-window',
+    'second-file-forwarding'
+];
+const EMPTY_ACTIONS: readonly RideSmokeAction[] = ['terminal-sentinel', 'packaged-plugin-command'];
 
 interface ProtocolCall {
     readonly method: 'plan' | 'recordStep' | 'complete';
@@ -44,6 +54,24 @@ function activePlan(actions: RideSmokeAction[]): unknown {
     return {
         mode: 'active',
         plan: smokePlan(actions),
+        sessionProof: PROOF,
+        diagnostic: null
+    };
+}
+
+function criticalEmptyPlan(): RideSmokePlan {
+    return {
+        ...smokePlan([...EMPTY_ACTIONS]),
+        scenario: 'critical-empty',
+        profile: 'tauri-critical',
+        files: []
+    };
+}
+
+function activeCriticalEmptyPlan(): unknown {
+    return {
+        mode: 'active',
+        plan: criticalEmptyPlan(),
         sessionProof: PROOF,
         diagnostic: null
     };
@@ -251,7 +279,7 @@ class ReplayAwareProtocol implements RidePackagedSmokeProtocol {
 
 class AmbiguousFailedRecordProtocol extends ReplayAwareProtocol {
     constructor(protected readonly applyFailedTransition: boolean) {
-        super(['editor-save'], new Set());
+        super([...FULL_ACTIONS], new Set());
     }
 
     override async recordStep(sessionProof: string, request: RideSmokeStepRequest): Promise<unknown> {
@@ -285,6 +313,14 @@ function actions(
         prepareSecondFile: () => ({ dispose: () => undefined }),
         waitForSecondFile: action('second-file-forwarding'),
         ...overrides
+    };
+}
+
+function forwardingActions(service: RidePackagedSmokeActionService): RidePackagedSmokeActions {
+    return {
+        ...actions([]),
+        prepareSecondFile: plan => service.prepareSecondFile(plan),
+        waitForSecondFile: plan => service.waitForSecondFile(plan)
     };
 }
 
@@ -322,7 +358,7 @@ test('packaged smoke waits for attached_shell before querying the protocol', asy
 });
 
 test('packaged smoke is inert outside Tauri and never resolves actions', async () => {
-    const protocol = new FakeProtocol(false, activePlan(['editor-save']));
+    const protocol = new FakeProtocol(false, activePlan([...FULL_ACTIONS]));
     let actionResolutions = 0;
     const contribution = new RidePackagedSmokeContribution(immediateState(), protocol, () => {
         actionResolutions++;
@@ -451,8 +487,9 @@ test('packaged smoke arms second-file observation before started becomes externa
             (handle as { cleared: boolean }).cleared = true;
         }
     });
-    const protocol = new FakeProtocol(true, activePlan(['second-file-forwarding']), (method, request) => {
+    const protocol = new FakeProtocol(true, activePlan([...FULL_ACTIONS]), (method, request) => {
         if (method === 'recordStep'
+            && (request as RideSmokeStepRequest).action === 'second-file-forwarding'
             && (request as RideSmokeStepRequest).state === 'started') {
             for (const listener of [...listeners]) {
                 listener({ source: 'singleInstance', relativePath: 'second.txt' });
@@ -460,7 +497,7 @@ test('packaged smoke arms second-file observation before started becomes externa
         }
         return { status: method === 'complete' ? 'completed' : 'recorded', diagnostic: null };
     });
-    new RidePackagedSmokeContribution(immediateState(), protocol, () => smokeActions).onStart();
+    new RidePackagedSmokeContribution(immediateState(), protocol, () => forwardingActions(smokeActions)).onStart();
 
     await waitUntil(() => actionTimers.length > 0, 'forwarding action did not begin waiting');
     await new Promise<void>(resolve => setImmediate(resolve));
@@ -469,7 +506,8 @@ test('packaged smoke arms second-file observation before started becomes externa
     }
     await waitUntil(() => protocol.calls.some(call => call.method === 'complete'), 'forwarding race did not complete');
 
-    assert.deepEqual(protocol.calls.filter(call => call.method === 'recordStep')
+    assert.deepEqual(protocol.calls.filter(call => call.method === 'recordStep'
+        && (call.request as RideSmokeStepRequest).action === 'second-file-forwarding')
         .map(call => (call.request as RideSmokeStepRequest).state), ['started', 'passed']);
     assert.equal((protocol.calls.find(call => call.method === 'complete')
         ?.request as RideSmokeCompleteRequest).status, 'passed');
@@ -489,13 +527,17 @@ test('packaged smoke releases a prepared second-file observer when started canno
             dispose: () => preparationDisposals++
         })
     } as RidePackagedSmokeActions;
-    const protocol = new FakeProtocol(true, activePlan(['second-file-forwarding']), method => ({
-        status: method === 'complete' ? 'completed' : 'invalid',
+    const protocol = new FakeProtocol(true, activePlan([...FULL_ACTIONS]), (method, request) => ({
+        status: method === 'recordStep'
+            && (request as RideSmokeStepRequest).action === 'second-file-forwarding'
+            ? 'invalid'
+            : method === 'complete' ? 'completed' : 'recorded',
         diagnostic: null
     }));
     new RidePackagedSmokeContribution(immediateState(), protocol, () => preparedActions).onStart();
 
-    await waitUntil(() => protocol.calls.filter(call => call.method === 'recordStep').length === 2,
+    await waitUntil(() => protocol.calls.filter(call => call.method === 'recordStep'
+        && (call.request as RideSmokeStepRequest).action === 'second-file-forwarding').length === 2,
         'started transition was not retried');
     await new Promise<void>(resolve => setImmediate(resolve));
 
@@ -516,7 +558,7 @@ test('packaged smoke releases a prepared second-file observer after action failu
             dispose: () => preparationDisposals++
         })
     } as RidePackagedSmokeActions;
-    const protocol = new FakeProtocol(true, activePlan(['second-file-forwarding']));
+    const protocol = new FakeProtocol(true, activePlan([...FULL_ACTIONS]));
     new RidePackagedSmokeContribution(immediateState(), protocol, () => preparedActions).onStart();
 
     await waitUntil(() => protocol.calls.some(call => call.method === 'complete'),
@@ -540,15 +582,18 @@ test('packaged smoke dispose releases a prepared second-file observer while star
             dispose: () => preparationDisposals++
         })
     } as RidePackagedSmokeActions;
-    const protocol = new FakeProtocol(true, activePlan(['second-file-forwarding']), (method, request) => {
-        if (method === 'recordStep' && (request as RideSmokeStepRequest).state === 'started') {
+    const protocol = new FakeProtocol(true, activePlan([...FULL_ACTIONS]), (method, request) => {
+        if (method === 'recordStep'
+            && (request as RideSmokeStepRequest).action === 'second-file-forwarding'
+            && (request as RideSmokeStepRequest).state === 'started') {
             return startedResponse.promise;
         }
         return { status: method === 'complete' ? 'completed' : 'recorded', diagnostic: null };
     });
     const contribution = new RidePackagedSmokeContribution(immediateState(), protocol, () => preparedActions);
     contribution.onStart();
-    await waitUntil(() => protocol.calls.some(call => call.method === 'recordStep'),
+    await waitUntil(() => protocol.calls.some(call => call.method === 'recordStep'
+        && (call.request as RideSmokeStepRequest).action === 'second-file-forwarding'),
         'started transition did not begin');
 
     contribution.dispose();
@@ -560,7 +605,7 @@ test('packaged smoke dispose releases a prepared second-file observer while star
 });
 
 test('packaged smoke fails fast with one bounded action failure and never reports passed', async () => {
-    const protocol = new FakeProtocol(true, activePlan(['editor-save', 'terminal-sentinel']));
+    const protocol = new FakeProtocol(true, activePlan([...FULL_ACTIONS]));
     const actionCalls: string[] = [];
     const unsafeError = new Error('C:\\secret\\workspace token=very-secret --dangerous-command');
     const contribution = new RidePackagedSmokeContribution(
@@ -604,7 +649,7 @@ test('packaged smoke fails fast with one bounded action failure and never report
 });
 
 test('packaged smoke reports a bounded timeout and does not await the stuck action forever', async () => {
-    const protocol = new FakeProtocol(true, activePlan(['editor-save']));
+    const protocol = new FakeProtocol(true, activePlan([...FULL_ACTIONS]));
     const timers: Array<() => void> = [];
     const contribution = new RidePackagedSmokeContribution(
         immediateState(),
@@ -651,11 +696,11 @@ test('packaged smoke recognizes production action timeout and cancels forwarding
         setTimeout: actionClock.setTimeout,
         clearTimeout: actionClock.clearTimeout
     });
-    const protocol = new FakeProtocol(true, activePlan(['second-file-forwarding']));
+    const protocol = new FakeProtocol(true, activePlan([...FULL_ACTIONS]));
     new RidePackagedSmokeContribution(
         immediateState(),
         protocol,
-        () => smokeActions,
+        () => forwardingActions(smokeActions),
         { setTimeout: sequencerClock.setTimeout, clearTimeout: sequencerClock.clearTimeout }
     ).onStart();
 
@@ -681,7 +726,7 @@ test('packaged smoke recognizes production action timeout and cancels forwarding
 
 test('packaged smoke contains timer setup and cleanup failures and consumes late action rejection', async () => {
     for (const timerFailure of ['set', 'clear', 'late-reject'] as const) {
-        const protocol = new FakeProtocol(true, activePlan(['editor-save']));
+        const protocol = new FakeProtocol(true, activePlan([...FULL_ACTIONS]));
         const operation = deferredOutcome<void>();
         const unhandled: unknown[] = [];
         const onUnhandled = (error: unknown) => unhandled.push(error);
@@ -732,7 +777,7 @@ test('packaged smoke contains timer setup and cleanup failures and consumes late
 test('packaged smoke safely contains malformed, rejected, and failed IPC responses', async () => {
     const malformed = new FakeProtocol(true, {
         mode: 'active',
-        plan: { ...smokePlan(['editor-save']), actions: ['unknown-action'] },
+        plan: { ...smokePlan([...FULL_ACTIONS]), actions: ['unknown-action'] },
         sessionProof: PROOF,
         diagnostic: null
     });
@@ -750,7 +795,7 @@ test('packaged smoke safely contains malformed, rejected, and failed IPC respons
         }
     });
 
-    const rejectedUpdate = new FakeProtocol(true, activePlan(['editor-save']), method => ({
+    const rejectedUpdate = new FakeProtocol(true, activePlan([...FULL_ACTIONS]), method => ({
         status: method === 'recordStep' ? 'rejected' : 'completed',
         diagnostic: { code: 'protocol-failed', message: 'Smoke protocol failed.' }
     }));
@@ -774,8 +819,66 @@ test('packaged smoke safely contains malformed, rejected, and failed IPC respons
     assert.deepEqual(failedPlan.calls, [{ method: 'plan' }]);
 });
 
+test('packaged smoke binds active plans to the exact cross-language scenario matrix before resolving actions', async () => {
+    const validPlans: RideSmokePlan[] = [
+        { ...smokePlan([...FULL_ACTIONS]), scenario: 'critical-file', profile: 'tauri-critical' },
+        { ...smokePlan([...EMPTY_ACTIONS]), scenario: 'critical-empty', profile: 'tauri-critical', files: [] },
+        { ...smokePlan([...FULL_ACTIONS]), scenario: 'full-file', profile: 'full' }
+    ];
+    for (const plan of validPlans) {
+        let actionResolutions = 0;
+        const protocol = new FakeProtocol(true, {
+            mode: 'active', plan, sessionProof: PROOF, diagnostic: null
+        }, method => ({
+            status: method === 'recordStep' ? 'rejected' : 'completed',
+            diagnostic: method === 'recordStep' ? PROTOCOL_DIAGNOSTIC : null
+        }));
+        new RidePackagedSmokeContribution(immediateState(), protocol, () => {
+            actionResolutions++;
+            return actions([]);
+        }).onStart();
+        await waitUntil(() => protocol.calls.some(call => call.method === 'recordStep'),
+            `valid ${plan.scenario} plan did not start`);
+        assert.equal(actionResolutions, 1, `valid ${plan.scenario} plan was rejected`);
+    }
+
+    const base = validPlans[0];
+    const mismatches: RideSmokePlan[] = [
+        { ...base, profile: 'full' },
+        { ...base, files: [] },
+        { ...base, actions: [...EMPTY_ACTIONS] },
+        { ...validPlans[1], profile: 'full' },
+        { ...validPlans[1], files: ['first.txt', 'second.txt'] },
+        { ...validPlans[1], actions: [...FULL_ACTIONS] },
+        { ...validPlans[2], profile: 'tauri-critical' },
+        { ...validPlans[2], files: [] },
+        { ...validPlans[2], actions: [...EMPTY_ACTIONS] }
+    ];
+    for (const plan of mismatches) {
+        let actionResolutions = 0;
+        const protocol = new FakeProtocol(true, {
+            mode: 'active', plan, sessionProof: PROOF, diagnostic: null
+        });
+        new RidePackagedSmokeContribution(immediateState(), protocol, () => {
+            actionResolutions++;
+            return actions([]);
+        }, { now: () => 0 }).onStart();
+        await waitUntil(() => protocol.calls.some(call => call.method === 'complete'),
+            `mismatched ${plan.scenario} plan was not closed`);
+        assert.equal(actionResolutions, 0, `mismatched ${plan.scenario} plan resolved actions`);
+        assert.deepEqual(protocol.calls[protocol.calls.length - 1], {
+            method: 'complete',
+            proof: PROOF,
+            request: {
+                status: 'failed', failurePhase: 'protocol', durationMs: 0,
+                diagnostic: PROTOCOL_DIAGNOSTIC
+            }
+        });
+    }
+});
+
 test('packaged smoke rejects forwarding plans without exactly one expected second file', async () => {
-    const base = activePlan(['second-file-forwarding']) as {
+    const base = activePlan([...FULL_ACTIONS]) as {
         mode: 'active';
         plan: RideSmokePlan;
         sessionProof: string;
@@ -815,7 +918,7 @@ test('packaged smoke rejects forwarding plans without exactly one expected secon
 test('packaged smoke retries response-loss mutations with the identical request and reaches a legal passed terminal', async () => {
     const actionCalls: string[] = [];
     const protocol = new ReplayAwareProtocol(
-        ['editor-save'], new Set(['started', 'passed', 'complete'])
+        [...FULL_ACTIONS], new Set(['started', 'passed', 'complete'])
     );
     const contribution = new RidePackagedSmokeContribution(
         immediateState(), protocol, () => actions(actionCalls),
@@ -825,11 +928,12 @@ test('packaged smoke retries response-loss mutations with the identical request 
     contribution.onStart();
     await waitUntil(() => protocol.completion !== undefined, 'response-loss sequence did not reach terminal');
 
-    assert.deepEqual(actionCalls, ['editor-save']);
-    assert.deepEqual(protocol.transitions.map(transition => transition.state), ['started', 'passed']);
+    assert.deepEqual(actionCalls, FULL_ACTIONS);
+    assert.equal(protocol.transitions.length, FULL_ACTIONS.length * 2);
     assert.equal(protocol.completion?.status, 'passed');
     for (const state of ['started', 'passed'] as const) {
         const attempts = protocol.calls.filter(call => call.method === 'recordStep'
+            && (call.request as RideSmokeStepRequest).action === 'editor-save'
             && (call.request as RideSmokeStepRequest).state === state);
         assert.equal(attempts.length, 2);
         assert.strictEqual(attempts[0].request, attempts[1].request);
@@ -841,7 +945,7 @@ test('packaged smoke retries response-loss mutations with the identical request 
 
 test('packaged smoke retries failed transition and failed completion response loss without duplicate state', async () => {
     let actionCalls = 0;
-    const protocol = new ReplayAwareProtocol(['editor-save'], new Set(['failed', 'complete']));
+    const protocol = new ReplayAwareProtocol([...FULL_ACTIONS], new Set(['failed', 'complete']));
     const contribution = new RidePackagedSmokeContribution(
         immediateState(), protocol, () => actions([], {
             editorSave: async () => {
@@ -870,7 +974,9 @@ test('packaged smoke retries failed transition and failed completion response lo
 test('packaged smoke stops after two identical uncertain started, passed, or complete attempts', async () => {
     for (const failedMutation of ['started', 'passed', 'complete'] as const) {
         const actionCalls: string[] = [];
-        const protocol = new FakeProtocol(true, activePlan(failedMutation === 'complete' ? [] : ['editor-save']),
+        const protocol = new FakeProtocol(true, failedMutation === 'complete'
+            ? activeCriticalEmptyPlan()
+            : activePlan([...FULL_ACTIONS]),
             (method, request) => {
                 const state = (request as RideSmokeStepRequest).state;
                 if ((method === 'recordStep' && state === failedMutation) || method === failedMutation) {
@@ -960,7 +1066,7 @@ test('packaged smoke bounds failed completion attempts when failed transition wa
 
 test('packaged smoke rejects untrusted proof without issuing any mutation', async () => {
     for (const sessionProof of ['short-proof', 'A'.repeat(64), `${'a'.repeat(63)}g`, '', null]) {
-        const response = { ...activePlan([]) as Record<string, unknown>, sessionProof };
+        const response = { ...activeCriticalEmptyPlan() as Record<string, unknown>, sessionProof };
         const protocol = new FakeProtocol(true, response);
         let actionResolutions = 0;
         const contribution = new RidePackagedSmokeContribution(immediateState(), protocol, () => {
@@ -978,8 +1084,8 @@ test('packaged smoke rejects untrusted proof without issuing any mutation', asyn
 });
 
 test('packaged smoke strictly rejects malformed active response and plan shapes with trusted proof', async () => {
-    const validResponse = activePlan([]) as Record<string, unknown>;
-    const validPlan = smokePlan([]) as unknown as Record<string, unknown>;
+    const validResponse = activeCriticalEmptyPlan() as Record<string, unknown>;
+    const validPlan = criticalEmptyPlan() as unknown as Record<string, unknown>;
     const { diagnostic: _diagnostic, ...missingResponseField } = validResponse;
     const { files: _files, ...missingPlanField } = validPlan;
     const malformed: Array<{ name: string; response: unknown }> = [
@@ -1028,8 +1134,8 @@ test('packaged smoke rejects non-canonical or non-portable workspace and file pa
     ];
 
     for (const entry of invalidPaths) {
-        const response = activePlan([]) as Record<string, unknown>;
-        response.plan = { ...smokePlan([]), ...entry.patch };
+        const response = activeCriticalEmptyPlan() as Record<string, unknown>;
+        response.plan = { ...criticalEmptyPlan(), ...entry.patch };
         const protocol = new FakeProtocol(true, response);
         let actionResolutions = 0;
         new RidePackagedSmokeContribution(immediateState(), protocol, () => {
@@ -1048,8 +1154,8 @@ test('packaged smoke rejects sparse file arrays before resolving actions', async
     const deletedFiles = ['first.txt', 'second.txt'];
     delete deletedFiles[0];
     for (const files of [sparseFiles, deletedFiles]) {
-        const response = activePlan([]) as Record<string, unknown>;
-        response.plan = { ...smokePlan([]), files };
+        const response = activeCriticalEmptyPlan() as Record<string, unknown>;
+        response.plan = { ...criticalEmptyPlan(), files };
         const protocol = new FakeProtocol(true, response);
         let actionResolutions = 0;
         new RidePackagedSmokeContribution(immediateState(), protocol, () => {
@@ -1066,7 +1172,7 @@ test('packaged smoke rejects sparse file arrays before resolving actions', async
 });
 
 test('packaged smoke deeply freezes the plan so actions cannot alter remaining sequencing', async () => {
-    const protocol = new FakeProtocol(true, activePlan(['editor-save', 'terminal-sentinel']));
+    const protocol = new FakeProtocol(true, activePlan([...FULL_ACTIONS]));
     const actionCalls: string[] = [];
     const mutationResults: string[] = [];
     new RidePackagedSmokeContribution(immediateState(), protocol, () => actions(actionCalls, {
@@ -1092,14 +1198,24 @@ test('packaged smoke deeply freezes the plan so actions cannot alter remaining s
     }), { now: () => 0 }).onStart();
     await waitUntil(() => protocol.calls.some(call => call.method === 'complete'), 'frozen plan did not complete');
 
-    assert.deepEqual(actionCalls, ['editor-save', 'terminal-sentinel']);
+    assert.deepEqual(actionCalls, FULL_ACTIONS);
     assert.equal(mutationResults.length, 3);
     assert.deepEqual(protocol.calls.filter(call => call.method === 'recordStep')
         .map(call => [(call.request as RideSmokeStepRequest).action, (call.request as RideSmokeStepRequest).state]), [
         ['editor-save', 'started'],
         ['editor-save', 'passed'],
         ['terminal-sentinel', 'started'],
-        ['terminal-sentinel', 'passed']
+        ['terminal-sentinel', 'passed'],
+        ['workspace-search', 'started'],
+        ['workspace-search', 'passed'],
+        ['scm-status', 'started'],
+        ['scm-status', 'passed'],
+        ['packaged-plugin-command', 'started'],
+        ['packaged-plugin-command', 'passed'],
+        ['secondary-window', 'started'],
+        ['secondary-window', 'passed'],
+        ['second-file-forwarding', 'started'],
+        ['second-file-forwarding', 'passed']
     ]);
     assert.equal((protocol.calls.find(call => call.method === 'complete')
         ?.request as RideSmokeCompleteRequest).status, 'passed');
@@ -1117,8 +1233,11 @@ test('packaged smoke path control-character boundary matches the canonical contr
 
     for (const boundary of boundaries) {
         const character = String.fromCodePoint(boundary.codePoint);
-        const response = activePlan(['editor-save']) as Record<string, unknown>;
-        response.plan = { ...smokePlan(['editor-save']), files: [`safe/file${character}name.txt`] };
+        const response = activePlan([...FULL_ACTIONS]) as Record<string, unknown>;
+        response.plan = {
+            ...smokePlan([...FULL_ACTIONS]),
+            files: [`safe/file${character}name.txt`, 'second.txt']
+        };
         const protocol = new FakeProtocol(true, response);
         const actionCalls: string[] = [];
         new RidePackagedSmokeContribution(
@@ -1127,7 +1246,7 @@ test('packaged smoke path control-character boundary matches the canonical contr
         await waitUntil(() => protocol.calls.some(call => call.method === 'complete'),
             `U+${boundary.codePoint.toString(16).padStart(4, '0')} did not reach terminal`);
 
-        assert.deepEqual(actionCalls, boundary.accepted ? ['editor-save'] : []);
+        assert.deepEqual(actionCalls, boundary.accepted ? FULL_ACTIONS : []);
         assert.equal(
             (protocol.calls.find(call => call.method === 'complete')?.request as { failurePhase?: string | null }).failurePhase,
             boundary.accepted ? null : 'protocol'
@@ -1167,7 +1286,7 @@ test('packaged smoke rejects loosely shaped recorded updates instead of treating
     ];
     for (const update of invalidUpdates) {
         const actionCalls: string[] = [];
-        const protocol = new FakeProtocol(true, activePlan(['editor-save']), method => (
+        const protocol = new FakeProtocol(true, activePlan([...FULL_ACTIONS]), method => (
             method === 'recordStep' ? update : { status: 'completed', diagnostic: null }
         ));
         new RidePackagedSmokeContribution(
@@ -1185,8 +1304,8 @@ test('packaged smoke rejects loosely shaped recorded updates instead of treating
 });
 
 test('packaged smoke accepts only the exact Rust durability warning on completed update', async () => {
-    const protocol = new FakeProtocol(true, activePlan([]), method => ({
-        status: 'completed',
+    const protocol = new FakeProtocol(true, activeCriticalEmptyPlan(), method => ({
+        status: method === 'complete' ? 'completed' : 'recorded',
         diagnostic: method === 'complete'
             ? {
                 code: 'report-durability-warning',
@@ -1202,7 +1321,7 @@ test('packaged smoke accepts only the exact Rust durability warning on completed
 
 test('packaged smoke disposal and repeated startup never execute twice', async () => {
     const shell = deferred();
-    const disposedProtocol = new FakeProtocol(true, activePlan(['editor-save']));
+    const disposedProtocol = new FakeProtocol(true, activePlan([...FULL_ACTIONS]));
     const disposed = new RidePackagedSmokeContribution(
         { reachedState: () => shell.promise } as unknown as FrontendApplicationStateService,
         disposedProtocol,
@@ -1215,7 +1334,7 @@ test('packaged smoke disposal and repeated startup never execute twice', async (
     await new Promise<void>(resolve => setImmediate(resolve));
     assert.deepEqual(disposedProtocol.calls, []);
 
-    const protocol = new FakeProtocol(true, activePlan([]));
+    const protocol = new FakeProtocol(true, activeCriticalEmptyPlan());
     const contribution = new RidePackagedSmokeContribution(immediateState(), protocol, () => actions([]));
     contribution.onStart();
     contribution.onStart();
@@ -1236,7 +1355,7 @@ test('packaged smoke plan already in flight reaches terminal when disposed befor
     contribution.onStart();
     await waitUntil(() => protocol.calls.some(call => call.method === 'plan'), 'plan IPC was not issued');
     contribution.dispose();
-    pendingPlan.resolve(activePlan([]));
+    pendingPlan.resolve(activeCriticalEmptyPlan());
     await waitUntil(() => protocol.calls.some(call => call.method === 'complete'), 'in-flight active plan did not reach terminal');
 
     assert.equal(actionResolutions, 1);
@@ -1265,7 +1384,7 @@ test('packaged smoke plan already in flight remains lazy when disposed response 
 });
 
 test('packaged smoke active session reaches failed terminal when disposed during a stuck action', async () => {
-    const protocol = new FakeProtocol(true, activePlan(['editor-save']));
+    const protocol = new FakeProtocol(true, activePlan([...FULL_ACTIONS]));
     const actionStarted = deferred();
     const timers: Array<() => void> = [];
     const contribution = new RidePackagedSmokeContribution(
@@ -1305,7 +1424,7 @@ test('packaged smoke active session reaches failed terminal when disposed during
 });
 
 test('packaged smoke active session reaches passed terminal when disposed at an action boundary', async () => {
-    const protocol = new FakeProtocol(true, activePlan(['editor-save', 'terminal-sentinel']));
+    const protocol = new FakeProtocol(true, activePlan([...FULL_ACTIONS]));
     const actionCalls: string[] = [];
     let contribution!: RidePackagedSmokeContribution;
     contribution = new RidePackagedSmokeContribution(
@@ -1324,10 +1443,10 @@ test('packaged smoke active session reaches passed terminal when disposed at an 
     contribution.onStart();
     await waitUntil(() => protocol.calls.some(call => call.method === 'complete'), 'disposed active smoke did not pass terminally');
 
-    assert.deepEqual(actionCalls, ['editor-save', 'terminal-sentinel']);
+    assert.deepEqual(actionCalls, FULL_ACTIONS);
     assert.equal(protocol.calls.filter(call => call.method === 'plan').length, 1);
     assert.deepEqual(protocol.calls.filter(call => call.method === 'complete').map(call => call.request), [{
-        status: 'passed', failurePhase: null, durationMs: 4, diagnostic: null
+        status: 'passed', failurePhase: null, durationMs: 14, diagnostic: null
     }]);
 });
 

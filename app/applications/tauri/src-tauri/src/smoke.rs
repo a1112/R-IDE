@@ -86,6 +86,38 @@ impl SmokeAction {
     }
 }
 
+struct SmokeScenarioRequirements {
+    profile: SmokeProfile,
+    file_count: usize,
+    actions: &'static [SmokeAction],
+}
+
+impl SmokeScenario {
+    fn requirements(self) -> SmokeScenarioRequirements {
+        const CRITICAL_EMPTY_ACTIONS: [SmokeAction; 2] = [
+            SmokeAction::TerminalSentinel,
+            SmokeAction::PackagedPluginCommand,
+        ];
+        match self {
+            Self::CriticalFile => SmokeScenarioRequirements {
+                profile: SmokeProfile::TauriCritical,
+                file_count: 2,
+                actions: &SmokeAction::ALL,
+            },
+            Self::CriticalEmpty => SmokeScenarioRequirements {
+                profile: SmokeProfile::TauriCritical,
+                file_count: 0,
+                actions: &CRITICAL_EMPTY_ACTIONS,
+            },
+            Self::FullFile => SmokeScenarioRequirements {
+                profile: SmokeProfile::Full,
+                file_count: 2,
+                actions: &SmokeAction::ALL,
+            },
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SmokeStepState {
@@ -1451,8 +1483,15 @@ fn validate_spec(spec: &SmokeSpec) -> Result<(), ()> {
         return Err(());
     }
     normalize_relative_path(&spec.workspace, true)?;
-    validate_files(&spec.files)?;
-    validate_actions(&spec.actions)?;
+    let files = validate_files(&spec.files)?;
+    let actions = validate_actions(&spec.actions)?;
+    let requirements = spec.scenario.requirements();
+    if spec.profile != requirements.profile
+        || files.len() != requirements.file_count
+        || actions != requirements.actions
+    {
+        return Err(());
+    }
     Ok(())
 }
 
@@ -2093,15 +2132,7 @@ mod tests {
             .expect("active smoke session proof");
 
         let error = protocol
-            .complete(
-                &proof,
-                CompleteRequest {
-                    status: SmokeTerminalStatus::Passed,
-                    failure_phase: None,
-                    duration_ms: 0,
-                    diagnostic: None,
-                },
-            )
+            .complete(&proof, failed_startup_completion())
             .expect_err("injected replacement failure is static");
 
         assert_eq!(error, SmokeError::rejected());
@@ -2119,8 +2150,7 @@ mod tests {
         fs::write(fixture.report_path(), old).expect("write old report");
         let replacements = Arc::new(AtomicUsize::new(0));
         let protocol = SmokeProtocol::from_environment_with_replacer(
-            &fixture
-                .environment_with_actions("progress-pre-commit-token", &[SmokeAction::EditorSave]),
+            &fixture.environment("progress-pre-commit-token"),
             &fixture.root,
             Arc::new(FailOnceCountingReplacer {
                 failed: AtomicBool::new(false),
@@ -2132,7 +2162,7 @@ mod tests {
             .session_proof
             .expect("active smoke session proof");
         let started = RecordStepRequest {
-            action: SmokeAction::EditorSave,
+            action: SmokeAction::TerminalSentinel,
             state: SmokeStepState::Started,
             duration_ms: 7,
             diagnostic: None,
@@ -2179,7 +2209,7 @@ mod tests {
             .record_step(
                 &proof,
                 RecordStepRequest {
-                    action: SmokeAction::EditorSave,
+                    action: SmokeAction::TerminalSentinel,
                     state: SmokeStepState::Passed,
                     duration_ms: 8,
                     diagnostic: None,
@@ -2200,10 +2230,7 @@ mod tests {
         let fixture = TestFixture::new();
         let replacements = Arc::new(AtomicUsize::new(0));
         let protocol = SmokeProtocol::from_environment_with_replacer(
-            &fixture.environment_with_actions(
-                "progress-sync-warning-token",
-                &[SmokeAction::EditorSave],
-            ),
+            &fixture.environment("progress-sync-warning-token"),
             &fixture.root,
             Arc::new(CountingSyncFailingReplacer(Arc::clone(&replacements))),
         );
@@ -2212,7 +2239,7 @@ mod tests {
             .session_proof
             .expect("active smoke session proof");
         let started = RecordStepRequest {
-            action: SmokeAction::EditorSave,
+            action: SmokeAction::TerminalSentinel,
             state: SmokeStepState::Started,
             duration_ms: 0,
             diagnostic: None,
@@ -2260,15 +2287,7 @@ mod tests {
             .expect("active smoke session proof");
 
         let response = protocol
-            .complete(
-                &proof,
-                CompleteRequest {
-                    status: SmokeTerminalStatus::Passed,
-                    failure_phase: None,
-                    duration_ms: 0,
-                    diagnostic: None,
-                },
-            )
+            .complete(&proof, failed_startup_completion())
             .expect("visible report remains a completed command");
 
         assert_eq!(response.status, SmokeUpdateStatus::Completed);
@@ -2283,20 +2302,12 @@ mod tests {
             &fs::read(fixture.report_path()).expect("committed report is visible"),
         )
         .expect("visible report is valid JSON");
-        assert_eq!(report["status"], "passed");
+        assert_eq!(report["status"], "failed");
         assert_eq!(temporary_report_count(&fixture.root), 0);
         let bytes = fs::read(fixture.report_path()).expect("read committed report bytes");
         assert_eq!(
             protocol
-                .complete(
-                    &proof,
-                    CompleteRequest {
-                        status: SmokeTerminalStatus::Passed,
-                        failure_phase: None,
-                        duration_ms: 0,
-                        diagnostic: None,
-                    },
-                )
+                .complete(&proof, failed_startup_completion())
                 .expect("identical completion replays committed warning"),
             response
         );
@@ -2321,12 +2332,7 @@ mod tests {
             .plan()
             .session_proof
             .expect("active smoke session proof");
-        let request = CompleteRequest {
-            status: SmokeTerminalStatus::Passed,
-            failure_phase: None,
-            duration_ms: 0,
-            diagnostic: None,
-        };
+        let request = failed_startup_completion();
 
         assert_eq!(
             protocol
@@ -2506,6 +2512,15 @@ mod tests {
         root: PathBuf,
     }
 
+    fn failed_startup_completion() -> CompleteRequest {
+        CompleteRequest {
+            status: SmokeTerminalStatus::Failed,
+            failure_phase: Some(FailurePhase::Startup),
+            duration_ms: 0,
+            diagnostic: SmokeDiagnostic::catalog("startup-failed"),
+        }
+    }
+
     impl TestFixture {
         fn new() -> Self {
             let root =
@@ -2521,14 +2536,6 @@ mod tests {
         }
 
         fn environment(&self, token: &str) -> BTreeMap<OsString, OsString> {
-            self.environment_with_actions(token, &[])
-        }
-
-        fn environment_with_actions(
-            &self,
-            token: &str,
-            actions: &[SmokeAction],
-        ) -> BTreeMap<OsString, OsString> {
             let spec_path = self.root.join("spec.json");
             let spec = json!({
                 "schema": SPEC_SCHEMA,
@@ -2537,7 +2544,10 @@ mod tests {
                 "profile": "tauri-critical",
                 "workspace": ".",
                 "files": [],
-                "actions": actions,
+                "actions": [
+                    SmokeAction::TerminalSentinel,
+                    SmokeAction::PackagedPluginCommand,
+                ],
                 "tokenSha256": sha256(token.as_bytes()),
                 "actionTimeoutMs": 30_000
             });

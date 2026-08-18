@@ -139,6 +139,19 @@ const ACTIONS: readonly RideSmokeAction[] = [
     'secondary-window',
     'second-file-forwarding'
 ];
+const CRITICAL_EMPTY_ACTIONS: readonly RideSmokeAction[] = [
+    'terminal-sentinel',
+    'packaged-plugin-command'
+];
+const SCENARIO_REQUIREMENTS: Readonly<Record<RideSmokePlan['scenario'], {
+    readonly profile: RideSmokePlan['profile'];
+    readonly fileCount: number;
+    readonly actions: readonly RideSmokeAction[];
+}>> = Object.freeze({
+    'critical-file': Object.freeze({ profile: 'tauri-critical', fileCount: 2, actions: ACTIONS }),
+    'critical-empty': Object.freeze({ profile: 'tauri-critical', fileCount: 0, actions: CRITICAL_EMPTY_ACTIONS }),
+    'full-file': Object.freeze({ profile: 'full', fileCount: 2, actions: ACTIONS })
+});
 const PLAN_RESPONSE_KEYS = ['mode', 'plan', 'sessionProof', 'diagnostic'] as const;
 const PLAN_KEYS = [
     'specSha256',
@@ -514,7 +527,11 @@ function parseActivePlan(value: unknown): RideSmokePlan | undefined {
     }
     const files = Object.freeze([...value.files]);
     const actions = Object.freeze([...value.actions]);
-    if (actions.includes('second-file-forwarding') && files.length !== 2) {
+    const requirements = SCENARIO_REQUIREMENTS[value.scenario];
+    if (value.profile !== requirements.profile
+        || files.length !== requirements.fileCount
+        || actions.length !== requirements.actions.length
+        || actions.some((action, index) => action !== requirements.actions[index])) {
         return undefined;
     }
     return Object.freeze({
