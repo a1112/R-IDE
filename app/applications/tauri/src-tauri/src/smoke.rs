@@ -1131,7 +1131,7 @@ fn unix_open_at(
 
     let name = std::ffi::CString::new(name.as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid path component"))?;
-    let descriptor = unsafe { libc::openat(directory, name.as_ptr(), flags, mode) };
+    let descriptor = unsafe { libc::openat(directory, name.as_ptr(), flags, mode as libc::c_uint) };
     if descriptor < 0 {
         Err(io::Error::last_os_error())
     } else {
