@@ -165,7 +165,7 @@ test('every package target explicitly builds the critical Tauri profile', () => 
   const packageJob = jobBlocks(workflow).find(({ name }) => name === 'package');
   assert.ok(packageJob, 'package job is required');
   assert.match(packageJob.text, /env:\s*\n\s+RIDE_TAURI_FRONTEND_PROFILE:\s*tauri-critical/);
-  assert.match(packageJob.text, /npm run verify:tauri-profile/);
+  assert.match(packageJob.text, /npm run verify:tauri-profile -- --expected-profile tauri-critical/);
 });
 
 test('Tauri verification builds and inventories full fallback before the critical profile', () => {
@@ -181,7 +181,9 @@ test('Tauri verification builds and inventories full fallback before the critica
   assert.ok(criticalVerify > criticalBuild, 'critical inventory must follow its build');
   assert.ok(nativeBuild > criticalVerify, 'the native smoke build must use the verified critical profile');
   assert.match(workflow.slice(fullBuild, fullVerify), /RIDE_TAURI_FRONTEND_PROFILE:\s*full/);
+  assert.match(workflow.slice(fullVerify, criticalBuild), /--expected-profile\s+full/);
   assert.match(workflow.slice(criticalBuild, criticalVerify), /RIDE_TAURI_FRONTEND_PROFILE:\s*tauri-critical/);
+  assert.match(workflow.slice(criticalVerify, nativeBuild), /--expected-profile\s+tauri-critical/);
   assert.match(workflow.slice(fullVerify, criticalBuild), /RUNNER_TEMP/,
     'full-profile evidence must be collected outside the source tree before the critical build');
 });

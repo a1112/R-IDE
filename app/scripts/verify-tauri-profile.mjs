@@ -389,6 +389,7 @@ function verifyFrontendVsCodeInit(browserDirectory) {
 export function verifyTauriProfileInventory({
   browserDirectory,
   pluginsDirectory,
+  expectedProfile,
 } = {}) {
   const resolvedBrowserDirectory = path.resolve(browserDirectory ?? path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'applications', 'browser'));
   const resolvedPluginsDirectory = path.resolve(pluginsDirectory ?? path.join(resolvedBrowserDirectory, '..', '..', 'plugins'));
@@ -397,6 +398,14 @@ export function verifyTauriProfileInventory({
     'Tauri profile manifest',
   );
   validateManifest(manifest);
+  if (expectedProfile !== undefined) {
+    if (expectedProfile !== 'tauri-critical' && expectedProfile !== 'full') {
+      throw new Error(`Unsupported expected Tauri profile ${expectedProfile}.`);
+    }
+    if (manifest.profile !== expectedProfile) {
+      throw new Error(`Expected profile ${expectedProfile}, received ${manifest.profile}.`);
+    }
+  }
 
   const metadataDirectory = path.join(resolvedBrowserDirectory, 'lib', 'metadata');
   const metadataRecords = Object.fromEntries(
@@ -464,14 +473,24 @@ export function verifyTauriProfileInventory({
   };
 }
 
-function main() {
-  const report = verifyTauriProfileInventory();
+function parseArguments(argv) {
+  if (argv.length === 0) {
+    return {};
+  }
+  if (argv.length !== 2 || argv[0] !== '--expected-profile') {
+    throw new Error('Usage: verify-tauri-profile.mjs [--expected-profile tauri-critical|full]');
+  }
+  return { expectedProfile: argv[1] };
+}
+
+function main(argv = process.argv.slice(2)) {
+  const report = verifyTauriProfileInventory(parseArguments(argv));
   console.log(JSON.stringify(report, null, 2));
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
-    main();
+    main(process.argv.slice(2));
   } catch (error) {
     console.error(`Tauri profile inventory verification failed: ${error.message}`);
     process.exitCode = 1;

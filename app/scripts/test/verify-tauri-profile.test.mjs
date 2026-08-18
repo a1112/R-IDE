@@ -244,6 +244,18 @@ test('full fallback requires every browser root and rejects stale metadata ident
   }
 });
 
+test('inventory verification rejects a valid profile that differs from the expected build profile', () => {
+  const fixture = createFixture('full');
+  try {
+    assert.throws(
+      () => verifyTauriProfileInventory({ ...fixture, expectedProfile: 'tauri-critical' }),
+      /expected profile tauri-critical.*received full/i,
+    );
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test('full fallback is checked against every browser dependency root', () => {
   const fixture = createFixture('full');
   try {

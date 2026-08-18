@@ -228,7 +228,7 @@ jobs:
         run: npm --workspace applications/tauri run verify
       - name: Verify critical Tauri profile inventory
         working-directory: app
-        run: npm run verify:tauri-profile
+        run: npm run verify:tauri-profile -- --expected-profile tauri-critical
       - name: Measure packaged Tauri startup on Linux
         if: runner.os == 'Linux'
         working-directory: app

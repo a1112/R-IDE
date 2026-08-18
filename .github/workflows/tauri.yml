@@ -76,7 +76,7 @@ jobs:
           RIDE_TAURI_FRONTEND_PROFILE: full
 
       - name: Verify full-profile inventory
-        run: npm run verify:tauri-profile
+        run: npm run verify:tauri-profile -- --expected-profile full
 
       - name: Collect full-profile evidence
         shell: bash
@@ -95,7 +95,7 @@ jobs:
           RIDE_TAURI_FRONTEND_PROFILE: tauri-critical
 
       - name: Verify critical-profile inventory
-        run: npm run verify:tauri-profile
+        run: npm run verify:tauri-profile -- --expected-profile tauri-critical
 
       - name: Collect critical-profile evidence
         shell: bash
