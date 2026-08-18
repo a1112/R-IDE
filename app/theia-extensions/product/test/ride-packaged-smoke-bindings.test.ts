@@ -13,6 +13,7 @@ import { FrontendApplicationContribution } from '@theia/core/lib/browser/fronten
 import { Container, ContainerModule } from '@theia/core/shared/inversify';
 import {
     bindRidePackagedSmokeContribution,
+    RidePackagedSmokeActionShutdownContribution,
     RidePackagedSmokeBindingIdentifiers
 } from '../src/browser/ride-packaged-smoke-bindings';
 import {
@@ -71,4 +72,44 @@ test('packaged smoke binding is installed by the product frontend module', async
     assert.match(moduleSource, /bindRidePackagedSmokeContribution\(bind,/);
     assert.match(moduleSource, /applicationState:\s*FrontendApplicationStateService/);
     assert.match(moduleSource, /contribution:\s*FrontendApplicationContribution/);
+});
+
+test('packaged smoke shutdown keeps late default action resolution lightweight and disposed', async () => {
+    const container = new Container();
+    const identifiers = {
+        applicationState: Symbol('applicationState'),
+        contribution: Symbol('contribution'),
+        workspaceService: Symbol('workspaceService'),
+        editorManager: Symbol('editorManager'),
+        fileService: Symbol('fileService'),
+        terminalService: Symbol('terminalService'),
+        searchService: Symbol('searchService'),
+        scmService: Symbol('scmService')
+    };
+    const resolutions = new Map<symbol, number>();
+    for (const identifier of [
+        identifiers.workspaceService,
+        identifiers.editorManager,
+        identifiers.fileService,
+        identifiers.terminalService,
+        identifiers.searchService,
+        identifiers.scmService
+    ]) {
+        resolutions.set(identifier, 0);
+        container.bind(identifier).toDynamicValue(() => {
+            resolutions.set(identifier, (resolutions.get(identifier) ?? 0) + 1);
+            return {};
+        });
+    }
+    container.load(new ContainerModule(bind => bindRidePackagedSmokeContribution(bind, identifiers)));
+
+    container.get<RidePackagedSmokeActionShutdownContribution>(
+        RidePackagedSmokeActionShutdownContribution
+    ).onStop();
+    const first = container.get<RidePackagedSmokeActions>(RidePackagedSmokeActions);
+    const second = container.get<RidePackagedSmokeActions>(RidePackagedSmokeActions);
+
+    assert.strictEqual(first, second);
+    assert.deepEqual([...resolutions.values()], [0, 0, 0, 0, 0, 0]);
+    await assert.rejects(first.editorSave({} as never), /Smoke action disposed\./);
 });

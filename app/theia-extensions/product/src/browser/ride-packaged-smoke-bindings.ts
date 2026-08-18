@@ -60,6 +60,12 @@ export function bindRidePackagedSmokeContribution(
     let actionIdentifier = identifiers.actions;
     if (actionIdentifier === undefined) {
         bind(RidePackagedSmokeActionService).toDynamicValue(context => {
+            if (actionsShutdown) {
+                const disposedActions = new RidePackagedSmokeActionService({});
+                disposedActions.dispose();
+                resolvedActions = disposedActions;
+                return disposedActions;
+            }
             // Keep browser/disabled startup free of editor, terminal, search, and SCM module initialization.
             const workspaceService = identifiers.workspaceService
                 ?? require('@theia/workspace/lib/browser').WorkspaceService;
@@ -83,9 +89,6 @@ export function bindRidePackagedSmokeContribution(
                 backendIsWindows: OS.backend.isWindows
             });
             resolvedActions = actions;
-            if (actionsShutdown) {
-                actions.dispose();
-            }
             return actions;
         }).inSingletonScope();
         bind(RidePackagedSmokeActions).toService(RidePackagedSmokeActionService);
