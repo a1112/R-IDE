@@ -149,21 +149,21 @@ function rewriteDesktopHtml(source) {
   const localeScript = '    <script type="text/javascript" src="./ride-bootstrap.js" charset="utf-8"></script>\n';
 
   html = html.replace(
-    /\s*<script>\s*if \(document\.head\)[\s\S]*?<\/script\s*>/,
+    /\s*<script>\s*if \(document\.head\)[\s\S]*?<\/script\b[^>]*>/,
     '',
   );
   if (!/<\/head>/i.test(html)) {
     throw new Error('Frontend index.html does not contain a closing head tag.');
   }
   html = html.replace(/<\/head>/i, `${cspMeta}</head>`);
-  const bundleScript = /([ \t]*)<script\b([^>]*\bsrc=["']\.\/bundle\.js["'][^>]*)><\/script\s*>/i;
+  const bundleScript = /([ \t]*)<script\b([^>]*\bsrc=["']\.\/bundle\.js["'][^>]*)><\/script\b[^>]*>/i;
   if (!bundleScript.test(html)) {
     throw new Error('Frontend index.html does not contain the bundle.js script tag.');
   }
   html = html.replace(bundleScript, (_match, indent, attributes) =>
     `${localeScript}${indent}<script${attributes}></script>`
   );
-  for (const script of html.matchAll(/<script\b([^>]*)>[\s\S]*?<\/script\s*>/gi)) {
+  for (const script of html.matchAll(/<script\b([^>]*)>[\s\S]*?<\/script\b[^>]*>/gi)) {
     if (!/(?:^|\s)src\s*=/i.test(script[1])) {
       throw new Error('Desktop index.html contains an inline script that violates the CSP.');
     }

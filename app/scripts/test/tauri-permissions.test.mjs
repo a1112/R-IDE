@@ -280,6 +280,10 @@ test('desktop HTML rewrite preserves module scripts and rejects remaining inline
     () => rewriteDesktopHtml('<html><head></head><body><script src="./bundle.js"></script><script>alert(1)</script ></body></html>'),
     /inline script/,
   );
+  assert.throws(
+    () => rewriteDesktopHtml('<html><head></head><body><script src="./bundle.js"></script><script>alert(1)</script\t\n bar></body></html>'),
+    /inline script/,
+  );
 });
 
 test('packaged profile validation rejects invalid identity, mismatch, and missing deferred chunks', () => {
