@@ -15,6 +15,9 @@
     "allow-ride-plugin-directories",
     "allow-ride-record-startup-milestone",
     "allow-ride-show-main-menu",
+    "allow-ride-smoke-complete",
+    "allow-ride-smoke-plan",
+    "allow-ride-smoke-record-step",
     "allow-ride-start-window-drag",
     "allow-ride-window-control"
   ]

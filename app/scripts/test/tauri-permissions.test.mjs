@@ -95,6 +95,9 @@ test('remote Tauri frontend receives only audited per-command permissions', asyn
     'ride_plugin_directories',
     'ride_record_startup_milestone',
     'ride_show_main_menu',
+    'ride_smoke_complete',
+    'ride_smoke_plan',
+    'ride_smoke_record_step',
     'ride_start_window_drag',
     'ride_window_control'
   ]);

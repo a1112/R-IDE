@@ -27,6 +27,21 @@ description = "Allows the R-IDE frontend to open the native application menu."
 commands.allow = ["ride_show_main_menu"]
 
 [[permission]]
+identifier = "allow-ride-smoke-complete"
+description = "Allows the R-IDE packaged smoke harness to commit its terminal report."
+commands.allow = ["ride_smoke_complete"]
+
+[[permission]]
+identifier = "allow-ride-smoke-plan"
+description = "Allows the R-IDE packaged smoke harness to request its authenticated plan."
+commands.allow = ["ride_smoke_plan"]
+
+[[permission]]
+identifier = "allow-ride-smoke-record-step"
+description = "Allows the R-IDE packaged smoke harness to commit authenticated action progress."
+commands.allow = ["ride_smoke_record_step"]
+
+[[permission]]
 identifier = "allow-ride-start-window-drag"
 description = "Allows the R-IDE frontend title bar to begin dragging the main window."
 commands.allow = ["ride_start_window_drag"]
