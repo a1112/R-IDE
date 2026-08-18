@@ -333,8 +333,14 @@ class FakeNativeChrome {
 }
 
 class TestRideOpenRequestContribution extends RideOpenRequestContribution {
+    rendererCompactions = 0;
+
     async settlePluginObservations(): Promise<void> {
         await Promise.all([this.pluginWillStart, this.pluginDidStart]);
+    }
+
+    protected override compactRendererMemoryAfterStartup(): void {
+        this.rendererCompactions++;
     }
 }
 
@@ -1329,6 +1335,24 @@ test('unresolved plugin deployment does not block plugin lifecycle reporting', a
         'plugins_started',
         'plugins_ready'
     ]);
+});
+
+test('plugin readiness compacts renderer memory once after the ready milestone', async () => {
+    const hostedPlugins = new FakeHostedPluginSupport();
+    hostedPlugins.resolveWillStart();
+    hostedPlugins.resolveDidStart();
+    const context = createContribution(
+        '/project', new MemoryStorage(), () => undefined, async () => undefined,
+        new FakeApplicationStateService(), hostedPlugins
+    );
+
+    await context.contribution.handleOpenRequest({
+        id: '55', source: 'initial', workspace: '/project', files: ['/project/compact.R']
+    });
+    await flushLifecycle();
+
+    assert.equal(context.milestones[context.milestones.length - 1], 'plugins_ready');
+    assert.equal(context.contribution.rendererCompactions, 1);
 });
 
 test('same-workspace requests open files in order, activate the target editor, and consume duplicate IDs once', async () => {
