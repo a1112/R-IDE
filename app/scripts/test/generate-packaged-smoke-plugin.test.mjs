@@ -14,6 +14,7 @@ import { afterEach, test } from 'node:test';
 
 import {
   generatePackagedSmokePluginInventory,
+  renderPackagedSmokePluginInventory,
   selectPackagedSmokePlugin,
 } from '../generate-packaged-smoke-plugin.mjs';
 
@@ -150,6 +151,22 @@ test('generates deterministic TypeScript provenance from the selected plugin man
   assert.match(firstSource, /commandId: 'git\.refresh'/);
   assert.match(firstSource, new RegExp(`manifestSha256: '${first.manifestSha256}'`));
   assert.match(firstSource, /generated from the unpacked packaged plugin inventory/i);
+});
+
+test('preserves an equivalent tracked inventory with Windows line endings', async () => {
+  const { pluginsDirectory, output } = fixture();
+  writePlugin(pluginsDirectory, 'vscode.git', {
+    publisher: 'vscode', name: 'git', version: '1.108.2',
+    contributes: { commands: [{ command: 'git.refresh', title: 'Refresh' }] },
+  });
+
+  const selected = await selectPackagedSmokePlugin(pluginsDirectory);
+  const windowsSource = renderPackagedSmokePluginInventory(selected).replaceAll('\n', '\r\n');
+  fs.writeFileSync(output, windowsSource);
+
+  await generatePackagedSmokePluginInventory({ pluginsDirectory, output });
+
+  assert.equal(fs.readFileSync(output, 'utf8'), windowsSource);
 });
 
 test('the canonical download and Tauri build paths regenerate the static inventory', () => {

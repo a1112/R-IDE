@@ -222,7 +222,7 @@ export async function generatePackagedSmokePluginInventory({
       throw error;
     }
   }
-  if (current !== source) {
+  if (current?.replaceAll('\r\n', '\n') !== source) {
     const temporary = `${output}.tmp-${process.pid}`;
     await fs.promises.writeFile(temporary, source, { encoding: 'utf8', flag: 'wx' });
     try {
