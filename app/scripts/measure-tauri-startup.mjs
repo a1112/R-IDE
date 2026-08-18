@@ -1189,7 +1189,7 @@ function processIdentity(row) {
   return identity;
 }
 
-function sameProcessIdentity(row, identity) {
+export function sameProcessIdentity(row, identity) {
   const sameCreationTime = row.creationTime === identity.creationTime;
   const exactLinuxIdentity = sameExactLinuxProcessIdentity(row, identity);
   return row.pid === identity.pid
@@ -1743,6 +1743,64 @@ export async function captureProcessIdentity(
     `spawned root process ${verifiedRoot} did not appear in the process table`
       + (lastReadError ? `: ${lastReadError.message}` : ''),
   );
+}
+
+const WINDOWS_GRACEFUL_CLOSE_SCRIPT = String.raw`& {
+param([int]$TargetPid)
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class RideWindowClose {
+  [DllImport("user32.dll", SetLastError = true)]
+  public static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+}
+'@
+$target = Get-Process -Id $TargetPid -ErrorAction Stop
+if ($target.CloseMainWindow()) { exit 0 }
+$WM_CLOSE = 0x0010
+if ($target.MainWindowHandle -ne [IntPtr]::Zero -and
+    [RideWindowClose]::PostMessage($target.MainWindowHandle, $WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero)) {
+  exit 0
+}
+exit 1
+} @args
+`;
+
+export async function requestGracefulProcessClose(
+  rootIdentity,
+  platform = process.platform,
+  {
+    capture = captureProcessIdentity,
+    signal = (pid, name) => process.kill(pid, name),
+    run = (command, args, options) => spawnSync(command, args, options),
+  } = {},
+) {
+  const verifiedIdentity = validateProcessIdentity(rootIdentity, 'graceful close identity');
+  const currentIdentity = await capture(verifiedIdentity.pid, { platform });
+  if (!sameProcessIdentity(currentIdentity, verifiedIdentity)) {
+    throw new Error('graceful close target changed identity');
+  }
+  if (platform !== 'win32') {
+    signal(verifiedIdentity.pid, 'SIGTERM');
+    return true;
+  }
+  const result = run('powershell.exe', [
+    '-NoLogo',
+    '-NoProfile',
+    '-NonInteractive',
+    '-Command',
+    WINDOWS_GRACEFUL_CLOSE_SCRIPT,
+    String(verifiedIdentity.pid),
+  ], {
+    encoding: 'utf8',
+    windowsHide: true,
+    timeout: SYNC_COMMAND_TIMEOUT_MS,
+    maxBuffer: SYNC_COMMAND_MAX_BUFFER_BYTES,
+  });
+  if (result?.error || result?.signal || result?.status !== 0) {
+    throw new Error('Windows graceful close failed');
+  }
+  return true;
 }
 
 function captureOwnedProcessGroup(rootIdentity, platform) {

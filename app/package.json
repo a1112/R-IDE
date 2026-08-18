@@ -60,6 +60,7 @@
     "check:rust": "node scripts/check-rust.js",
     "test:tauri-rust": "node scripts/run-tauri-tests.js",
     "measure:tauri-startup": "node scripts/measure-tauri-startup.mjs",
+    "smoke:tauri-packaged": "node scripts/run-tauri-packaged-smoke.mjs",
     "verify:tauri-profile": "node scripts/verify-tauri-profile.mjs",
     "check:tauri-performance": "node scripts/check-tauri-performance.mjs --baseline applications/tauri/perf/baselines/pre-optimization-windows-x64-d034943.json --min-startup-gain 30 --min-memory-gain 10",
     "electron": "yarn --cwd applications/electron",

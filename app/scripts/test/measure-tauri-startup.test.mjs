@@ -38,13 +38,106 @@ import {
   planProcessCleanup,
   readLinuxProcEnvironment,
   readCampaignMetadata,
+  requestGracefulProcessClose,
   runMeasurementCampaign,
   sampleProcessTree,
   redactDiagnosticText,
+  sameProcessIdentity,
   startProcessTreeMonitor,
   terminateMeasuredTree,
   waitForStartupReport,
 } from '../measure-tauri-startup.mjs';
+
+test('measurement module exports the reviewed reusable surface only', async () => {
+  const module = await import('../measure-tauri-startup.mjs');
+  assert.deepEqual(Object.keys(module).sort(), [
+    'aggregateProcessTree',
+    'attachBoundedLogCapture',
+    'attachLinuxProcIdentities',
+    'captureProcessIdentity',
+    'classifyProcessRoles',
+    'createBoundedLogSink',
+    'createHostMetadata',
+    'discoverExecutable',
+    'discoverMarkedProcessSnapshot',
+    'filterSpawnEnvironment',
+    'launchMeasuredProcess',
+    'measureOnce',
+    'median',
+    'parseLinuxProcEnvironment',
+    'parseLinuxProcStatIdentity',
+    'parseMacOsProcessEnvironments',
+    'parsePosixProcessTable',
+    'parseStartupReport',
+    'parseWindowsProcessTable',
+    'planProcessCleanup',
+    'readCampaignMetadata',
+    'readLinuxProcEnvironment',
+    'redactDiagnosticText',
+    'requestGracefulProcessClose',
+    'runMeasurementCampaign',
+    'sameProcessIdentity',
+    'sampleProcessTree',
+    'startProcessTreeMonitor',
+    'terminateMeasuredTree',
+    'waitForStartupReport',
+  ].sort());
+});
+
+test('sameProcessIdentity rejects a reused pid', () => {
+  assert.equal(sameProcessIdentity(
+    { pid: 42, pgid: 42, creationTime: 'windows:200' },
+    { pid: 42, pgid: 42, creationTime: 'windows:100' },
+  ), false);
+});
+
+test('requestGracefulProcessClose reattests identity before sending SIGTERM', async () => {
+  const identity = { pid: 42, pgid: 42, creationTime: 'linux:100' };
+  const signals = [];
+  assert.equal(await requestGracefulProcessClose(identity, 'linux', {
+    capture: async () => ({ ...identity }),
+    signal: (pid, name) => signals.push([pid, name]),
+  }), true);
+  assert.deepEqual(signals, [[42, 'SIGTERM']]);
+});
+
+test('requestGracefulProcessClose refuses a reused pid without signalling it', async () => {
+  const identity = { pid: 42, pgid: 42, creationTime: 'linux:100' };
+  let signalled = false;
+  await assert.rejects(requestGracefulProcessClose(identity, 'linux', {
+    capture: async () => ({ ...identity, creationTime: 'linux:200' }),
+    signal: () => { signalled = true; },
+  }), /changed identity/);
+  assert.equal(signalled, false);
+});
+
+test('requestGracefulProcessClose uses fixed PowerShell with a numeric pid', async () => {
+  const identity = { pid: 7331, pgid: null, creationTime: 'windows:100' };
+  const calls = [];
+  assert.equal(await requestGracefulProcessClose(identity, 'win32', {
+    capture: async () => ({ ...identity }),
+    run: (file, args, options) => {
+      calls.push({ file, args, options });
+      return { status: 0, error: undefined, stderr: '' };
+    },
+  }), true);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].file, 'powershell.exe');
+  assert.equal(calls[0].args.at(-1), '7331');
+  assert.equal(calls[0].args.includes('-TargetPid'), false);
+  assert.match(calls[0].args.join(' '), /@args/);
+  assert.match(calls[0].args.join(' '), /CloseMainWindow/);
+  assert.match(calls[0].args.join(' '), /WM_CLOSE/);
+  assert.doesNotMatch(calls[0].args.join(' '), /windows:100/);
+});
+
+test('requestGracefulProcessClose treats a refused Windows close as failure', async () => {
+  const identity = { pid: 7331, pgid: null, creationTime: 'windows:100' };
+  await assert.rejects(requestGracefulProcessClose(identity, 'win32', {
+    capture: async () => ({ ...identity }),
+    run: () => ({ status: 1, error: undefined, stderr: 'window refused close' }),
+  }), /graceful close failed/);
+});
 
 function temporaryDirectory(label) {
   return fs.mkdtempSync(path.join(os.tmpdir(), `ride-measure-${label}-`));
