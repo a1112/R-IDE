@@ -471,3 +471,21 @@ fn production_uses_one_app_state_path_cache_and_the_shared_tauri_runtime() {
     assert!(direct_start.contains("stop_fallback_rx.recv()"));
     assert!(sidecar_source.contains("stop_fallback_rx.blocking_recv()"));
 }
+
+#[test]
+fn backend_start_is_scheduled_before_the_main_webview_is_built() {
+    let lib_source = include_str!("../src/lib.rs");
+    let setup_source = lib_source
+        .split(".setup(move |app|")
+        .nth(1)
+        .and_then(|source| source.split(".invoke_handler").next())
+        .expect("Tauri setup source");
+    let backend_start = setup_source
+        .find("sidecar::start_backend")
+        .expect("backend start task");
+    let webview_build = setup_source
+        .find("WebviewWindowBuilder::from_config")
+        .expect("configured main webview build");
+
+    assert!(backend_start < webview_build);
+}
