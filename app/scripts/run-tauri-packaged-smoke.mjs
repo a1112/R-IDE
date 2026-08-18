@@ -53,7 +53,6 @@ const SIDECAR_FAILURE_PATTERN = /(?:Failed to start backend|Backend process exit
 const FAILURE_SCHEMA = 'ride.tauri-packaged-smoke-runner-failure';
 const OWNER_SCHEMA = 'ride.tauri-packaged-smoke-owner';
 const OWNER_FILE = '.ride-tauri-packaged-smoke-owner.json';
-const STARTUP_ATTESTATION_TIMEOUT_MS = 2_000;
 const MAX_FAILURE_ENTRIES = 8;
 const MAX_FAILURE_DETAIL_LENGTH = 192;
 const MAX_FAILURE_MESSAGE_LENGTH = 1_024;
@@ -493,7 +492,7 @@ export async function launchPackagedSmokeInstance(
         error => ({ type: 'identity-error', error }),
       );
     const reportObservation = waitForReport(startupReportPath, {
-      timeoutMs: Math.min(remainingMs, STARTUP_ATTESTATION_TIMEOUT_MS),
+      timeoutMs: remainingMs,
       pollMs: Math.min(10, remainingMs),
       phase: 'process',
     }).then(

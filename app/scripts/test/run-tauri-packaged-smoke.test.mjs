@@ -689,6 +689,56 @@ test('default launcher bounds capture and startup attestation by one 1s phase de
   }
 });
 
+test('default launcher gives startup attestation the remaining long phase budget', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ride-smoke-long-launch-deadline-'));
+  const script = path.join(root, 'second.js');
+  writeStartupFixture(script, 0, true);
+  let currentTime = 0;
+  let captureTimeout;
+  let reportTimeout;
+  let spawnedPid;
+  const run = {
+    executable: process.execPath,
+    absoluteFiles: ['unused', script],
+    workspace: root,
+    logsDirectory: root,
+    timeoutMs: 10_000,
+    childEnvironment: { PATH: process.env.PATH ?? '' },
+    smokeEnvironment: {},
+    sensitiveValues: [],
+  };
+  let instance;
+  try {
+    instance = await launchPackagedSmokeInstance({ run, kind: 'second' }, {
+      now: () => currentTime,
+      spawnProcess: (executable, arguments_, spawnOptions) => {
+        const child = spawn(executable, arguments_, spawnOptions);
+        spawnedPid = child.pid;
+        currentTime = 2_500;
+        return child;
+      },
+      capture: async (pid, captureOptions) => {
+        captureTimeout = captureOptions.timeoutMs;
+        return { pid, ppid: 1, pgid: null, creationTime: 'windows:fixture' };
+      },
+      waitForReport: async (_file, waitOptions) => {
+        reportTimeout = waitOptions.timeoutMs;
+        return { pid: spawnedPid };
+      },
+      startMonitor: () => ({ stop: async () => [] }),
+    });
+    assert.equal(captureTimeout, 2_000);
+    assert.equal(reportTimeout, 7_500);
+  } finally {
+    if (instance && instance.child.exitCode === null) {
+      instance.child.kill();
+      await new Promise(resolve => instance.child.once('exit', resolve));
+      await instance.logCapture.persist();
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('default launcher fails statically when its 1s phase deadline is exhausted', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ride-smoke-launch-expired-'));
   const script = path.join(root, 'second.js');
