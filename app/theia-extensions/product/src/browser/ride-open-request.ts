@@ -197,6 +197,7 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
                 unlisten();
             } else {
                 this.unlisten = unlisten;
+                await this.nativeChrome.notifyFrontendReady();
             }
         } catch (error) {
             await this.messageService.error(`R-IDE could not listen for file-open requests: ${errorMessage(error)}`);

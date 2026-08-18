@@ -300,6 +300,7 @@ class FakeShell {
 class FakeNativeChrome {
     registrations = 0;
     unlistenCalls = 0;
+    frontendReadyNotifications = 0;
     protected handler: ((request: RideOpenRequest) => void) | undefined;
 
     constructor(
@@ -319,6 +320,10 @@ class FakeNativeChrome {
 
     waitForFrontendReadyNotification(): Promise<void> {
         return this.frontendReady;
+    }
+
+    async notifyFrontendReady(): Promise<void> {
+        this.frontendReadyNotifications++;
     }
 
     emit(payload: unknown): void {
@@ -1055,6 +1060,21 @@ test('no-file fallback waits until the native initial-intent window has closed',
     frontendReady.resolve();
     await flushLifecycle();
     assert.deepEqual(deferredWork.scheduledDelays, [1_500]);
+});
+
+test('native initial intent delivery starts as soon as its listener is installed', async () => {
+    const frontendReady = deferred<void>();
+    const native = new FakeNativeChrome(() => undefined, frontendReady.promise);
+    const context = createContribution(
+        '/project', new MemoryStorage(), () => undefined, async () => undefined,
+        new FakeApplicationStateService(), new FakeHostedPluginSupport(), undefined, native
+    );
+
+    context.contribution.onStart();
+    await flushLifecycle();
+
+    assert.equal(native.registrations, 1);
+    assert.equal(native.frontendReadyNotifications, 1);
 });
 
 test('an initial native target received before frontend-ready suppresses the fallback timer', async () => {
