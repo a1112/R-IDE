@@ -42,14 +42,15 @@ Rust、Node runner 和前端对这三组映射做严格一致性校验；profile
 - Node 契约与 runner 测试覆盖参数解析、场景编排、超时、报告、脱敏和清理失败聚合。
 - Rust 测试覆盖协议启用/禁用、场景一致性、原子进度报告和静态诊断。
 - Product 前端测试覆盖动作编排、场景一致性和拒绝时不解析动作依赖。
-- Workflow 策略测试覆盖 Windows 手动交互 job、非 Windows 静态验证、失败诊断上传和既有 package matrix。
+- 普通 push/PR 的 `quality` job 持续运行 runner、startup measurement 和 inventory 生成器测试，覆盖进程身份、清理、临时目录所有权和脱敏边界。
+- Workflow 策略测试覆盖上述非交互回归入口、Windows 手动交互 job、非 Windows 静态验证、失败诊断上传和既有 package matrix。
 
 GitHub Actions 中的真实 Windows 交互 smoke 默认关闭，仅在 `workflow_dispatch` 勾选 `run_windows_packaged_smoke` 后运行：
 
 - `.github/workflows/ci.yml`：Windows `critical-file`。
 - `.github/workflows/tauri.yml`：独立 Windows full-profile job 的 `full-file`。
 
-在 packaged interaction smoke 维度，macOS/Linux CI 只执行 package/profile/contract 静态验证，不宣称真实 IDE 交互成功；其他明确标注的 startup measurement 也不能替代交互 smoke。`critical-empty` 已实现，可在本地 Windows 运行，但当前没有独立的 CI 真实交互步骤。
+非交互 runner/cleanup 单元测试以及 macOS/Linux 的 package/profile/contract 校验都不宣称真实 IDE 交互成功；其他明确标注的 startup measurement 也不能替代交互 smoke。`critical-empty` 已实现，可在本地 Windows 运行，但当前没有独立的 CI 真实交互步骤。
 
 ## 本地验证状态
 

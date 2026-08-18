@@ -135,6 +135,6 @@ runner 对每个阶段使用有界超时，随后尝试优雅关闭并清理受�
 
 ## CI 范围
 
-GitHub Actions 的 Windows 真实交互 smoke 只在手动 `workflow_dispatch` 且 `run_windows_packaged_smoke=true` 时运行。普通 push/PR 仍保留跨平台 package/profile/contract 校验。在 packaged interaction smoke 维度，macOS/Linux 只运行 non-interactive 静态验证，不宣称完整交互成功；startup measurement 也不能替代交互 smoke。
+GitHub Actions 的 Windows 真实交互 smoke 只在手动 `workflow_dispatch` 且 `run_windows_packaged_smoke=true` 时运行。普通 push/PR 除跨平台 package/profile/contract 校验外，还在 `quality` job 运行 runner、startup measurement 和 inventory 生成器的非交互测试，覆盖进程身份、清理、临时目录所有权与脱敏边界。这些测试以及 macOS/Linux 的静态验证都不宣称完整交互成功；startup measurement 也不能替代交互 smoke。
 
 当前实现状态见 [Tauri 实现状态](TAURI-IMPLEMENTATION-STATUS.md)。

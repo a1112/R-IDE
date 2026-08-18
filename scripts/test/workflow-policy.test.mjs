@@ -51,6 +51,23 @@ test('every CI job has an explicit timeout and required quality jobs exist', () 
   assert.ok(jobs.some(({ name }) => name === 'package'));
 });
 
+test('quality CI continuously exercises packaged smoke lifecycle safety', () => {
+  const workflow = readWorkflow();
+  const qualityJob = jobBlocks(workflow).find(({ name }) => name === 'quality');
+  assert.ok(qualityJob, 'quality job is required');
+  const policyStepIndex = qualityJob.text.indexOf('- name: Run synchronization and policy tests');
+  const nextStepIndex = qualityJob.text.indexOf('\n      - name:', policyStepIndex + 1);
+  assert.ok(policyStepIndex >= 0, 'quality job must run its non-interactive policy tests');
+  const policyStep = qualityJob.text.slice(policyStepIndex, nextStepIndex);
+  for (const testFile of [
+    'app/scripts/test/generate-packaged-smoke-plugin.test.mjs',
+    'app/scripts/test/measure-tauri-startup.test.mjs',
+    'app/scripts/test/run-tauri-packaged-smoke.test.mjs',
+  ]) {
+    assert.match(policyStep, new RegExp(testFile.replaceAll('.', '\\.').replaceAll('/', '\\/')));
+  }
+});
+
 test('package matrix covers all supported desktop runners and Node 22', () => {
   const workflow = readWorkflow();
   const packageJob = jobBlocks(workflow).find(({ name }) => name === 'package');
@@ -361,10 +378,12 @@ test('macOS package builds retry transient DMG bundling failures once', () => {
 test('quality and compatibility jobs run the required Node builds and Rust checks', () => {
   const workflow = readWorkflow();
   const jobs = Object.fromEntries(jobBlocks(workflow).map(({ name, text }) => [name, text]));
-  assert.match(jobs.quality, /node --test scripts\/test\/upstream-sync\/\*\.test\.mjs scripts\/test\/workflow-policy\.test\.mjs/);
-  assert.match(jobs.quality, /node --test[^\n]*scripts\/test\/desktop-integration-policy\.test\.mjs/);
-  assert.match(jobs.quality, /node --test[^\n]*scripts\/test\/appimage-integration\.test\.mjs/);
-  assert.match(jobs.quality, /node --test[^\n]*app\/scripts\/test\/tauri-permissions\.test\.mjs/);
+  assert.match(jobs.quality, /node --test/);
+  assert.match(jobs.quality, /scripts\/test\/upstream-sync\/\*\.test\.mjs/);
+  assert.match(jobs.quality, /scripts\/test\/workflow-policy\.test\.mjs/);
+  assert.match(jobs.quality, /scripts\/test\/desktop-integration-policy\.test\.mjs/);
+  assert.match(jobs.quality, /scripts\/test\/appimage-integration\.test\.mjs/);
+  assert.match(jobs.quality, /app\/scripts\/test\/tauri-permissions\.test\.mjs/);
   assert.match(jobs.quality, /npm --workspace theia-extensions\/product test/);
   assert.match(jobs.quality, /yarn lint/);
   assert.match(jobs.quality, /yarn build:extensions/);

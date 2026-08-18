@@ -139,6 +139,8 @@ npm run smoke:tauri-packaged -- --scenario critical-file --output applications/t
 
 ## CI 操作范围
 
+普通 push/PR 的 `quality` job 会执行 smoke runner、startup measurement 和插件 inventory 生成器的非交互单元测试，持续覆盖 PID 身份复核、Windows Job/窗口关闭清理、临时目录所有权和诊断脱敏。它们验证安全与编排逻辑，但不会启动真实桌面程序，因此不能作为交互 smoke 通过证据。
+
 两个 workflow 都提供 boolean `workflow_dispatch` 输入 `run_windows_packaged_smoke`，默认 `false`：
 
 - [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) 在既有 Windows package matrix 完成 package verify 与 `tauri-critical` profile 校验后，手动运行 `critical-file`。
