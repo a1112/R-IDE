@@ -117,6 +117,11 @@ interface ActiveSmokeSession {
     readonly sessionProof: string;
 }
 
+type ParsedPlanResponse =
+    | { readonly kind: 'inactive' }
+    | { readonly kind: 'active'; readonly session: ActiveSmokeSession }
+    | { readonly kind: 'malformed'; readonly sessionProof?: string };
+
 const ACTIONS: readonly RideSmokeAction[] = [
     'editor-save',
     'terminal-sentinel',
@@ -126,6 +131,18 @@ const ACTIONS: readonly RideSmokeAction[] = [
     'secondary-window',
     'second-file-forwarding'
 ];
+const PLAN_RESPONSE_KEYS = ['mode', 'plan', 'sessionProof', 'diagnostic'] as const;
+const PLAN_KEYS = [
+    'specSha256',
+    'scenario',
+    'profile',
+    'workspace',
+    'files',
+    'actions',
+    'actionTimeoutMs'
+] as const;
+const UPDATE_RESPONSE_KEYS = ['status', 'diagnostic'] as const;
+const DIAGNOSTIC_KEYS = ['code', 'message'] as const;
 
 const PROTOCOL_FAILED: RideSmokeDiagnostic = {
     code: 'protocol-failed',
@@ -138,6 +155,10 @@ const ACTION_FAILED: RideSmokeDiagnostic = {
 const ACTION_TIMEOUT: RideSmokeDiagnostic = {
     code: 'action-timeout',
     message: 'Smoke action timed out.'
+};
+const REPORT_DURABILITY_WARNING: RideSmokeDiagnostic = {
+    code: 'report-durability-warning',
+    message: 'Smoke report was committed but durability sync failed.'
 };
 // Rust serializes absent Option values as JSON null; keep outbound envelopes canonical.
 // eslint-disable-next-line no-null/no-null
@@ -189,19 +210,21 @@ export class RidePackagedSmokeContribution implements FrontendApplicationContrib
         }
 
         const response = await this.protocol.plan();
-        if (this.disposed || isInactivePlanResponse(response)) {
+        if (this.disposed) {
             return;
         }
-
-        const sessionProof = activeSessionProof(response);
-        if (sessionProof === undefined) {
+        const parsed = parsePlanResponse(response);
+        if (parsed.kind === 'inactive') {
             return;
         }
-        const plan = activeSessionPlan(response);
-        if (plan === undefined) {
-            await this.completeProtocolFailure(sessionProof, () => 0);
+        if (parsed.kind === 'malformed') {
+            if (parsed.sessionProof === undefined) {
+                return;
+            }
+            await this.completeProtocolFailure(parsed.sessionProof, () => 0);
             return;
         }
+        const { plan, sessionProof } = parsed.session;
 
         let smokeActions: RidePackagedSmokeActions;
         try {
@@ -210,25 +233,23 @@ export class RidePackagedSmokeContribution implements FrontendApplicationContrib
             await this.completeProtocolFailure(sessionProof, () => 0);
             return;
         }
-        if (this.disposed) {
-            return;
-        }
-
         await this.sequence({ plan, sessionProof }, smokeActions);
     }
 
     protected async sequence(session: ActiveSmokeSession, smokeActions: RidePackagedSmokeActions): Promise<void> {
         const elapsed = this.createElapsedClock();
         for (const action of session.plan.actions) {
-            if (this.disposed) {
+            try {
+                await this.record(session.sessionProof, {
+                    action,
+                    state: 'started',
+                    durationMs: elapsed(),
+                    diagnostic: JSON_NULL
+                });
+            } catch {
+                await this.completeProtocolFailure(session.sessionProof, elapsed);
                 return;
             }
-            await this.record(session.sessionProof, {
-                action,
-                state: 'started',
-                durationMs: elapsed(),
-                diagnostic: JSON_NULL
-            });
 
             let diagnostic: RideSmokeDiagnostic | undefined;
             try {
@@ -236,30 +257,30 @@ export class RidePackagedSmokeContribution implements FrontendApplicationContrib
             } catch (error) {
                 diagnostic = error instanceof SmokeActionTimeout ? ACTION_TIMEOUT : ACTION_FAILED;
             }
-            if (this.disposed) {
-                return;
-            }
             if (diagnostic !== undefined) {
                 await this.reportActionFailure(session.sessionProof, action, diagnostic, elapsed);
                 return;
             }
 
-            await this.record(session.sessionProof, {
-                action,
-                state: 'passed',
-                durationMs: elapsed(),
-                diagnostic: JSON_NULL
-            });
+            try {
+                await this.record(session.sessionProof, {
+                    action,
+                    state: 'passed',
+                    durationMs: elapsed(),
+                    diagnostic: JSON_NULL
+                });
+            } catch {
+                await this.reportActionFailure(session.sessionProof, action, ACTION_FAILED, elapsed);
+                return;
+            }
         }
 
-        if (!this.disposed) {
-            await this.complete(session.sessionProof, {
-                status: 'passed',
-                failurePhase: JSON_NULL,
-                durationMs: elapsed(),
-                diagnostic: JSON_NULL
-            });
-        }
+        await this.complete(session.sessionProof, {
+            status: 'passed',
+            failurePhase: JSON_NULL,
+            durationMs: elapsed(),
+            diagnostic: JSON_NULL
+        });
     }
 
     protected executeAction(
@@ -291,6 +312,10 @@ export class RidePackagedSmokeContribution implements FrontendApplicationContrib
                 durationMs: elapsed(),
                 diagnostic
             });
+        } catch {
+            // A mutation may have reached the server. Never replay it.
+        }
+        try {
             await this.complete(sessionProof, {
                 status: 'failed',
                 failurePhase: 'action',
@@ -298,8 +323,7 @@ export class RidePackagedSmokeContribution implements FrontendApplicationContrib
                 diagnostic
             });
         } catch {
-            // The server may have rejected the transition. Do not retry an
-            // ambiguous mutation and do not expose the original action error.
+            // Completion is also a single best-effort mutation.
         }
     }
 
@@ -380,39 +404,53 @@ function isRecord(value: unknown): value is Record<string, unknown> {
     return typeof value === 'object' && !!value && !Array.isArray(value);
 }
 
-function isInactivePlanResponse(value: unknown): boolean {
-    return isRecord(value) && (value.mode === 'disabled' || value.mode === 'rejected');
+function parsePlanResponse(value: unknown): ParsedPlanResponse {
+    const trustedProof = isRecord(value) && value.mode === 'active' && isCanonicalProof(value.sessionProof)
+        ? value.sessionProof
+        : undefined;
+    if (!isRecord(value) || !hasExactKeys(value, PLAN_RESPONSE_KEYS)) {
+        return { kind: 'malformed', sessionProof: trustedProof };
+    }
+    if (value.mode === 'disabled') {
+        return value.plan === JSON_NULL && value.sessionProof === JSON_NULL && value.diagnostic === JSON_NULL
+            ? { kind: 'inactive' }
+            : { kind: 'malformed' };
+    }
+    if (value.mode === 'rejected') {
+        return value.plan === JSON_NULL && value.sessionProof === JSON_NULL
+            && isExactDiagnostic(value.diagnostic, PROTOCOL_FAILED)
+            ? { kind: 'inactive' }
+            : { kind: 'malformed' };
+    }
+    if (value.mode !== 'active' || trustedProof === undefined || value.diagnostic !== JSON_NULL) {
+        return { kind: 'malformed', sessionProof: trustedProof };
+    }
+    const plan = parseActivePlan(value.plan);
+    return plan === undefined
+        ? { kind: 'malformed', sessionProof: trustedProof }
+        : { kind: 'active', session: { plan, sessionProof: trustedProof } };
 }
 
-function activeSessionProof(value: unknown): string | undefined {
-    if (!isRecord(value) || value.mode !== 'active' || typeof value.sessionProof !== 'string'
-        || value.sessionProof.length === 0) {
+function parseActivePlan(value: unknown): RideSmokePlan | undefined {
+    if (!isRecord(value) || !hasExactKeys(value, PLAN_KEYS)) {
         return undefined;
     }
-    return value.sessionProof;
-}
-
-function activeSessionPlan(value: unknown): RideSmokePlan | undefined {
-    if (!isRecord(value) || value.mode !== 'active' || !isRecord(value.plan)) {
-        return undefined;
-    }
-    const plan = value.plan;
-    if (typeof plan.specSha256 !== 'string' || !/^[0-9a-f]{64}$/.test(plan.specSha256)
-        || !isScenario(plan.scenario) || !isProfile(plan.profile)
-        || typeof plan.workspace !== 'string' || plan.workspace.length === 0
-        || !isStringArray(plan.files) || !isCanonicalActions(plan.actions)
-        || !Number.isSafeInteger(plan.actionTimeoutMs)
-        || (plan.actionTimeoutMs as number) < 1_000 || (plan.actionTimeoutMs as number) > 300_000) {
+    if (!isCanonicalSha256(value.specSha256)
+        || !isScenario(value.scenario) || !isProfile(value.profile)
+        || !isCanonicalPortablePath(value.workspace, true)
+        || !isCanonicalFiles(value.files) || !isCanonicalActions(value.actions)
+        || !Number.isSafeInteger(value.actionTimeoutMs)
+        || (value.actionTimeoutMs as number) < 1_000 || (value.actionTimeoutMs as number) > 300_000) {
         return undefined;
     }
     return {
-        specSha256: plan.specSha256,
-        scenario: plan.scenario,
-        profile: plan.profile,
-        workspace: plan.workspace,
-        files: [...plan.files],
-        actions: [...plan.actions],
-        actionTimeoutMs: plan.actionTimeoutMs as number
+        specSha256: value.specSha256,
+        scenario: value.scenario,
+        profile: value.profile,
+        workspace: value.workspace,
+        files: [...value.files],
+        actions: [...value.actions],
+        actionTimeoutMs: value.actionTimeoutMs as number
     };
 }
 
@@ -424,8 +462,57 @@ function isProfile(value: unknown): value is RideSmokePlan['profile'] {
     return value === 'tauri-critical' || value === 'full';
 }
 
-function isStringArray(value: unknown): value is string[] {
-    return Array.isArray(value) && value.every(item => typeof item === 'string');
+function isCanonicalProof(value: unknown): value is string {
+    return isCanonicalSha256(value);
+}
+
+function isCanonicalSha256(value: unknown): value is string {
+    return typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
+}
+
+function isCanonicalFiles(value: unknown): value is string[] {
+    if (!Array.isArray(value) || !value.every(item => isCanonicalPortablePath(item, false))) {
+        return false;
+    }
+    const keys = value.map(windowsOrdinalCaseKey);
+    return new Set(keys).size === keys.length;
+}
+
+function isCanonicalPortablePath(value: unknown, allowDot: boolean): value is string {
+    if (typeof value !== 'string' || value.length === 0 || value.trim() !== value || value.includes('\\')) {
+        return false;
+    }
+    if (value === '.') {
+        return allowDot;
+    }
+    if (value.startsWith('/') || /^[A-Za-z]:/u.test(value) || /^[A-Za-z][A-Za-z0-9+.-]*:/u.test(value)) {
+        return false;
+    }
+    const segments = value.split('/');
+    if (segments.some(segment => segment.length === 0 || segment === '.' || segment === '..')) {
+        return false;
+    }
+    return segments.every(isWindowsPortableSegment);
+}
+
+function isWindowsPortableSegment(segment: string): boolean {
+    if (/[<>:"|?*\u0000-\u001f\u007f-\u009f]/u.test(segment)
+        || segment.endsWith('.') || segment.endsWith(' ')) {
+        return false;
+    }
+    const deviceName = segment.split('.', 1)[0].toUpperCase();
+    return !/^(?:CON|PRN|AUX|NUL|CLOCK\$|CONIN\$|CONOUT\$|COM[1-9¹²³]|LPT[1-9¹²³])$/u.test(deviceName);
+}
+
+function windowsOrdinalCaseKey(path: string): string {
+    return path.split('/').map(segment => {
+        let key = '';
+        for (const codePoint of segment) {
+            const uppercase = codePoint.toUpperCase();
+            key += [...uppercase].length === 1 ? uppercase : codePoint;
+        }
+        return key;
+    }).join('/');
 }
 
 function isCanonicalActions(value: unknown): value is RideSmokeAction[] {
@@ -444,5 +531,22 @@ function isCanonicalActions(value: unknown): value is RideSmokeAction[] {
 }
 
 function isUpdateResponse(value: unknown, expectedStatus: 'recorded' | 'completed'): boolean {
-    return isRecord(value) && value.status === expectedStatus;
+    if (!isRecord(value) || !hasExactKeys(value, UPDATE_RESPONSE_KEYS) || value.status !== expectedStatus) {
+        return false;
+    }
+    if (expectedStatus === 'recorded') {
+        return value.diagnostic === JSON_NULL;
+    }
+    return value.diagnostic === JSON_NULL || isExactDiagnostic(value.diagnostic, REPORT_DURABILITY_WARNING);
+}
+
+function isExactDiagnostic(value: unknown, expected: RideSmokeDiagnostic): boolean {
+    return isRecord(value) && hasExactKeys(value, DIAGNOSTIC_KEYS)
+        && value.code === expected.code && value.message === expected.message;
+}
+
+function hasExactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
+    const actual = Object.keys(value);
+    return actual.length === expected.length
+        && expected.every(key => Object.prototype.hasOwnProperty.call(value, key));
 }

@@ -16,7 +16,8 @@ import {
     RideTauriPackagedSmokeProtocol
 } from '../src/browser/ride-packaged-smoke';
 
-const PROOF = 'proof-that-must-never-be-logged';
+const PROOF = 'b'.repeat(64);
+const PROTOCOL_DIAGNOSTIC = { code: 'protocol-failed', message: 'Smoke protocol failed.' } as const;
 
 interface ProtocolCall {
     readonly method: 'plan' | 'recordStep' | 'complete';
@@ -357,13 +358,276 @@ test('packaged smoke safely contains malformed, rejected, and failed IPC respons
     await waitUntil(() => rejectedUpdate.calls.some(call => call.method === 'recordStep'), 'step was not attempted');
     await new Promise<void>(resolve => setImmediate(resolve));
     assert.equal(rejectedActionCalls, 0);
-    assert.equal(rejectedUpdate.calls.some(call => call.method === 'complete'), false);
+    assert.equal(rejectedUpdate.calls.filter(call => call.method === 'recordStep').length, 1);
+    assert.deepEqual(rejectedUpdate.calls.filter(call => call.method === 'complete').map(call => call.request), [{
+        status: 'failed', failurePhase: 'protocol', durationMs: 0,
+        diagnostic: { code: 'protocol-failed', message: 'Smoke protocol failed.' }
+    }]);
 
     const failedPlan = new FakeProtocol(true, new Error('IPC failure with secret path C:\\private'));
     new RidePackagedSmokeContribution(immediateState(), failedPlan, () => actions([])).onStart();
     await waitUntil(() => failedPlan.calls.length === 1, 'failed plan IPC was not attempted');
     await new Promise<void>(resolve => setImmediate(resolve));
     assert.deepEqual(failedPlan.calls, [{ method: 'plan' }]);
+});
+
+test('packaged smoke started IPC failure attempts one protocol completion without replay', async () => {
+    const actionCalls: string[] = [];
+    const protocol = new FakeProtocol(true, activePlan(['editor-save']), (method, request) => {
+        if (method === 'recordStep') {
+            throw new Error('ambiguous started mutation with C:\\private\\secret');
+        }
+        return { status: 'completed', diagnostic: null };
+    });
+    const contribution = new RidePackagedSmokeContribution(
+        immediateState(), protocol, () => actions(actionCalls), { now: () => 0 }
+    );
+
+    contribution.onStart();
+    await waitUntil(() => protocol.calls.some(call => call.method === 'complete'), 'started failure compensation was not attempted');
+
+    assert.deepEqual(actionCalls, []);
+    assert.deepEqual(protocol.calls.filter(call => call.method !== 'plan'), [
+        {
+            method: 'recordStep', proof: PROOF, request: {
+                action: 'editor-save', state: 'started', durationMs: 0, diagnostic: null
+            }
+        },
+        {
+            method: 'complete', proof: PROOF, request: {
+                status: 'failed', failurePhase: 'protocol', durationMs: 0,
+                diagnostic: { code: 'protocol-failed', message: 'Smoke protocol failed.' }
+            }
+        }
+    ]);
+});
+
+test('packaged smoke passed IPC failure attempts failed transition and action completion once', async () => {
+    const actionCalls: string[] = [];
+    const protocol = new FakeProtocol(true, activePlan(['editor-save']), (method, request) => {
+        if (method === 'recordStep' && (request as { state?: string }).state === 'passed') {
+            return { status: 'rejected', diagnostic: { code: 'protocol-failed', message: 'Smoke protocol failed.' } };
+        }
+        return { status: method === 'complete' ? 'completed' : 'recorded', diagnostic: null };
+    });
+    const contribution = new RidePackagedSmokeContribution(
+        immediateState(), protocol, () => actions(actionCalls),
+        { now: (() => { let now = 0; return () => now++; })() }
+    );
+
+    contribution.onStart();
+    await waitUntil(() => protocol.calls.some(call => call.method === 'complete'), 'passed failure compensation was not attempted');
+
+    assert.deepEqual(actionCalls, ['editor-save']);
+    assert.deepEqual(protocol.calls.filter(call => call.method !== 'plan').map(call => [
+        call.method,
+        (call.request as { state?: string; status?: string }).state ?? (call.request as { status?: string }).status
+    ]), [
+        ['recordStep', 'started'],
+        ['recordStep', 'passed'],
+        ['recordStep', 'failed'],
+        ['complete', 'failed']
+    ]);
+    assert.equal(protocol.calls.filter(call =>
+        call.method === 'recordStep' && (call.request as { state?: string }).state === 'passed'
+    ).length, 1);
+    assert.equal(protocol.calls.some(call =>
+        call.method === 'complete' && (call.request as { status?: string }).status === 'passed'
+    ), false);
+});
+
+test('packaged smoke failed transition IPC failure cannot suppress one action completion attempt', async () => {
+    const protocol = new FakeProtocol(true, activePlan(['editor-save']), (method, request) => {
+        if (method === 'recordStep' && (request as { state?: string }).state === 'failed') {
+            throw new Error('failed transition was ambiguous');
+        }
+        return { status: method === 'complete' ? 'completed' : 'recorded', diagnostic: null };
+    });
+    const contribution = new RidePackagedSmokeContribution(
+        immediateState(),
+        protocol,
+        () => actions([], { editorSave: async () => { throw new Error('unsafe action details'); } }),
+        { now: (() => { let now = 0; return () => now++; })() }
+    );
+
+    contribution.onStart();
+    await waitUntil(() => protocol.calls.some(call => call.method === 'complete'), 'action completion was suppressed');
+
+    assert.deepEqual(protocol.calls.filter(call => call.method !== 'plan').map(call => [
+        call.method,
+        (call.request as { state?: string; status?: string }).state ?? (call.request as { status?: string }).status
+    ]), [
+        ['recordStep', 'started'],
+        ['recordStep', 'failed'],
+        ['complete', 'failed']
+    ]);
+});
+
+test('packaged smoke terminal completion failure is consumed without retry', async () => {
+    for (const terminalFailure of ['throw', 'malformed'] as const) {
+        const protocol = new FakeProtocol(true, activePlan([]), method => {
+            assert.equal(method, 'complete');
+            if (terminalFailure === 'throw') {
+                throw new Error('terminal result unknown with secret');
+            }
+            return { status: 'completed' };
+        });
+        const contribution = new RidePackagedSmokeContribution(immediateState(), protocol, () => actions([]));
+
+        contribution.onStart();
+        await waitUntil(() => protocol.calls.some(call => call.method === 'complete'), `${terminalFailure} completion was not attempted`);
+        await new Promise<void>(resolve => setImmediate(resolve));
+
+        assert.equal(protocol.calls.filter(call => call.method === 'complete').length, 1);
+        assert.equal(protocol.calls.filter(call => call.method === 'recordStep').length, 0);
+    }
+});
+
+test('packaged smoke rejects untrusted proof without issuing any mutation', async () => {
+    for (const sessionProof of ['short-proof', 'A'.repeat(64), `${'a'.repeat(63)}g`, '', null]) {
+        const response = { ...activePlan([]) as Record<string, unknown>, sessionProof };
+        const protocol = new FakeProtocol(true, response);
+        let actionResolutions = 0;
+        const contribution = new RidePackagedSmokeContribution(immediateState(), protocol, () => {
+            actionResolutions++;
+            return actions([]);
+        });
+
+        contribution.onStart();
+        await waitUntil(() => protocol.calls.some(call => call.method === 'plan'), 'invalid proof plan was not queried');
+        await new Promise<void>(resolve => setImmediate(resolve));
+
+        assert.equal(actionResolutions, 0, `invalid proof ${String(sessionProof)} resolved actions`);
+        assert.deepEqual(protocol.calls, [{ method: 'plan' }]);
+    }
+});
+
+test('packaged smoke strictly rejects malformed active response and plan shapes with trusted proof', async () => {
+    const validResponse = activePlan([]) as Record<string, unknown>;
+    const validPlan = smokePlan([]) as unknown as Record<string, unknown>;
+    const { diagnostic: _diagnostic, ...missingResponseField } = validResponse;
+    const { files: _files, ...missingPlanField } = validPlan;
+    const malformed: Array<{ name: string; response: unknown }> = [
+        { name: 'unknown response field', response: { ...validResponse, unexpected: true } },
+        { name: 'missing response field', response: missingResponseField },
+        { name: 'non-null active diagnostic', response: { ...validResponse, diagnostic: PROTOCOL_DIAGNOSTIC } },
+        { name: 'unknown plan field', response: { ...validResponse, plan: { ...validPlan, unexpected: true } } },
+        { name: 'missing plan field', response: { ...validResponse, plan: missingPlanField } }
+    ];
+
+    for (const entry of malformed) {
+        const protocol = new FakeProtocol(true, entry.response);
+        let actionResolutions = 0;
+        new RidePackagedSmokeContribution(immediateState(), protocol, () => {
+            actionResolutions++;
+            return actions([]);
+        }, { now: () => 0 }).onStart();
+        await waitUntil(() => protocol.calls.some(call => call.method === 'complete'), `${entry.name} was not closed`);
+
+        assert.equal(actionResolutions, 0, `${entry.name} resolved actions`);
+        assert.deepEqual(protocol.calls.filter(call => call.method === 'complete').map(call => call.request), [{
+            status: 'failed', failurePhase: 'protocol', durationMs: 0, diagnostic: PROTOCOL_DIAGNOSTIC
+        }]);
+    }
+});
+
+test('packaged smoke rejects non-canonical or non-portable workspace and file paths', async () => {
+    const invalidPaths: Array<{ name: string; patch: Partial<RideSmokePlan> }> = [
+        { name: 'absolute workspace', patch: { workspace: '/host/workspace' } },
+        { name: 'drive workspace', patch: { workspace: 'C:/host/workspace' } },
+        { name: 'traversal workspace', patch: { workspace: '../outside' } },
+        { name: 'dot segment workspace', patch: { workspace: 'safe/./workspace' } },
+        { name: 'empty segment workspace', patch: { workspace: 'safe//workspace' } },
+        { name: 'backslash workspace', patch: { workspace: 'safe\\workspace' } },
+        { name: 'reserved workspace', patch: { workspace: 'CON' } },
+        { name: 'absolute file', patch: { files: ['/host/file.txt'] } },
+        { name: 'traversal file', patch: { files: ['safe/../file.txt'] } },
+        { name: 'backslash file', patch: { files: ['safe\\file.txt'] } },
+        { name: 'control file', patch: { files: ['safe/bad\u0001.txt'] } },
+        { name: 'forbidden file', patch: { files: ['safe/bad<name>.txt'] } },
+        { name: 'trailing dot file', patch: { files: ['safe/file.'] } },
+        { name: 'trailing space file', patch: { files: ['safe/file '] } },
+        { name: 'reserved nested file', patch: { files: ['safe/AUX.txt'] } },
+        { name: 'duplicate files', patch: { files: ['safe/file.txt', 'safe/file.txt'] } },
+        { name: 'ordinal case collision', patch: { files: ['safe/File.txt', 'SAFE/file.TXT'] } }
+    ];
+
+    for (const entry of invalidPaths) {
+        const response = activePlan([]) as Record<string, unknown>;
+        response.plan = { ...smokePlan([]), ...entry.patch };
+        const protocol = new FakeProtocol(true, response);
+        let actionResolutions = 0;
+        new RidePackagedSmokeContribution(immediateState(), protocol, () => {
+            actionResolutions++;
+            return actions([]);
+        }, { now: () => 0 }).onStart();
+        await waitUntil(() => protocol.calls.some(call => call.method === 'complete'), `${entry.name} was not closed`);
+
+        assert.equal(actionResolutions, 0, `${entry.name} resolved actions`);
+        assert.equal((protocol.calls.find(call => call.method === 'complete')?.request as { failurePhase?: string }).failurePhase, 'protocol');
+    }
+});
+
+test('packaged smoke validates complete disabled and rejected plan response shapes', async () => {
+    const malformedResponses: unknown[] = [
+        { mode: 'disabled', plan: null, sessionProof: null },
+        { mode: 'disabled', plan: {}, sessionProof: null, diagnostic: null },
+        { mode: 'disabled', plan: null, sessionProof: null, diagnostic: null, extra: true },
+        { mode: 'rejected', plan: null, sessionProof: null, diagnostic: null },
+        { mode: 'rejected', plan: null, sessionProof: null, diagnostic: { ...PROTOCOL_DIAGNOSTIC, extra: true } },
+        { mode: 'rejected', plan: null, sessionProof: null, diagnostic: { code: 'protocol-failed', message: 'wrong' } }
+    ];
+    for (const response of malformedResponses) {
+        const protocol = new FakeProtocol(true, response);
+        let actionResolutions = 0;
+        new RidePackagedSmokeContribution(immediateState(), protocol, () => {
+            actionResolutions++;
+            return actions([]);
+        }).onStart();
+        await waitUntil(() => protocol.calls.length === 1, 'malformed inactive plan was not queried');
+        await new Promise<void>(resolve => setImmediate(resolve));
+        assert.equal(actionResolutions, 0);
+        assert.deepEqual(protocol.calls, [{ method: 'plan' }]);
+    }
+});
+
+test('packaged smoke rejects loosely shaped recorded updates instead of treating them as success', async () => {
+    const invalidUpdates: unknown[] = [
+        { status: 'recorded' },
+        { status: 'recorded', diagnostic: null, extra: true },
+        { status: 'recorded', diagnostic: PROTOCOL_DIAGNOSTIC },
+        { status: 'recorded', diagnostic: { code: 'protocol-failed', message: 'wrong' } }
+    ];
+    for (const update of invalidUpdates) {
+        const actionCalls: string[] = [];
+        const protocol = new FakeProtocol(true, activePlan(['editor-save']), method => (
+            method === 'recordStep' ? update : { status: 'completed', diagnostic: null }
+        ));
+        new RidePackagedSmokeContribution(
+            immediateState(), protocol, () => actions(actionCalls), { now: () => 0 }
+        ).onStart();
+        await waitUntil(() => protocol.calls.some(call => call.method === 'complete'), 'invalid recorded update was not compensated');
+
+        assert.deepEqual(actionCalls, []);
+        assert.equal(protocol.calls.filter(call => call.method === 'recordStep').length, 1);
+        assert.equal((protocol.calls.find(call => call.method === 'complete')?.request as { failurePhase?: string }).failurePhase, 'protocol');
+    }
+});
+
+test('packaged smoke accepts only the exact Rust durability warning on completed update', async () => {
+    const protocol = new FakeProtocol(true, activePlan([]), method => ({
+        status: 'completed',
+        diagnostic: method === 'complete'
+            ? {
+                code: 'report-durability-warning',
+                message: 'Smoke report was committed but durability sync failed.'
+            }
+            : null
+    }));
+    new RidePackagedSmokeContribution(immediateState(), protocol, () => actions([])).onStart();
+    await waitUntil(() => protocol.calls.some(call => call.method === 'complete'), 'durability warning completion was not attempted');
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(protocol.calls.filter(call => call.method === 'complete').length, 1);
 });
 
 test('packaged smoke disposal and repeated startup never execute twice', async () => {
@@ -388,6 +652,73 @@ test('packaged smoke disposal and repeated startup never execute twice', async (
     await waitUntil(() => protocol.calls.some(call => call.method === 'complete'), 'empty smoke did not complete');
     assert.equal(protocol.calls.filter(call => call.method === 'plan').length, 1);
     assert.equal(protocol.calls.filter(call => call.method === 'complete').length, 1);
+});
+
+test('packaged smoke active session reaches failed terminal when disposed during a stuck action', async () => {
+    const protocol = new FakeProtocol(true, activePlan(['editor-save']));
+    const actionStarted = deferred();
+    const timers: Array<() => void> = [];
+    const contribution = new RidePackagedSmokeContribution(
+        immediateState(),
+        protocol,
+        () => actions([], {
+            editorSave: () => {
+                actionStarted.resolve();
+                return new Promise<void>(() => undefined);
+            }
+        }),
+        {
+            now: (() => { let now = 0; return () => now++; })(),
+            setTimeout: callback => {
+                timers.push(callback);
+                return callback;
+            },
+            clearTimeout: () => undefined
+        }
+    );
+
+    contribution.onStart();
+    await actionStarted.promise;
+    contribution.dispose();
+    assert.equal(timers.length, 1);
+    timers[0]();
+    await waitUntil(() => protocol.calls.some(call => call.method === 'complete'), 'disposed active smoke did not fail terminally');
+
+    const mutations = protocol.calls.filter(call => call.method !== 'plan');
+    assert.deepEqual(mutations.map(call => [call.method, (call.request as { state?: string; status?: string }).state
+        ?? (call.request as { status?: string }).status]), [
+        ['recordStep', 'started'],
+        ['recordStep', 'failed'],
+        ['complete', 'failed']
+    ]);
+    assert.equal(mutations.some(call => (call.request as { status?: string }).status === 'passed'), false);
+});
+
+test('packaged smoke active session reaches passed terminal when disposed at an action boundary', async () => {
+    const protocol = new FakeProtocol(true, activePlan(['editor-save', 'terminal-sentinel']));
+    const actionCalls: string[] = [];
+    let contribution!: RidePackagedSmokeContribution;
+    contribution = new RidePackagedSmokeContribution(
+        immediateState(),
+        protocol,
+        () => actions(actionCalls, {
+            editorSave: async () => {
+                actionCalls.push('editor-save');
+                contribution.dispose();
+            }
+        }),
+        { now: (() => { let now = 0; return () => now++; })() }
+    );
+
+    contribution.onStart();
+    contribution.onStart();
+    await waitUntil(() => protocol.calls.some(call => call.method === 'complete'), 'disposed active smoke did not pass terminally');
+
+    assert.deepEqual(actionCalls, ['editor-save', 'terminal-sentinel']);
+    assert.equal(protocol.calls.filter(call => call.method === 'plan').length, 1);
+    assert.deepEqual(protocol.calls.filter(call => call.method === 'complete').map(call => call.request), [{
+        status: 'passed', failurePhase: null, durationMs: 4, diagnostic: null
+    }]);
 });
 
 test('packaged smoke Tauri adapter emits the exact raw Value envelopes', async () => {
