@@ -472,6 +472,9 @@ function parseActivePlan(value: unknown): RideSmokePlan | undefined {
     }
     const files = Object.freeze([...value.files]);
     const actions = Object.freeze([...value.actions]);
+    if (actions.includes('second-file-forwarding') && files.length !== 2) {
+        return undefined;
+    }
     return Object.freeze({
         specSha256: value.specSha256,
         scenario: value.scenario,

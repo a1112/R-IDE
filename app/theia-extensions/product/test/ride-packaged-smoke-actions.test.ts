@@ -14,6 +14,7 @@ import {
 } from '../src/browser/ride-packaged-smoke';
 import type { RideSmokeAction, RideSmokePlan } from '../src/browser/ride-packaged-smoke';
 import { bindRidePackagedSmokeContribution } from '../src/browser/ride-packaged-smoke-bindings';
+import { RIDE_SMOKE_PACKAGED_PLUGIN } from '../src/browser/ride-packaged-plugin-inventory';
 import {
     RIDE_SMOKE_EDITOR_MARKER,
     RIDE_SMOKE_TERMINAL_SENTINEL,
@@ -877,11 +878,106 @@ test('smoke action service dispose prevents new side effects', async () => {
     assert.equal(fixture.saveCalls, 0);
 });
 
-test('smoke action Task 5 methods fail explicitly without resolving unrelated services', async () => {
+test('smoke action waits for hosted plugins before executing the canonical packaged command', async () => {
+    const pluginsReady = deferred<void>();
+    const lookups: string[] = [];
+    const executions: string[] = [];
+    let commandRegistered = false;
+    const services = workspaceServices({
+        ...({
+            hostedPlugins: { didStart: pluginsReady.promise },
+            commandRegistry: {
+                getCommand: (id: string) => {
+                    lookups.push(id);
+                    return commandRegistered ? { id } : undefined;
+                },
+                getAllHandlers: () => [],
+                executeCommand: async (id: string) => {
+                    executions.push(id);
+                }
+            }
+        } as unknown as Partial<RidePackagedSmokeActionServices>)
+    });
+    const operation = new RidePackagedSmokeActionService(services).packagedPluginCommand(plan());
+    const outcome = outcomeWithin(operation);
+
+    await turn();
+    assert.deepEqual(lookups, []);
+    assert.deepEqual(executions, []);
+
+    commandRegistered = true;
+    pluginsReady.resolve();
+    assert.equal(await outcome, undefined);
+    assert.deepEqual(lookups, [RIDE_SMOKE_PACKAGED_PLUGIN.commandId]);
+    assert.deepEqual(executions, [RIDE_SMOKE_PACKAGED_PLUGIN.commandId]);
+});
+
+test('smoke action executes extract-widget and proves the deferred proxy handler was replaced', async () => {
+    const proxyHandler = { execute: () => undefined };
+    const realHandler = { execute: () => undefined };
+    const eligibleWidget = { id: 'scm-view', isExtractable: true, secondaryWindow: undefined as object | undefined };
+    const executions: Array<{ id: string; widget: unknown }> = [];
+    let handlers = [proxyHandler];
+    const services = workspaceServices({
+        ...({
+            applicationShell: {
+                widgets: [
+                    { id: 'not-extractable', isExtractable: false },
+                    eligibleWidget
+                ]
+            },
+            commandRegistry: {
+                getCommand: (id: string) => id === 'extract-widget' ? { id } : undefined,
+                getAllHandlers: () => handlers,
+                executeCommand: async (id: string, widget: unknown) => {
+                    executions.push({ id, widget });
+                    handlers = [realHandler];
+                    eligibleWidget.secondaryWindow = {};
+                }
+            }
+        } as unknown as Partial<RidePackagedSmokeActionServices>)
+    });
+
+    await new RidePackagedSmokeActionService(services).secondaryWindow(plan());
+
+    assert.deepEqual(executions, [{ id: 'extract-widget', widget: eligibleWidget }]);
+    assert.deepEqual(handlers, [realHandler]);
+});
+
+test('smoke action accepts only the planned second file from a single-instance open event', async () => {
+    let listener: ((event: { source: string; relativePath: string }) => void) | undefined;
+    let subscriptionDisposals = 0;
+    const services = workspaceServices({
+        ...({
+            openRequests: {
+                onDidOpenRequest: (candidate: (event: { source: string; relativePath: string }) => void) => {
+                    listener = candidate;
+                    return { dispose: () => subscriptionDisposals++ };
+                }
+            }
+        } as unknown as Partial<RidePackagedSmokeActionServices>)
+    });
+    const smokePlan = plan({ files: Object.freeze(['startup.R', 'forwarded.R']) });
+    const operation = new RidePackagedSmokeActionService(services).waitForSecondFile(smokePlan);
+    const outcome = outcomeWithin(operation);
+
+    await turn();
+    assert.ok(listener, 'the forwarding observer must be installed while the action is active');
+    listener({ source: 'initial', relativePath: 'forwarded.R' });
+    listener({ source: 'singleInstance', relativePath: 'other.R' });
+    await turn();
+    assert.equal(subscriptionDisposals, 0);
+    listener({ source: 'singleInstance', relativePath: 'forwarded.R' });
+
+    assert.equal(await outcome, undefined);
+    assert.equal(subscriptionDisposals, 1);
+});
+
+test('smoke action Task 5 methods fail safely when their production services are unavailable', async () => {
     const actions = new RidePackagedSmokeActionService(workspaceServices());
-    await assert.rejects(actions.packagedPluginCommand(plan()), /Smoke action not ready\./);
-    await assert.rejects(actions.secondaryWindow(plan()), /Smoke action not ready\./);
-    await assert.rejects(actions.waitForSecondFile(plan()), /Smoke action not ready\./);
+    await assert.rejects(actions.packagedPluginCommand(plan()), /Smoke action unavailable\./);
+    await assert.rejects(actions.secondaryWindow(plan()), /Smoke action unavailable\./);
+    await assert.rejects(actions.waitForSecondFile(plan({ files: Object.freeze(['startup.R', 'forwarded.R']) })), /Smoke action unavailable\./);
 });
 
 test('smoke action production shutdown is a no-op before the default actions service resolves', () => {
@@ -894,7 +990,11 @@ test('smoke action production shutdown is a no-op before the default actions ser
         fileService: Symbol('fileService'),
         terminalService: Symbol('terminalService'),
         searchService: Symbol('searchService'),
-        scmService: Symbol('scmService')
+        scmService: Symbol('scmService'),
+        hostedPlugins: Symbol('hostedPlugins'),
+        commandRegistry: Symbol('commandRegistry'),
+        applicationShell: Symbol('applicationShell'),
+        openRequests: Symbol('openRequests')
     };
     let resolutions = 0;
     for (const identifier of [
@@ -903,7 +1003,11 @@ test('smoke action production shutdown is a no-op before the default actions ser
         identifiers.fileService,
         identifiers.terminalService,
         identifiers.searchService,
-        identifiers.scmService
+        identifiers.scmService,
+        identifiers.hostedPlugins,
+        identifiers.commandRegistry,
+        identifiers.applicationShell,
+        identifiers.openRequests
     ]) {
         container.bind(identifier).toDynamicValue(() => {
             resolutions++;
@@ -931,7 +1035,11 @@ test('smoke action production binding lazily resolves every explicit adapter onc
         fileService: Symbol('fileService'),
         terminalService: Symbol('terminalService'),
         searchService: Symbol('searchService'),
-        scmService: Symbol('scmService')
+        scmService: Symbol('scmService'),
+        hostedPlugins: Symbol('hostedPlugins'),
+        commandRegistry: Symbol('commandRegistry'),
+        applicationShell: Symbol('applicationShell'),
+        openRequests: Symbol('openRequests')
     };
     const resolutions = new Map<symbol, number>();
     const services = new Map<symbol, unknown>([
@@ -940,7 +1048,15 @@ test('smoke action production binding lazily resolves every explicit adapter onc
         [identifiers.fileService, { read: async () => ({ value: '' }), exists: async () => false }],
         [identifiers.terminalService, { newTerminal: async () => assert.fail('not executed') }],
         [identifiers.searchService, { searchWithCallback: async () => 1, cancel: () => undefined }],
-        [identifiers.scmService, { repositories: [] }]
+        [identifiers.scmService, { repositories: [] }],
+        [identifiers.hostedPlugins, { didStart: Promise.resolve() }],
+        [identifiers.commandRegistry, {
+            getCommand: () => undefined,
+            getAllHandlers: () => [],
+            executeCommand: async () => undefined
+        }],
+        [identifiers.applicationShell, { widgets: [] }],
+        [identifiers.openRequests, { onDidOpenRequest: () => ({ dispose: () => undefined }) }]
     ]);
     for (const [identifier, service] of services) {
         container.bind(identifier).toDynamicValue(() => {
@@ -967,7 +1083,7 @@ test('smoke action production binding lazily resolves every explicit adapter onc
 
     assert.strictEqual(first, second);
     assert.equal(first instanceof RidePackagedSmokeActionService, true);
-    assert.deepEqual([...resolutions.values()], [1, 1, 1, 1, 1, 1]);
+    assert.deepEqual([...resolutions.values()], [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]);
     assert.equal(contributions.length, 2);
     assert.equal(disposals, 1);
     await assert.rejects(first.editorSave(plan()), /Smoke action disposed\./);

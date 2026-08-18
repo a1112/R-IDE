@@ -15,6 +15,7 @@ import { open } from '@theia/core/lib/browser/opener-service';
 import type { OpenerService } from '@theia/core/lib/browser/opener-service';
 import type { WidgetOpenerOptions } from '@theia/core/lib/browser/widget-open-handler';
 import type { Disposable } from '@theia/core/lib/common/disposable';
+import { Emitter, Event } from '@theia/core/lib/common/event';
 import { FileUri } from '@theia/core/lib/common/file-uri';
 import type { MessageService } from '@theia/core/lib/common/message-service';
 import type { WorkspaceService } from '@theia/workspace/lib/browser';
@@ -110,6 +111,11 @@ export interface RideOpenRequest {
     files: string[];
 }
 
+export interface RideOpenRequestObservation {
+    readonly source: RideOpenRequestSource;
+    readonly relativePath: string;
+}
+
 interface RideOpenRequestState {
     readonly version: 2;
     readonly lastConsumed: string;
@@ -128,6 +134,8 @@ interface NormalizedNativePath {
 }
 
 export class RideOpenRequestContribution implements FrontendApplicationContribution, Disposable {
+    protected readonly didOpenRequestEmitter = new Emitter<RideOpenRequestObservation>();
+    readonly onDidOpenRequest: Event<RideOpenRequestObservation> = this.didOpenRequestEmitter.event;
     protected readonly storage: Storage;
     protected readonly initializationComplete: Promise<void>;
     protected resolveInitializationComplete!: () => void;
@@ -246,6 +254,7 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
         this.finishInitialization();
         this.cancelPluginFallback();
         this.pluginDeployment?.dispose();
+        this.didOpenRequestEmitter.dispose();
         this.unlisten?.();
         this.unlisten = undefined;
     }
@@ -340,6 +349,8 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
     protected async openFiles(request: RideOpenRequest): Promise<void> {
         this.cancelPluginFallback();
         let targetWidgetId: string | undefined;
+        let targetFile: string | undefined;
+        let activatedTargetFile: string | undefined;
         let openedTarget = false;
         let editableTarget = false;
         const options: WidgetOpenerOptions = { mode: 'open' };
@@ -350,6 +361,7 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
                     openedTarget = true;
                     if (hasWidgetId(opened)) {
                         targetWidgetId = opened.id;
+                        targetFile = file;
                     }
                 } catch (error) {
                     await this.reportErrorSafely(
@@ -362,6 +374,7 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
                 try {
                     await this.shell.activateWidget(targetWidgetId);
                     editableTarget = true;
+                    activatedTargetFile = targetFile;
                 } catch (error) {
                     await this.reportErrorSafely(
                         `R-IDE could not activate the opened target: ${errorMessage(error)}`,
@@ -375,6 +388,12 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
                 this.targetFileOpened = true;
                 await this.reportStartupMilestone('target_file_opened');
                 this.schedulePluginActivationAfterYield();
+                const observation = activatedTargetFile
+                    ? createOpenRequestObservation(request, activatedTargetFile)
+                    : undefined;
+                if (observation && !this.disposed) {
+                    this.didOpenRequestEmitter.fire(observation);
+                }
             }
         } finally {
             if (!editableTarget) {
@@ -790,6 +809,24 @@ function isImmediateParentPath(parent: NormalizedNativePath, child: NormalizedNa
     const prefix = parent.comparisonPath.endsWith('/') ? parent.comparisonPath : `${parent.comparisonPath}/`;
     const relativePath = child.comparisonPath.slice(prefix.length);
     return child.comparisonPath.startsWith(prefix) && !!relativePath && !relativePath.includes('/');
+}
+
+function createOpenRequestObservation(
+    request: RideOpenRequest,
+    targetFile: string
+): RideOpenRequestObservation | undefined {
+    const workspace = normalizeNativePath(request.workspace);
+    const file = normalizeNativePath(targetFile);
+    if (!workspace || !file || !isImmediateParentPath(workspace, file)) {
+        return undefined;
+    }
+    const prefixLength = workspace.fileSystemPath.endsWith('/')
+        ? workspace.fileSystemPath.length
+        : workspace.fileSystemPath.length + 1;
+    return {
+        source: request.source,
+        relativePath: file.fileSystemPath.slice(prefixLength)
+    };
 }
 
 function hasWidgetId(value: object | undefined): value is { id: string } {

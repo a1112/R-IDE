@@ -6,6 +6,8 @@
 
 import type { FrontendApplicationStateService } from '@theia/core/lib/browser/frontend-application-state';
 import type { FrontendApplicationContribution } from '@theia/core/lib/browser/frontend-application-contribution';
+import type { ApplicationShell } from '@theia/core/lib/browser/shell/application-shell';
+import type { CommandRegistry } from '@theia/core/lib/common/command';
 import { OS } from '@theia/core/lib/common/os';
 import { interfaces } from '@theia/core/shared/inversify';
 import type { EditorManager } from '@theia/editor/lib/browser';
@@ -13,6 +15,7 @@ import type { FileService } from '@theia/filesystem/lib/browser/file-service';
 import type { ScmService } from '@theia/scm/lib/browser/scm-service';
 import type { SearchInWorkspaceService } from '@theia/search-in-workspace/lib/browser/search-in-workspace-service';
 import type { TerminalService } from '@theia/terminal/lib/browser/base/terminal-service';
+import type { HostedPluginSupport } from '@theia/plugin-ext/lib/hosted/browser/hosted-plugin';
 import type { WorkspaceService } from '@theia/workspace/lib/browser';
 import {
     RidePackagedSmokeActions,
@@ -21,6 +24,7 @@ import {
     RideTauriPackagedSmokeProtocol
 } from './ride-packaged-smoke';
 import { RidePackagedSmokeActionService } from './ride-packaged-smoke-actions';
+import { RideOpenRequestContribution } from './ride-open-request';
 
 declare const require: (moduleName: string) => Record<string, interfaces.ServiceIdentifier<unknown>>;
 
@@ -49,6 +53,10 @@ export interface RidePackagedSmokeBindingIdentifiers {
     readonly terminalService?: interfaces.ServiceIdentifier<TerminalService>;
     readonly searchService?: interfaces.ServiceIdentifier<SearchInWorkspaceService>;
     readonly scmService?: interfaces.ServiceIdentifier<ScmService>;
+    readonly hostedPlugins?: interfaces.ServiceIdentifier<HostedPluginSupport>;
+    readonly commandRegistry?: interfaces.ServiceIdentifier<CommandRegistry>;
+    readonly applicationShell?: interfaces.ServiceIdentifier<ApplicationShell>;
+    readonly openRequests?: interfaces.ServiceIdentifier<RideOpenRequestContribution>;
 }
 
 export function bindRidePackagedSmokeContribution(
@@ -79,6 +87,13 @@ export function bindRidePackagedSmokeContribution(
                 ?? require('@theia/search-in-workspace/lib/browser/search-in-workspace-service').SearchInWorkspaceService;
             const scmService = identifiers.scmService
                 ?? require('@theia/scm/lib/browser/scm-service').ScmService;
+            const hostedPlugins = identifiers.hostedPlugins
+                ?? require('@theia/plugin-ext/lib/hosted/browser/hosted-plugin').HostedPluginSupport;
+            const commandRegistry = identifiers.commandRegistry
+                ?? require('@theia/core/lib/common/command').CommandRegistry;
+            const applicationShell = identifiers.applicationShell
+                ?? require('@theia/core/lib/browser/shell/application-shell').ApplicationShell;
+            const openRequests = identifiers.openRequests ?? RideOpenRequestContribution;
             const actions = new RidePackagedSmokeActionService({
                 workspaceService: context.container.get(workspaceService) as WorkspaceService,
                 editorManager: context.container.get(editorManager) as EditorManager,
@@ -86,6 +101,10 @@ export function bindRidePackagedSmokeContribution(
                 terminalService: context.container.get(terminalService) as TerminalService,
                 searchService: context.container.get(searchService) as SearchInWorkspaceService,
                 scmService: context.container.get(scmService) as ScmService,
+                hostedPlugins: context.container.get(hostedPlugins) as HostedPluginSupport,
+                commandRegistry: context.container.get(commandRegistry) as CommandRegistry,
+                applicationShell: context.container.get(applicationShell) as ApplicationShell,
+                openRequests: context.container.get(openRequests) as RideOpenRequestContribution,
                 backendIsWindows: OS.backend.isWindows
             });
             resolvedActions = actions;

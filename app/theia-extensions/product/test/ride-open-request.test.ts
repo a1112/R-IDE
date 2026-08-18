@@ -2403,6 +2403,76 @@ test('target-file milestone is emitted only after a target opens successfully', 
     assert.deepEqual(succeeded.milestones, ['target_file_opened']);
 });
 
+test('open-request observation exposes only source and relative path after open and activation', async () => {
+    const order: string[] = [];
+    const observed: Array<{ source: string; relativePath: string }> = [];
+    const context = createContribution(
+        '/project',
+        new MemoryStorage(),
+        () => {
+            order.push('open');
+            assert.deepEqual(observed, []);
+        },
+        async () => {
+            order.push('milestone');
+            assert.deepEqual(observed, []);
+        },
+        new FakeApplicationStateService(),
+        new FakeHostedPluginSupport(),
+        undefined,
+        undefined,
+        undefined,
+        () => undefined,
+        () => {
+            order.push('activate');
+            assert.deepEqual(observed, []);
+        }
+    );
+    const observationEvent = (context.contribution as unknown as {
+        readonly onDidOpenRequest?: (
+            listener: (event: { source: string; relativePath: string }) => void
+        ) => { dispose(): void };
+    }).onDidOpenRequest;
+    assert.equal(typeof observationEvent, 'function');
+    const subscription = observationEvent!(event => {
+        order.push('observe');
+        observed.push(event);
+    });
+
+    await context.contribution.handleOpenRequest({
+        id: '23', source: 'singleInstance', workspace: '/project', files: ['/project/forwarded.R']
+    });
+
+    assert.deepEqual(order, ['open', 'activate', 'milestone', 'observe']);
+    assert.deepEqual(observed, [{ source: 'singleInstance', relativePath: 'forwarded.R' }]);
+    assert.deepEqual(Object.keys(observed[0]), ['source', 'relativePath']);
+    assert.doesNotMatch(JSON.stringify(observed), /\/project/i);
+    subscription.dispose();
+});
+
+test('open-request observation is not emitted when target activation fails', async () => {
+    const context = createContribution(
+        '/project', new MemoryStorage(), () => undefined, async () => undefined,
+        new FakeApplicationStateService(), new FakeHostedPluginSupport(), undefined,
+        undefined, undefined, () => undefined,
+        async () => { throw new Error('activation rejected'); }
+    );
+    const observationEvent = (context.contribution as unknown as {
+        readonly onDidOpenRequest?: (
+            listener: (event: { source: string; relativePath: string }) => void
+        ) => { dispose(): void };
+    }).onDidOpenRequest;
+    assert.equal(typeof observationEvent, 'function');
+    const observed: unknown[] = [];
+    observationEvent!(event => observed.push(event));
+
+    await context.contribution.handleOpenRequest({
+        id: '24', source: 'singleInstance', workspace: '/project', files: ['/project/not-activated.R']
+    });
+
+    assert.deepEqual(observed, []);
+});
+
 test('already-resolved plugin lifecycle is reported after the target in canonical order', async () => {
     const hostedPlugins = new FakeHostedPluginSupport();
     hostedPlugins.resolveDidStart();

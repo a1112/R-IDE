@@ -550,6 +550,44 @@ test('packaged smoke safely contains malformed, rejected, and failed IPC respons
     assert.deepEqual(failedPlan.calls, [{ method: 'plan' }]);
 });
 
+test('packaged smoke rejects forwarding plans without exactly one expected second file', async () => {
+    const base = activePlan(['second-file-forwarding']) as {
+        mode: 'active';
+        plan: RideSmokePlan;
+        sessionProof: string;
+        diagnostic: null;
+    };
+    for (const files of [
+        ['startup.R'],
+        ['startup.R', 'forwarded.R', 'unexpected.R']
+    ]) {
+        const protocol = new FakeProtocol(true, {
+            ...base,
+            plan: { ...base.plan, files }
+        });
+        let actionResolutions = 0;
+        const contribution = new RidePackagedSmokeContribution(immediateState(), protocol, () => {
+            actionResolutions++;
+            return actions([]);
+        });
+
+        contribution.onStart();
+        await waitUntil(() => protocol.calls.some(call => call.method === 'complete'), 'invalid forwarding plan was not rejected');
+
+        assert.equal(actionResolutions, 0);
+        assert.deepEqual(protocol.calls[protocol.calls.length - 1], {
+            method: 'complete',
+            proof: PROOF,
+            request: {
+                status: 'failed',
+                failurePhase: 'protocol',
+                durationMs: 0,
+                diagnostic: PROTOCOL_DIAGNOSTIC
+            }
+        });
+    }
+});
+
 test('packaged smoke retries response-loss mutations with the identical request and reaches a legal passed terminal', async () => {
     const actionCalls: string[] = [];
     const protocol = new ReplayAwareProtocol(

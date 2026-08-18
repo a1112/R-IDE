@@ -8,11 +8,14 @@ import { OS } from '@theia/core/lib/common/os';
 import URI from '@theia/core/lib/common/uri';
 import type { Disposable } from '@theia/core/lib/common/disposable';
 import type { RidePackagedSmokeActions, RideSmokePlan } from './ride-packaged-smoke';
+import type { RideOpenRequestObservation } from './ride-open-request';
+import { RIDE_SMOKE_PACKAGED_PLUGIN } from './ride-packaged-plugin-inventory';
 
 export const RIDE_SMOKE_EDITOR_MARKER = 'RIDE_PACKAGED_SMOKE_EDITOR_MARKER';
 export const RIDE_SMOKE_TERMINAL_SENTINEL = '.ride-smoke-terminal-ok';
 export const RIDE_SMOKE_WINDOWS_COMMAND = "New-Item -ItemType File -Force '.ride-smoke-terminal-ok' | Out-Null\r\n";
 export const RIDE_SMOKE_UNIX_COMMAND = ": > '.ride-smoke-terminal-ok'\n";
+export const RIDE_SMOKE_EXTRACT_WIDGET_COMMAND = 'extract-widget';
 
 interface WorkspaceRootLike {
     readonly resource: URI;
@@ -102,6 +105,31 @@ interface ScmServiceLike {
     }>;
 }
 
+interface HostedPluginsLike {
+    readonly didStart: PromiseLike<void>;
+}
+
+interface CommandRegistryLike {
+    getCommand(id: string): { readonly id: string } | undefined;
+    getAllHandlers(id: string): readonly unknown[];
+    executeCommand(id: string, ...args: unknown[]): PromiseLike<unknown> | unknown;
+}
+
+interface ApplicationShellLike {
+    readonly widgets: readonly unknown[];
+}
+
+interface ExtractableWidgetLike {
+    readonly isExtractable: true;
+    secondaryWindow: unknown | undefined;
+}
+
+interface OpenRequestsLike {
+    readonly onDidOpenRequest: (
+        listener: (event: RideOpenRequestObservation) => void
+    ) => Disposable;
+}
+
 export interface RidePackagedSmokeActionServices {
     readonly workspaceService?: WorkspaceServiceLike;
     readonly editorManager?: EditorManagerLike;
@@ -109,6 +137,10 @@ export interface RidePackagedSmokeActionServices {
     readonly terminalService?: TerminalServiceLike;
     readonly searchService?: SearchServiceLike;
     readonly scmService?: ScmServiceLike;
+    readonly hostedPlugins?: HostedPluginsLike;
+    readonly commandRegistry?: CommandRegistryLike;
+    readonly applicationShell?: ApplicationShellLike;
+    readonly openRequests?: OpenRequestsLike;
     readonly backendIsWindows?: boolean;
     readonly pollIntervalMs?: number;
     readonly pollTimeoutMs?: number;
@@ -120,8 +152,7 @@ type SafeErrorMessage =
     | 'Smoke action unavailable.'
     | 'Smoke action failed.'
     | 'Smoke action timed out.'
-    | 'Smoke action disposed.'
-    | 'Smoke action not ready.';
+    | 'Smoke action disposed.';
 
 class RideSmokeActionError extends Error {
     constructor(message: SafeErrorMessage) {
@@ -331,19 +362,96 @@ export class RidePackagedSmokeActionService implements RidePackagedSmokeActions,
         });
     }
 
-    async packagedPluginCommand(_plan: RideSmokePlan): Promise<void> {
-        this.ensureActive();
-        throw this.error('Smoke action not ready.');
+    packagedPluginCommand(plan: RideSmokePlan): Promise<void> {
+        return this.runAction(plan, async run => {
+            const hostedPlugins = this.requireService(this.services.hostedPlugins);
+            const commandRegistry = this.requireService(this.services.commandRegistry);
+            await run.wait(hostedPlugins.didStart);
+            run.assertActive();
+            const commandId = RIDE_SMOKE_PACKAGED_PLUGIN.commandId;
+            if (commandRegistry.getCommand(commandId)?.id !== commandId) {
+                throw this.error('Smoke action unavailable.');
+            }
+            run.assertActive();
+            await run.wait(commandRegistry.executeCommand(commandId));
+        });
     }
 
-    async secondaryWindow(_plan: RideSmokePlan): Promise<void> {
-        this.ensureActive();
-        throw this.error('Smoke action not ready.');
+    secondaryWindow(plan: RideSmokePlan): Promise<void> {
+        return this.runAction(plan, async run => {
+            const commandRegistry = this.requireService(this.services.commandRegistry);
+            const applicationShell = this.requireService(this.services.applicationShell);
+            run.assertActive();
+            const widget = applicationShell.widgets.find(isEligibleExtractableWidget);
+            if (!widget || commandRegistry.getCommand(RIDE_SMOKE_EXTRACT_WIDGET_COMMAND)?.id
+                !== RIDE_SMOKE_EXTRACT_WIDGET_COMMAND) {
+                throw this.error('Smoke action unavailable.');
+            }
+            const proxyHandlers = [...commandRegistry.getAllHandlers(RIDE_SMOKE_EXTRACT_WIDGET_COMMAND)];
+            if (proxyHandlers.length !== 1) {
+                throw this.error('Smoke action unavailable.');
+            }
+            run.assertActive();
+            await run.wait(commandRegistry.executeCommand(RIDE_SMOKE_EXTRACT_WIDGET_COMMAND, widget));
+            run.assertActive();
+            const realHandlers = [...commandRegistry.getAllHandlers(RIDE_SMOKE_EXTRACT_WIDGET_COMMAND)];
+            if (commandRegistry.getCommand(RIDE_SMOKE_EXTRACT_WIDGET_COMMAND)?.id
+                !== RIDE_SMOKE_EXTRACT_WIDGET_COMMAND
+                || realHandlers.length !== 1
+                || realHandlers[0] === proxyHandlers[0]
+                || widget.secondaryWindow === undefined) {
+                throw this.error('Smoke action failed.');
+            }
+        });
     }
 
-    async waitForSecondFile(_plan: RideSmokePlan): Promise<void> {
-        this.ensureActive();
-        throw this.error('Smoke action not ready.');
+    waitForSecondFile(plan: RideSmokePlan): Promise<void> {
+        return this.runAction(plan, async run => {
+            const expectedFile = plan.files.length === 2 ? plan.files[1] : undefined;
+            if (!expectedFile) {
+                throw this.error('Smoke action unavailable.');
+            }
+            const openRequests = this.requireService(this.services.openRequests);
+            await run.wait(new Promise<void>((resolve, reject) => {
+                let settled = false;
+                let subscription: Disposable | undefined;
+                const disposeSubscription = (): void => {
+                    try {
+                        subscription?.dispose();
+                    } catch {
+                        // Observation cleanup is best-effort after the action has settled.
+                    }
+                };
+                const stopOnAbort = run.onAbort(disposeSubscription);
+                const finish = (error?: unknown): void => {
+                    if (settled) {
+                        return;
+                    }
+                    settled = true;
+                    stopOnAbort();
+                    disposeSubscription();
+                    if (error) {
+                        reject(error);
+                    } else {
+                        resolve();
+                    }
+                };
+                try {
+                    subscription = openRequests.onDidOpenRequest(event => {
+                        if (!run.aborted
+                            && event.source === 'singleInstance'
+                            && event.relativePath === expectedFile) {
+                            finish();
+                        }
+                    });
+                    if (settled) {
+                        disposeSubscription();
+                    }
+                } catch (error) {
+                    finish(error);
+                }
+            }));
+        });
     }
 
     protected async resolveWorkspaceRoot(plan: RideSmokePlan, run: RideSmokeActionRun): Promise<URI> {
@@ -666,4 +774,10 @@ export class RidePackagedSmokeActionService implements RidePackagedSmokeActions,
             );
         });
     }
+}
+
+function isEligibleExtractableWidget(value: unknown): value is ExtractableWidgetLike {
+    return typeof value === 'object' && !!value
+        && 'isExtractable' in value && value.isExtractable === true
+        && 'secondaryWindow' in value && value.secondaryWindow === undefined;
 }
