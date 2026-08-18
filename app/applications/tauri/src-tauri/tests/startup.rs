@@ -351,9 +351,13 @@ fn tauri_uses_an_isolated_config_directory_unless_explicitly_overridden() {
 #[test]
 fn release_windows_binary_uses_the_gui_subsystem() {
     let main_source = include_str!("../src/main.rs");
+    let compact_source = main_source
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
 
-    assert!(main_source.contains(
-        "#![cfg_attr(all(not(debug_assertions), target_os = \"windows\"), windows_subsystem = \"windows\")]"
+    assert!(compact_source.contains(
+        "#![cfg_attr(all(not(debug_assertions),target_os=\"windows\"),windows_subsystem=\"windows\")]"
     ));
 }
 
