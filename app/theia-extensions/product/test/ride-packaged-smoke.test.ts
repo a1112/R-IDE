@@ -209,6 +209,25 @@ class ReplayAwareProtocol implements RidePackagedSmokeProtocol {
     }
 }
 
+class AmbiguousFailedRecordProtocol extends ReplayAwareProtocol {
+    constructor(protected readonly applyFailedTransition: boolean) {
+        super(['editor-save'], new Set());
+    }
+
+    override async recordStep(sessionProof: string, request: RideSmokeStepRequest): Promise<unknown> {
+        if (request.state !== 'failed') {
+            return super.recordStep(sessionProof, request);
+        }
+        this.calls.push({ method: 'recordStep', proof: sessionProof, request });
+        if (this.applyFailedTransition && !this.transitions.some(transition => transition.state === 'failed')) {
+            this.applyTransition(request);
+            this.lastTransition = request;
+            this.transitions.push(request);
+        }
+        throw new Error('failed response lost with private details');
+    }
+}
+
 function actions(
     calls: string[],
     overrides: Partial<RidePackagedSmokeActions> = {}
@@ -586,8 +605,8 @@ test('packaged smoke retries failed transition and failed completion response lo
     assert.strictEqual(completions[0].request, completions[1].request);
 });
 
-test('packaged smoke stops after two identical failed mutation attempts without compensating or rejecting', async () => {
-    for (const failedMutation of ['started', 'passed', 'failed', 'complete'] as const) {
+test('packaged smoke stops after two identical uncertain started, passed, or complete attempts', async () => {
+    for (const failedMutation of ['started', 'passed', 'complete'] as const) {
         const actionCalls: string[] = [];
         const protocol = new FakeProtocol(true, activePlan(failedMutation === 'complete' ? [] : ['editor-save']),
             (method, request) => {
@@ -603,9 +622,7 @@ test('packaged smoke stops after two identical failed mutation attempts without 
         try {
             new RidePackagedSmokeContribution(
                 immediateState(), protocol, () => actions(actionCalls, {
-                    editorSave: failedMutation === 'failed'
-                        ? async () => { throw new Error('action failure'); }
-                        : async () => { actionCalls.push('editor-save'); }
+                    editorSave: async () => { actionCalls.push('editor-save'); }
                 }), { now: () => 0 }
             ).onStart();
             await waitUntil(() => protocol.calls.filter(call => {
@@ -628,6 +645,54 @@ test('packaged smoke stops after two identical failed mutation attempts without 
         } finally {
             process.off('unhandledRejection', onUnhandled);
         }
+    }
+});
+
+test('packaged smoke completes after failed transition was applied but both responses were lost', async () => {
+    const protocol = new AmbiguousFailedRecordProtocol(true);
+    new RidePackagedSmokeContribution(
+        immediateState(), protocol, () => actions([], {
+            editorSave: async () => { throw new Error('bounded action failure'); }
+        }), { now: () => 0 }
+    ).onStart();
+    await waitUntil(() => protocol.completion !== undefined, 'ambiguous applied failure did not reach terminal');
+
+    const failedCalls = protocol.calls.filter(call => call.method === 'recordStep'
+        && (call.request as RideSmokeStepRequest).state === 'failed');
+    assert.equal(failedCalls.length, 2);
+    assert.strictEqual(failedCalls[0].request, failedCalls[1].request);
+    assert.deepEqual(protocol.transitions.map(transition => transition.state), ['started', 'failed']);
+    assert.equal(protocol.completion?.status, 'failed');
+    assert.equal(protocol.calls.filter(call => call.method === 'complete').length, 1);
+});
+
+test('packaged smoke bounds failed completion attempts when failed transition was never applied', async () => {
+    const protocol = new AmbiguousFailedRecordProtocol(false);
+    const unhandled: unknown[] = [];
+    const onUnhandled = (error: unknown) => unhandled.push(error);
+    process.on('unhandledRejection', onUnhandled);
+    try {
+        new RidePackagedSmokeContribution(
+            immediateState(), protocol, () => actions([], {
+                editorSave: async () => { throw new Error('bounded action failure'); }
+            }), { now: () => 0 }
+        ).onStart();
+        await waitUntil(() => protocol.calls.filter(call => call.method === 'complete').length === 2,
+            'unapplied failed transition did not attempt bounded completion');
+        await new Promise<void>(resolve => setImmediate(resolve));
+
+        const failedCalls = protocol.calls.filter(call => call.method === 'recordStep'
+            && (call.request as RideSmokeStepRequest).state === 'failed');
+        const completions = protocol.calls.filter(call => call.method === 'complete');
+        assert.equal(failedCalls.length, 2);
+        assert.strictEqual(failedCalls[0].request, failedCalls[1].request);
+        assert.equal(completions.length, 2);
+        assert.strictEqual(completions[0].request, completions[1].request);
+        assert.equal(protocol.completion, undefined);
+        assert.deepEqual(protocol.transitions.map(transition => transition.state), ['started']);
+        assert.deepEqual(unhandled, []);
+    } finally {
+        process.off('unhandledRejection', onUnhandled);
     }
 });
 

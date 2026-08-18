@@ -308,7 +308,7 @@ export class RidePackagedSmokeContribution implements FrontendApplicationContrib
                 diagnostic
             });
         } catch {
-            return;
+            // The failed transition may have committed despite both responses being lost.
         }
         try {
             await this.complete(sessionProof, {
