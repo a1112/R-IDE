@@ -31,6 +31,11 @@ pub(crate) const BACKEND_PORT: u16 = 3000;
 const BACKEND_PROBE_INTERVAL: Duration = Duration::from_millis(50);
 const BACKEND_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 
+#[cfg(windows)]
+const fn direct_backend_creation_flags() -> u32 {
+    windows_sys::Win32::System::Threading::CREATE_NO_WINDOW
+}
+
 trait BackendChildEnvironment {
     fn remove_environment(&mut self, name: &str);
 }
@@ -1168,6 +1173,8 @@ async fn start_backend_direct_process(
     let config_dir = node_runtime_path(&config_dir);
     let frontend_dir = frontend_dir.map(|path| node_runtime_path(&path));
     let mut command = Command::new(&config.node_exe);
+    #[cfg(windows)]
+    command.creation_flags(direct_backend_creation_flags());
     remove_smoke_environment(&mut command);
     if config.use_node {
         command.arg(&script_path);
@@ -1638,6 +1645,15 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
     use tokio::sync::mpsc;
+
+    #[cfg(windows)]
+    #[test]
+    fn direct_backend_process_uses_no_window_creation_flag() {
+        assert_eq!(
+            super::direct_backend_creation_flags(),
+            windows_sys::Win32::System::Threading::CREATE_NO_WINDOW
+        );
+    }
 
     #[test]
     fn backend_child_environment_removes_smoke_secrets_and_preserves_unrelated_values() {
