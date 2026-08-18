@@ -304,6 +304,7 @@ function waitForSpawn(
   {
     schedule = (callback, milliseconds) => setTimeout(callback, milliseconds),
     cancel = scheduledTimer => clearTimeout(scheduledTimer),
+    lateErrorGuard,
   } = {},
 ) {
   const remainingMs = remainingPhaseBudget(budget);
@@ -311,15 +312,16 @@ function waitForSpawn(
   let settled = false;
   let resolveSpawn;
   let rejectSpawn;
-  const settle = (complete, value) => {
+  const settle = (complete, value, beforeSettle) => {
     if (settled) {
       return;
     }
+    beforeSettle?.();
     settled = true;
     complete(value);
   };
   const onSpawn = () => settle(resolveSpawn);
-  const onError = error => settle(rejectSpawn, error);
+  const onError = error => settle(rejectSpawn, error, lateErrorGuard?.activate);
   const waiting = new Promise((resolve, reject) => {
     resolveSpawn = resolve;
     rejectSpawn = reject;
@@ -329,6 +331,7 @@ function waitForSpawn(
       () => settle(
         reject,
         new Error(`${budget.phase} timed out after ${budget.timeoutMs}ms`),
+        lateErrorGuard?.activate,
       ),
       remainingMs,
     );
@@ -341,6 +344,33 @@ function waitForSpawn(
       cancel(timer);
     }
   });
+}
+
+function createLateSpawnErrorGuard(child) {
+  let active = false;
+  const consumeLateError = () => undefined;
+  const release = () => {
+    if (!active) {
+      return;
+    }
+    active = false;
+    child.off('error', consumeLateError);
+    child.off('exit', release);
+    child.off('close', release);
+  };
+  const activate = () => {
+    if (active) {
+      return;
+    }
+    active = true;
+    child.on('error', consumeLateError);
+    child.once('exit', release);
+    child.once('close', release);
+    if (child.exitCode !== null || child.signalCode !== null) {
+      release();
+    }
+  };
+  return { activate, release };
 }
 
 function observeChildExit(child) {
@@ -419,9 +449,10 @@ export async function launchPackagedSmokeInstance(
     containmentVerified: false,
     cleanupComplete: false,
   };
+  const lateErrorGuard = createLateSpawnErrorGuard(child);
   try {
     const exitObservation = observeChildExit(child);
-    await waitForSpawn(child, launchBudget, { schedule, cancel });
+    await waitForSpawn(child, launchBudget, { schedule, cancel, lateErrorGuard });
     const remainingMs = remainingPhaseBudget(launchBudget);
     const identityObservation = Promise.resolve()
       .then(() => capture(child.pid, {
@@ -476,6 +507,8 @@ export async function launchPackagedSmokeInstance(
       await logCapture.persist();
     } catch (cleanupError) {
       error.cause ??= cleanupError;
+    } finally {
+      lateErrorGuard.release();
     }
     throw error;
   }

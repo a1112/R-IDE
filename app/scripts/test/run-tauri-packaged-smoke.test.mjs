@@ -12,6 +12,7 @@
 
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
+import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -372,45 +373,32 @@ function writeStartupFixture(file, exitCode, linger = false) {
 }
 
 function stalledSpawnChild() {
-  const activeListeners = new Map();
-  const capturedListeners = new Map();
+  const child = new EventEmitter();
   const signals = [];
-  const child = {
+  let resolveCleanupStarted;
+  const cleanupStarted = new Promise(resolve => { resolveCleanupStarted = resolve; });
+  Object.assign(child, {
     pid: 7331,
     killed: false,
     exitCode: null,
     signalCode: null,
     stdout: new PassThrough(),
     stderr: new PassThrough(),
-    once(event, listener) {
-      activeListeners.set(event, listener);
-      capturedListeners.set(event, listener);
-      return this;
-    },
-    off(event, listener) {
-      if (activeListeners.get(event) === listener) {
-        activeListeners.delete(event);
-      }
-      return this;
-    },
-    listenerCount(event) {
-      return activeListeners.has(event) ? 1 : 0;
-    },
     kill(signal) {
       signals.push(signal);
-      this.killed = true;
-      this.exitCode = 0;
-      this.stdout.end();
-      this.stderr.end();
-      activeListeners.get('exit')?.(0, null);
-      activeListeners.delete('exit');
+      resolveCleanupStarted();
+      if (signal === 'SIGKILL') {
+        this.killed = true;
+        this.signalCode = signal;
+        this.stdout.end();
+        this.stderr.end();
+        this.emit('exit', null, signal);
+      }
       return true;
     },
-    invokeCaptured(event, value) {
-      capturedListeners.get(event)?.(value);
-    },
+    cleanupStarted,
     signals,
-  };
+  });
   return child;
 }
 
@@ -419,9 +407,6 @@ test('default launcher bounds a silent spawn and makes late spawn errors inert',
   const child = stalledSpawnChild();
   const scheduled = [];
   const cancelled = [];
-  const unhandled = [];
-  const onUnhandled = reason => unhandled.push(reason);
-  process.on('unhandledRejection', onUnhandled);
   const run = {
     executable: 'R-IDE.exe',
     absoluteFiles: ['unused', 'second.R'],
@@ -452,17 +437,72 @@ test('default launcher bounds a silent spawn and makes late spawn errors inert',
     assert.equal(scheduled.length, 1);
     assert.equal(scheduled[0].milliseconds, 50);
     scheduled[0].callback();
+    await child.cleanupStarted;
+    assert.equal(child.listenerCount('spawn'), 0);
+    assert.equal(child.listenerCount('error'), 1);
+    let lateError;
+    try {
+      child.emit('error', new Error('late spawn error'));
+    } catch (error) {
+      lateError = error;
+    }
     await assert.rejects(launching, /second instance launch timed out after 50ms/i);
+    assert.equal(lateError, undefined);
     assert.equal(child.listenerCount('spawn'), 0);
     assert.equal(child.listenerCount('error'), 0);
+    assert.equal(child.listenerCount('exit'), 0);
+    assert.equal(child.listenerCount('close'), 0);
     assert.deepEqual(cancelled, [scheduled[0]]);
-    assert.deepEqual(child.signals, ['SIGTERM']);
-    child.invokeCaptured('spawn');
-    child.invokeCaptured('error', new Error('late spawn error'));
-    await Promise.resolve();
-    assert.deepEqual(unhandled, []);
+    assert.deepEqual(child.signals, ['SIGTERM', 'SIGKILL']);
   } finally {
-    process.off('unhandledRejection', onUnhandled);
+    child.stdout.destroy();
+    child.stderr.destroy();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('late-error guard does not swallow a normal pre-spawn error', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ride-smoke-pre-spawn-error-'));
+  const child = stalledSpawnChild();
+  const scheduled = [];
+  const cancelled = [];
+  const run = {
+    executable: 'R-IDE.exe',
+    absoluteFiles: ['unused', 'second.R'],
+    workspace: root,
+    logsDirectory: root,
+    timeoutMs: 50,
+    childEnvironment: {},
+    smokeEnvironment: {},
+    sensitiveValues: [],
+  };
+  const budget = {
+    deadline: 50,
+    timeoutMs: 50,
+    phase: 'second instance launch',
+    now: () => 0,
+  };
+  try {
+    const launching = launchPackagedSmokeInstance({ run, kind: 'second', budget }, {
+      platform: 'win32',
+      spawnProcess: () => child,
+      schedule: (callback, milliseconds) => {
+        const timer = { callback, milliseconds, unref() {} };
+        scheduled.push(timer);
+        return timer;
+      },
+      cancel: timer => cancelled.push(timer),
+    });
+    child.emit('error', new Error('pre-spawn failure'));
+    await assert.rejects(launching, /pre-spawn failure/);
+    scheduled[0].callback();
+    await Promise.resolve();
+    assert.equal(child.listenerCount('spawn'), 0);
+    assert.equal(child.listenerCount('error'), 0);
+    assert.equal(child.listenerCount('exit'), 0);
+    assert.equal(child.listenerCount('close'), 0);
+    assert.deepEqual(cancelled, [scheduled[0]]);
+  } finally {
     child.stdout.destroy();
     child.stderr.destroy();
     fs.rmSync(root, { recursive: true, force: true });
