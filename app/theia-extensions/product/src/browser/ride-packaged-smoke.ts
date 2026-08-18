@@ -58,6 +58,7 @@ export interface RidePackagedSmokeActions {
     scmStatus(plan: RideSmokePlan): Promise<void>;
     packagedPluginCommand(plan: RideSmokePlan): Promise<void>;
     secondaryWindow(plan: RideSmokePlan): Promise<void>;
+    prepareSecondFile(plan: RideSmokePlan): Disposable;
     waitForSecondFile(plan: RideSmokePlan): Promise<void>;
 }
 
@@ -173,6 +174,7 @@ export class RidePackagedSmokeContribution implements FrontendApplicationContrib
     protected readonly cancelTimeout: (handle: unknown) => void;
     protected started = false;
     protected disposed = false;
+    protected activeActionPreparation: Disposable | undefined;
 
     constructor(
         protected readonly applicationState: FrontendApplicationStateService,
@@ -201,6 +203,7 @@ export class RidePackagedSmokeContribution implements FrontendApplicationContrib
 
     dispose(): void {
         this.disposed = true;
+        this.releaseActionPreparation(this.activeActionPreparation);
     }
 
     protected async startAfterShellAttached(): Promise<void> {
@@ -236,37 +239,51 @@ export class RidePackagedSmokeContribution implements FrontendApplicationContrib
     protected async sequence(session: ActiveSmokeSession, smokeActions: RidePackagedSmokeActions): Promise<void> {
         const elapsed = this.createElapsedClock();
         for (const action of session.plan.actions) {
-            try {
-                await this.record(session.sessionProof, {
-                    action,
-                    state: 'started',
-                    durationMs: elapsed(),
-                    diagnostic: JSON_NULL
-                });
-            } catch {
-                return;
+            let preparation: Disposable | undefined;
+            if (action === 'second-file-forwarding') {
+                try {
+                    preparation = smokeActions.prepareSecondFile(session.plan);
+                    this.activeActionPreparation = preparation;
+                } catch {
+                    await this.completeProtocolFailure(session.sessionProof, elapsed);
+                    return;
+                }
             }
+            try {
+                try {
+                    await this.record(session.sessionProof, {
+                        action,
+                        state: 'started',
+                        durationMs: elapsed(),
+                        diagnostic: JSON_NULL
+                    });
+                } catch {
+                    return;
+                }
 
-            let diagnostic: RideSmokeDiagnostic | undefined;
-            try {
-                await this.withTimeout(this.executeAction(smokeActions, action, session.plan), session.plan.actionTimeoutMs);
-            } catch (error) {
-                diagnostic = error instanceof SmokeActionTimeout ? ACTION_TIMEOUT : ACTION_FAILED;
-            }
-            if (diagnostic !== undefined) {
-                await this.reportActionFailure(session.sessionProof, action, diagnostic, elapsed);
-                return;
-            }
+                let diagnostic: RideSmokeDiagnostic | undefined;
+                try {
+                    await this.withTimeout(this.executeAction(smokeActions, action, session.plan), session.plan.actionTimeoutMs);
+                } catch (error) {
+                    diagnostic = error instanceof SmokeActionTimeout ? ACTION_TIMEOUT : ACTION_FAILED;
+                }
+                if (diagnostic !== undefined) {
+                    await this.reportActionFailure(session.sessionProof, action, diagnostic, elapsed);
+                    return;
+                }
 
-            try {
-                await this.record(session.sessionProof, {
-                    action,
-                    state: 'passed',
-                    durationMs: elapsed(),
-                    diagnostic: JSON_NULL
-                });
-            } catch {
-                return;
+                try {
+                    await this.record(session.sessionProof, {
+                        action,
+                        state: 'passed',
+                        durationMs: elapsed(),
+                        diagnostic: JSON_NULL
+                    });
+                } catch {
+                    return;
+                }
+            } finally {
+                this.releaseActionPreparation(preparation);
             }
         }
 
@@ -291,6 +308,18 @@ export class RidePackagedSmokeContribution implements FrontendApplicationContrib
             case 'packaged-plugin-command': return smokeActions.packagedPluginCommand(plan);
             case 'secondary-window': return smokeActions.secondaryWindow(plan);
             case 'second-file-forwarding': return smokeActions.waitForSecondFile(plan);
+        }
+    }
+
+    protected releaseActionPreparation(preparation: Disposable | undefined): void {
+        if (preparation === undefined || this.activeActionPreparation !== preparation) {
+            return;
+        }
+        this.activeActionPreparation = undefined;
+        try {
+            preparation.dispose();
+        } catch {
+            // The terminal protocol result remains authoritative after best-effort observation cleanup.
         }
     }
 

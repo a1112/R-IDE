@@ -130,6 +130,12 @@ interface OpenRequestsLike {
     ) => Disposable;
 }
 
+interface ArmedSecondFileObservation extends Disposable {
+    readonly expectedFile: string;
+    readonly completion: Promise<void>;
+    claimed: boolean;
+}
+
 export interface RidePackagedSmokeActionServices {
     readonly workspaceService?: WorkspaceServiceLike;
     readonly editorManager?: EditorManagerLike;
@@ -175,6 +181,7 @@ export class RidePackagedSmokeActionService implements RidePackagedSmokeActions,
     protected readonly scheduleTimeout: (callback: () => void, timeoutMs: number) => unknown;
     protected readonly cancelTimeout: (handle: unknown) => void;
     protected readonly activeCancellations = new Set<() => void>();
+    protected armedSecondFileObservation: ArmedSecondFileObservation | undefined;
     protected disposed = false;
 
     constructor(protected readonly services: RidePackagedSmokeActionServices) {
@@ -192,6 +199,7 @@ export class RidePackagedSmokeActionService implements RidePackagedSmokeActions,
             return;
         }
         this.disposed = true;
+        this.armedSecondFileObservation?.dispose();
         for (const cancel of [...this.activeCancellations]) {
             cancel();
         }
@@ -398,60 +406,93 @@ export class RidePackagedSmokeActionService implements RidePackagedSmokeActions,
             if (commandRegistry.getCommand(RIDE_SMOKE_EXTRACT_WIDGET_COMMAND)?.id
                 !== RIDE_SMOKE_EXTRACT_WIDGET_COMMAND
                 || realHandlers.length !== 1
-                || realHandlers[0] === proxyHandlers[0]
-                || widget.secondaryWindow === undefined) {
+                || realHandlers[0] === proxyHandlers[0]) {
                 throw this.error('Smoke action failed.');
+            }
+            while (widget.secondaryWindow === undefined) {
+                await run.delay(this.pollIntervalMs);
             }
         });
     }
 
     waitForSecondFile(plan: RideSmokePlan): Promise<void> {
         return this.runAction(plan, async run => {
-            const expectedFile = plan.files.length === 2 ? plan.files[1] : undefined;
-            if (!expectedFile) {
+            const expectedFile = this.resolveSecondFile(plan);
+            const observation = this.armedSecondFileObservation;
+            if (!observation || observation.expectedFile !== expectedFile || observation.claimed) {
                 throw this.error('Smoke action unavailable.');
             }
-            const openRequests = this.requireService(this.services.openRequests);
-            await run.wait(new Promise<void>((resolve, reject) => {
-                let settled = false;
-                let subscription: Disposable | undefined;
-                const disposeSubscription = (): void => {
-                    try {
-                        subscription?.dispose();
-                    } catch {
-                        // Observation cleanup is best-effort after the action has settled.
-                    }
-                };
-                const stopOnAbort = run.onAbort(disposeSubscription);
-                const finish = (error?: unknown): void => {
-                    if (settled) {
-                        return;
-                    }
-                    settled = true;
-                    stopOnAbort();
-                    disposeSubscription();
-                    if (error) {
-                        reject(error);
-                    } else {
-                        resolve();
-                    }
-                };
-                try {
-                    subscription = openRequests.onDidOpenRequest(event => {
-                        if (!run.aborted
-                            && event.source === 'singleInstance'
-                            && event.relativePath === expectedFile) {
-                            finish();
-                        }
-                    });
-                    if (settled) {
-                        disposeSubscription();
-                    }
-                } catch (error) {
-                    finish(error);
-                }
-            }));
+            observation.claimed = true;
+            const stopOnAbort = run.onAbort(() => observation.dispose());
+            try {
+                await run.wait(observation.completion);
+            } finally {
+                stopOnAbort();
+                observation.dispose();
+            }
         });
+    }
+
+    prepareSecondFile(plan: RideSmokePlan): Disposable {
+        this.ensureActive();
+        const expectedFile = this.resolveSecondFile(plan);
+        const openRequests = this.requireService(this.services.openRequests);
+        if (this.armedSecondFileObservation !== undefined) {
+            throw this.error('Smoke action unavailable.');
+        }
+        let resolveCompletion!: () => void;
+        const completion = new Promise<void>(resolve => {
+            resolveCompletion = resolve;
+        });
+        let disposed = false;
+        let matched = false;
+        let subscriptionDisposed = false;
+        let subscription: Disposable | undefined;
+        const disposeSubscription = (): void => {
+            if (subscriptionDisposed || subscription === undefined) {
+                return;
+            }
+            subscriptionDisposed = true;
+            try {
+                subscription.dispose();
+            } catch {
+                // Observation cleanup is best-effort after the arm has settled.
+            }
+        };
+        const observation: ArmedSecondFileObservation = {
+            expectedFile,
+            completion,
+            claimed: false,
+            dispose: () => {
+                if (disposed) {
+                    return;
+                }
+                disposed = true;
+                disposeSubscription();
+                if (this.armedSecondFileObservation === observation) {
+                    this.armedSecondFileObservation = undefined;
+                }
+            }
+        };
+        this.armedSecondFileObservation = observation;
+        try {
+            subscription = openRequests.onDidOpenRequest(event => {
+                if (!disposed && !matched
+                    && event.source === 'singleInstance'
+                    && event.relativePath === expectedFile) {
+                    matched = true;
+                    resolveCompletion();
+                    disposeSubscription();
+                }
+            });
+            if (disposed || matched) {
+                disposeSubscription();
+            }
+        } catch {
+            observation.dispose();
+            throw this.error('Smoke action unavailable.');
+        }
+        return observation;
     }
 
     protected async resolveWorkspaceRoot(plan: RideSmokePlan, run: RideSmokeActionRun): Promise<URI> {
@@ -474,6 +515,14 @@ export class RidePackagedSmokeActionService implements RidePackagedSmokeActions,
             throw this.error('Smoke action unavailable.');
         }
         return this.resolveRelative(root, firstFile);
+    }
+
+    protected resolveSecondFile(plan: RideSmokePlan): string {
+        const expectedFile = plan.files.length === 2 ? plan.files[1] : undefined;
+        if (!expectedFile) {
+            throw this.error('Smoke action unavailable.');
+        }
+        return expectedFile;
     }
 
     protected resolveRelative(root: URI, relative: string): URI {

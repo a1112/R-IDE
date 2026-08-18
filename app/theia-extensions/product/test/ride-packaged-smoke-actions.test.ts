@@ -944,6 +944,142 @@ test('smoke action executes extract-widget and proves the deferred proxy handler
     assert.deepEqual(handlers, [realHandler]);
 });
 
+test('smoke action waits after handler replacement for a delayed secondary window', async () => {
+    const proxyHandler = { execute: () => undefined };
+    const realHandler = { execute: () => undefined };
+    const eligibleWidget = { id: 'scm-view', isExtractable: true, secondaryWindow: undefined as object | undefined };
+    const timers: Array<{ callback: () => void; timeoutMs: number; cleared: boolean }> = [];
+    let handlers = [proxyHandler];
+    let executions = 0;
+    const actions = new RidePackagedSmokeActionService(workspaceServices({
+        ...({
+            applicationShell: { widgets: [eligibleWidget] },
+            commandRegistry: {
+                getCommand: (id: string) => id === 'extract-widget' ? { id } : undefined,
+                getAllHandlers: () => handlers,
+                executeCommand: async () => {
+                    executions++;
+                    handlers = [realHandler];
+                }
+            }
+        } as unknown as Partial<RidePackagedSmokeActionServices>),
+        pollIntervalMs: 10,
+        setTimeout: (callback, timeoutMs) => {
+            const timer = { callback, timeoutMs, cleared: false };
+            timers.push(timer);
+            return timer;
+        },
+        clearTimeout: handle => {
+            (handle as { cleared: boolean }).cleared = true;
+        }
+    }));
+    const operation = actions.secondaryWindow(plan({ actionTimeoutMs: 1_000 }));
+    const outcome = outcomeWithin(operation);
+
+    await turn();
+    await turn();
+    assert.equal(executions, 1);
+    assert.deepEqual(handlers, [realHandler]);
+    assert.deepEqual(timers.map(timer => timer.timeoutMs), [1_000, 10]);
+
+    eligibleWidget.secondaryWindow = {};
+    timers[1].callback();
+
+    assert.equal(await outcome, undefined);
+    assert.equal(timers.every(timer => timer.cleared), true);
+});
+
+test('smoke action secondary-window timeout cancels polling without late side effects or timer leaks', async () => {
+    const proxyHandler = { execute: () => undefined };
+    const realHandler = { execute: () => undefined };
+    const eligibleWidget = { id: 'scm-view', isExtractable: true, secondaryWindow: undefined as object | undefined };
+    const timers: Array<{ callback: () => void; timeoutMs: number; cleared: boolean }> = [];
+    let handlers = [proxyHandler];
+    let executions = 0;
+    const actions = new RidePackagedSmokeActionService(workspaceServices({
+        ...({
+            applicationShell: { widgets: [eligibleWidget] },
+            commandRegistry: {
+                getCommand: (id: string) => id === 'extract-widget' ? { id } : undefined,
+                getAllHandlers: () => handlers,
+                executeCommand: async () => {
+                    executions++;
+                    handlers = [realHandler];
+                }
+            }
+        } as unknown as Partial<RidePackagedSmokeActionServices>),
+        pollIntervalMs: 5,
+        pollTimeoutMs: 20,
+        setTimeout: (callback, timeoutMs) => {
+            const timer = { callback, timeoutMs, cleared: false };
+            timers.push(timer);
+            return timer;
+        },
+        clearTimeout: handle => {
+            (handle as { cleared: boolean }).cleared = true;
+        }
+    }));
+    const operation = actions.secondaryWindow(plan());
+
+    await turn();
+    await turn();
+    assert.deepEqual(timers.map(timer => timer.timeoutMs), [20, 5]);
+    timers[0].callback();
+    await assert.rejects(operation, /Smoke action timed out\./);
+    assert.equal(timers.every(timer => timer.cleared), true);
+
+    eligibleWidget.secondaryWindow = {};
+    timers[1].callback();
+    await turn();
+    assert.equal(executions, 1);
+    assert.equal(timers.length, 2);
+});
+
+test('smoke action secondary-window dispose cancels polling without late side effects or timer leaks', async () => {
+    const proxyHandler = { execute: () => undefined };
+    const realHandler = { execute: () => undefined };
+    const eligibleWidget = { id: 'scm-view', isExtractable: true, secondaryWindow: undefined as object | undefined };
+    const timers: Array<{ callback: () => void; timeoutMs: number; cleared: boolean }> = [];
+    let handlers = [proxyHandler];
+    let executions = 0;
+    const actions = new RidePackagedSmokeActionService(workspaceServices({
+        ...({
+            applicationShell: { widgets: [eligibleWidget] },
+            commandRegistry: {
+                getCommand: (id: string) => id === 'extract-widget' ? { id } : undefined,
+                getAllHandlers: () => handlers,
+                executeCommand: async () => {
+                    executions++;
+                    handlers = [realHandler];
+                }
+            }
+        } as unknown as Partial<RidePackagedSmokeActionServices>),
+        pollIntervalMs: 5,
+        setTimeout: (callback, timeoutMs) => {
+            const timer = { callback, timeoutMs, cleared: false };
+            timers.push(timer);
+            return timer;
+        },
+        clearTimeout: handle => {
+            (handle as { cleared: boolean }).cleared = true;
+        }
+    }));
+    const operation = actions.secondaryWindow(plan());
+
+    await turn();
+    await turn();
+    assert.equal(timers.length, 2);
+    actions.dispose();
+    await assert.rejects(operation, /Smoke action disposed\./);
+    assert.equal(timers.every(timer => timer.cleared), true);
+
+    eligibleWidget.secondaryWindow = {};
+    timers[1].callback();
+    await turn();
+    assert.equal(executions, 1);
+    assert.equal(timers.length, 2);
+});
+
 test('smoke action accepts only the planned second file from a single-instance open event', async () => {
     let listener: ((event: { source: string; relativePath: string }) => void) | undefined;
     let subscriptionDisposals = 0;
@@ -958,7 +1094,9 @@ test('smoke action accepts only the planned second file from a single-instance o
         } as unknown as Partial<RidePackagedSmokeActionServices>)
     });
     const smokePlan = plan({ files: Object.freeze(['startup.R', 'forwarded.R']) });
-    const operation = new RidePackagedSmokeActionService(services).waitForSecondFile(smokePlan);
+    const actions = new RidePackagedSmokeActionService(services);
+    const preparation = actions.prepareSecondFile(smokePlan);
+    const operation = actions.waitForSecondFile(smokePlan);
     const outcome = outcomeWithin(operation);
 
     await turn();
@@ -971,6 +1109,7 @@ test('smoke action accepts only the planned second file from a single-instance o
 
     assert.equal(await outcome, undefined);
     assert.equal(subscriptionDisposals, 1);
+    preparation.dispose();
 });
 
 test('smoke action Task 5 methods fail safely when their production services are unavailable', async () => {

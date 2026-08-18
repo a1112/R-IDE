@@ -17,6 +17,7 @@ import {
     RideSmokeStepRequest,
     RideTauriPackagedSmokeProtocol
 } from '../src/browser/ride-packaged-smoke';
+import { RidePackagedSmokeActionService } from '../src/browser/ride-packaged-smoke-actions';
 
 const PROOF = 'b'.repeat(64);
 const PROTOCOL_DIAGNOSTIC = { code: 'protocol-failed', message: 'Smoke protocol failed.' } as const;
@@ -242,6 +243,7 @@ function actions(
         scmStatus: action('scm-status'),
         packagedPluginCommand: action('packaged-plugin-command'),
         secondaryWindow: action('secondary-window'),
+        prepareSecondFile: () => ({ dispose: () => undefined }),
         waitForSecondFile: action('second-file-forwarding'),
         ...overrides
     };
@@ -382,6 +384,140 @@ test('packaged smoke executes exact plan order and records proof-carrying transi
             diagnostic: null
         }
     });
+});
+
+test('packaged smoke arms second-file observation before started becomes externally visible', async () => {
+    const listeners = new Set<(event: { source: 'singleInstance'; relativePath: string }) => void>();
+    const actionTimers: Array<{ callback: () => void; cleared: boolean }> = [];
+    let subscriptionDisposals = 0;
+    const smokeActions = new RidePackagedSmokeActionService({
+        openRequests: {
+            onDidOpenRequest: listener => {
+                listeners.add(listener);
+                return {
+                    dispose: () => {
+                        if (listeners.delete(listener)) {
+                            subscriptionDisposals++;
+                        }
+                    }
+                };
+            }
+        },
+        setTimeout: callback => {
+            const timer = { callback, cleared: false };
+            actionTimers.push(timer);
+            return timer;
+        },
+        clearTimeout: handle => {
+            (handle as { cleared: boolean }).cleared = true;
+        }
+    });
+    const protocol = new FakeProtocol(true, activePlan(['second-file-forwarding']), (method, request) => {
+        if (method === 'recordStep'
+            && (request as RideSmokeStepRequest).state === 'started') {
+            for (const listener of [...listeners]) {
+                listener({ source: 'singleInstance', relativePath: 'second.txt' });
+            }
+        }
+        return { status: method === 'complete' ? 'completed' : 'recorded', diagnostic: null };
+    });
+    new RidePackagedSmokeContribution(immediateState(), protocol, () => smokeActions).onStart();
+
+    await waitUntil(() => actionTimers.length > 0, 'forwarding action did not begin waiting');
+    await new Promise<void>(resolve => setImmediate(resolve));
+    if (!protocol.calls.some(call => call.method === 'complete')) {
+        actionTimers.find(timer => !timer.cleared)?.callback();
+    }
+    await waitUntil(() => protocol.calls.some(call => call.method === 'complete'), 'forwarding race did not complete');
+
+    assert.deepEqual(protocol.calls.filter(call => call.method === 'recordStep')
+        .map(call => (call.request as RideSmokeStepRequest).state), ['started', 'passed']);
+    assert.equal((protocol.calls.find(call => call.method === 'complete')
+        ?.request as RideSmokeCompleteRequest).status, 'passed');
+    assert.equal(subscriptionDisposals, 1);
+});
+
+test('packaged smoke releases a prepared second-file observer when started cannot be recorded', async () => {
+    let preparationDisposals = 0;
+    let actionExecutions = 0;
+    const preparedActions = {
+        ...actions([], {
+            waitForSecondFile: async () => {
+                actionExecutions++;
+            }
+        }),
+        prepareSecondFile: () => ({
+            dispose: () => preparationDisposals++
+        })
+    } as RidePackagedSmokeActions;
+    const protocol = new FakeProtocol(true, activePlan(['second-file-forwarding']), method => ({
+        status: method === 'complete' ? 'completed' : 'invalid',
+        diagnostic: null
+    }));
+    new RidePackagedSmokeContribution(immediateState(), protocol, () => preparedActions).onStart();
+
+    await waitUntil(() => protocol.calls.filter(call => call.method === 'recordStep').length === 2,
+        'started transition was not retried');
+    await new Promise<void>(resolve => setImmediate(resolve));
+
+    assert.equal(actionExecutions, 0);
+    assert.equal(preparationDisposals, 1);
+    assert.equal(protocol.calls.some(call => call.method === 'complete'), false);
+});
+
+test('packaged smoke releases a prepared second-file observer after action failure', async () => {
+    let preparationDisposals = 0;
+    const preparedActions = {
+        ...actions([], {
+            waitForSecondFile: async () => {
+                throw new Error('forwarding failed');
+            }
+        }),
+        prepareSecondFile: () => ({
+            dispose: () => preparationDisposals++
+        })
+    } as RidePackagedSmokeActions;
+    const protocol = new FakeProtocol(true, activePlan(['second-file-forwarding']));
+    new RidePackagedSmokeContribution(immediateState(), protocol, () => preparedActions).onStart();
+
+    await waitUntil(() => protocol.calls.some(call => call.method === 'complete'),
+        'failed forwarding action did not complete');
+
+    assert.equal(preparationDisposals, 1);
+    assert.equal((protocol.calls.find(call => call.method === 'complete')
+        ?.request as RideSmokeCompleteRequest).status, 'failed');
+});
+
+test('packaged smoke dispose releases a prepared second-file observer while started is in flight', async () => {
+    const startedResponse = deferredValue<unknown>();
+    let preparationDisposals = 0;
+    const preparedActions = {
+        ...actions([], {
+            waitForSecondFile: async () => {
+                throw new Error('disposed forwarding action');
+            }
+        }),
+        prepareSecondFile: () => ({
+            dispose: () => preparationDisposals++
+        })
+    } as RidePackagedSmokeActions;
+    const protocol = new FakeProtocol(true, activePlan(['second-file-forwarding']), (method, request) => {
+        if (method === 'recordStep' && (request as RideSmokeStepRequest).state === 'started') {
+            return startedResponse.promise;
+        }
+        return { status: method === 'complete' ? 'completed' : 'recorded', diagnostic: null };
+    });
+    const contribution = new RidePackagedSmokeContribution(immediateState(), protocol, () => preparedActions);
+    contribution.onStart();
+    await waitUntil(() => protocol.calls.some(call => call.method === 'recordStep'),
+        'started transition did not begin');
+
+    contribution.dispose();
+    startedResponse.resolve({ status: 'recorded', diagnostic: null });
+    await waitUntil(() => protocol.calls.some(call => call.method === 'complete'),
+        'disposed forwarding action did not complete');
+
+    assert.equal(preparationDisposals, 1);
 });
 
 test('packaged smoke fails fast with one bounded action failure and never reports passed', async () => {
