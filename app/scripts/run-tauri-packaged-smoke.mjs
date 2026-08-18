@@ -298,16 +298,48 @@ export async function removeSmokeRunArtifacts(run) {
   await fs.promises.rm(runRoot, { recursive: true, force: true });
 }
 
-function waitForSpawn(child) {
-  return new Promise((resolve, reject) => {
-    const clear = () => {
-      child.off('spawn', onSpawn);
-      child.off('error', onError);
-    };
-    const onSpawn = () => { clear(); resolve(); };
-    const onError = error => { clear(); reject(error); };
+function waitForSpawn(
+  child,
+  budget,
+  {
+    schedule = (callback, milliseconds) => setTimeout(callback, milliseconds),
+    cancel = scheduledTimer => clearTimeout(scheduledTimer),
+  } = {},
+) {
+  const remainingMs = remainingPhaseBudget(budget);
+  let timer;
+  let settled = false;
+  let resolveSpawn;
+  let rejectSpawn;
+  const settle = (complete, value) => {
+    if (settled) {
+      return;
+    }
+    settled = true;
+    complete(value);
+  };
+  const onSpawn = () => settle(resolveSpawn);
+  const onError = error => settle(rejectSpawn, error);
+  const waiting = new Promise((resolve, reject) => {
+    resolveSpawn = resolve;
+    rejectSpawn = reject;
     child.once('spawn', onSpawn);
     child.once('error', onError);
+    timer = schedule(
+      () => settle(
+        reject,
+        new Error(`${budget.phase} timed out after ${budget.timeoutMs}ms`),
+      ),
+      remainingMs,
+    );
+    timer?.unref?.();
+  });
+  return waiting.finally(() => {
+    child.off('spawn', onSpawn);
+    child.off('error', onError);
+    if (timer !== undefined) {
+      cancel(timer);
+    }
   });
 }
 
@@ -338,6 +370,8 @@ export async function launchPackagedSmokeInstance(
     createRunId = randomUUID,
     platform = process.platform,
     now = Date.now,
+    schedule = (callback, milliseconds) => setTimeout(callback, milliseconds),
+    cancel = timer => clearTimeout(timer),
   } = {},
 ) {
   const launchBudget = budget ?? createPhaseBudget(
@@ -387,7 +421,7 @@ export async function launchPackagedSmokeInstance(
   };
   try {
     const exitObservation = observeChildExit(child);
-    await waitForSpawn(child);
+    await waitForSpawn(child, launchBudget, { schedule, cancel });
     const remainingMs = remainingPhaseBudget(launchBudget);
     const identityObservation = Promise.resolve()
       .then(() => capture(child.pid, {

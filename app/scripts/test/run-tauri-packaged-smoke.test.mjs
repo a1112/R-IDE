@@ -15,6 +15,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { PassThrough } from 'node:stream';
 import test from 'node:test';
 
 import { SMOKE_ACTIONS } from '../tauri-packaged-smoke-contract.mjs';
@@ -369,6 +370,104 @@ function writeStartupFixture(file, exitCode, linger = false) {
     linger ? 'setInterval(() => undefined, 1000);' : `process.exit(${exitCode});`,
   ].join('\n'));
 }
+
+function stalledSpawnChild() {
+  const activeListeners = new Map();
+  const capturedListeners = new Map();
+  const signals = [];
+  const child = {
+    pid: 7331,
+    killed: false,
+    exitCode: null,
+    signalCode: null,
+    stdout: new PassThrough(),
+    stderr: new PassThrough(),
+    once(event, listener) {
+      activeListeners.set(event, listener);
+      capturedListeners.set(event, listener);
+      return this;
+    },
+    off(event, listener) {
+      if (activeListeners.get(event) === listener) {
+        activeListeners.delete(event);
+      }
+      return this;
+    },
+    listenerCount(event) {
+      return activeListeners.has(event) ? 1 : 0;
+    },
+    kill(signal) {
+      signals.push(signal);
+      this.killed = true;
+      this.exitCode = 0;
+      this.stdout.end();
+      this.stderr.end();
+      activeListeners.get('exit')?.(0, null);
+      activeListeners.delete('exit');
+      return true;
+    },
+    invokeCaptured(event, value) {
+      capturedListeners.get(event)?.(value);
+    },
+    signals,
+  };
+  return child;
+}
+
+test('default launcher bounds a silent spawn and makes late spawn errors inert', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ride-smoke-silent-spawn-'));
+  const child = stalledSpawnChild();
+  const scheduled = [];
+  const cancelled = [];
+  const unhandled = [];
+  const onUnhandled = reason => unhandled.push(reason);
+  process.on('unhandledRejection', onUnhandled);
+  const run = {
+    executable: 'R-IDE.exe',
+    absoluteFiles: ['unused', 'second.R'],
+    workspace: root,
+    logsDirectory: root,
+    timeoutMs: 50,
+    childEnvironment: {},
+    smokeEnvironment: {},
+    sensitiveValues: [],
+  };
+  const budget = {
+    deadline: 50,
+    timeoutMs: 50,
+    phase: 'second instance launch',
+    now: () => 0,
+  };
+  try {
+    const launching = launchPackagedSmokeInstance({ run, kind: 'second', budget }, {
+      platform: 'win32',
+      spawnProcess: () => child,
+      schedule: (callback, milliseconds) => {
+        const timer = { callback, milliseconds, unref() {} };
+        scheduled.push(timer);
+        return timer;
+      },
+      cancel: timer => cancelled.push(timer),
+    });
+    assert.equal(scheduled.length, 1);
+    assert.equal(scheduled[0].milliseconds, 50);
+    scheduled[0].callback();
+    await assert.rejects(launching, /second instance launch timed out after 50ms/i);
+    assert.equal(child.listenerCount('spawn'), 0);
+    assert.equal(child.listenerCount('error'), 0);
+    assert.deepEqual(cancelled, [scheduled[0]]);
+    assert.deepEqual(child.signals, ['SIGTERM']);
+    child.invokeCaptured('spawn');
+    child.invokeCaptured('error', new Error('late spawn error'));
+    await Promise.resolve();
+    assert.deepEqual(unhandled, []);
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
+    child.stdout.destroy();
+    child.stderr.destroy();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test('default launcher accepts a real fast second-instance exit without waiting for identity timeout', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ride-smoke-fast-second-'));
