@@ -57,6 +57,45 @@ async function turn(): Promise<void> {
     await new Promise<void>(resolve => setImmediate(resolve));
 }
 
+function manualTimers(): {
+    readonly setTimeout: (callback: () => void, timeoutMs: number) => unknown;
+    readonly clearTimeout: (handle: unknown) => void;
+    readonly pending: () => number;
+    advanceTo(timeMs: number): Promise<void>;
+} {
+    let now = 0;
+    let order = 0;
+    const timers = new Map<object, { readonly callback: () => void; readonly due: number; readonly order: number }>();
+    return {
+        setTimeout: (callback, timeoutMs) => {
+            const handle = {};
+            timers.set(handle, { callback, due: now + timeoutMs, order: order++ });
+            return handle;
+        },
+        clearTimeout: handle => {
+            timers.delete(handle as object);
+        },
+        pending: () => timers.size,
+        advanceTo: async timeMs => {
+            assert.ok(timeMs >= now, 'manual time cannot move backwards');
+            while (true) {
+                await turn();
+                const next = [...timers.entries()]
+                    .filter(([, timer]) => timer.due <= timeMs)
+                    .sort((left, right) => left[1].due - right[1].due || left[1].order - right[1].order)[0];
+                if (!next) {
+                    now = timeMs;
+                    await turn();
+                    return;
+                }
+                now = next[1].due;
+                timers.delete(next[0]);
+                next[1].callback();
+            }
+        }
+    };
+}
+
 function plan(patch: Partial<RideSmokePlan> = {}): RideSmokePlan {
     return Object.freeze({
         specSha256: 'a'.repeat(64),
@@ -912,6 +951,89 @@ test('smoke action waits for hosted plugins before executing the canonical packa
     assert.deepEqual(executions, [RIDE_SMOKE_PACKAGED_PLUGIN.commandId]);
 });
 
+test('Task 5 actions can complete after five seconds but before the planned deadline', async t => {
+    await t.test('hosted plugin readiness', async () => {
+        const clock = manualTimers();
+        const pluginsReady = deferred<void>();
+        let executions = 0;
+        const actions = new RidePackagedSmokeActionService({
+            hostedPlugins: { didStart: pluginsReady.promise },
+            commandRegistry: {
+                getCommand: id => ({ id }),
+                getAllHandlers: () => [],
+                executeCommand: async () => { executions++; }
+            },
+            setTimeout: clock.setTimeout,
+            clearTimeout: clock.clearTimeout
+        });
+        const operation = actions.packagedPluginCommand(plan({ actionTimeoutMs: 10_000 }));
+        const outcome = outcomeWithin(operation);
+
+        await clock.advanceTo(6_000);
+        pluginsReady.resolve();
+
+        assert.equal(await outcome, undefined);
+        assert.equal(executions, 1);
+        assert.equal(clock.pending(), 0);
+    });
+
+    await t.test('secondary window readiness', async () => {
+        const clock = manualTimers();
+        const proxyHandler = {};
+        const realHandler = {};
+        const widget = { isExtractable: true, secondaryWindow: undefined as object | undefined };
+        let handlers = [proxyHandler];
+        const actions = new RidePackagedSmokeActionService({
+            applicationShell: { widgets: [widget] },
+            commandRegistry: {
+                getCommand: id => ({ id }),
+                getAllHandlers: () => handlers,
+                executeCommand: async () => { handlers = [realHandler]; }
+            },
+            pollIntervalMs: 1_000,
+            setTimeout: clock.setTimeout,
+            clearTimeout: clock.clearTimeout
+        });
+        const operation = actions.secondaryWindow(plan({ actionTimeoutMs: 10_000 }));
+        const outcome = outcomeWithin(operation);
+
+        await clock.advanceTo(6_000);
+        widget.secondaryWindow = {};
+        await clock.advanceTo(7_000);
+
+        assert.equal(await outcome, undefined);
+        assert.equal(clock.pending(), 0);
+    });
+
+    await t.test('single-instance forwarding', async () => {
+        const clock = manualTimers();
+        const listeners = new Set<(event: { source: 'singleInstance'; relativePath: string }) => void>();
+        const actions = new RidePackagedSmokeActionService({
+            openRequests: {
+                onDidOpenRequest: listener => {
+                    listeners.add(listener);
+                    return { dispose: () => { listeners.delete(listener); } };
+                }
+            },
+            setTimeout: clock.setTimeout,
+            clearTimeout: clock.clearTimeout
+        });
+        const smokePlan = plan({ files: Object.freeze(['startup.R', 'forwarded.R']), actionTimeoutMs: 10_000 });
+        actions.prepareSecondFile(smokePlan);
+        const operation = actions.waitForSecondFile(smokePlan);
+        const outcome = outcomeWithin(operation);
+
+        await clock.advanceTo(6_000);
+        for (const listener of [...listeners]) {
+            listener({ source: 'singleInstance', relativePath: 'forwarded.R' });
+        }
+
+        assert.equal(await outcome, undefined);
+        assert.equal(listeners.size, 0);
+        assert.equal(clock.pending(), 0);
+    });
+});
+
 test('smoke action executes extract-widget and proves the deferred proxy handler was replaced', async () => {
     const proxyHandler = { execute: () => undefined };
     const realHandler = { execute: () => undefined };
@@ -1019,7 +1141,7 @@ test('smoke action secondary-window timeout cancels polling without late side ef
             (handle as { cleared: boolean }).cleared = true;
         }
     }));
-    const operation = actions.secondaryWindow(plan());
+    const operation = actions.secondaryWindow(plan({ actionTimeoutMs: 20 }));
 
     await turn();
     await turn();

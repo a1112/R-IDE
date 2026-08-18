@@ -61,18 +61,71 @@ function sha256(value) {
   return crypto.createHash('sha256').update(value).digest('hex');
 }
 
-async function readPluginManifest(pluginsDirectory, entry) {
+async function canonicalPathStat(fileSystem, candidate, kind, label) {
+  let stat;
+  try {
+    stat = await fileSystem.lstat(candidate);
+  } catch {
+    throw new Error(`${label} is not canonical`);
+  }
+  if (stat.isSymbolicLink() || (kind === 'directory' ? !stat.isDirectory() : !stat.isFile())) {
+    throw new Error(`${label} is not canonical`);
+  }
+  let resolved;
+  try {
+    resolved = await fileSystem.realpath(candidate);
+  } catch {
+    throw new Error(`${label} is not canonical`);
+  }
+  if (typeof resolved !== 'string') {
+    throw new Error(`${label} is not canonical`);
+  }
+  return path.resolve(resolved);
+}
+
+function isCanonicalDirectChild(parent, child, childName) {
+  const relative = path.relative(parent, child);
+  const normalize = value => process.platform === 'win32' ? value.toLowerCase() : value;
+  return normalize(relative) === normalize(childName);
+}
+
+async function readPluginManifest(pluginsDirectory, pluginsRealPath, entry, fileSystem) {
   if (!entry.isDirectory() || entry.isSymbolicLink() || entry.name.startsWith('.')) {
     throw new Error(`packaged plugin entry ${entry.name} is not canonical`);
   }
-  const manifestPath = path.join(pluginsDirectory, entry.name, 'extension', 'package.json');
-  const manifestStat = await fs.promises.lstat(manifestPath);
-  if (!manifestStat.isFile() || manifestStat.isSymbolicLink()) {
+  const pluginDirectory = path.join(pluginsDirectory, entry.name);
+  const pluginRealPath = await canonicalPathStat(
+    fileSystem,
+    pluginDirectory,
+    'directory',
+    `packaged plugin entry ${entry.name}`,
+  );
+  if (!isCanonicalDirectChild(pluginsRealPath, pluginRealPath, entry.name)) {
+    throw new Error(`packaged plugin entry ${entry.name} is not canonical`);
+  }
+  const extensionDirectory = path.join(pluginDirectory, 'extension');
+  const extensionRealPath = await canonicalPathStat(
+    fileSystem,
+    extensionDirectory,
+    'directory',
+    `packaged plugin ${entry.name} extension`,
+  );
+  if (!isCanonicalDirectChild(pluginRealPath, extensionRealPath, 'extension')) {
+    throw new Error(`packaged plugin ${entry.name} extension is not canonical`);
+  }
+  const manifestPath = path.join(extensionDirectory, 'package.json');
+  const manifestRealPath = await canonicalPathStat(
+    fileSystem,
+    manifestPath,
+    'file',
+    `packaged plugin manifest ${entry.name}`,
+  );
+  if (!isCanonicalDirectChild(extensionRealPath, manifestRealPath, 'package.json')) {
     throw new Error(`packaged plugin manifest ${entry.name} is not canonical`);
   }
   let manifest;
   try {
-    manifest = JSON.parse(await fs.promises.readFile(manifestPath, 'utf8'));
+    manifest = JSON.parse(await fileSystem.readFile(manifestRealPath, 'utf8'));
   } catch {
     throw new Error(`packaged plugin manifest ${entry.name} could not be read`);
   }
@@ -103,15 +156,20 @@ async function readPluginManifest(pluginsDirectory, entry) {
   return { extensionId, extensionVersion, commands };
 }
 
-export async function selectPackagedSmokePlugin(pluginsDirectory = DEFAULT_PLUGINS_DIRECTORY) {
-  const directoryStat = await fs.promises.lstat(pluginsDirectory);
-  if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink()) {
-    throw new Error('packaged plugin inventory is not a canonical directory');
-  }
-  const entries = await fs.promises.readdir(pluginsDirectory, { withFileTypes: true });
+export async function selectPackagedSmokePlugin(
+  pluginsDirectory = DEFAULT_PLUGINS_DIRECTORY,
+  { fileSystem = fs.promises } = {},
+) {
+  const pluginsRealPath = await canonicalPathStat(
+    fileSystem,
+    pluginsDirectory,
+    'directory',
+    'packaged plugin inventory',
+  );
+  const entries = await fileSystem.readdir(pluginsDirectory, { withFileTypes: true });
   const manifests = new Map();
   for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name, 'en'))) {
-    const manifest = await readPluginManifest(pluginsDirectory, entry);
+    const manifest = await readPluginManifest(pluginsDirectory, pluginsRealPath, entry, fileSystem);
     if (manifests.has(manifest.extensionId)) {
       throw new Error(`packaged plugin ${manifest.extensionId} is duplicated`);
     }

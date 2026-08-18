@@ -51,7 +51,14 @@ export interface RideSmokeCompleteRequest {
 }
 
 export const RidePackagedSmokeActions = Symbol('RidePackagedSmokeActions');
+export class RidePackagedSmokeActionTimeout extends Error {
+    constructor() {
+        super('Smoke action timed out.');
+    }
+}
+
 export interface RidePackagedSmokeActions {
+    readonly managesActionTimeouts?: boolean;
     editorSave(plan: RideSmokePlan): Promise<void>;
     terminalSentinel(plan: RideSmokePlan): Promise<void>;
     workspaceSearch(plan: RideSmokePlan): Promise<void>;
@@ -263,9 +270,15 @@ export class RidePackagedSmokeContribution implements FrontendApplicationContrib
 
                 let diagnostic: RideSmokeDiagnostic | undefined;
                 try {
-                    await this.withTimeout(this.executeAction(smokeActions, action, session.plan), session.plan.actionTimeoutMs);
+                    const operation = this.executeAction(smokeActions, action, session.plan);
+                    await (smokeActions.managesActionTimeouts === true
+                        ? operation
+                        : this.withTimeout(operation, session.plan.actionTimeoutMs));
                 } catch (error) {
-                    diagnostic = error instanceof SmokeActionTimeout ? ACTION_TIMEOUT : ACTION_FAILED;
+                    diagnostic = error instanceof SmokeActionTimeout
+                        || error instanceof RidePackagedSmokeActionTimeout
+                        ? ACTION_TIMEOUT
+                        : ACTION_FAILED;
                 }
                 if (diagnostic !== undefined) {
                     await this.reportActionFailure(session.sessionProof, action, diagnostic, elapsed);

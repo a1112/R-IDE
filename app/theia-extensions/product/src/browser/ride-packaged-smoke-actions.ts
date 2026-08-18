@@ -7,7 +7,11 @@
 import { OS } from '@theia/core/lib/common/os';
 import URI from '@theia/core/lib/common/uri';
 import type { Disposable } from '@theia/core/lib/common/disposable';
-import type { RidePackagedSmokeActions, RideSmokePlan } from './ride-packaged-smoke';
+import {
+    RidePackagedSmokeActionTimeout,
+    type RidePackagedSmokeActions,
+    type RideSmokePlan
+} from './ride-packaged-smoke';
 import type { RideOpenRequestObservation } from './ride-open-request';
 import { RIDE_SMOKE_PACKAGED_PLUGIN } from './ride-packaged-plugin-inventory';
 
@@ -175,6 +179,7 @@ interface RideSmokeActionRun {
 }
 
 export class RidePackagedSmokeActionService implements RidePackagedSmokeActions, Disposable {
+    readonly managesActionTimeouts = true;
     protected readonly backendIsWindows: boolean;
     protected readonly pollIntervalMs: number;
     protected readonly pollTimeoutMs: number;
@@ -382,7 +387,7 @@ export class RidePackagedSmokeActionService implements RidePackagedSmokeActions,
             }
             run.assertActive();
             await run.wait(commandRegistry.executeCommand(commandId));
-        });
+        }, plan.actionTimeoutMs);
     }
 
     secondaryWindow(plan: RideSmokePlan): Promise<void> {
@@ -412,7 +417,7 @@ export class RidePackagedSmokeActionService implements RidePackagedSmokeActions,
             while (widget.secondaryWindow === undefined) {
                 await run.delay(this.pollIntervalMs);
             }
-        });
+        }, plan.actionTimeoutMs);
     }
 
     waitForSecondFile(plan: RideSmokePlan): Promise<void> {
@@ -430,7 +435,7 @@ export class RidePackagedSmokeActionService implements RidePackagedSmokeActions,
                 stopOnAbort();
                 observation.dispose();
             }
-        });
+        }, plan.actionTimeoutMs);
     }
 
     prepareSecondFile(plan: RideSmokePlan): Disposable {
@@ -658,14 +663,15 @@ export class RidePackagedSmokeActionService implements RidePackagedSmokeActions,
 
     protected async runAction(
         plan: RideSmokePlan,
-        operation: (run: RideSmokeActionRun) => Promise<void>
+        operation: (run: RideSmokeActionRun) => Promise<void>,
+        deadlineMs: number = this.effectiveTimeout(plan.actionTimeoutMs)
     ): Promise<void> {
         this.ensureActive();
         return new Promise<void>((resolve, reject) => {
             let settled = false;
             let timerAssigned = false;
             let timer: unknown;
-            let abortError: RideSmokeActionError | undefined;
+            let abortError: RideSmokeActionError | RidePackagedSmokeActionTimeout | undefined;
             const abortCallbacks = new Set<() => void>();
             const clearTimer = (): void => {
                 if (!timerAssigned) {
@@ -686,12 +692,14 @@ export class RidePackagedSmokeActionService implements RidePackagedSmokeActions,
                 clearTimer();
                 abortCallbacks.clear();
                 if (error) {
-                    reject(error instanceof RideSmokeActionError ? error : this.error('Smoke action failed.'));
+                    reject(error instanceof RideSmokeActionError || error instanceof RidePackagedSmokeActionTimeout
+                        ? error
+                        : this.error('Smoke action failed.'));
                 } else {
                     resolve();
                 }
             };
-            const abort = (error: RideSmokeActionError): void => {
+            const abort = (error: RideSmokeActionError | RidePackagedSmokeActionTimeout): void => {
                 if (settled) {
                     return;
                 }
@@ -804,8 +812,8 @@ export class RidePackagedSmokeActionService implements RidePackagedSmokeActions,
             this.activeCancellations.add(cancel);
             try {
                 timer = this.scheduleTimeout(
-                    () => abort(this.error('Smoke action timed out.')),
-                    this.effectiveTimeout(plan.actionTimeoutMs)
+                    () => abort(new RidePackagedSmokeActionTimeout()),
+                    deadlineMs
                 );
                 timerAssigned = true;
                 if (settled) {

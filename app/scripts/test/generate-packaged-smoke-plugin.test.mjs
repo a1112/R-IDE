@@ -79,6 +79,59 @@ test('rejects an arbitrary command and a preferred command absent from its ownin
   );
 });
 
+test('rejects an extension directory symlink or junction that escapes its plugin entry', async t => {
+  const { root, pluginsDirectory } = fixture();
+  const pluginDirectory = path.join(pluginsDirectory, 'vscode.git');
+  const externalExtension = path.join(root, 'external-extension');
+  fs.mkdirSync(pluginDirectory);
+  fs.mkdirSync(externalExtension);
+  fs.writeFileSync(path.join(externalExtension, 'package.json'), `${JSON.stringify({
+    publisher: 'vscode', name: 'git', version: '1.108.2',
+    contributes: { commands: [{ command: 'git.refresh', title: 'Refresh' }] },
+  })}\n`);
+  try {
+    fs.symlinkSync(
+      externalExtension,
+      path.join(pluginDirectory, 'extension'),
+      process.platform === 'win32' ? 'junction' : 'dir',
+    );
+  } catch (error) {
+    if (['EACCES', 'EPERM', 'ENOTSUP'].includes(error?.code)) {
+      t.skip(`directory links are unavailable: ${error.code}`);
+      return;
+    }
+    throw error;
+  }
+
+  await assert.rejects(
+    selectPackagedSmokePlugin(pluginsDirectory),
+    /packaged plugin vscode\.git extension is not canonical/i,
+  );
+});
+
+test('rejects an injected realpath escape even when link creation is unavailable', async () => {
+  const { root, pluginsDirectory } = fixture();
+  writePlugin(pluginsDirectory, 'vscode.git', {
+    publisher: 'vscode', name: 'git', version: '1.108.2',
+    contributes: { commands: [{ command: 'git.refresh', title: 'Refresh' }] },
+  });
+  const extensionDirectory = path.resolve(pluginsDirectory, 'vscode.git', 'extension');
+  const escapedDirectory = path.resolve(root, 'outside-entry', 'extension');
+  const fileSystem = {
+    lstat: (...args) => fs.promises.lstat(...args),
+    readdir: (...args) => fs.promises.readdir(...args),
+    readFile: (...args) => fs.promises.readFile(...args),
+    realpath: async target => path.resolve(target) === extensionDirectory
+      ? escapedDirectory
+      : fs.promises.realpath(target),
+  };
+
+  await assert.rejects(
+    selectPackagedSmokePlugin(pluginsDirectory, { fileSystem }),
+    /packaged plugin vscode\.git extension is not canonical/i,
+  );
+});
+
 test('generates deterministic TypeScript provenance from the selected plugin manifest', async () => {
   const { pluginsDirectory, output } = fixture();
   writePlugin(pluginsDirectory, 'vscode.git', {

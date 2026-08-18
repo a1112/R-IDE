@@ -89,6 +89,45 @@ async function waitUntil(predicate: () => boolean, message: string): Promise<voi
     assert.fail(message);
 }
 
+function manualTimers(): {
+    readonly setTimeout: (callback: () => void, timeoutMs: number) => unknown;
+    readonly clearTimeout: (handle: unknown) => void;
+    readonly pending: () => number;
+    advanceTo(timeMs: number): Promise<void>;
+} {
+    let now = 0;
+    let order = 0;
+    const timers = new Map<object, { readonly callback: () => void; readonly due: number; readonly order: number }>();
+    return {
+        setTimeout: (callback, timeoutMs) => {
+            const handle = {};
+            timers.set(handle, { callback, due: now + timeoutMs, order: order++ });
+            return handle;
+        },
+        clearTimeout: handle => {
+            timers.delete(handle as object);
+        },
+        pending: () => timers.size,
+        advanceTo: async timeMs => {
+            assert.ok(timeMs >= now, 'manual time cannot move backwards');
+            while (true) {
+                await new Promise<void>(resolve => setImmediate(resolve));
+                const next = [...timers.entries()]
+                    .filter(([, timer]) => timer.due <= timeMs)
+                    .sort((left, right) => left[1].due - right[1].due || left[1].order - right[1].order)[0];
+                if (!next) {
+                    now = timeMs;
+                    await new Promise<void>(resolve => setImmediate(resolve));
+                    return;
+                }
+                now = next[1].due;
+                timers.delete(next[0]);
+                next[1].callback();
+            }
+        }
+    };
+}
+
 class FakeProtocol implements RidePackagedSmokeProtocol {
     readonly calls: ProtocolCall[] = [];
 
@@ -589,6 +628,55 @@ test('packaged smoke reports a bounded timeout and does not await the stuck acti
     const serialized = JSON.stringify(protocol.calls);
     assert.match(serialized, /action-timeout/);
     assert.doesNotMatch(serialized, /status":"passed/);
+});
+
+test('packaged smoke recognizes production action timeout and cancels forwarding without late effects', async () => {
+    const actionClock = manualTimers();
+    const sequencerClock = manualTimers();
+    const listeners = new Set<(event: { source: 'singleInstance'; relativePath: string }) => void>();
+    let subscriptionDisposals = 0;
+    const smokeActions = new RidePackagedSmokeActionService({
+        openRequests: {
+            onDidOpenRequest: listener => {
+                listeners.add(listener);
+                return {
+                    dispose: () => {
+                        if (listeners.delete(listener)) {
+                            subscriptionDisposals++;
+                        }
+                    }
+                };
+            }
+        },
+        setTimeout: actionClock.setTimeout,
+        clearTimeout: actionClock.clearTimeout
+    });
+    const protocol = new FakeProtocol(true, activePlan(['second-file-forwarding']));
+    new RidePackagedSmokeContribution(
+        immediateState(),
+        protocol,
+        () => smokeActions,
+        { setTimeout: sequencerClock.setTimeout, clearTimeout: sequencerClock.clearTimeout }
+    ).onStart();
+
+    await waitUntil(() => actionClock.pending() === 1 && listeners.size === 1,
+        'forwarding action did not install its timeout and observer');
+    await actionClock.advanceTo(1_000);
+    await waitUntil(() => protocol.calls.some(call => call.method === 'complete'),
+        'production timeout did not complete');
+
+    const failed = protocol.calls.find(call => call.method === 'recordStep'
+        && (call.request as RideSmokeStepRequest).state === 'failed')?.request as RideSmokeStepRequest;
+    assert.equal(failed.diagnostic?.code, 'action-timeout');
+    assert.equal(subscriptionDisposals, 1);
+    assert.equal(listeners.size, 0);
+    assert.equal(actionClock.pending(), 0);
+    assert.equal(sequencerClock.pending(), 0);
+
+    const callsAfterTimeout = protocol.calls.length;
+    await actionClock.advanceTo(2_000);
+    await sequencerClock.advanceTo(2_000);
+    assert.equal(protocol.calls.length, callsAfterTimeout);
 });
 
 test('packaged smoke contains timer setup and cleanup failures and consumes late action rejection', async () => {
