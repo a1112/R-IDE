@@ -1,8 +1,8 @@
 diff --git a/theia-extensions/product/package.json b/theia-extensions/product/package.json
-index a4e00d2..34d7cea 100644
+index a4e00d2..ca68db6 100644
 --- a/theia-extensions/product/package.json
 +++ b/theia-extensions/product/package.json
-@@ -1,14 +1,17 @@
+@@ -1,14 +1,21 @@
  {
    "private": true,
    "name": "theia-ide-product-ext",
@@ -18,15 +18,19 @@ index a4e00d2..34d7cea 100644
 +    "@tauri-apps/api": "^2.1.0",
 +    "@theia/ai-registry": "1.73.0-next.2",
 +    "@theia/core": "1.73.0-next.2",
++    "@theia/editor": "1.73.0-next.2",
++    "@theia/filesystem": "1.73.0-next.2",
 +    "@theia/getting-started": "1.73.0-next.2",
 +    "@theia/plugin-ext": "1.73.0-next.2",
++    "@theia/scm": "1.73.0-next.2",
++    "@theia/search-in-workspace": "1.73.0-next.2",
 +    "@theia/terminal": "1.73.0-next.2",
 +    "@theia/vsx-registry": "1.73.0-next.2",
 +    "@theia/workspace": "1.73.0-next.2",
      "inversify": "^6.2.2"
    },
    "devDependencies": {
-@@ -41,12 +44,13 @@
+@@ -41,12 +48,13 @@
    "scripts": {
      "clean": "rimraf lib *.tsbuildinfo",
      "build": "tsc -b",
@@ -1617,10 +1621,10 @@ index 388697a..dec36d4 100644
      }
  }
 diff --git a/theia-extensions/product/src/browser/theia-ide-frontend-module.ts b/theia-extensions/product/src/browser/theia-ide-frontend-module.ts
-index d3c3ed3..646dbff 100644
+index d3c3ed3..cd982a9 100644
 --- a/theia-extensions/product/src/browser/theia-ide-frontend-module.ts
 +++ b/theia-extensions/product/src/browser/theia-ide-frontend-module.ts
-@@ -9,27 +9,30 @@
+@@ -9,27 +9,31 @@
  
  import '../../src/browser/style/index.css';
  
@@ -1651,6 +1655,7 @@ index d3c3ed3..646dbff 100644
 +import { RideWorkbenchContribution } from './ride-workbench-contribution';
 +import { bindRidePerformanceContribution } from './ride-performance-contribution';
 +import { bindRideDeferredFeatureLoader } from './ride-deferred-feature-loader';
++import { bindRidePackagedSmokeContribution } from './ride-packaged-smoke-bindings';
  
  export default new ContainerModule((bind, _unbind, isBound, rebind) => {
      applyBranding();
@@ -1663,7 +1668,7 @@ index d3c3ed3..646dbff 100644
      if (isBound(AboutDialog)) {
          rebind(AboutDialog).to(TheiaIDEAboutDialog).inSingletonScope();
      } else {
-@@ -41,9 +44,29 @@ export default new ContainerModule((bind, _unbind, isBound, rebind) => {
+@@ -41,9 +45,34 @@ export default new ContainerModule((bind, _unbind, isBound, rebind) => {
          bind(serviceIdentifier).toService(TheiaIDEContribution)
      );
  
@@ -1677,6 +1682,11 @@ index d3c3ed3..646dbff 100644
 +    bind(CommandContribution).toService(RideWorkbenchContribution);
 +
 +    bindRidePerformanceContribution(bind);
++
++    bindRidePackagedSmokeContribution(bind, {
++        applicationState: FrontendApplicationStateService,
++        contribution: FrontendApplicationContribution
++    });
 +
 +    bindRideDeferredFeatureLoader(bind, {
 +        commands: CommandRegistry,

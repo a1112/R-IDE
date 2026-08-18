@@ -55,7 +55,7 @@ index 882bfac..7573561 100644
 \ No newline at end of file
 +}
 diff --git a/package.json b/package.json
-index 95188d1..1b079a9 100644
+index 95188d1..0de36fd 100644
 --- a/package.json
 +++ b/package.json
 @@ -1,6 +1,6 @@
@@ -66,16 +66,17 @@ index 95188d1..1b079a9 100644
    "license": "MIT",
    "author": "Rob Moran <github@thegecko.org>",
    "homepage": "https://github.com/eclipse-theia/theia-ide#readme",
-@@ -17,7 +17,7 @@
+@@ -17,7 +17,8 @@
    },
    "devDependencies": {
      "@eclipse-dash/nodejs-wrapper": "^0.0.1",
 -    "@theia/cli": "1.74.0",
 +    "@theia/cli": "1.73.0-next.2",
++    "@theia/terminal": "1.73.0-next.2",
      "@types/yargs": "^17",
      "@typescript-eslint/eslint-plugin": "^4.33.0",
      "@typescript-eslint/eslint-plugin-tslint": "^4.33.0",
-@@ -30,10 +30,11 @@
+@@ -30,10 +31,11 @@
      "eslint-plugin-react": "^7.37.5",
      "lerna": "^9.0.7",
      "node-gyp": "^11.5.0",
@@ -88,7 +89,7 @@ index 95188d1..1b079a9 100644
    },
    "scripts": {
      "clean": "lerna run clean && rimraf node_modules",
-@@ -43,9 +44,9 @@
+@@ -43,9 +45,10 @@
      "build:applications:dev": "lerna run --scope=\"theia-ide*app\" --ignore=\"theia-ide-next*\" build --concurrency 1",
      "build:applications:next": "lerna run --scope=\"theia-ide-next*\" build:prod --concurrency 1",
      "build:applications:next:dev": "lerna run --scope=\"theia-ide-next*\" build --concurrency 1",
@@ -96,12 +97,13 @@ index 95188d1..1b079a9 100644
 -    "build:local-theia": "node scripts/build-with-local-theia.js",
 -    "download:plugins": "theia download:plugins --rate-limit=15 --parallel=false && yarn permissions:writeable",
 +    "build:extensions": "npm --workspace theia-extensions/product run build && npm --workspace theia-extensions/launcher run build && npm --workspace theia-extensions/updater run build",
-+    "build:tauri": "npm run build:extensions && npm --workspace applications/browser run build:tauri-backend && npm --workspace applications/tauri run build:prod",
-+    "download:plugins": "theia download:plugins --rate-limit=15 --parallel=false && npm run permissions:writeable",
++    "build:tauri": "npm run generate:packaged-smoke-plugin && npm run build:extensions && npm --workspace applications/browser run build:tauri-backend && npm --workspace applications/tauri run build:prod",
++    "download:plugins": "theia download:plugins --rate-limit=15 --parallel=false && npm run generate:packaged-smoke-plugin && npm run permissions:writeable",
++    "generate:packaged-smoke-plugin": "node scripts/generate-packaged-smoke-plugin.mjs",
      "package:applications": "lerna run --scope=\"theia-ide*app\" --ignore=\"theia-ide-next*\" package --concurrency 1",
      "package:applications:preview": "lerna run --scope=\"theia-ide*app\" --ignore=\"theia-ide-next*\" package:preview --concurrency 1",
      "package:applications:prod": "lerna run --scope=\"theia-ide*app\" --ignore=\"theia-ide-next*\" package:prod --concurrency 1",
-@@ -53,22 +54,32 @@
+@@ -53,22 +56,33 @@
      "permissions:writeable": "ts-node scripts/make-files-writeable.ts plugins",
      "watch": "lerna run --parallel watch",
      "test": "lerna run test",
@@ -110,6 +112,7 @@ index 95188d1..1b079a9 100644
 +    "check:rust": "node scripts/check-rust.js",
 +    "test:tauri-rust": "node scripts/run-tauri-tests.js",
 +    "measure:tauri-startup": "node scripts/measure-tauri-startup.mjs",
++    "smoke:tauri-packaged": "node scripts/run-tauri-packaged-smoke.mjs",
 +    "verify:tauri-profile": "node scripts/verify-tauri-profile.mjs",
 +    "check:tauri-performance": "node scripts/check-tauri-performance.mjs --baseline applications/tauri/perf/baselines/pre-optimization-windows-x64-d034943.json --min-startup-gain 30 --min-memory-gain 10",
      "electron": "yarn --cwd applications/electron",
@@ -137,9 +140,24 @@ index 95188d1..1b079a9 100644
      "vscjava.vscode-java-pack": "https://open-vsx.org/api/vscjava/vscode-java-pack/0.30.5/file/vscjava.vscode-java-pack-0.30.5.vsix",
      "vscjava.vscode-java-dependency": "https://open-vsx.org/api/vscjava/vscode-java-dependency/0.27.0/file/vscjava.vscode-java-dependency-0.27.0.vsix"
    },
-@@ -82,25 +93,42 @@
-     "theia-extensions/*"
+@@ -77,30 +91,53 @@
+     "vscode.extension-editing",
+     "vscode.microsoft-authentication"
    ],
+-  "workspaces": [
+-    "applications/*",
+-    "theia-extensions/*"
+-  ],
++  "workspaces": {
++    "packages": [
++      "applications/*",
++      "theia-extensions/*"
++    ],
++    "nohoist": [
++      "theia-ide-browser-app/**",
++      "theia-ide-product-ext/**"
++    ]
++  },
    "resolutions": {
 +    "**/@electron/node-gyp": "10.2.0-electron.1",
      "@types/puppeteer": "^5.4.7",
