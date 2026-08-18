@@ -9,6 +9,7 @@
 
 export const SMOKE_SCHEMAS = Object.freeze({
   spec: 'ride.tauri-packaged-smoke-spec',
+  progress: 'ride.tauri-packaged-smoke-progress',
   report: 'ride.tauri-packaged-smoke',
 });
 
@@ -53,6 +54,15 @@ const REPORT_KEYS = Object.freeze([
   'failurePhase',
   'durationMs',
   'diagnostic',
+  'steps',
+]);
+const PROGRESS_KEYS = Object.freeze([
+  'schema',
+  'version',
+  'specSha256',
+  'scenario',
+  'profile',
+  'durationMs',
   'steps',
 ]);
 const REPORT_CONTEXT_KEYS = Object.freeze(['specSha256', 'scenario', 'profile', 'actions']);
@@ -266,8 +276,11 @@ function validateReportContext(value) {
   };
 }
 
-function validateReportTransitions(value, expectedActions) {
-  const transitions = stringArray(value, 'Smoke report steps');
+function validateReportTransitions(value, expectedActions, {
+  artifact = 'Smoke report',
+  allowPending = false,
+} = {}) {
+  const transitions = stringArray(value, `${artifact} steps`);
   const normalized = [];
   const seenActions = new Set();
   let pendingAction;
@@ -278,7 +291,7 @@ function validateReportTransitions(value, expectedActions) {
 
   for (let index = 0; index < transitions.length; index += 1) {
     const transition = transitions[index];
-    const label = `Smoke report transition ${index}`;
+    const label = `${artifact} transition ${index}`;
     exactKeys(transition, TRANSITION_KEYS, label);
     const actionIndex = SMOKE_ACTIONS.indexOf(transition.action);
     if (actionIndex < 0) {
@@ -290,38 +303,38 @@ function validateReportTransitions(value, expectedActions) {
       fail(`${label} durationMs must be monotonic`);
     }
     if (failed) {
-      fail('Smoke report must not contain a transition after failure');
+      fail(`${artifact} must not contain a transition after failure`);
     }
 
     let diagnostic = null;
     if (state === 'started') {
       if (pendingAction !== undefined) {
-        fail(`Smoke report action at transition ${index} must wait for the prior terminal transition`);
+        fail(`${artifact} action at transition ${index} must wait for the prior terminal transition`);
       }
       if (seenActions.has(transition.action)) {
-        fail(`Smoke report has duplicate action at transition ${index}`);
+        fail(`${artifact} has duplicate action at transition ${index}`);
       }
       if (actionIndex <= previousActionIndex) {
-        fail('Smoke report actions must follow canonical order');
+        fail(`${artifact} actions must follow canonical order`);
       }
       if (expectedActions[seenActions.size] !== transition.action) {
-        fail(`Smoke report has unexpected action at transition ${index}`);
+        fail(`${artifact} has unexpected action at transition ${index}`);
       }
       if (transition.diagnostic !== null) {
-        fail('Smoke report started transition diagnostic must be null');
+        fail(`${artifact} started transition diagnostic must be null`);
       }
       seenActions.add(transition.action);
       pendingAction = transition.action;
       previousActionIndex = actionIndex;
     } else {
       if (pendingAction !== transition.action) {
-        fail(`Smoke report terminal transition at index ${index} must follow its started transition`);
+        fail(`${artifact} terminal transition at index ${index} must follow its started transition`);
       }
       if (state === 'failed') {
-        diagnostic = validateDiagnostic(transition.diagnostic, 'Smoke report failed transition diagnostic');
+        diagnostic = validateDiagnostic(transition.diagnostic, `${artifact} failed transition diagnostic`);
         failed = true;
       } else if (transition.diagnostic !== null) {
-        fail('Smoke report passed transition diagnostic must be null');
+        fail(`${artifact} passed transition diagnostic must be null`);
       } else {
         passedCount += 1;
       }
@@ -331,8 +344,8 @@ function validateReportTransitions(value, expectedActions) {
     previousDuration = durationMs;
   }
 
-  if (pendingAction !== undefined) {
-    fail('Smoke report final started transition must complete');
+  if (!allowPending && pendingAction !== undefined) {
+    fail(`${artifact} final started transition must complete`);
   }
   return {
     transitions: normalized,
@@ -361,6 +374,45 @@ export function validateSmokeSpec(value) {
     actions: validateActions(value.actions),
     tokenSha256: validateSha256(value.tokenSha256, 'Smoke spec tokenSha256'),
     actionTimeoutMs: validateActionTimeout(value.actionTimeoutMs),
+  });
+}
+
+export function validateSmokeProgress(value, expected) {
+  exactKeys(value, PROGRESS_KEYS, 'Smoke progress');
+  const context = validateReportContext(expected);
+  if (value.schema !== SMOKE_SCHEMAS.progress) {
+    fail(`Smoke progress schema must be ${SMOKE_SCHEMAS.progress}`);
+  }
+  if (value.version !== 1) {
+    fail('Smoke progress version must be 1');
+  }
+
+  const specSha256 = validateSha256(value.specSha256, 'Smoke progress specSha256');
+  const scenario = enumValue(value.scenario, SMOKE_SCENARIOS, 'Smoke progress scenario');
+  const profile = enumValue(value.profile, SMOKE_PROFILES, 'Smoke progress profile');
+  for (const [field, actual] of Object.entries({ specSha256, scenario, profile })) {
+    if (actual !== context[field]) {
+      fail(`Smoke progress ${field} must match the expected context`);
+    }
+  }
+
+  const durationMs = nonNegativeSafeInteger(value.durationMs, 'Smoke progress durationMs');
+  const { transitions, lastDurationMs } = validateReportTransitions(value.steps, context.actions, {
+    artifact: 'Smoke progress',
+    allowPending: true,
+  });
+  if (durationMs !== lastDurationMs) {
+    fail('Smoke progress durationMs must equal its final transition duration');
+  }
+
+  return deepFreeze({
+    schema: value.schema,
+    version: value.version,
+    specSha256,
+    scenario,
+    profile,
+    durationMs,
+    steps: transitions,
   });
 }
 

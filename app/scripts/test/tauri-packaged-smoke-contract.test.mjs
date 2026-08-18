@@ -14,6 +14,7 @@ import {
   SMOKE_ACTIONS,
   SMOKE_SCENARIOS,
   SMOKE_SCHEMAS,
+  validateSmokeProgress,
   validateSmokeReport,
   validateSmokeSpec,
 } from '../tauri-packaged-smoke-contract.mjs';
@@ -64,6 +65,23 @@ function smokeReport(overrides = {}) {
       transition('editor-save', 'passed', 20),
       transition('terminal-sentinel', 'started', 25),
       transition('terminal-sentinel', 'passed', 75),
+    ],
+    ...overrides,
+  };
+}
+
+function smokeProgress(overrides = {}) {
+  return {
+    schema: 'ride.tauri-packaged-smoke-progress',
+    version: 1,
+    specSha256: 'b'.repeat(64),
+    scenario: 'critical-file',
+    profile: 'tauri-critical',
+    durationMs: 25,
+    steps: [
+      transition('editor-save', 'started', 0),
+      transition('editor-save', 'passed', 20),
+      transition('terminal-sentinel', 'started', 25),
     ],
     ...overrides,
   };
@@ -128,6 +146,7 @@ const DIAGNOSTIC_CATALOG = Object.freeze({
 test('exports immutable canonical schemas, scenarios, and ordered actions', () => {
   assert.deepEqual(SMOKE_SCHEMAS, {
     spec: 'ride.tauri-packaged-smoke-spec',
+    progress: 'ride.tauri-packaged-smoke-progress',
     report: 'ride.tauri-packaged-smoke',
   });
   assert.deepEqual(SMOKE_SCENARIOS, [
@@ -141,6 +160,136 @@ test('exports immutable canonical schemas, scenarios, and ordered actions', () =
   assert.equal(Object.isFrozen(SMOKE_SCENARIOS), true);
   assert.equal(Object.isFrozen(SMOKE_ACTIONS), true);
   assert.throws(() => SMOKE_ACTIONS.push('unexpected'), TypeError);
+});
+
+test('accepts strict progress prefixes ending in started, passed, or failed', () => {
+  const failure = {
+    code: 'action-timeout',
+    message: DIAGNOSTIC_CATALOG['action-timeout'],
+  };
+  const cases = [
+    smokeProgress(),
+    smokeProgress({
+      durationMs: 20,
+      steps: [
+        transition('editor-save', 'started', 0),
+        transition('editor-save', 'passed', 20),
+      ],
+    }),
+    smokeProgress({
+      durationMs: 30,
+      steps: [
+        transition('editor-save', 'started', 0),
+        transition('editor-save', 'passed', 20),
+        transition('terminal-sentinel', 'started', 25),
+        transition('terminal-sentinel', 'passed', 30),
+      ],
+    }),
+    smokeProgress({
+      durationMs: 30,
+      steps: [
+        transition('editor-save', 'started', 0),
+        transition('editor-save', 'passed', 20),
+        transition('terminal-sentinel', 'started', 25),
+        transition('terminal-sentinel', 'failed', 30, failure),
+      ],
+    }),
+  ];
+
+  for (const input of cases) {
+    const progress = validateSmokeProgress(input, REPORT_CONTEXT);
+    assert.deepEqual(progress, input);
+    assert.notEqual(progress, input);
+    assert.equal(Object.isFrozen(progress), true);
+    assert.equal(Object.isFrozen(progress.steps), true);
+  }
+});
+
+test('requires exact progress fields and rejects terminal reports masquerading as progress', () => {
+  assert.throws(
+    () => validateSmokeProgress({ ...smokeProgress(), status: 'started' }, REPORT_CONTEXT),
+    /progress.*unexpected field/i,
+  );
+  const missing = smokeProgress();
+  delete missing.steps;
+  assert.throws(() => validateSmokeProgress(missing, REPORT_CONTEXT), /missing a required field/i);
+  assert.throws(
+    () => validateSmokeProgress({
+      ...smokeReport(),
+      schema: 'ride.tauri-packaged-smoke-progress',
+    }, REPORT_CONTEXT),
+    /progress.*unexpected field/i,
+  );
+});
+
+test('binds progress identity to the expected report context', () => {
+  for (const [field, value] of [
+    ['specSha256', 'c'.repeat(64)],
+    ['scenario', 'full-file'],
+    ['profile', 'full'],
+  ]) {
+    assert.throws(
+      () => validateSmokeProgress(smokeProgress({ [field]: value }), REPORT_CONTEXT),
+      new RegExp(`${field}.*match`, 'i'),
+    );
+  }
+});
+
+test('rejects invalid progress order, repetition, continuation after failure, and durations', () => {
+  const failure = {
+    code: 'action-failed',
+    message: DIAGNOSTIC_CATALOG['action-failed'],
+  };
+  const invalid = [
+    smokeProgress({
+      durationMs: 1,
+      steps: [transition('editor-save', 'passed', 1)],
+    }),
+    smokeProgress({
+      durationMs: 2,
+      steps: [
+        transition('editor-save', 'started', 0),
+        transition('editor-save', 'passed', 1),
+        transition('editor-save', 'started', 2),
+      ],
+    }),
+    smokeProgress({
+      durationMs: 3,
+      steps: [
+        transition('editor-save', 'started', 0),
+        transition('editor-save', 'failed', 1, failure),
+        transition('terminal-sentinel', 'started', 3),
+      ],
+    }),
+    smokeProgress({
+      durationMs: 10,
+      steps: [
+        transition('editor-save', 'started', 10),
+        transition('editor-save', 'passed', 9),
+      ],
+    }),
+    smokeProgress({
+      durationMs: 8,
+      steps: [transition('editor-save', 'started', 9)],
+    }),
+  ];
+
+  for (const value of invalid) {
+    assert.throws(
+      () => validateSmokeProgress(value, REPORT_CONTEXT),
+      /transition|duplicate|failure|duration/i,
+    );
+  }
+});
+
+test('progress validation errors never echo untrusted values', () => {
+  const marker = 'PROGRESS_SECRET_ABSOLUTE_PATH';
+  const error = captureValidationError(() => validateSmokeProgress({
+    ...smokeProgress(),
+    [marker]: `C:\\Users\\runner\\${marker}`,
+  }, REPORT_CONTEXT));
+
+  assert.doesNotMatch(error.message, new RegExp(marker, 'i'));
 });
 
 test('accepts each exact scenario and returns a normalized copy', () => {

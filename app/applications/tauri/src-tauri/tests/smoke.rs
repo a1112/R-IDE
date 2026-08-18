@@ -670,6 +670,131 @@ fn smoke_protocol_replays_identical_failed_step_without_duplicate_failure_state(
 }
 
 #[test]
+fn smoke_record_step_immediately_publishes_strict_progress_snapshots() {
+    let fixture = Fixture::new();
+    let token = "progress-snapshot-token";
+    let protocol = SmokeProtocol::from_environment(
+        &fixture.environment(
+            token,
+            json!({ "actions": ["editor-save", "terminal-sentinel"] }),
+        ),
+        &fixture.root,
+    );
+    let proof = active_session_proof(&protocol);
+
+    protocol
+        .record_step(
+            &proof,
+            step(SmokeAction::EditorSave, SmokeStepState::Started, 3),
+        )
+        .expect("record started progress");
+    let started_bytes = fs::read(fixture.report_path()).expect("started progress is visible");
+    let started: Value =
+        serde_json::from_slice(&started_bytes).expect("started progress is complete JSON");
+    assert_eq!(started["schema"], "ride.tauri-packaged-smoke-progress");
+    assert_eq!(started["durationMs"], 3);
+    assert_eq!(started["steps"].as_array().expect("started steps").len(), 1);
+    assert_eq!(started["steps"][0]["state"], "started");
+
+    protocol
+        .record_step(
+            &proof,
+            step(SmokeAction::EditorSave, SmokeStepState::Passed, 5),
+        )
+        .expect("record passed progress");
+    let passed: Value = serde_json::from_slice(
+        &fs::read(fixture.report_path()).expect("passed progress is visible"),
+    )
+    .expect("passed progress is complete JSON");
+    assert_eq!(passed["durationMs"], 5);
+    assert_eq!(passed["steps"].as_array().expect("passed steps").len(), 2);
+    assert_eq!(passed["steps"][1]["state"], "passed");
+
+    protocol
+        .record_step(
+            &proof,
+            step(SmokeAction::TerminalSentinel, SmokeStepState::Started, 8),
+        )
+        .expect("record second started progress");
+    let failure = diagnostic("action-timeout", "Smoke action timed out.");
+    protocol
+        .record_step(
+            &proof,
+            RecordStepRequest {
+                action: SmokeAction::TerminalSentinel,
+                state: SmokeStepState::Failed,
+                duration_ms: 13,
+                diagnostic: Some(failure),
+            },
+        )
+        .expect("record failed progress");
+    let failed_bytes = fs::read(fixture.report_path()).expect("failed progress is visible");
+    let failed: Value =
+        serde_json::from_slice(&failed_bytes).expect("failed progress is complete JSON");
+    assert_eq!(failed["durationMs"], 13);
+    assert_eq!(failed["steps"].as_array().expect("failed steps").len(), 4);
+    assert_eq!(failed["steps"][3]["state"], "failed");
+
+    let serialized = String::from_utf8(failed_bytes).expect("progress is UTF-8");
+    assert!(!serialized.contains(token));
+    assert!(!serialized.contains(&proof));
+    assert!(!serialized.contains(fixture.root.to_string_lossy().as_ref()));
+    assert!(failed.get("workspace").is_none());
+    assert_eq!(
+        failed
+            .as_object()
+            .expect("progress object")
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        [
+            "durationMs",
+            "profile",
+            "scenario",
+            "schema",
+            "specSha256",
+            "steps",
+            "version",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    );
+}
+
+#[test]
+fn smoke_complete_atomically_replaces_progress_with_the_final_report_schema() {
+    let fixture = Fixture::new();
+    let protocol = SmokeProtocol::from_environment(
+        &fixture.environment(
+            "progress-complete-token",
+            json!({ "actions": ["editor-save"] }),
+        ),
+        &fixture.root,
+    );
+    let proof = active_session_proof(&protocol);
+    complete_actions(&protocol, &proof, &[SmokeAction::EditorSave]);
+
+    let progress: Value = serde_json::from_slice(
+        &fs::read(fixture.report_path()).expect("final progress is visible before complete"),
+    )
+    .expect("parse final progress");
+    assert_eq!(progress["schema"], "ride.tauri-packaged-smoke-progress");
+    assert!(progress.get("status").is_none());
+
+    protocol
+        .complete(&proof, complete_passed(2))
+        .expect("complete final report");
+    let report: Value = serde_json::from_slice(
+        &fs::read(fixture.report_path()).expect("final report replaces progress"),
+    )
+    .expect("parse final report");
+    assert_eq!(report["schema"], "ride.tauri-packaged-smoke");
+    assert_eq!(report["status"], "passed");
+    assert_eq!(report["steps"].as_array().expect("report steps").len(), 2);
+}
+
+#[test]
 fn smoke_protocol_rejects_durations_beyond_the_node_safe_integer_limit() {
     const ABOVE_NODE_SAFE_INTEGER: u64 = 9_007_199_254_740_992;
     let fixture = Fixture::new();

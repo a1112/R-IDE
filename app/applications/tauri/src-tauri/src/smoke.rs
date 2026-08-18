@@ -23,6 +23,7 @@ const REPORT_ENV: &str = "RIDE_TAURI_SMOKE_REPORT";
 const TOKEN_ENV: &str = "RIDE_TAURI_SMOKE_TOKEN";
 pub(crate) const SMOKE_ENV_NAMES: [&str; 3] = [SPEC_ENV, REPORT_ENV, TOKEN_ENV];
 const SPEC_SCHEMA: &str = "ride.tauri-packaged-smoke-spec";
+const PROGRESS_SCHEMA: &str = "ride.tauri-packaged-smoke-progress";
 const REPORT_SCHEMA: &str = "ride.tauri-packaged-smoke";
 const PROTOCOL_VERSION: u32 = 1;
 const MAX_SPEC_BYTES: u64 = 1024 * 1024;
@@ -280,6 +281,18 @@ struct SmokeReport {
     steps: Vec<SmokeTransition>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SmokeProgress {
+    schema: &'static str,
+    version: u32,
+    spec_sha256: String,
+    scenario: SmokeScenario,
+    profile: SmokeProfile,
+    duration_ms: u64,
+    steps: Vec<SmokeTransition>,
+}
+
 struct ActiveProtocol {
     plan: SmokePlan,
     report_target: ReportTarget,
@@ -288,6 +301,7 @@ struct ActiveProtocol {
     proof_delivered: bool,
     transitions: Vec<SmokeTransition>,
     last_record_request: Option<RecordStepRequest>,
+    last_record_response: Option<SmokeUpdateResponse>,
     next_action: usize,
     pending_action: Option<SmokeAction>,
     action_failure: Option<SmokeDiagnostic>,
@@ -513,10 +527,10 @@ fn record_step_active(
         return Err(SmokeError::rejected());
     }
     if active.last_record_request.as_ref() == Some(&request) {
-        return Ok(SmokeUpdateResponse {
-            status: SmokeUpdateStatus::Recorded,
-            diagnostic: None,
-        });
+        return active
+            .last_record_response
+            .clone()
+            .ok_or_else(SmokeError::rejected);
     }
     if active.action_failure.is_some() {
         return Err(SmokeError::rejected());
@@ -529,49 +543,77 @@ fn record_step_active(
         return Err(SmokeError::rejected());
     }
 
+    let mut next_action = active.next_action;
+    let mut pending_action = active.pending_action;
+    let mut action_failure = active.action_failure.clone();
     match request.state {
         SmokeStepState::Started => {
             if request.diagnostic.is_some()
-                || active.pending_action.is_some()
+                || pending_action.is_some()
                 || active.plan.actions.get(active.next_action) != Some(&request.action)
             {
                 return Err(SmokeError::rejected());
             }
-            active.pending_action = Some(request.action);
+            pending_action = Some(request.action);
         }
         SmokeStepState::Passed => {
-            if request.diagnostic.is_some() || active.pending_action != Some(request.action) {
+            if request.diagnostic.is_some() || pending_action != Some(request.action) {
                 return Err(SmokeError::rejected());
             }
-            active.pending_action = None;
-            active.next_action += 1;
+            pending_action = None;
+            next_action += 1;
         }
         SmokeStepState::Failed => {
             let Some(diagnostic) = request.diagnostic.as_ref() else {
                 return Err(SmokeError::rejected());
             };
-            if active.pending_action != Some(request.action)
+            if pending_action != Some(request.action)
                 || !diagnostic.is_exact_catalog_entry()
                 || !matches!(diagnostic.code.as_str(), "action-failed" | "action-timeout")
             {
                 return Err(SmokeError::rejected());
             }
-            active.pending_action = None;
-            active.action_failure = Some(diagnostic.clone());
+            pending_action = None;
+            action_failure = Some(diagnostic.clone());
         }
     }
 
-    active.last_record_request = Some(request.clone());
-    active.transitions.push(SmokeTransition {
+    let mut transitions = active.transitions.clone();
+    transitions.push(SmokeTransition {
         action: request.action,
         state: request.state,
         duration_ms: request.duration_ms,
-        diagnostic: request.diagnostic,
+        diagnostic: request.diagnostic.clone(),
     });
-    Ok(SmokeUpdateResponse {
+    let progress = SmokeProgress {
+        schema: PROGRESS_SCHEMA,
+        version: PROTOCOL_VERSION,
+        spec_sha256: active.plan.spec_sha256.clone(),
+        scenario: active.plan.scenario,
+        profile: active.plan.profile,
+        duration_ms: request.duration_ms,
+        steps: transitions.clone(),
+    };
+    let publish =
+        write_report_atomically(&active.report_target, &progress, active.replacer.as_ref())
+            .map_err(|_| SmokeError::rejected())?;
+    let response = SmokeUpdateResponse {
         status: SmokeUpdateStatus::Recorded,
-        diagnostic: None,
-    })
+        diagnostic: match publish {
+            PublishOutcome::Durable => None,
+            PublishOutcome::CommittedWithDurabilityWarning => {
+                Some(SmokeDiagnostic::report_durability_warning())
+            }
+        },
+    };
+
+    active.next_action = next_action;
+    active.pending_action = pending_action;
+    active.action_failure = action_failure;
+    active.transitions = transitions;
+    active.last_record_request = Some(request);
+    active.last_record_response = Some(response.clone());
+    Ok(response)
 }
 
 fn complete_active(
@@ -889,6 +931,7 @@ fn build_active_protocol(
         proof_delivered: false,
         transitions: Vec::new(),
         last_record_request: None,
+        last_record_response: None,
         next_action: 0,
         pending_action: None,
         action_failure: None,
@@ -1584,9 +1627,9 @@ enum PublishOutcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PublishNotCommitted;
 
-fn write_report_atomically(
+fn write_report_atomically<T: Serialize>(
     target: &ReportTarget,
-    report: &SmokeReport,
+    report: &T,
     replacer: &dyn ReportReplacer,
 ) -> Result<PublishOutcome, PublishNotCommitted> {
     validate_report_destination(target).map_err(|_| PublishNotCommitted)?;
@@ -1914,7 +1957,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::io::Cursor;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
     #[test]
@@ -2024,6 +2067,140 @@ mod tests {
             old
         );
         assert_eq!(temporary_report_count(&fixture.root), 0);
+    }
+
+    #[test]
+    fn smoke_progress_pre_commit_failure_preserves_state_and_is_retryable() {
+        let fixture = TestFixture::new();
+        let old = b"{\"generation\":\"old\"}\n";
+        fs::write(fixture.report_path(), old).expect("write old report");
+        let replacements = Arc::new(AtomicUsize::new(0));
+        let protocol = SmokeProtocol::from_environment_with_replacer(
+            &fixture
+                .environment_with_actions("progress-pre-commit-token", &[SmokeAction::EditorSave]),
+            &fixture.root,
+            Arc::new(FailOnceCountingReplacer {
+                failed: AtomicBool::new(false),
+                replacements: Arc::clone(&replacements),
+            }),
+        );
+        let proof = protocol
+            .plan()
+            .session_proof
+            .expect("active smoke session proof");
+        let started = RecordStepRequest {
+            action: SmokeAction::EditorSave,
+            state: SmokeStepState::Started,
+            duration_ms: 7,
+            diagnostic: None,
+        };
+
+        assert_eq!(
+            protocol
+                .record_step(&proof, started.clone())
+                .expect_err("first progress replacement fails before commit"),
+            SmokeError::rejected()
+        );
+        assert_eq!(
+            fs::read(fixture.report_path()).expect("read old report"),
+            old
+        );
+        assert_eq!(replacements.load(Ordering::SeqCst), 1);
+
+        let recorded = protocol
+            .record_step(&proof, started.clone())
+            .expect("same request retries after pre-commit failure");
+        assert_eq!(recorded.status, SmokeUpdateStatus::Recorded);
+        assert_eq!(replacements.load(Ordering::SeqCst), 2);
+        let progress: serde_json::Value = serde_json::from_slice(
+            &fs::read(fixture.report_path()).expect("read retried progress"),
+        )
+        .expect("parse retried progress");
+        assert_eq!(
+            progress["steps"].as_array().expect("progress steps").len(),
+            1
+        );
+
+        assert_eq!(
+            protocol
+                .record_step(&proof, started)
+                .expect("exact committed request replays"),
+            recorded
+        );
+        assert_eq!(
+            replacements.load(Ordering::SeqCst),
+            2,
+            "exact replay must not publish a duplicate snapshot"
+        );
+        protocol
+            .record_step(
+                &proof,
+                RecordStepRequest {
+                    action: SmokeAction::EditorSave,
+                    state: SmokeStepState::Passed,
+                    duration_ms: 8,
+                    diagnostic: None,
+                },
+            )
+            .expect("single committed started transition advances state once");
+        let progress: serde_json::Value =
+            serde_json::from_slice(&fs::read(fixture.report_path()).expect("read passed progress"))
+                .expect("parse passed progress");
+        assert_eq!(
+            progress["steps"].as_array().expect("progress steps").len(),
+            2
+        );
+    }
+
+    #[test]
+    fn smoke_progress_committed_sync_warning_is_recorded_and_replayed_without_rewrite() {
+        let fixture = TestFixture::new();
+        let replacements = Arc::new(AtomicUsize::new(0));
+        let protocol = SmokeProtocol::from_environment_with_replacer(
+            &fixture.environment_with_actions(
+                "progress-sync-warning-token",
+                &[SmokeAction::EditorSave],
+            ),
+            &fixture.root,
+            Arc::new(CountingSyncFailingReplacer(Arc::clone(&replacements))),
+        );
+        let proof = protocol
+            .plan()
+            .session_proof
+            .expect("active smoke session proof");
+        let started = RecordStepRequest {
+            action: SmokeAction::EditorSave,
+            state: SmokeStepState::Started,
+            duration_ms: 0,
+            diagnostic: None,
+        };
+
+        let response = protocol
+            .record_step(&proof, started.clone())
+            .expect("committed progress remains recorded after sync warning");
+        assert_eq!(response.status, SmokeUpdateStatus::Recorded);
+        assert_eq!(
+            response.diagnostic,
+            Some(SmokeDiagnostic::report_durability_warning())
+        );
+        assert_eq!(replacements.load(Ordering::SeqCst), 1);
+        let progress: serde_json::Value = serde_json::from_slice(
+            &fs::read(fixture.report_path()).expect("committed progress is visible"),
+        )
+        .expect("parse committed progress");
+        assert_eq!(progress["schema"], "ride.tauri-packaged-smoke-progress");
+
+        assert_eq!(
+            protocol
+                .record_step(&proof, started)
+                .expect("identical progress request replays cached warning"),
+            response
+        );
+        assert_eq!(
+            replacements.load(Ordering::SeqCst),
+            1,
+            "replay must not rewrite committed progress"
+        );
     }
 
     #[test]
@@ -2222,6 +2399,47 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct FailOnceCountingReplacer {
+        failed: AtomicBool,
+        replacements: Arc<AtomicUsize>,
+    }
+
+    impl ReportReplacer for FailOnceCountingReplacer {
+        fn replace(
+            &self,
+            temporary: &mut TemporaryReport,
+            target: &ReportTarget,
+        ) -> io::Result<()> {
+            self.replacements.fetch_add(1, Ordering::SeqCst);
+            if !self.failed.swap(true, Ordering::SeqCst) {
+                Err(io::Error::other("injected progress pre-commit failure"))
+            } else {
+                SystemReplacer.replace(temporary, target)
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct CountingSyncFailingReplacer(Arc<AtomicUsize>);
+
+    impl ReportReplacer for CountingSyncFailingReplacer {
+        fn replace(
+            &self,
+            temporary: &mut TemporaryReport,
+            target: &ReportTarget,
+        ) -> io::Result<()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            SystemReplacer.replace(temporary, target)
+        }
+
+        fn sync_parent(&self, _target: &ReportTarget) -> io::Result<()> {
+            Err(io::Error::other(
+                "injected progress post-commit sync failure",
+            ))
+        }
+    }
+
     struct TestFixture {
         root: PathBuf,
     }
@@ -2241,6 +2459,14 @@ mod tests {
         }
 
         fn environment(&self, token: &str) -> BTreeMap<OsString, OsString> {
+            self.environment_with_actions(token, &[])
+        }
+
+        fn environment_with_actions(
+            &self,
+            token: &str,
+            actions: &[SmokeAction],
+        ) -> BTreeMap<OsString, OsString> {
             let spec_path = self.root.join("spec.json");
             let spec = json!({
                 "schema": SPEC_SCHEMA,
@@ -2249,7 +2475,7 @@ mod tests {
                 "profile": "tauri-critical",
                 "workspace": ".",
                 "files": [],
-                "actions": [],
+                "actions": actions,
                 "tokenSha256": sha256(token.as_bytes()),
                 "actionTimeoutMs": 30_000
             });
