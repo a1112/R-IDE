@@ -29,7 +29,7 @@ const LEGACY_LAST_CONSUMED_KEY = 'r-ide.open-request.last-consumed.v1';
 const MAX_PENDING_REQUESTS = 64;
 const MAX_STATE_CHARS = 262_144;
 const WINDOWS_PLUGIN_DIRECTORY = 'C:\\R-IDE\\plugins';
-const WINDOWS_PLUGIN_ENTRY = 'local-dir:/c%3A/R-IDE/plugins';
+const WINDOWS_PLUGIN_ENTRY = FileUri.create(WINDOWS_PLUGIN_DIRECTORY).withScheme('local-dir').toString();
 const WINDOWS_PLUGIN_INSTALL_EVENT = `install:${WINDOWS_PLUGIN_ENTRY}:${PluginType.System}`;
 
 class MemoryStorage implements Storage {
