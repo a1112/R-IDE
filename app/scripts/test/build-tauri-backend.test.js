@@ -107,7 +107,7 @@ test('returns status 1 when a build step is terminated by a signal', () => {
   const previousExitCode = process.exitCode;
   try {
     process.exitCode = undefined;
-    const status = runBuild('linux', () => ({ status: null, signal: 'SIGTERM' }), 'tauri-critical', {});
+    const status = runBuild('linux', () => ({ status: undefined, signal: 'SIGTERM' }), 'tauri-critical', {});
     assert.equal(status, 1);
     assert.equal(process.exitCode, 1);
   } finally {
