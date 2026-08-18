@@ -1617,25 +1617,29 @@ index 388697a..dec36d4 100644
      }
  }
 diff --git a/theia-extensions/product/src/browser/theia-ide-frontend-module.ts b/theia-extensions/product/src/browser/theia-ide-frontend-module.ts
-index d3c3ed3..9cbd979 100644
+index d3c3ed3..646dbff 100644
 --- a/theia-extensions/product/src/browser/theia-ide-frontend-module.ts
 +++ b/theia-extensions/product/src/browser/theia-ide-frontend-module.ts
-@@ -9,27 +9,27 @@
+@@ -9,27 +9,30 @@
  
  import '../../src/browser/style/index.css';
  
 -import { AIRegistryConfiguration } from '@theia/ai-registry/lib/common/ai-registry-configuration';
 -import { WidgetFactory } from '@theia/core/lib/browser';
-+import { ApplicationShell } from '@theia/core/lib/browser';
++import { ApplicationShell, FrontendApplication } from '@theia/core/lib/browser';
 +import { FrontendApplicationStateService } from '@theia/core/lib/browser/frontend-application-state';
 +import { FrontendApplicationContribution } from '@theia/core/lib/browser/frontend-application-contribution';
  import { AboutDialog } from '@theia/core/lib/browser/about-dialog';
  import { applyBranding } from './theia-ide-config';
- import { CommandContribution } from '@theia/core/lib/common/command';
+-import { CommandContribution } from '@theia/core/lib/common/command';
++import { CommandContribution, CommandRegistry } from '@theia/core/lib/common/command';
  import { ContainerModule } from '@theia/core/shared/inversify';
 -import { GettingStartedWidget } from '@theia/getting-started/lib/browser/getting-started-widget';
+-import { MenuContribution } from '@theia/core/lib/common/menu';
 +import { MessageService } from '@theia/core/lib/common/message-service';
- import { MenuContribution } from '@theia/core/lib/common/menu';
++import { MenuContribution, MenuModelRegistry } from '@theia/core/lib/common/menu';
++import { KeybindingRegistry } from '@theia/core/lib/browser/keybinding';
++import { TabBarToolbarRegistry } from '@theia/core/lib/browser/shell/tab-bar-toolbar';
 +import { OpenerService } from '@theia/core/lib/browser/opener-service';
 +import { WorkspaceService } from '@theia/workspace/lib/browser';
 +import { HostedPluginSupport } from '@theia/plugin-ext/lib/hosted/browser/hosted-plugin';
@@ -1646,6 +1650,7 @@ index d3c3ed3..9cbd979 100644
 +import { bindRideOpenRequestContribution } from './ride-open-request-bindings';
 +import { RideWorkbenchContribution } from './ride-workbench-contribution';
 +import { bindRidePerformanceContribution } from './ride-performance-contribution';
++import { bindRideDeferredFeatureLoader } from './ride-deferred-feature-loader';
  
  export default new ContainerModule((bind, _unbind, isBound, rebind) => {
      applyBranding();
@@ -1658,7 +1663,7 @@ index d3c3ed3..9cbd979 100644
      if (isBound(AboutDialog)) {
          rebind(AboutDialog).to(TheiaIDEAboutDialog).inSingletonScope();
      } else {
-@@ -41,9 +41,19 @@ export default new ContainerModule((bind, _unbind, isBound, rebind) => {
+@@ -41,9 +44,29 @@ export default new ContainerModule((bind, _unbind, isBound, rebind) => {
          bind(serviceIdentifier).toService(TheiaIDEContribution)
      );
  
@@ -1672,6 +1677,16 @@ index d3c3ed3..9cbd979 100644
 +    bind(CommandContribution).toService(RideWorkbenchContribution);
 +
 +    bindRidePerformanceContribution(bind);
++
++    bindRideDeferredFeatureLoader(bind, {
++        commands: CommandRegistry,
++        menus: MenuModelRegistry,
++        keybindings: KeybindingRegistry,
++        toolbar: TabBarToolbarRegistry,
++        application: FrontendApplication,
++        messages: MessageService,
++        frontendContribution: FrontendApplicationContribution
++    });
 +
 +    bindRideOpenRequestContribution(bind, {
 +        applicationShell: ApplicationShell,

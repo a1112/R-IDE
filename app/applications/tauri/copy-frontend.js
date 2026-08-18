@@ -15,6 +15,12 @@
 
 const fs = require('fs');
 const path = require('path');
+const {
+  assertRequiredRegularFiles,
+  copyRegularTree,
+  publishDirectoryAtomic,
+  rewriteDesktopHtml,
+} = require('./copy-build-tree');
 
 const sourceDir = path.resolve(__dirname, '../browser/lib/frontend');
 const targetDir = path.resolve(__dirname, './browser-frontend');
@@ -26,95 +32,14 @@ const requiredFiles = [
   'bundle.css',
 ];
 
-fs.rmSync(targetDir, { recursive: true, force: true });
-fs.rmSync(tauriFrontendDir, { recursive: true, force: true });
-fs.mkdirSync(targetDir, { recursive: true });
-fs.mkdirSync(tauriFrontendDir, { recursive: true });
-
-// 要复制的文件列表
-const filesToCopy = [
-  ...requiredFiles,
-  'plugin-worker.js',
-  'editor.worker.js',
-  'secondary-window.js',
-  'secondary-window.css',
-  'favicon.ico',
-];
-
-const sourceMapFiles = [
-  'bundle.js.map',
-  'bundle.css.map',
-  'plugin-worker.js.map',
-  'editor.worker.js.map',
-  'secondary-window.js.map',
-  'secondary-window.css.map',
-];
-
-if (process.env.RIDE_COPY_SOURCEMAPS === '1') {
-  filesToCopy.push(...sourceMapFiles);
-}
-
-const missingRequired = requiredFiles.filter(file => !fs.existsSync(path.join(sourceDir, file)));
-if (missingRequired.length > 0) {
+try {
+  assertRequiredRegularFiles(sourceDir, requiredFiles);
+} catch (error) {
   console.error('Required Theia frontend build artifacts are missing:');
-  missingRequired.forEach(file => console.error(`  - ${path.join(sourceDir, file)}`));
+  console.error(`  - ${error.message}`);
   console.error('\nBuild the browser application first from the app workspace:');
   console.error('  yarn --cwd applications/browser build:prod');
   process.exit(1);
-}
-
-// 复制文件
-console.log('Copying frontend resources...');
-filesToCopy.forEach(file => {
-  const sourcePath = path.join(sourceDir, file);
-  const targetPath = path.join(targetDir, file);
-
-  if (fs.existsSync(sourcePath)) {
-    fs.copyFileSync(sourcePath, targetPath);
-    console.log(`✓ Copied ${file}`);
-  } else {
-    console.warn(`- Optional source file not found: ${file}`);
-  }
-});
-
-// Create the desktop-served frontend with an early locale bootstrap and CSP.
-const htmlSource = path.join(sourceDir, 'index.html');
-const htmlTarget = path.join(targetDir, 'index.html');
-
-if (fs.existsSync(htmlSource)) {
-  let html = fs.readFileSync(htmlSource, 'utf-8');
-  const csp = [
-    "default-src 'self'",
-    "script-src 'self' 'unsafe-eval'",
-    "style-src 'self' 'unsafe-inline'",
-    "img-src 'self' data: blob: https:",
-    "font-src 'self' data:",
-    "connect-src 'self' http: https: ws: wss:",
-    "worker-src 'self' blob:",
-    "frame-src 'self' http: https:",
-    "object-src 'none'",
-    "base-uri 'self'",
-    "frame-ancestors 'none'",
-  ].join('; ');
-  const cspMeta = `  <meta http-equiv="Content-Security-Policy" content="${csp}">\n`;
-  const localeScript = '    <script type="text/javascript" src="./ride-bootstrap.js" charset="utf-8"></script>\n';
-
-  // The preload template contains a redundant inline favicon script. Removing it
-  // lets the desktop frontend enforce script-src without unsafe-inline.
-  html = html.replace(
-    /\s*<script>\s*if \(document\.head\)[\s\S]*?<\/script>/,
-    ''
-  );
-  html = html.replace('</head>', `${cspMeta}</head>`);
-  html = html.replace(
-    '    <script type="text/javascript" src="./bundle.js" charset="utf-8"></script>',
-    `${localeScript}    <script type="text/javascript" src="./bundle.js" charset="utf-8"></script>`
-  );
-
-  fs.writeFileSync(htmlTarget, html);
-  console.log('✓ Added desktop CSP and locale bootstrap');
-} else {
-  console.warn('✗ Source index.html not found');
 }
 
 const frontendBootstrap = `(() => {
@@ -136,8 +61,6 @@ const frontendBootstrap = `(() => {
   }
 })();
 `;
-
-fs.writeFileSync(path.join(targetDir, 'ride-bootstrap.js'), frontendBootstrap);
 
 const bootstrapHtml = `<!DOCTYPE html>
 <html lang="en">
@@ -205,7 +128,6 @@ const bootstrapHtml = `<!DOCTYPE html>
 </body>
 </html>`;
 
-fs.writeFileSync(path.join(tauriFrontendDir, 'index.html'), bootstrapHtml);
 const tauriBootstrapScript = `(() => {
   'use strict';
 
@@ -234,7 +156,21 @@ const tauriBootstrapScript = `(() => {
 })();
 `;
 
-fs.writeFileSync(path.join(tauriFrontendDir, 'bootstrap.js'), tauriBootstrapScript);
+console.log('Copying frontend resources...');
+publishDirectoryAtomic(targetDir, stagingDirectory => {
+  copyRegularTree(sourceDir, stagingDirectory, {
+    includeSourceMaps: process.env.RIDE_COPY_SOURCEMAPS === '1',
+  });
+  const htmlPath = path.join(stagingDirectory, 'index.html');
+  fs.writeFileSync(htmlPath, rewriteDesktopHtml(fs.readFileSync(htmlPath, 'utf8')));
+  fs.writeFileSync(path.join(stagingDirectory, 'ride-bootstrap.js'), frontendBootstrap);
+});
+console.log('✓ Recursively copied frontend assets with desktop CSP and locale bootstrap');
+
+publishDirectoryAtomic(tauriFrontendDir, stagingDirectory => {
+  fs.writeFileSync(path.join(stagingDirectory, 'index.html'), bootstrapHtml);
+  fs.writeFileSync(path.join(stagingDirectory, 'bootstrap.js'), tauriBootstrapScript);
+});
 console.log('✓ Created Tauri bootstrap frontend');
 
 console.log('Frontend resources copied successfully!');

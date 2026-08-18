@@ -226,21 +226,16 @@ pub fn run() {
 
     let app = builder
         .setup(move |app| {
-            if let Some(window) = app.get_webview_window("main") {
-                native_chrome::configure_native_window(&window);
-                match window.is_visible() {
-                    Ok(true) => app
-                        .state::<AppState>()
-                        .startup_metrics
-                        .record_or_warn(startup_metrics::StartupMilestone::NativeWindowVisible),
-                    Ok(false) => {}
-                    Err(error) => {
-                        log::warn!("Failed to observe initial main-window visibility: {error}")
-                    }
-                }
-            }
             native_chrome::install_menu_event_bridge(app.handle());
 
+            let main_window_config = app
+                .config()
+                .app
+                .windows
+                .iter()
+                .find(|config| config.label == "main")
+                .cloned()
+                .ok_or_else(|| std::io::Error::other("missing main window configuration"))?;
             let app_handle = app.handle().clone();
             let backend_start = app
                 .state::<AppState>()
@@ -255,6 +250,21 @@ pub fn run() {
                     eprintln!("Failed to start backend: {}", e);
                 }
             });
+
+            let window =
+                tauri::WebviewWindowBuilder::from_config(app.handle(), &main_window_config)?
+                    .build()?;
+            native_chrome::configure_native_window(&window);
+            match window.is_visible() {
+                Ok(true) => app
+                    .state::<AppState>()
+                    .startup_metrics
+                    .record_or_warn(startup_metrics::StartupMilestone::NativeWindowVisible),
+                Ok(false) => {}
+                Err(error) => {
+                    log::warn!("Failed to observe initial main-window visibility: {error}")
+                }
+            }
 
             Ok(())
         })

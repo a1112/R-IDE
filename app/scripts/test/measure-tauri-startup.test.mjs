@@ -8,6 +8,7 @@
  ********************************************************************************/
 
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { EventEmitter, once } from 'node:events';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -19,6 +20,8 @@ import {
   attachLinuxProcIdentities,
   attachBoundedLogCapture,
   captureProcessIdentity,
+  classifyProcessRoles,
+  createHostMetadata,
   createBoundedLogSink,
   discoverMarkedProcessSnapshot,
   discoverExecutable,
@@ -34,6 +37,7 @@ import {
   parseWindowsProcessTable,
   planProcessCleanup,
   readLinuxProcEnvironment,
+  readCampaignMetadata,
   runMeasurementCampaign,
   sampleProcessTree,
   redactDiagnosticText,
@@ -59,6 +63,19 @@ function assertNoSensitiveWindows(output, secret, windowLength = 16) {
       `secret window at offset ${index} must not be present`,
     );
   }
+}
+
+function runMeasurementCli(args) {
+  return spawnSync(
+    process.execPath,
+    [path.resolve(import.meta.dirname, '..', 'measure-tauri-startup.mjs'), ...args],
+    {
+      cwd: path.resolve(import.meta.dirname, '..', '..'),
+      encoding: 'utf8',
+      timeout: 10_000,
+      maxBuffer: 4 * 1024 * 1024,
+    },
+  );
 }
 
 function currentRustTarget() {
@@ -97,6 +114,46 @@ const finalMilestones = {
   plugins_started: 50,
   plugins_ready: 60,
 };
+
+const fixtureCampaignMetadata = {
+  build: {
+    commit: '0123456789abcdef0123456789abcdef01234567',
+    profile: 'tauri-critical',
+    profileSha256: '1'.repeat(64),
+    pluginManifestSha256: '2'.repeat(64),
+    pluginCount: 69,
+  },
+  host: {
+    platform: process.platform,
+    arch: process.arch,
+    fingerprint: '3'.repeat(64),
+  },
+};
+
+function campaignDependencies(dependencies = {}) {
+  return {
+    readCampaignMetadata: async () => fixtureCampaignMetadata,
+    ...dependencies,
+  };
+}
+
+function campaignMetrics(overrides = {}) {
+  return {
+    processCount: 1,
+    rssBytes: 100,
+    roles: {
+      main: { processCount: 1, rssBytes: 100 },
+      backend: { processCount: 0, rssBytes: 0 },
+      pluginHost: { processCount: 0, rssBytes: 0 },
+      webviewRenderer: { processCount: 0, rssBytes: 0 },
+      webviewGpu: { processCount: 0, rssBytes: 0 },
+      webviewUtility: { processCount: 0, rssBytes: 0 },
+      terminal: { processCount: 0, rssBytes: 0 },
+      other: { processCount: 0, rssBytes: 0 },
+    },
+    ...overrides,
+  };
+}
 
 test('discovers runnable Windows binary without selecting installers', () => {
   const root = temporaryDirectory('windows');
@@ -376,9 +433,9 @@ test('RSS conversion, aggregation, and median reject unsafe integer arithmetic',
 test('parses POSIX ps and Windows PowerShell process table fixtures', () => {
   assert.deepEqual(
     parsePosixProcessTable(`
-       10     1    10  2048 Sat Aug 15 12:34:56 2026
-       11    10    10  1024 Sat Aug 15 12:34:57 2026
-       99     1    99   512 Sat Aug 15 12:35:00 2026
+       10     1    10  2048 Sat Aug 15 12:34:56 2026 /opt/ride/R-IDE /opt/ride/R-IDE --startup
+       11    10    10  1024 Sat Aug 15 12:34:57 2026 /usr/bin/node /usr/bin/node /opt/ride/resources/backend/main.js
+       99     1    99   512 Sat Aug 15 12:35:00 2026 /usr/bin/bash /usr/bin/bash -l
     `),
     [
       {
@@ -388,6 +445,9 @@ test('parses POSIX ps and Windows PowerShell process table fixtures', () => {
         rssBytes: 2_097_152,
         creationTime: 'Sat Aug 15 12:34:56 2026',
         startedAt: Date.parse('Sat Aug 15 12:34:56 2026'),
+        name: 'R-IDE',
+        executable: '/opt/ride/R-IDE',
+        commandLine: '/opt/ride/R-IDE --startup',
       },
       {
         pid: 11,
@@ -396,6 +456,9 @@ test('parses POSIX ps and Windows PowerShell process table fixtures', () => {
         rssBytes: 1_048_576,
         creationTime: 'Sat Aug 15 12:34:57 2026',
         startedAt: Date.parse('Sat Aug 15 12:34:57 2026'),
+        name: 'node',
+        executable: '/usr/bin/node',
+        commandLine: '/usr/bin/node /opt/ride/resources/backend/main.js',
       },
       {
         pid: 99,
@@ -404,6 +467,9 @@ test('parses POSIX ps and Windows PowerShell process table fixtures', () => {
         rssBytes: 524_288,
         creationTime: 'Sat Aug 15 12:35:00 2026',
         startedAt: Date.parse('Sat Aug 15 12:35:00 2026'),
+        name: 'bash',
+        executable: '/usr/bin/bash',
+        commandLine: '/usr/bin/bash -l',
       },
     ],
   );
@@ -415,18 +481,27 @@ test('parses POSIX ps and Windows PowerShell process table fixtures', () => {
         ParentProcessId: 0,
         WorkingSetSize: 8_192,
         CreationDate: '20260815120000.000000+480',
+        Name: 'Idle',
+        ExecutablePath: null,
+        CommandLine: null,
       },
       {
         ProcessId: 10,
         ParentProcessId: 1,
         WorkingSetSize: 2_000,
         CreationDate: '20260815123456.000000+480',
+        Name: 'ride-tauri.exe',
+        ExecutablePath: 'C:\\Program Files\\R-IDE\\ride-tauri.exe',
+        CommandLine: '"C:\\Program Files\\R-IDE\\ride-tauri.exe" --startup',
       },
       {
         ProcessId: 11,
         ParentProcessId: 10,
         WorkingSetSize: 3_000,
         CreationDate: '20260815123457.000000+480',
+        Name: 'node.exe',
+        ExecutablePath: 'C:\\Program Files\\R-IDE\\resources\\backend\\runtime\\node.exe',
+        CommandLine: 'node.exe resources\\backend\\main.js',
       },
     ])),
     [
@@ -437,6 +512,9 @@ test('parses POSIX ps and Windows PowerShell process table fixtures', () => {
         rssBytes: 2_000,
         creationTime: '20260815123456.000000+480',
         startedAt: Date.UTC(2026, 7, 15, 4, 34, 56),
+        name: 'ride-tauri.exe',
+        executable: 'C:\\Program Files\\R-IDE\\ride-tauri.exe',
+        commandLine: '"C:\\Program Files\\R-IDE\\ride-tauri.exe" --startup',
       },
       {
         pid: 11,
@@ -445,6 +523,9 @@ test('parses POSIX ps and Windows PowerShell process table fixtures', () => {
         rssBytes: 3_000,
         creationTime: '20260815123457.000000+480',
         startedAt: Date.UTC(2026, 7, 15, 4, 34, 57),
+        name: 'node.exe',
+        executable: 'C:\\Program Files\\R-IDE\\resources\\backend\\runtime\\node.exe',
+        commandLine: 'node.exe resources\\backend\\main.js',
       },
     ],
   );
@@ -453,8 +534,8 @@ test('parses POSIX ps and Windows PowerShell process table fixtures', () => {
 test('POSIX process parsing ignores kernel rows without a signalable process group', () => {
   assert.deepEqual(
     parsePosixProcessTable(`
-      2 0 0 0 Sat Aug 15 12:34:55 2026
-      10 1 10 1 Sat Aug 15 12:34:56 2026
+      2 0 0 0 Sat Aug 15 12:34:55 2026 [kthreadd] [kthreadd]
+      10 1 10 1 Sat Aug 15 12:34:56 2026 /opt/ride/R-IDE /opt/ride/R-IDE
     `),
     [{
       pid: 10,
@@ -463,7 +544,90 @@ test('POSIX process parsing ignores kernel rows without a signalable process gro
       rssBytes: 1_024,
       creationTime: 'Sat Aug 15 12:34:56 2026',
       startedAt: Date.parse('Sat Aug 15 12:34:56 2026'),
+      name: 'R-IDE',
+      executable: '/opt/ride/R-IDE',
+      commandLine: '/opt/ride/R-IDE',
     }],
+  );
+});
+
+test('malformed POSIX process rows report only a safe line number and field shape', () => {
+  for (const unsafeTimestamp of [
+    'malformed-timestamp',
+    'Sat Aug 99 99:99:99 2026',
+  ]) {
+    const secretRow = [
+      `10 1 10 1 ${unsafeTimestamp}`,
+      'token=token-secret-value',
+      'password=password-secret-value',
+      'Authorization: Bearer authorization-secret-value',
+      'TOPSECRETCOMMANDLINE',
+    ].join(' ');
+    assert.throws(
+      () => parsePosixProcessTable([
+        '10 1 10 1 Sat Aug 15 12:34:56 2026 /opt/ride/R-IDE /opt/ride/R-IDE',
+        secretRow,
+      ].join('\n')),
+      error => {
+        assert.match(error.message, /ps process row 2.*field/i);
+        assert.doesNotMatch(
+          `${error.name}\n${error.message}\n${error.stack}`,
+          /token|password|authorization|TOPSECRETCOMMANDLINE|malformed-timestamp|Aug 99/i,
+        );
+        return true;
+      },
+    );
+  }
+});
+
+test('classifies verified process roles by precedence without persisting process command text', () => {
+  const rootIdentity = {
+    pid: 10,
+    pgid: null,
+    creationTime: 'root',
+    startedAt: 1_000,
+  };
+  const row = (pid, ppid, rssBytes, name, executable, commandLine, startedAt = 1_001) => ({
+    pid,
+    ppid,
+    pgid: null,
+    rssBytes,
+    creationTime: `process-${pid}`,
+    startedAt,
+    name,
+    executable,
+    commandLine,
+  });
+  const rows = [
+    {
+      ...row(10, 1, 10, 'ride-tauri.exe', 'C:\\R-IDE\\ride-tauri.exe', 'plugin-host --type=renderer', 1_000),
+      creationTime: 'root',
+    },
+    row(20, 10, 20, 'node.exe', 'C:\\R-IDE\\resources\\backend\\runtime\\node.exe', 'node.exe C:\\R-IDE\\resources\\backend\\main.js'),
+    row(21, 20, 30, 'node.exe', 'C:\\R-IDE\\resources\\backend\\runtime\\node.exe', 'node.exe C:\\R-IDE\\resources\\backend\\plugin-host.js'),
+    row(22, 21, 40, 'node.exe', 'C:\\R-IDE\\resources\\backend\\runtime\\node.exe', 'node.exe --plugin-host=secondary'),
+    row(23, 20, 30, 'pwsh.exe', 'C:\\Program Files\\PowerShell\\7\\pwsh.exe', 'pwsh.exe -NoLogo'),
+    row(30, 10, 100, 'msedgewebview2.exe', 'C:\\WebView2\\msedgewebview2.exe', 'msedgewebview2.exe --type=renderer'),
+    row(31, 10, 50, 'msedgewebview2.exe', 'C:\\WebView2\\msedgewebview2.exe', 'msedgewebview2.exe --type=gpu-process'),
+    row(32, 10, 40, 'msedgewebview2.exe', 'C:\\WebView2\\msedgewebview2.exe', 'msedgewebview2.exe --type=utility'),
+  ];
+
+  assert.deepEqual(classifyProcessRoles(rows, rootIdentity), {
+    main: { processCount: 1, rssBytes: 10 },
+    backend: { processCount: 1, rssBytes: 20 },
+    pluginHost: { processCount: 2, rssBytes: 70 },
+    webviewRenderer: { processCount: 1, rssBytes: 100 },
+    webviewGpu: { processCount: 1, rssBytes: 50 },
+    webviewUtility: { processCount: 1, rssBytes: 40 },
+    terminal: { processCount: 1, rssBytes: 30 },
+    other: { processCount: 0, rssBytes: 0 },
+  });
+
+  const aggregate = aggregateProcessTree(rows, rootIdentity);
+  assert.deepEqual(aggregate.roles, classifyProcessRoles(rows, rootIdentity));
+  assert.doesNotMatch(
+    JSON.stringify(aggregate),
+    /"executable"|"commandLine"|C:\\R-IDE|plugin-host|msedgewebview2/i,
   );
 });
 
@@ -1355,14 +1519,18 @@ test('process table parsers preserve comparable creation chronology and reject m
   assert.equal(windowsRows[5].startedAt, null);
   assert.equal(windowsRows[6].startedAt, null);
 
-  const posixRows = parsePosixProcessTable(`
-    20 1 20 1 Sat Aug 15 12:34:56 2026
-    21 20 20 1 malformed timestamp
-    22 20 20 1 2026-08-15
-  `);
-  assert.equal(posixRows[0].startedAt, Date.parse('Sat Aug 15 12:34:56 2026'));
-  assert.equal(posixRows[1].startedAt, null);
-  assert.equal(posixRows[2].startedAt, null);
+  const [posixRow] = parsePosixProcessTable(
+    '20 1 20 1 Sat Aug 15 12:34:56 2026',
+  );
+  assert.equal(posixRow.startedAt, Date.parse('Sat Aug 15 12:34:56 2026'));
+  assert.throws(
+    () => parsePosixProcessTable('21 20 20 1 malformed timestamp'),
+    /ps process row 1.*field/i,
+  );
+  assert.throws(
+    () => parsePosixProcessTable('22 20 20 1 2026-08-15'),
+    /ps process row 1.*field/i,
+  );
 
   const malformedCleanupRows = parseWindowsProcessTable(JSON.stringify([
     {
@@ -1410,6 +1578,16 @@ test('process aggregation includes only verified descendants of the spawned root
     processIds: [100, 101, 102],
     processCount: 3,
     rssBytes: 60,
+    roles: {
+      main: { processCount: 1, rssBytes: 10 },
+      backend: { processCount: 0, rssBytes: 0 },
+      pluginHost: { processCount: 0, rssBytes: 0 },
+      webviewRenderer: { processCount: 0, rssBytes: 0 },
+      webviewGpu: { processCount: 0, rssBytes: 0 },
+      webviewUtility: { processCount: 0, rssBytes: 0 },
+      terminal: { processCount: 0, rssBytes: 0 },
+      other: { processCount: 2, rssBytes: 50 },
+    },
     processes: [
       { pid: 100, ppid: 1, pgid: 100, creationTime: 'root-start', startedAt: 1_000, depth: 0 },
       { pid: 101, ppid: 100, pgid: 100, creationTime: 'child-start', startedAt: 1_000, depth: 1 },
@@ -4520,6 +4698,55 @@ test('diagnostic redaction removes short nonempty lines from multiline sensitive
   assert.match(redacted, /ordinary   spaces must remain intact/);
 });
 
+test('malformed POSIX process rows persist no command-line secrets in failure diagnostics', async () => {
+  const root = temporaryDirectory('malformed-posix-diagnostic');
+  const executable = path.join(root, 'R-IDE');
+  const output = path.join(root, 'startup-metrics.json');
+  const secretRow = [
+    '10 1 10 1 malformed-timestamp',
+    'token=token-secret-value',
+    'password=password-secret-value',
+    'Authorization: Bearer authorization-secret-value',
+    'TOPSECRETCOMMANDLINE',
+  ].join(' ');
+  touch(executable);
+  try {
+    let failure;
+    try {
+      await runMeasurementCampaign({
+        executable,
+        output,
+        runs: 1,
+        idleMs: 0,
+        timeoutMs: 100,
+        pollMs: 1,
+      }, campaignDependencies({
+        measure: async () => parsePosixProcessTable(secretRow),
+      }));
+    } catch (error) {
+      failure = error;
+    }
+    assert.ok(failure, 'ambiguous POSIX row must fail the campaign');
+    assert.equal(fs.existsSync(output), false);
+    const serializedFailure = `${failure.name}\n${failure.message}\n${failure.stack}`;
+    assert.doesNotMatch(
+      serializedFailure,
+      /token|password|authorization|TOPSECRETCOMMANDLINE|malformed-timestamp/i,
+    );
+    const serializedDiagnostic = fs.readFileSync(
+      path.join(root, 'startup-metrics.failure.json'),
+      'utf8',
+    );
+    assert.doesNotMatch(
+      serializedDiagnostic,
+      /token|password|authorization|TOPSECRETCOMMANDLINE|malformed-timestamp/i,
+    );
+    assert.match(failure.message, /ps process row 1.*field/i);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('failed campaign atomically preserves diagnostics, report, and unique copied logs', async () => {
   const root = temporaryDirectory('failure-diagnostic');
   const executable = path.join(root, 'R-IDE.exe');
@@ -4539,7 +4766,7 @@ test('failed campaign atomically preserves diagnostics, report, and unique copie
   let calls = 0;
   const completedRun = {
     startupReport: startupReport(finalMilestones),
-    metrics: { processCount: 1, rssBytes: 100 },
+    metrics: campaignMetrics(),
   };
   try {
     await assert.rejects(
@@ -4550,30 +4777,36 @@ test('failed campaign atomically preserves diagnostics, report, and unique copie
         idleMs: 0,
         timeoutMs: 100,
         pollMs: 1,
-      }, {
+      }, campaignDependencies({
         measure: async options => {
           calls++;
-          fs.writeFileSync(options.stdoutLogPath, `stdout run ${calls}\n`);
+          fs.writeFileSync(
+            options.stdoutLogPath,
+            `stdout run ${calls} executable ${path.resolve(executable)}\n`,
+          );
           fs.writeFileSync(options.stderrLogPath, `stderr run ${calls}\n`);
           if (calls === 2) {
             fs.writeFileSync(options.reportPath, JSON.stringify(startupReport(finalMilestones)));
-            throw new Error('fixture startup failed');
+            throw new Error(`fixture startup failed at ${path.resolve(executable)}`);
           }
           return completedRun;
         },
-      }),
+      })),
       /fixture startup failed/,
     );
 
     const failurePath = path.join(root, 'startup-metrics.failure.json');
-    const diagnostic = JSON.parse(fs.readFileSync(failurePath, 'utf8'));
+    const serializedDiagnostic = fs.readFileSync(failurePath, 'utf8');
+    const diagnostic = JSON.parse(serializedDiagnostic);
     assert.equal(diagnostic.status, 'failed');
-    assert.equal(diagnostic.error.message, 'fixture startup failed');
+    assert.equal(diagnostic.error.message, 'fixture startup failed at [REDACTED]');
     assert.deepEqual(diagnostic.completedRuns, [completedRun]);
     assert.equal(diagnostic.runIndex, 2);
     assert.equal(diagnostic.platform, process.platform);
     assert.equal(diagnostic.arch, process.arch);
-    assert.equal(diagnostic.executable, path.resolve(executable));
+    assert.equal(Object.hasOwn(diagnostic, 'executable'), false);
+    assert.equal(serializedDiagnostic.includes(path.resolve(executable)), false);
+    assert.doesNotMatch(serializedDiagnostic, /"commandLine"|"executable"/);
     assert.equal(diagnostic.output, path.resolve(output));
     assert.match(diagnostic.campaignId, /^[0-9a-f-]{36}$/i);
     assert.deepEqual(diagnostic.startupReport, startupReport(finalMilestones));
@@ -4593,7 +4826,7 @@ test('failed campaign atomically preserves diagnostics, report, and unique copie
     const stderrCopy = path.resolve(root, diagnostic.logs.stderr);
     assert.equal(path.dirname(stdoutCopy), path.dirname(stderrCopy));
     assert.equal(path.dirname(stdoutCopy), ownedDiagnostics);
-    assert.equal(fs.readFileSync(stdoutCopy, 'utf8'), 'stdout run 2\n');
+    assert.equal(fs.readFileSync(stdoutCopy, 'utf8'), 'stdout run 2 executable [REDACTED]\n');
     assert.equal(fs.readFileSync(stderrCopy, 'utf8'), 'stderr run 2\n');
     assert.equal(fs.existsSync(output), false);
     assert.equal(fs.existsSync(staleDiagnostics), true);
@@ -4631,7 +4864,7 @@ test('measurement cleanup failure rejects the campaign and is persisted in failu
         idleMs: 0,
         timeoutMs: 100,
         pollMs: 1,
-      }, {
+      }, campaignDependencies({
         measure: options => measureOnce(options, {
           launch: () => ({ pid: 7331 }),
           capture: async () => rootIdentity,
@@ -4654,7 +4887,7 @@ test('measurement cleanup failure rejects the campaign and is persisted in failu
             );
           },
         }),
-      }),
+      })),
       /cleanup incomplete.*group 7331 membership changed after SIGTERM/i,
     );
 
@@ -4696,7 +4929,7 @@ test('POSIX marker query failure fails the campaign without persisting marker or
         idleMs: 0,
         timeoutMs: 100,
         pollMs: 1,
-      }, {
+      }, campaignDependencies({
         measure: options => measureOnce(options, {
           platform: 'linux',
           createRunId: () => runId,
@@ -4725,7 +4958,7 @@ test('POSIX marker query failure fails the campaign without persisting marker or
             cleanupVerifyAttempts: 1,
           }),
         }),
-      }),
+      })),
       /startup cleanup incomplete: startup run marker query could not be verified/,
     );
 
@@ -4758,7 +4991,7 @@ test('campaign redacts its per-run marker from rejection, diagnostics, and inval
         idleMs: 0,
         timeoutMs: 100,
         pollMs: 1,
-      }, {
+      }, campaignDependencies({
         environment: {
           PATH: process.env.PATH,
           RIDE_STARTUP_RUN_ID: 'stale-run-id',
@@ -4774,7 +5007,7 @@ test('campaign redacts its per-run marker from rejection, diagnostics, and inval
           failure.name = `MarkerFailure-${runId}-${privateValue}`;
           throw failure;
         },
-      });
+      }));
     } catch (error) {
       rejection = error;
     }
@@ -4809,12 +5042,12 @@ test('timeout diagnostic without a report preserves logs and omits report conten
         idleMs: 0,
         timeoutMs: 1,
         pollMs: 1,
-      }, {
+      }, campaignDependencies({
         measure: async options => {
           fs.writeFileSync(options.stderrLogPath, 'timed out while opening\n');
           throw new Error('startup report timeout after 1ms');
         },
-      }),
+      })),
       /startup report timeout/,
     );
 
@@ -4847,12 +5080,12 @@ test('diagnostic records a bounded parse error instead of copying invalid report
         idleMs: 0,
         timeoutMs: 1,
         pollMs: 1,
-      }, {
+      }, campaignDependencies({
         measure: async options => {
           fs.writeFileSync(options.reportPath, '{not-json');
           throw new Error('startup report is not valid JSON');
         },
-      }),
+      })),
       /not valid JSON/,
     );
 
@@ -4883,7 +5116,7 @@ test('failure artifacts bound and redact oversized logs and error messages', asy
         idleMs: 0,
         timeoutMs: 1,
         pollMs: 1,
-      }, {
+      }, campaignDependencies({
         environment: {
           PATH: process.env.PATH,
           RIDE_TEST_SECRET: secret,
@@ -4899,7 +5132,7 @@ test('failure artifacts bound and redact oversized logs and error messages', asy
           );
           throw new Error(`startup failed with ${secret}`);
         },
-      }),
+      })),
       error => {
         assert.match(error.message, /startup failed with \[REDACTED\]/);
         assert.equal(String(error.stack).includes(secret), false);
@@ -4925,6 +5158,512 @@ test('failure artifacts bound and redact oversized logs and error messages', asy
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('campaign v2 records build and host identity plus per-role medians', async () => {
+  const root = temporaryDirectory('campaign-v2');
+  const executable = path.join(root, 'R-IDE');
+  const output = path.join(root, 'startup-metrics.json');
+  touch(executable);
+  const build = {
+    commit: '0123456789abcdef0123456789abcdef01234567',
+    profile: 'tauri-critical',
+    profileSha256: '1'.repeat(64),
+    pluginManifestSha256: '2'.repeat(64),
+    pluginCount: 69,
+  };
+  const host = {
+    platform: process.platform,
+    arch: process.arch,
+    fingerprint: '3'.repeat(64),
+  };
+  let run = 0;
+  try {
+    const measurement = await runMeasurementCampaign({
+      executable,
+      output,
+      runs: 2,
+      idleMs: 0,
+      timeoutMs: 100,
+      pollMs: 1,
+    }, {
+      readCampaignMetadata: async () => ({ build, host }),
+      measure: async () => {
+        run++;
+        return {
+          startupReport: startupReport({
+            ...finalMilestones,
+            target_file_opened: 40 + (run * 4),
+          }),
+          metrics: {
+            processCount: run + 1,
+            rssBytes: 100 + (run * 20),
+            roles: {
+              main: { processCount: 1, rssBytes: 10 },
+              backend: { processCount: 1, rssBytes: 20 * run },
+              pluginHost: { processCount: 0, rssBytes: 0 },
+              webviewRenderer: { processCount: 0, rssBytes: 0 },
+              webviewGpu: { processCount: 0, rssBytes: 0 },
+              webviewUtility: { processCount: 0, rssBytes: 0 },
+              terminal: { processCount: 0, rssBytes: 0 },
+              other: { processCount: run - 1, rssBytes: 90 },
+            },
+          },
+        };
+      },
+    });
+
+    assert.equal(measurement.schema, 'ride.startup-measurement');
+    assert.equal(measurement.version, 2);
+    assert.deepEqual(measurement.build, build);
+    assert.deepEqual(measurement.host, host);
+    assert.equal(measurement.runs[0].startupReport.version, 1);
+    assert.equal(Object.hasOwn(measurement, 'executable'), false);
+    assert.doesNotMatch(JSON.stringify(measurement), /"commandLine"|"executable"/);
+    assert.deepEqual(measurement.median.roles.backend, {
+      processCount: 1,
+      rssBytes: 30,
+    });
+    assert.deepEqual(measurement.median.roles.other, {
+      processCount: 0.5,
+      rssBytes: 90,
+    });
+    assert.deepEqual(JSON.parse(fs.readFileSync(output, 'utf8')), measurement);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('packaged metadata reader uses canonical profile and plugin resources', async () => {
+  const root = temporaryDirectory('packaged-metadata');
+  const executable = path.join(root, 'R-IDE.exe');
+  const profileManifest = path.join(root, 'explicit-profile.json');
+  const plugins = path.join(root, 'resources', 'plugins');
+  touch(executable);
+  fs.writeFileSync(profileManifest, JSON.stringify({
+    schema: 'ride.tauri-profile',
+    version: 1,
+    profile: 'tauri-critical',
+    commit: '4'.repeat(40),
+    extensions: ['@theia/core', 'theia-ide-product-ext'],
+  }));
+  for (const [directory, publisher, name, version] of [
+    ['Acme.alpha', 'Acme', 'alpha', '1.2.3'],
+    ['zeta.tool', 'zeta', 'tool', '2.0.0'],
+  ]) {
+    const extension = path.join(plugins, directory, 'extension');
+    fs.mkdirSync(extension, { recursive: true });
+    fs.writeFileSync(path.join(extension, 'package.json'), JSON.stringify({
+      publisher,
+      name,
+      version,
+    }));
+  }
+  fs.writeFileSync(path.join(plugins, '.gitkeep'), '\n');
+
+  try {
+    const metadata = await readCampaignMetadata({
+      executable,
+      options: { profileManifest },
+    }, {
+      readCommit: () => '4'.repeat(40),
+    });
+    assert.deepEqual(metadata.build, {
+      commit: '4'.repeat(40),
+      profile: 'tauri-critical',
+      profileSha256: metadata.build.profileSha256,
+      pluginManifestSha256: metadata.build.pluginManifestSha256,
+      pluginCount: 2,
+    });
+    assert.match(metadata.build.profileSha256, /^[0-9a-f]{64}$/);
+    assert.match(metadata.build.pluginManifestSha256, /^[0-9a-f]{64}$/);
+    assert.deepEqual(Object.keys(metadata.host).sort(), ['arch', 'fingerprint', 'platform']);
+    assert.match(metadata.host.fingerprint, /^[0-9a-f]{64}$/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('profile contract digest excludes provenance and canonically includes every contract field', async () => {
+  const root = temporaryDirectory('profile-contract-digest');
+  const executable = path.join(root, 'R-IDE.exe');
+  const profileManifest = path.join(root, 'profile.json');
+  const extension = path.join(root, 'resources', 'plugins', 'acme.tool', 'extension');
+  touch(executable);
+  fs.mkdirSync(extension, { recursive: true });
+  fs.writeFileSync(path.join(extension, 'package.json'), JSON.stringify({
+    publisher: 'acme',
+    name: 'tool',
+    version: '1.0.0',
+  }));
+  const readProfile = async manifest => {
+    fs.writeFileSync(profileManifest, JSON.stringify(manifest));
+    return readCampaignMetadata({
+      executable,
+      options: { profileManifest },
+    }, {
+      readCommit: () => manifest.commit,
+    });
+  };
+
+  try {
+    const contract = {
+      schema: 'ride.tauri-profile',
+      version: 1,
+      profile: 'tauri-critical',
+      digest: 'a'.repeat(64),
+      roots: ['@theia/core'],
+      extensions: ['@theia/core', 'theia-ide-product-ext'],
+      packages: [{
+        requestName: '@theia/core',
+        packageName: '@theia/core',
+        version: '1.63.3',
+        dependencyPath: ['@theia/core'],
+      }],
+      featureGroups: { ai: { deferredRoots: ['@theia/ai-chat'], blockedRoots: [] } },
+      launch: { mode: 'critical', flags: ['safe', 'bounded'] },
+    };
+    const first = await readProfile({
+      ...contract,
+      commit: '4'.repeat(40),
+      buildId: 'first-build',
+      sourceIdentity: { commit: '4'.repeat(40), clean: true },
+    });
+    const differentCommitAndKeyOrder = await readProfile({
+      launch: contract.launch,
+      featureGroups: contract.featureGroups,
+      packages: contract.packages,
+      extensions: contract.extensions,
+      roots: contract.roots,
+      digest: contract.digest,
+      commit: '5'.repeat(40),
+      sourceIdentity: { clean: true, commit: '5'.repeat(40) },
+      buildId: 'second-build',
+      profile: contract.profile,
+      version: contract.version,
+      schema: contract.schema,
+    });
+    assert.equal(
+      differentCommitAndKeyOrder.build.profileSha256,
+      first.build.profileSha256,
+      'commit, buildId, sourceIdentity, and JSON object key order are not part of the profile contract identity',
+    );
+    assert.equal(differentCommitAndKeyOrder.build.commit, '5'.repeat(40));
+
+    const reorderedContractArray = await readProfile({
+      ...contract,
+      commit: '6'.repeat(40),
+      extensions: ['theia-ide-product-ext', '@theia/core'],
+      buildId: 'third-build',
+      sourceIdentity: { commit: '6'.repeat(40), clean: true },
+    });
+    assert.notEqual(reorderedContractArray.build.profileSha256, first.build.profileSha256);
+
+    const extendedContract = await readProfile({
+      ...contract,
+      commit: '7'.repeat(40),
+      futureConstraint: { enabled: true },
+    });
+    assert.notEqual(extendedContract.build.profileSha256, first.build.profileSha256);
+
+    const changedDigest = await readProfile({
+      ...contract,
+      commit: '8'.repeat(40),
+      digest: 'b'.repeat(64),
+    });
+    assert.notEqual(changedDigest.build.profileSha256, first.build.profileSha256);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('plugin fingerprint preserves canonical SemVer case and rejects non-canonical versions', async () => {
+  const root = temporaryDirectory('plugin-version-fingerprint');
+  const executable = path.join(root, 'R-IDE.exe');
+  const profileManifest = path.join(root, 'profile.json');
+  const pluginManifest = path.join(
+    root,
+    'resources',
+    'plugins',
+    'acme.tool',
+    'extension',
+    'package.json',
+  );
+  touch(executable);
+  fs.writeFileSync(profileManifest, JSON.stringify({
+    schema: 'ride.tauri-profile',
+    version: 1,
+    profile: 'tauri-critical',
+    commit: '4'.repeat(40),
+  }));
+  fs.mkdirSync(path.dirname(pluginManifest), { recursive: true });
+  const readVersion = async version => {
+    fs.writeFileSync(pluginManifest, JSON.stringify({
+      publisher: 'Acme',
+      name: 'Tool',
+      version,
+    }));
+    return readCampaignMetadata({
+      executable,
+      options: { profileManifest },
+    }, {
+      readCommit: () => '4'.repeat(40),
+    });
+  };
+
+  try {
+    const upperPrerelease = await readVersion('1.0.0-RC');
+    const lowerPrerelease = await readVersion('1.0.0-rc');
+    assert.notEqual(
+      upperPrerelease.build.pluginManifestSha256,
+      lowerPrerelease.build.pluginManifestSha256,
+    );
+    for (const invalid of [' 1.0.0', '1.0.0 ', '1.0. 0', '01.0.0', 'v1.0.0']) {
+      await assert.rejects(readVersion(invalid), /plugin.*version.*canonical|semver/i);
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('CLI missing-executable errors redact the executable path and its fragments', () => {
+  const root = temporaryDirectory('cli-private-executable');
+  const executable = path.join(root, 'sensitive-binary-name.exe');
+  try {
+    const result = runMeasurementCli(['--executable', executable]);
+    assert.equal(result.status, 1);
+    assert.equal(result.stdout, '');
+    assertNoSensitiveWindows(result.stderr, path.resolve(executable));
+    assertNoSensitiveWindows(result.stderr, path.dirname(path.resolve(executable)));
+    assert.doesNotMatch(result.stderr, /cli-private-executable|sensitive-binary-name/i);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('CLI metadata parse errors do not expose the explicit profile manifest path', () => {
+  const root = temporaryDirectory('cli-private-profile-manifest');
+  const executable = path.join(root, 'sensitive-binary-name.exe');
+  const profileManifest = path.join(root, 'private-profile-manifest.json');
+  const extension = path.join(root, 'resources', 'plugins', 'acme.tool', 'extension');
+  touch(executable);
+  fs.writeFileSync(profileManifest, '{"schema":');
+  fs.mkdirSync(extension, { recursive: true });
+  fs.writeFileSync(path.join(extension, 'package.json'), JSON.stringify({
+    publisher: 'acme',
+    name: 'tool',
+    version: '1.0.0',
+  }));
+  try {
+    const result = runMeasurementCli([
+      '--executable', executable,
+      '--profile-manifest', profileManifest,
+    ]);
+    assert.equal(result.status, 1);
+    assertNoSensitiveWindows(result.stderr, path.resolve(executable));
+    assertNoSensitiveWindows(result.stderr, path.resolve(profileManifest));
+    assertNoSensitiveWindows(result.stderr, root);
+    assert.doesNotMatch(result.stderr, /cli-private-profile-manifest|private-profile-manifest/i);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('CLI packaged-plugin fs errors redact executable resource roots', () => {
+  const root = temporaryDirectory('cli-private-plugin-resources');
+  const executable = path.join(root, 'sensitive-binary-name.exe');
+  const profileManifest = path.join(root, 'private-profile-manifest.json');
+  const pluginRoot = path.join(root, 'resources', 'plugins', 'acme.tool');
+  const commitResult = spawnSync('git', ['rev-parse', 'HEAD'], {
+    cwd: path.resolve(import.meta.dirname, '..', '..', '..'),
+    encoding: 'utf8',
+    timeout: 10_000,
+    maxBuffer: 1024 * 1024,
+  });
+  assert.equal(commitResult.status, 0);
+  touch(executable);
+  fs.writeFileSync(profileManifest, JSON.stringify({
+    schema: 'ride.tauri-profile',
+    version: 1,
+    profile: 'tauri-critical',
+    commit: commitResult.stdout.trim(),
+  }));
+  fs.mkdirSync(pluginRoot, { recursive: true });
+  try {
+    const result = runMeasurementCli([
+      '--executable', executable,
+      '--profile-manifest', profileManifest,
+    ]);
+    assert.equal(result.status, 1);
+    assertNoSensitiveWindows(result.stderr, path.resolve(executable));
+    assertNoSensitiveWindows(result.stderr, path.resolve(profileManifest));
+    assertNoSensitiveWindows(result.stderr, root);
+    assertNoSensitiveWindows(result.stderr, pluginRoot);
+    assert.doesNotMatch(result.stderr, /cli-private-plugin-resources|acme\.tool/i);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('CLI default bundle discovery errors redact paths without explicit path options', () => {
+  const root = temporaryDirectory('cli-private-default-bundle');
+  const copiedScript = path.join(root, 'scripts', 'measure-tauri-startup.mjs');
+  fs.mkdirSync(path.dirname(copiedScript), { recursive: true });
+  fs.copyFileSync(
+    path.resolve(import.meta.dirname, '..', 'measure-tauri-startup.mjs'),
+    copiedScript,
+  );
+  try {
+    const result = spawnSync(process.execPath, [copiedScript], {
+      cwd: root,
+      encoding: 'utf8',
+      timeout: 10_000,
+      maxBuffer: 4 * 1024 * 1024,
+    });
+    assert.equal(result.status, 1);
+    assert.equal(result.stdout, '');
+    assertNoSensitiveWindows(result.stderr, root);
+    assert.doesNotMatch(result.stderr, /cli-private-default-bundle|applications[\\/]tauri/i);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('packaged metadata reader fails closed on non-canonical manifests and resources', async () => {
+  const cases = [
+    ['profile commit', { commit: 'NOT-A-COMMIT' }, undefined, /profile.*commit/i],
+    ['plugin identity', {}, 'wrong.plugin', /identity.*canonical/i],
+    ['hidden plugin', {}, undefined, /hidden.*canonical/i],
+  ];
+  for (const [label, profileOverrides, pluginDirectoryOverride, expected] of cases) {
+    const root = temporaryDirectory(`invalid-metadata-${label.replace(' ', '-')}`);
+    const executable = path.join(root, 'R-IDE.exe');
+    const profileManifest = path.join(root, 'profile.json');
+    const plugins = path.join(root, 'resources', 'plugins');
+    touch(executable);
+    fs.writeFileSync(profileManifest, JSON.stringify({
+      schema: 'ride.tauri-profile',
+      version: 1,
+      profile: 'tauri-critical',
+      commit: '4'.repeat(40),
+      ...profileOverrides,
+    }));
+    const pluginDirectory = pluginDirectoryOverride ?? 'acme.tool';
+    const extension = path.join(plugins, pluginDirectory, 'extension');
+    fs.mkdirSync(extension, { recursive: true });
+    fs.writeFileSync(path.join(extension, 'package.json'), JSON.stringify({
+      publisher: 'acme',
+      name: 'tool',
+      version: '1.0.0',
+    }));
+    if (label === 'hidden plugin') {
+      fs.mkdirSync(path.join(plugins, '.hidden-plugin'));
+    }
+    try {
+      await assert.rejects(
+        readCampaignMetadata({ executable, options: { profileManifest } }, {
+          readCommit: () => '4'.repeat(40),
+        }),
+        expected,
+      );
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  const missingRoot = temporaryDirectory('missing-packaged-metadata');
+  try {
+    const executable = path.join(missingRoot, 'R-IDE.exe');
+    touch(executable);
+    await assert.rejects(
+      readCampaignMetadata({ executable, options: {} }, {
+        readCommit: () => '4'.repeat(40),
+      }),
+      /profile manifest.*missing/i,
+    );
+  } finally {
+    fs.rmSync(missingRoot, { recursive: true, force: true });
+  }
+});
+
+test('metadata failures invalidate stale successful output and owned diagnostics first', async () => {
+  for (const [label, metadataError] of [
+    ['missing', new Error('profile metadata is missing')],
+    ['malformed', new Error('profile metadata is malformed')],
+  ]) {
+    const root = temporaryDirectory(`metadata-${label}-stale-output`);
+    const executable = path.join(root, 'R-IDE.exe');
+    const output = path.join(root, 'startup-metrics.json');
+    const failurePath = path.join(root, 'startup-metrics.failure.json');
+    const campaignId = label === 'missing'
+      ? '11111111-1111-4111-8111-111111111111'
+      : '22222222-2222-4222-8222-222222222222';
+    const diagnosticsName = `startup-metrics-diagnostics-${campaignId}`;
+    const diagnostics = path.join(root, diagnosticsName);
+    touch(executable);
+    fs.writeFileSync(output, JSON.stringify({ status: 'stale-success' }));
+    fs.mkdirSync(diagnostics);
+    fs.writeFileSync(path.join(diagnostics, '.ride-startup-diagnostics-owner.json'), JSON.stringify({
+      schema: 'ride.startup-diagnostics-owner',
+      version: 1,
+      campaignId,
+      output: path.resolve(output),
+    }));
+    fs.writeFileSync(failurePath, JSON.stringify({
+      status: 'failed',
+      output: path.resolve(output),
+      campaignId,
+      diagnostics: { directory: diagnosticsName },
+    }));
+    try {
+      await assert.rejects(
+        runMeasurementCampaign({
+          executable,
+          output,
+          runs: 1,
+          idleMs: 0,
+          timeoutMs: 100,
+          pollMs: 1,
+        }, {
+          readCampaignMetadata: async () => { throw metadataError; },
+        }),
+        metadataError,
+      );
+      assert.equal(fs.existsSync(output), false, `${label} metadata must invalidate stale output`);
+      assert.equal(fs.existsSync(failurePath), false, `${label} metadata must invalidate stale failure`);
+      assert.equal(fs.existsSync(diagnostics), false, `${label} metadata must remove owned diagnostics`);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test('host fingerprint normalizes inputs and persists no raw host identifiers', () => {
+  const first = createHostMetadata({
+    platform: 'WIN32',
+    arch: 'X64',
+    release: '  Windows  11  ',
+    cpuModel: ' Fixture  CPU ',
+    logicalCpuCount: 16,
+    totalMemory: 33 * 1024 * 1024 * 1024,
+  });
+  const second = createHostMetadata({
+    platform: 'win32',
+    arch: 'x64',
+    release: 'windows 11',
+    cpuModel: 'fixture cpu',
+    logicalCpuCount: 16,
+    totalMemory: 33 * 1024 * 1024 * 1024,
+  });
+
+  assert.deepEqual(first, second);
+  assert.deepEqual(first, {
+    platform: 'win32',
+    arch: 'x64',
+    fingerprint: first.fingerprint,
+  });
+  assert.match(first.fingerprint, /^[0-9a-f]{64}$/);
+  assert.doesNotMatch(JSON.stringify(first), /windows 11|fixture cpu|34359738368/i);
 });
 
 test('successful campaign writes only the measurement artifact', async () => {
@@ -4957,15 +5696,19 @@ test('successful campaign writes only the measurement artifact', async () => {
       idleMs: 0,
       timeoutMs: 100,
       pollMs: 1,
-    }, {
+    }, campaignDependencies({
       measure: async () => ({
         startupReport: startupReport(finalMilestones),
-        metrics: { processCount: 1, rssBytes: 100 },
+        metrics: campaignMetrics(),
       }),
-    });
+    }));
 
     assert.equal(measurement.runs.length, 1);
-    assert.deepEqual(JSON.parse(fs.readFileSync(output, 'utf8')), measurement);
+    const serializedMeasurement = fs.readFileSync(output, 'utf8');
+    assert.deepEqual(JSON.parse(serializedMeasurement), measurement);
+    assert.equal(Object.hasOwn(measurement, 'executable'), false);
+    assert.equal(serializedMeasurement.includes(path.resolve(executable)), false);
+    assert.doesNotMatch(serializedMeasurement, /"commandLine"|"executable"/);
     assert.equal(fs.existsSync(path.join(root, 'startup-metrics.failure.json')), false);
     assert.equal(fs.existsSync(staleDiagnostics), true);
     assert.equal(fs.readFileSync(similarlyNamedFile, 'utf8'), 'keep file');
@@ -4988,12 +5731,12 @@ test('next campaign removes only the diagnostics directory owned by a valid old 
         idleMs: 0,
         timeoutMs: 1,
         pollMs: 1,
-      }, {
+      }, campaignDependencies({
         measure: async options => {
           fs.writeFileSync(options.stderrLogPath, 'owned failure\n');
           throw new Error('owned fixture failure');
         },
-      }),
+      })),
       /owned fixture failure/,
     );
     const oldFailure = JSON.parse(fs.readFileSync(
@@ -5010,12 +5753,12 @@ test('next campaign removes only the diagnostics directory owned by a valid old 
       idleMs: 0,
       timeoutMs: 1,
       pollMs: 1,
-    }, {
+    }, campaignDependencies({
       measure: async () => ({
         startupReport: startupReport(finalMilestones),
-        metrics: { processCount: 1, rssBytes: 100 },
+        metrics: campaignMetrics(),
       }),
-    });
+    }));
 
     assert.equal(fs.existsSync(ownedDirectory), false);
   } finally {
@@ -5071,12 +5814,12 @@ test('campaign cleanup rejects unsafe diagnostic directory metadata without dele
         idleMs: 0,
         timeoutMs: 1,
         pollMs: 1,
-      }, {
+      }, campaignDependencies({
         measure: async () => ({
           startupReport: startupReport(finalMilestones),
-          metrics: { processCount: 1, rssBytes: 100 },
+          metrics: campaignMetrics(),
         }),
-      });
+      }));
 
       assert.equal(fs.existsSync(output), true, `${label}: measurement output must survive`);
       assert.equal(fs.existsSync(outputDirectory), true, `${label}: output parent must survive`);

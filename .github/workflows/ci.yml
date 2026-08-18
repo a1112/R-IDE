@@ -127,6 +127,8 @@ jobs:
     name: Package Tauri (${{ matrix.platform }} ${{ matrix.arch }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
+    env:
+      RIDE_TAURI_FRONTEND_PROFILE: tauri-critical
     strategy:
       fail-fast: false
       matrix:
@@ -224,6 +226,9 @@ jobs:
       - name: Verify the packaged Tauri application
         working-directory: app
         run: npm --workspace applications/tauri run verify
+      - name: Verify critical Tauri profile inventory
+        working-directory: app
+        run: npm run verify:tauri-profile -- --expected-profile tauri-critical
       - name: Measure packaged Tauri startup on Linux
         if: runner.os == 'Linux'
         working-directory: app
@@ -265,6 +270,22 @@ jobs:
         if: runner.os != 'Linux'
         working-directory: app
         run: npm run measure:tauri-startup -- --output applications/tauri/src-tauri/target/release/bundle/startup-metrics.json
+      - name: Validate hosted startup report schema
+        working-directory: app
+        shell: bash
+        run: |
+          report='applications/tauri/src-tauri/target/release/bundle/startup-metrics.json'
+          npm run check:tauri-performance -- --baseline "$report" --candidate "$report" --min-startup-gain 0 --min-memory-gain 0
+      - name: Collect critical profile and esbuild evidence
+        working-directory: app
+        shell: bash
+        run: |
+          artifact_dir='applications/tauri/src-tauri/target/release/bundle/profile-artifacts'
+          mkdir -p "$artifact_dir"
+          cp applications/browser/lib/ride-tauri-profile.json "$artifact_dir/ride-tauri-profile.json"
+          for source in applications/browser/lib/metadata/*.json; do
+            cp "$source" "$artifact_dir/esbuild-metafile-$(basename "$source")"
+          done
       - name: Upload unsigned native bundles
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f

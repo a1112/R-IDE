@@ -9,15 +9,17 @@
 
 import '../../src/browser/style/index.css';
 
-import { ApplicationShell } from '@theia/core/lib/browser';
+import { ApplicationShell, FrontendApplication } from '@theia/core/lib/browser';
 import { FrontendApplicationStateService } from '@theia/core/lib/browser/frontend-application-state';
 import { FrontendApplicationContribution } from '@theia/core/lib/browser/frontend-application-contribution';
 import { AboutDialog } from '@theia/core/lib/browser/about-dialog';
 import { applyBranding } from './theia-ide-config';
-import { CommandContribution } from '@theia/core/lib/common/command';
+import { CommandContribution, CommandRegistry } from '@theia/core/lib/common/command';
 import { ContainerModule } from '@theia/core/shared/inversify';
 import { MessageService } from '@theia/core/lib/common/message-service';
-import { MenuContribution } from '@theia/core/lib/common/menu';
+import { MenuContribution, MenuModelRegistry } from '@theia/core/lib/common/menu';
+import { KeybindingRegistry } from '@theia/core/lib/browser/keybinding';
+import { TabBarToolbarRegistry } from '@theia/core/lib/browser/shell/tab-bar-toolbar';
 import { OpenerService } from '@theia/core/lib/browser/opener-service';
 import { WorkspaceService } from '@theia/workspace/lib/browser';
 import { HostedPluginSupport } from '@theia/plugin-ext/lib/hosted/browser/hosted-plugin';
@@ -26,6 +28,7 @@ import { TheiaIDEContribution } from './theia-ide-contribution';
 import { bindRideOpenRequestContribution } from './ride-open-request-bindings';
 import { RideWorkbenchContribution } from './ride-workbench-contribution';
 import { bindRidePerformanceContribution } from './ride-performance-contribution';
+import { bindRideDeferredFeatureLoader } from './ride-deferred-feature-loader';
 
 export default new ContainerModule((bind, _unbind, isBound, rebind) => {
     applyBranding();
@@ -46,6 +49,16 @@ export default new ContainerModule((bind, _unbind, isBound, rebind) => {
     bind(CommandContribution).toService(RideWorkbenchContribution);
 
     bindRidePerformanceContribution(bind);
+
+    bindRideDeferredFeatureLoader(bind, {
+        commands: CommandRegistry,
+        menus: MenuModelRegistry,
+        keybindings: KeybindingRegistry,
+        toolbar: TabBarToolbarRegistry,
+        application: FrontendApplication,
+        messages: MessageService,
+        frontendContribution: FrontendApplicationContribution
+    });
 
     bindRideOpenRequestContribution(bind, {
         applicationShell: ApplicationShell,

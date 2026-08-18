@@ -14,7 +14,12 @@ import type { HostedPluginSupport } from '@theia/plugin-ext/lib/hosted/browser/h
 import { PluginServer } from '@theia/plugin-ext/lib/common/plugin-protocol';
 import type { WorkspaceService } from '@theia/workspace/lib/browser';
 import { RideNativeChrome } from './ride-native-chrome';
-import { RideOpenRequestContribution, RidePluginDeploymentScheduler } from './ride-open-request';
+import {
+    DEFAULT_RIDE_DEFERRED_WORK_SCHEDULER,
+    RideDeferredWorkScheduler,
+    RideOpenRequestContribution,
+    RidePluginDeploymentScheduler
+} from './ride-open-request';
 
 export interface RideOpenRequestBindingIdentifiers {
     readonly applicationShell: interfaces.ServiceIdentifier<ApplicationShell>;
@@ -24,6 +29,7 @@ export interface RideOpenRequestBindingIdentifiers {
     readonly messageService: interfaces.ServiceIdentifier<MessageService>;
     readonly openerService: interfaces.ServiceIdentifier<OpenerService>;
     readonly workspaceService: interfaces.ServiceIdentifier<WorkspaceService>;
+    readonly deferredWorkScheduler?: interfaces.ServiceIdentifier<RideDeferredWorkScheduler>;
 }
 
 interface DeferredContainerResolution<T> {
@@ -72,10 +78,13 @@ export function bindRideOpenRequestContribution(
         const hostedPlugins = prepareContainerResolution(context.container, identifiers.hostedPlugins);
         const pluginServer = prepareContainerResolution<PluginServer>(context.container, PluginServer);
         const nativeChrome = context.container.get(RideNativeChrome);
+        const deferredWorkScheduler = identifiers.deferredWorkScheduler
+            && context.container.isBound(identifiers.deferredWorkScheduler)
+            ? context.container.get(identifiers.deferredWorkScheduler)
+            : DEFAULT_RIDE_DEFERRED_WORK_SCHEDULER;
         const pluginDeployment = new RidePluginDeploymentScheduler(
             pluginServer.promise,
             () => nativeChrome.getPluginDirectories(),
-            undefined,
             pluginServer.start
         );
         return new RideOpenRequestContribution(
@@ -89,7 +98,8 @@ export function bindRideOpenRequestContribution(
             undefined,
             undefined,
             hostedPlugins.start,
-            pluginDeployment
+            pluginDeployment,
+            deferredWorkScheduler
         );
     }).inSingletonScope();
     bind(identifiers.contribution).toService(RideOpenRequestContribution);

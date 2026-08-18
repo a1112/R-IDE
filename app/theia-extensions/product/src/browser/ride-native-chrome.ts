@@ -439,7 +439,7 @@ export class RideNativeChrome {
         });
     }
 
-    async notifyFrontendReady(locale: RideLanguage): Promise<void> {
+    async notifyFrontendReady(locale?: RideLanguage): Promise<void> {
         try {
             if (!this.isTauri) {
                 return;

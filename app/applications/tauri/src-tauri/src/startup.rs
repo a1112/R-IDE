@@ -555,6 +555,16 @@ pub enum RuntimePathMode {
     Development(PathBuf),
 }
 
+pub fn resolve_tauri_config_directory(
+    configured: Option<PathBuf>,
+    home: Option<PathBuf>,
+) -> PathBuf {
+    configured.unwrap_or_else(|| {
+        home.unwrap_or_else(|| PathBuf::from("."))
+            .join(".ride-tauri")
+    })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimePaths {
     mode: RuntimePathMode,

@@ -183,6 +183,7 @@ test('the main Tauri window uses custom borderless chrome while remaining resiza
   const mainWindow = config.app.windows.find(({ label }) => label === 'main');
 
   assert.ok(mainWindow, 'expected a main Tauri window');
+  assert.equal(mainWindow.create, false);
   assert.equal(mainWindow.decorations, false);
   assert.equal(mainWindow.resizable, true);
   assert.equal(mainWindow.minWidth, 1024);

@@ -8,10 +8,10 @@
  ********************************************************************************/
 
 use ride_tauri::startup::{
-    finish_backend_stop, parse_linux_listener_inodes, wait_for_loopback, wait_for_owned_loopback,
-    BackendLaunchPlan, BackendOwnershipState, BackendReadinessPolicy, BackendSpawnStrategy,
-    BackendStartupAction, BackendStartupEvent, BackendStartupState, BackendTransport,
-    RuntimePathMode, RuntimePaths, RuntimePathsCache,
+    finish_backend_stop, parse_linux_listener_inodes, resolve_tauri_config_directory,
+    wait_for_loopback, wait_for_owned_loopback, BackendLaunchPlan, BackendOwnershipState,
+    BackendReadinessPolicy, BackendSpawnStrategy, BackendStartupAction, BackendStartupEvent,
+    BackendStartupState, BackendTransport, RuntimePathMode, RuntimePaths, RuntimePathsCache,
 };
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -335,6 +335,33 @@ fn packaged_runtime_paths_derive_from_one_resource_root() {
 }
 
 #[test]
+fn tauri_uses_an_isolated_config_directory_unless_explicitly_overridden() {
+    let home = PathBuf::from("home");
+
+    assert_eq!(
+        resolve_tauri_config_directory(None, Some(home.clone())),
+        home.join(".ride-tauri")
+    );
+    assert_eq!(
+        resolve_tauri_config_directory(Some(PathBuf::from("explicit-config")), Some(home)),
+        PathBuf::from("explicit-config")
+    );
+}
+
+#[test]
+fn release_windows_binary_uses_the_gui_subsystem() {
+    let main_source = include_str!("../src/main.rs");
+    let compact_source = main_source
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+
+    assert!(compact_source.contains(
+        "#![cfg_attr(all(not(debug_assertions),target_os=\"windows\"),windows_subsystem=\"windows\")]"
+    ));
+}
+
+#[test]
 fn ancestor_scanning_requires_explicit_development_mode() {
     let development_root = PathBuf::from("checkout");
     let paths = RuntimePaths::resolve(
@@ -443,4 +470,22 @@ fn production_uses_one_app_state_path_cache_and_the_shared_tauri_runtime() {
     );
     assert!(direct_start.contains("stop_fallback_rx.recv()"));
     assert!(sidecar_source.contains("stop_fallback_rx.blocking_recv()"));
+}
+
+#[test]
+fn backend_start_is_scheduled_before_the_main_webview_is_built() {
+    let lib_source = include_str!("../src/lib.rs");
+    let setup_source = lib_source
+        .split(".setup(move |app|")
+        .nth(1)
+        .and_then(|source| source.split(".invoke_handler").next())
+        .expect("Tauri setup source");
+    let backend_start = setup_source
+        .find("sidecar::start_backend")
+        .expect("backend start task");
+    let webview_build = setup_source
+        .find("WebviewWindowBuilder::from_config")
+        .expect("configured main webview build");
+
+    assert!(backend_start < webview_build);
 }
