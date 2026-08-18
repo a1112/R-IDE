@@ -1486,61 +1486,214 @@ fn smoke_atomic_publish_replaces_an_existing_valid_report() {
 
 #[test]
 fn smoke_atomic_publish_is_old_or_new_json_for_concurrent_readers() {
+    for iteration in 0..12 {
+        let fixture = Fixture::new();
+        let old = json!({ "generation": "old", "payload": "x".repeat(16_384) });
+        fs::write(
+            fixture.report_path(),
+            serde_json::to_vec(&old).expect("serialize old report"),
+        )
+        .expect("write old report");
+        let protocol = SmokeProtocol::from_environment(
+            &fixture.environment(
+                &format!("reader-token-{iteration}"),
+                json!({ "actions": [] }),
+            ),
+            &fixture.root,
+        );
+        let proof = active_session_proof(&protocol);
+        let report_path = fixture.report_path();
+        let running = Arc::new(AtomicBool::new(true));
+        let observations = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let reader_running = Arc::clone(&running);
+        let reader_observations = Arc::clone(&observations);
+        let reader = thread::spawn(move || {
+            while reader_running.load(Ordering::Acquire) {
+                let bytes = fs::read(&report_path).expect("atomic destination is always present");
+                let value = serde_json::from_slice(&bytes).expect("reader sees complete JSON");
+                reader_observations
+                    .lock()
+                    .expect("lock reader observations")
+                    .push(value);
+                thread::yield_now();
+            }
+        });
+
+        thread::sleep(Duration::from_millis(10));
+        protocol
+            .complete(&proof, complete_passed(0))
+            .expect("publish while reader is active");
+        let new: Value =
+            serde_json::from_slice(&fs::read(fixture.report_path()).expect("read new report"))
+                .expect("parse new report");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline
+            && !observations
+                .lock()
+                .expect("inspect reader observations")
+                .iter()
+                .any(|value| value == &new)
+        {
+            thread::yield_now();
+        }
+        running.store(false, Ordering::Release);
+        reader.join().expect("join atomic reader");
+
+        let observations = observations.lock().expect("lock final observations");
+        assert!(observations.iter().any(|value| value == &old));
+        assert!(observations.iter().any(|value| value == &new));
+        assert!(observations
+            .iter()
+            .all(|value| value == &old || value == &new));
+        assert_eq!(temporary_report_count(&fixture.root), 0);
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_smoke_atomic_publish_retries_a_short_non_delete_shared_reader() {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+    for iteration in 0..12 {
+        let fixture = Fixture::new();
+        let old = json!({ "generation": "old", "iteration": iteration });
+        fs::write(
+            fixture.report_path(),
+            serde_json::to_vec(&old).expect("serialize old report"),
+        )
+        .expect("write old report");
+        let protocol = SmokeProtocol::from_environment(
+            &fixture.environment(
+                &format!("sharing-reader-token-{iteration}"),
+                json!({ "actions": [] }),
+            ),
+            &fixture.root,
+        );
+        let proof = active_session_proof(&protocol);
+        let blocker = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(fixture.report_path())
+            .expect("open reader without delete sharing");
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(30));
+            drop(blocker);
+        });
+
+        protocol
+            .complete(&proof, complete_passed(0))
+            .expect("publisher waits for short reader competition");
+        release.join().expect("release blocking reader");
+        let report: Value =
+            serde_json::from_slice(&fs::read(fixture.report_path()).expect("read final report"))
+                .expect("parse final report");
+        assert_eq!(report["schema"], "ride.tauri-packaged-smoke");
+        assert_eq!(report["status"], "passed");
+        assert_eq!(temporary_report_count(&fixture.root), 0);
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_smoke_atomic_publish_supports_a_real_node_polling_reader() {
     let fixture = Fixture::new();
-    let old = json!({ "generation": "old", "payload": "x".repeat(16_384) });
+    fs::write(fixture.report_path(), b"{\"generation\":\"old\"}\n")
+        .expect("write report for Node reader");
+    let protocol = SmokeProtocol::from_environment(
+        &fixture.environment("node-reader-token", json!({ "actions": [] })),
+        &fixture.root,
+    );
+    let proof = active_session_proof(&protocol);
+    let script = r#"
+        const fs = require('node:fs');
+        const path = process.argv[1];
+        setInterval(() => fs.readFileSync(path), 1);
+        fs.readFileSync(path);
+        process.stdout.write('READY\n');
+    "#;
+    let mut reader = Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .arg(fixture.report_path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start real Node polling reader");
+    let mut ready = [0_u8; 6];
+    reader
+        .stdout
+        .as_mut()
+        .expect("capture Node readiness")
+        .read_exact(&mut ready)
+        .expect("Node reader becomes ready");
+    assert_eq!(&ready, b"READY\n");
+    thread::sleep(Duration::from_millis(10));
+
+    let started = Instant::now();
+    let result = protocol.complete(&proof, complete_passed(0));
+    let polling_status = reader.try_wait();
+    let _ = reader.kill();
+    let _ = reader.wait();
+
+    result.expect("publisher remains compatible with Node/libuv polling share flags");
+    assert!(
+        polling_status
+            .expect("inspect Node polling reader")
+            .is_none(),
+        "Node polling reader must remain active through replacement"
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let report: Value =
+        serde_json::from_slice(&fs::read(fixture.report_path()).expect("read Node-polled report"))
+            .expect("parse Node-polled report");
+    assert_eq!(report["schema"], "ride.tauri-packaged-smoke");
+    assert_eq!(report["status"], "passed");
+    assert_eq!(temporary_report_count(&fixture.root), 0);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_smoke_atomic_publish_bounds_persistent_reader_competition() {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+    let fixture = Fixture::new();
+    let old = json!({ "generation": "old" });
     fs::write(
         fixture.report_path(),
         serde_json::to_vec(&old).expect("serialize old report"),
     )
     .expect("write old report");
     let protocol = SmokeProtocol::from_environment(
-        &fixture.environment("reader-token", json!({ "actions": [] })),
+        &fixture.environment("persistent-reader-token", json!({ "actions": [] })),
         &fixture.root,
     );
     let proof = active_session_proof(&protocol);
-    let report_path = fixture.report_path();
-    let running = Arc::new(AtomicBool::new(true));
-    let observations = Arc::new(Mutex::new(Vec::<Value>::new()));
-    let reader_running = Arc::clone(&running);
-    let reader_observations = Arc::clone(&observations);
-    let reader = thread::spawn(move || {
-        while reader_running.load(Ordering::Acquire) {
-            let bytes = fs::read(&report_path).expect("atomic destination is always present");
-            let value = serde_json::from_slice(&bytes).expect("reader sees complete JSON");
-            reader_observations
-                .lock()
-                .expect("lock reader observations")
-                .push(value);
-            thread::yield_now();
-        }
-    });
+    let blocker = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open(fixture.report_path())
+        .expect("open persistent reader without delete sharing");
+    let started = Instant::now();
 
-    thread::sleep(Duration::from_millis(10));
     protocol
         .complete(&proof, complete_passed(0))
-        .expect("publish while reader is active");
-    let new: Value =
-        serde_json::from_slice(&fs::read(fixture.report_path()).expect("read new report"))
-            .expect("parse new report");
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline
-        && !observations
-            .lock()
-            .expect("inspect reader observations")
-            .iter()
-            .any(|value| value == &new)
-    {
-        thread::yield_now();
-    }
-    running.store(false, Ordering::Release);
-    reader.join().expect("join atomic reader");
-
-    let observations = observations.lock().expect("lock final observations");
-    assert!(observations.iter().any(|value| value == &old));
-    assert!(observations.iter().any(|value| value == &new));
-    assert!(observations
-        .iter()
-        .all(|value| value == &old || value == &new));
+        .expect_err("persistent sharing competition remains a publish failure");
+    assert!(
+        started.elapsed() >= Duration::from_millis(150),
+        "retryable sharing competition must use the bounded retry window"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "replace retry must have a bounded total duration"
+    );
+    drop(blocker);
+    let visible: Value =
+        serde_json::from_slice(&fs::read(fixture.report_path()).expect("read preserved report"))
+            .expect("parse preserved report");
+    assert_eq!(visible, old);
     assert_eq!(temporary_report_count(&fixture.root), 0);
 }
 

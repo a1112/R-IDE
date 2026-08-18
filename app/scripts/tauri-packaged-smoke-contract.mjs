@@ -279,6 +279,7 @@ function validateReportContext(value) {
 function validateReportTransitions(value, expectedActions, {
   artifact = 'Smoke report',
   allowPending = false,
+  failureCodes,
 } = {}) {
   const transitions = stringArray(value, `${artifact} steps`);
   const normalized = [];
@@ -332,6 +333,9 @@ function validateReportTransitions(value, expectedActions, {
       }
       if (state === 'failed') {
         diagnostic = validateDiagnostic(transition.diagnostic, `${artifact} failed transition diagnostic`);
+        if (failureCodes !== undefined && !failureCodes.includes(diagnostic.code)) {
+          fail(`${artifact} failed transition diagnostic must be action-failed or action-timeout`);
+        }
         failed = true;
       } else if (transition.diagnostic !== null) {
         fail(`${artifact} passed transition diagnostic must be null`);
@@ -397,9 +401,13 @@ export function validateSmokeProgress(value, expected) {
   }
 
   const durationMs = nonNegativeSafeInteger(value.durationMs, 'Smoke progress durationMs');
+  if (!Array.isArray(value.steps) || value.steps.length === 0) {
+    fail('Smoke progress must contain at least one transition');
+  }
   const { transitions, lastDurationMs } = validateReportTransitions(value.steps, context.actions, {
     artifact: 'Smoke progress',
     allowPending: true,
+    failureCodes: ACTION_FAILURE_CODES,
   });
   if (durationMs !== lastDurationMs) {
     fail('Smoke progress durationMs must equal its final transition duration');

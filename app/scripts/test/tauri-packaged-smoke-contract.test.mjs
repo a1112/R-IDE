@@ -205,6 +205,29 @@ test('accepts strict progress prefixes ending in started, passed, or failed', ()
   }
 });
 
+test('rejects empty progress because snapshots exist only after a recorded transition', () => {
+  assert.throws(
+    () => validateSmokeProgress(smokeProgress({ durationMs: 0, steps: [] }), REPORT_CONTEXT),
+    /progress.*at least one transition/i,
+  );
+});
+
+test('restricts progress failure diagnostics to action failures', () => {
+  for (const code of ['startup-failed', 'sidecar-failed', 'protocol-failed', 'cleanup-failed']) {
+    const diagnostic = { code, message: DIAGNOSTIC_CATALOG[code] };
+    assert.throws(
+      () => validateSmokeProgress(smokeProgress({
+        durationMs: 30,
+        steps: [
+          transition('editor-save', 'started', 0),
+          transition('editor-save', 'failed', 30, diagnostic),
+        ],
+      }), REPORT_CONTEXT),
+      /progress.*action-failed.*action-timeout/i,
+    );
+  }
+});
+
 test('requires exact progress fields and rejects terminal reports masquerading as progress', () => {
   assert.throws(
     () => validateSmokeProgress({ ...smokeProgress(), status: 'started' }, REPORT_CONTEXT),

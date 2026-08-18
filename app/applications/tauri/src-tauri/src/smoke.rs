@@ -31,6 +31,10 @@ const MAX_REPORT_BYTES: u64 = 4 * 1024 * 1024;
 const MIN_ACTION_TIMEOUT_MS: u64 = 1_000;
 const MAX_ACTION_TIMEOUT_MS: u64 = 300_000;
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+#[cfg(windows)]
+const WINDOWS_REPLACE_RETRY_LIMIT: std::time::Duration = std::time::Duration::from_millis(250);
+#[cfg(windows)]
+const WINDOWS_REPLACE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(5);
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -1814,8 +1818,10 @@ impl ReportReplacer for SystemReplacer {
     fn replace(&self, temporary: &mut TemporaryReport, target: &ReportTarget) -> io::Result<()> {
         use windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER;
 
-        let relative =
-            windows_rename_by_handle(&temporary.file, target, Path::new(&target.file_name), true);
+        let deadline = std::time::Instant::now() + WINDOWS_REPLACE_RETRY_LIMIT;
+        let relative = retry_windows_replace_until(deadline, || {
+            windows_rename_by_handle(&temporary.file, target, Path::new(&target.file_name), true)
+        });
         if !matches!(
             relative.as_ref().err().and_then(io::Error::raw_os_error),
             Some(code) if code == ERROR_INVALID_PARAMETER as i32
@@ -1826,20 +1832,57 @@ impl ReportReplacer for SystemReplacer {
         // Some Windows filesystems reject FILE_RENAME_INFO.RootDirectory with
         // ERROR_INVALID_PARAMETER. The parent remains open without delete sharing; verify its
         // identity and pathname binding again before the absolute SetFileInformation fallback.
-        verify_parent_identity(
-            target.parent_identity,
-            windows_file_identity(&target.parent)?,
-        )
-        .map_err(|_| invalid_report_path())?;
-        let rebound_parent = windows_open_directory_no_follow(&target.parent_path)?;
-        verify_parent_identity(
-            target.parent_identity,
-            windows_file_identity(&rebound_parent)?,
-        )
-        .map_err(|_| invalid_report_path())?;
-        validate_report_destination(target)?;
-        windows_rename_by_handle(&temporary.file, target, &target.path_key, false)
+        retry_windows_replace_until(deadline, || {
+            verify_parent_identity(
+                target.parent_identity,
+                windows_file_identity(&target.parent)?,
+            )
+            .map_err(|_| invalid_report_path())?;
+            let rebound_parent = windows_open_directory_no_follow(&target.parent_path)?;
+            verify_parent_identity(
+                target.parent_identity,
+                windows_file_identity(&rebound_parent)?,
+            )
+            .map_err(|_| invalid_report_path())?;
+            validate_report_destination(target)?;
+            windows_rename_by_handle(&temporary.file, target, &target.path_key, false)
+        })
     }
+}
+
+#[cfg(windows)]
+fn retry_windows_replace_until(
+    deadline: std::time::Instant,
+    mut operation: impl FnMut() -> io::Result<()>,
+) -> io::Result<()> {
+    loop {
+        match operation() {
+            Ok(()) => return Ok(()),
+            Err(error) if is_retryable_windows_replace_error(&error) => {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(error);
+                }
+                std::thread::sleep(WINDOWS_REPLACE_RETRY_DELAY.min(remaining));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn is_retryable_windows_replace_error(error: &io::Error) -> bool {
+    use windows_sys::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION,
+    };
+
+    matches!(
+        error.raw_os_error(),
+        Some(code)
+            if code == ERROR_ACCESS_DENIED as i32
+                || code == ERROR_SHARING_VIOLATION as i32
+                || code == ERROR_LOCK_VIOLATION as i32
+    )
 }
 
 #[cfg(windows)]
@@ -2347,6 +2390,25 @@ mod tests {
             std::mem::size_of::<FILE_RENAME_INFO>() + name_bytes as usize
         );
         assert!(windows_rename_buffer_layout(usize::MAX).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_replace_retry_does_not_repeat_non_competition_errors() {
+        use windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER;
+
+        let mut calls = 0;
+        let error = retry_windows_replace_until(
+            std::time::Instant::now() + WINDOWS_REPLACE_RETRY_LIMIT,
+            || {
+                calls += 1;
+                Err(io::Error::from_raw_os_error(ERROR_INVALID_PARAMETER as i32))
+            },
+        )
+        .expect_err("invalid parameter is not transient reader competition");
+
+        assert_eq!(error.raw_os_error(), Some(ERROR_INVALID_PARAMETER as i32));
+        assert_eq!(calls, 1);
     }
 
     #[derive(Debug)]
