@@ -22,9 +22,9 @@
         "fullscreen": false,
         "center": true,
         "decorations": false,
-        "transparent": false,
+        "transparent": true,
         "shadow": true,
-        "backgroundColor": "#202020",
+        "backgroundColor": "#00000000",
         "backgroundThrottling": "suspend"
       }
     ],
