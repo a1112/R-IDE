@@ -6,6 +6,7 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { canonicalDigest, PROFILE_SCHEMA } from './tauri-frontend-profile.mjs';
+import { SMOKE_SCENARIOS, SMOKE_SCENARIO_REQUIREMENTS } from './tauri-packaged-smoke-contract.mjs';
 
 const METADATA_SCHEMA = 'ride.esbuild-metafile@1';
 const REQUIRED_METADATA = [
@@ -390,6 +391,7 @@ export function verifyTauriProfileInventory({
   browserDirectory,
   pluginsDirectory,
   expectedProfile,
+  expectedScenario,
 } = {}) {
   const resolvedBrowserDirectory = path.resolve(browserDirectory ?? path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'applications', 'browser'));
   const resolvedPluginsDirectory = path.resolve(pluginsDirectory ?? path.join(resolvedBrowserDirectory, '..', '..', 'plugins'));
@@ -398,12 +400,23 @@ export function verifyTauriProfileInventory({
     'Tauri profile manifest',
   );
   validateManifest(manifest);
-  if (expectedProfile !== undefined) {
-    if (expectedProfile !== 'tauri-critical' && expectedProfile !== 'full') {
-      throw new Error(`Unsupported expected Tauri profile ${expectedProfile}.`);
+  let requiredProfile = expectedProfile;
+  if (expectedScenario !== undefined) {
+    if (!SMOKE_SCENARIOS.includes(expectedScenario)) {
+      throw new Error('Unsupported expected packaged smoke scenario.');
     }
-    if (manifest.profile !== expectedProfile) {
-      throw new Error(`Expected profile ${expectedProfile}, received ${manifest.profile}.`);
+    const scenarioProfile = SMOKE_SCENARIO_REQUIREMENTS[expectedScenario].profile;
+    if (requiredProfile !== undefined && requiredProfile !== scenarioProfile) {
+      throw new Error('Expected profile and smoke scenario disagree.');
+    }
+    requiredProfile = scenarioProfile;
+  }
+  if (requiredProfile !== undefined) {
+    if (requiredProfile !== 'tauri-critical' && requiredProfile !== 'full') {
+      throw new Error(`Unsupported expected Tauri profile ${requiredProfile}.`);
+    }
+    if (manifest.profile !== requiredProfile) {
+      throw new Error(`Expected profile ${requiredProfile}, received ${manifest.profile}.`);
     }
   }
 
@@ -473,18 +486,27 @@ export function verifyTauriProfileInventory({
   };
 }
 
-function parseArguments(argv) {
+export function parseTauriProfileArguments(argv) {
   if (argv.length === 0) {
     return {};
   }
-  if (argv.length !== 2 || argv[0] !== '--expected-profile') {
-    throw new Error('Usage: verify-tauri-profile.mjs [--expected-profile tauri-critical|full]');
+  if (argv.length !== 2) {
+    throw new Error('Usage: verify-tauri-profile.mjs [--expected-profile tauri-critical|full | --expected-smoke-scenario critical-file|critical-empty|full-file]');
   }
-  return { expectedProfile: argv[1] };
+  if (argv[0] === '--expected-profile') {
+    return { expectedProfile: argv[1] };
+  }
+  if (argv[0] === '--expected-smoke-scenario') {
+    if (!SMOKE_SCENARIOS.includes(argv[1])) {
+      throw new Error('Unsupported expected packaged smoke scenario.');
+    }
+    return { expectedScenario: argv[1] };
+  }
+  throw new Error('Usage: verify-tauri-profile.mjs [--expected-profile tauri-critical|full | --expected-smoke-scenario critical-file|critical-empty|full-file]');
 }
 
 function main(argv = process.argv.slice(2)) {
-  const report = verifyTauriProfileInventory(parseArguments(argv));
+  const report = verifyTauriProfileInventory(parseTauriProfileArguments(argv));
   console.log(JSON.stringify(report, null, 2));
 }
 

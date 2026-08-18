@@ -1090,3 +1090,170 @@ test('package exposes the packaged Tauri smoke command', () => {
     'node scripts/run-tauri-packaged-smoke.mjs',
   );
 });
+
+test('critical-empty launches no file or forwarding instance and proves shell plus plugin readiness', async () => {
+  const events = [];
+  const actions = ['terminal-sentinel', 'packaged-plugin-command'];
+  const emptyRun = {
+    ...fixtureRun(),
+    files: [],
+    absoluteFiles: [],
+    launchArguments: [],
+    context: {
+      specSha256: digest,
+      scenario: 'critical-empty',
+      profile: 'tauri-critical',
+      actions,
+    },
+  };
+  const steps = actions.flatMap((action, index) => [
+    { action, state: 'started', durationMs: index * 2, diagnostic: null },
+    { action, state: 'passed', durationMs: index * 2 + 1, diagnostic: null },
+  ]);
+  const dependencies = fixtureDependencies(events, {
+    createRun: async () => { events.push('create'); return emptyRun; },
+    launchInstance: async ({ kind, run }) => {
+      assert.equal(kind, 'first');
+      assert.deepEqual(packagedSmokeLaunchArguments(run, kind), []);
+      events.push('launch-first');
+      return { kind, child: { exitCode: null }, identity: { pid: 10 } };
+    },
+    waitForForwardingStarted: async () => {
+      throw new Error('critical-empty must not wait for forwarding');
+    },
+    waitForFinalReport: async ({ budget }) => {
+      assert.equal(budget.phase, 'final smoke report');
+      assert.equal(budget.timeoutMs, 30_000);
+      events.push('wait-final');
+      return {
+        schema: 'ride.tauri-packaged-smoke',
+        version: 1,
+        specSha256: digest,
+        scenario: 'critical-empty',
+        profile: 'tauri-critical',
+        status: 'passed',
+        failurePhase: null,
+        durationMs: steps.at(-1).durationMs,
+        diagnostic: null,
+        steps,
+      };
+    },
+  });
+
+  const result = await runPackagedSmoke({ scenario: 'critical-empty', timeoutMs: 30_000 }, dependencies);
+  assert.equal(result.status, 'passed');
+  assert.deepEqual(events, [
+    'create',
+    'launch-first',
+    'wait-final',
+    'graceful-close',
+    'wait-first-exit',
+    'verify-cleanup',
+    'validate-logs',
+    'publish',
+    'temp-cleanup',
+  ]);
+});
+
+test('full-file requires the full run context and preserves two-instance orchestration', async () => {
+  const events = [];
+  const fullRun = {
+    ...fixtureRun(),
+    context: {
+      specSha256: digest,
+      scenario: 'full-file',
+      profile: 'full',
+      actions: [...SMOKE_ACTIONS],
+    },
+  };
+  const dependencies = fixtureDependencies(events, {
+    verifyProfile: async ({ scenario }) => {
+      assert.equal(scenario, 'full-file');
+    },
+    createRun: async () => { events.push('create'); return fullRun; },
+    launchInstance: async ({ kind, run, budget }) => {
+      assert.deepEqual(packagedSmokeLaunchArguments(run, kind), [
+        run.absoluteFiles[kind === 'first' ? 0 : 1],
+      ]);
+      assert.match(budget.phase, new RegExp(`${kind} instance launch`));
+      events.push(`launch-${kind}`);
+      return { kind, child: { exitCode: null }, identity: { pid: kind === 'first' ? 10 : 20 } };
+    },
+    waitForForwardingStarted: async () => {
+      events.push('wait-forwarding-started');
+      return { ...progress(), scenario: 'full-file', profile: 'full' };
+    },
+    waitForFinalReport: async () => {
+      events.push('wait-final');
+      return { ...report(), scenario: 'full-file', profile: 'full' };
+    },
+  });
+
+  const result = await runPackagedSmoke({ scenario: 'full-file', timeoutMs: 30_000 }, dependencies);
+  assert.equal(result.profile, 'full');
+  assert.deepEqual(events, [
+    'create',
+    'launch-first',
+    'wait-forwarding-started',
+    'launch-second',
+    'wait-second-exit',
+    'wait-final',
+    'graceful-close',
+    'wait-first-exit',
+    'verify-cleanup',
+    'validate-logs',
+    'publish',
+    'temp-cleanup',
+  ]);
+});
+
+test('runner rejects a run context that weakens its requested scenario before launch', async () => {
+  const events = [];
+  const weakenedRun = {
+    ...fixtureRun(),
+    context: {
+      ...fixtureRun().context,
+      scenario: 'full-file',
+      profile: 'tauri-critical',
+      actions: ['terminal-sentinel', 'packaged-plugin-command'],
+    },
+  };
+  await assert.rejects(runPackagedSmoke(
+    { scenario: 'full-file', timeoutMs: 30_000 },
+    fixtureDependencies(events, {
+      createRun: async () => { events.push('create'); return weakenedRun; },
+    }),
+  ), /does not match the requested scenario/i);
+  assert.deepEqual(events, ['create', 'temp-cleanup']);
+});
+
+test('scenario artifacts bind critical-empty and full-file to exact plans', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ride-smoke-scenarios-'));
+  const executable = path.join(root, 'R-IDE.exe');
+  fs.writeFileSync(executable, 'fixture');
+  const runs = [];
+  try {
+    for (const scenario of ['critical-empty', 'full-file']) {
+      runs.push(await createSmokeRunArtifacts({
+        executable,
+        scenario,
+        output: path.join(root, `${scenario}.json`),
+        timeoutMs: 45_000,
+        keepWorkspace: true,
+        sourceEnvironment: { PATH: process.env.PATH ?? '' },
+      }));
+    }
+    const [empty, full] = runs.map(run => JSON.parse(fs.readFileSync(run.specPath, 'utf8')));
+    assert.deepEqual(empty.files, []);
+    assert.deepEqual(empty.actions, ['terminal-sentinel', 'packaged-plugin-command']);
+    assert.equal(empty.profile, 'tauri-critical');
+    assert.deepEqual(full.files, ['first.R', 'second.R']);
+    assert.deepEqual(full.actions, [...SMOKE_ACTIONS]);
+    assert.equal(full.profile, 'full');
+  } finally {
+    for (const run of runs) {
+      fs.rmSync(run.runRoot, { recursive: true, force: true });
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

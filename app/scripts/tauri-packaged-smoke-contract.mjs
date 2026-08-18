@@ -29,6 +29,24 @@ export const SMOKE_ACTIONS = Object.freeze([
   'second-file-forwarding',
 ]);
 
+export const SMOKE_SCENARIO_REQUIREMENTS = deepFreeze({
+  'critical-file': {
+    profile: 'tauri-critical',
+    fileCount: 2,
+    actions: [...SMOKE_ACTIONS],
+  },
+  'critical-empty': {
+    profile: 'tauri-critical',
+    fileCount: 0,
+    actions: ['terminal-sentinel', 'packaged-plugin-command'],
+  },
+  'full-file': {
+    profile: 'full',
+    fileCount: 2,
+    actions: [...SMOKE_ACTIONS],
+  },
+});
+
 const SMOKE_PROFILES = Object.freeze(['tauri-critical', 'full']);
 const SPEC_KEYS = Object.freeze([
   'schema',
@@ -368,14 +386,26 @@ export function validateSmokeSpec(value) {
     fail('Smoke spec version must be 1');
   }
 
+  const scenario = enumValue(value.scenario, SMOKE_SCENARIOS, 'Smoke spec scenario');
+  const profile = enumValue(value.profile, SMOKE_PROFILES, 'Smoke spec profile');
+  const files = validateFiles(value.files);
+  const actions = validateActions(value.actions);
+  const requirement = SMOKE_SCENARIO_REQUIREMENTS[scenario];
+  if (profile !== requirement.profile
+      || files.length !== requirement.fileCount
+      || actions.length !== requirement.actions.length
+      || actions.some((action, index) => action !== requirement.actions[index])) {
+    fail('Smoke spec must match its scenario requirements');
+  }
+
   return deepFreeze({
     schema: value.schema,
     version: value.version,
-    scenario: enumValue(value.scenario, SMOKE_SCENARIOS, 'Smoke spec scenario'),
-    profile: enumValue(value.profile, SMOKE_PROFILES, 'Smoke spec profile'),
+    scenario,
+    profile,
     workspace: relativePath(value.workspace, 'Smoke spec workspace', { allowDot: true }),
-    files: validateFiles(value.files),
-    actions: validateActions(value.actions),
+    files,
+    actions,
     tokenSha256: validateSha256(value.tokenSha256, 'Smoke spec tokenSha256'),
     actionTimeoutMs: validateActionTimeout(value.actionTimeoutMs),
   });

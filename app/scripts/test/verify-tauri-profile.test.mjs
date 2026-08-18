@@ -8,7 +8,10 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { verifyTauriProfileInventory } from '../verify-tauri-profile.mjs';
+import {
+  parseTauriProfileArguments,
+  verifyTauriProfileInventory,
+} from '../verify-tauri-profile.mjs';
 import { createProfileMetadataPlugin } from '../../applications/browser/tauri-src/esbuild-metadata.mjs';
 
 function canonicalJson(value) {
@@ -167,6 +170,36 @@ function createFixture(profile = 'tauri-critical') {
   }
   return { root, browserDirectory, pluginsDirectory, manifest, records };
 }
+
+test('smoke scenarios select the authoritative packaged profile', () => {
+  const critical = createFixture('tauri-critical');
+  const full = createFixture('full');
+  try {
+    assert.equal(verifyTauriProfileInventory({
+      ...critical,
+      expectedScenario: 'critical-empty',
+    }).profile, 'tauri-critical');
+    assert.equal(verifyTauriProfileInventory({
+      ...full,
+      expectedScenario: 'full-file',
+    }).profile, 'full');
+    assert.throws(() => verifyTauriProfileInventory({
+      ...critical,
+      expectedScenario: 'full-file',
+    }), /expected profile full/i);
+    assert.deepEqual(parseTauriProfileArguments([
+      '--expected-smoke-scenario',
+      'critical-file',
+    ]), { expectedScenario: 'critical-file' });
+    assert.throws(
+      () => parseTauriProfileArguments(['--expected-smoke-scenario', 'unknown']),
+      /unsupported.*scenario/i,
+    );
+  } finally {
+    fs.rmSync(critical.root, { recursive: true, force: true });
+    fs.rmSync(full.root, { recursive: true, force: true });
+  }
+});
 
 test('verifies critical profile inventory, workers, plugin hosts, VS Code init, and deferred chunks', () => {
   const fixture = createFixture();

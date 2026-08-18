@@ -32,8 +32,8 @@ import {
   waitForStartupReport,
 } from './measure-tauri-startup.mjs';
 import {
-  SMOKE_ACTIONS,
   SMOKE_SCENARIOS,
+  SMOKE_SCENARIO_REQUIREMENTS,
   validateSmokeProgress,
   validateSmokeReport,
   validateSmokeSpec,
@@ -105,17 +105,33 @@ function remainingPhaseBudget(budget, phase = budget.phase) {
 }
 
 function scenarioDefinition(scenario) {
-  if (!SMOKE_SCENARIOS.includes(scenario)) {
+  const requirement = SMOKE_SCENARIO_REQUIREMENTS[scenario];
+  if (requirement === undefined) {
     throw new Error(`unsupported packaged smoke scenario ${scenario}`);
   }
-  if (scenario === 'critical-empty') {
-    return { profile: 'tauri-critical', files: [], actions: [...SMOKE_ACTIONS] };
-  }
   return {
-    profile: scenario === 'full-file' ? 'full' : 'tauri-critical',
-    files: ['first.R', 'second.R'],
-    actions: [...SMOKE_ACTIONS],
+    profile: requirement.profile,
+    files: requirement.fileCount === 0 ? [] : ['first.R', 'second.R'],
+    actions: [...requirement.actions],
   };
+}
+
+function assertRunMatchesScenario(run, scenario) {
+  const definition = scenarioDefinition(scenario);
+  const matches = run?.context?.scenario === scenario
+    && run.context.profile === definition.profile
+    && Array.isArray(run.context.actions)
+    && run.context.actions.length === definition.actions.length
+    && run.context.actions.every((action, index) => action === definition.actions[index])
+    && Array.isArray(run.files)
+    && run.files.length === definition.files.length
+    && run.files.every((file, index) => file === definition.files[index])
+    && Array.isArray(run.absoluteFiles)
+    && run.absoluteFiles.length === definition.files.length;
+  if (!matches) {
+    throw new Error('packaged smoke run does not match the requested scenario');
+  }
+  return definition;
 }
 
 function assertCleanSourceEnvironment(sourceEnvironment) {
@@ -899,35 +915,38 @@ export async function runPackagedSmoke(options, injectedDependencies) {
   try {
     await dependencies.verifyProfile(options);
     run = await dependencies.createRun(options);
+    const definition = assertRunMatchesScenario(run, options.scenario);
     const first = await dependencies.launchInstance({
       run,
       kind: 'first',
       budget: phaseBudget('first instance launch'),
     });
     instances.push(first);
-    const progress = validateSmokeProgress(
-      await dependencies.waitForForwardingStarted({
+    if (definition.actions.includes('second-file-forwarding')) {
+      const progress = validateSmokeProgress(
+        await dependencies.waitForForwardingStarted({
+          run,
+          first,
+          budget: phaseBudget('second-file-forwarding started progress'),
+        }),
+        run.context,
+      );
+      const forwarding = progress.steps.at(-1);
+      if (forwarding.action !== 'second-file-forwarding' || forwarding.state !== 'started') {
+        throw new Error('second-file-forwarding started progress was not observed');
+      }
+      const second = await dependencies.launchInstance({
         run,
-        first,
-        budget: phaseBudget('second-file-forwarding started progress'),
-      }),
-      run.context,
-    );
-    const forwarding = progress.steps.at(-1);
-    if (forwarding.action !== 'second-file-forwarding' || forwarding.state !== 'started') {
-      throw new Error('second-file-forwarding started progress was not observed');
+        kind: 'second',
+        budget: phaseBudget('second instance launch'),
+      });
+      instances.push(second);
+      await dependencies.waitForInstanceExit(second, {
+        run,
+        phase: 'second instance exit',
+        budget: phaseBudget('second instance exit'),
+      });
     }
-    const second = await dependencies.launchInstance({
-      run,
-      kind: 'second',
-      budget: phaseBudget('second instance launch'),
-    });
-    instances.push(second);
-    await dependencies.waitForInstanceExit(second, {
-      run,
-      phase: 'second instance exit',
-      budget: phaseBudget('second instance exit'),
-    });
     finalReport = validateSmokeReport(
       await dependencies.waitForFinalReport({
         run,

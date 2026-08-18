@@ -13,6 +13,7 @@ import test from 'node:test';
 import {
   SMOKE_ACTIONS,
   SMOKE_SCENARIOS,
+  SMOKE_SCENARIO_REQUIREMENTS,
   SMOKE_SCHEMAS,
   validateSmokeProgress,
   validateSmokeReport,
@@ -160,6 +161,55 @@ test('exports immutable canonical schemas, scenarios, and ordered actions', () =
   assert.equal(Object.isFrozen(SMOKE_SCENARIOS), true);
   assert.equal(Object.isFrozen(SMOKE_ACTIONS), true);
   assert.throws(() => SMOKE_ACTIONS.push('unexpected'), TypeError);
+});
+
+test('exports immutable exact requirements for every packaged smoke scenario', () => {
+  assert.deepEqual(SMOKE_SCENARIO_REQUIREMENTS, {
+    'critical-file': {
+      profile: 'tauri-critical',
+      fileCount: 2,
+      actions: [...SMOKE_ACTIONS],
+    },
+    'critical-empty': {
+      profile: 'tauri-critical',
+      fileCount: 0,
+      actions: ['terminal-sentinel', 'packaged-plugin-command'],
+    },
+    'full-file': {
+      profile: 'full',
+      fileCount: 2,
+      actions: [...SMOKE_ACTIONS],
+    },
+  });
+  assert.equal(Object.isFrozen(SMOKE_SCENARIO_REQUIREMENTS), true);
+  for (const requirement of Object.values(SMOKE_SCENARIO_REQUIREMENTS)) {
+    assert.equal(Object.isFrozen(requirement), true);
+    assert.equal(Object.isFrozen(requirement.actions), true);
+  }
+});
+
+test('binds every smoke scenario to its exact profile, file count, and action contract', () => {
+  const valid = [
+    smokeSpec(),
+    smokeSpec({
+      scenario: 'critical-empty',
+      files: [],
+      actions: ['terminal-sentinel', 'packaged-plugin-command'],
+    }),
+    smokeSpec({ scenario: 'full-file', profile: 'full' }),
+  ];
+  valid.forEach(candidate => assert.doesNotThrow(() => validateSmokeSpec(candidate)));
+
+  for (const candidate of [
+    smokeSpec({ profile: 'full' }),
+    smokeSpec({ files: ['only.R'] }),
+    smokeSpec({ actions: ['terminal-sentinel'] }),
+    smokeSpec({ scenario: 'critical-empty', files: ['unexpected.R'], actions: ['terminal-sentinel', 'packaged-plugin-command'] }),
+    smokeSpec({ scenario: 'critical-empty', files: [], actions: ['terminal-sentinel'] }),
+    smokeSpec({ scenario: 'full-file', profile: 'tauri-critical' }),
+  ]) {
+    assert.throws(() => validateSmokeSpec(candidate), /scenario requirements/i);
+  }
 });
 
 test('accepts strict progress prefixes ending in started, passed, or failed', () => {
@@ -317,9 +367,9 @@ test('progress validation errors never echo untrusted values', () => {
 
 test('accepts each exact scenario and returns a normalized copy', () => {
   const cases = [
-    ['critical-file', 'tauri-critical', ['workspace\\startup.R'], ['editor-save']],
-    ['critical-empty', 'tauri-critical', [], []],
-    ['full-file', 'full', ['nested\\startup.R'], [...FILE_ACTIONS]],
+    ['critical-file', 'tauri-critical', ['workspace\\startup.R', 'workspace\\forwarded.R'], [...FILE_ACTIONS]],
+    ['critical-empty', 'tauri-critical', [], ['terminal-sentinel', 'packaged-plugin-command']],
+    ['full-file', 'full', ['nested\\startup.R', 'nested\\forwarded.R'], [...FILE_ACTIONS]],
   ];
 
   for (const [scenario, profile, files, actions] of cases) {
@@ -506,15 +556,19 @@ test('rejects Windows ordinal-style single-code-point case collisions', () => {
 });
 
 test('preserves expanding uppercase and normalization-distinct Unicode filenames', () => {
-  const files = ['ß.R', 'SS.R', 'é.R', 'e\u0301.R'];
-
-  assert.deepEqual(validateSmokeSpec(smokeSpec({ files })).files, files);
+  for (const files of [['ß.R', 'SS.R'], ['é.R', 'e\u0301.R']]) {
+    assert.deepEqual(validateSmokeSpec(smokeSpec({ files })).files, files);
+  }
 });
 
-test('requires actions to be known, unique, and in canonical order', () => {
+test('requires scenario actions to be complete, known, unique, and in canonical order', () => {
   assert.deepEqual(
-    validateSmokeSpec(smokeSpec({ actions: ['editor-save', 'scm-status', 'secondary-window'] })).actions,
-    ['editor-save', 'scm-status', 'secondary-window'],
+    validateSmokeSpec(smokeSpec()).actions,
+    [...FILE_ACTIONS],
+  );
+  assert.throws(
+    () => validateSmokeSpec(smokeSpec({ actions: ['editor-save', 'scm-status', 'secondary-window'] })),
+    /scenario requirements/i,
   );
   assert.throws(
     () => validateSmokeSpec(smokeSpec({ actions: ['terminal-sentinel', 'editor-save'] })),
