@@ -17,9 +17,13 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Barrier};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const SPEC_ENV: &str = "RIDE_TAURI_SMOKE_SPEC";
@@ -141,6 +145,24 @@ fn complete_actions(protocol: &SmokeProtocol, actions: &[SmokeAction]) {
             .expect("pass smoke action");
         duration_ms += 1;
     }
+}
+
+fn active_session_proof(protocol: &SmokeProtocol) -> String {
+    protocol
+        .plan()
+        .session_proof
+        .expect("active smoke session proof")
+}
+
+fn record_envelope(proof: &str, request: Value) -> Value {
+    json!({ "sessionProof": proof, "request": request })
+}
+
+fn assert_static_rejection(error: &ride_tauri::smoke::SmokeError, secret: &str) {
+    assert_eq!(error.code, "smoke-request-rejected");
+    assert_eq!(error.message, "Smoke protocol request was rejected.");
+    let serialized = serde_json::to_string(error).expect("serialize static smoke error");
+    assert!(!serialized.contains(secret));
 }
 
 #[test]
@@ -266,15 +288,27 @@ fn smoke_protocol_rejects_symlinks_non_files_and_oversized_inputs() {
 
     let target = fixture.write_spec(token, json!({}));
     let link = fixture.root.join("spec-link.json");
-    if create_file_symlink(&target, &link).is_ok() {
-        let mut symlink_environment = fixture.environment(token, json!({}));
-        symlink_environment.insert(OsString::from(SPEC_ENV), link.into_os_string());
-        assert_eq!(
-            SmokeProtocol::from_environment(&symlink_environment, &fixture.root)
-                .plan()
-                .mode,
-            SmokeMode::Rejected
-        );
+    match create_file_symlink(&target, &link) {
+        Ok(()) => {
+            let mut symlink_environment = fixture.environment(token, json!({}));
+            symlink_environment.insert(OsString::from(SPEC_ENV), link.into_os_string());
+            assert_eq!(
+                SmokeProtocol::from_environment(&symlink_environment, &fixture.root)
+                    .plan()
+                    .mode,
+                SmokeMode::Rejected
+            );
+        }
+        #[cfg(windows)]
+        Err(error)
+            if error.kind() == std::io::ErrorKind::PermissionDenied
+                || error.raw_os_error() == Some(1314) =>
+        {
+            eprintln!(
+                "Windows symlink integration unavailable; deterministic capability-seam test remains mandatory"
+            );
+        }
+        Err(_) => panic!("unexpected failure creating smoke symlink fixture"),
     }
 }
 
@@ -637,4 +671,691 @@ fn smoke_protocol_serializes_concurrent_updates() {
     protocol
         .complete(complete_passed(2))
         .expect("complete serialized report");
+}
+
+#[test]
+fn smoke_plan_returns_one_time_session_proof() {
+    let fixture = Fixture::new();
+    let token = "one-time-environment-token";
+    let protocol = SmokeProtocol::from_environment(
+        &fixture.environment(token, json!({ "actions": [] })),
+        &fixture.root,
+    );
+
+    let first = protocol.plan();
+    let proof = first
+        .session_proof
+        .clone()
+        .expect("first plan returns proof");
+    assert_eq!(proof.len(), 64);
+    assert!(proof
+        .bytes()
+        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()));
+    assert_ne!(proof, sha256(token.as_bytes()));
+    assert!(!format!("{first:?}").contains(&proof));
+    assert!(!format!("{first:?}").contains(token));
+    assert!(protocol.plan().session_proof.is_none());
+}
+
+#[test]
+fn smoke_commands_require_matching_session_proof_without_state_change() {
+    let fixture = Fixture::new();
+    let protocol = SmokeProtocol::from_environment(
+        &fixture.environment("command-proof-token", json!({ "actions": ["editor-save"] })),
+        &fixture.root,
+    );
+    let proof = active_session_proof(&protocol);
+    let request = json!({
+        "action": "editor-save",
+        "state": "started",
+        "durationMs": 0,
+        "diagnostic": null
+    });
+
+    let error = protocol
+        .record_step_command(record_envelope("0", request.clone()))
+        .expect_err("wrong proof rejected");
+    assert_static_rejection(&error, "command-proof-token");
+    assert_eq!(
+        protocol
+            .record_step_command(record_envelope(&proof, request))
+            .expect("correct proof records unchanged first transition")
+            .status,
+        SmokeUpdateStatus::Recorded
+    );
+}
+
+#[test]
+fn smoke_stale_session_proof_is_rejected() {
+    let first_fixture = Fixture::new();
+    let first = SmokeProtocol::from_environment(
+        &first_fixture.environment("first-process-token", json!({ "actions": [] })),
+        &first_fixture.root,
+    );
+    let stale = active_session_proof(&first);
+    let second_fixture = Fixture::new();
+    let second = SmokeProtocol::from_environment(
+        &second_fixture.environment("second-process-token", json!({ "actions": [] })),
+        &second_fixture.root,
+    );
+    let current = active_session_proof(&second);
+
+    let error = second
+        .complete_command(record_envelope(
+            &stale,
+            json!({
+                "status": "passed",
+                "failurePhase": null,
+                "durationMs": 0,
+                "diagnostic": null
+            }),
+        ))
+        .expect_err("stale proof rejected");
+    assert_static_rejection(&error, &stale);
+    assert_eq!(
+        second
+            .complete_command(record_envelope(
+                &current,
+                json!({
+                    "status": "passed",
+                    "failurePhase": null,
+                    "durationMs": 0,
+                    "diagnostic": null
+                }),
+            ))
+            .expect("current proof remains usable")
+            .status,
+        SmokeUpdateStatus::Completed
+    );
+}
+
+#[test]
+fn smoke_report_never_persists_session_proof_or_environment_token() {
+    let fixture = Fixture::new();
+    let token = "never-persist-environment-token";
+    let protocol = SmokeProtocol::from_environment(
+        &fixture.environment(token, json!({ "actions": [] })),
+        &fixture.root,
+    );
+    let proof = active_session_proof(&protocol);
+    protocol
+        .complete_command(record_envelope(
+            &proof,
+            json!({
+                "status": "passed",
+                "failurePhase": null,
+                "durationMs": 0,
+                "diagnostic": null
+            }),
+        ))
+        .expect("complete authenticated smoke report");
+
+    let report = fs::read_to_string(fixture.report_path()).expect("read smoke report");
+    assert!(!report.contains(token));
+    assert!(!report.contains(&proof));
+    assert!(!format!("{protocol:?}").contains(token));
+    assert!(!format!("{protocol:?}").contains(&proof));
+}
+
+#[test]
+fn smoke_record_command_maps_malformed_values_to_static_error() {
+    let fixture = Fixture::new();
+    let protocol = SmokeProtocol::from_environment(
+        &fixture.environment("record-parser-token", json!({ "actions": ["editor-save"] })),
+        &fixture.root,
+    );
+    let proof = active_session_proof(&protocol);
+    let secret = "C:\\host\\secret-token";
+    let malformed = [
+        Value::Null,
+        json!([]),
+        json!({ "sessionProof": proof }),
+        json!({ "sessionProof": proof, "request": secret, "unknown": secret }),
+        record_envelope(
+            &proof,
+            json!({
+                "action": secret,
+                "state": "started",
+                "durationMs": 0,
+                "diagnostic": null
+            }),
+        ),
+        record_envelope(
+            &proof,
+            json!({
+                "action": "editor-save",
+                "state": secret,
+                "durationMs": 0,
+                "diagnostic": null
+            }),
+        ),
+    ];
+
+    for value in malformed {
+        let error = protocol
+            .record_step_command(value)
+            .expect_err("schema-invalid record request rejected");
+        assert_static_rejection(&error, secret);
+    }
+}
+
+#[test]
+fn smoke_complete_command_maps_malformed_values_to_static_error() {
+    let fixture = Fixture::new();
+    let protocol = SmokeProtocol::from_environment(
+        &fixture.environment("complete-parser-token", json!({ "actions": [] })),
+        &fixture.root,
+    );
+    let proof = active_session_proof(&protocol);
+    let secret = "untrusted-failure-phase-value";
+    for value in [
+        Value::Null,
+        json!({ "sessionProof": proof, "request": null }),
+        record_envelope(
+            &proof,
+            json!({
+                "status": "failed",
+                "failurePhase": secret,
+                "durationMs": 0,
+                "diagnostic": null
+            }),
+        ),
+        record_envelope(
+            &proof,
+            json!({
+                "status": "passed",
+                "failurePhase": null,
+                "durationMs": 0,
+                "diagnostic": null,
+                "unknown": secret
+            }),
+        ),
+    ] {
+        let error = protocol
+            .complete_command(value)
+            .expect_err("schema-invalid completion rejected");
+        assert_static_rejection(&error, secret);
+    }
+}
+
+#[test]
+fn smoke_disabled_commands_return_disabled_for_untrusted_payloads() {
+    let fixture = Fixture::new();
+    let protocol = SmokeProtocol::from_environment(&BTreeMap::new(), &fixture.root);
+
+    assert_eq!(
+        protocol
+            .record_step_command(json!({ "secret": ["malformed"] }))
+            .expect("disabled record is a safe no-op")
+            .status,
+        SmokeUpdateStatus::Disabled
+    );
+    assert_eq!(
+        protocol
+            .complete_command(Value::Null)
+            .expect("disabled completion is a safe no-op")
+            .status,
+        SmokeUpdateStatus::Disabled
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_smoke_reparse_integration_has_explicit_fallback() {
+    let fixture = Fixture::new();
+    let token = "windows-reparse-token";
+    let target = fixture.write_spec(token, json!({ "actions": [] }));
+    let spec_link = fixture.root.join("spec-link.json");
+    match create_file_symlink(&target, &spec_link) {
+        Ok(()) => {
+            let mut environment = fixture.environment(token, json!({ "actions": [] }));
+            environment.insert(OsString::from(SPEC_ENV), spec_link.into_os_string());
+            assert_eq!(
+                SmokeProtocol::from_environment(&environment, &fixture.root)
+                    .plan()
+                    .mode,
+                SmokeMode::Rejected
+            );
+        }
+        Err(error) => {
+            assert!(
+                error.kind() == std::io::ErrorKind::PermissionDenied
+                    || error.raw_os_error() == Some(1314),
+                "unexpected Windows symlink error kind"
+            );
+            eprintln!(
+                "Windows symlink integration unavailable; deterministic capability-seam test remains mandatory"
+            );
+        }
+    }
+
+    let report_fixture = Fixture::new();
+    let report_target = report_fixture.root.join("existing-report.json");
+    let report_link = report_fixture.root.join("report-link.json");
+    fs::write(&report_target, br#"{"generation":"old"}"#).expect("write report link target");
+    match create_file_symlink(&report_target, &report_link) {
+        Ok(()) => {
+            let mut environment = report_fixture.environment(token, json!({ "actions": [] }));
+            environment.insert(OsString::from(REPORT_ENV), report_link.into_os_string());
+            assert_eq!(
+                SmokeProtocol::from_environment(&environment, &report_fixture.root)
+                    .plan()
+                    .mode,
+                SmokeMode::Rejected
+            );
+        }
+        Err(error) => {
+            assert!(
+                error.kind() == std::io::ErrorKind::PermissionDenied
+                    || error.raw_os_error() == Some(1314),
+                "unexpected Windows report symlink error kind"
+            );
+            eprintln!(
+                "Windows report symlink integration unavailable; deterministic capability-seam test remains mandatory"
+            );
+        }
+    }
+
+    let target_parent = fixture.root.join("report-target");
+    let junction_parent = fixture.root.join("report-junction");
+    fs::create_dir(&target_parent).expect("create junction target");
+    let junction = Command::new("cmd.exe")
+        .args(["/d", "/c", "mklink", "/J"])
+        .arg(&junction_parent)
+        .arg(&target_parent)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    match junction {
+        Ok(status) if status.success() => {
+            let mut environment = fixture.environment(token, json!({ "actions": [] }));
+            environment.insert(
+                OsString::from(REPORT_ENV),
+                junction_parent.join("report.json").into_os_string(),
+            );
+            assert_eq!(
+                SmokeProtocol::from_environment(&environment, &fixture.root)
+                    .plan()
+                    .mode,
+                SmokeMode::Rejected
+            );
+        }
+        Ok(_) | Err(_) => eprintln!(
+            "Windows junction integration unavailable; deterministic capability-seam test remains mandatory"
+        ),
+    }
+}
+
+#[test]
+fn smoke_atomic_publish_replaces_an_existing_valid_report() {
+    let fixture = Fixture::new();
+    let old = json!({ "generation": "old", "complete": true });
+    fs::write(
+        fixture.report_path(),
+        serde_json::to_vec(&old).expect("serialize old report"),
+    )
+    .expect("write old report");
+    let protocol = SmokeProtocol::from_environment(
+        &fixture.environment("replacement-token", json!({ "actions": [] })),
+        &fixture.root,
+    );
+
+    protocol
+        .complete(complete_passed(0))
+        .expect("replace existing report");
+    let new: Value =
+        serde_json::from_slice(&fs::read(fixture.report_path()).expect("read replacement report"))
+            .expect("replacement remains complete JSON");
+    assert_ne!(new, old);
+    assert_eq!(new["schema"], "ride.tauri-packaged-smoke");
+    assert_eq!(new["status"], "passed");
+    assert_eq!(temporary_report_count(&fixture.root), 0);
+}
+
+#[test]
+fn smoke_atomic_publish_is_old_or_new_json_for_concurrent_readers() {
+    let fixture = Fixture::new();
+    let old = json!({ "generation": "old", "payload": "x".repeat(16_384) });
+    fs::write(
+        fixture.report_path(),
+        serde_json::to_vec(&old).expect("serialize old report"),
+    )
+    .expect("write old report");
+    let protocol = SmokeProtocol::from_environment(
+        &fixture.environment("reader-token", json!({ "actions": [] })),
+        &fixture.root,
+    );
+    let report_path = fixture.report_path();
+    let running = Arc::new(AtomicBool::new(true));
+    let observations = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let reader_running = Arc::clone(&running);
+    let reader_observations = Arc::clone(&observations);
+    let reader = thread::spawn(move || {
+        while reader_running.load(Ordering::Acquire) {
+            let bytes = fs::read(&report_path).expect("atomic destination is always present");
+            let value = serde_json::from_slice(&bytes).expect("reader sees complete JSON");
+            reader_observations
+                .lock()
+                .expect("lock reader observations")
+                .push(value);
+            thread::yield_now();
+        }
+    });
+
+    thread::sleep(Duration::from_millis(10));
+    protocol
+        .complete(complete_passed(0))
+        .expect("publish while reader is active");
+    let new: Value =
+        serde_json::from_slice(&fs::read(fixture.report_path()).expect("read new report"))
+            .expect("parse new report");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline
+        && !observations
+            .lock()
+            .expect("inspect reader observations")
+            .iter()
+            .any(|value| value == &new)
+    {
+        thread::yield_now();
+    }
+    running.store(false, Ordering::Release);
+    reader.join().expect("join atomic reader");
+
+    let observations = observations.lock().expect("lock final observations");
+    assert!(observations.iter().any(|value| value == &old));
+    assert!(observations.iter().any(|value| value == &new));
+    assert!(observations
+        .iter()
+        .all(|value| value == &old || value == &new));
+    assert_eq!(temporary_report_count(&fixture.root), 0);
+}
+
+fn temporary_report_count(parent: &Path) -> usize {
+    fs::read_dir(parent)
+        .expect("list smoke report directory")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+        .count()
+}
+
+fn smoke_spec_value(token: &str, overrides: Value) -> Value {
+    let mut value = json!({
+        "schema": "ride.tauri-packaged-smoke-spec",
+        "version": 1,
+        "scenario": "critical-file",
+        "profile": "tauri-critical",
+        "workspace": ".",
+        "files": ["startup.R"],
+        "actions": ["editor-save"],
+        "tokenSha256": sha256(token.as_bytes()),
+        "actionTimeoutMs": 30_000
+    });
+    if let (Some(target), Some(source)) = (value.as_object_mut(), overrides.as_object()) {
+        target.extend(source.clone());
+    }
+    value
+}
+
+fn rust_accepts_spec(value: &Value, token: &str) -> bool {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.spec_path(),
+        serde_json::to_vec(value).expect("serialize parity spec"),
+    )
+    .expect("write parity spec");
+    let environment = BTreeMap::from([
+        (
+            OsString::from(SPEC_ENV),
+            dunce::canonicalize(fixture.spec_path())
+                .expect("canonical parity spec")
+                .into_os_string(),
+        ),
+        (
+            OsString::from(REPORT_ENV),
+            fixture.report_path().into_os_string(),
+        ),
+        (OsString::from(TOKEN_ENV), OsString::from(token)),
+    ]);
+    SmokeProtocol::from_environment(&environment, &fixture.root)
+        .plan()
+        .mode
+        == SmokeMode::Active
+}
+
+fn run_node_contract(input: &Value) -> Result<Value, &'static str> {
+    run_node_contract_with_program("node", input)
+}
+
+fn run_node_contract_with_program(program: &str, input: &Value) -> Result<Value, &'static str> {
+    const STATIC_ERROR: &str = "Node smoke parity runner failed.";
+    const MAX_INPUT_BYTES: usize = 64 * 1024;
+    const MAX_OUTPUT_BYTES: usize = 64 * 1024;
+    const SCRIPT: &str = r#"
+import fs from 'node:fs';
+import { pathToFileURL } from 'node:url';
+const [contractPath, fixturePath] = process.argv.slice(1);
+const contract = await import(pathToFileURL(contractPath).href);
+const input = JSON.parse(fs.readFileSync(fixturePath, 'utf8'));
+const accepts = (operation) => { try { operation(); return true; } catch { return false; } };
+const result = {
+  specs: input.specs.map(value => accepts(() => contract.validateSmokeSpec(value))),
+  reports: input.reports.map(({ value, expected }) => (
+    accepts(() => contract.validateSmokeReport(value, expected))
+  )),
+};
+process.stdout.write(JSON.stringify(result));
+"#;
+
+    let fixture = Fixture::new();
+    let fixture_path = fixture.root.join("node-parity.json");
+    let input = serde_json::to_vec(input).map_err(|_| STATIC_ERROR)?;
+    if input.len() > MAX_INPUT_BYTES {
+        return Err(STATIC_ERROR);
+    }
+    fs::write(&fixture_path, input).map_err(|_| STATIC_ERROR)?;
+    let contract_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../scripts/tauri-packaged-smoke-contract.mjs");
+    let mut child = Command::new(program)
+        .args(["--input-type=module", "-e", SCRIPT])
+        .arg(&contract_path)
+        .arg(&fixture_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| STATIC_ERROR)?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|_| STATIC_ERROR)? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(STATIC_ERROR);
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    if !status.success() {
+        return Err(STATIC_ERROR);
+    }
+    let mut output = Vec::new();
+    child
+        .stdout
+        .take()
+        .ok_or(STATIC_ERROR)?
+        .take((MAX_OUTPUT_BYTES + 1) as u64)
+        .read_to_end(&mut output)
+        .map_err(|_| STATIC_ERROR)?;
+    if output.len() > MAX_OUTPUT_BYTES {
+        return Err(STATIC_ERROR);
+    }
+    serde_json::from_slice(&output).map_err(|_| STATIC_ERROR)
+}
+
+fn terminal_report_fixtures() -> Vec<Value> {
+    [
+        "passed", "action", "startup", "sidecar", "protocol", "cleanup",
+    ]
+    .into_iter()
+    .map(terminal_report_fixture)
+    .collect()
+}
+
+fn terminal_report_fixture(kind: &str) -> Value {
+    let fixture = Fixture::new();
+    let actions = if kind == "action" {
+        json!(["editor-save"])
+    } else {
+        json!([])
+    };
+    let protocol = SmokeProtocol::from_environment(
+        &fixture.environment(
+            &format!("terminal-{kind}-token"),
+            json!({ "actions": actions }),
+        ),
+        &fixture.root,
+    );
+    let plan = protocol.plan().plan.expect("terminal fixture plan");
+    match kind {
+        "passed" => protocol
+            .complete(complete_passed(0))
+            .expect("complete passed fixture"),
+        "action" => {
+            protocol
+                .record_step(step(SmokeAction::EditorSave, SmokeStepState::Started, 0))
+                .expect("start failed action fixture");
+            let failure = diagnostic("action-failed", "Smoke action failed.");
+            protocol
+                .record_step(RecordStepRequest {
+                    action: SmokeAction::EditorSave,
+                    state: SmokeStepState::Failed,
+                    duration_ms: 1,
+                    diagnostic: Some(failure.clone()),
+                })
+                .expect("fail action fixture");
+            protocol
+                .complete(CompleteRequest {
+                    status: SmokeTerminalStatus::Failed,
+                    failure_phase: Some(FailurePhase::Action),
+                    duration_ms: 1,
+                    diagnostic: Some(failure),
+                })
+                .expect("complete action failure fixture")
+        }
+        "startup" | "sidecar" | "protocol" | "cleanup" => {
+            let (phase, code, message) = match kind {
+                "startup" => (
+                    FailurePhase::Startup,
+                    "startup-failed",
+                    "Application startup failed.",
+                ),
+                "sidecar" => (
+                    FailurePhase::Sidecar,
+                    "sidecar-failed",
+                    "Backend sidecar failed.",
+                ),
+                "protocol" => (
+                    FailurePhase::Protocol,
+                    "protocol-failed",
+                    "Smoke protocol failed.",
+                ),
+                "cleanup" => (
+                    FailurePhase::Cleanup,
+                    "cleanup-failed",
+                    "Process cleanup failed.",
+                ),
+                _ => unreachable!("closed terminal fixture kind"),
+            };
+            protocol
+                .complete(CompleteRequest {
+                    status: SmokeTerminalStatus::Failed,
+                    failure_phase: Some(phase),
+                    duration_ms: 0,
+                    diagnostic: Some(diagnostic(code, message)),
+                })
+                .expect("complete terminal failure fixture")
+        }
+        _ => unreachable!("closed terminal fixture kind"),
+    };
+    let value: Value = serde_json::from_slice(
+        &fs::read(fixture.report_path()).expect("read terminal fixture report"),
+    )
+    .expect("parse terminal fixture report");
+    json!({
+        "value": value,
+        "expected": {
+            "specSha256": plan.spec_sha256,
+            "scenario": plan.scenario,
+            "profile": plan.profile,
+            "actions": plan.actions
+        }
+    })
+}
+
+#[test]
+fn smoke_rust_and_node_spec_acceptance_matches() {
+    let token = "node-parity-token";
+    let specs = vec![
+        smoke_spec_value(token, json!({})),
+        smoke_spec_value(
+            token,
+            json!({ "scenario": "critical-empty", "files": [], "actions": [] }),
+        ),
+        smoke_spec_value(
+            token,
+            json!({ "schema": "ride.tauri-packaged-smoke-spec@1" }),
+        ),
+        smoke_spec_value(token, json!({ "workspace": "../outside" })),
+        smoke_spec_value(
+            token,
+            json!({ "actions": ["terminal-sentinel", "editor-save"] }),
+        ),
+        smoke_spec_value(token, json!({ "unexpected": "must-be-rejected" })),
+    ];
+    let rust = specs
+        .iter()
+        .map(|value| rust_accepts_spec(value, token))
+        .collect::<Vec<_>>();
+    let node = run_node_contract(&json!({ "specs": specs, "reports": [] }))
+        .expect("run real Node smoke contract");
+
+    assert_eq!(node["specs"], json!(rust));
+    assert_eq!(rust, [true, true, false, false, false, false]);
+}
+
+#[test]
+fn smoke_node_accepts_all_rust_terminal_report_shapes() {
+    let terminal_reports = terminal_report_fixtures();
+    let result = run_node_contract(&json!({ "specs": [], "reports": terminal_reports }))
+        .expect("validate Rust reports with real Node contract");
+
+    assert_eq!(
+        result["reports"],
+        json!([true, true, true, true, true, true])
+    );
+}
+
+#[test]
+fn smoke_node_runner_is_bounded_and_non_echoing() {
+    let secret = "C:\\private\\node-contract-secret";
+    let error = run_node_contract_with_program(
+        "ride-node-executable-that-does-not-exist",
+        &json!({ "specs": [{ "secret": secret }], "reports": [] }),
+    )
+    .expect_err("missing Node executable returns static error");
+
+    assert_eq!(error, "Node smoke parity runner failed.");
+    assert!(!error.contains(secret));
+
+    let oversized_secret = format!("{secret}{}", "x".repeat(64 * 1024));
+    let oversized_error = run_node_contract(&json!({
+        "specs": [{ "secret": oversized_secret }],
+        "reports": []
+    }))
+    .expect_err("oversized Node fixture is rejected before spawning");
+    assert_eq!(oversized_error, "Node smoke parity runner failed.");
+    assert!(!oversized_error.contains(secret));
 }
