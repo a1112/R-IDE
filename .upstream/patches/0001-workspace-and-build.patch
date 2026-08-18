@@ -1,8 +1,8 @@
 diff --git a/.gitignore b/.gitignore
-index 7e83a50..a8cddf2 100644
+index 7e83a50..285295f 100644
 --- a/.gitignore
 +++ b/.gitignore
-@@ -11,4 +11,24 @@
+@@ -11,4 +11,31 @@
  license-check-summary.txt*
  .theia-ide/chatSessions
  .prompts
@@ -14,6 +14,13 @@ index 7e83a50..a8cddf2 100644
 +**/target/
 +**/browser-frontend/
 +**/tauri-frontend/
++**/.ride-tauri-profile/
++**/.ride-tauri-profile/builds/
++**/.ride-tauri-publish.lock/
++**/.ride-tauri-publish.lock.stale-*/
++**/.lib.tmp-*/
++**/.lib.old-*/
++**/.lib.transaction-*
 +**/resources/backend/*
 +**/resources/plugins/*
 +!**/resources/backend/
@@ -48,7 +55,7 @@ index 882bfac..7573561 100644
 \ No newline at end of file
 +}
 diff --git a/package.json b/package.json
-index 95188d1..dad46b8 100644
+index 95188d1..1b079a9 100644
 --- a/package.json
 +++ b/package.json
 @@ -1,6 +1,6 @@
@@ -68,7 +75,11 @@ index 95188d1..dad46b8 100644
      "@types/yargs": "^17",
      "@typescript-eslint/eslint-plugin": "^4.33.0",
      "@typescript-eslint/eslint-plugin-tslint": "^4.33.0",
-@@ -33,7 +33,7 @@
+@@ -30,10 +30,11 @@
+     "eslint-plugin-react": "^7.37.5",
+     "lerna": "^9.0.7",
+     "node-gyp": "^11.5.0",
++    "proper-lockfile": "4.1.2",
      "rimraf": "^2.7.1",
      "ts-node": "^10.9.2",
      "type-fest": "^0.20.2",
@@ -77,7 +88,7 @@ index 95188d1..dad46b8 100644
    },
    "scripts": {
      "clean": "lerna run clean && rimraf node_modules",
-@@ -43,9 +43,9 @@
+@@ -43,9 +44,9 @@
      "build:applications:dev": "lerna run --scope=\"theia-ide*app\" --ignore=\"theia-ide-next*\" build --concurrency 1",
      "build:applications:next": "lerna run --scope=\"theia-ide-next*\" build:prod --concurrency 1",
      "build:applications:next:dev": "lerna run --scope=\"theia-ide-next*\" build --concurrency 1",
@@ -90,7 +101,7 @@ index 95188d1..dad46b8 100644
      "package:applications": "lerna run --scope=\"theia-ide*app\" --ignore=\"theia-ide-next*\" package --concurrency 1",
      "package:applications:preview": "lerna run --scope=\"theia-ide*app\" --ignore=\"theia-ide-next*\" package:preview --concurrency 1",
      "package:applications:prod": "lerna run --scope=\"theia-ide*app\" --ignore=\"theia-ide-next*\" package:prod --concurrency 1",
-@@ -53,22 +53,30 @@
+@@ -53,22 +54,32 @@
      "permissions:writeable": "ts-node scripts/make-files-writeable.ts plugins",
      "watch": "lerna run --parallel watch",
      "test": "lerna run test",
@@ -99,6 +110,8 @@ index 95188d1..dad46b8 100644
 +    "check:rust": "node scripts/check-rust.js",
 +    "test:tauri-rust": "node scripts/run-tauri-tests.js",
 +    "measure:tauri-startup": "node scripts/measure-tauri-startup.mjs",
++    "verify:tauri-profile": "node scripts/verify-tauri-profile.mjs",
++    "check:tauri-performance": "node scripts/check-tauri-performance.mjs --baseline applications/tauri/perf/baselines/pre-optimization-windows-x64-d034943.json --min-startup-gain 30 --min-memory-gain 10",
      "electron": "yarn --cwd applications/electron",
      "electron-next": "yarn --cwd applications/electron-next",
      "browser": "yarn --cwd applications/browser",
@@ -124,7 +137,7 @@ index 95188d1..dad46b8 100644
      "vscjava.vscode-java-pack": "https://open-vsx.org/api/vscjava/vscode-java-pack/0.30.5/file/vscjava.vscode-java-pack-0.30.5.vsix",
      "vscjava.vscode-java-dependency": "https://open-vsx.org/api/vscjava/vscode-java-dependency/0.27.0/file/vscjava.vscode-java-dependency-0.27.0.vsix"
    },
-@@ -82,25 +90,42 @@
+@@ -82,25 +93,42 @@
      "theia-extensions/*"
    ],
    "resolutions": {
