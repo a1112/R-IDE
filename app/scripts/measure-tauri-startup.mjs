@@ -2080,7 +2080,6 @@ function waitForReadableEnd(stream, timeoutMs = STREAM_SETTLE_TIMEOUT_MS) {
     };
     const onSettled = () => finish(true);
     const timer = setTimeout(() => finish(false), timeoutMs);
-    timer.unref?.();
     stream.once('end', onSettled);
     stream.once('close', onSettled);
   });

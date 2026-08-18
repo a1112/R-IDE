@@ -4645,6 +4645,49 @@ test('bounded log capture exposes a controlled stream-settle seam', async () => 
   assert.match(source.slice(start, end), /settleTimeoutMs/);
 });
 
+test('bounded log capture settle deadline keeps isolated persistence alive', () => {
+  const root = temporaryDirectory('capture-isolated-timeout');
+  const modulePath = path.join(import.meta.dirname, '..', 'measure-tauri-startup.mjs');
+  const stdoutLogPath = path.join(root, 'stdout.log');
+  const stderrLogPath = path.join(root, 'stderr.log');
+  const script = `
+    import { EventEmitter } from 'node:events';
+    import { pathToFileURL } from 'node:url';
+    const { attachBoundedLogCapture } = await import(pathToFileURL(${JSON.stringify(modulePath)}));
+    class NeverEndingReadable extends EventEmitter {
+      readableEnded = false;
+      closed = false;
+      destroyed = false;
+      destroy() {
+        this.destroyed = true;
+        this.closed = true;
+        this.emit('close');
+      }
+    }
+    const stdout = new NeverEndingReadable();
+    const stderr = new NeverEndingReadable();
+    const capture = attachBoundedLogCapture(
+      { stdout, stderr },
+      { stdoutLogPath: ${JSON.stringify(stdoutLogPath)}, stderrLogPath: ${JSON.stringify(stderrLogPath)} },
+      [],
+      { settleTimeoutMs: 5 },
+    );
+    await capture.persist();
+    process.stdout.write('persisted');
+  `;
+
+  try {
+    const result = spawnSync(process.execPath, ['--input-type=module', '--eval', script], {
+      encoding: 'utf8',
+      timeout: 5_000,
+    });
+    assert.equal(result.status, 0, result.stderr || `isolated capture exited ${result.status}`);
+    assert.equal(result.stdout, 'persisted');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('bounded log capture destroys timed-out pipes safely and persists idempotently', async () => {
   class ControlledReadable extends EventEmitter {
     readableEnded = false;
