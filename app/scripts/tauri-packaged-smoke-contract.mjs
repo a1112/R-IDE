@@ -119,7 +119,7 @@ function enumValue(value, allowed, label) {
 }
 
 function validateWindowsPortableSegment(segment, label, index) {
-  if (segment.includes(':') || segment.endsWith('.') || segment.endsWith(' ')) {
+  if (/[<>:"|?*\u0000-\u001f]/u.test(segment) || segment.endsWith('.') || segment.endsWith(' ')) {
     fail(`${label} must be Windows-portable at segment ${index}`);
   }
   const deviceName = segment.split('.', 1)[0].toUpperCase();
@@ -129,7 +129,7 @@ function validateWindowsPortableSegment(segment, label, index) {
 }
 
 function relativePath(value, label, { allowDot = false } = {}) {
-  if (typeof value !== 'string' || value.length === 0 || value.trim() !== value || value.includes('\0')) {
+  if (typeof value !== 'string' || value.length === 0 || value.trim() !== value) {
     fail(`${label} must be a non-empty relative path`);
   }
   const slashPath = value.replaceAll('\\', '/');

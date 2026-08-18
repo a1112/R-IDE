@@ -271,6 +271,57 @@ test('requires Windows-portable relative workspace and file paths', () => {
   })).files, ['com10.R', 'auxiliary.R']);
 });
 
+test('rejects every Windows-forbidden filename character in every path segment', () => {
+  const forbiddenCharacters = ['<', '>', '"', '|', '?', '*', ':'];
+
+  for (const character of forbiddenCharacters) {
+    const unsafePaths = [
+      `bad${character}segment/file.R`,
+      `nested/file${character}.R`,
+    ];
+    for (const unsafePath of unsafePaths) {
+      assert.throws(
+        () => validateSmokeSpec(smokeSpec({ workspace: unsafePath })),
+        /workspace.*(?:Windows-portable|relative path)/i,
+      );
+      assert.throws(
+        () => validateSmokeSpec(smokeSpec({ files: [unsafePath] })),
+        /files\[0\].*(?:Windows-portable|relative path)/i,
+      );
+    }
+  }
+});
+
+test('rejects every ASCII control character in Windows path segments', () => {
+  for (let codePoint = 0x00; codePoint <= 0x1f; codePoint += 1) {
+    const character = String.fromCodePoint(codePoint);
+    const unsafePaths = [
+      `bad${character}segment/file.R`,
+      `nested/file${character}.R`,
+    ];
+    for (const unsafePath of unsafePaths) {
+      assert.throws(
+        () => validateSmokeSpec(smokeSpec({ workspace: unsafePath })),
+        /workspace.*Windows-portable/i,
+      );
+      assert.throws(
+        () => validateSmokeSpec(smokeSpec({ files: [unsafePath] })),
+        /files\[0\].*Windows-portable/i,
+      );
+    }
+  }
+});
+
+test('accepts valid Unicode filenames on Windows-portable paths', () => {
+  const spec = validateSmokeSpec(smokeSpec({
+    workspace: '数据/项目',
+    files: ['分析/启动.R', 'café/数据📊.R'],
+  }));
+
+  assert.equal(spec.workspace, '数据/项目');
+  assert.deepEqual(spec.files, ['分析/启动.R', 'café/数据📊.R']);
+});
+
 test('requires actions to be known, unique, and in canonical order', () => {
   assert.deepEqual(
     validateSmokeSpec(smokeSpec({ actions: ['editor-save', 'scm-status', 'secondary-window'] })).actions,
