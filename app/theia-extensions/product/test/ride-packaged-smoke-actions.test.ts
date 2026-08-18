@@ -81,6 +81,8 @@ function editorServices(options: {
     persist?: boolean;
     persistedInitial?: string;
     normalizeInsertedEol?: boolean;
+    initialContent?: string;
+    mutateAfterReplace?: (content: string, inserted: string) => string;
 } = {}): {
     services: RidePackagedSmokeActionServices;
     getBuffer: () => string;
@@ -88,7 +90,7 @@ function editorServices(options: {
     replaceCalls: unknown[];
     saveCalls: number;
 } {
-    let buffer = 'x <- 1\n';
+    let buffer = options.initialContent ?? 'x <- 1\n';
     let persisted = options.persistedInitial ?? buffer;
     let saveCalls = 0;
     const replaceCalls: unknown[] = [];
@@ -108,9 +110,9 @@ function editorServices(options: {
         replaceText: async (request: { replaceOperations: Array<{ text: string }> }) => {
             replaceCalls.push(request);
             const inserted = options.normalizeInsertedEol
-                ? request.replaceOperations[0].text.replace(/\n/gu, '\r\n')
+                ? request.replaceOperations[0].text.replace(/\r?\n/gu, '\r\n')
                 : request.replaceOperations[0].text;
-            buffer += inserted;
+            buffer = options.mutateAfterReplace?.(buffer, inserted) ?? buffer + inserted;
             return true;
         }
     };
@@ -172,10 +174,98 @@ test('smoke action editor-save rejects a stale marker when the new append was no
     );
 });
 
-test('smoke action editor-save verifies Monaco-normalized CRLF document content', async () => {
-    const fixture = editorServices({ normalizeInsertedEol: true });
-    await new RidePackagedSmokeActionService(fixture.services).editorSave(plan());
-    assert.match(fixture.getPersisted(), /\r\n# RIDE_PACKAGED_SMOKE_EDITOR_MARKER\r\n/u);
+test('smoke action editor-save verifies exact LF and Monaco-normalized CRLF appends', async t => {
+    const cases = [
+        ['LF', 'x <- 1\n', `x <- 1\n# ${RIDE_SMOKE_EDITOR_MARKER}\n`],
+        ['CRLF', 'x <- 1\r\n', `x <- 1\r\n# ${RIDE_SMOKE_EDITOR_MARKER}\r\n`]
+    ] as const;
+    for (const [name, initialContent, expected] of cases) {
+        await t.test(name, async () => {
+            const fixture = editorServices({ initialContent, normalizeInsertedEol: name === 'CRLF' });
+            await new RidePackagedSmokeActionService(fixture.services).editorSave(plan());
+            assert.equal(fixture.getPersisted(), expected);
+        });
+    }
+});
+
+test('smoke action editor-save rejects non-append edits before saving', async t => {
+    const initial = 'alpha\nbeta\n';
+    const cases: Array<[string, (content: string, inserted: string) => string]> = [
+        ['marker inserted in the middle', (content, inserted) => `${content.slice(0, 6)}${inserted}${content.slice(6)}`],
+        ['original content replaced', (_content, inserted) => inserted],
+        ['concurrent trailing text', (content, inserted) => `${content}${inserted}late mutation\n`]
+    ];
+    for (const [name, mutateAfterReplace] of cases) {
+        await t.test(name, async () => {
+            const fixture = editorServices({ initialContent: initial, mutateAfterReplace });
+            await assert.rejects(
+                new RidePackagedSmokeActionService(fixture.services).editorSave(plan()),
+                /Smoke action failed\./
+            );
+            assert.equal(fixture.saveCalls, 0);
+        });
+    }
+});
+
+test('smoke action editor-save bounds every asynchronous editor stage and consumes late settlement', async t => {
+    for (const stage of ['replace', 'save', 'read'] as const) {
+        for (const late of ['resolve', 'reject'] as const) {
+            await t.test(`${stage} ${late}`, async () => {
+                const pending = deferred<unknown>();
+                let buffer = 'x <- 1\n';
+                let saves = 0;
+                let reads = 0;
+                const append = `# ${RIDE_SMOKE_EDITOR_MARKER}\n`;
+                const services = workspaceServices({
+                    pollTimeoutMs: 5,
+                    editorManager: {
+                        activeEditor: {
+                            editor: {
+                                uri: EXPECTED,
+                                document: {
+                                    getText: () => buffer,
+                                    positionAt: () => ({ line: 1, character: 0 }),
+                                    save: async () => {
+                                        saves++;
+                                        if (stage === 'save') {
+                                            await pending.promise;
+                                        }
+                                    }
+                                },
+                                replaceText: async () => {
+                                    if (stage === 'replace') {
+                                        await pending.promise;
+                                    }
+                                    buffer += append;
+                                    return true;
+                                }
+                            }
+                        }
+                    },
+                    fileService: {
+                        read: async () => {
+                            reads++;
+                            if (stage === 'read') {
+                                await pending.promise;
+                            }
+                            return { value: buffer };
+                        },
+                        exists: async () => false
+                    }
+                });
+                const result = await outcomeWithin(new RidePackagedSmokeActionService(services).editorSave(plan()));
+                assert.equal((result as Error).message, 'Smoke action timed out.');
+                if (late === 'resolve') {
+                    pending.resolve(stage === 'replace' ? true : undefined);
+                } else {
+                    pending.reject(new Error(`sensitive late ${stage} failure`));
+                }
+                await turn();
+                assert.equal(saves, stage === 'replace' ? 0 : 1);
+                assert.equal(reads, stage === 'read' ? 1 : 0);
+            });
+        }
+    }
 });
 
 function terminalFixture(windows: boolean, sentinelAppears: boolean = true): {
@@ -281,6 +371,22 @@ test('smoke actions reject non-dot plan workspace before any workbench side effe
 test('smoke action terminal-sentinel selects the fixed Unix command', async () => {
     const fixture = terminalFixture(false);
     await new RidePackagedSmokeActionService(fixture.services).terminalSentinel(plan());
+    assert.deepEqual(fixture.commands, [RIDE_SMOKE_UNIX_COMMAND]);
+});
+
+test('critical-empty runs terminal-sentinel without a file and rejects file-dependent actions', async () => {
+    const fixture = terminalFixture(false);
+    const emptyPlan = plan({
+        scenario: 'critical-empty',
+        files: Object.freeze([]),
+        actions: Object.freeze<RideSmokeAction[]>(['terminal-sentinel'])
+    });
+
+    await new RidePackagedSmokeActionService(fixture.services).terminalSentinel(emptyPlan);
+    await assert.rejects(new RidePackagedSmokeActionService(editorServices().services).editorSave(emptyPlan), /Smoke action unavailable\./);
+    await assert.rejects(new RidePackagedSmokeActionService(searchServices(EXPECTED).services).workspaceSearch(emptyPlan), /Smoke action unavailable\./);
+    await assert.rejects(new RidePackagedSmokeActionService(scmServices(ROOT, EXPECTED)).scmStatus(emptyPlan), /Smoke action unavailable\./);
+    assert.equal(fixture.starts, 1);
     assert.deepEqual(fixture.commands, [RIDE_SMOKE_UNIX_COMMAND]);
 });
 
@@ -563,11 +669,36 @@ test('smoke action scm-status verifies the workspace repository changed resource
     await new RidePackagedSmokeActionService(scmServices(ROOT, EXPECTED)).scmStatus(plan());
 });
 
+test('smoke action scm-status observes repositories and resources registered after polling starts', async () => {
+    let reads = 0;
+    const services = workspaceServices({
+        pollIntervalMs: 1,
+        pollTimeoutMs: 50,
+        scmService: {
+            get repositories() {
+                reads++;
+                if (reads === 1) {
+                    return [];
+                }
+                return [{
+                    provider: {
+                        rootUri: ROOT.toString(),
+                        groups: [{ resources: reads >= 3 ? [{ sourceUri: EXPECTED }] : [] }]
+                    }
+                }];
+            }
+        }
+    });
+
+    await new RidePackagedSmokeActionService(services).scmStatus(plan());
+    assert.equal(reads >= 3, true);
+});
+
 test('smoke action scm-status rejects wrong repositories, resources, and missing refresh', async t => {
     await t.test('wrong repository', async () => {
         await assert.rejects(
             new RidePackagedSmokeActionService(scmServices(new URI('file:///C:/other'), EXPECTED)).scmStatus(plan()),
-            /Smoke action unavailable\./
+            /Smoke action timed out\./
         );
     });
     await t.test('wrong resource', async () => {
@@ -578,10 +709,82 @@ test('smoke action scm-status rejects wrong repositories, resources, and missing
     });
     await t.test('no repository', async () => {
         await assert.rejects(
-            new RidePackagedSmokeActionService(workspaceServices({ scmService: { repositories: [] } })).scmStatus(plan()),
-            /Smoke action unavailable\./
+            new RidePackagedSmokeActionService(workspaceServices({
+                pollIntervalMs: 1,
+                pollTimeoutMs: 8,
+                scmService: { repositories: [] }
+            })).scmStatus(plan()),
+            /Smoke action timed out\./
         );
     });
+});
+
+test('Task 4 action deadlines start before workspace roots and suppress every late side effect', async t => {
+    for (const late of ['resolve', 'reject'] as const) {
+        await t.test(late, async () => {
+            const roots = deferred<readonly [{ readonly resource: URI }]>();
+            const sideEffects = { editor: 0, terminal: 0, search: 0, scm: 0 };
+            const services: RidePackagedSmokeActionServices = {
+                workspaceService: { roots: roots.promise },
+                pollIntervalMs: 1,
+                pollTimeoutMs: 5,
+                editorManager: {
+                    activeEditor: {
+                        editor: {
+                            uri: EXPECTED,
+                            document: {
+                                getText: () => 'x <- 1\n',
+                                positionAt: () => ({ line: 1, character: 0 }),
+                                save: async () => undefined
+                            },
+                            replaceText: async () => { sideEffects.editor++; return true; }
+                        }
+                    }
+                },
+                fileService: {
+                    read: async () => ({ value: '' }),
+                    exists: async () => false
+                },
+                terminalService: {
+                    newTerminal: async () => {
+                        sideEffects.terminal++;
+                        return { start: async () => 1, sendText: () => undefined, dispose: () => undefined };
+                    }
+                },
+                searchService: {
+                    searchWithCallback: async () => { sideEffects.search++; return 1; },
+                    cancel: () => undefined
+                },
+                scmService: {
+                    get repositories() {
+                        sideEffects.scm++;
+                        return [];
+                    }
+                }
+            };
+            const actions = new RidePackagedSmokeActionService(services);
+            const outcomes = await Promise.all([
+                outcomeWithin(actions.editorSave(plan())),
+                outcomeWithin(actions.terminalSentinel(plan())),
+                outcomeWithin(actions.workspaceSearch(plan())),
+                outcomeWithin(actions.scmStatus(plan()))
+            ]);
+
+            assert.deepEqual(outcomes.map(outcome => (outcome as Error).message), [
+                'Smoke action timed out.',
+                'Smoke action timed out.',
+                'Smoke action timed out.',
+                'Smoke action timed out.'
+            ]);
+            if (late === 'resolve') {
+                roots.resolve([{ resource: ROOT }]);
+            } else {
+                roots.reject(new Error('sensitive late roots failure'));
+            }
+            await turn();
+            assert.deepEqual(sideEffects, { editor: 0, terminal: 0, search: 0, scm: 0 });
+        });
+    }
 });
 
 test('smoke action service dispose prevents new side effects', async () => {

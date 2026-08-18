@@ -112,7 +112,6 @@ export interface RidePackagedSmokeActionServices {
     readonly backendIsWindows?: boolean;
     readonly pollIntervalMs?: number;
     readonly pollTimeoutMs?: number;
-    readonly now?: () => number;
     readonly setTimeout?: (callback: () => void, timeoutMs: number) => unknown;
     readonly clearTimeout?: (handle: unknown) => void;
 }
@@ -130,11 +129,18 @@ class RideSmokeActionError extends Error {
     }
 }
 
+interface RideSmokeActionRun {
+    readonly aborted: boolean;
+    assertActive(): void;
+    wait<T>(value: PromiseLike<T> | T): Promise<T>;
+    delay(timeoutMs: number): Promise<void>;
+    onAbort(callback: () => void): () => void;
+}
+
 export class RidePackagedSmokeActionService implements RidePackagedSmokeActions, Disposable {
     protected readonly backendIsWindows: boolean;
     protected readonly pollIntervalMs: number;
     protected readonly pollTimeoutMs: number;
-    protected readonly now: () => number;
     protected readonly scheduleTimeout: (callback: () => void, timeoutMs: number) => unknown;
     protected readonly cancelTimeout: (handle: unknown) => void;
     protected readonly activeCancellations = new Set<() => void>();
@@ -144,7 +150,6 @@ export class RidePackagedSmokeActionService implements RidePackagedSmokeActions,
         this.backendIsWindows = services.backendIsWindows ?? OS.backend.isWindows;
         this.pollIntervalMs = services.pollIntervalMs ?? 100;
         this.pollTimeoutMs = services.pollTimeoutMs ?? 5_000;
-        this.now = services.now ?? (() => Date.now());
         this.scheduleTimeout = services.setTimeout ?? ((callback, timeoutMs) => globalThis.setTimeout(callback, timeoutMs));
         this.cancelTimeout = services.clearTimeout ?? (handle => globalThis.clearTimeout(
             handle as ReturnType<typeof globalThis.setTimeout>
@@ -163,37 +168,45 @@ export class RidePackagedSmokeActionService implements RidePackagedSmokeActions,
     }
 
     editorSave(plan: RideSmokePlan): Promise<void> {
-        return this.runSafely(async () => {
-            const { expectedFile } = await this.resolveWorkspace(plan);
+        return this.runAction(plan, async run => {
+            const root = await this.resolveWorkspaceRoot(plan, run);
+            const expectedFile = this.resolveExpectedFile(plan, root);
             const editorManager = this.requireService(this.services.editorManager);
             const fileService = this.requireService(this.services.fileService);
+            run.assertActive();
             const editor = editorManager.activeEditor?.editor;
             if (!editor || !this.uriEquals(editor.uri, expectedFile)) {
                 throw this.error('Smoke action unavailable.');
             }
-            this.ensureActive();
+            run.assertActive();
             const content = editor.document.getText();
             const end = editor.document.positionAt(content.length);
-            const markerAppend = `\n# ${RIDE_SMOKE_EDITOR_MARKER}\n`;
-            const changed = await editor.replaceText({
+            const eol = content.includes('\r\n') ? '\r\n' : '\n';
+            const markerAppend = `${content && !content.endsWith('\n') ? eol : ''}# ${RIDE_SMOKE_EDITOR_MARKER}${eol}`;
+            const expectedContent = content + markerAppend;
+            run.assertActive();
+            const changed = await run.wait(editor.replaceText({
                 source: 'ride-packaged-smoke',
                 replaceOperations: [{
                     range: { start: end, end },
                     text: markerAppend
                 }]
-            });
+            }));
             if (!changed) {
                 throw this.error('Smoke action failed.');
             }
-            this.ensureActive();
+            run.assertActive();
             const editedContent = editor.document.getText();
-            if (editedContent.length <= content.length
-                || this.markerCount(editedContent) <= this.markerCount(content)) {
+            if (editedContent !== expectedContent
+                || !editedContent.startsWith(content)
+                || !editedContent.endsWith(markerAppend)
+                || this.markerCount(editedContent) !== this.markerCount(content) + 1) {
                 throw this.error('Smoke action failed.');
             }
-            await editor.document.save();
-            this.ensureActive();
-            const persisted = await fileService.read(expectedFile);
+            run.assertActive();
+            await run.wait(editor.document.save());
+            run.assertActive();
+            const persisted = await run.wait(fileService.read(expectedFile));
             if (persisted.value !== editedContent) {
                 throw this.error('Smoke action failed.');
             }
@@ -201,15 +214,14 @@ export class RidePackagedSmokeActionService implements RidePackagedSmokeActions,
     }
 
     terminalSentinel(plan: RideSmokePlan): Promise<void> {
-        return this.runSafely(async () => {
-            const { root } = await this.resolveWorkspace(plan);
+        return this.runAction(plan, async run => {
+            const root = await this.resolveWorkspaceRoot(plan, run);
             const terminalService = this.requireService(this.services.terminalService);
             const fileService = this.requireService(this.services.fileService);
             const sentinel = this.resolveRelative(root, RIDE_SMOKE_TERMINAL_SENTINEL);
             const windows = this.backendIsWindows;
             let terminal: TerminalWidgetLike | undefined;
             let terminalDisposed = false;
-            let retired = false;
             const disposeTerminal = (candidate: TerminalWidgetLike | undefined): void => {
                 if (!candidate || terminalDisposed) {
                     return;
@@ -221,88 +233,82 @@ export class RidePackagedSmokeActionService implements RidePackagedSmokeActions,
                     // Cleanup failures must not expose implementation details or replace the terminal outcome.
                 }
             };
-            const retire = (): void => {
-                retired = true;
-                disposeTerminal(terminal);
-            };
+            const stopOnAbort = run.onAbort(() => disposeTerminal(terminal));
             try {
-                await this.withDeadline(async () => {
-                    const creation = Promise.resolve(terminalService.newTerminal({
-                        title: 'R-IDE Smoke',
-                        cwd: root,
-                        shellPath: windows ? 'powershell.exe' : '/bin/sh',
-                        shellArgs: windows ? ['-NoLogo', '-NoProfile', '-NonInteractive'] : [],
-                        destroyTermOnClose: true,
-                        hideFromUser: true,
-                        isTransient: true,
-                        kind: 'ride-smoke'
-                    }));
-                    creation.then(
-                        candidate => {
-                            if (retired) {
-                                disposeTerminal(candidate);
-                            }
-                        },
-                        () => undefined
-                    );
-                    const created = await creation;
-                    terminal = created;
-                    if (retired) {
-                        disposeTerminal(created);
+                run.assertActive();
+                const creation = Promise.resolve(terminalService.newTerminal({
+                    title: 'R-IDE Smoke',
+                    cwd: root,
+                    shellPath: windows ? 'powershell.exe' : '/bin/sh',
+                    shellArgs: windows ? ['-NoLogo', '-NoProfile', '-NonInteractive'] : [],
+                    destroyTermOnClose: true,
+                    hideFromUser: true,
+                    isTransient: true,
+                    kind: 'ride-smoke'
+                }));
+                creation.then(
+                    candidate => {
+                        if (run.aborted) {
+                            disposeTerminal(candidate);
+                        }
+                    },
+                    () => undefined
+                );
+                terminal = await run.wait(creation);
+                run.assertActive();
+                await run.wait(terminal.start());
+                run.assertActive();
+                terminal.sendText(windows ? RIDE_SMOKE_WINDOWS_COMMAND : RIDE_SMOKE_UNIX_COMMAND);
+                while (true) {
+                    run.assertActive();
+                    if (await run.wait(fileService.exists(sentinel))) {
                         return;
                     }
-                    await Promise.resolve(created.start());
-                    if (retired) {
-                        return;
-                    }
-                    this.ensureActive();
-                    created.sendText(windows ? RIDE_SMOKE_WINDOWS_COMMAND : RIDE_SMOKE_UNIX_COMMAND);
-                    while (!retired) {
-                        if (await fileService.exists(sentinel)) {
-                            return;
-                        }
-                        if (!retired) {
-                            await this.delay(this.pollIntervalMs);
-                        }
-                    }
-                }, plan.actionTimeoutMs, retire);
+                    await run.delay(this.pollIntervalMs);
+                }
             } finally {
-                retire();
+                stopOnAbort();
+                disposeTerminal(terminal);
             }
         });
     }
 
     workspaceSearch(plan: RideSmokePlan): Promise<void> {
-        return this.runSafely(async () => {
-            const { root, expectedFile } = await this.resolveWorkspace(plan);
+        return this.runAction(plan, async run => {
+            const root = await this.resolveWorkspaceRoot(plan, run);
+            const expectedFile = this.resolveExpectedFile(plan, root);
             const searchService = this.requireService(this.services.searchService);
-            await this.waitForSearch(searchService, root, expectedFile, plan.actionTimeoutMs);
+            await this.waitForSearch(searchService, root, expectedFile, run);
         });
     }
 
     scmStatus(plan: RideSmokePlan): Promise<void> {
-        return this.runSafely(async () => {
-            const { root, expectedFile } = await this.resolveWorkspace(plan);
+        return this.runAction(plan, async run => {
+            const root = await this.resolveWorkspaceRoot(plan, run);
+            const expectedFile = this.resolveExpectedFile(plan, root);
             const scmService = this.requireService(this.services.scmService);
-            const repository = scmService.repositories.find(candidate => {
-                try {
-                    return this.uriEquals(new URI(candidate.provider.rootUri), root);
-                } catch {
-                    return false;
-                }
-            });
-            if (!repository) {
-                throw this.error('Smoke action unavailable.');
-            }
-            await this.pollUntil(async () => repository.provider.groups.some(group =>
-                group.resources.some(resource => {
+            while (true) {
+                run.assertActive();
+                const repository = scmService.repositories.find(candidate => {
                     try {
-                        return this.uriEquals(new URI(resource.sourceUri.toString()), expectedFile);
+                        return this.uriEquals(new URI(candidate.provider.rootUri), root);
                     } catch {
                         return false;
                     }
-                })
-            ), plan.actionTimeoutMs);
+                });
+                if (repository?.provider.groups.some(group =>
+                    group.resources.some(resource => {
+                        try {
+                            return this.uriEquals(new URI(resource.sourceUri.toString()), expectedFile);
+                        } catch {
+                            return false;
+                        }
+                    })
+                )) {
+                    return;
+                }
+                await run.delay(this.pollIntervalMs);
+            }
         });
     }
 
@@ -321,24 +327,26 @@ export class RidePackagedSmokeActionService implements RidePackagedSmokeActions,
         throw this.error('Smoke action not ready.');
     }
 
-    protected async resolveWorkspace(plan: RideSmokePlan): Promise<{ root: URI; expectedFile: URI }> {
-        this.ensureActive();
+    protected async resolveWorkspaceRoot(plan: RideSmokePlan, run: RideSmokeActionRun): Promise<URI> {
+        run.assertActive();
         if (plan.workspace !== '.') {
             throw this.error('Smoke action unavailable.');
         }
         const workspaceService = this.requireService(this.services.workspaceService);
-        const roots = await workspaceService.roots;
-        this.ensureActive();
+        const roots = await run.wait(workspaceService.roots);
         if (roots.length !== 1 || roots[0].resource.scheme !== 'file'
             || !!roots[0].resource.query || !!roots[0].resource.fragment) {
             throw this.error('Smoke action unavailable.');
         }
-        const root = roots[0].resource.normalizePath().withoutQuery().withoutFragment();
+        return roots[0].resource.normalizePath().withoutQuery().withoutFragment();
+    }
+
+    protected resolveExpectedFile(plan: RideSmokePlan, root: URI): URI {
         const firstFile = plan.files[0];
         if (!firstFile) {
             throw this.error('Smoke action unavailable.');
         }
-        return { root, expectedFile: this.resolveRelative(root, firstFile) };
+        return this.resolveRelative(root, firstFile);
     }
 
     protected resolveRelative(root: URI, relative: string): URI {
@@ -371,7 +379,7 @@ export class RidePackagedSmokeActionService implements RidePackagedSmokeActions,
         searchService: SearchServiceLike,
         root: URI,
         expectedFile: URI,
-        actionTimeoutMs: number
+        run: RideSmokeActionRun
     ): Promise<void> {
         await new Promise<void>((resolve, reject) => {
             let settled = false;
@@ -379,7 +387,6 @@ export class RidePackagedSmokeActionService implements RidePackagedSmokeActions,
             let searchId: number | undefined;
             let cancelRequested = false;
             let searchCancelled = false;
-            let timer: unknown;
             const cancelSearch = (): void => {
                 if (!cancelRequested || searchCancelled || searchId === undefined) {
                     return;
@@ -396,14 +403,7 @@ export class RidePackagedSmokeActionService implements RidePackagedSmokeActions,
                     return;
                 }
                 settled = true;
-                this.activeCancellations.delete(cancel);
-                if (timer !== undefined) {
-                    try {
-                        this.cancelTimeout(timer);
-                    } catch {
-                        // Timer cleanup must not replace the bounded action result.
-                    }
-                }
+                stopOnAbort();
                 if (error) {
                     cancelRequested = true;
                     cancelSearch();
@@ -414,17 +414,8 @@ export class RidePackagedSmokeActionService implements RidePackagedSmokeActions,
                     resolve();
                 }
             };
-            const cancel = (): void => settle(this.error('Smoke action disposed.'));
-            this.activeCancellations.add(cancel);
-            try {
-                timer = this.scheduleTimeout(
-                    () => settle(this.error('Smoke action timed out.')),
-                    this.effectiveTimeout(actionTimeoutMs)
-                );
-            } catch {
-                settle(this.error('Smoke action failed.'));
-                return;
-            }
+            let stopOnAbort = (): void => undefined;
+            stopOnAbort = run.onAbort(() => settle(this.error('Smoke action disposed.')));
             const callbacks: SearchCallbacksLike = {
                 onResult: (_id, result) => {
                     if (settled || !result.matches.length) {
@@ -442,135 +433,29 @@ export class RidePackagedSmokeActionService implements RidePackagedSmokeActions,
                 },
                 onDone: (_id, error) => settle(error || !found ? this.error('Smoke action failed.') : undefined)
             };
-            Promise.resolve(searchService.searchWithCallback(
-                RIDE_SMOKE_EDITOR_MARKER,
-                [root.toString()],
-                callbacks,
-                { matchCase: true, maxResults: 20 }
-            )).then(
+            run.assertActive();
+            let search: Promise<number>;
+            try {
+                search = Promise.resolve(searchService.searchWithCallback(
+                    RIDE_SMOKE_EDITOR_MARKER,
+                    [root.toString()],
+                    callbacks,
+                    { matchCase: true, maxResults: 20 }
+                ));
+            } catch {
+                settle(this.error('Smoke action failed.'));
+                return;
+            }
+            search.then(
                 id => {
                     searchId = id;
+                    if (run.aborted) {
+                        cancelRequested = true;
+                    }
                     cancelSearch();
                 },
                 () => settle(this.error('Smoke action failed.'))
             );
-        });
-    }
-
-    protected async pollUntil(predicate: () => Promise<boolean>, actionTimeoutMs: number): Promise<void> {
-        const timeout = this.effectiveTimeout(actionTimeoutMs);
-        const deadline = this.now() + timeout;
-        while (true) {
-            this.ensureActive();
-            if (await predicate()) {
-                return;
-            }
-            this.ensureActive();
-            if (this.now() >= deadline) {
-                throw this.error('Smoke action timed out.');
-            }
-            await this.delay(Math.min(this.pollIntervalMs, Math.max(1, deadline - this.now())));
-        }
-    }
-
-    protected withDeadline<T>(
-        operation: () => Promise<T>,
-        actionTimeoutMs: number,
-        onAbort: () => void
-    ): Promise<T> {
-        return new Promise<T>((resolve, reject) => {
-            let settled = false;
-            let timerAssigned = false;
-            let timer: unknown;
-            const clearTimer = (): void => {
-                if (!timerAssigned) {
-                    return;
-                }
-                try {
-                    this.cancelTimeout(timer);
-                } catch {
-                    // Timer cleanup must not prevent settlement.
-                }
-            };
-            const finish = (value?: T, error?: RideSmokeActionError): void => {
-                if (settled) {
-                    return;
-                }
-                settled = true;
-                this.activeCancellations.delete(cancel);
-                clearTimer();
-                if (error) {
-                    reject(error);
-                } else {
-                    resolve(value as T);
-                }
-            };
-            const abort = (error: RideSmokeActionError): void => {
-                if (settled) {
-                    return;
-                }
-                try {
-                    onAbort();
-                } finally {
-                    finish(undefined, error);
-                }
-            };
-            const cancel = (): void => abort(this.error('Smoke action disposed.'));
-            this.activeCancellations.add(cancel);
-            try {
-                timer = this.scheduleTimeout(
-                    () => abort(this.error('Smoke action timed out.')),
-                    this.effectiveTimeout(actionTimeoutMs)
-                );
-                timerAssigned = true;
-                if (settled) {
-                    clearTimer();
-                }
-            } catch {
-                abort(this.error('Smoke action failed.'));
-            }
-            if (settled) {
-                return;
-            }
-            Promise.resolve().then(operation).then(
-                value => finish(value),
-                () => finish(undefined, this.error('Smoke action failed.'))
-            );
-        });
-    }
-
-    protected delay(timeoutMs: number): Promise<void> {
-        return new Promise<void>((resolve, reject) => {
-            let settled = false;
-            let handle: unknown;
-            const finish = (error?: RideSmokeActionError): void => {
-                if (settled) {
-                    return;
-                }
-                settled = true;
-                this.activeCancellations.delete(cancel);
-                if (error) {
-                    reject(error);
-                } else {
-                    resolve();
-                }
-            };
-            const cancel = (): void => {
-                if (handle !== undefined) {
-                    try {
-                        this.cancelTimeout(handle);
-                    } catch {
-                        // The promise is still settled below.
-                    }
-                }
-                finish(this.error('Smoke action disposed.'));
-            };
-            this.activeCancellations.add(cancel);
-            try {
-                handle = this.scheduleTimeout(() => finish(), timeoutMs);
-            } catch {
-                finish(this.error('Smoke action failed.'));
-            }
         });
     }
 
@@ -595,15 +480,171 @@ export class RidePackagedSmokeActionService implements RidePackagedSmokeActions,
         return new RideSmokeActionError(message);
     }
 
-    protected async runSafely(operation: () => Promise<void>): Promise<void> {
+    protected async runAction(
+        plan: RideSmokePlan,
+        operation: (run: RideSmokeActionRun) => Promise<void>
+    ): Promise<void> {
         this.ensureActive();
-        try {
-            await operation();
-        } catch (error) {
-            if (error instanceof RideSmokeActionError) {
-                throw error;
+        return new Promise<void>((resolve, reject) => {
+            let settled = false;
+            let timerAssigned = false;
+            let timer: unknown;
+            let abortError: RideSmokeActionError | undefined;
+            const abortCallbacks = new Set<() => void>();
+            const clearTimer = (): void => {
+                if (!timerAssigned) {
+                    return;
+                }
+                try {
+                    this.cancelTimeout(timer);
+                } catch {
+                    // Timer cleanup must not prevent settlement.
+                }
+            };
+            const finish = (error?: unknown): void => {
+                if (settled) {
+                    return;
+                }
+                settled = true;
+                this.activeCancellations.delete(cancel);
+                clearTimer();
+                abortCallbacks.clear();
+                if (error) {
+                    reject(error instanceof RideSmokeActionError ? error : this.error('Smoke action failed.'));
+                } else {
+                    resolve();
+                }
+            };
+            const abort = (error: RideSmokeActionError): void => {
+                if (settled) {
+                    return;
+                }
+                abortError = error;
+                for (const callback of [...abortCallbacks]) {
+                    try {
+                        callback();
+                    } catch {
+                        // Cancellation is best-effort; the bounded result remains authoritative.
+                    }
+                }
+                finish(error);
+            };
+            const cancel = (): void => abort(this.error('Smoke action disposed.'));
+            const assertActive = (): void => {
+                if (abortError) {
+                    throw abortError;
+                }
+                this.ensureActive();
+            };
+            const onAbort = (callback: () => void): (() => void) => {
+                if (abortError) {
+                    try {
+                        callback();
+                    } catch {
+                        // Cancellation is best-effort.
+                    }
+                    return () => undefined;
+                }
+                abortCallbacks.add(callback);
+                return () => abortCallbacks.delete(callback);
+            };
+            const wait = <T>(value: PromiseLike<T> | T): Promise<T> => {
+                const source = Promise.resolve(value);
+                return new Promise<T>((resolveWait, rejectWait) => {
+                    let waitSettled = false;
+                    let stopWaiting = (): void => undefined;
+                    const finishWait = (result?: T, error?: unknown): void => {
+                        if (waitSettled) {
+                            return;
+                        }
+                        waitSettled = true;
+                        stopWaiting();
+                        if (error) {
+                            rejectWait(error);
+                        } else {
+                            try {
+                                assertActive();
+                                resolveWait(result as T);
+                            } catch (activeError) {
+                                rejectWait(activeError);
+                            }
+                        }
+                    };
+                    stopWaiting = onAbort(() => finishWait(undefined, abortError));
+                    source.then(
+                        result => finishWait(result),
+                        error => finishWait(undefined, error)
+                    );
+                });
+            };
+            const delay = (timeoutMs: number): Promise<void> => {
+                let handleAssigned = false;
+                let handle: unknown;
+                let delaySettled = false;
+                return wait(new Promise<void>((resolveDelay, rejectDelay) => {
+                    let stopDelay = (): void => undefined;
+                    const finishDelay = (error?: unknown): void => {
+                        if (delaySettled) {
+                            return;
+                        }
+                        delaySettled = true;
+                        stopDelay();
+                        if (handleAssigned) {
+                            try {
+                                this.cancelTimeout(handle);
+                            } catch {
+                                // Timer cleanup must not prevent settlement.
+                            }
+                        }
+                        if (error) {
+                            rejectDelay(error);
+                        } else {
+                            resolveDelay();
+                        }
+                    };
+                    stopDelay = onAbort(() => finishDelay(abortError));
+                    try {
+                        handle = this.scheduleTimeout(() => finishDelay(), Math.max(1, timeoutMs));
+                        handleAssigned = true;
+                        if (delaySettled) {
+                            try {
+                                this.cancelTimeout(handle);
+                            } catch {
+                                // Synchronous schedulers may settle before returning a handle.
+                            }
+                        }
+                    } catch (error) {
+                        finishDelay(error);
+                    }
+                }));
+            };
+            const run: RideSmokeActionRun = {
+                get aborted(): boolean { return abortError !== undefined; },
+                assertActive,
+                wait,
+                delay,
+                onAbort
+            };
+            this.activeCancellations.add(cancel);
+            try {
+                timer = this.scheduleTimeout(
+                    () => abort(this.error('Smoke action timed out.')),
+                    this.effectiveTimeout(plan.actionTimeoutMs)
+                );
+                timerAssigned = true;
+                if (settled) {
+                    clearTimer();
+                }
+            } catch {
+                abort(this.error('Smoke action failed.'));
             }
-            throw this.error('Smoke action failed.');
-        }
+            if (settled) {
+                return;
+            }
+            Promise.resolve().then(() => operation(run)).then(
+                () => finish(),
+                error => finish(error)
+            );
+        });
     }
 }
