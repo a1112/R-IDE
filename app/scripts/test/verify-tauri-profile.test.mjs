@@ -4,6 +4,7 @@
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -13,6 +14,8 @@ import {
   verifyTauriProfileInventory,
 } from '../verify-tauri-profile.mjs';
 import { createProfileMetadataPlugin } from '../../applications/browser/tauri-src/esbuild-metadata.mjs';
+
+const require = createRequire(import.meta.url);
 
 function canonicalJson(value) {
   if (value === null || typeof value === 'boolean' || typeof value === 'string' || typeof value === 'number') {
@@ -378,8 +381,11 @@ test('profile builds emit named esbuild metadata and expose the verifier command
   assert.match(esbuildSource, /withProfileMetadata\(nodeOptions, 'backend'\)/);
   assert.match(metadataSource, /lib', 'metadata'/);
   assert.match(metadataSource, /metafile:\s*result\.metafile/);
-  const generatedBrowserOptions = fs.readFileSync(path.join(appDirectory, 'applications', 'browser', 'gen-esbuild.browser.mjs'), 'utf8');
-  assert.match(generatedBrowserOptions, /const sourcemap = production \? false : 'linked'/);
+  const bundlerGeneratorSource = fs.readFileSync(
+    require.resolve('@theia/application-manager/lib/generator/bundler-generator.js'),
+    'utf8',
+  );
+  assert.match(bundlerGeneratorSource, /const sourcemap = production \? false : 'linked'/);
 });
 
 test('metadata plugin atomically hashes successful outputs and removes stale records after failure', () => {
