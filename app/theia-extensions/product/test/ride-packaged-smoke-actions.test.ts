@@ -8,7 +8,10 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import URI from '@theia/core/lib/common/uri';
 import { Container, ContainerModule } from '@theia/core/shared/inversify';
-import { RidePackagedSmokeActions } from '../src/browser/ride-packaged-smoke';
+import {
+    RidePackagedSmokeActions,
+    RidePackagedSmokeContribution
+} from '../src/browser/ride-packaged-smoke';
 import type { RideSmokeAction, RideSmokePlan } from '../src/browser/ride-packaged-smoke';
 import { bindRidePackagedSmokeContribution } from '../src/browser/ride-packaged-smoke-bindings';
 import {
@@ -22,6 +25,36 @@ import {
 
 const ROOT = new URI('file:///C:/ride-smoke/workspace');
 const EXPECTED = ROOT.resolve('startup.R');
+
+interface Deferred<T> {
+    readonly promise: Promise<T>;
+    resolve(value: T): void;
+    reject(error: unknown): void;
+}
+
+function deferred<T>(): Deferred<T> {
+    let resolve!: (value: T) => void;
+    let reject!: (error: unknown) => void;
+    const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+        resolve = resolvePromise;
+        reject = rejectPromise;
+    });
+    return { promise, resolve, reject };
+}
+
+async function outcomeWithin(operation: Promise<void>, timeoutMs: number = 100): Promise<unknown> {
+    return new Promise(resolve => {
+        const timer = setTimeout(() => resolve(new Error('test guard elapsed')), timeoutMs);
+        operation.then(
+            () => { clearTimeout(timer); resolve(undefined); },
+            error => { clearTimeout(timer); resolve(error); }
+        );
+    });
+}
+
+async function turn(): Promise<void> {
+    await new Promise<void>(resolve => setImmediate(resolve));
+}
 
 function plan(patch: Partial<RideSmokePlan> = {}): RideSmokePlan {
     return Object.freeze({
@@ -43,7 +76,12 @@ function workspaceServices(overrides: Partial<RidePackagedSmokeActionServices> =
     };
 }
 
-function editorServices(options: { activeUri?: URI; persist?: boolean; persistedInitial?: string } = {}): {
+function editorServices(options: {
+    activeUri?: URI;
+    persist?: boolean;
+    persistedInitial?: string;
+    normalizeInsertedEol?: boolean;
+} = {}): {
     services: RidePackagedSmokeActionServices;
     getBuffer: () => string;
     getPersisted: () => string;
@@ -69,7 +107,10 @@ function editorServices(options: { activeUri?: URI; persist?: boolean; persisted
         document,
         replaceText: async (request: { replaceOperations: Array<{ text: string }> }) => {
             replaceCalls.push(request);
-            buffer += request.replaceOperations[0].text;
+            const inserted = options.normalizeInsertedEol
+                ? request.replaceOperations[0].text.replace(/\n/gu, '\r\n')
+                : request.replaceOperations[0].text;
+            buffer += inserted;
             return true;
         }
     };
@@ -131,6 +172,12 @@ test('smoke action editor-save rejects a stale marker when the new append was no
     );
 });
 
+test('smoke action editor-save verifies Monaco-normalized CRLF document content', async () => {
+    const fixture = editorServices({ normalizeInsertedEol: true });
+    await new RidePackagedSmokeActionService(fixture.services).editorSave(plan());
+    assert.match(fixture.getPersisted(), /\r\n# RIDE_PACKAGED_SMOKE_EDITOR_MARKER\r\n/u);
+});
+
 function terminalFixture(windows: boolean, sentinelAppears: boolean = true): {
     services: RidePackagedSmokeActionServices;
     options: unknown[];
@@ -175,14 +222,60 @@ function terminalFixture(windows: boolean, sentinelAppears: boolean = true): {
 
 test('smoke action terminal-sentinel uses a fixed Windows command and workspace cwd', async () => {
     const fixture = terminalFixture(true);
-    await new RidePackagedSmokeActionService(fixture.services).terminalSentinel(plan({ workspace: 'secret/path' }));
+    await new RidePackagedSmokeActionService(fixture.services).terminalSentinel(plan());
 
     assert.equal(fixture.starts, 1);
     assert.deepEqual(fixture.commands, [RIDE_SMOKE_WINDOWS_COMMAND]);
-    assert.equal(fixture.commands[0].includes('secret/path'), false);
     assert.equal(fixture.commands[0].includes('startup.R'), false);
     assert.equal((fixture.options[0] as { cwd: URI }).cwd.isEqual(ROOT), true);
     assert.equal(fixture.disposals, 1);
+});
+
+test('smoke actions reject non-dot plan workspace before any workbench side effect', async () => {
+    const sideEffects = { editor: 0, terminal: 0, search: 0, scm: 0 };
+    const services = workspaceServices({
+        editorManager: {
+            activeEditor: {
+                editor: {
+                    uri: EXPECTED,
+                    document: {
+                        getText: () => 'x <- 1\n',
+                        positionAt: () => ({ line: 1, character: 0 }),
+                        save: async () => undefined
+                    },
+                    replaceText: async () => { sideEffects.editor++; return true; }
+                }
+            }
+        },
+        fileService: {
+            read: async () => ({ value: '' }),
+            exists: async () => false
+        },
+        terminalService: {
+            newTerminal: async () => {
+                sideEffects.terminal++;
+                return { start: async () => 1, sendText: () => undefined, dispose: () => undefined };
+            }
+        },
+        searchService: {
+            searchWithCallback: async () => { sideEffects.search++; return 1; },
+            cancel: () => undefined
+        },
+        scmService: {
+            get repositories() {
+                sideEffects.scm++;
+                return [];
+            }
+        }
+    });
+    const mismatch = plan({ workspace: 'secret/path' });
+    const actions = new RidePackagedSmokeActionService(services);
+
+    await assert.rejects(actions.editorSave(mismatch), /Smoke action unavailable\./);
+    await assert.rejects(actions.terminalSentinel(mismatch), /Smoke action unavailable\./);
+    await assert.rejects(actions.workspaceSearch(mismatch), /Smoke action unavailable\./);
+    await assert.rejects(actions.scmStatus(mismatch), /Smoke action unavailable\./);
+    assert.deepEqual(sideEffects, { editor: 0, terminal: 0, search: 0, scm: 0 });
 });
 
 test('smoke action terminal-sentinel selects the fixed Unix command', async () => {
@@ -217,6 +310,114 @@ test('smoke action terminal-sentinel rejects missing services and an invalid ter
             error => error instanceof Error && error.message === 'Smoke action failed.'
         );
     });
+});
+
+function lateTerminalFixture(create: Promise<{
+    start(): Promise<number>;
+    sendText(command: string): void;
+    dispose(): void;
+}>): {
+    readonly services: RidePackagedSmokeActionServices;
+    readonly commands: string[];
+} {
+    const commands: string[] = [];
+    return {
+        commands,
+        services: workspaceServices({
+            pollIntervalMs: 1,
+            pollTimeoutMs: 10,
+            fileService: { read: async () => ({ value: '' }), exists: async () => false },
+            terminalService: { newTerminal: async () => create }
+        })
+    };
+}
+
+test('smoke action terminal-sentinel bounds pending creation and disposes a late terminal without starting it', async () => {
+    const creation = deferred<{
+        start(): Promise<number>;
+        sendText(command: string): void;
+        dispose(): void;
+    }>();
+    let starts = 0;
+    let disposals = 0;
+    const fixture = lateTerminalFixture(creation.promise);
+    const operation = new RidePackagedSmokeActionService(fixture.services).terminalSentinel(plan());
+
+    const result = await outcomeWithin(operation);
+    creation.resolve({
+        start: async () => { starts++; return 1; },
+        sendText: command => fixture.commands.push(command),
+        dispose: () => { disposals++; }
+    });
+    await turn();
+
+    assert.equal((result as Error).message, 'Smoke action timed out.');
+    assert.equal(starts, 0);
+    assert.deepEqual(fixture.commands, []);
+    assert.equal(disposals, 1);
+});
+
+test('smoke action terminal-sentinel consumes a late creation rejection after timeout', async () => {
+    const creation = deferred<{
+        start(): Promise<number>;
+        sendText(command: string): void;
+        dispose(): void;
+    }>();
+    const fixture = lateTerminalFixture(creation.promise);
+    const operation = new RidePackagedSmokeActionService(fixture.services).terminalSentinel(plan());
+
+    const result = await outcomeWithin(operation);
+    creation.reject(new Error('sensitive late create failure'));
+    await turn();
+
+    assert.equal((result as Error).message, 'Smoke action timed out.');
+    assert.deepEqual(fixture.commands, []);
+});
+
+test('smoke action terminal-sentinel bounds pending start and disposes exactly once before late completion', async t => {
+    for (const late of ['resolve', 'reject'] as const) {
+        await t.test(late, async () => {
+            const start = deferred<number>();
+            let disposals = 0;
+            const fixture = lateTerminalFixture(Promise.resolve({
+                start: () => start.promise,
+                sendText: command => fixture.commands.push(command),
+                dispose: () => { disposals++; }
+            }));
+            const operation = new RidePackagedSmokeActionService(fixture.services).terminalSentinel(plan());
+
+            const result = await outcomeWithin(operation);
+            if (late === 'resolve') {
+                start.resolve(1);
+            } else {
+                start.reject(new Error('sensitive late start failure'));
+            }
+            await turn();
+
+            assert.equal((result as Error).message, 'Smoke action timed out.');
+            assert.deepEqual(fixture.commands, []);
+            assert.equal(disposals, 1);
+        });
+    }
+});
+
+test('smoke action terminal-sentinel handles a synchronous timeout callback without TDZ failure', async () => {
+    let creates = 0;
+    const services = workspaceServices({
+        pollTimeoutMs: 10,
+        setTimeout: callback => { callback(); return 1; },
+        clearTimeout: () => { throw new Error('clear failed'); },
+        fileService: { read: async () => ({ value: '' }), exists: async () => false },
+        terminalService: {
+            newTerminal: async () => {
+                creates++;
+                return { start: async () => 1, sendText: () => undefined, dispose: () => undefined };
+            }
+        }
+    });
+    const result = await outcomeWithin(new RidePackagedSmokeActionService(services).terminalSentinel(plan()));
+    assert.equal((result as Error).message, 'Smoke action timed out.');
+    assert.equal(creates <= 1, true);
 });
 
 function searchServices(resultUri: URI | undefined): { services: RidePackagedSmokeActionServices; searches: unknown[][] } {
@@ -292,6 +493,57 @@ test('smoke action workspace-search times out and cancels an unfinished producti
     assert.equal(cancelled, 19);
 });
 
+test('smoke action workspace-search cancels an ID that resolves after timeout exactly once', async () => {
+    const id = deferred<number>();
+    const cancelled: number[] = [];
+    const services = workspaceServices({
+        pollTimeoutMs: 5,
+        searchService: {
+            searchWithCallback: async () => id.promise,
+            cancel: searchId => { cancelled.push(searchId); }
+        }
+    });
+    const operation = new RidePackagedSmokeActionService(services).workspaceSearch(plan());
+
+    await assert.rejects(operation, /Smoke action timed out\./);
+    assert.deepEqual(cancelled, []);
+    id.resolve(41);
+    await turn();
+    assert.deepEqual(cancelled, [41]);
+});
+
+test('smoke action workspace-search cancels a delayed ID after dispose and consumes late failures', async t => {
+    await t.test('delayed resolve and throwing cancel', async () => {
+        const id = deferred<number>();
+        const cancelled: number[] = [];
+        const services = workspaceServices({
+            searchService: {
+                searchWithCallback: async () => id.promise,
+                cancel: searchId => { cancelled.push(searchId); throw new Error('cancel failed'); }
+            }
+        });
+        const actions = new RidePackagedSmokeActionService(services);
+        const operation = actions.workspaceSearch(plan());
+        await turn();
+        actions.dispose();
+        await assert.rejects(operation, /Smoke action disposed\./);
+        id.resolve(53);
+        await turn();
+        assert.deepEqual(cancelled, [53]);
+    });
+    await t.test('delayed reject', async () => {
+        const id = deferred<number>();
+        const services = workspaceServices({
+            pollTimeoutMs: 5,
+            searchService: { searchWithCallback: async () => id.promise, cancel: () => undefined }
+        });
+        const operation = new RidePackagedSmokeActionService(services).workspaceSearch(plan());
+        await assert.rejects(operation, /Smoke action timed out\./);
+        id.reject(new Error('sensitive delayed search failure'));
+        await turn();
+    });
+});
+
 function scmServices(root: URI, resource: URI): RidePackagedSmokeActionServices {
     return workspaceServices({
         pollIntervalMs: 1,
@@ -349,7 +601,44 @@ test('smoke action Task 5 methods fail explicitly without resolving unrelated se
     await assert.rejects(actions.waitForSecondFile(plan()), /Smoke action not ready\./);
 });
 
-test('smoke action production binding lazily resolves every explicit adapter once as a singleton', () => {
+test('smoke action production shutdown is a no-op before the default actions service resolves', () => {
+    const container = new Container();
+    const identifiers = {
+        applicationState: Symbol('applicationState'),
+        contribution: Symbol('contribution'),
+        workspaceService: Symbol('workspaceService'),
+        editorManager: Symbol('editorManager'),
+        fileService: Symbol('fileService'),
+        terminalService: Symbol('terminalService'),
+        searchService: Symbol('searchService'),
+        scmService: Symbol('scmService')
+    };
+    let resolutions = 0;
+    for (const identifier of [
+        identifiers.workspaceService,
+        identifiers.editorManager,
+        identifiers.fileService,
+        identifiers.terminalService,
+        identifiers.searchService,
+        identifiers.scmService
+    ]) {
+        container.bind(identifier).toDynamicValue(() => {
+            resolutions++;
+            return {};
+        });
+    }
+    container.bind(identifiers.applicationState).toConstantValue({ reachedState: async () => undefined });
+    container.load(new ContainerModule(bind => bindRidePackagedSmokeContribution(bind, identifiers)));
+
+    const contributions = container.getAll<{ onStop?(): void }>(identifiers.contribution);
+    const shutdown = contributions.find(candidate => !(candidate instanceof RidePackagedSmokeContribution));
+    shutdown?.onStop?.();
+
+    assert.equal(contributions.length, 2);
+    assert.equal(resolutions, 0);
+});
+
+test('smoke action production binding lazily resolves every explicit adapter once as a singleton', async () => {
     const container = new Container();
     const identifiers = {
         applicationState: Symbol('applicationState'),
@@ -376,13 +665,27 @@ test('smoke action production binding lazily resolves every explicit adapter onc
             return service;
         }).inSingletonScope();
     }
+    container.bind(identifiers.applicationState).toConstantValue({ reachedState: async () => undefined });
     container.load(new ContainerModule(bind => bindRidePackagedSmokeContribution(bind, identifiers)));
     assert.equal(resolutions.size, 0);
 
     const first = container.get<RidePackagedSmokeActions>(RidePackagedSmokeActions);
     const second = container.get<RidePackagedSmokeActions>(RidePackagedSmokeActions);
+    const contributions = container.getAll<{ onStop?(): void }>(identifiers.contribution);
+    const shutdown = contributions.find(candidate => !(candidate instanceof RidePackagedSmokeContribution));
+    let disposals = 0;
+    const originalDispose = (first as RidePackagedSmokeActionService).dispose.bind(first);
+    (first as RidePackagedSmokeActionService).dispose = () => {
+        disposals++;
+        originalDispose();
+    };
+    shutdown?.onStop?.();
+    shutdown?.onStop?.();
 
     assert.strictEqual(first, second);
     assert.equal(first instanceof RidePackagedSmokeActionService, true);
     assert.deepEqual([...resolutions.values()], [1, 1, 1, 1, 1, 1]);
+    assert.equal(contributions.length, 2);
+    assert.equal(disposals, 1);
+    await assert.rejects(first.editorSave(plan()), /Smoke action disposed\./);
 });

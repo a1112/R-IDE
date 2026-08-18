@@ -24,6 +24,20 @@ import { RidePackagedSmokeActionService } from './ride-packaged-smoke-actions';
 
 declare const require: (moduleName: string) => Record<string, interfaces.ServiceIdentifier<unknown>>;
 
+export class RidePackagedSmokeActionShutdownContribution implements FrontendApplicationContribution {
+    protected stopped = false;
+
+    constructor(protected readonly shutdown: () => void) { }
+
+    onStop(): void {
+        if (this.stopped) {
+            return;
+        }
+        this.stopped = true;
+        this.shutdown();
+    }
+}
+
 export interface RidePackagedSmokeBindingIdentifiers {
     readonly applicationState: interfaces.ServiceIdentifier<FrontendApplicationStateService>;
     readonly contribution: interfaces.ServiceIdentifier<FrontendApplicationContribution>;
@@ -41,6 +55,8 @@ export function bindRidePackagedSmokeContribution(
     bind: interfaces.Bind,
     identifiers: RidePackagedSmokeBindingIdentifiers
 ): void {
+    let resolvedActions: RidePackagedSmokeActionService | undefined;
+    let actionsShutdown = false;
     let actionIdentifier = identifiers.actions;
     if (actionIdentifier === undefined) {
         bind(RidePackagedSmokeActionService).toDynamicValue(context => {
@@ -57,7 +73,7 @@ export function bindRidePackagedSmokeContribution(
                 ?? require('@theia/search-in-workspace/lib/browser/search-in-workspace-service').SearchInWorkspaceService;
             const scmService = identifiers.scmService
                 ?? require('@theia/scm/lib/browser/scm-service').ScmService;
-            return new RidePackagedSmokeActionService({
+            const actions = new RidePackagedSmokeActionService({
                 workspaceService: context.container.get(workspaceService) as WorkspaceService,
                 editorManager: context.container.get(editorManager) as EditorManager,
                 fileService: context.container.get(fileService) as FileService,
@@ -66,11 +82,23 @@ export function bindRidePackagedSmokeContribution(
                 scmService: context.container.get(scmService) as ScmService,
                 backendIsWindows: OS.backend.isWindows
             });
+            resolvedActions = actions;
+            if (actionsShutdown) {
+                actions.dispose();
+            }
+            return actions;
         }).inSingletonScope();
         bind(RidePackagedSmokeActions).toService(RidePackagedSmokeActionService);
         actionIdentifier = RidePackagedSmokeActions;
     }
     const smokeActionIdentifier = actionIdentifier;
+    bind(RidePackagedSmokeActionShutdownContribution).toDynamicValue(() =>
+        new RidePackagedSmokeActionShutdownContribution(() => {
+            actionsShutdown = true;
+            resolvedActions?.dispose();
+        })
+    ).inSingletonScope();
+    bind(identifiers.contribution).toService(RidePackagedSmokeActionShutdownContribution);
     let protocolIdentifier = identifiers.protocol;
     if (protocolIdentifier === undefined) {
         bind(RideTauriPackagedSmokeProtocol).toSelf().inSingletonScope();

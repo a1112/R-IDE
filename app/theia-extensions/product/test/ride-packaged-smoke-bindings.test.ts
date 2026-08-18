@@ -49,11 +49,14 @@ test('packaged smoke binding exposes one singleton frontend contribution with la
     container.load(new ContainerModule(bind => bindRidePackagedSmokeContribution(bind, identifiers)));
 
     const direct = container.get<RidePackagedSmokeContribution>(RidePackagedSmokeContribution);
-    const contributions = container.getAll(FrontendApplicationContribution);
-    assert.equal(contributions.length, 1);
-    assert.strictEqual(contributions[0], direct);
+    const contributions = container.getAll<FrontendApplicationContribution>(FrontendApplicationContribution);
+    assert.equal(contributions.length, 2);
+    assert.equal(contributions.includes(direct), true);
+    const shutdown = contributions.find(contribution => contribution !== direct) as { onStop?(): void } | undefined;
     assert.strictEqual(container.get(RidePackagedSmokeContribution), direct);
     assert.equal(actionResolutions, 0);
+    shutdown?.onStop?.();
+    assert.equal(actionResolutions, 0, 'shutdown hook must not resolve actions');
 
     direct.onStart();
     await new Promise<void>(resolve => setImmediate(resolve));

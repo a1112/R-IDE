@@ -164,9 +164,9 @@ export class RidePackagedSmokeActionService implements RidePackagedSmokeActions,
 
     editorSave(plan: RideSmokePlan): Promise<void> {
         return this.runSafely(async () => {
+            const { expectedFile } = await this.resolveWorkspace(plan);
             const editorManager = this.requireService(this.services.editorManager);
             const fileService = this.requireService(this.services.fileService);
-            const { expectedFile } = await this.resolveWorkspace(plan);
             const editor = editorManager.activeEditor?.editor;
             if (!editor || !this.uriEquals(editor.uri, expectedFile)) {
                 throw this.error('Smoke action unavailable.');
@@ -186,10 +186,15 @@ export class RidePackagedSmokeActionService implements RidePackagedSmokeActions,
                 throw this.error('Smoke action failed.');
             }
             this.ensureActive();
+            const editedContent = editor.document.getText();
+            if (editedContent.length <= content.length
+                || this.markerCount(editedContent) <= this.markerCount(content)) {
+                throw this.error('Smoke action failed.');
+            }
             await editor.document.save();
             this.ensureActive();
             const persisted = await fileService.read(expectedFile);
-            if (persisted.value !== content + markerAppend) {
+            if (persisted.value !== editedContent) {
                 throw this.error('Smoke action failed.');
             }
         });
@@ -197,45 +202,88 @@ export class RidePackagedSmokeActionService implements RidePackagedSmokeActions,
 
     terminalSentinel(plan: RideSmokePlan): Promise<void> {
         return this.runSafely(async () => {
+            const { root } = await this.resolveWorkspace(plan);
             const terminalService = this.requireService(this.services.terminalService);
             const fileService = this.requireService(this.services.fileService);
-            const { root } = await this.resolveWorkspace(plan);
             const sentinel = this.resolveRelative(root, RIDE_SMOKE_TERMINAL_SENTINEL);
             const windows = this.backendIsWindows;
-            const terminal = await terminalService.newTerminal({
-                title: 'R-IDE Smoke',
-                cwd: root,
-                shellPath: windows ? 'powershell.exe' : '/bin/sh',
-                shellArgs: windows ? ['-NoLogo', '-NoProfile', '-NonInteractive'] : [],
-                destroyTermOnClose: true,
-                hideFromUser: true,
-                isTransient: true,
-                kind: 'ride-smoke'
-            });
+            let terminal: TerminalWidgetLike | undefined;
+            let terminalDisposed = false;
+            let retired = false;
+            const disposeTerminal = (candidate: TerminalWidgetLike | undefined): void => {
+                if (!candidate || terminalDisposed) {
+                    return;
+                }
+                terminalDisposed = true;
+                try {
+                    candidate.dispose();
+                } catch {
+                    // Cleanup failures must not expose implementation details or replace the terminal outcome.
+                }
+            };
+            const retire = (): void => {
+                retired = true;
+                disposeTerminal(terminal);
+            };
             try {
-                this.ensureActive();
-                await terminal.start();
-                this.ensureActive();
-                terminal.sendText(windows ? RIDE_SMOKE_WINDOWS_COMMAND : RIDE_SMOKE_UNIX_COMMAND);
-                await this.pollUntil(async () => fileService.exists(sentinel), plan.actionTimeoutMs);
+                await this.withDeadline(async () => {
+                    const creation = Promise.resolve(terminalService.newTerminal({
+                        title: 'R-IDE Smoke',
+                        cwd: root,
+                        shellPath: windows ? 'powershell.exe' : '/bin/sh',
+                        shellArgs: windows ? ['-NoLogo', '-NoProfile', '-NonInteractive'] : [],
+                        destroyTermOnClose: true,
+                        hideFromUser: true,
+                        isTransient: true,
+                        kind: 'ride-smoke'
+                    }));
+                    creation.then(
+                        candidate => {
+                            if (retired) {
+                                disposeTerminal(candidate);
+                            }
+                        },
+                        () => undefined
+                    );
+                    const created = await creation;
+                    terminal = created;
+                    if (retired) {
+                        disposeTerminal(created);
+                        return;
+                    }
+                    await Promise.resolve(created.start());
+                    if (retired) {
+                        return;
+                    }
+                    this.ensureActive();
+                    created.sendText(windows ? RIDE_SMOKE_WINDOWS_COMMAND : RIDE_SMOKE_UNIX_COMMAND);
+                    while (!retired) {
+                        if (await fileService.exists(sentinel)) {
+                            return;
+                        }
+                        if (!retired) {
+                            await this.delay(this.pollIntervalMs);
+                        }
+                    }
+                }, plan.actionTimeoutMs, retire);
             } finally {
-                terminal.dispose();
+                retire();
             }
         });
     }
 
     workspaceSearch(plan: RideSmokePlan): Promise<void> {
         return this.runSafely(async () => {
-            const searchService = this.requireService(this.services.searchService);
             const { root, expectedFile } = await this.resolveWorkspace(plan);
+            const searchService = this.requireService(this.services.searchService);
             await this.waitForSearch(searchService, root, expectedFile, plan.actionTimeoutMs);
         });
     }
 
     scmStatus(plan: RideSmokePlan): Promise<void> {
         return this.runSafely(async () => {
-            const scmService = this.requireService(this.services.scmService);
             const { root, expectedFile } = await this.resolveWorkspace(plan);
+            const scmService = this.requireService(this.services.scmService);
             const repository = scmService.repositories.find(candidate => {
                 try {
                     return this.uriEquals(new URI(candidate.provider.rootUri), root);
@@ -275,6 +323,9 @@ export class RidePackagedSmokeActionService implements RidePackagedSmokeActions,
 
     protected async resolveWorkspace(plan: RideSmokePlan): Promise<{ root: URI; expectedFile: URI }> {
         this.ensureActive();
+        if (plan.workspace !== '.') {
+            throw this.error('Smoke action unavailable.');
+        }
         const workspaceService = this.requireService(this.services.workspaceService);
         const roots = await workspaceService.roots;
         this.ensureActive();
@@ -312,6 +363,10 @@ export class RidePackagedSmokeActionService implements RidePackagedSmokeActions,
         );
     }
 
+    protected markerCount(content: string): number {
+        return content.split(RIDE_SMOKE_EDITOR_MARKER).length - 1;
+    }
+
     protected async waitForSearch(
         searchService: SearchServiceLike,
         root: URI,
@@ -322,7 +377,20 @@ export class RidePackagedSmokeActionService implements RidePackagedSmokeActions,
             let settled = false;
             let found = false;
             let searchId: number | undefined;
+            let cancelRequested = false;
+            let searchCancelled = false;
             let timer: unknown;
+            const cancelSearch = (): void => {
+                if (!cancelRequested || searchCancelled || searchId === undefined) {
+                    return;
+                }
+                searchCancelled = true;
+                try {
+                    searchService.cancel(searchId);
+                } catch {
+                    // Cancellation is best-effort after the promise has settled.
+                }
+            };
             const settle = (error?: RideSmokeActionError): void => {
                 if (settled) {
                     return;
@@ -336,12 +404,9 @@ export class RidePackagedSmokeActionService implements RidePackagedSmokeActions,
                         // Timer cleanup must not replace the bounded action result.
                     }
                 }
-                if (error && searchId !== undefined) {
-                    try {
-                        searchService.cancel(searchId);
-                    } catch {
-                        // Cancellation is best-effort after the promise has settled.
-                    }
+                if (error) {
+                    cancelRequested = true;
+                    cancelSearch();
                 }
                 if (error) {
                     reject(error);
@@ -385,9 +450,7 @@ export class RidePackagedSmokeActionService implements RidePackagedSmokeActions,
             )).then(
                 id => {
                     searchId = id;
-                    if (this.disposed) {
-                        cancel();
-                    }
+                    cancelSearch();
                 },
                 () => settle(this.error('Smoke action failed.'))
             );
@@ -408,6 +471,72 @@ export class RidePackagedSmokeActionService implements RidePackagedSmokeActions,
             }
             await this.delay(Math.min(this.pollIntervalMs, Math.max(1, deadline - this.now())));
         }
+    }
+
+    protected withDeadline<T>(
+        operation: () => Promise<T>,
+        actionTimeoutMs: number,
+        onAbort: () => void
+    ): Promise<T> {
+        return new Promise<T>((resolve, reject) => {
+            let settled = false;
+            let timerAssigned = false;
+            let timer: unknown;
+            const clearTimer = (): void => {
+                if (!timerAssigned) {
+                    return;
+                }
+                try {
+                    this.cancelTimeout(timer);
+                } catch {
+                    // Timer cleanup must not prevent settlement.
+                }
+            };
+            const finish = (value?: T, error?: RideSmokeActionError): void => {
+                if (settled) {
+                    return;
+                }
+                settled = true;
+                this.activeCancellations.delete(cancel);
+                clearTimer();
+                if (error) {
+                    reject(error);
+                } else {
+                    resolve(value as T);
+                }
+            };
+            const abort = (error: RideSmokeActionError): void => {
+                if (settled) {
+                    return;
+                }
+                try {
+                    onAbort();
+                } finally {
+                    finish(undefined, error);
+                }
+            };
+            const cancel = (): void => abort(this.error('Smoke action disposed.'));
+            this.activeCancellations.add(cancel);
+            try {
+                timer = this.scheduleTimeout(
+                    () => abort(this.error('Smoke action timed out.')),
+                    this.effectiveTimeout(actionTimeoutMs)
+                );
+                timerAssigned = true;
+                if (settled) {
+                    clearTimer();
+                }
+            } catch {
+                abort(this.error('Smoke action failed.'));
+            }
+            if (settled) {
+                return;
+            }
+            Promise.resolve().then(operation).then(
+                value => finish(value),
+                () => finish(undefined, this.error('Smoke action failed.'))
+            );
+        });
     }
 
     protected delay(timeoutMs: number): Promise<void> {
