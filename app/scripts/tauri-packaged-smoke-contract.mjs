@@ -68,11 +68,33 @@ const CANONICAL_DIAGNOSTIC_MESSAGE_PATTERN = new RegExp(
   String.raw`^${DIAGNOSTIC_CLAUSE}(?:(?:,|:) ${DIAGNOSTIC_CLAUSE})*[.!?]?$`,
   'u',
 );
-const COMMAND_LINE_PREFIX_PATTERN = new RegExp(
-  '^(?:command(?: line)?|execut(?:e|ed|ing)|invok(?:e|ed|ing)|launch(?:ed|ing)?'
-    + '|run|ran|running|spawn(?:ed|ing)?|start(?:ed|ing)?)(?: |:)',
-  'i',
-);
+const DIAGNOSTIC_SUBJECT_PATTERN = new RegExp(String.raw`^${DIAGNOSTIC_WORD}`, 'u');
+const SAFE_DIAGNOSTIC_SUBJECTS = Object.freeze([
+  'Action',
+  'Application',
+  'Backend',
+  'Cleanup',
+  'Editor',
+  'Expected',
+  'File',
+  'Forwarding',
+  'Invalid',
+  'Missing',
+  'Plugin',
+  'Process',
+  'Report',
+  'R-IDE',
+  'SCM',
+  'Search',
+  'Secondary',
+  'Smoke',
+  'Startup',
+  'Terminal',
+  'Unable',
+  'Unsupported',
+  'Validation',
+  'Workspace',
+]);
 
 function fail(message) {
   throw new Error(message);
@@ -192,6 +214,14 @@ function nonNegativeSafeInteger(value, label) {
   return value;
 }
 
+function isCanonicalDiagnosticMessage(value) {
+  if (!CANONICAL_DIAGNOSTIC_MESSAGE_PATTERN.test(value)) {
+    return false;
+  }
+  const subject = DIAGNOSTIC_SUBJECT_PATTERN.exec(value)?.[0];
+  return SAFE_DIAGNOSTIC_SUBJECTS.includes(subject);
+}
+
 function validateDiagnostic(value, label) {
   exactKeys(value, DIAGNOSTIC_KEYS, label);
   if (typeof value.code !== 'string'
@@ -206,8 +236,7 @@ function validateDiagnostic(value, label) {
     || /[\u0000-\u001f\u007f]/.test(value.message)) {
     fail(`${label} message must be a bounded single-line string of at most ${MAX_DIAGNOSTIC_MESSAGE_LENGTH} characters`);
   }
-  if (!CANONICAL_DIAGNOSTIC_MESSAGE_PATTERN.test(value.message)
-    || COMMAND_LINE_PREFIX_PATTERN.test(value.message)) {
+  if (!isCanonicalDiagnosticMessage(value.message)) {
     fail(`${label} message must not contain host paths, environment data, or command lines`);
   }
   return { code: value.code, message: value.message };

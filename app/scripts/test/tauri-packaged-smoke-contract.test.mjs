@@ -442,6 +442,13 @@ test('rejects host paths, environment data, and command lines in diagnostic mess
     'Executing git status',
     'Invoked git status',
     'Invoking git status',
+    'git status',
+    'git status porcelain',
+    'Rscript secret',
+    'Rscript.exe secret.R',
+    'npm test',
+    'whoami',
+    'tool.exe argument',
   ];
   for (const message of unsafeMessages) {
     const diagnostic = { code: 'unsafe-diagnostic', message };
