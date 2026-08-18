@@ -354,7 +354,7 @@ test('packaged smoke safely contains malformed, rejected, and failed IPC respons
     let rejectedActionCalls = 0;
     new RidePackagedSmokeContribution(immediateState(), rejectedUpdate, () => actions([], {
         editorSave: async () => { rejectedActionCalls++; }
-    })).onStart();
+    }), { now: () => 0 }).onStart();
     await waitUntil(() => rejectedUpdate.calls.some(call => call.method === 'recordStep'), 'step was not attempted');
     await new Promise<void>(resolve => setImmediate(resolve));
     assert.equal(rejectedActionCalls, 0);
