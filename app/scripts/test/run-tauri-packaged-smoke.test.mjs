@@ -223,6 +223,104 @@ test('diagnostics are redacted and temporary cleanup still runs on failure', asy
   assert.equal(events.at(-1), 'temp-cleanup');
 });
 
+test('primary and process cleanup failures remain distinct in output and saved diagnostics', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ride-smoke-double-failure-'));
+  const executable = path.join(root, 'R-IDE.exe');
+  const output = path.join(root, 'result.json');
+  fs.writeFileSync(executable, 'fixture');
+  let runToken;
+  let runRoot;
+  try {
+    await assert.rejects(runPackagedSmoke({
+      executable,
+      scenario: 'critical-file',
+      output,
+      timeoutMs: 30_000,
+      sourceEnvironment: { PATH: process.env.PATH ?? '' },
+    }, {
+      verifyProfile: async () => undefined,
+      launchInstance: async ({ run, kind }) => {
+        runToken = run.token;
+        runRoot = run.runRoot;
+        return { kind, child: { exitCode: null }, identity: { pid: 10 } };
+      },
+      waitForForwardingStarted: async ({ run }) => ({
+        ...progress(),
+        specSha256: run.context.specSha256,
+      }),
+      waitForInstanceExit: async () => undefined,
+      waitForFinalReport: async () => {
+        throw new Error(`primary report failure ${runToken} at ${runRoot}`);
+      },
+      cleanupInstances: async () => {
+        throw new Error(`owned descendant survived ${runToken} at ${runRoot}`);
+      },
+    }), error => {
+      assert.match(error.message, /primary failure/i);
+      assert.match(error.message, /process cleanup failure/i);
+      assert.match(error.message, /processes may remain/i);
+      assert.doesNotMatch(error.message, new RegExp(runToken));
+      assert.equal(error.message.includes(runRoot), false);
+      return true;
+    });
+    const pointer = JSON.parse(fs.readFileSync(path.join(root, 'result.failure.json'), 'utf8'));
+    const serializedFailure = fs.readFileSync(path.join(
+      root,
+      pointer.diagnostics.directory,
+      'failure.json',
+    ), 'utf8');
+    const savedFailure = JSON.parse(serializedFailure);
+    assert.deepEqual(savedFailure.diagnostic.categories, ['primary', 'process-cleanup']);
+    assert.match(savedFailure.diagnostic.message, /primary failure/i);
+    assert.match(savedFailure.diagnostic.message, /process cleanup failure/i);
+    assert.doesNotMatch(serializedFailure, new RegExp(runToken));
+    assert.equal(serializedFailure.includes(runRoot), false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('diagnostic preservation failure is aggregated without replacing a bounded primary failure', async () => {
+  const events = [];
+  const secret = fixtureRun().token;
+  const primary = new AggregateError(
+    Array.from({ length: 32 }, (_, index) => new Error(`nested-${index} ${secret}`)),
+    `primary aggregate ${secret}`,
+  );
+  primary.cause = primary;
+  let preservedMessage;
+  await assert.rejects(runPackagedSmoke(options, fixtureDependencies(events, {
+    waitForFinalReport: async () => { throw primary; },
+    preserveFailure: async ({ error }) => {
+      preservedMessage = error.message;
+      throw new Error(`preservation write failed ${secret}`);
+    },
+  })), error => {
+    assert.match(error.message, /primary failure/i);
+    assert.match(error.message, /diagnostic preservation failure/i);
+    assert.doesNotMatch(error.message, new RegExp(secret));
+    assert.ok(error.message.length <= 1_024);
+    return true;
+  });
+  assert.match(preservedMessage, /primary failure/i);
+  assert.doesNotMatch(preservedMessage, new RegExp(secret));
+  assert.ok(preservedMessage.length <= 1_024);
+});
+
+test('a lone diagnostic preservation failure remains the final bounded failure', async () => {
+  const { aggregatePackagedSmokeFailures } = await import('../run-tauri-packaged-smoke.mjs');
+  assert.equal(typeof aggregatePackagedSmokeFailures, 'function');
+  const secret = fixtureRun().token;
+  const failure = aggregatePackagedSmokeFailures([{
+    category: 'diagnostic-preservation',
+    error: new Error(`preservation failed ${secret}`),
+  }], [secret]);
+  assert.deepEqual(failure.failureCategories, ['diagnostic-preservation']);
+  assert.match(failure.message, /diagnostic preservation failure/i);
+  assert.doesNotMatch(failure.message, new RegExp(secret));
+  assert.ok(failure.message.length <= 1_024);
+});
+
 test('artifact creation keeps raw token only in child environment', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ride-smoke-artifacts-'));
   const executable = path.join(root, 'R-IDE.exe');
@@ -963,6 +1061,23 @@ test('CLI parser accepts only strict packaged smoke options', () => {
   assert.throws(() => parsePackagedSmokeArguments(['--scenario', 'unknown']), /scenario/i);
   assert.throws(() => parsePackagedSmokeArguments(['--scenario', 'critical-file', '--wat']), /unknown/i);
   assert.throws(() => parsePackagedSmokeArguments(['--scenario', 'critical-file', '--timeout-ms', '0']), /timeout/i);
+});
+
+test('CLI rejects unknown Windows and POSIX absolute arguments without echoing them', () => {
+  const script = path.resolve(import.meta.dirname, '..', 'run-tauri-packaged-smoke.mjs');
+  for (const unknownArgument of [
+    'C:\\PRIVATE-UNKNOWN-PATH\\secret-file.R',
+    '/PRIVATE-UNKNOWN-PATH/secret-file.R',
+  ]) {
+    const result = spawnSync(process.execPath, [
+      script,
+      '--scenario', 'critical-file',
+      unknownArgument,
+    ], { encoding: 'utf8', timeout: 10_000 });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /unknown packaged smoke option/i);
+    assert.doesNotMatch(result.stderr, /PRIVATE-UNKNOWN-PATH|secret-file/i);
+  }
 });
 
 test('package exposes the packaged Tauri smoke command', () => {

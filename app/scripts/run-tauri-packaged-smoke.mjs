@@ -54,6 +54,16 @@ const FAILURE_SCHEMA = 'ride.tauri-packaged-smoke-runner-failure';
 const OWNER_SCHEMA = 'ride.tauri-packaged-smoke-owner';
 const OWNER_FILE = '.ride-tauri-packaged-smoke-owner.json';
 const STARTUP_ATTESTATION_TIMEOUT_MS = 2_000;
+const MAX_FAILURE_ENTRIES = 8;
+const MAX_FAILURE_DETAIL_LENGTH = 192;
+const MAX_FAILURE_MESSAGE_LENGTH = 1_024;
+const FAILURE_CATALOG = Object.freeze({
+  primary: 'primary failure',
+  'process-cleanup': 'process cleanup failure (owned processes may remain)',
+  'diagnostic-preservation': 'diagnostic preservation failure',
+  'workspace-cleanup': 'temporary workspace cleanup failure',
+});
+const failureEntriesSymbol = Symbol('packagedSmokeFailureEntries');
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const applicationRoot = path.resolve(scriptDirectory, '..');
 
@@ -255,12 +265,14 @@ export async function createSmokeRunArtifacts({
       },
     };
   } catch (error) {
+    const failures = [];
+    appendFailure(failures, 'primary', error);
     try {
       await fs.promises.rm(runRoot, { recursive: true, force: true });
     } catch (cleanupError) {
-      error.cause ??= cleanupError;
+      appendFailure(failures, 'workspace-cleanup', cleanupError);
     }
-    throw error;
+    throw aggregatePackagedSmokeFailures(failures, [runRoot, token, executable, output]);
   }
 }
 
@@ -502,15 +514,21 @@ export async function launchPackagedSmokeInstance(
     await attestContainment();
     return instance;
   } catch (error) {
+    const failures = [];
+    appendFailure(failures, 'primary', error);
     try {
       await cleanupPackagedSmokeInstances([instance]);
-      await logCapture.persist();
     } catch (cleanupError) {
-      error.cause ??= cleanupError;
+      appendFailure(failures, 'process-cleanup', cleanupError);
+    }
+    try {
+      await logCapture.persist();
+    } catch (preservationError) {
+      appendFailure(failures, 'diagnostic-preservation', preservationError);
     } finally {
       lateErrorGuard.release();
     }
-    throw error;
+    throw aggregatePackagedSmokeFailures(failures, run.sensitiveValues);
   }
 }
 
@@ -714,12 +732,15 @@ async function preserveFailureArtifacts({ run, instances, error, report }) {
   const message = redactDiagnosticText(error.message, run.sensitiveValues)
     .replace(/[\u0000-\u001f\u007f]+/gu, ' ')
     .trim()
-    .slice(0, 256) || 'Packaged smoke failed.';
+    .slice(0, MAX_FAILURE_MESSAGE_LENGTH) || 'Packaged smoke failed.';
+  const categories = Array.isArray(error.failureCategories)
+    ? error.failureCategories.filter(category => Object.hasOwn(FAILURE_CATALOG, category))
+    : ['primary'];
   const artifact = {
     schema: FAILURE_SCHEMA,
     version: 1,
     status: 'failed',
-    diagnostic: { message },
+    diagnostic: { message, categories: [...new Set(categories)] },
     logs: copiedLogs,
     report: report ?? null,
   };
@@ -771,13 +792,92 @@ function defaultDependencies(options) {
   };
 }
 
-function errorWithRedactedMessage(error, sensitiveValues) {
-  const redacted = new Error(redactDiagnosticText(
-    typeof error?.message === 'string' ? error.message : String(error),
-    sensitiveValues,
-  ));
-  redacted.name = typeof error?.name === 'string' ? error.name : 'Error';
-  return redacted;
+function appendFailure(failures, category, error) {
+  const nested = error?.[failureEntriesSymbol];
+  const entries = Array.isArray(nested) && nested.length > 0
+    ? nested
+    : [{ category, error }];
+  for (const entry of entries) {
+    if (failures.length >= MAX_FAILURE_ENTRIES) {
+      break;
+    }
+    failures.push({
+      category: Object.hasOwn(FAILURE_CATALOG, entry.category) ? entry.category : category,
+      error: entry.error,
+    });
+  }
+}
+
+function boundedErrorDetails(error, sensitiveValues) {
+  const pending = [error];
+  const seen = new Set();
+  const details = [];
+  while (pending.length > 0 && seen.size < MAX_FAILURE_ENTRIES) {
+    const current = pending.shift();
+    if (current !== null && (typeof current === 'object' || typeof current === 'function')) {
+      if (seen.has(current)) {
+        continue;
+      }
+      seen.add(current);
+    }
+    let rawMessage;
+    try {
+      rawMessage = typeof current?.message === 'string' ? current.message : String(current);
+    } catch {
+      rawMessage = 'unrenderable error';
+    }
+    const detail = redactDiagnosticText(rawMessage, sensitiveValues)
+      .replace(/[\u0000-\u001f\u007f]+/gu, ' ')
+      .trim()
+      .slice(0, MAX_FAILURE_DETAIL_LENGTH);
+    if (detail && !details.includes(detail)) {
+      details.push(detail);
+    }
+    if (current !== null && (typeof current === 'object' || typeof current === 'function')) {
+      if (current.cause !== undefined) {
+        pending.push(current.cause);
+      }
+      if (Array.isArray(current.errors)) {
+        pending.push(...current.errors.slice(0, MAX_FAILURE_ENTRIES - pending.length));
+      }
+    }
+  }
+  return details;
+}
+
+export function aggregatePackagedSmokeFailures(failures, sensitiveValues = []) {
+  const normalized = failures.slice(0, MAX_FAILURE_ENTRIES).map(entry => ({
+    category: Object.hasOwn(FAILURE_CATALOG, entry.category) ? entry.category : 'primary',
+    error: entry.error,
+  }));
+  const categories = [...new Set(normalized.map(({ category }) => category))];
+  const summary = categories.map(category => FAILURE_CATALOG[category]).join('; ')
+    || FAILURE_CATALOG.primary;
+  const details = normalized.flatMap(({ category, error }) => {
+    const rendered = boundedErrorDetails(error, sensitiveValues);
+    return rendered.length > 0 ? [`${FAILURE_CATALOG[category]}: ${rendered.join(' <- ')}`] : [];
+  });
+  const message = `${summary}${details.length > 0 ? `. ${details.join('; ')}` : ''}`
+    .slice(0, MAX_FAILURE_MESSAGE_LENGTH);
+  const sanitizedErrors = normalized.map(({ error }) => {
+    const rendered = boundedErrorDetails(error, sensitiveValues).join(' <- ')
+      .slice(0, MAX_FAILURE_DETAIL_LENGTH) || 'Packaged smoke failed.';
+    const sanitized = new Error(rendered);
+    return sanitized;
+  });
+  const aggregate = new AggregateError(sanitizedErrors, message);
+  aggregate.name = 'PackagedSmokeFailure';
+  Object.defineProperty(aggregate, 'failureCategories', {
+    value: Object.freeze(categories),
+    enumerable: true,
+  });
+  Object.defineProperty(aggregate, failureEntriesSymbol, {
+    value: Object.freeze(normalized.map((entry, index) => Object.freeze({
+      category: entry.category,
+      error: sanitizedErrors[index],
+    }))),
+  });
+  return aggregate;
 }
 
 export async function runPackagedSmoke(options, injectedDependencies) {
@@ -788,7 +888,7 @@ export async function runPackagedSmoke(options, injectedDependencies) {
   let run;
   const instances = [];
   let cleanupComplete = false;
-  let failure;
+  const failures = [];
   let finalReport;
   const now = dependencies.now ?? Date.now;
   const phaseBudget = phase => createPhaseBudget(
@@ -846,43 +946,49 @@ export async function runPackagedSmoke(options, injectedDependencies) {
       phase: 'first instance graceful exit',
       budget: gracefulBudget,
     });
-    await dependencies.cleanupInstances(instances, { run });
+    try {
+      await dependencies.cleanupInstances(instances, { run });
+    } catch (cleanupError) {
+      const cleanupFailures = [];
+      appendFailure(cleanupFailures, 'process-cleanup', cleanupError);
+      throw aggregatePackagedSmokeFailures(cleanupFailures, run.sensitiveValues);
+    }
     cleanupComplete = true;
     await dependencies.validateLogs({ run, instances });
     await dependencies.publishResult({ run, report: finalReport });
   } catch (error) {
-    failure = error;
+    appendFailure(failures, 'primary', error);
   } finally {
     if (instances.length > 0 && !cleanupComplete) {
       try {
         await dependencies.cleanupInstances(instances, { run });
         cleanupComplete = true;
       } catch (cleanupError) {
-        failure ??= cleanupError;
+        appendFailure(failures, 'process-cleanup', cleanupError);
       }
     }
     if (run !== undefined) {
-      if (failure !== undefined) {
+      if (failures.length > 0) {
         try {
           await dependencies.preserveFailure({
             run,
             instances,
-            error: errorWithRedactedMessage(failure, run.sensitiveValues),
+            error: aggregatePackagedSmokeFailures(failures, run.sensitiveValues),
             report: finalReport,
           });
         } catch (preservationError) {
-          failure = preservationError;
+          appendFailure(failures, 'diagnostic-preservation', preservationError);
         }
       }
       try {
         await dependencies.cleanupRun(run);
       } catch (cleanupError) {
-        failure ??= cleanupError;
+        appendFailure(failures, 'workspace-cleanup', cleanupError);
       }
     }
   }
-  if (failure !== undefined) {
-    throw errorWithRedactedMessage(failure, run?.sensitiveValues ?? []);
+  if (failures.length > 0) {
+    throw aggregatePackagedSmokeFailures(failures, run?.sensitiveValues ?? []);
   }
   return finalReport;
 }
@@ -909,7 +1015,7 @@ export function parsePackagedSmokeArguments(argv) {
     }
     const key = valued.get(option);
     if (key === undefined) {
-      throw new Error(`unknown packaged smoke option ${option}`);
+      throw new Error('unknown packaged smoke option');
     }
     if (seen.has(option) || index + 1 >= argv.length || argv[index + 1].startsWith('--')) {
       throw new Error(`invalid value for ${option}`);
