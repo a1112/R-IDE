@@ -139,6 +139,47 @@ test('requestGracefulProcessClose treats a refused Windows close as failure', as
   }), /graceful close failed/);
 });
 
+test('requestGracefulProcessClose bounds identity capture and PowerShell by one shared deadline', async () => {
+  const identity = { pid: 7331, pgid: null, creationTime: 'windows:100' };
+  let currentTime = 0;
+  let captureTimeout;
+  let commandTimeout;
+  assert.equal(await requestGracefulProcessClose(identity, 'win32', {
+    timeoutMs: 1_000,
+    now: () => currentTime,
+    capture: async (_pid, options) => {
+      captureTimeout = options.timeoutMs;
+      currentTime = 400;
+      return { ...identity };
+    },
+    run: (_file, _arguments, options) => {
+      commandTimeout = options.timeout;
+      return { status: 0, error: undefined, signal: undefined };
+    },
+  }), true);
+  assert.equal(captureTimeout, 1_000);
+  assert.equal(commandTimeout, 600);
+});
+
+test('requestGracefulProcessClose fails statically when its shared deadline is exhausted', async () => {
+  const identity = { pid: 7331, pgid: null, creationTime: 'windows:100' };
+  let currentTime = 0;
+  let commandCalled = false;
+  await assert.rejects(requestGracefulProcessClose(identity, 'win32', {
+    timeoutMs: 1_000,
+    now: () => currentTime,
+    capture: async () => {
+      currentTime = 1_000;
+      return { ...identity };
+    },
+    run: () => {
+      commandCalled = true;
+      return { status: 0 };
+    },
+  }), /graceful close timed out after 1000ms/i);
+  assert.equal(commandCalled, false);
+});
+
 function temporaryDirectory(label) {
   return fs.mkdtempSync(path.join(os.tmpdir(), `ride-measure-${label}-`));
 }
@@ -1863,6 +1904,48 @@ test('root identity capture always performs one verification read at an exhauste
   });
 
   assert.equal(identity.creationTime, 'root-start');
+});
+
+test('root identity capture caps its final polling delay at the phase deadline', async () => {
+  let currentTime = 0;
+  const delays = [];
+  await assert.rejects(captureProcessIdentity(7331, {
+    timeoutMs: 20,
+    pollMs: 25,
+    now: () => currentTime,
+    read: () => [],
+    delay: async milliseconds => {
+      delays.push(milliseconds);
+      currentTime += milliseconds;
+    },
+  }), /did not appear/);
+  assert.deepEqual(delays, [20]);
+});
+
+test('root identity capture bounds each production process query by its remaining time', async () => {
+  let currentTime = 0;
+  let processQueryTimeout;
+  const identity = await captureProcessIdentity(7331, {
+    platform: 'win32',
+    timeoutMs: 1_000,
+    now: () => currentTime,
+    read: (_platform, options) => {
+      if (options === undefined) {
+        currentTime = 1_000;
+        throw new Error('process query was not given a deadline');
+      }
+      processQueryTimeout = options.timeoutMs;
+      return [{
+        pid: 7331,
+        ppid: 1,
+        pgid: null,
+        rssBytes: 100,
+        creationTime: 'windows:100',
+      }];
+    },
+  });
+  assert.equal(identity.pid, 7331);
+  assert.equal(processQueryTimeout, 1_000);
 });
 
 test('root identity capture retries a transient process-table query failure', async () => {

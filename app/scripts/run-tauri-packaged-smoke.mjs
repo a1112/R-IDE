@@ -77,6 +77,23 @@ function strictTimeout(value, label = 'timeout') {
   return value;
 }
 
+function createPhaseBudget(timeoutMs, phase, now = Date.now) {
+  return {
+    deadline: now() + timeoutMs,
+    timeoutMs,
+    phase,
+    now,
+  };
+}
+
+function remainingPhaseBudget(budget, phase = budget.phase) {
+  const remainingMs = Math.floor(budget.deadline - budget.now());
+  if (remainingMs <= 0) {
+    throw new Error(`${phase} timed out after ${budget.timeoutMs}ms`);
+  }
+  return remainingMs;
+}
+
 function scenarioDefinition(scenario) {
   if (!SMOKE_SCENARIOS.includes(scenario)) {
     throw new Error(`unsupported packaged smoke scenario ${scenario}`);
@@ -312,7 +329,7 @@ export function packagedSmokeLaunchArguments(run, kind) {
 }
 
 export async function launchPackagedSmokeInstance(
-  { run, kind },
+  { run, kind, budget },
   {
     spawnProcess = spawn,
     capture = captureProcessIdentity,
@@ -320,8 +337,14 @@ export async function launchPackagedSmokeInstance(
     startMonitor = startProcessTreeMonitor,
     createRunId = randomUUID,
     platform = process.platform,
+    now = Date.now,
   } = {},
 ) {
+  const launchBudget = budget ?? createPhaseBudget(
+    run.timeoutMs,
+    `${kind} instance launch`,
+    now,
+  );
   const launchArguments = packagedSmokeLaunchArguments(run, kind);
   const runId = createRunId();
   const startupReportPath = path.join(run.logsDirectory, `${kind}-startup-report.json`);
@@ -365,15 +388,20 @@ export async function launchPackagedSmokeInstance(
   try {
     const exitObservation = observeChildExit(child);
     await waitForSpawn(child);
+    const remainingMs = remainingPhaseBudget(launchBudget);
     const identityObservation = Promise.resolve()
-      .then(() => capture(child.pid))
+      .then(() => capture(child.pid, {
+        platform,
+        timeoutMs: Math.min(2_000, remainingMs),
+        pollMs: Math.min(25, remainingMs),
+      }))
       .then(
         identity => ({ type: 'identity', identity }),
         error => ({ type: 'identity-error', error }),
       );
     const reportObservation = waitForReport(startupReportPath, {
-      timeoutMs: Math.min(run.timeoutMs, STARTUP_ATTESTATION_TIMEOUT_MS),
-      pollMs: 10,
+      timeoutMs: Math.min(remainingMs, STARTUP_ATTESTATION_TIMEOUT_MS),
+      pollMs: Math.min(10, remainingMs),
       phase: 'process',
     }).then(
       report => ({ report }),
@@ -435,9 +463,13 @@ async function waitForJsonArtifact({
   phase,
   validate,
   accept,
+  budget,
+  now = Date.now,
+  delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds)),
 }) {
-  const deadline = Date.now() + run.timeoutMs;
-  while (Date.now() <= deadline) {
+  const waitBudget = budget ?? createPhaseBudget(run.timeoutMs, phase, now);
+  while (true) {
+    remainingPhaseBudget(waitBudget);
     try {
       const value = JSON.parse(await fs.promises.readFile(run.reportPath, 'utf8'));
       const validated = validate(value, run.context);
@@ -452,12 +484,11 @@ async function waitForJsonArtifact({
     if (childHasExited(first)) {
       throw new Error(`first instance exited before ${phase}: ${childExitDescription(first)}`);
     }
-    await new Promise(resolve => setTimeout(resolve, POLL_MS));
+    await delay(Math.min(POLL_MS, remainingPhaseBudget(waitBudget)));
   }
-  throw new Error(`${phase} timed out after ${run.timeoutMs}ms`);
 }
 
-async function waitForForwardingStartedDefault({ run, first }) {
+async function waitForForwardingStartedDefault({ run, first, budget }) {
   return waitForJsonArtifact({
     run,
     first,
@@ -467,16 +498,29 @@ async function waitForForwardingStartedDefault({ run, first }) {
       const final = progress.steps.at(-1);
       return final?.action === 'second-file-forwarding' && final.state === 'started';
     },
+    budget,
   });
 }
 
-async function waitForFinalReportDefault({ run, first }) {
+export async function waitForPackagedSmokeFinalReport({ run, first, budget }) {
   const final = await waitForJsonArtifact({
     run,
     first,
     phase: 'final smoke report',
-    validate: validateSmokeReport,
-    accept: () => true,
+    validate: (value, context) => {
+      try {
+        return validateSmokeReport(value, context);
+      } catch (reportError) {
+        try {
+          validateSmokeProgress(value, context);
+          return undefined;
+        } catch {
+          throw reportError;
+        }
+      }
+    },
+    accept: candidate => candidate !== undefined,
+    budget,
   });
   if (final.status !== 'passed') {
     throw new Error(final.diagnostic.message);
@@ -484,13 +528,15 @@ async function waitForFinalReportDefault({ run, first }) {
   return final;
 }
 
-async function waitForInstanceExitDefault(instance, { run, phase }) {
+export async function waitForPackagedSmokeInstanceExit(instance, { run, phase, budget }) {
   if (!childHasExited(instance)) {
+    const waitBudget = budget ?? createPhaseBudget(run.timeoutMs, phase);
+    const remainingMs = remainingPhaseBudget(waitBudget, phase);
     await new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         clear();
-        reject(new Error(`${phase} timed out after ${run.timeoutMs}ms`));
-      }, run.timeoutMs);
+        reject(new Error(`${phase} timed out after ${waitBudget.timeoutMs}ms`));
+      }, remainingMs);
       timer.unref?.();
       const clear = () => {
         clearTimeout(timer);
@@ -624,6 +670,7 @@ async function preserveFailureArtifacts({ run, instances, error, report }) {
 
 function defaultDependencies(options) {
   return {
+    now: Date.now,
     verifyProfile: async () => {
       const definition = scenarioDefinition(options.scenario);
       const metadata = await readCampaignMetadata({ options, executable: options.executable });
@@ -634,9 +681,16 @@ function defaultDependencies(options) {
     createRun: () => createSmokeRunArtifacts(options),
     launchInstance: launchPackagedSmokeInstance,
     waitForForwardingStarted: waitForForwardingStartedDefault,
-    waitForInstanceExit: waitForInstanceExitDefault,
-    waitForFinalReport: waitForFinalReportDefault,
-    requestGracefulClose: instance => requestGracefulProcessClose(instance.identity),
+    waitForInstanceExit: waitForPackagedSmokeInstanceExit,
+    waitForFinalReport: waitForPackagedSmokeFinalReport,
+    requestGracefulClose: (instance, { budget }) => requestGracefulProcessClose(
+      instance.identity,
+      instance.platform ?? process.platform,
+      {
+        timeoutMs: remainingPhaseBudget(budget),
+        now: budget.now,
+      },
+    ),
     cleanupInstances: cleanupPackagedSmokeInstances,
     validateLogs: validatePackagedSmokeLogs,
     publishResult: ({ run, report }) => writeFileAtomically(
@@ -669,36 +723,61 @@ export async function runPackagedSmoke(options, injectedDependencies) {
   let cleanupComplete = false;
   let failure;
   let finalReport;
+  const now = dependencies.now ?? Date.now;
+  const phaseBudget = phase => createPhaseBudget(
+    run?.timeoutMs ?? options.timeoutMs,
+    phase,
+    now,
+  );
   try {
     await dependencies.verifyProfile(options);
     run = await dependencies.createRun(options);
-    const first = await dependencies.launchInstance({ run, kind: 'first' });
+    const first = await dependencies.launchInstance({
+      run,
+      kind: 'first',
+      budget: phaseBudget('first instance launch'),
+    });
     instances.push(first);
     const progress = validateSmokeProgress(
-      await dependencies.waitForForwardingStarted({ run, first }),
+      await dependencies.waitForForwardingStarted({
+        run,
+        first,
+        budget: phaseBudget('second-file-forwarding started progress'),
+      }),
       run.context,
     );
     const forwarding = progress.steps.at(-1);
     if (forwarding.action !== 'second-file-forwarding' || forwarding.state !== 'started') {
       throw new Error('second-file-forwarding started progress was not observed');
     }
-    const second = await dependencies.launchInstance({ run, kind: 'second' });
+    const second = await dependencies.launchInstance({
+      run,
+      kind: 'second',
+      budget: phaseBudget('second instance launch'),
+    });
     instances.push(second);
     await dependencies.waitForInstanceExit(second, {
       run,
       phase: 'second instance exit',
+      budget: phaseBudget('second instance exit'),
     });
     finalReport = validateSmokeReport(
-      await dependencies.waitForFinalReport({ run, first }),
+      await dependencies.waitForFinalReport({
+        run,
+        first,
+        budget: phaseBudget('final smoke report'),
+      }),
       run.context,
     );
     if (finalReport.status !== 'passed') {
       throw new Error(finalReport.diagnostic.message);
     }
-    await dependencies.requestGracefulClose(first, { run });
+    const gracefulBudget = phaseBudget('first instance graceful exit');
+    await dependencies.requestGracefulClose(first, { run, budget: gracefulBudget });
     await dependencies.waitForInstanceExit(first, {
       run,
       phase: 'first instance graceful exit',
+      budget: gracefulBudget,
     });
     await dependencies.cleanupInstances(instances, { run });
     cleanupComplete = true;

@@ -139,6 +139,23 @@ test('orchestration follows the exact two-instance packaged smoke order', async 
   ]);
 });
 
+test('graceful close and first-instance natural exit share one phase deadline', async () => {
+  const events = [];
+  let gracefulBudget;
+  await runPackagedSmoke(options, fixtureDependencies(events, {
+    now: () => 100,
+    requestGracefulClose: async (_instance, { budget }) => {
+      gracefulBudget = budget;
+    },
+    waitForInstanceExit: async (instance, { budget }) => {
+      if (instance.kind === 'first') {
+        assert.equal(budget, gracefulBudget);
+      }
+    },
+  }));
+  assert.equal(gracefulBudget.deadline, 30_100);
+});
+
 for (const [label, method, message] of [
   ['phase timeout', 'waitForForwardingStarted', 'forwarding phase timed out'],
   ['early first exit', 'waitForForwardingStarted', 'first instance exited before progress'],
@@ -385,6 +402,91 @@ test('default launcher accepts a real fast second-instance exit without waiting 
   }
 });
 
+test('default launcher bounds capture and startup attestation by one 1s phase deadline', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ride-smoke-launch-deadline-'));
+  const script = path.join(root, 'second.js');
+  writeStartupFixture(script, 0, true);
+  let currentTime = 0;
+  let captureTimeout;
+  let reportTimeout;
+  let spawnedPid;
+  const run = {
+    executable: process.execPath,
+    absoluteFiles: ['unused', script],
+    workspace: root,
+    logsDirectory: root,
+    timeoutMs: 1_000,
+    childEnvironment: { PATH: process.env.PATH ?? '' },
+    smokeEnvironment: {},
+    sensitiveValues: [],
+  };
+  let instance;
+  try {
+    instance = await launchPackagedSmokeInstance({ run, kind: 'second' }, {
+      now: () => currentTime,
+      spawnProcess: (executable, arguments_, spawnOptions) => {
+        const child = spawn(executable, arguments_, spawnOptions);
+        spawnedPid = child.pid;
+        currentTime = 400;
+        return child;
+      },
+      capture: async (pid, captureOptions) => {
+        captureTimeout = captureOptions.timeoutMs;
+        return { pid, ppid: 1, pgid: null, creationTime: 'windows:fixture' };
+      },
+      waitForReport: async (_file, waitOptions) => {
+        reportTimeout = waitOptions.timeoutMs;
+        return { pid: spawnedPid };
+      },
+      startMonitor: () => ({ stop: async () => [] }),
+    });
+    assert.equal(captureTimeout, 600);
+    assert.equal(reportTimeout, 600);
+  } finally {
+    if (instance && instance.child.exitCode === null) {
+      instance.child.kill();
+      await new Promise(resolve => instance.child.once('exit', resolve));
+      await instance.logCapture.persist();
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('default launcher fails statically when its 1s phase deadline is exhausted', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ride-smoke-launch-expired-'));
+  const script = path.join(root, 'second.js');
+  writeStartupFixture(script, 0, true);
+  let currentTime = 0;
+  let captureCalled = false;
+  let reportCalled = false;
+  const run = {
+    executable: process.execPath,
+    absoluteFiles: ['unused', script],
+    workspace: root,
+    logsDirectory: root,
+    timeoutMs: 1_000,
+    childEnvironment: { PATH: process.env.PATH ?? '' },
+    smokeEnvironment: {},
+    sensitiveValues: [],
+  };
+  try {
+    await assert.rejects(launchPackagedSmokeInstance({ run, kind: 'second' }, {
+      now: () => currentTime,
+      spawnProcess: (executable, arguments_, spawnOptions) => {
+        const child = spawn(executable, arguments_, spawnOptions);
+        currentTime = 1_000;
+        return child;
+      },
+      capture: async () => { captureCalled = true; },
+      waitForReport: async () => { reportCalled = true; },
+    }), /second instance launch timed out after 1000ms/i);
+    assert.equal(captureCalled, false);
+    assert.equal(reportCalled, false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('default launcher filters the actual child environment while retaining desktop authority', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ride-smoke-launch-environment-'));
   const script = path.join(root, 'second.js');
@@ -518,6 +620,59 @@ test('default cleanup reattests marker-owned descendants after a fast POSIX root
   assert.deepEqual(terminated[0].trackedProcesses, [descendant]);
   assert.equal(terminated[0].containmentVerified, true);
   assert.equal(terminated[0].runId, runId);
+});
+
+test('default final waiter treats a valid current-run progress snapshot as pending', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ride-smoke-final-progress-'));
+  const reportPath = path.join(root, 'report.json');
+  const run = { ...fixtureRun(), reportPath, timeoutMs: 1_000 };
+  const first = { child: { exitCode: null, signalCode: null } };
+  let publishFinal;
+  try {
+    fs.writeFileSync(reportPath, JSON.stringify(progress()));
+    publishFinal = setTimeout(() => fs.writeFileSync(reportPath, JSON.stringify(report())), 150);
+    const { waitForPackagedSmokeFinalReport } = await import('../run-tauri-packaged-smoke.mjs');
+    const final = await waitForPackagedSmokeFinalReport({ run, first });
+    assert.equal(final.status, 'passed');
+  } finally {
+    clearTimeout(publishFinal);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('default final waiter does not treat an identity-mismatched progress snapshot as pending', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ride-smoke-stale-progress-'));
+  const reportPath = path.join(root, 'report.json');
+  const run = { ...fixtureRun(), reportPath, timeoutMs: 1_000 };
+  const first = { child: { exitCode: null, signalCode: null } };
+  try {
+    fs.writeFileSync(reportPath, JSON.stringify({ ...progress(), specSha256: 'b'.repeat(64) }));
+    const { waitForPackagedSmokeFinalReport } = await import('../run-tauri-packaged-smoke.mjs');
+    await assert.rejects(
+      waitForPackagedSmokeFinalReport({ run, first }),
+      /Smoke report|specSha256|schema/i,
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('default natural-exit waiter fails statically when the phase deadline is exhausted', async () => {
+  const { waitForPackagedSmokeInstanceExit } = await import('../run-tauri-packaged-smoke.mjs');
+  const instance = {
+    kind: 'first',
+    child: { exitCode: null, signalCode: null },
+  };
+  const run = { timeoutMs: 1_000 };
+  const budget = { deadline: 1_000, timeoutMs: 1_000, now: () => 1_000 };
+  await assert.rejects(
+    waitForPackagedSmokeInstanceExit(instance, {
+      run,
+      phase: 'first instance graceful exit',
+      budget,
+    }),
+    /first instance graceful exit timed out after 1000ms/i,
+  );
 });
 
 test('CLI redacts explicit executable and worktree paths before run creation', () => {

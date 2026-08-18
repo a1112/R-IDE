@@ -1582,7 +1582,14 @@ export function planProcessCleanup(
   };
 }
 
-function readProcessTable(platform = process.platform) {
+function readProcessTable(
+  platform = process.platform,
+  { timeoutMs = SYNC_COMMAND_TIMEOUT_MS } = {},
+) {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+    throw new Error('process query timeout must be a positive safe integer');
+  }
+  const COMMAND_TIMEOUT_MS = Math.min(SYNC_COMMAND_TIMEOUT_MS, timeoutMs);
   if (platform === 'win32') {
     const result = spawnSync(
       'powershell.exe',
@@ -1596,7 +1603,7 @@ function readProcessTable(platform = process.platform) {
       {
         encoding: 'utf8',
         windowsHide: true,
-        timeout: SYNC_COMMAND_TIMEOUT_MS,
+        timeout: COMMAND_TIMEOUT_MS,
         maxBuffer: SYNC_COMMAND_MAX_BUFFER_BYTES,
       },
     );
@@ -1609,7 +1616,7 @@ function readProcessTable(platform = process.platform) {
   const result = spawnSync('ps', ['-axo', 'pid=,ppid=,pgid=,rss=,lstart=,comm=,args='], {
     encoding: 'utf8',
     env: { ...process.env, LANG: 'C', LC_ALL: 'C' },
-    timeout: SYNC_COMMAND_TIMEOUT_MS,
+    timeout: COMMAND_TIMEOUT_MS,
     maxBuffer: SYNC_COMMAND_MAX_BUFFER_BYTES,
   });
   if (result.error || result.status !== 0) {
@@ -1724,9 +1731,20 @@ export async function captureProcessIdentity(
   }
   const deadline = now() + timeoutMs;
   let lastReadError;
+  let attempted = false;
   while (true) {
+    const queryRemainingMs = Math.floor(deadline - now());
+    if (attempted && queryRemainingMs <= 0) {
+      break;
+    }
+    attempted = true;
     try {
-      const row = read(platform).find(candidate => candidate.pid === verifiedRoot);
+      const row = read(platform, {
+        timeoutMs: Math.min(
+          SYNC_COMMAND_TIMEOUT_MS,
+          Math.max(1, queryRemainingMs),
+        ),
+      }).find(candidate => candidate.pid === verifiedRoot);
       if (row) {
         return validateProcessIdentity(processIdentity(row), 'spawned root identity');
       }
@@ -1734,10 +1752,11 @@ export async function captureProcessIdentity(
     } catch (error) {
       lastReadError = error;
     }
-    if (now() > deadline) {
+    const remainingMs = Math.floor(deadline - now());
+    if (remainingMs <= 0) {
       break;
     }
-    await delay(pollMs);
+    await delay(Math.min(pollMs, remainingMs));
   }
   throw new Error(
     `spawned root process ${verifiedRoot} did not appear in the process table`
@@ -1773,13 +1792,30 @@ export async function requestGracefulProcessClose(
     capture = captureProcessIdentity,
     signal = (pid, name) => process.kill(pid, name),
     run = (command, args, options) => spawnSync(command, args, options),
+    timeoutMs = SYNC_COMMAND_TIMEOUT_MS,
+    now = Date.now,
   } = {},
 ) {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0) {
+    throw new Error('graceful close timeout must be a non-negative safe integer');
+  }
+  const deadline = now() + timeoutMs;
+  const remaining = () => {
+    const remainingMs = Math.floor(deadline - now());
+    if (remainingMs <= 0) {
+      throw new Error(`graceful close timed out after ${timeoutMs}ms`);
+    }
+    return remainingMs;
+  };
   const verifiedIdentity = validateProcessIdentity(rootIdentity, 'graceful close identity');
-  const currentIdentity = await capture(verifiedIdentity.pid, { platform });
+  const currentIdentity = await capture(verifiedIdentity.pid, {
+    platform,
+    timeoutMs: Math.min(2_000, remaining()),
+  });
   if (!sameProcessIdentity(currentIdentity, verifiedIdentity)) {
     throw new Error('graceful close target changed identity');
   }
+  const actionTimeoutMs = remaining();
   if (platform !== 'win32') {
     signal(verifiedIdentity.pid, 'SIGTERM');
     return true;
@@ -1794,7 +1830,7 @@ export async function requestGracefulProcessClose(
   ], {
     encoding: 'utf8',
     windowsHide: true,
-    timeout: SYNC_COMMAND_TIMEOUT_MS,
+    timeout: Math.min(SYNC_COMMAND_TIMEOUT_MS, actionTimeoutMs),
     maxBuffer: SYNC_COMMAND_MAX_BUFFER_BYTES,
   });
   if (result?.error || result?.signal || result?.status !== 0) {
