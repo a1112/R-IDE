@@ -182,6 +182,8 @@ test('Tauri verification builds and inventories full fallback before the critica
   assert.ok(nativeBuild > criticalVerify, 'the native smoke build must use the verified critical profile');
   assert.match(workflow.slice(fullBuild, fullVerify), /RIDE_TAURI_FRONTEND_PROFILE:\s*full/);
   assert.match(workflow.slice(criticalBuild, criticalVerify), /RIDE_TAURI_FRONTEND_PROFILE:\s*tauri-critical/);
+  assert.match(workflow.slice(fullVerify, criticalBuild), /RUNNER_TEMP/,
+    'full-profile evidence must be collected outside the source tree before the critical build');
 });
 
 test('hosted workflows preserve profile, esbuild, and startup evidence without local baseline claims', () => {

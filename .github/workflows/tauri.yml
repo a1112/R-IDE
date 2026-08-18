@@ -81,7 +81,7 @@ jobs:
       - name: Collect full-profile evidence
         shell: bash
         run: |
-          artifact_dir='applications/tauri/profile-artifacts/full'
+          artifact_dir="$RUNNER_TEMP/tauri-profile-artifacts/full"
           mkdir -p "$artifact_dir"
           cp applications/browser/lib/ride-tauri-profile.json "$artifact_dir/ride-tauri-profile.json"
           for source in applications/browser/lib/metadata/*.json; do
@@ -100,7 +100,7 @@ jobs:
       - name: Collect critical-profile evidence
         shell: bash
         run: |
-          artifact_dir='applications/tauri/profile-artifacts/tauri-critical'
+          artifact_dir="$RUNNER_TEMP/tauri-profile-artifacts/tauri-critical"
           mkdir -p "$artifact_dir"
           cp applications/browser/lib/ride-tauri-profile.json "$artifact_dir/ride-tauri-profile.json"
           for source in applications/browser/lib/metadata/*.json; do
@@ -124,6 +124,6 @@ jobs:
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
           name: tauri-profile-macos-arm64
-          path: app/applications/tauri/profile-artifacts/**
+          path: ${{ runner.temp }}/tauri-profile-artifacts/**
           if-no-files-found: error
           retention-days: 7
