@@ -189,6 +189,14 @@ test('the main Tauri window uses custom borderless chrome while remaining resiza
   assert.equal(mainWindow.minHeight, 768);
 });
 
+test('the main Tauri window avoids transparent composition for startup efficiency', () => {
+  const mainWindow = config.app.windows.find(({ label }) => label === 'main');
+
+  assert.ok(mainWindow, 'expected a main Tauri window');
+  assert.equal(mainWindow.transparent, false);
+  assert.equal(mainWindow.backgroundColor, '#202020');
+});
+
 function readRequiredText(filePath, description) {
   assert.ok(fs.existsSync(filePath), `expected ${description} at ${filePath}`);
   return fs.readFileSync(filePath, 'utf8');
