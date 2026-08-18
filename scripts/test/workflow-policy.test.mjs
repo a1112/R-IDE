@@ -51,6 +51,18 @@ test('every CI job has an explicit timeout and required quality jobs exist', () 
   assert.ok(jobs.some(({ name }) => name === 'package'));
 });
 
+test('CI dependency installs disable unused browser and Electron binary downloads', () => {
+  const workflow = readWorkflow();
+  const globalSection = workflow.split(/^jobs:\s*$/m)[0];
+  for (const variable of [
+    'ELECTRON_SKIP_BINARY_DOWNLOAD',
+    'PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD',
+    'PUPPETEER_SKIP_DOWNLOAD',
+  ]) {
+    assert.match(globalSection, new RegExp(`^  ${variable}:\\s*['\"]?1['\"]?\\s*$`, 'm'));
+  }
+});
+
 test('quality CI continuously exercises packaged smoke lifecycle safety', () => {
   const workflow = readWorkflow();
   const qualityJob = jobBlocks(workflow).find(({ name }) => name === 'quality');

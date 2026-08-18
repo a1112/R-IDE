@@ -22,6 +22,11 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  ELECTRON_SKIP_BINARY_DOWNLOAD: 1
+  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+  PUPPETEER_SKIP_DOWNLOAD: 1
+
 jobs:
   quality:
     name: Quality
