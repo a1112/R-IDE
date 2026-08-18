@@ -1128,7 +1128,7 @@ test('resolves an installed package manifest when exports hide package metadata 
     assert.equal(installed.manifest.name, '@openai/codex-sdk');
 });
 
-test('resolves a range-compatible installed copy past an unrelated Yarn hoist', async t => {
+test('preserves Node nearest-package semantics for an incompatible Yarn hoist', async t => {
     const applicationDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-hoist-range-'));
     t.after(() => fs.promises.rm(applicationDirectory, { recursive: true, force: true }));
     const parentDirectory = path.join(applicationDirectory, 'node_modules', 'parent');
@@ -1152,9 +1152,30 @@ test('resolves a range-compatible installed copy past an unrelated Yarn hoist', 
         })),
     ]);
 
-    const installed = await resolveInstalledManifest('dependency', parentDirectory, '^1.0.0');
-    assert.equal(installed.packageDirectory, hoistedDependency);
-    assert.equal(installed.manifest.version, '1.5.0');
+    const installed = await resolveInstalledManifest('dependency', parentDirectory);
+    assert.equal(installed.packageDirectory, unrelatedNestedDependency);
+    assert.equal(installed.manifest.version, '2.0.0');
+});
+
+test('workspace install isolates the Tauri browser dependency generation from newer desktop apps', () => {
+    const rootManifest = JSON.parse(fs.readFileSync(path.join(appDirectory, 'package.json'), 'utf8'));
+    assert.deepEqual(rootManifest.workspaces.packages, [
+        'applications/*',
+        'theia-extensions/*',
+    ]);
+    assert.deepEqual(rootManifest.workspaces.nohoist, [
+        'theia-ide-browser-app/**',
+        'theia-ide-product-ext/**',
+    ]);
+    const browserManifest = JSON.parse(fs.readFileSync(
+        path.join(appDirectory, 'applications', 'browser', 'package.json'),
+        'utf8',
+    ));
+    assert.equal(
+        rootManifest.devDependencies['@theia/terminal'],
+        browserManifest.dependencies['@theia/terminal'],
+        'the root postinstall patch target must remain installed at the browser-compatible version',
+    );
 });
 
 async function writeSentinel(directory, value) {

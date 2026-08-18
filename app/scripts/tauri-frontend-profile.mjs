@@ -1068,7 +1068,7 @@ export function selectCanonicalPackageManifest(manifestPath) {
     return findPackageManifest(manifestPath);
 }
 
-function packageManifestCandidatesOnSearchPath(requestName, searchPaths) {
+function findManifestOnPackageSearchPath(requestName, searchPaths) {
     const segments = requestName.split('/');
     const validSegments = requestName.startsWith('@')
         ? segments.length === 2
@@ -1076,38 +1076,16 @@ function packageManifestCandidatesOnSearchPath(requestName, searchPaths) {
     if (!validSegments || segments.some(segment => !segment || segment === '.' || segment === '..' || segment.includes('\\'))) {
         throw new Error(`Invalid installed package request name "${requestName}".`);
     }
-    const candidates = [];
     for (const searchPath of searchPaths ?? []) {
         const candidate = path.join(searchPath, ...segments, 'package.json');
         if (fs.existsSync(candidate)) {
-            candidates.push(selectCanonicalPackageManifest(candidate));
+            return selectCanonicalPackageManifest(candidate);
         }
-    }
-    return [...new Set(candidates)];
-}
-
-function findManifestOnPackageSearchPath(requestName, searchPaths) {
-    const [manifestPath] = packageManifestCandidatesOnSearchPath(requestName, searchPaths);
-    if (manifestPath) {
-        return manifestPath;
     }
     throw new Error(`Unable to locate installed package manifest for "${requestName}".`);
 }
 
-function isManifestCompatibleWithSpec(requestName, spec, manifest) {
-    if (spec === undefined) {
-        return true;
-    }
-    const expected = parseDependencySpec(requestName, spec);
-    const range = semver.validRange(expected.range);
-    return manifest?.name === expected.packageName
-        && typeof manifest.version === 'string'
-        && !!semver.valid(manifest.version)
-        && !!range
-        && semver.satisfies(manifest.version, range);
-}
-
-export async function resolveInstalledManifest(requestName, fromDirectory, spec) {
+export async function resolveInstalledManifest(requestName, fromDirectory) {
     const localRequire = createRequire(path.join(fromDirectory, 'package.json'));
     let manifestPath;
     try {
@@ -1121,27 +1099,10 @@ export async function resolveInstalledManifest(requestName, fromDirectory, spec)
         }
     }
     manifestPath = selectCanonicalPackageManifest(manifestPath);
-    let manifest = JSON.parse(await fs.promises.readFile(manifestPath, 'utf8'));
-    if (!isManifestCompatibleWithSpec(requestName, spec, manifest)) {
-        for (const candidate of packageManifestCandidatesOnSearchPath(
-            requestName,
-            localRequire.resolve.paths(requestName),
-        )) {
-            if (candidate === manifestPath) {
-                continue;
-            }
-            const candidateManifest = JSON.parse(await fs.promises.readFile(candidate, 'utf8'));
-            if (isManifestCompatibleWithSpec(requestName, spec, candidateManifest)) {
-                manifestPath = candidate;
-                manifest = candidateManifest;
-                break;
-            }
-        }
-    }
     return {
         requestName,
         packageDirectory: path.dirname(manifestPath),
-        manifest,
+        manifest: JSON.parse(await fs.promises.readFile(manifestPath, 'utf8')),
     };
 }
 
@@ -1163,7 +1124,7 @@ export async function resolveInstalledPackageGraph({
         }
         let installed;
         try {
-            installed = await resolver(requestName, fromDirectory, spec);
+            installed = await resolver(requestName, fromDirectory);
         } catch (error) {
             if (optional) {
                 return;
