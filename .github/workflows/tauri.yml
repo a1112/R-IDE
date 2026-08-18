@@ -69,10 +69,43 @@ jobs:
       - name: Build product extension
         run: npm --workspace theia-extensions/product run build
 
-      - name: Build Tauri backend
+      - name: Build full-profile fallback backend
         run: npm --workspace applications/browser run build:tauri-backend
         env:
           NODE_OPTIONS: --max_old_space_size=4096
+          RIDE_TAURI_FRONTEND_PROFILE: full
+
+      - name: Verify full-profile inventory
+        run: npm run verify:tauri-profile
+
+      - name: Collect full-profile evidence
+        shell: bash
+        run: |
+          artifact_dir='applications/tauri/profile-artifacts/full'
+          mkdir -p "$artifact_dir"
+          cp applications/browser/lib/ride-tauri-profile.json "$artifact_dir/ride-tauri-profile.json"
+          for source in applications/browser/lib/metadata/*.json; do
+            cp "$source" "$artifact_dir/esbuild-metafile-$(basename "$source")"
+          done
+
+      - name: Build critical-profile backend
+        run: npm --workspace applications/browser run build:tauri-backend
+        env:
+          NODE_OPTIONS: --max_old_space_size=4096
+          RIDE_TAURI_FRONTEND_PROFILE: tauri-critical
+
+      - name: Verify critical-profile inventory
+        run: npm run verify:tauri-profile
+
+      - name: Collect critical-profile evidence
+        shell: bash
+        run: |
+          artifact_dir='applications/tauri/profile-artifacts/tauri-critical'
+          mkdir -p "$artifact_dir"
+          cp applications/browser/lib/ride-tauri-profile.json "$artifact_dir/ride-tauri-profile.json"
+          for source in applications/browser/lib/metadata/*.json; do
+            cp "$source" "$artifact_dir/esbuild-metafile-$(basename "$source")"
+          done
 
       - name: Prepare Tauri resources
         run: npm --workspace applications/tauri run copy:all
@@ -85,3 +118,12 @@ jobs:
 
       - name: Build Tauri debug application
         run: npm --workspace applications/tauri run tauri -- build --debug --no-bundle
+
+      - name: Upload Tauri profile evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: tauri-profile-macos-arm64
+          path: app/applications/tauri/profile-artifacts/**
+          if-no-files-found: error
+          retention-days: 7

@@ -6,10 +6,16 @@ import { fileURLToPath } from 'node:url';
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const workflowPath = path.join(repositoryRoot, '.github', 'workflows', 'ci.yml');
+const tauriWorkflowPath = path.join(repositoryRoot, '.github', 'workflows', 'tauri.yml');
 
 function readWorkflow() {
   assert.ok(fs.existsSync(workflowPath), `expected workflow at ${workflowPath}`);
   return fs.readFileSync(workflowPath, 'utf8');
+}
+
+function readTauriWorkflow() {
+  assert.ok(fs.existsSync(tauriWorkflowPath), `expected workflow at ${tauriWorkflowPath}`);
+  return fs.readFileSync(tauriWorkflowPath, 'utf8');
 }
 
 function jobBlocks(workflow) {
@@ -154,6 +160,52 @@ test('packaged Tauri builds preserve the complete plugin dependency graph', () =
   assert.match(verification, /validatePackagedProfileAssets/);
 });
 
+test('every package target explicitly builds the critical Tauri profile', () => {
+  const workflow = readWorkflow();
+  const packageJob = jobBlocks(workflow).find(({ name }) => name === 'package');
+  assert.ok(packageJob, 'package job is required');
+  assert.match(packageJob.text, /env:\s*\n\s+RIDE_TAURI_FRONTEND_PROFILE:\s*tauri-critical/);
+  assert.match(packageJob.text, /npm run verify:tauri-profile/);
+});
+
+test('Tauri verification builds and inventories full fallback before the critical profile', () => {
+  const workflow = readTauriWorkflow();
+  const fullBuild = workflow.indexOf('- name: Build full-profile fallback backend');
+  const fullVerify = workflow.indexOf('- name: Verify full-profile inventory');
+  const criticalBuild = workflow.indexOf('- name: Build critical-profile backend');
+  const criticalVerify = workflow.indexOf('- name: Verify critical-profile inventory');
+  const nativeBuild = workflow.indexOf('- name: Build Tauri debug application');
+  assert.ok(fullBuild >= 0, 'full fallback build is required');
+  assert.ok(fullVerify > fullBuild, 'full fallback inventory must follow its build');
+  assert.ok(criticalBuild > fullVerify, 'critical profile must be rebuilt after full fallback verification');
+  assert.ok(criticalVerify > criticalBuild, 'critical inventory must follow its build');
+  assert.ok(nativeBuild > criticalVerify, 'the native smoke build must use the verified critical profile');
+  assert.match(workflow.slice(fullBuild, fullVerify), /RIDE_TAURI_FRONTEND_PROFILE:\s*full/);
+  assert.match(workflow.slice(criticalBuild, criticalVerify), /RIDE_TAURI_FRONTEND_PROFILE:\s*tauri-critical/);
+});
+
+test('hosted workflows preserve profile, esbuild, and startup evidence without local baseline claims', () => {
+  const ci = readWorkflow();
+  const tauri = readTauriWorkflow();
+  const workflows = `${ci}\n${tauri}`;
+  assert.match(ci, /startup-metrics\*\.json|startup-metrics\.json/);
+  assert.match(workflows, /ride-tauri-profile\.json/);
+  assert.match(workflows, /esbuild-metafile-\$\(basename/);
+  assert.match(ci, /Validate hosted startup report schema/);
+  assert.match(ci, /--baseline\s+"\$report"\s+--candidate\s+"\$report"/);
+  assert.match(ci, /--min-startup-gain\s+0\s+--min-memory-gain\s+0/);
+  assert.doesNotMatch(workflows, /pre-optimization-windows-x64|--min-startup-gain\s+30|--min-memory-gain\s+10/);
+  assert.match(tauri, /uses:\s*actions\/upload-artifact@[0-9a-f]{40}/);
+});
+
+test('Tauri verification keeps least privilege, concurrency, and an explicit timeout', () => {
+  const workflow = readTauriWorkflow();
+  assert.match(workflow, /^permissions:\s*\n\s+contents:\s*read\s*$/m);
+  assert.match(workflow, /^concurrency:\s*\n\s+group:/m);
+  assert.match(workflow, /cancel-in-progress:\s*true/);
+  assert.match(workflow, /timeout-minutes:\s*\d+/);
+});
+
 test('package jobs measure startup after verification and upload the unsigned JSON report', () => {
   const workflow = readWorkflow();
   const packageJob = jobBlocks(workflow).find(({ name }) => name === 'package');
@@ -246,7 +298,7 @@ test('quality and compatibility jobs run the required Node builds and Rust check
 });
 
 test('all third-party actions are pinned to approved full commit SHAs', () => {
-  const workflow = readWorkflow();
+  const workflow = `${readWorkflow()}\n${readTauriWorkflow()}`;
   const uses = [...workflow.matchAll(/^\s+uses:\s*([^\s#]+)\s*$/gm)].map((match) => match[1]);
   assert.ok(uses.length > 0, 'workflow should use pinned official actions');
   const allowed = new Set([
