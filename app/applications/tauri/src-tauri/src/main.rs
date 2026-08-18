@@ -7,6 +7,8 @@
  * SPDX-License-Identifier: MIT
  ********************************************************************************/
 
+#![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
+
 #[cfg(any(target_os = "linux", test))]
 #[derive(Debug, Eq, PartialEq)]
 enum AppImageIntegrationAction {

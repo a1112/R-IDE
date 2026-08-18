@@ -27,6 +27,7 @@ import {
     RideTextKey,
     getRideWindowControls
 } from './ride-native-chrome';
+import { shouldRestoreDemoWorkbench } from './ride-workbench-startup';
 
 const GETTING_STARTED_WIDGET_ID = 'getting.started.widget';
 
@@ -623,14 +624,7 @@ export class RideWorkbenchContribution implements FrontendApplicationContributio
     }
 
     protected shouldRestoreDemoWorkbench(): boolean {
-        const flags = window as Window & { RIDE_RESTORE_DEMO_WORKBENCH?: boolean };
-        if (flags.RIDE_RESTORE_DEMO_WORKBENCH) {
-            return true;
-        }
-
-        const searchParams = new URLSearchParams(window.location.search);
-        return searchParams.get('rideDemoWorkbench') === '1'
-            || window.localStorage?.getItem('ride.restoreDemoWorkbench') === '1';
+        return shouldRestoreDemoWorkbench(window);
     }
 
     protected async configureLeanStartup(): Promise<void> {

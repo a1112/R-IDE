@@ -10,7 +10,8 @@
 use crate::startup::{
     finish_backend_stop, wait_for_owned_loopback, BackendLaunchPlan, BackendReadinessPolicy,
     BackendSpawnStrategy, BackendStartToken, BackendStartupAction, BackendStartupEvent,
-    BackendStartupState, BackendTransport, RuntimePathMode, RuntimePaths,
+    resolve_tauri_config_directory, BackendStartupState, BackendTransport, RuntimePathMode,
+    RuntimePaths,
 };
 use crate::startup_metrics::StartupMilestone;
 use dirs::home_dir;
@@ -35,13 +36,10 @@ fn resolve_runtime_paths(app_handle: &AppHandle) -> Result<RuntimePaths, String>
     state
         .runtime_paths
         .get_or_try_init(|| {
-            let config_directory = std::env::var_os("RIDE_CONFIG_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| {
-                    home_dir()
-                        .unwrap_or_else(|| PathBuf::from("."))
-                        .join(".ride")
-                });
+            let config_directory = resolve_tauri_config_directory(
+                std::env::var_os("RIDE_CONFIG_DIR").map(PathBuf::from),
+                home_dir(),
+            );
             let mode =
                 if let Some(root) = std::env::var_os("RIDE_DEVELOPMENT_ROOT") {
                     RuntimePathMode::Development(PathBuf::from(root))

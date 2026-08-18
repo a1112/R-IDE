@@ -9,6 +9,7 @@
 
 use ride_tauri::startup::{
     finish_backend_stop, parse_linux_listener_inodes, wait_for_loopback, wait_for_owned_loopback,
+    resolve_tauri_config_directory,
     BackendLaunchPlan, BackendOwnershipState, BackendReadinessPolicy, BackendSpawnStrategy,
     BackendStartupAction, BackendStartupEvent, BackendStartupState, BackendTransport,
     RuntimePathMode, RuntimePaths, RuntimePathsCache,
@@ -332,6 +333,32 @@ fn packaged_runtime_paths_derive_from_one_resource_root() {
         PathBuf::from("package-root/resources/plugins")
     );
     assert_eq!(paths.config_directory(), config);
+}
+
+#[test]
+fn tauri_uses_an_isolated_config_directory_unless_explicitly_overridden() {
+    let home = PathBuf::from("home");
+
+    assert_eq!(
+        resolve_tauri_config_directory(None, Some(home.clone())),
+        home.join(".ride-tauri")
+    );
+    assert_eq!(
+        resolve_tauri_config_directory(
+            Some(PathBuf::from("explicit-config")),
+            Some(home)
+        ),
+        PathBuf::from("explicit-config")
+    );
+}
+
+#[test]
+fn release_windows_binary_uses_the_gui_subsystem() {
+    let main_source = include_str!("../src/main.rs");
+
+    assert!(main_source.contains(
+        "#![cfg_attr(all(not(debug_assertions), target_os = \"windows\"), windows_subsystem = \"windows\")]"
+    ));
 }
 
 #[test]
