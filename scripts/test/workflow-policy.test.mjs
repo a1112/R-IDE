@@ -168,6 +168,82 @@ test('every package target explicitly builds the critical Tauri profile', () => 
   assert.match(packageJob.text, /npm run verify:tauri-profile -- --expected-profile tauri-critical/);
 });
 
+test('Windows critical packaged smoke is an explicit manual interaction after package verification', () => {
+  const workflow = readWorkflow();
+  const packageJob = jobBlocks(workflow).find(({ name }) => name === 'package');
+  assert.ok(packageJob, 'package job is required');
+  assert.match(workflow, /workflow_dispatch:\s*\n\s+inputs:\s*\n\s+run_windows_packaged_smoke:/);
+  assert.match(workflow, /run_windows_packaged_smoke:[\s\S]*?type:\s*boolean[\s\S]*?default:\s*false/);
+
+  const verifyIndex = packageJob.text.indexOf('- name: Verify the packaged Tauri application');
+  const smokeIndex = packageJob.text.indexOf('- name: Run packaged Tauri interaction smoke on Windows (manual opt-in)');
+  const diagnosticsIndex = packageJob.text.indexOf('- name: Upload Windows packaged smoke diagnostics');
+  assert.ok(verifyIndex >= 0, 'package verification is required');
+  assert.ok(smokeIndex > verifyIndex, 'Windows interaction smoke must follow package verification');
+  assert.ok(diagnosticsIndex > smokeIndex, 'failure diagnostics must be uploaded after the smoke step');
+
+  const smokeBlock = packageJob.text.slice(smokeIndex, diagnosticsIndex);
+  assert.match(smokeBlock, /if:\s*runner\.os\s*==\s*['"]Windows['"]\s*&&\s*github\.event_name\s*==\s*['"]workflow_dispatch['"]\s*&&\s*inputs\.run_windows_packaged_smoke/);
+  assert.match(smokeBlock, /npm run smoke:tauri-packaged -- --scenario critical-file/);
+  assert.match(smokeBlock, /smoke-diagnostics\/critical-file\.json/);
+
+  const diagnosticsBlock = packageJob.text.slice(diagnosticsIndex);
+  assert.match(diagnosticsBlock, /if:\s*failure\(\)[^\n]*runner\.os\s*==\s*['"]Windows['"]/);
+  assert.match(diagnosticsBlock, /uses:\s*actions\/upload-artifact@[0-9a-f]{40}/);
+  assert.match(diagnosticsBlock, /path:\s*app\/applications\/tauri\/src-tauri\/target\/release\/bundle\/smoke-diagnostics\/\*\*/);
+  const retention = Number(diagnosticsBlock.match(/retention-days:\s*(\d+)/)?.[1]);
+  assert.ok(retention >= 1 && retention <= 14, 'smoke diagnostic retention must be bounded to 1-14 days');
+});
+
+test('full-profile packaged interaction has a distinct manual Windows job', () => {
+  const workflow = readTauriWorkflow();
+  const fullJob = jobBlocks(workflow).find(({ name }) => name === 'windows-full-packaged-smoke');
+  assert.ok(fullJob, 'a distinct full-profile Windows packaged smoke job is required');
+  assert.match(workflow, /workflow_dispatch:\s*\n\s+inputs:\s*\n\s+run_windows_packaged_smoke:/);
+  assert.match(fullJob.text, /if:\s*github\.event_name\s*==\s*['"]workflow_dispatch['"]\s*&&\s*inputs\.run_windows_packaged_smoke/);
+  assert.match(fullJob.text, /runs-on:\s*windows-2022/);
+  assert.match(fullJob.text, /timeout-minutes:\s*\d+/);
+  assert.match(fullJob.text, /RIDE_TAURI_FRONTEND_PROFILE:\s*full/);
+  const buildIndex = fullJob.text.indexOf('run: yarn build:tauri');
+  const verifyIndex = fullJob.text.indexOf('npm --workspace applications/tauri run verify');
+  const inventoryIndex = fullJob.text.indexOf('npm run verify:tauri-profile -- --expected-profile full');
+  const smokeIndex = fullJob.text.indexOf('npm run smoke:tauri-packaged -- --scenario full-file');
+  assert.ok(buildIndex >= 0, 'full-profile package must be built');
+  assert.ok(verifyIndex > buildIndex, 'full-profile package verification must follow its build');
+  assert.ok(inventoryIndex > verifyIndex, 'full-profile inventory must follow package verification');
+  assert.ok(smokeIndex > inventoryIndex, 'full-file interaction must use the verified full-profile package');
+  assert.match(fullJob.text, /name:\s*Upload full-profile packaged smoke diagnostics[\s\S]*?if:\s*failure\(\)/);
+  assert.match(fullJob.text, /retention-days:\s*(?:[1-9]|1[0-4])\b/);
+});
+
+test('non-Windows package jobs validate smoke contracts without claiming interactive success', () => {
+  const workflow = readWorkflow();
+  const tauriWorkflow = readTauriWorkflow();
+  const packageJob = jobBlocks(workflow).find(({ name }) => name === 'package');
+  const tauriVerifyJob = jobBlocks(tauriWorkflow).find(({ name }) => name === 'verify');
+  assert.ok(packageJob, 'package job is required');
+  assert.ok(tauriVerifyJob, 'Tauri verification job is required');
+  const verifyIndex = packageJob.text.indexOf('- name: Verify the packaged Tauri application');
+  const contractIndex = packageJob.text.indexOf('- name: Validate packaged smoke contracts (non-interactive)');
+  const nextStepIndex = packageJob.text.indexOf('\n      - name:', contractIndex + 1);
+  assert.ok(contractIndex > verifyIndex, 'non-interactive contract validation must follow package verification');
+  const contractBlock = packageJob.text.slice(contractIndex, nextStepIndex);
+  assert.match(contractBlock, /if:\s*runner\.os\s*!=\s*['"]Windows['"]/);
+  assert.match(contractBlock, /node --test[^\n]*scripts\/test\/tauri-packaged-smoke-contract\.test\.mjs/);
+  assert.match(contractBlock, /node --test[^\n]*scripts\/test\/verify-tauri-profile\.test\.mjs/);
+  assert.doesNotMatch(contractBlock, /(?:interactive|interaction)\s+(?:passed|success|successful)/i);
+
+  const tauriContractIndex = tauriVerifyJob.text.indexOf('- name: Validate packaged smoke contracts (non-interactive)');
+  const tauriNativeBuildIndex = tauriVerifyJob.text.indexOf('- name: Build Tauri debug application');
+  assert.ok(tauriContractIndex >= 0, 'macOS verification must validate packaged smoke contracts');
+  assert.ok(tauriNativeBuildIndex > tauriContractIndex,
+    'macOS contract validation must precede its native verification build');
+  const tauriContractBlock = tauriVerifyJob.text.slice(tauriContractIndex, tauriNativeBuildIndex);
+  assert.match(tauriContractBlock, /node --test[^\n]*scripts\/test\/tauri-packaged-smoke-contract\.test\.mjs/);
+  assert.match(tauriContractBlock, /node --test[^\n]*scripts\/test\/verify-tauri-profile\.test\.mjs/);
+  assert.doesNotMatch(tauriContractBlock, /smoke:tauri-packaged|(?:interactive|interaction)\s+(?:passed|success|successful)/i);
+});
+
 test('Tauri verification builds and inventories full fallback before the critical profile', () => {
   const workflow = readTauriWorkflow();
   const fullBuild = workflow.indexOf('- name: Build full-profile fallback backend');

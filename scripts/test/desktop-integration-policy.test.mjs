@@ -7,6 +7,8 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+const ciWorkflowPath = path.join(repositoryRoot, '.github', 'workflows', 'ci.yml');
+const tauriWorkflowPath = path.join(repositoryRoot, '.github', 'workflows', 'tauri.yml');
 const configPath = path.join(
   repositoryRoot,
   'app',
@@ -188,6 +190,34 @@ test('the main Tauri window uses custom borderless chrome while remaining resiza
   assert.equal(mainWindow.resizable, true);
   assert.equal(mainWindow.minWidth, 1024);
   assert.equal(mainWindow.minHeight, 768);
+});
+
+test('hosted packaged interaction is Windows-only, manually opted in, and never implied by static checks', () => {
+  const ciWorkflow = readRequiredText(ciWorkflowPath, 'CI workflow');
+  const tauriWorkflow = readRequiredText(tauriWorkflowPath, 'Tauri workflow');
+  const interactionCommands = [...`${ciWorkflow}\n${tauriWorkflow}`.matchAll(
+    /npm run smoke:tauri-packaged -- --scenario (critical-file|full-file)/g,
+  )];
+  assert.equal(interactionCommands.length, 2, 'critical and full packaged interactions must both be explicit');
+
+  const criticalCommandIndex = ciWorkflow.indexOf(interactionCommands[0][0]);
+  const criticalGuard = ciWorkflow.slice(Math.max(0, criticalCommandIndex - 500), criticalCommandIndex);
+  assert.match(criticalGuard, /runner\.os\s*==\s*['"]Windows['"]/);
+  assert.match(criticalGuard, /github\.event_name\s*==\s*['"]workflow_dispatch['"]/);
+  assert.match(criticalGuard, /inputs\.run_windows_packaged_smoke/);
+
+  const fullCommandIndex = tauriWorkflow.indexOf('npm run smoke:tauri-packaged -- --scenario full-file');
+  const fullJobPrefix = tauriWorkflow.slice(tauriWorkflow.lastIndexOf('\n  windows-full-packaged-smoke:', fullCommandIndex), fullCommandIndex);
+  assert.match(fullJobPrefix, /runs-on:\s*windows-2022/);
+  assert.match(fullJobPrefix, /github\.event_name\s*==\s*['"]workflow_dispatch['"]/);
+  assert.match(fullJobPrefix, /inputs\.run_windows_packaged_smoke/);
+
+  const staticValidation = ciWorkflow.match(
+    /- name: Validate packaged smoke contracts \(non-interactive\)([\s\S]*?)(?=\n\s+- name:)/,
+  )?.[0];
+  assert.ok(staticValidation, 'non-Windows static smoke-contract validation is required');
+  assert.match(staticValidation, /runner\.os\s*!=\s*['"]Windows['"]/);
+  assert.doesNotMatch(staticValidation, /smoke:tauri-packaged/);
 });
 
 function readRequiredText(filePath, description) {

@@ -16,6 +16,12 @@ on:
       - '.gitignore'
       - 'app/**'
   workflow_dispatch:
+    inputs:
+      run_windows_packaged_smoke:
+        description: Build and run the full-profile packaged interaction smoke on Windows
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -107,6 +113,9 @@ jobs:
             cp "$source" "$artifact_dir/esbuild-metafile-$(basename "$source")"
           done
 
+      - name: Validate packaged smoke contracts (non-interactive)
+        run: node --test scripts/test/tauri-packaged-smoke-contract.test.mjs scripts/test/verify-tauri-profile.test.mjs
+
       - name: Prepare Tauri resources
         run: npm --workspace applications/tauri run copy:all
 
@@ -125,5 +134,70 @@ jobs:
         with:
           name: tauri-profile-macos-arm64
           path: ${{ runner.temp }}/tauri-profile-artifacts/**
+          if-no-files-found: error
+          retention-days: 7
+
+  windows-full-packaged-smoke:
+    name: Full-profile packaged interaction smoke (Windows, manual)
+    if: github.event_name == 'workflow_dispatch' && inputs.run_windows_packaged_smoke
+    runs-on: windows-2022
+    timeout-minutes: 90
+    env:
+      RIDE_TAURI_FRONTEND_PROFILE: full
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - name: Use Node.js 24
+        uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238
+        with:
+          node-version: 24
+          cache: yarn
+          cache-dependency-path: app/yarn.lock
+      - name: Install Yarn
+        run: npm install --global yarn@1.22.22
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile --network-timeout 100000
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: 1
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+          PUPPETEER_SKIP_DOWNLOAD: 1
+      - name: Download bundled plugins
+        run: yarn download:plugins
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Select stable Rust
+        run: rustup default stable
+      - name: Build the unsigned full-profile Tauri application
+        run: yarn build:tauri
+      - name: Verify the packaged full-profile Tauri application
+        run: npm --workspace applications/tauri run verify
+      - name: Verify full-profile inventory
+        run: npm run verify:tauri-profile -- --expected-profile full
+      - name: Run full-profile packaged Tauri interaction smoke
+        shell: pwsh
+        run: |
+          $smokeOutput = 'applications/tauri/src-tauri/target/release/bundle/smoke-diagnostics/full-file.json'
+          New-Item -ItemType Directory -Force -Path (Split-Path -Parent $smokeOutput) | Out-Null
+          npm run smoke:tauri-packaged -- --scenario full-file --output $smokeOutput
+      - name: Upload full-profile packaged smoke diagnostics
+        if: failure()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: tauri-full-windows-x64-smoke-diagnostics
+          path: app/applications/tauri/src-tauri/target/release/bundle/smoke-diagnostics/**
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Upload full-profile unsigned native bundle
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: tauri-full-windows-x64
+          path: app/applications/tauri/src-tauri/target/release/bundle/**
           if-no-files-found: error
           retention-days: 7

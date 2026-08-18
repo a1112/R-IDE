@@ -8,6 +8,12 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      run_windows_packaged_smoke:
+        description: Run the real packaged interaction smoke in the hosted Windows desktop session
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -229,6 +235,26 @@ jobs:
       - name: Verify critical Tauri profile inventory
         working-directory: app
         run: npm run verify:tauri-profile -- --expected-profile tauri-critical
+      - name: Validate packaged smoke contracts (non-interactive)
+        if: runner.os != 'Windows'
+        working-directory: app
+        run: node --test scripts/test/tauri-packaged-smoke-contract.test.mjs scripts/test/verify-tauri-profile.test.mjs
+      - name: Run packaged Tauri interaction smoke on Windows (manual opt-in)
+        if: runner.os == 'Windows' && github.event_name == 'workflow_dispatch' && inputs.run_windows_packaged_smoke
+        working-directory: app
+        shell: pwsh
+        run: |
+          $smokeOutput = 'applications/tauri/src-tauri/target/release/bundle/smoke-diagnostics/critical-file.json'
+          New-Item -ItemType Directory -Force -Path (Split-Path -Parent $smokeOutput) | Out-Null
+          npm run smoke:tauri-packaged -- --scenario critical-file --output $smokeOutput
+      - name: Upload Windows packaged smoke diagnostics
+        if: failure() && runner.os == 'Windows' && github.event_name == 'workflow_dispatch' && inputs.run_windows_packaged_smoke
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: tauri-windows-x64-smoke-diagnostics
+          path: app/applications/tauri/src-tauri/target/release/bundle/smoke-diagnostics/**
+          if-no-files-found: warn
+          retention-days: 7
       - name: Measure packaged Tauri startup on Linux
         if: runner.os == 'Linux'
         working-directory: app
