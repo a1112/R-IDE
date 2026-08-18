@@ -183,17 +183,67 @@ test('smoke action editor-save appends the fixed marker, saves, and verifies per
     assert.match(fixture.getPersisted(), new RegExp(RIDE_SMOKE_EDITOR_MARKER));
 });
 
+test('smoke action editor-save waits for the initial target editor to become active', async () => {
+    const fixture = editorServices();
+    const expectedActiveEditor = fixture.services.editorManager?.activeEditor;
+    const staleActiveEditor = editorServices({ activeUri: ROOT.resolve('stale.R') }).services.editorManager?.activeEditor;
+    let observations = 0;
+    const services = workspaceServices({
+        ...fixture.services,
+        pollIntervalMs: 1,
+        editorManager: {
+            get activeEditor() {
+                observations++;
+                return observations === 1 ? undefined : observations === 2 ? staleActiveEditor : expectedActiveEditor;
+            }
+        }
+    });
+
+    await new RidePackagedSmokeActionService(services).editorSave(plan({ actionTimeoutMs: 100 }));
+
+    assert.equal(observations, 3);
+    assert.equal(fixture.saveCalls, 1);
+});
+
+test('smoke action editor-save resolves an opened target when active-editor tracking is stale', async () => {
+    const fixture = editorServices();
+    const expectedWidget = fixture.services.editorManager?.activeEditor;
+    const staleWidget = editorServices({ activeUri: ROOT.resolve('stale.R') }).services.editorManager?.activeEditor;
+    const requested: URI[] = [];
+    const services = workspaceServices({
+        ...fixture.services,
+        editorManager: {
+            activeEditor: staleWidget,
+            getByUri: async uri => {
+                requested.push(uri);
+                return expectedWidget;
+            }
+        }
+    });
+
+    await new RidePackagedSmokeActionService(services).editorSave(plan());
+
+    assert.equal(requested.length, 1);
+    assert.equal(requested[0].isEqual(EXPECTED, false), true);
+    assert.equal(fixture.saveCalls, 1);
+});
+
 test('smoke action editor-save rejects missing, wrong, and escaping active editors', async t => {
-    const cases: Array<[string, RidePackagedSmokeActionServices, RideSmokePlan]> = [
-        ['missing editor', workspaceServices({ fileService: { read: async () => ({ value: '' }), exists: async () => false } }), plan()],
-        ['wrong editor', editorServices({ activeUri: ROOT.resolve('other.R') }).services, plan()],
-        ['outside editor', editorServices({ activeUri: new URI('file:///C:/ride-smoke/outside.R') }).services, plan()],
-        ['query-bearing editor', editorServices({ activeUri: EXPECTED.withQuery('other') }).services, plan()],
-        ['escaping plan file', editorServices().services, plan({ files: Object.freeze(['../outside.R']) })]
+    const bounded = (services: RidePackagedSmokeActionServices): RidePackagedSmokeActionServices => ({
+        ...services,
+        pollIntervalMs: 1,
+        pollTimeoutMs: 5
+    });
+    const cases: Array<[string, RidePackagedSmokeActionServices, RideSmokePlan, RegExp]> = [
+        ['missing editor', workspaceServices({ fileService: { read: async () => ({ value: '' }), exists: async () => false } }), plan(), /Smoke action unavailable\./],
+        ['wrong editor', bounded(editorServices({ activeUri: ROOT.resolve('other.R') }).services), plan(), /Smoke action timed out\./],
+        ['outside editor', bounded(editorServices({ activeUri: new URI('file:///C:/ride-smoke/outside.R') }).services), plan(), /Smoke action timed out\./],
+        ['query-bearing editor', bounded(editorServices({ activeUri: EXPECTED.withQuery('other') }).services), plan(), /Smoke action timed out\./],
+        ['escaping plan file', editorServices().services, plan({ files: Object.freeze(['../outside.R']) }), /Smoke action unavailable\./]
     ];
-    for (const [name, services, smokePlan] of cases) {
+    for (const [name, services, smokePlan, expectedError] of cases) {
         await t.test(name, async () => {
-            await assert.rejects(new RidePackagedSmokeActionService(services).editorSave(smokePlan), /Smoke action unavailable\./);
+            await assert.rejects(new RidePackagedSmokeActionService(services).editorSave(smokePlan), expectedError);
         });
     }
 });
@@ -357,7 +407,7 @@ test('smoke action terminal-sentinel uses a fixed Windows command and workspace 
     assert.equal(fixture.starts, 1);
     assert.deepEqual(fixture.commands, [RIDE_SMOKE_WINDOWS_COMMAND]);
     assert.equal(fixture.commands[0].includes('startup.R'), false);
-    assert.equal((fixture.options[0] as { cwd: URI }).cwd.isEqual(ROOT), true);
+    assert.equal((fixture.options[0] as { cwd: string }).cwd, ROOT.toString());
     assert.equal(fixture.disposals, 1);
 });
 
@@ -951,6 +1001,36 @@ test('smoke action waits for hosted plugins before executing the canonical packa
     assert.deepEqual(executions, [RIDE_SMOKE_PACKAGED_PLUGIN.commandId]);
 });
 
+test('smoke action waits for the packaged command registration after hosted plugins start', async () => {
+    const clock = manualTimers();
+    let commandRegistered = false;
+    let executions = 0;
+    const actions = new RidePackagedSmokeActionService({
+        hostedPlugins: { didStart: Promise.resolve() },
+        commandRegistry: {
+            getCommand: id => commandRegistered ? { id } : undefined,
+            getAllHandlers: () => [],
+            executeCommand: async () => { executions++; }
+        },
+        pollIntervalMs: 100,
+        setTimeout: clock.setTimeout,
+        clearTimeout: clock.clearTimeout
+    });
+    const operation = actions.packagedPluginCommand(plan({ actionTimeoutMs: 1_000 }));
+    const outcome = outcomeWithin(operation);
+
+    await turn();
+    await turn();
+    assert.equal(executions, 0);
+
+    commandRegistered = true;
+    await clock.advanceTo(100);
+
+    assert.equal(await outcome, undefined);
+    assert.equal(executions, 1);
+    assert.equal(clock.pending(), 0);
+});
+
 test('Task 5 actions can complete after five seconds but before the planned deadline', async t => {
     await t.test('hosted plugin readiness', async () => {
         const clock = manualTimers();
@@ -1063,6 +1143,64 @@ test('smoke action executes extract-widget and proves the deferred proxy handler
     await new RidePackagedSmokeActionService(services).secondaryWindow(plan());
 
     assert.deepEqual(executions, [{ id: 'extract-widget', widget: eligibleWidget }]);
+    assert.deepEqual(handlers, [realHandler]);
+});
+
+test('smoke action accepts the stable real extract-widget handler in the full profile', async () => {
+    const realHandler = { execute: () => undefined };
+    const eligibleWidget = {
+        id: 'editor',
+        isExtractable: true,
+        secondaryWindow: undefined as object | undefined
+    };
+    let executions = 0;
+    const services = workspaceServices({
+        ...({
+            applicationShell: { widgets: [eligibleWidget] },
+            commandRegistry: {
+                getCommand: (id: string) => id === 'extract-widget' ? { id } : undefined,
+                getAllHandlers: () => [realHandler],
+                executeCommand: async () => {
+                    executions++;
+                    eligibleWidget.secondaryWindow = {};
+                }
+            }
+        } as unknown as Partial<RidePackagedSmokeActionServices>)
+    });
+
+    await new RidePackagedSmokeActionService(services).secondaryWindow(plan({ profile: 'full' }));
+
+    assert.equal(executions, 1);
+});
+
+test('smoke action accepts an extractable widget before Theia creates its secondaryWindow property', async () => {
+    const proxyHandler = { execute: () => undefined };
+    const realHandler = { execute: () => undefined };
+    const eligibleWidget = { id: 'editor', isExtractable: true } as {
+        id: string;
+        isExtractable: true;
+        secondaryWindow?: object;
+    };
+    let handlers = [proxyHandler];
+    let executions = 0;
+    const services = workspaceServices({
+        ...({
+            applicationShell: { widgets: [eligibleWidget] },
+            commandRegistry: {
+                getCommand: (id: string) => id === 'extract-widget' ? { id } : undefined,
+                getAllHandlers: () => handlers,
+                executeCommand: async () => {
+                    executions++;
+                    handlers = [realHandler];
+                    eligibleWidget.secondaryWindow = {};
+                }
+            }
+        } as unknown as Partial<RidePackagedSmokeActionServices>)
+    });
+
+    await new RidePackagedSmokeActionService(services).secondaryWindow(plan());
+
+    assert.equal(executions, 1);
     assert.deepEqual(handlers, [realHandler]);
 });
 

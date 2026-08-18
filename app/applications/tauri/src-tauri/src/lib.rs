@@ -22,10 +22,21 @@ pub mod startup_metrics;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use tauri::{Emitter, Manager};
 
 const MAX_PENDING_LAUNCH_INTENTS: usize = 64;
+static NEXT_SECONDARY_WINDOW_ID: AtomicU64 = AtomicU64::new(1);
+
+fn is_trusted_secondary_window_url(url: &tauri::Url) -> bool {
+    url.scheme() == "http"
+        && url.host_str() == Some("127.0.0.1")
+        && url.port() == Some(sidecar::BACKEND_PORT)
+        && url.path() == "/secondary-window.html"
+        && url.query().is_none()
+        && url.fragment().is_none()
+}
 
 fn configure_local_proxy_bypass() {
     for name in ["NO_PROXY", "no_proxy"] {
@@ -151,6 +162,16 @@ fn log_launch_intent_delivery_failures<E: std::fmt::Display>(
     }
 }
 
+fn close_secondary_windows(app_handle: &tauri::AppHandle) {
+    for (label, window) in app_handle.webview_windows() {
+        if label.starts_with("theia-secondary-") {
+            if let Err(error) = window.close() {
+                log::warn!("Failed to close secondary window {label}: {error}");
+            }
+        }
+    }
+}
+
 #[cfg(unix)]
 fn install_shutdown_signal_handlers(app_handle: tauri::AppHandle) {
     use signal_hook::consts::signal::{SIGINT, SIGTERM};
@@ -254,8 +275,40 @@ pub fn run() {
                 }
             });
 
+            let secondary_window_app = app.handle().clone();
             let window =
                 tauri::WebviewWindowBuilder::from_config(app.handle(), &main_window_config)?
+                    .on_new_window(move |url, features| {
+                        if !is_trusted_secondary_window_url(&url) {
+                            log::warn!("Denied untrusted secondary-window navigation: {url}");
+                            return tauri::webview::NewWindowResponse::Deny;
+                        }
+
+                        let id = NEXT_SECONDARY_WINDOW_ID.fetch_add(1, Ordering::Relaxed);
+                        let label = format!("theia-secondary-{id}");
+                        let blank_url = tauri::Url::parse("about:blank")
+                            .expect("the static secondary-window bootstrap URL must be valid");
+                        let builder = tauri::WebviewWindowBuilder::new(
+                            &secondary_window_app,
+                            label,
+                            tauri::WebviewUrl::External(blank_url),
+                        )
+                        .window_features(features)
+                        .title("R-IDE")
+                        .on_document_title_changed(|window, title| {
+                            if let Err(error) = window.set_title(&title) {
+                                log::warn!("Failed to update secondary-window title: {error}");
+                            }
+                        });
+
+                        match builder.build() {
+                            Ok(window) => tauri::webview::NewWindowResponse::Create { window },
+                            Err(error) => {
+                                log::warn!("Failed to create secondary Tauri window: {error}");
+                                tauri::webview::NewWindowResponse::Deny
+                            }
+                        }
+                    })
                     .build()?;
             native_chrome::configure_native_window(&window);
             match window.is_visible() {
@@ -298,6 +351,17 @@ pub fn run() {
     install_shutdown_signal_handlers(app.handle().clone());
 
     app.run(|app_handle, event| match event {
+        tauri::RunEvent::WindowEvent {
+            label,
+            event: tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed,
+            ..
+        } if label == "main" => {
+            close_secondary_windows(app_handle);
+            if let Err(error) = sidecar::stop_backend(app_handle) {
+                log::warn!("Failed to stop backend while closing the main window: {error}");
+            }
+            app_handle.exit(0);
+        }
         #[cfg(target_os = "macos")]
         tauri::RunEvent::Opened { urls } => {
             let state = app_handle.state::<AppState>();
@@ -400,6 +464,26 @@ mod tests {
             Ok::<_, ()>(())
         });
         assert_eq!(delivered, vec![initial]);
+    }
+
+    #[test]
+    fn secondary_window_url_is_limited_to_the_packaged_theia_page() {
+        let trusted = tauri::Url::parse("http://127.0.0.1:3000/secondary-window.html")
+            .expect("trusted secondary-window URL");
+        assert!(is_trusted_secondary_window_url(&trusted));
+
+        for untrusted in [
+            "https://127.0.0.1:3000/secondary-window.html",
+            "http://localhost:3000/secondary-window.html",
+            "http://127.0.0.1:3001/secondary-window.html",
+            "http://127.0.0.1:3000/secondary-window.html?target=external",
+            "http://127.0.0.1:3000/secondary-window.html#external",
+            "http://127.0.0.1:3000/other.html",
+            "https://example.com/secondary-window.html",
+        ] {
+            let url = tauri::Url::parse(untrusted).expect("untrusted URL fixture");
+            assert!(!is_trusted_secondary_window_url(&url), "accepted {url}");
+        }
     }
 
     #[derive(Debug)]

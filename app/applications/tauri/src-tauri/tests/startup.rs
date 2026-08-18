@@ -489,3 +489,40 @@ fn backend_start_is_scheduled_before_the_main_webview_is_built() {
 
     assert!(backend_start < webview_build);
 }
+
+#[test]
+fn main_webview_bridges_theia_popups_to_tauri_windows() {
+    let lib_source = include_str!("../src/lib.rs");
+    let setup_source = lib_source
+        .split(".setup(move |app|")
+        .nth(1)
+        .and_then(|source| source.split(".invoke_handler").next())
+        .expect("Tauri setup source");
+
+    assert!(setup_source.contains(".on_new_window"));
+    assert!(setup_source.contains("is_trusted_secondary_window_url"));
+    assert!(setup_source.contains("NewWindowResponse::Create"));
+    assert!(setup_source.contains("NewWindowResponse::Deny"));
+}
+
+#[test]
+fn closing_the_main_window_closes_tauri_secondary_windows() {
+    let lib_source = include_str!("../src/lib.rs");
+
+    assert!(lib_source.contains("RunEvent::WindowEvent"));
+    assert!(lib_source.contains("WindowEvent::CloseRequested"));
+    assert!(lib_source.contains("WindowEvent::Destroyed"));
+    assert!(lib_source.contains("close_secondary_windows"));
+    assert!(lib_source.contains("app_handle.exit(0)"));
+
+    let close_source = lib_source
+        .split("if label == \"main\" => {")
+        .nth(1)
+        .and_then(|source| source.split("#[cfg(target_os = \"macos\")]").next())
+        .expect("main-window close handler");
+    let backend_stop = close_source
+        .find("sidecar::stop_backend")
+        .expect("backend shutdown in close handler");
+    let app_exit = close_source.find("app_handle.exit(0)").expect("app exit");
+    assert!(backend_stop < app_exit);
+}

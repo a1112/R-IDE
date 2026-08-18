@@ -123,10 +123,13 @@ test('requestGracefulProcessClose uses fixed PowerShell with a numeric pid', asy
   }), true);
   assert.equal(calls.length, 1);
   assert.equal(calls[0].file, 'powershell.exe');
-  assert.equal(calls[0].args.at(-1), '7331');
+  assert.match(calls[0].args.at(-1), /\}\s+7331\s*$/u);
+  assert.equal(calls[0].args.filter(argument => argument === '7331').length, 0);
   assert.equal(calls[0].args.includes('-TargetPid'), false);
-  assert.match(calls[0].args.join(' '), /@args/);
-  assert.match(calls[0].args.join(' '), /CloseMainWindow/);
+  assert.doesNotMatch(calls[0].args.join(' '), /@args/);
+  assert.match(calls[0].args.join(' '), /EnumWindows/);
+  assert.match(calls[0].args.join(' '), /GetWindowThreadProcessId/);
+  assert.match(calls[0].args.join(' '), /CloseAll/);
   assert.match(calls[0].args.join(' '), /WM_CLOSE/);
   assert.doesNotMatch(calls[0].args.join(' '), /windows:100/);
 });

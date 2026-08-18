@@ -593,9 +593,14 @@ async function waitForForwardingStartedDefault({ run, first, budget }) {
     run,
     first,
     phase: 'second-file-forwarding started progress',
-    validate: validateSmokeProgress,
-    accept: progress => {
-      const final = progress.steps.at(-1);
+    validate: (value, context) => value?.schema === 'ride.tauri-packaged-smoke'
+      ? validateSmokeReport(value, context)
+      : validateSmokeProgress(value, context),
+    accept: artifact => {
+      if (artifact.schema === 'ride.tauri-packaged-smoke') {
+        return true;
+      }
+      const final = artifact.steps.at(-1);
       return final?.action === 'second-file-forwarding' && final.state === 'started';
     },
     budget,
@@ -922,14 +927,16 @@ export async function runPackagedSmoke(options, injectedDependencies) {
     });
     instances.push(first);
     if (definition.actions.includes('second-file-forwarding')) {
-      const progress = validateSmokeProgress(
-        await dependencies.waitForForwardingStarted({
+      const forwardingArtifact = await dependencies.waitForForwardingStarted({
           run,
           first,
           budget: phaseBudget('second-file-forwarding started progress'),
-        }),
-        run.context,
-      );
+        });
+      if (forwardingArtifact?.schema === 'ride.tauri-packaged-smoke') {
+        finalReport = validateSmokeReport(forwardingArtifact, run.context);
+        throw new Error(finalReport.diagnostic?.message ?? 'Smoke ended before second-file forwarding started.');
+      }
+      const progress = validateSmokeProgress(forwardingArtifact, run.context);
       const forwarding = progress.steps.at(-1);
       if (forwarding.action !== 'second-file-forwarding' || forwarding.state !== 'started') {
         throw new Error('second-file-forwarding started progress was not observed');

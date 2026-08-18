@@ -93,7 +93,7 @@ fn args(paths: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
 }
 
 fn canonical(path: &Path) -> PathBuf {
-    fs::canonicalize(path).expect("canonical fixture path")
+    dunce::canonicalize(path).expect("canonical fixture path")
 }
 
 fn expected(id: u64, source: LaunchSource, workspace: &Path, files: Vec<PathBuf>) -> LaunchIntent {
@@ -730,6 +730,28 @@ fn returns_canonical_paths_and_uses_the_canonical_parent_as_workspace() {
         actual.workspace,
         expected_file.parent().expect("canonical fixture parent")
     );
+}
+
+#[cfg(windows)]
+#[test]
+fn canonical_launch_paths_do_not_leak_windows_verbatim_prefixes_to_the_frontend() {
+    let file = Fixture::nested_file("frontend-path.rs");
+
+    let actual = parse_args(
+        args([file.path().as_os_str().to_os_string()]),
+        Path::new("."),
+        LaunchSource::Initial,
+        1,
+    )
+    .expect("Windows launch intent");
+    let serialized = serde_json::to_string(&actual).expect("serialize launch intent");
+
+    assert!(!actual.workspace.to_string_lossy().starts_with(r"\\?\"));
+    assert!(actual
+        .files
+        .iter()
+        .all(|path| !path.to_string_lossy().starts_with(r"\\?\")));
+    assert!(!serialized.contains(r"\\\\?\\"));
 }
 
 #[test]

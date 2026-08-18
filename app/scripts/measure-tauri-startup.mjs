@@ -1770,19 +1770,40 @@ Add-Type @'
 using System;
 using System.Runtime.InteropServices;
 public static class RideWindowClose {
+  public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+  [DllImport("user32.dll")]
+  public static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
+
+  [DllImport("user32.dll")]
+  public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+  [DllImport("user32.dll")]
+  public static extern bool IsWindowVisible(IntPtr hWnd);
+
   [DllImport("user32.dll", SetLastError = true)]
   public static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+
+  public static int CloseAll(int targetPid) {
+    const uint WM_CLOSE = 0x0010;
+    var posted = 0;
+    EnumWindows(delegate (IntPtr hWnd, IntPtr lParam) {
+      uint processId;
+      GetWindowThreadProcessId(hWnd, out processId);
+      if (processId == targetPid && IsWindowVisible(hWnd) &&
+          PostMessage(hWnd, WM_CLOSE, IntPtr.Zero, IntPtr.Zero)) {
+        posted++;
+      }
+      return true;
+    }, IntPtr.Zero);
+    return posted;
+  }
 }
 '@
-$target = Get-Process -Id $TargetPid -ErrorAction Stop
-if ($target.CloseMainWindow()) { exit 0 }
-$WM_CLOSE = 0x0010
-if ($target.MainWindowHandle -ne [IntPtr]::Zero -and
-    [RideWindowClose]::PostMessage($target.MainWindowHandle, $WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero)) {
-  exit 0
-}
+$null = Get-Process -Id $TargetPid -ErrorAction Stop
+if ([RideWindowClose]::CloseAll($TargetPid) -gt 0) { exit 0 }
 exit 1
-} @args
+} __RIDE_TARGET_PID__
 `;
 
 export async function requestGracefulProcessClose(
@@ -1820,13 +1841,16 @@ export async function requestGracefulProcessClose(
     signal(verifiedIdentity.pid, 'SIGTERM');
     return true;
   }
+  const closeScript = WINDOWS_GRACEFUL_CLOSE_SCRIPT.replace(
+    '__RIDE_TARGET_PID__',
+    String(verifiedIdentity.pid),
+  );
   const result = run('powershell.exe', [
     '-NoLogo',
     '-NoProfile',
     '-NonInteractive',
     '-Command',
-    WINDOWS_GRACEFUL_CLOSE_SCRIPT,
-    String(verifiedIdentity.pid),
+    closeScript,
   ], {
     encoding: 'utf8',
     windowsHide: true,

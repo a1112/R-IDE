@@ -27,7 +27,7 @@ use tokio::net::TcpStream;
 use tokio::process::Command;
 
 const BACKEND_STARTUP_TIMEOUT: u64 = 240; // seconds
-const BACKEND_PORT: u16 = 3000;
+pub(crate) const BACKEND_PORT: u16 = 3000;
 const BACKEND_PROBE_INTERVAL: Duration = Duration::from_millis(50);
 const BACKEND_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 

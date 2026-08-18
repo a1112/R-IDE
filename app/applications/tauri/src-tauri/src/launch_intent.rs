@@ -656,7 +656,11 @@ fn resolve_existing_file(path: PathBuf) -> Option<PathBuf> {
         return None;
     }
 
-    let canonical = std::fs::canonicalize(path).ok()?;
+    // `std::fs::canonicalize` returns a verbatim `\\?\` path on Windows.
+    // That prefix is valid for native I/O but serializes into a different
+    // file URI authority in Theia, so keep the canonical path in normal
+    // Win32 form at the native/frontend boundary.
+    let canonical = dunce::canonicalize(path).ok()?;
     if !canonical.is_file() || canonical.to_str().is_none() {
         return None;
     }

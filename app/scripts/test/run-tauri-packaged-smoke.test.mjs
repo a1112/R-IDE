@@ -1205,6 +1205,36 @@ test('critical-empty launches no file or forwarding instance and proves shell pl
   ]);
 });
 
+test('orchestration preserves an early failed final report observed while waiting for forwarding', async () => {
+  const events = [];
+  let preservedReport;
+  const failedSteps = [
+    { action: 'editor-save', state: 'started', durationMs: 0, diagnostic: null },
+    {
+      action: 'editor-save',
+      state: 'failed',
+      durationMs: 1,
+      diagnostic: { code: 'action-failed', message: 'Smoke action failed.' },
+    },
+  ];
+  const failedReport = report({
+    status: 'failed',
+    failurePhase: 'action',
+    durationMs: 1,
+    diagnostic: { code: 'action-failed', message: 'Smoke action failed.' },
+    steps: failedSteps,
+  });
+
+  await assert.rejects(runPackagedSmoke(options, fixtureDependencies(events, {
+    waitForForwardingStarted: async () => failedReport,
+    preserveFailure: async ({ report: observed }) => { preservedReport = observed; },
+  })), /Smoke action failed\./);
+
+  assert.equal(preservedReport?.status, 'failed');
+  assert.equal(events.includes('launch-second'), false);
+  assert.equal(events.at(-1), 'temp-cleanup');
+});
+
 test('full-file requires the full run context and preserves two-instance orchestration', async () => {
   const events = [];
   const fullRun = {

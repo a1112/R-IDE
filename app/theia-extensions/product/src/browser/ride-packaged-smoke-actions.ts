@@ -52,6 +52,7 @@ interface EditorLike {
 
 interface EditorManagerLike {
     readonly activeEditor: { readonly editor: EditorLike } | undefined;
+    getByUri?(uri: URI): Promise<{ readonly editor: EditorLike } | undefined>;
 }
 
 interface FileServiceLike {
@@ -67,7 +68,7 @@ interface TerminalWidgetLike extends Disposable {
 interface TerminalServiceLike {
     newTerminal(options: {
         readonly title: string;
-        readonly cwd: URI;
+        readonly cwd: string;
         readonly shellPath: string;
         readonly shellArgs: string[];
         readonly destroyTermOnClose: boolean;
@@ -125,7 +126,7 @@ interface ApplicationShellLike {
 
 interface ExtractableWidgetLike {
     readonly isExtractable: true;
-    secondaryWindow: unknown | undefined;
+    secondaryWindow?: unknown;
 }
 
 interface OpenRequestsLike {
@@ -217,10 +218,23 @@ export class RidePackagedSmokeActionService implements RidePackagedSmokeActions,
             const expectedFile = this.resolveExpectedFile(plan, root);
             const editorManager = this.requireService(this.services.editorManager);
             const fileService = this.requireService(this.services.fileService);
-            run.assertActive();
-            const editor = editorManager.activeEditor?.editor;
-            if (!editor || !this.uriEquals(editor.uri, expectedFile)) {
-                throw this.error('Smoke action unavailable.');
+            const findExpectedEditor = async (): Promise<EditorLike | undefined> => {
+                run.assertActive();
+                const active = editorManager.activeEditor?.editor;
+                if (active && this.uriEquals(active.uri, expectedFile)) {
+                    return active;
+                }
+                const opened = editorManager.getByUri
+                    ? await run.wait(editorManager.getByUri(expectedFile))
+                    : undefined;
+                return opened?.editor && this.uriEquals(opened.editor.uri, expectedFile)
+                    ? opened.editor
+                    : undefined;
+            };
+            let editor = await findExpectedEditor();
+            while (!editor) {
+                await run.delay(this.pollIntervalMs);
+                editor = await findExpectedEditor();
             }
             run.assertActive();
             const content = editor.document.getText();
@@ -293,7 +307,7 @@ export class RidePackagedSmokeActionService implements RidePackagedSmokeActions,
                 run.assertActive();
                 const creation = Promise.resolve(terminalService.newTerminal({
                     title: 'R-IDE Smoke',
-                    cwd: root,
+                    cwd: root.toString(),
                     shellPath: windows ? 'powershell.exe' : '/bin/sh',
                     shellArgs: windows ? ['-NoLogo', '-NoProfile', '-NonInteractive'] : [],
                     destroyTermOnClose: true,
@@ -382,8 +396,8 @@ export class RidePackagedSmokeActionService implements RidePackagedSmokeActions,
             await run.wait(hostedPlugins.didStart);
             run.assertActive();
             const commandId = RIDE_SMOKE_PACKAGED_PLUGIN.commandId;
-            if (commandRegistry.getCommand(commandId)?.id !== commandId) {
-                throw this.error('Smoke action unavailable.');
+            while (commandRegistry.getCommand(commandId)?.id !== commandId) {
+                await run.delay(this.pollIntervalMs);
             }
             run.assertActive();
             await run.wait(commandRegistry.executeCommand(commandId));
@@ -408,10 +422,11 @@ export class RidePackagedSmokeActionService implements RidePackagedSmokeActions,
             await run.wait(commandRegistry.executeCommand(RIDE_SMOKE_EXTRACT_WIDGET_COMMAND, widget));
             run.assertActive();
             const realHandlers = [...commandRegistry.getAllHandlers(RIDE_SMOKE_EXTRACT_WIDGET_COMMAND)];
+            const handlerWasReplaced = realHandlers[0] !== proxyHandlers[0];
             if (commandRegistry.getCommand(RIDE_SMOKE_EXTRACT_WIDGET_COMMAND)?.id
                 !== RIDE_SMOKE_EXTRACT_WIDGET_COMMAND
                 || realHandlers.length !== 1
-                || realHandlers[0] === proxyHandlers[0]) {
+                || handlerWasReplaced !== (plan.profile === 'tauri-critical')) {
                 throw this.error('Smoke action failed.');
             }
             while (widget.secondaryWindow === undefined) {
@@ -836,5 +851,5 @@ export class RidePackagedSmokeActionService implements RidePackagedSmokeActions,
 function isEligibleExtractableWidget(value: unknown): value is ExtractableWidgetLike {
     return typeof value === 'object' && !!value
         && 'isExtractable' in value && value.isExtractable === true
-        && 'secondaryWindow' in value && value.secondaryWindow === undefined;
+        && (!('secondaryWindow' in value) || value.secondaryWindow === undefined);
 }

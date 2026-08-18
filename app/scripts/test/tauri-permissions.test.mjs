@@ -112,7 +112,7 @@ test('remote Tauri frontend receives only audited per-command permissions', asyn
   }
 
   const capability = JSON.parse(await readFile(path.join(tauriDirectory, 'capabilities', 'default.json'), 'utf8'));
-  assert.deepEqual(capability.windows, ['main']);
+  assert.deepEqual(capability.windows, ['main', 'theia-secondary-*']);
   assert.equal(capability.local, false);
   assert.deepEqual(capability.remote?.urls, ['http://127.0.0.1:3000']);
   assert.deepEqual(
