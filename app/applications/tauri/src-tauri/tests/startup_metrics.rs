@@ -300,6 +300,36 @@ fn enabled_recorder_publishes_incrementally_readable_json() {
 }
 
 #[test]
+fn overlapped_backend_spawn_is_published_in_canonical_order_after_window_visibility() {
+    let output = unique_report_path("overlapped-backend");
+    let metrics = StartupMetrics::with_clock(
+        Some(output.clone()),
+        "test-platform",
+        "test-arch",
+        77,
+        Arc::new(SequenceClock::new(vec![0, 100, 700])),
+    );
+
+    metrics
+        .record(StartupMilestone::ProcessStarted)
+        .expect("publish process start");
+    metrics
+        .record_backend_spawned_before_window()
+        .expect("hold overlapped backend spawn");
+    let before_window = wait_for_report_milestone(&output, "process_started");
+    assert_eq!(before_window["milestones"].get("backend_spawned"), None);
+
+    metrics
+        .record(StartupMilestone::NativeWindowVisible)
+        .expect("publish native window and held backend spawn");
+    let visible = wait_for_report_milestone(&output, "backend_spawned");
+    assert_eq!(visible["milestones"]["native_window_visible"], 700);
+    assert_eq!(visible["milestones"]["backend_spawned"], 700);
+
+    fs::remove_file(output).expect("remove report");
+}
+
+#[test]
 fn blocked_writer_does_not_block_recording_and_preserves_snapshot_order() {
     let (started_tx, started_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();

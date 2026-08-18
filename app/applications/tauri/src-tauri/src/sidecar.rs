@@ -8,10 +8,10 @@
  ********************************************************************************/
 
 use crate::startup::{
-    finish_backend_stop, wait_for_owned_loopback, BackendLaunchPlan, BackendReadinessPolicy,
-    BackendSpawnStrategy, BackendStartToken, BackendStartupAction, BackendStartupEvent,
-    resolve_tauri_config_directory, BackendStartupState, BackendTransport, RuntimePathMode,
-    RuntimePaths,
+    finish_backend_stop, resolve_tauri_config_directory, wait_for_owned_loopback,
+    BackendLaunchPlan, BackendReadinessPolicy, BackendSpawnStrategy, BackendStartToken,
+    BackendStartupAction, BackendStartupEvent, BackendStartupState, BackendTransport,
+    RuntimePathMode, RuntimePaths,
 };
 use crate::startup_metrics::StartupMilestone;
 use dirs::home_dir;
@@ -742,7 +742,7 @@ async fn start_node_backend_process(
         .spawn_command(command)
         .map_err(|e| format!("Failed to spawn backend in PTY: {}", e))?;
     drop(pair.slave);
-    record_startup_milestone(app_handle, StartupMilestone::BackendSpawned);
+    record_backend_spawned_before_window(app_handle);
 
     let child_pid = child.process_id();
     if let Some(pid) = child_pid {
@@ -1181,7 +1181,7 @@ async fn start_backend_direct_process(
     let mut child = command
         .spawn()
         .map_err(|error| format!("Failed to spawn backend with direct pipes: {error}"))?;
-    record_startup_milestone(app_handle, StartupMilestone::BackendSpawned);
+    record_backend_spawned_before_window(app_handle);
     let Some(pid) = child.id() else {
         let cleanup = terminate_and_reap_backend(&mut child, None).await;
         clear_backend_state(app_handle);
@@ -1461,6 +1461,14 @@ fn record_startup_milestone(app_handle: &AppHandle, milestone: StartupMilestone)
         log::warn!(
             "Cannot record startup milestone {milestone:?}: application state is unavailable"
         );
+    }
+}
+
+fn record_backend_spawned_before_window(app_handle: &AppHandle) {
+    if let Some(state) = app_handle.try_state::<crate::AppState>() {
+        if let Err(error) = state.startup_metrics.record_backend_spawned_before_window() {
+            log::warn!("Failed to record overlapped backend spawn: {error}");
+        }
     }
 }
 
