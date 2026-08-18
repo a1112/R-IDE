@@ -251,11 +251,9 @@ pub fn run() {
                 }
             });
 
-            let window = tauri::WebviewWindowBuilder::from_config(
-                app.handle(),
-                &main_window_config,
-            )?
-            .build()?;
+            let window =
+                tauri::WebviewWindowBuilder::from_config(app.handle(), &main_window_config)?
+                    .build()?;
             native_chrome::configure_native_window(&window);
             match window.is_visible() {
                 Ok(true) => app

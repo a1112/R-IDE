@@ -8,11 +8,10 @@
  ********************************************************************************/
 
 use ride_tauri::startup::{
-    finish_backend_stop, parse_linux_listener_inodes, wait_for_loopback, wait_for_owned_loopback,
-    resolve_tauri_config_directory,
-    BackendLaunchPlan, BackendOwnershipState, BackendReadinessPolicy, BackendSpawnStrategy,
-    BackendStartupAction, BackendStartupEvent, BackendStartupState, BackendTransport,
-    RuntimePathMode, RuntimePaths, RuntimePathsCache,
+    finish_backend_stop, parse_linux_listener_inodes, resolve_tauri_config_directory,
+    wait_for_loopback, wait_for_owned_loopback, BackendLaunchPlan, BackendOwnershipState,
+    BackendReadinessPolicy, BackendSpawnStrategy, BackendStartupAction, BackendStartupEvent,
+    BackendStartupState, BackendTransport, RuntimePathMode, RuntimePaths, RuntimePathsCache,
 };
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -344,10 +343,7 @@ fn tauri_uses_an_isolated_config_directory_unless_explicitly_overridden() {
         home.join(".ride-tauri")
     );
     assert_eq!(
-        resolve_tauri_config_directory(
-            Some(PathBuf::from("explicit-config")),
-            Some(home)
-        ),
+        resolve_tauri_config_directory(Some(PathBuf::from("explicit-config")), Some(home)),
         PathBuf::from("explicit-config")
     );
 }
