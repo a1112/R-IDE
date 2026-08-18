@@ -374,8 +374,7 @@ function createContribution(
     nativeChrome?: FakeNativeChrome,
     deferredWorkScheduler?: RideDeferredWorkScheduler,
     startHostedPluginResolution: () => void = () => undefined,
-    onActivate: (id: string) => void | Promise<void> = () => undefined,
-    releaseStartupMemory: () => void = () => undefined
+    onActivate: (id: string) => void | Promise<void> = () => undefined
 ): {
     contribution: TestRideOpenRequestContribution;
     workspace: FakeWorkspaceService;
@@ -416,8 +415,7 @@ function createContribution(
         },
         startHostedPluginResolution,
         pluginDeployment,
-        effectiveDeferredWorkScheduler,
-        releaseStartupMemory
+        effectiveDeferredWorkScheduler
     );
     return {
         contribution,
@@ -2437,47 +2435,6 @@ test('late plugin lifecycle is observed in the background without blocking targe
         'plugins_started',
         'plugins_ready'
     ]);
-});
-
-test('plugin readiness releases startup memory once after publishing the final milestone', async () => {
-    const hostedPlugins = new FakeHostedPluginSupport();
-    const events: string[] = [];
-    const context = createContribution(
-        '/project',
-        new MemoryStorage(),
-        () => undefined,
-        async milestone => {
-            events.push(`milestone:${milestone}`);
-        },
-        new FakeApplicationStateService(),
-        hostedPlugins,
-        undefined,
-        undefined,
-        undefined,
-        () => undefined,
-        () => undefined,
-        () => events.push('release-memory')
-    );
-
-    await context.contribution.handleOpenRequest({
-        id: '42', source: 'initial', workspace: '/project', files: ['/project/release-memory.R']
-    });
-    hostedPlugins.resolveWillStart();
-    hostedPlugins.resolveDidStart();
-    await flushLifecycle();
-
-    assert.deepEqual(events, [
-        'milestone:target_file_opened',
-        'milestone:plugins_started',
-        'milestone:plugins_ready',
-        'release-memory'
-    ]);
-
-    await context.contribution.handleOpenRequest({
-        id: '43', source: 'singleInstance', workspace: '/project', files: ['/project/second.R']
-    });
-    await flushLifecycle();
-    assert.equal(events.filter(event => event === 'release-memory').length, 1);
 });
 
 test('plugin lifecycle rejection warns once without blocking files or producing false milestones', async () => {
