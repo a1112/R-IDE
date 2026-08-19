@@ -500,21 +500,6 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
             return;
         }
         await this.reportStartupMilestone('plugins_ready');
-        if (!this.disposed) {
-            this.compactRendererMemoryAfterStartup();
-        }
-    }
-
-    protected compactRendererMemoryAfterStartup(): void {
-        const garbageCollector = (globalThis as typeof globalThis & { gc?: () => void }).gc;
-        if (typeof garbageCollector !== 'function') {
-            return;
-        }
-        try {
-            garbageCollector.call(globalThis);
-        } catch (error) {
-            console.warn('[R-IDE] Failed to compact renderer memory after startup.', error);
-        }
     }
 
     protected async reportStartupMilestone(milestone: RideStartupMilestone): Promise<void> {
