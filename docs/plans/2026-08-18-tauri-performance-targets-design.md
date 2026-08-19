@@ -100,6 +100,17 @@ Startup without a target file schedules the same plugin path after a bounded fal
 
 The `target_file_opened` milestone continues to mean that the target widget has been opened and activated. Deferred plugin work must not be hidden inside work awaited before that milestone.
 
+Post-profile Windows measurements found one additional lifecycle cost outside the
+frontend dependency graph: Theia's terminal contribution created a default
+terminal during `initializeLayout`, even though the bottom panel remained
+collapsed. The Tauri frontend therefore replaces that contribution with a
+subclass that skips only the eager layout-time terminal creation. Browser and
+explicit full-profile launches retain the upstream behavior, while every
+terminal command and service remains registered so the first user or smoke-test
+request creates a terminal on demand. This is a startup lifecycle optimization,
+not removal of terminal functionality; packaged smoke must continue to execute
+the terminal sentinel in both target-file and empty-window scenarios.
+
 ## Deferred feature activation
 
 Deferred modules are not deleted. Their commands, menus, file-type handlers, or other activation surfaces use a small registration layer that loads the corresponding feature chunk on first demand. Multiple concurrent requests share one activation promise. Successful activations are cached; failures are surfaced to the user and remain retryable without preventing core editor startup.

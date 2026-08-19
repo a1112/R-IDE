@@ -30,6 +30,7 @@ import { RideWorkbenchContribution } from './ride-workbench-contribution';
 import { bindRidePerformanceContribution } from './ride-performance-contribution';
 import { bindRideDeferredFeatureLoader } from './ride-deferred-feature-loader';
 import { bindRidePackagedSmokeContribution } from './ride-packaged-smoke-bindings';
+import { bindRideTerminalFrontendContribution } from './ride-terminal-frontend-contribution';
 
 export default new ContainerModule((bind, _unbind, isBound, rebind) => {
     applyBranding();
@@ -39,6 +40,8 @@ export default new ContainerModule((bind, _unbind, isBound, rebind) => {
     } else {
         bind(AboutDialog).to(TheiaIDEAboutDialog).inSingletonScope();
     }
+
+    bindRideTerminalFrontendContribution(bind, isBound, rebind);
 
     bind(TheiaIDEContribution).toSelf().inSingletonScope();
     [CommandContribution, MenuContribution].forEach(serviceIdentifier =>
