@@ -4108,6 +4108,31 @@ test('POSIX termination never sends a group signal when root is not the detached
   assert.equal(signals.some(([pid]) => pid < 0), false);
 });
 
+test('measurement grants Windows identity capture the synchronous command budget', async () => {
+  let captureTimeout;
+  await assert.rejects(measureOnce({
+    executable: '/fixture/R-IDE.exe',
+    codeFile: '/fixture/startup.R',
+    reportPath: '/fixture/report.json',
+    idleMs: 0,
+    timeoutMs: 300_000,
+    pollMs: 25,
+    cwd: '/fixture',
+  }, {
+    platform: 'win32',
+    now: () => 0,
+    createRunId: () => '7f7df1aa-a324-4fd4-b11c-4cc260a94d8f',
+    launch: () => ({ pid: 7331 }),
+    capture: async (_pid, options) => {
+      captureTimeout = options.timeoutMs;
+      throw new Error('stop after capture');
+    },
+    terminate: async () => undefined,
+  }), /stop after capture/);
+
+  assert.equal(captureTimeout, 10_000);
+});
+
 test('measurement timeout always terminates only the process tree it launched', async () => {
   const terminated = [];
   const sampled = [];

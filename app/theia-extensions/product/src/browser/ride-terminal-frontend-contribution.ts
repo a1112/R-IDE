@@ -8,11 +8,28 @@
  ********************************************************************************/
 
 import { TerminalFrontendContribution } from '@theia/terminal/lib/browser/terminal-frontend-contribution';
-import { injectable } from '@theia/core/shared/inversify';
+import { injectable, interfaces } from '@theia/core/shared/inversify';
+import { isTauri as isTauriRuntime } from '@tauri-apps/api/core';
+import {
+    bindReplacementSingleton,
+    RideTerminalStartupFlags,
+    shouldInitializeDefaultTerminal
+} from './ride-terminal-startup';
 
-interface RideWindow extends Window {
-    RIDE_DISABLE_DEFAULT_TERMINAL?: boolean;
-    RIDE_TAURI?: boolean;
+interface RideWindow extends Window, RideTerminalStartupFlags { }
+
+export function bindRideTerminalFrontendContribution(
+    bind: interfaces.Bind,
+    isBound: (serviceIdentifier: interfaces.ServiceIdentifier<unknown>) => boolean,
+    rebind: interfaces.Bind
+): void {
+    bindReplacementSingleton(
+        bind,
+        isBound,
+        rebind,
+        TerminalFrontendContribution,
+        RideTerminalFrontendContribution
+    );
 }
 
 @injectable()
@@ -20,7 +37,7 @@ export class RideTerminalFrontendContribution extends TerminalFrontendContributi
 
     override async initializeLayout(): Promise<void> {
         const flags = window as RideWindow;
-        if (flags.RIDE_DISABLE_DEFAULT_TERMINAL || flags.RIDE_TAURI) {
+        if (!shouldInitializeDefaultTerminal(flags, isTauriRuntime)) {
             return;
         }
         return super.initializeLayout();

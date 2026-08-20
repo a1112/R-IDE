@@ -1621,10 +1621,10 @@ index 388697a..dec36d4 100644
      }
  }
 diff --git a/theia-extensions/product/src/browser/theia-ide-frontend-module.ts b/theia-extensions/product/src/browser/theia-ide-frontend-module.ts
-index d3c3ed3..cd982a9 100644
+index d3c3ed3..eb5cbe1 100644
 --- a/theia-extensions/product/src/browser/theia-ide-frontend-module.ts
 +++ b/theia-extensions/product/src/browser/theia-ide-frontend-module.ts
-@@ -9,27 +9,31 @@
+@@ -9,41 +9,73 @@
  
  import '../../src/browser/style/index.css';
  
@@ -1656,6 +1656,7 @@ index d3c3ed3..cd982a9 100644
 +import { bindRidePerformanceContribution } from './ride-performance-contribution';
 +import { bindRideDeferredFeatureLoader } from './ride-deferred-feature-loader';
 +import { bindRidePackagedSmokeContribution } from './ride-packaged-smoke-bindings';
++import { bindRideTerminalFrontendContribution } from './ride-terminal-frontend-contribution';
  
  export default new ContainerModule((bind, _unbind, isBound, rebind) => {
      applyBranding();
@@ -1668,7 +1669,13 @@ index d3c3ed3..cd982a9 100644
      if (isBound(AboutDialog)) {
          rebind(AboutDialog).to(TheiaIDEAboutDialog).inSingletonScope();
      } else {
-@@ -41,9 +45,34 @@ export default new ContainerModule((bind, _unbind, isBound, rebind) => {
+         bind(AboutDialog).to(TheiaIDEAboutDialog).inSingletonScope();
+     }
+ 
++    bindRideTerminalFrontendContribution(bind, isBound, rebind);
++
+     bind(TheiaIDEContribution).toSelf().inSingletonScope();
+     [CommandContribution, MenuContribution].forEach(serviceIdentifier =>
          bind(serviceIdentifier).toService(TheiaIDEContribution)
      );
  

@@ -2833,7 +2833,7 @@ export async function measureOnce(options, dependencies = defaultMeasurementDepe
   try {
     rootIdentity = await dependencies.capture(rootPid, {
       platform,
-      timeoutMs: Math.min(2_000, Math.max(0, deadline - now())),
+      timeoutMs: Math.min(SYNC_COMMAND_TIMEOUT_MS, Math.max(0, deadline - now())),
       pollMs: Math.min(25, options.pollMs),
     });
     ownedGroup = captureOwnedProcessGroup(rootIdentity, platform);

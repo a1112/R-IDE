@@ -21,6 +21,7 @@ theia-extensions/product/src/browser/ride-packaged-smoke.ts
 theia-extensions/product/src/browser/ride-performance-contribution.ts
 theia-extensions/product/src/browser/ride-performance.ts
 theia-extensions/product/src/browser/ride-terminal-frontend-contribution.ts
+theia-extensions/product/src/browser/ride-terminal-startup.ts
 theia-extensions/product/src/browser/ride-workbench-contribution.ts
 theia-extensions/product/src/browser/ride-workbench-startup.ts
 theia-extensions/product/test/ride-deferred-feature-loader.test.ts
@@ -32,6 +33,7 @@ theia-extensions/product/test/ride-packaged-smoke-bindings.test.ts
 theia-extensions/product/test/ride-packaged-smoke.test.ts
 theia-extensions/product/test/ride-performance-contribution.test.ts
 theia-extensions/product/test/ride-performance.test.ts
+theia-extensions/product/test/ride-terminal-frontend-contribution.test.ts
 theia-extensions/product/test/ride-workbench-startup.test.ts
 theia-extensions/product/tsconfig.test.json
 package-lock.json
