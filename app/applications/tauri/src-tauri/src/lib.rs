@@ -63,6 +63,91 @@ where
     backend_cleanup()
 }
 
+type ApplicationShutdownResult = Result<(), String>;
+
+enum ApplicationShutdownState {
+    Idle,
+    Running,
+    Complete(ApplicationShutdownResult),
+}
+
+enum ApplicationShutdownRole {
+    Leader,
+    Follower(tokio::sync::watch::Receiver<Option<ApplicationShutdownResult>>),
+    Complete(ApplicationShutdownResult),
+}
+
+struct ApplicationShutdown {
+    state: Mutex<ApplicationShutdownState>,
+    completion: tokio::sync::watch::Sender<Option<ApplicationShutdownResult>>,
+}
+
+impl ApplicationShutdown {
+    fn new() -> Self {
+        let (completion, _) = tokio::sync::watch::channel(None);
+        Self {
+            state: Mutex::new(ApplicationShutdownState::Idle),
+            completion,
+        }
+    }
+
+    async fn run<G, GFut, B, BFut>(
+        &self,
+        gateway_stop: G,
+        backend_cleanup: B,
+    ) -> ApplicationShutdownResult
+    where
+        G: FnOnce() -> GFut,
+        GFut: Future<Output = ApplicationShutdownResult>,
+        B: FnOnce() -> BFut,
+        BFut: Future<Output = ApplicationShutdownResult>,
+    {
+        let role = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| "application shutdown state mutex is poisoned".to_string())?;
+            match &*state {
+                ApplicationShutdownState::Idle => {
+                    *state = ApplicationShutdownState::Running;
+                    ApplicationShutdownRole::Leader
+                }
+                ApplicationShutdownState::Running => {
+                    ApplicationShutdownRole::Follower(self.completion.subscribe())
+                }
+                ApplicationShutdownState::Complete(result) => {
+                    ApplicationShutdownRole::Complete(result.clone())
+                }
+            }
+        };
+
+        match role {
+            ApplicationShutdownRole::Complete(result) => result,
+            ApplicationShutdownRole::Follower(mut completion) => completion
+                .wait_for(Option::is_some)
+                .await
+                .map(|result| result.clone().expect("shutdown completion is present"))
+                .map_err(|_| "application shutdown completion channel closed".to_string())?,
+            ApplicationShutdownRole::Leader => {
+                let result = match gateway_stop().await {
+                    Ok(()) => backend_cleanup().await,
+                    Err(error) => Err(error),
+                };
+                let stored_result = {
+                    let mut state = self
+                        .state
+                        .lock()
+                        .map_err(|_| "application shutdown state mutex is poisoned".to_string())?;
+                    *state = ApplicationShutdownState::Complete(result.clone());
+                    result
+                };
+                self.completion.send_replace(Some(stored_result.clone()));
+                stored_result
+            }
+        }
+    }
+}
+
 pub async fn begin_gateway_retry_after_cleanup<C, E>(
     state: &startup_gateway::GatewayState,
     failed_generation: startup_gateway::BackendGeneration,
@@ -164,6 +249,7 @@ pub struct AppState {
     pub startup_mode: Mutex<startup_metrics::StartupMode>,
     pub gateway: Mutex<Option<startup_gateway::StartupGateway>>,
     pub runtime_paths: startup::RuntimePathsCache,
+    application_shutdown: ApplicationShutdown,
 }
 
 impl AppState {
@@ -190,6 +276,7 @@ impl AppState {
             startup_mode: Mutex::new(startup_mode),
             gateway: Mutex::new(None),
             runtime_paths: startup::RuntimePathsCache::default(),
+            application_shutdown: ApplicationShutdown::new(),
         }
     }
 }
@@ -260,26 +347,33 @@ fn register_gateway_capability(
 }
 
 fn shutdown_application(app_handle: &tauri::AppHandle) -> Result<(), String> {
-    let gateway = if let Some(state) = app_handle.try_state::<AppState>() {
-        let _ownership = state
-            .backend_ownership
-            .lock()
-            .map_err(|_| "backend ownership mutex is poisoned".to_string())?;
-        state.backend_retries_stopped.store(true, Ordering::Release);
-        state
-            .gateway
-            .lock()
-            .map_err(|_| "gateway mutex is poisoned".to_string())?
-            .take()
-    } else {
-        None
+    let Some(state) = app_handle.try_state::<AppState>() else {
+        return tauri::async_runtime::block_on(sidecar::stop_backend_bounded(
+            app_handle,
+            sidecar::BACKEND_CLEANUP_BOUND,
+        ));
     };
-    tauri::async_runtime::block_on(async move {
-        if let Some(gateway) = gateway {
-            gateway.shutdown().await;
-        }
-        sidecar::stop_backend_bounded(app_handle, sidecar::BACKEND_CLEANUP_BOUND).await
-    })
+    tauri::async_runtime::block_on(state.application_shutdown.run(
+        || async {
+            let gateway = {
+                let _ownership = state
+                    .backend_ownership
+                    .lock()
+                    .map_err(|_| "backend ownership mutex is poisoned".to_string())?;
+                state.backend_retries_stopped.store(true, Ordering::Release);
+                state
+                    .gateway
+                    .lock()
+                    .map_err(|_| "gateway mutex is poisoned".to_string())?
+                    .take()
+            };
+            if let Some(gateway) = gateway {
+                gateway.shutdown().await;
+            }
+            Ok(())
+        },
+        || sidecar::stop_backend_bounded(app_handle, sidecar::BACKEND_CLEANUP_BOUND),
+    ))
 }
 
 fn restore_main_window(app: &tauri::AppHandle) {
@@ -657,8 +751,85 @@ pub fn initialize_current_startup_metrics(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::{mpsc, Arc};
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn concurrent_application_shutdowns_wait_for_one_ordered_failure() {
+        let shutdown = Arc::new(ApplicationShutdown::new());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let backend_cleanup_calls = Arc::new(AtomicUsize::new(0));
+        let (gateway_started, gateway_started_wait) = tokio::sync::oneshot::channel();
+        let (release_gateway, gateway_release_wait) = tokio::sync::oneshot::channel();
+
+        let first_shutdown = Arc::clone(&shutdown);
+        let first_gateway_events = Arc::clone(&events);
+        let first_backend_events = Arc::clone(&events);
+        let first_backend_calls = Arc::clone(&backend_cleanup_calls);
+        let first = tokio::spawn(async move {
+            first_shutdown
+                .run(
+                    move || async move {
+                        first_gateway_events
+                            .lock()
+                            .unwrap()
+                            .push("gateway_close_started");
+                        gateway_started.send(()).unwrap();
+                        gateway_release_wait.await.unwrap();
+                        first_gateway_events
+                            .lock()
+                            .unwrap()
+                            .push("gateway_close_complete");
+                        Ok(())
+                    },
+                    move || async move {
+                        first_backend_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                        first_backend_events.lock().unwrap().push("backend_cleanup");
+                        Err("first backend cleanup failed".to_string())
+                    },
+                )
+                .await
+        });
+        gateway_started_wait.await.unwrap();
+
+        let (second_started, second_started_wait) = tokio::sync::oneshot::channel();
+        let second_shutdown = Arc::clone(&shutdown);
+        let second = tokio::spawn(async move {
+            second_started.send(()).unwrap();
+            second_shutdown
+                .run(
+                    || async { panic!("concurrent caller started a second gateway shutdown") },
+                    || async { panic!("concurrent caller started backend cleanup early") },
+                )
+                .await
+        });
+        second_started_wait.await.unwrap();
+        tokio::task::yield_now().await;
+
+        assert!(!second.is_finished());
+        assert_eq!(backend_cleanup_calls.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(*events.lock().unwrap(), ["gateway_close_started"]);
+
+        release_gateway.send(()).unwrap();
+        let first_result = first.await.unwrap();
+        let second_result = second.await.unwrap();
+
+        assert_eq!(
+            first_result,
+            Err("first backend cleanup failed".to_string())
+        );
+        assert_eq!(second_result, first_result);
+        assert_eq!(backend_cleanup_calls.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                "gateway_close_started",
+                "gateway_close_complete",
+                "backend_cleanup"
+            ]
+        );
+    }
 
     #[tokio::test]
     async fn retry_generation_waits_for_cleanup_and_then_advances_once() {
