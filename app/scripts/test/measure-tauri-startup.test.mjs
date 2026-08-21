@@ -5440,8 +5440,8 @@ test('failure artifacts bound and redact oversized logs and error messages', asy
   }
 });
 
-test('campaign v3 records effective mode, build and host identity plus per-role medians', async () => {
-  const root = temporaryDirectory('campaign-v3');
+test('campaign v4 records window and frontend/backend overlap diagnostics', async () => {
+  const root = temporaryDirectory('campaign-v4');
   const executable = path.join(root, 'R-IDE');
   const output = path.join(root, 'startup-metrics.json');
   touch(executable);
@@ -5494,7 +5494,7 @@ test('campaign v3 records effective mode, build and host identity plus per-role 
     });
 
     assert.equal(measurement.schema, 'ride.startup-measurement');
-    assert.equal(measurement.version, 3);
+    assert.equal(measurement.version, 4);
     assert.equal(measurement.startupMode, 'rust-gateway');
     assert.deepEqual(measurement.build, build);
     assert.deepEqual(measurement.host, host);
@@ -5508,6 +5508,11 @@ test('campaign v3 records effective mode, build and host identity plus per-role 
     assert.deepEqual(measurement.median.roles.other, {
       processCount: 0.5,
       rssBytes: 90,
+    });
+    assert.equal(measurement.median.nativeWindowVisibleMs, 5);
+    assert.deepEqual(measurement.diagnostics.frontendBackendOverlapMs, {
+      runs: [16, 16],
+      median: 16,
     });
     assert.deepEqual(JSON.parse(fs.readFileSync(output, 'utf8')), measurement);
   } finally {

@@ -18,7 +18,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const REPORT_SCHEMA = 'ride.startup-report';
 const REPORT_VERSION = 2;
 const MEASUREMENT_SCHEMA = 'ride.startup-measurement';
-const MEASUREMENT_VERSION = 3;
+const MEASUREMENT_VERSION = 4;
 const DIAGNOSTICS_OWNER_SCHEMA = 'ride.startup-diagnostics-owner';
 const DIAGNOSTICS_OWNER_VERSION = 1;
 const DIAGNOSTICS_OWNER_FILE = '.ride-startup-diagnostics-owner.json';
@@ -548,6 +548,18 @@ export function median(values) {
     return Number(exactSum) / 2;
   }
   return Number(exactSum / 2n);
+}
+
+function frontendBackendOverlapMs(milestones) {
+  const overlapStart = Math.max(
+    milestones.frontend_request_started,
+    milestones.backend_spawned,
+  );
+  const overlapEnd = Math.min(
+    milestones.frontend_bundle_loaded,
+    milestones.backend_listening,
+  );
+  return Math.max(0, overlapEnd - overlapStart);
 }
 
 function positiveInteger(value, name) {
@@ -3504,6 +3516,9 @@ export async function runMeasurementCampaign(
   if (!STARTUP_MODES.has(startupMode)) {
     throw new Error(`measurement campaign reported unsupported startup mode ${startupMode}`);
   }
+  const overlapRuns = startupMode === 'rust-gateway'
+    ? rawRuns.map(run => frontendBackendOverlapMs(run.startupReport.milestones))
+    : null;
 
   const measurement = {
     schema: MEASUREMENT_SCHEMA,
@@ -3518,12 +3533,21 @@ export async function runMeasurementCampaign(
       targetFileOpenedMs: median(
         rawRuns.map(run => run.startupReport.milestones.target_file_opened),
       ),
+      nativeWindowVisibleMs: median(
+        rawRuns.map(run => run.startupReport.milestones.native_window_visible),
+      ),
       rssBytes: median(rawRuns.map(run => run.metrics.rssBytes)),
       processCount: median(rawRuns.map(run => run.metrics.processCount)),
       roles: Object.fromEntries(PROCESS_ROLES.map(role => [role, {
         processCount: median(rawRuns.map(run => run.metrics.roles[role].processCount)),
         rssBytes: median(rawRuns.map(run => run.metrics.roles[role].rssBytes)),
       }])),
+    },
+    diagnostics: {
+      frontendBackendOverlapMs: overlapRuns === null ? null : {
+        runs: overlapRuns,
+        median: median(overlapRuns),
+      },
     },
   };
   await writeJsonAtomically(options.output, measurement);

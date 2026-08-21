@@ -8,7 +8,9 @@
  ********************************************************************************/
 
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
@@ -142,6 +144,47 @@ function measurement({
   };
 }
 
+function fixtureMedian(values) {
+  const sorted = [...values].sort((left, right) => left - right);
+  return sorted[Math.floor(sorted.length / 2)];
+}
+
+function rustGatewayMeasurementV4({
+  targetSamples = [2_200, 2_200, 2_200, 2_200, 2_200],
+  windowSamples = [800, 800, 800, 800, 800],
+  rssSamples = [1_030, 1_030, 1_030, 1_030, 1_030],
+  ...options
+} = {}) {
+  assert.equal(targetSamples.length, 5);
+  assert.equal(windowSamples.length, 5);
+  assert.equal(rssSamples.length, 5);
+  const value = measurement({
+    targetFileOpenedMs: targetSamples[0],
+    rssBytes: rssSamples[0],
+    ...options,
+  });
+  value.version = 4;
+  value.runs = targetSamples.map((targetFileOpenedMs, index) => {
+    const run = startupRun(targetFileOpenedMs, rssSamples[index], 7_300 + index);
+    run.startupReport.milestones.native_window_visible = windowSamples[index];
+    return run;
+  });
+  value.median = {
+    targetFileOpenedMs: fixtureMedian(targetSamples),
+    nativeWindowVisibleMs: fixtureMedian(windowSamples),
+    rssBytes: fixtureMedian(rssSamples),
+    processCount: 1,
+    roles: roleMetrics(fixtureMedian(rssSamples)),
+  };
+  value.diagnostics = {
+    frontendBackendOverlapMs: {
+      runs: [440, 440, 440, 440, 440],
+      median: 440,
+    },
+  };
+  return value;
+}
+
 function existingV2Measurement(options = {}) {
   const value = measurement(options);
   value.version = 2;
@@ -188,6 +231,166 @@ test('accepts exactly five compatible v3 rust-gateway runs at the fixed gain thr
       delta: 0,
     },
   });
+});
+
+test('rust-gateway policy accepts all absolute boundaries and reports overlap diagnostically', () => {
+  const baseline = measurement({ targetFileOpenedMs: 1_000, rssBytes: 1_000 });
+  const candidate = rustGatewayMeasurementV4({
+    targetSamples: [1_800, 2_100, 2_200, 2_300, 3_000],
+    windowSamples: [700, 750, 800, 810, 820],
+    rssSamples: [1_030, 1_030, 1_030, 1_030, 1_030],
+  });
+
+  const result = compareTauriPerformance(baseline, candidate, {
+    policy: 'rust-gateway',
+    maxStartupMedianMs: 2_200,
+    maxStartupSlowestMs: 3_000,
+    maxWindowMedianMs: 800,
+    maxMemoryRegressionPercent: 3,
+  });
+
+  assert.deepEqual(result, {
+    policy: 'rust-gateway',
+    runs: 5,
+    startupMedian: { actual: 2_200, target: 2_200, delta: 0 },
+    startupSlowest: { actual: 3_000, target: 3_000, delta: 0 },
+    windowMedian: { actual: 800, target: 800, delta: 0 },
+    memory: { actual: 1_030, target: 1_030, delta: 0 },
+    diagnostics: {
+      frontendBackendOverlapMs: {
+        runs: [440, 440, 440, 440, 440],
+        median: 440,
+      },
+    },
+  });
+});
+
+test('rust-gateway policy absolute limits replace historical gain defaults', () => {
+  const baseline = measurement({ targetFileOpenedMs: 1_000, rssBytes: 1_000 });
+  const candidate = rustGatewayMeasurementV4({
+    targetSamples: [2_000, 2_000, 2_000, 2_000, 2_000],
+    windowSamples: [700, 700, 700, 700, 700],
+    rssSamples: [1_030, 1_030, 1_030, 1_030, 1_030],
+  });
+
+  assert.throws(
+    () => compareTauriPerformance(baseline, candidate),
+    /performance targets failed/i,
+  );
+  assert.equal(compareTauriPerformance(baseline, candidate, {
+    policy: 'rust-gateway',
+  }).policy, 'rust-gateway');
+});
+
+test('rust-gateway policy rejects each absolute startup, window, and memory limit', () => {
+  const baseline = measurement({ targetFileOpenedMs: 1_000, rssBytes: 1_000 });
+  const cases = [
+    ['startup median', {
+      targetSamples: [2_201, 2_201, 2_201, 2_201, 2_201],
+    }, /startup median.*actual 2201.*target 2200.*delta \+1/i],
+    ['startup slowest', {
+      targetSamples: [2_000, 2_100, 2_200, 2_300, 3_001],
+    }, /startup slowest.*actual 3001.*target 3000.*delta \+1/i],
+    ['window median', {
+      windowSamples: [801, 801, 801, 801, 801],
+    }, /window median.*actual 801.*target 800.*delta \+1/i],
+    ['memory', {
+      rssSamples: [1_031, 1_031, 1_031, 1_031, 1_031],
+    }, /memory.*actual 1031.*target 1030.*delta \+1/i],
+  ];
+  for (const [label, samples, expected] of cases) {
+    assert.throws(
+      () => compareTauriPerformance(
+        baseline,
+        rustGatewayMeasurementV4(samples),
+        { policy: 'rust-gateway' },
+      ),
+      expected,
+      label,
+    );
+  }
+});
+
+test('rust-gateway policy validates absolute options as bounded safe integers', () => {
+  const baseline = measurement({ targetFileOpenedMs: 1_000, rssBytes: 1_000 });
+  const candidate = rustGatewayMeasurementV4();
+  for (const [field, value] of [
+    ['maxStartupMedianMs', Number.NaN],
+    ['maxStartupSlowestMs', Number.MAX_SAFE_INTEGER + 1],
+    ['maxWindowMedianMs', -1],
+    ['maxMemoryRegressionPercent', 101],
+  ]) {
+    assert.throws(
+      () => compareTauriPerformance(baseline, candidate, {
+        policy: 'rust-gateway',
+        [field]: value,
+      }),
+      /safe integer|0 through 100/i,
+      field,
+    );
+  }
+  assert.throws(
+    () => compareTauriPerformance(baseline, candidate, { policy: 'unknown' }),
+    /unsupported performance policy unknown/i,
+  );
+});
+
+test('strict v4 diagnostics must exactly match safe per-run overlap values', () => {
+  const baseline = measurement({ targetFileOpenedMs: 1_000, rssBytes: 1_000 });
+  const mutations = [
+    diagnostics => { diagnostics.frontendBackendOverlapMs.runs[0] = -1; },
+    diagnostics => { diagnostics.frontendBackendOverlapMs.median = 439; },
+    diagnostics => { diagnostics.unexpected = true; },
+  ];
+  for (const mutate of mutations) {
+    const candidate = rustGatewayMeasurementV4();
+    mutate(candidate.diagnostics);
+    assert.throws(
+      () => compareTauriPerformance(baseline, candidate, { policy: 'rust-gateway' }),
+      /overlap|unexpected field|safe integer/i,
+    );
+  }
+});
+
+test('strict v4 overlap median must be a non-negative safe number', () => {
+  const baseline = measurement({ targetFileOpenedMs: 1_000, rssBytes: 1_000 });
+  const candidate = rustGatewayMeasurementV4();
+  candidate.diagnostics.frontendBackendOverlapMs.median = Number.MAX_VALUE;
+
+  assert.throws(
+    () => compareTauriPerformance(baseline, candidate, { policy: 'rust-gateway' }),
+    /overlap median.*safe number/i,
+  );
+});
+
+test('rust-gateway CLI accepts absolute gate options and emits policy diagnostics', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ride-performance-policy-'));
+  const baselinePath = path.join(directory, 'baseline.json');
+  const candidatePath = path.join(directory, 'candidate.json');
+  try {
+    fs.writeFileSync(
+      baselinePath,
+      JSON.stringify(measurement({ targetFileOpenedMs: 1_000, rssBytes: 1_000 })),
+    );
+    fs.writeFileSync(candidatePath, JSON.stringify(rustGatewayMeasurementV4()));
+    const result = spawnSync(process.execPath, [
+      path.resolve(import.meta.dirname, '..', 'check-tauri-performance.mjs'),
+      '--baseline', baselinePath,
+      '--candidate', candidatePath,
+      '--policy', 'rust-gateway',
+      '--max-startup-median-ms', '2200',
+      '--max-startup-slowest-ms', '3000',
+      '--max-window-median-ms', '800',
+      '--max-memory-regression-percent', '3',
+    ], { encoding: 'utf8' });
+
+    assert.equal(result.status, 0, result.stderr);
+    const output = JSON.parse(result.stdout);
+    assert.equal(output.policy, 'rust-gateway');
+    assert.equal(output.diagnostics.frontendBackendOverlapMs.median, 440);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test('accepts an existing v2 baseline with a v3 rust-gateway candidate', () => {

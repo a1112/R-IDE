@@ -271,6 +271,18 @@ function validateStartupReport(report, measurement, label) {
   return report.startupMode;
 }
 
+function frontendBackendOverlapMs(milestones) {
+  const overlapStart = Math.max(
+    milestones.frontend_request_started,
+    milestones.backend_spawned,
+  );
+  const overlapEnd = Math.min(
+    milestones.frontend_bundle_loaded,
+    milestones.backend_listening,
+  );
+  return Math.max(0, overlapEnd - overlapStart);
+}
+
 function validateProcessIdentity(identity, label) {
   exactKeys(identity, ['pid', 'pgid', 'creationTime', 'startedAt'], label);
   positiveInteger(identity.pid, `${label} pid`);
@@ -335,8 +347,10 @@ function validateMeasurementRun(run, measurement, measurementLabel, index) {
 }
 
 function validateReportedMedians(measurement, label) {
+  const isV4 = measurement.version === 4;
   exactKeys(measurement.median, [
     'targetFileOpenedMs',
+    ...(isV4 ? ['nativeWindowVisibleMs'] : []),
     'rssBytes',
     'processCount',
     'roles',
@@ -345,6 +359,11 @@ function validateReportedMedians(measurement, label) {
     targetFileOpenedMs: median(measurement.runs.map(run => (
       run.startupReport.milestones.target_file_opened
     ))),
+    ...(isV4 ? {
+      nativeWindowVisibleMs: median(measurement.runs.map(run => (
+        run.startupReport.milestones.native_window_visible
+      ))),
+    } : {}),
     rssBytes: median(measurement.runs.map(run => run.metrics.rssBytes)),
     processCount: median(measurement.runs.map(run => run.metrics.processCount)),
   };
@@ -371,18 +390,53 @@ function validateReportedMedians(measurement, label) {
   return expected;
 }
 
+function validateDiagnostics(measurement, label) {
+  if (measurement.version !== 4) {
+    return undefined;
+  }
+  exactKeys(measurement.diagnostics, ['frontendBackendOverlapMs'], `${label} diagnostics`);
+  const overlap = measurement.diagnostics.frontendBackendOverlapMs;
+  if (measurement.startupMode !== 'rust-gateway') {
+    if (overlap !== null) {
+      fail(`${label} non-gateway overlap diagnostic must be null`);
+    }
+    return null;
+  }
+  exactKeys(overlap, ['runs', 'median'], `${label} frontend/backend overlap`);
+  if (!Array.isArray(overlap.runs) || overlap.runs.length !== measurement.runs.length) {
+    fail(`${label} frontend/backend overlap runs must match measurement runs`);
+  }
+  const expectedRuns = measurement.runs.map(run => (
+    frontendBackendOverlapMs(run.startupReport.milestones)
+  ));
+  for (const [index, value] of overlap.runs.entries()) {
+    nonNegativeInteger(value, `${label} frontend/backend overlap run ${index + 1}`);
+    if (value !== expectedRuns[index]) {
+      fail(`${label} frontend/backend overlap run ${index + 1} does not match its milestones`);
+    }
+  }
+  const expectedMedian = median(expectedRuns);
+  safeNumber(overlap.median, `${label} frontend/backend overlap median`);
+  if (overlap.median !== expectedMedian) {
+    fail(`${label} frontend/backend overlap median does not match its runs`);
+  }
+  return { runs: expectedRuns, median: expectedMedian };
+}
+
 function validateModernMeasurement(measurement, label, { exactlyFive, versions }) {
-  const isV3 = measurement?.version === 3;
+  const hasStartupMode = measurement?.version === 3 || measurement?.version === 4;
+  const isV4 = measurement?.version === 4;
   exactKeys(measurement, [
     'schema',
     'version',
-    ...(isV3 ? ['startupMode'] : []),
+    ...(hasStartupMode ? ['startupMode'] : []),
     'platform',
     'arch',
     'build',
     'host',
     'runs',
     'median',
+    ...(isV4 ? ['diagnostics'] : []),
   ], label);
   if (measurement.schema !== MEASUREMENT_SCHEMA || !versions.includes(measurement.version)) {
     fail(`${label} must use ${MEASUREMENT_SCHEMA}@${versions.join(' or @')}`);
@@ -403,7 +457,7 @@ function validateModernMeasurement(measurement, label, { exactlyFive, versions }
   const runModes = measurement.runs.map((run, index) => (
     validateMeasurementRun(run, measurement, label, index)
   ));
-  if (isV3) {
+  if (hasStartupMode) {
     if (!STARTUP_MODES.has(measurement.startupMode)) {
       fail(`${label} has unsupported startupMode ${measurement.startupMode}`);
     }
@@ -422,7 +476,8 @@ function validateModernMeasurement(measurement, label, { exactlyFive, versions }
     measurement,
     hostFingerprint: measurement.host.fingerprint,
     medians: validateReportedMedians(measurement, label),
-    startupMode: isV3 ? measurement.startupMode : undefined,
+    startupMode: hasStartupMode ? measurement.startupMode : undefined,
+    diagnostics: validateDiagnostics(measurement, label),
   };
 }
 
@@ -543,7 +598,7 @@ function validateBaseline(measurement) {
   }
   return validateModernMeasurement(measurement, 'baseline', {
     exactlyFive: false,
-    versions: [2, 3],
+    versions: [2, 3, 4],
   });
 }
 
@@ -558,17 +613,43 @@ function gainTarget(baseline, gain) {
   return Number((BigInt(baseline) * BigInt(100 - gain)) / 100n);
 }
 
+function regressionTarget(baseline, regressionPercent) {
+  if (!Number.isSafeInteger(baseline)) {
+    fail('baseline median RSS must be a safe integer for rust-gateway policy');
+  }
+  const target = (BigInt(baseline) * BigInt(100 + regressionPercent)) / 100n;
+  if (target > BigInt(Number.MAX_SAFE_INTEGER)) {
+    fail('memory regression target must be a safe integer');
+  }
+  return Number(target);
+}
+
 export function compareTauriPerformance(
   baselineMeasurement,
   candidateMeasurement,
-  { minStartupGain = 30, minMemoryGain = 10 } = {},
+  {
+    minStartupGain = 30,
+    minMemoryGain = 10,
+    policy,
+    maxStartupMedianMs = 2_200,
+    maxStartupSlowestMs = 3_000,
+    maxWindowMedianMs = 800,
+    maxMemoryRegressionPercent = 3,
+  } = {},
 ) {
-  const startupGain = validateGain(minStartupGain, 'minimum startup gain');
-  const memoryGain = validateGain(minMemoryGain, 'minimum memory gain');
+  if (policy !== undefined && policy !== 'rust-gateway') {
+    fail(`unsupported performance policy ${policy}`);
+  }
+  const startupGain = policy === undefined
+    ? validateGain(minStartupGain, 'minimum startup gain')
+    : undefined;
+  const memoryGain = policy === undefined
+    ? validateGain(minMemoryGain, 'minimum memory gain')
+    : undefined;
   const baseline = validateBaseline(baselineMeasurement);
   const candidate = validateModernMeasurement(candidateMeasurement, 'candidate', {
     exactlyFive: true,
-    versions: [3],
+    versions: [3, 4],
   });
   if (candidate.startupMode !== 'rust-gateway') {
     fail(
@@ -596,6 +677,84 @@ export function compareTauriPerformance(
         fail(`baseline and candidate build ${field} are incompatible`);
       }
     }
+  }
+
+  if (policy === 'rust-gateway') {
+    const startupMedianTarget = nonNegativeInteger(
+      maxStartupMedianMs,
+      'maximum startup median',
+    );
+    const startupSlowestTarget = nonNegativeInteger(
+      maxStartupSlowestMs,
+      'maximum startup slowest',
+    );
+    const windowMedianTarget = nonNegativeInteger(
+      maxWindowMedianMs,
+      'maximum window median',
+    );
+    const memoryRegressionPercent = validateGain(
+      maxMemoryRegressionPercent,
+      'maximum memory regression percent',
+    );
+    const startupMedianActual = candidate.medians.targetFileOpenedMs;
+    const startupSlowestActual = Math.max(...candidate.measurement.runs.map(run => (
+      run.startupReport.milestones.target_file_opened
+    )));
+    const windowMedianActual = median(candidate.measurement.runs.map(run => (
+      run.startupReport.milestones.native_window_visible
+    )));
+    const memoryActual = candidate.medians.rssBytes;
+    const memoryTarget = regressionTarget(baseline.medians.rssBytes, memoryRegressionPercent);
+    const overlapRuns = candidate.measurement.runs.map(run => (
+      frontendBackendOverlapMs(run.startupReport.milestones)
+    ));
+    const diagnostics = candidate.diagnostics ?? {
+      runs: overlapRuns,
+      median: median(overlapRuns),
+    };
+    const failures = [];
+    for (const [label, actual, target] of [
+      ['startup median', startupMedianActual, startupMedianTarget],
+      ['startup slowest', startupSlowestActual, startupSlowestTarget],
+      ['window median', windowMedianActual, windowMedianTarget],
+      ['memory', memoryActual, memoryTarget],
+    ]) {
+      if (actual > target) {
+        failures.push(
+          `${label}: actual ${actual}, target ${target}, delta +${actual - target}`,
+        );
+      }
+    }
+    if (failures.length > 0) {
+      fail(`Tauri performance targets failed:\n${failures.join('\n')}`);
+    }
+    return {
+      policy,
+      runs: candidate.measurement.runs.length,
+      startupMedian: {
+        actual: startupMedianActual,
+        target: startupMedianTarget,
+        delta: startupMedianActual - startupMedianTarget,
+      },
+      startupSlowest: {
+        actual: startupSlowestActual,
+        target: startupSlowestTarget,
+        delta: startupSlowestActual - startupSlowestTarget,
+      },
+      windowMedian: {
+        actual: windowMedianActual,
+        target: windowMedianTarget,
+        delta: windowMedianActual - windowMedianTarget,
+      },
+      memory: {
+        actual: memoryActual,
+        target: memoryTarget,
+        delta: memoryActual - memoryTarget,
+      },
+      diagnostics: {
+        frontendBackendOverlapMs: diagnostics,
+      },
+    };
   }
 
   const startupTarget = gainTarget(baseline.medians.targetFileOpenedMs, startupGain);
@@ -645,7 +804,14 @@ function readMeasurement(filePath, label) {
 }
 
 function parseArguments(argv) {
-  const options = { minStartupGain: 30, minMemoryGain: 10 };
+  const options = {
+    minStartupGain: 30,
+    minMemoryGain: 10,
+    maxStartupMedianMs: 2_200,
+    maxStartupSlowestMs: 3_000,
+    maxWindowMedianMs: 800,
+    maxMemoryRegressionPercent: 3,
+  };
   for (let index = 0; index < argv.length; index++) {
     const argument = argv[index];
     const value = argv[index + 1];
@@ -661,6 +827,16 @@ function parseArguments(argv) {
       options.minStartupGain = Number(value);
     } else if (argument === '--min-memory-gain') {
       options.minMemoryGain = Number(value);
+    } else if (argument === '--policy') {
+      options.policy = value;
+    } else if (argument === '--max-startup-median-ms') {
+      options.maxStartupMedianMs = Number(value);
+    } else if (argument === '--max-startup-slowest-ms') {
+      options.maxStartupSlowestMs = Number(value);
+    } else if (argument === '--max-window-median-ms') {
+      options.maxWindowMedianMs = Number(value);
+    } else if (argument === '--max-memory-regression-percent') {
+      options.maxMemoryRegressionPercent = Number(value);
     } else {
       fail(`unsupported option ${argument}`);
     }
