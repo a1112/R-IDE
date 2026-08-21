@@ -12,10 +12,10 @@ use bytes::Bytes;
 use futures_util::{FutureExt, TryStreamExt};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Empty, Full, StreamBody};
-use hyper::body::Frame;
+use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper::header::{
     CACHE_CONTROL, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HOST, LOCATION, ORIGIN,
-    SET_COOKIE,
+    SET_COOKIE, TRANSFER_ENCODING,
 };
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -34,7 +34,9 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
@@ -51,6 +53,7 @@ const SESSION_COOKIE_NAME: &str = "ride_session";
 const STATIC_ASSET_CHUNK_SIZE: usize = 16 * 1024;
 const BACKEND_UNAVAILABLE_BODY: &[u8] = b"{\"error\":\"backend_unavailable\"}";
 const BACKEND_PROXY_FAILED_BODY: &[u8] = b"{\"error\":\"backend_proxy_failed\"}";
+const INVALID_HTTP_MESSAGE_BODY: &[u8] = b"{\"error\":\"invalid_http_message\"}";
 const HOP_BY_HOP_HEADERS: [&str; 9] = [
     "connection",
     "proxy-connection",
@@ -110,8 +113,15 @@ impl std::error::Error for GatewayLimitError {}
 pub struct BackendGeneration(u64);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BackendLease {
+    pub generation: BackendGeneration,
+    pub address: SocketAddr,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GatewayLimits {
     pub backend_wait: Duration,
+    pub backend_response_header_timeout: Duration,
     pub max_waiters: usize,
     pub max_connections: usize,
     pub http_header_read_timeout: Duration,
@@ -122,6 +132,7 @@ impl GatewayLimits {
     pub fn test_defaults() -> Self {
         Self {
             backend_wait: Duration::from_secs(1),
+            backend_response_header_timeout: Duration::from_secs(1),
             max_waiters: 8,
             max_connections: 16,
             http_header_read_timeout: Duration::from_secs(1),
@@ -134,6 +145,7 @@ impl Default for GatewayLimits {
     fn default() -> Self {
         Self {
             backend_wait: Duration::from_secs(5),
+            backend_response_header_timeout: Duration::from_secs(30),
             max_waiters: 64,
             max_connections: 128,
             http_header_read_timeout: Duration::from_secs(10),
@@ -375,15 +387,28 @@ impl GatewayState {
         self.inner.current.lock().await.snapshot.clone()
     }
 
+    async fn backend_lease_is_current(&self, lease: BackendLease) -> bool {
+        let current = self.inner.current.lock().await;
+        current.snapshot.generation == lease.generation
+            && current.snapshot.phase == BackendPhase::Ready
+            && current.backend_addr == Some(lease.address)
+    }
+
     pub async fn wait_for_backend(&self) -> Result<SocketAddr, GatewayError> {
-        self.wait_for_backend_with_timeout(self.inner.limits.backend_wait)
+        self.wait_for_backend_lease()
+            .await
+            .map(|lease| lease.address)
+    }
+
+    pub async fn wait_for_backend_lease(&self) -> Result<BackendLease, GatewayError> {
+        self.wait_for_backend_lease_with_timeout(self.inner.limits.backend_wait)
             .await
     }
 
-    async fn wait_for_backend_with_timeout(
+    async fn wait_for_backend_lease_with_timeout(
         &self,
         backend_wait: Duration,
-    ) -> Result<SocketAddr, GatewayError> {
+    ) -> Result<BackendLease, GatewayError> {
         let mut readiness = self.inner.readiness.subscribe();
         let mut shutdown = self.inner.shutdown.subscribe();
         let expected_generation = readiness.borrow().snapshot.generation;
@@ -469,7 +494,7 @@ impl GatewayState {
     fn published_result(
         published: &PublishedBackend,
         expected_generation: BackendGeneration,
-    ) -> Option<Result<SocketAddr, GatewayError>> {
+    ) -> Option<Result<BackendLease, GatewayError>> {
         if published.snapshot.generation != expected_generation {
             return Some(Err(GatewayError::BackendGenerationSuperseded {
                 expected: expected_generation,
@@ -478,9 +503,12 @@ impl GatewayState {
         }
 
         match published.snapshot.phase {
-            BackendPhase::Ready => Some(Ok(published
-                .backend_addr
-                .expect("ready backend must publish an address"))),
+            BackendPhase::Ready => Some(Ok(BackendLease {
+                generation: published.snapshot.generation,
+                address: published
+                    .backend_addr
+                    .expect("ready backend must publish an address"),
+            })),
             BackendPhase::Failed if published.snapshot.generation.0 > 0 => {
                 Some(Err(GatewayError::BackendFailed {
                     generation: published.snapshot.generation,
@@ -532,9 +560,69 @@ struct StaticInventory {
 
 #[derive(Clone)]
 struct BackendProxy {
-    client: Client<HttpConnector, hyper::body::Incoming>,
+    pool: Arc<Mutex<Option<GenerationBackendClient>>>,
     state: GatewayState,
     limits: GatewayLimits,
+}
+
+struct GenerationBackendClient {
+    lease: BackendLease,
+    client: Client<HttpConnector, UploadCompletionBody>,
+}
+
+struct UploadCompletionBody {
+    inner: Incoming,
+    completion: Option<oneshot::Sender<()>>,
+}
+
+impl UploadCompletionBody {
+    fn new(inner: Incoming, completion: oneshot::Sender<()>) -> Self {
+        let mut body = Self {
+            inner,
+            completion: Some(completion),
+        };
+        if body.inner.is_end_stream() {
+            body.complete();
+        }
+        body
+    }
+
+    fn complete(&mut self) {
+        if let Some(completion) = self.completion.take() {
+            let _ = completion.send(());
+        }
+    }
+}
+
+impl Body for UploadCompletionBody {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let body = self.get_mut();
+        let frame = Pin::new(&mut body.inner).poll_frame(context);
+        if matches!(&frame, Poll::Ready(None) | Poll::Ready(Some(Err(_)))) {
+            body.complete();
+        }
+        frame
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl Drop for UploadCompletionBody {
+    fn drop(&mut self) {
+        self.complete();
+    }
 }
 
 #[derive(Clone)]
@@ -791,24 +879,59 @@ async fn serve_connection(
 
 impl BackendProxy {
     fn new(state: GatewayState, limits: GatewayLimits) -> Self {
-        let mut builder = Client::builder(TokioExecutor::new());
-        builder.retry_canceled_requests(false);
         Self {
-            client: builder.build(HttpConnector::new()),
+            pool: Arc::new(Mutex::new(None)),
             state,
             limits,
         }
     }
 
+    fn build_client() -> Client<HttpConnector, UploadCompletionBody> {
+        let mut builder = Client::builder(TokioExecutor::new());
+        builder.retry_canceled_requests(false);
+        builder.build(HttpConnector::new())
+    }
+
+    async fn client_for_generation(
+        &self,
+        lease: BackendLease,
+    ) -> Option<Client<HttpConnector, UploadCompletionBody>> {
+        let mut pool = self.pool.lock().await;
+        if let Some(current) = pool.as_ref() {
+            if current.lease == lease {
+                return Some(current.client.clone());
+            }
+            if current.lease.generation > lease.generation {
+                return None;
+            }
+        }
+        let client = Self::build_client();
+        *pool = Some(GenerationBackendClient {
+            lease,
+            client: client.clone(),
+        });
+        Some(client)
+    }
+
     async fn forward(&self, mut request: Request<hyper::body::Incoming>) -> Response<GatewayBody> {
-        let backend_addr = match self
+        strip_gateway_session_cookie(request.headers_mut());
+        if normalize_message_framing(request.headers_mut()).is_err()
+            || strip_hop_by_hop_headers(request.headers_mut()).is_err()
+        {
+            return invalid_http_message();
+        }
+        let backend_lease = match self
             .state
-            .wait_for_backend_with_timeout(self.limits.backend_wait)
+            .wait_for_backend_lease_with_timeout(self.limits.backend_wait)
             .await
         {
-            Ok(backend_addr) => backend_addr,
+            Ok(backend_lease) => backend_lease,
             Err(_) => return backend_unavailable(),
         };
+        let Some(client) = self.client_for_generation(backend_lease).await else {
+            return backend_unavailable();
+        };
+        let backend_addr = backend_lease.address;
         let backend_authority = backend_addr.to_string();
         let path_and_query = request
             .uri()
@@ -826,21 +949,45 @@ impl BackendProxy {
         };
 
         *request.uri_mut() = backend_uri;
-        strip_gateway_session_cookie(request.headers_mut());
-        strip_hop_by_hop_headers(request.headers_mut());
         let backend_host =
             match hyper::header::HeaderValue::from_bytes(backend_authority.as_bytes()) {
                 Ok(host) => host,
                 Err(_) => return backend_proxy_failed(),
             };
         request.headers_mut().insert(HOST, backend_host);
+        if !self.state.backend_lease_is_current(backend_lease).await {
+            return backend_unavailable();
+        }
 
-        let response = match self.client.request(request).await {
+        let (parts, body) = request.into_parts();
+        let (upload_completion, mut upload_completed) = oneshot::channel();
+        let request =
+            Request::from_parts(parts, UploadCompletionBody::new(body, upload_completion));
+        let backend_request = client.request(request);
+        tokio::pin!(backend_request);
+        let response = match tokio::select! {
+            response = &mut backend_request => response,
+            _ = &mut upload_completed => {
+                match tokio::time::timeout(
+                    self.limits.backend_response_header_timeout,
+                    &mut backend_request,
+                )
+                .await
+                {
+                    Ok(response) => response,
+                    Err(_) => return backend_proxy_failed(),
+                }
+            }
+        } {
             Ok(response) => response,
             Err(_) => return backend_proxy_failed(),
         };
         let (mut parts, body) = response.into_parts();
-        strip_hop_by_hop_headers(&mut parts.headers);
+        if normalize_message_framing(&mut parts.headers).is_err()
+            || strip_hop_by_hop_headers(&mut parts.headers).is_err()
+        {
+            return backend_proxy_failed();
+        }
         strip_backend_session_cookie(&mut parts.headers);
         let body = body.map_err(io::Error::other).boxed();
         Response::from_parts(parts, body)
@@ -1507,20 +1654,128 @@ fn fixed_content_type(path: &Path) -> Option<&'static str> {
     }
 }
 
-fn strip_hop_by_hop_headers(headers: &mut HeaderMap) {
-    let nominated = headers
-        .get_all(CONNECTION)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .filter_map(|name| hyper::header::HeaderName::from_bytes(name.trim().as_bytes()).ok())
-        .collect::<Vec<_>>();
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProxyHeaderError {
+    InvalidFraming,
+    InvalidConnection,
+}
+
+fn normalize_message_framing(headers: &mut HeaderMap) -> Result<(), ProxyHeaderError> {
+    let content_length = validated_content_length(headers)?;
+    let has_transfer_encoding = validate_plain_chunked_transfer_encoding(headers)?;
+    if content_length.is_some() && has_transfer_encoding {
+        return Err(ProxyHeaderError::InvalidFraming);
+    }
+    headers.remove(CONTENT_LENGTH);
+    headers.remove(TRANSFER_ENCODING);
+    Ok(())
+}
+
+fn validated_content_length(headers: &HeaderMap) -> Result<Option<u64>, ProxyHeaderError> {
+    let mut parsed = None;
+    for value in headers.get_all(CONTENT_LENGTH).iter() {
+        for candidate in value.as_bytes().split(|byte| *byte == b',') {
+            let candidate = trim_ows(candidate);
+            if candidate.is_empty() {
+                return Err(ProxyHeaderError::InvalidFraming);
+            }
+            let mut length = 0_u64;
+            for byte in candidate {
+                if !byte.is_ascii_digit() {
+                    return Err(ProxyHeaderError::InvalidFraming);
+                }
+                length = length
+                    .checked_mul(10)
+                    .and_then(|current| current.checked_add(u64::from(*byte - b'0')))
+                    .ok_or(ProxyHeaderError::InvalidFraming)?;
+            }
+            if parsed.is_some_and(|current| current != length) {
+                return Err(ProxyHeaderError::InvalidFraming);
+            }
+            parsed = Some(length);
+        }
+    }
+    Ok(parsed)
+}
+
+fn validate_plain_chunked_transfer_encoding(headers: &HeaderMap) -> Result<bool, ProxyHeaderError> {
+    let mut count = 0_usize;
+    for value in headers.get_all(TRANSFER_ENCODING).iter() {
+        for coding in value.as_bytes().split(|byte| *byte == b',') {
+            let coding = trim_ows(coding);
+            if coding.is_empty() || !coding.eq_ignore_ascii_case(b"chunked") {
+                return Err(ProxyHeaderError::InvalidFraming);
+            }
+            count = count
+                .checked_add(1)
+                .ok_or(ProxyHeaderError::InvalidFraming)?;
+        }
+    }
+    match count {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(ProxyHeaderError::InvalidFraming),
+    }
+}
+
+fn trim_ows(mut value: &[u8]) -> &[u8] {
+    while value
+        .first()
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    {
+        value = &value[1..];
+    }
+    while value
+        .last()
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    {
+        value = &value[..value.len() - 1];
+    }
+    value
+}
+
+fn strip_hop_by_hop_headers(headers: &mut HeaderMap) -> Result<(), ProxyHeaderError> {
+    let mut nominated = Vec::new();
+    for value in headers.get_all(CONNECTION).iter() {
+        for token in value.as_bytes().split(|byte| *byte == b',') {
+            let token = trim_ows(token);
+            if token.is_empty() || !token.iter().copied().all(is_tchar) {
+                return Err(ProxyHeaderError::InvalidConnection);
+            }
+            nominated.push(
+                hyper::header::HeaderName::from_bytes(token)
+                    .map_err(|_| ProxyHeaderError::InvalidConnection)?,
+            );
+        }
+    }
     for name in nominated {
         headers.remove(name);
     }
     for name in HOP_BY_HOP_HEADERS {
         headers.remove(name);
     }
+    Ok(())
+}
+
+fn is_tchar(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
 }
 
 fn strip_gateway_session_cookie(headers: &mut HeaderMap) {
@@ -1556,17 +1811,45 @@ fn strip_backend_session_cookie(headers: &mut HeaderMap) {
         .collect::<Vec<_>>();
     headers.remove(SET_COOKIE);
     for value in original {
-        let overwrites_gateway_session = value.to_str().ok().is_some_and(|value| {
-            value
-                .split(';')
-                .next()
-                .and_then(|pair| pair.split_once('='))
-                .is_some_and(|(name, _)| name.trim() == SESSION_COOKIE_NAME)
-        });
-        if !overwrites_gateway_session {
+        let Some(name) = legal_set_cookie_name(value.as_bytes()) else {
+            continue;
+        };
+        if name != SESSION_COOKIE_NAME.as_bytes() {
             headers.append(SET_COOKIE, value);
         }
     }
+}
+
+fn legal_set_cookie_name(value: &[u8]) -> Option<&[u8]> {
+    if value.iter().any(|byte| !(b' '..=b'~').contains(byte)) {
+        return None;
+    }
+    let cookie_pair = value
+        .split(|byte| *byte == b';')
+        .next()
+        .expect("split always yields the first cookie pair");
+    let equals = cookie_pair.iter().position(|byte| *byte == b'=')?;
+    let (name, cookie_value) = cookie_pair.split_at(equals);
+    let cookie_value = &cookie_value[1..];
+    if name.is_empty() || !name.iter().copied().all(is_tchar) {
+        return None;
+    }
+    let cookie_value = if cookie_value.len() >= 2
+        && cookie_value.first() == Some(&b'"')
+        && cookie_value.last() == Some(&b'"')
+    {
+        &cookie_value[1..cookie_value.len() - 1]
+    } else {
+        cookie_value
+    };
+    if !cookie_value.iter().copied().all(is_cookie_octet) {
+        return None;
+    }
+    Some(name)
+}
+
+fn is_cookie_octet(byte: u8) -> bool {
+    matches!(byte, 0x21 | 0x23..=0x2b | 0x2d..=0x3a | 0x3c..=0x5b | 0x5d..=0x7e)
 }
 
 fn empty_body() -> GatewayBody {
@@ -1618,6 +1901,17 @@ fn backend_proxy_failed() -> Response<GatewayBody> {
         .header("x-content-type-options", "nosniff")
         .body(full_body(BACKEND_PROXY_FAILED_BODY))
         .expect("fixed backend-proxy-failed response must be valid")
+}
+
+fn invalid_http_message() -> Response<GatewayBody> {
+    Response::builder()
+        .status(StatusCode::BAD_REQUEST)
+        .header(CONTENT_TYPE, "application/json")
+        .header(CONTENT_LENGTH, INVALID_HTTP_MESSAGE_BODY.len())
+        .header(CACHE_CONTROL, "no-store")
+        .header("x-content-type-options", "nosniff")
+        .body(full_body(INVALID_HTTP_MESSAGE_BODY))
+        .expect("fixed invalid-http-message response must be valid")
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1776,6 +2070,60 @@ impl RouteTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backend_set_cookie_filter_is_fail_closed_and_order_preserving() {
+        let values: &[&[u8]] = &[
+            b"theme=dark; Path=/",
+            b"ride_session=backend; Path=/",
+            b"Ride_Session=case-sensitive; Path=/",
+            b"RIDE_SESSION=upper; Secure",
+            b"ride_sessionx=similar; HttpOnly",
+            b"missing-equals",
+            b"bad name=value",
+            b"bad\tname=value",
+            b"theme=bad\tvalue",
+            b"obs-text=\x80",
+        ];
+        let mut headers = HeaderMap::new();
+        for value in values {
+            headers.append(
+                SET_COOKIE,
+                hyper::header::HeaderValue::from_bytes(value).unwrap(),
+            );
+        }
+
+        strip_backend_session_cookie(&mut headers);
+
+        assert_eq!(
+            headers
+                .get_all(SET_COOKIE)
+                .iter()
+                .map(|value| value.as_bytes())
+                .collect::<Vec<_>>(),
+            vec![
+                b"theme=dark; Path=/".as_slice(),
+                b"Ride_Session=case-sensitive; Path=/".as_slice(),
+                b"RIDE_SESSION=upper; Secure".as_slice(),
+                b"ride_sessionx=similar; HttpOnly".as_slice(),
+            ]
+        );
+
+        for malformed in [
+            b"control=\x01".as_slice(),
+            b"delete=\x7f".as_slice(),
+            b"obs-text=\x80".as_slice(),
+            b"bad\tname=value".as_slice(),
+            b"missing-equals".as_slice(),
+            b"bad name=value".as_slice(),
+        ] {
+            assert_eq!(legal_set_cookie_name(malformed), None);
+        }
+        assert_eq!(
+            legal_set_cookie_name(b"unrelated=\"legal-value\"; Path=/"),
+            Some(b"unrelated".as_slice())
+        );
+    }
 
     #[tokio::test]
     async fn join_error_diagnostics_are_static_and_redacted() {

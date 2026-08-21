@@ -318,6 +318,92 @@ async fn raw_anonymous_get(gateway: &StartupGateway) -> Vec<u8> {
     response
 }
 
+async fn raw_http_exchange(address: SocketAddr, request: &[u8]) -> Vec<u8> {
+    let mut stream = TcpStream::connect(address).await.unwrap();
+    stream.write_all(request).await.unwrap();
+    let mut response = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_millis(500), async {
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match stream.read(&mut buffer).await {
+                Ok(0) | Err(_) => break,
+                Ok(read) => {
+                    response.extend_from_slice(&buffer[..read]);
+                    if raw_http_response_is_complete(&response) {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+    .await;
+    response
+}
+
+fn raw_http_response_is_complete(response: &[u8]) -> bool {
+    let Some(header_end) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return false;
+    };
+    let body_offset = header_end + 4;
+    let headers = String::from_utf8_lossy(&response[..header_end]).to_ascii_lowercase();
+    if let Some(content_length) = headers.lines().find_map(|line| {
+        line.strip_prefix("content-length:")
+            .and_then(|value| value.trim().parse::<usize>().ok())
+    }) {
+        return response.len() >= body_offset + content_length;
+    }
+    headers.contains("transfer-encoding: chunked") && response.ends_with(b"\r\n0\r\n\r\n")
+}
+
+fn raw_authenticated_request(
+    gateway: &StartupGateway,
+    cookie: &str,
+    headers: &[u8],
+    body: &[u8],
+) -> Vec<u8> {
+    let mut request = format!(
+        "POST /api/raw-framing HTTP/1.1\r\nHost: {}\r\nCookie: {cookie}\r\n",
+        gateway.public_authority()
+    )
+    .into_bytes();
+    request.extend_from_slice(headers);
+    request.extend_from_slice(b"\r\n");
+    request.extend_from_slice(body);
+    request
+}
+
+struct RawResponseBackend {
+    addr: SocketAddr,
+    task: JoinHandle<()>,
+}
+
+impl RawResponseBackend {
+    async fn spawn(responses: Vec<Vec<u8>>) -> Self {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            for response in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = stream.read(&mut buffer).await.unwrap();
+                    assert_ne!(read, 0, "gateway closed before sending backend headers");
+                    request.extend_from_slice(&buffer[..read]);
+                    assert!(request.len() <= 16 * 1024);
+                }
+                stream.write_all(&response).await.unwrap();
+                let _ = stream.shutdown().await;
+            }
+        });
+        Self { addr, task }
+    }
+
+    async fn finish(self) {
+        self.task.await.unwrap();
+    }
+}
+
 #[cfg(unix)]
 fn symlink_file(original: &Path, link: &Path) -> io::Result<()> {
     std::os::unix::fs::symlink(original, link)
@@ -885,6 +971,9 @@ async fn same_backend_generation_transitions_from_starting_to_ready() {
     state.backend_ready(generation, backend_addr).await.unwrap();
 
     assert_eq!(waiter.await, Ok(backend_addr));
+    let lease = state.wait_for_backend_lease().await.unwrap();
+    assert_eq!(lease.generation, generation);
+    assert_eq!(lease.address, backend_addr);
     let ready = state.snapshot().await;
     assert_eq!(ready.generation, generation);
     assert_eq!(ready.phase, BackendPhase::Ready);
@@ -1300,6 +1389,216 @@ async fn http_proxy_static_bundle_completes_while_backend_request_is_blocked() {
     backend.shutdown().await;
 }
 
+#[tokio::test]
+async fn http_proxy_rejects_unsafe_request_framing_and_invalid_connection_before_backend_delivery()
+{
+    let backend_deliveries = Arc::new(AtomicUsize::new(0));
+    let observed_deliveries = backend_deliveries.clone();
+    let backend = FakeBackend::spawn(Arc::new(move |_request| {
+        let observed_deliveries = observed_deliveries.clone();
+        async move {
+            observed_deliveries.fetch_add(1, Ordering::SeqCst);
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(full_test_body("unexpected backend delivery"))
+                .unwrap()
+        }
+        .boxed()
+    }))
+    .await;
+    let frontend = TemporaryFrontend::new();
+    let gateway = bind_gateway(&frontend).await;
+    let cookie = bootstrap_session(&gateway).await;
+    let state = gateway.state();
+    let generation = state.begin_backend_start().await.unwrap();
+    state.backend_ready(generation, backend.addr).await.unwrap();
+
+    let cases = [
+        (
+            b"Transfer-Encoding: gzip, chunked\r\nConnection: close\r\n".as_slice(),
+            b"4\r\ntest\r\n0\r\n\r\n".as_slice(),
+        ),
+        (
+            b"Content-Length: 4\r\nContent-Length: 5\r\nConnection: close\r\n".as_slice(),
+            b"test".as_slice(),
+        ),
+        (
+            b"Content-Length: 4, 5\r\nConnection: close\r\n".as_slice(),
+            b"test".as_slice(),
+        ),
+        (
+            b"Content-Length: 0\r\nConnection: x-\thop\r\nX-Hop: secret\r\n".as_slice(),
+            b"".as_slice(),
+        ),
+        (
+            b"Content-Length: 0\r\nConnection: x-hop,,keep-alive\r\nX-Hop: secret\r\n".as_slice(),
+            b"".as_slice(),
+        ),
+        (
+            b"Content-Length: 0\r\nConnection: x@hop\r\nX-Hop: secret\r\n".as_slice(),
+            b"".as_slice(),
+        ),
+        (
+            b"Content-Length: 0\r\nConnection: x-\x80hop\r\nX-Hop: secret\r\n".as_slice(),
+            b"".as_slice(),
+        ),
+    ];
+
+    for (headers, body) in cases {
+        let request = raw_authenticated_request(&gateway, &cookie, headers, body);
+        let response = raw_http_exchange(gateway_addr(&gateway), &request).await;
+        assert!(
+            response.is_empty() || response.starts_with(b"HTTP/1.1 400"),
+            "unsafe request was not rejected: {}",
+            String::from_utf8_lossy(&response)
+        );
+        assert!(response.len() <= 1024);
+    }
+    assert_eq!(backend_deliveries.load(Ordering::SeqCst), 0);
+    gateway.shutdown().await;
+    backend.shutdown().await;
+}
+
+#[tokio::test]
+async fn http_proxy_accepts_consistent_length_plain_chunked_and_connection_ows() {
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let backend_observed = observed.clone();
+    let backend = FakeBackend::spawn(Arc::new(move |request| {
+        let backend_observed = backend_observed.clone();
+        async move {
+            let leaked_hop = request.headers().contains_key("x-raw-hop");
+            let ambiguous_framing = request.headers().contains_key(CONTENT_LENGTH)
+                && request.headers().contains_key("transfer-encoding");
+            let body = request.into_body().collect().await.unwrap().to_bytes();
+            backend_observed
+                .lock()
+                .await
+                .push((body, leaked_hop, ambiguous_framing));
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(full_test_body("accepted"))
+                .unwrap()
+        }
+        .boxed()
+    }))
+    .await;
+    let frontend = TemporaryFrontend::new();
+    let gateway = bind_gateway(&frontend).await;
+    let cookie = bootstrap_session(&gateway).await;
+    let state = gateway.state();
+    let generation = state.begin_backend_start().await.unwrap();
+    state.backend_ready(generation, backend.addr).await.unwrap();
+
+    for headers in [
+        b"Content-Length: 4\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n".as_slice(),
+        b"Transfer-Encoding: chunked\r\nContent-Length: 4\r\nConnection: close\r\n".as_slice(),
+    ] {
+        let request =
+            raw_authenticated_request(&gateway, &cookie, headers, b"4\r\ntest\r\n0\r\n\r\n");
+        let response = raw_http_exchange(gateway_addr(&gateway), &request).await;
+        assert!(response.starts_with(b"HTTP/1.1 200"));
+    }
+
+    let duplicate_length = raw_authenticated_request(
+        &gateway,
+        &cookie,
+        b"Content-Length: 4\r\nContent-Length: 4\r\nConnection: close\r\n",
+        b"test",
+    );
+    let response = raw_http_exchange(gateway_addr(&gateway), &duplicate_length).await;
+    assert!(response.starts_with(b"HTTP/1.1 200"));
+
+    let plain_chunked = raw_authenticated_request(
+        &gateway,
+        &cookie,
+        b"Transfer-Encoding:\tchunked\t\r\nConnection:\t x-raw-hop \t,\tkeep-alive\t\r\nX-Raw-Hop: secret\r\n",
+        b"4\r\ntest\r\n0\r\n\r\n",
+    );
+    let response = raw_http_exchange(gateway_addr(&gateway), &plain_chunked).await;
+    assert!(response.starts_with(b"HTTP/1.1 200"));
+
+    assert_eq!(
+        observed.lock().await.as_slice(),
+        &[
+            (Bytes::from_static(b"test"), false, false),
+            (Bytes::from_static(b"test"), false, false),
+            (Bytes::from_static(b"test"), false, false),
+            (Bytes::from_static(b"test"), false, false),
+        ]
+    );
+    gateway.shutdown().await;
+    backend.shutdown().await;
+}
+
+#[tokio::test]
+async fn http_proxy_rejects_ambiguous_response_framing_and_invalid_connection() {
+    let responses = vec![
+        b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4\r\ntest\r\n0\r\n\r\n".to_vec(),
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 4\r\nConnection: close\r\n\r\n4\r\ntest\r\n0\r\n\r\n".to_vec(),
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\nConnection: close\r\n\r\n4\r\ntest\r\n0\r\n\r\n".to_vec(),
+        b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nContent-Length: 5\r\nConnection: close\r\n\r\ntest".to_vec(),
+        b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: x-\thop\r\nX-Hop: secret\r\n\r\ntest".to_vec(),
+        b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: x-hop,,keep-alive\r\nX-Hop: secret\r\n\r\ntest".to_vec(),
+        b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: x@hop\r\nX-Hop: secret\r\n\r\ntest".to_vec(),
+        b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: x-\x80hop\r\nX-Hop: secret\r\n\r\ntest".to_vec(),
+    ];
+    let backend = RawResponseBackend::spawn(responses).await;
+    let frontend = TemporaryFrontend::new();
+    let gateway = bind_gateway(&frontend).await;
+    let cookie = bootstrap_session(&gateway).await;
+    let state = gateway.state();
+    let generation = state.begin_backend_start().await.unwrap();
+    state.backend_ready(generation, backend.addr).await.unwrap();
+
+    for index in 0..8 {
+        let response = send_request(
+            &gateway,
+            Method::GET,
+            &format!("/api/raw-response/{index}"),
+            &[(COOKIE.as_str(), &cookie)],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = response_bytes(response).await;
+        assert_eq!(
+            body,
+            Bytes::from_static(b"{\"error\":\"backend_proxy_failed\"}")
+        );
+    }
+    gateway.shutdown().await;
+    backend.finish().await;
+}
+
+#[tokio::test]
+async fn http_proxy_accepts_safe_backend_framing_and_connection_ows() {
+    let responses = vec![
+        b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nContent-Length: 4\r\nConnection: close\r\n\r\ntest".to_vec(),
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding:\tchunked\t\r\nConnection:\t x-raw-hop \t,\tclose\t\r\nX-Raw-Hop: secret\r\n\r\n4\r\ntest\r\n0\r\n\r\n".to_vec(),
+    ];
+    let backend = RawResponseBackend::spawn(responses).await;
+    let frontend = TemporaryFrontend::new();
+    let gateway = bind_gateway(&frontend).await;
+    let cookie = bootstrap_session(&gateway).await;
+    let state = gateway.state();
+    let generation = state.begin_backend_start().await.unwrap();
+    state.backend_ready(generation, backend.addr).await.unwrap();
+
+    for index in 0..2 {
+        let response = send_request(
+            &gateway,
+            Method::GET,
+            &format!("/api/safe-response/{index}"),
+            &[(COOKIE.as_str(), &cookie)],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!response.headers().contains_key("x-raw-hop"));
+        assert_eq!(response_bytes(response).await, Bytes::from_static(b"test"));
+    }
+    gateway.shutdown().await;
+    backend.finish().await;
+}
+
 #[derive(Debug)]
 struct ObservedProxyRequest {
     method: Method,
@@ -1343,7 +1642,7 @@ async fn http_proxy_preserves_end_to_end_request_and_response_semantics() {
                 .header("x-response-hop-second", "private")
                 .header("proxy-connection", "keep-alive")
                 .header("keep-alive", "timeout=5")
-                .header("transfer-encoding", "gzip, chunked")
+                .header("transfer-encoding", "chunked")
                 .header("te", "trailers")
                 .header("trailer", "x-response-trailer")
                 .header("upgrade", "h2c")
@@ -1383,7 +1682,7 @@ async fn http_proxy_preserves_end_to_end_request_and_response_semantics() {
                 ("x-request-hop-second", "private"),
                 ("proxy-connection", "keep-alive"),
                 ("keep-alive", "timeout=5"),
-                ("transfer-encoding", "gzip, chunked"),
+                ("transfer-encoding", "chunked"),
                 ("te", "trailers"),
                 ("trailer", "x-trailer"),
                 ("upgrade", "h2c"),
@@ -1439,7 +1738,7 @@ async fn http_proxy_preserves_end_to_end_request_and_response_semantics() {
         .headers()
         .get_all("transfer-encoding")
         .iter()
-        .all(|value| !value.to_str().unwrap().contains("gzip")));
+        .all(|value| value.as_bytes().eq_ignore_ascii_case(b"chunked")));
     assert_eq!(
         response_bytes(response).await,
         Bytes::from_static(b"proxied response")
@@ -1491,7 +1790,7 @@ async fn http_proxy_preserves_end_to_end_request_and_response_semantics() {
         .headers
         .get_all("transfer-encoding")
         .iter()
-        .all(|value| !value.to_str().unwrap().contains("gzip")));
+        .all(|value| value.as_bytes().eq_ignore_ascii_case(b"chunked")));
     gateway.shutdown().await;
     backend.shutdown().await;
 }
@@ -1625,13 +1924,344 @@ async fn http_proxy_connect_failure_is_bounded_and_never_echoes_private_authorit
     gateway.shutdown().await;
 }
 
-#[test]
-fn http_proxy_disables_hyper_automatic_request_retries() {
-    let source = include_str!("../src/startup_gateway.rs");
-    assert!(
-        source.contains("retry_canceled_requests(false)"),
-        "the proxy client must never replay an ordinary HTTP request"
+struct ActiveBackendRequest(Arc<AtomicUsize>);
+
+impl Drop for ActiveBackendRequest {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test]
+async fn http_proxy_bounds_response_headers_without_timing_out_streaming_bodies() {
+    let active_stalls = Arc::new(AtomicUsize::new(0));
+    let observed_active_stalls = active_stalls.clone();
+    let backend = FakeBackend::spawn(Arc::new(move |request| {
+        let active_stalls = observed_active_stalls.clone();
+        async move {
+            match request.uri().path() {
+                "/api/stalled-response-headers" => {
+                    request.into_body().collect().await.unwrap();
+                    active_stalls.fetch_add(1, Ordering::SeqCst);
+                    let _active = ActiveBackendRequest(active_stalls);
+                    std::future::pending::<Response<TestBody>>().await
+                }
+                "/api/slow-upload-before-headers" => {
+                    let body = request.into_body().collect().await.unwrap().to_bytes();
+                    assert_eq!(body, Bytes::from_static(b"slow-upload"));
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(full_test_body("upload-complete"))
+                        .unwrap()
+                }
+                "/api/slow-download-after-headers" => {
+                    let download = stream::unfold(0_usize, |index| async move {
+                        if index == 8 {
+                            return None;
+                        }
+                        tokio::time::sleep(Duration::from_millis(15)).await;
+                        Some((
+                            Ok::<_, io::Error>(Frame::data(Bytes::from_static(b"download"))),
+                            index + 1,
+                        ))
+                    });
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(StreamBody::new(download).boxed_unsync())
+                        .unwrap()
+                }
+                path => panic!("unexpected backend path: {path}"),
+            }
+        }
+        .boxed()
+    }))
+    .await;
+    let frontend = TemporaryFrontend::new();
+    let gateway = StartupGateway::bind(
+        frontend.root.clone(),
+        disabled_metrics(),
+        GatewayLimits {
+            backend_response_header_timeout: Duration::from_millis(30),
+            ..GatewayLimits::test_defaults()
+        },
+    )
+    .await
+    .unwrap();
+    let cookie = bootstrap_session(&gateway).await;
+    let state = gateway.state();
+    let generation = state.begin_backend_start().await.unwrap();
+    state.backend_ready(generation, backend.addr).await.unwrap();
+
+    let stalled = tokio::time::timeout(
+        Duration::from_millis(250),
+        send_request(
+            &gateway,
+            Method::POST,
+            "/api/stalled-response-headers",
+            &[(COOKIE.as_str(), &cookie)],
+        ),
+    )
+    .await
+    .expect("backend response-header wait was not bounded");
+    assert_eq!(stalled.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        response_bytes(stalled).await,
+        Bytes::from_static(b"{\"error\":\"backend_proxy_failed\"}")
     );
+    tokio::time::timeout(Duration::from_millis(250), async {
+        while active_stalls.load(Ordering::SeqCst) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled response-header wait retained backend resources");
+
+    let upload = stream::unfold(0_usize, |index| async move {
+        if index == b"slow-upload".len() {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        Some((
+            Ok::<_, io::Error>(Frame::data(Bytes::from_static(
+                &b"slow-upload"[index..index + 1],
+            ))),
+            index + 1,
+        ))
+    });
+    let upload_response = send_request_to(
+        gateway_addr(&gateway),
+        gateway.public_authority(),
+        Method::POST,
+        "/api/slow-upload-before-headers",
+        &[(COOKIE.as_str(), &cookie)],
+        StreamBody::new(upload).boxed_unsync(),
+    )
+    .await;
+    assert_eq!(upload_response.status(), StatusCode::OK);
+    assert_eq!(
+        response_bytes(upload_response).await,
+        Bytes::from_static(b"upload-complete")
+    );
+
+    let download_response = send_request(
+        &gateway,
+        Method::GET,
+        "/api/slow-download-after-headers",
+        &[(COOKIE.as_str(), &cookie)],
+    )
+    .await;
+    assert_eq!(download_response.status(), StatusCode::OK);
+    assert_eq!(
+        response_bytes(download_response).await,
+        Bytes::from_static(b"downloaddownloaddownloaddownloaddownloaddownloaddownloaddownload")
+    );
+
+    gateway.shutdown().await;
+    backend.shutdown().await;
+}
+
+#[tokio::test]
+async fn http_proxy_discards_idle_backend_connections_when_generation_changes() {
+    let old_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let backend_addr = old_listener.local_addr().unwrap();
+    let old_requests = Arc::new(AtomicUsize::new(0));
+    let old_request_counter = old_requests.clone();
+    let (old_listener_released, old_listener_released_receiver) = oneshot::channel();
+    let old_task = tokio::spawn(async move {
+        let (stream, _) = old_listener.accept().await.unwrap();
+        drop(old_listener);
+        let _ = old_listener_released.send(());
+        let service = service_fn(move |request: Request<Incoming>| {
+            let old_requests = old_request_counter.clone();
+            async move {
+                request.into_body().collect().await.unwrap();
+                old_requests.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, std::convert::Infallible>(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(full_test_body("generation-n"))
+                        .unwrap(),
+                )
+            }
+        });
+        let _ = http1::Builder::new()
+            .serve_connection(TokioIo::new(stream), service)
+            .await;
+    });
+
+    let frontend = TemporaryFrontend::new();
+    let gateway = bind_gateway(&frontend).await;
+    let cookie = bootstrap_session(&gateway).await;
+    let state = gateway.state();
+    let generation_n = state.begin_backend_start().await.unwrap();
+    state
+        .backend_ready(generation_n, backend_addr)
+        .await
+        .unwrap();
+
+    let warmup = send_request(
+        &gateway,
+        Method::GET,
+        "/api/generation-n",
+        &[(COOKIE.as_str(), &cookie)],
+    )
+    .await;
+    assert_eq!(
+        response_bytes(warmup).await,
+        Bytes::from_static(b"generation-n")
+    );
+    old_listener_released_receiver.await.unwrap();
+
+    let new_listener = TcpListener::bind(backend_addr).await.unwrap();
+    let new_requests = Arc::new(AtomicUsize::new(0));
+    let new_request_counter = new_requests.clone();
+    let new_task = tokio::spawn(async move {
+        let (stream, _) = new_listener.accept().await.unwrap();
+        let service = service_fn(move |request: Request<Incoming>| {
+            let new_requests = new_request_counter.clone();
+            async move {
+                let body = request.into_body().collect().await.unwrap().to_bytes();
+                assert_eq!(body, Bytes::from_static(b"streamed-post"));
+                new_requests.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, std::convert::Infallible>(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(full_test_body("generation-n-plus-one"))
+                        .unwrap(),
+                )
+            }
+        });
+        let _ = http1::Builder::new()
+            .serve_connection(TokioIo::new(stream), service)
+            .await;
+    });
+
+    state
+        .fail_backend(generation_n, "generation n exited")
+        .await
+        .unwrap();
+    let generation_n_plus_one = state.begin_backend_start().await.unwrap();
+    state
+        .backend_ready(generation_n_plus_one, backend_addr)
+        .await
+        .unwrap();
+
+    let post_stream = stream::iter([
+        Ok::<_, io::Error>(Frame::data(Bytes::from_static(b"streamed-"))),
+        Ok::<_, io::Error>(Frame::data(Bytes::from_static(b"post"))),
+    ]);
+    let response = send_request_to(
+        gateway_addr(&gateway),
+        gateway.public_authority(),
+        Method::POST,
+        "/api/generation-n-plus-one",
+        &[(COOKIE.as_str(), &cookie)],
+        StreamBody::new(post_stream).boxed_unsync(),
+    )
+    .await;
+    assert_eq!(
+        response_bytes(response).await,
+        Bytes::from_static(b"generation-n-plus-one")
+    );
+    assert_eq!(old_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(new_requests.load(Ordering::SeqCst), 1);
+
+    gateway.shutdown().await;
+    old_task.abort();
+    new_task.abort();
+    let _ = old_task.await;
+    let _ = new_task.await;
+}
+
+#[tokio::test]
+async fn http_proxy_does_not_replay_a_stale_pooled_streaming_post() {
+    let old_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let backend_addr = old_listener.local_addr().unwrap();
+    let streamed_posts = Arc::new(AtomicUsize::new(0));
+    let observed_streamed_posts = streamed_posts.clone();
+    let (old_listener_released, old_listener_released_receiver) = oneshot::channel();
+    let old_task = tokio::spawn(async move {
+        let (stream, _) = old_listener.accept().await.unwrap();
+        drop(old_listener);
+        let _ = old_listener_released.send(());
+        let service = service_fn(move |request: Request<Incoming>| {
+            let streamed_posts = observed_streamed_posts.clone();
+            async move {
+                if request.uri().path() == "/api/warm-pool" {
+                    return Ok::<_, io::Error>(
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .body(full_test_body("warm"))
+                            .unwrap(),
+                    );
+                }
+                let mut body = request.into_body();
+                let first = body.frame().await.unwrap().unwrap();
+                assert!(first.data_ref().is_some_and(|data| !data.is_empty()));
+                streamed_posts.fetch_add(1, Ordering::SeqCst);
+                Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "intentional stale pooled connection reset",
+                ))
+            }
+        });
+        let _ = http1::Builder::new()
+            .serve_connection(TokioIo::new(stream), service)
+            .await;
+    });
+
+    let frontend = TemporaryFrontend::new();
+    let gateway = bind_gateway(&frontend).await;
+    let cookie = bootstrap_session(&gateway).await;
+    let state = gateway.state();
+    let generation = state.begin_backend_start().await.unwrap();
+    state.backend_ready(generation, backend_addr).await.unwrap();
+
+    let warmup = send_request(
+        &gateway,
+        Method::GET,
+        "/api/warm-pool",
+        &[(COOKIE.as_str(), &cookie)],
+    )
+    .await;
+    assert_eq!(response_bytes(warmup).await, Bytes::from_static(b"warm"));
+    old_listener_released_receiver.await.unwrap();
+    let new_listener = TcpListener::bind(backend_addr).await.unwrap();
+
+    let post_stream = stream::unfold(0_usize, |index| async move {
+        if index == 8 {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        Some((
+            Ok::<_, io::Error>(Frame::data(Bytes::from_static(b"post-chunk"))),
+            index + 1,
+        ))
+    });
+    let response = send_request_to(
+        gateway_addr(&gateway),
+        gateway.public_authority(),
+        Method::POST,
+        "/api/stale-streaming-post",
+        &[(COOKIE.as_str(), &cookie)],
+        StreamBody::new(post_stream).boxed_unsync(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        response_bytes(response).await,
+        Bytes::from_static(b"{\"error\":\"backend_proxy_failed\"}")
+    );
+    assert_eq!(streamed_posts.load(Ordering::SeqCst), 1);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), new_listener.accept())
+            .await
+            .is_err(),
+        "the non-idempotent streaming POST was replayed on a new connection"
+    );
+
+    gateway.shutdown().await;
+    let _ = old_task.await;
 }
 
 #[tokio::test]
