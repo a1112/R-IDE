@@ -539,7 +539,11 @@ fn clear_backend_process(app_handle: &AppHandle, pid: u32) -> bool {
         return false;
     };
     let mut ownership = state.backend_ownership.lock().unwrap();
+    let owns_process = ownership.pid() == Some(pid);
     let stopping = ownership.clear_spawn(pid);
+    if !owns_process {
+        return stopping;
+    }
     let mut stop_fallback = state.backend_stop_fallback.lock().unwrap();
     if stop_fallback.as_ref().map(|(owner, _)| *owner) == Some(pid) {
         stop_fallback.take();
@@ -715,9 +719,19 @@ async fn kill_portable_child_async(
         .map_err(|error| format!("Failed to kill PTY backend: {error}"))
 }
 
-async fn wait_for_pty_exit_bounded(
-    exit_rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+type SharedPtyExitReceiver = Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<String>>>;
+
+async fn run_pty_cleanup_action_bounded(
+    action: impl Future<Output = Result<(), String>>,
+    timeout_error: &'static str,
 ) -> Result<(), String> {
+    tokio::time::timeout(Duration::from_secs(5), action)
+        .await
+        .unwrap_or_else(|_| Err(timeout_error.to_string()))
+}
+
+async fn wait_for_pty_exit_bounded(exit_rx: SharedPtyExitReceiver) -> Result<(), String> {
+    let mut exit_rx = exit_rx.lock().await;
     match tokio::time::timeout(Duration::from_secs(5), exit_rx.recv()).await {
         Ok(Some(_)) => Ok(()),
         Ok(None) => Err("PTY backend exit channel closed before reap".to_string()),
@@ -725,18 +739,60 @@ async fn wait_for_pty_exit_bounded(
     }
 }
 
-async fn finish_pty_readiness_publication<Kill, KillFuture, Reap, ReapFuture, Clear>(
+async fn clear_retained_pty_ownership_after_exit<Exit, Clear>(exit: Exit, clear: Clear) -> bool
+where
+    Exit: Future<Output = Option<String>>,
+    Clear: FnOnce(),
+{
+    if exit.await.is_some() {
+        clear();
+        true
+    } else {
+        false
+    }
+}
+
+fn pty_cleanup_status(result: &Result<(), String>) -> String {
+    const MAX_CHARS: usize = 192;
+    result
+        .as_ref()
+        .map(|()| "ok".to_string())
+        .unwrap_or_else(|error| error.chars().take(MAX_CHARS).collect())
+}
+
+async fn finish_pty_readiness_publication<
+    Kill,
+    KillFuture,
+    FirstReap,
+    FirstReapFuture,
+    TreeFallback,
+    TreeFallbackFuture,
+    SecondReap,
+    SecondReapFuture,
+    Clear,
+    Retain,
+    RetainFuture,
+>(
     publication: Result<bool, String>,
     kill: Kill,
-    reap: Reap,
+    first_reap: FirstReap,
+    tree_fallback: TreeFallback,
+    second_reap: SecondReap,
     clear: Clear,
+    retain: Retain,
 ) -> Result<(), String>
 where
     Kill: FnOnce() -> KillFuture,
     KillFuture: Future<Output = Result<(), String>>,
-    Reap: FnOnce() -> ReapFuture,
-    ReapFuture: Future<Output = Result<(), String>>,
+    FirstReap: FnOnce() -> FirstReapFuture,
+    FirstReapFuture: Future<Output = Result<(), String>>,
+    TreeFallback: FnOnce() -> TreeFallbackFuture,
+    TreeFallbackFuture: Future<Output = Result<(), String>>,
+    SecondReap: FnOnce() -> SecondReapFuture,
+    SecondReapFuture: Future<Output = Result<(), String>>,
     Clear: FnOnce(),
+    Retain: FnOnce() -> RetainFuture,
+    RetainFuture: Future<Output = ()>,
 {
     let publication_error = match publication {
         Ok(true) => return Ok(()),
@@ -744,16 +800,31 @@ where
         Err(error) => error,
     };
     let kill = kill().await;
-    let reap = reap().await;
-    clear();
-    match (kill, reap) {
-        (Ok(()), Ok(())) => Err(publication_error),
-        (kill, reap) => Err(format!(
-            "{publication_error}; PTY cleanup failed: kill: {}; reap: {}",
-            kill.err().unwrap_or_else(|| "ok".to_string()),
-            reap.err().unwrap_or_else(|| "ok".to_string())
-        )),
+    let first_reap = first_reap().await;
+    if first_reap.is_ok() {
+        clear();
+        return Err(format!(
+            "{publication_error}; ownership cleared after confirmed exit; kill: {}; first reap: ok; tree fallback: skipped; second reap: skipped",
+            pty_cleanup_status(&kill)
+        ));
     }
+
+    let tree_fallback = tree_fallback().await;
+    let second_reap = second_reap().await;
+    let ownership = if second_reap.is_ok() {
+        clear();
+        "ownership cleared after confirmed exit"
+    } else {
+        retain().await;
+        "ownership retained pending confirmed exit"
+    };
+    Err(format!(
+        "{publication_error}; {ownership}; kill: {}; first reap: {}; tree fallback: {}; second reap: {}",
+        pty_cleanup_status(&kill),
+        pty_cleanup_status(&first_reap),
+        pty_cleanup_status(&tree_fallback),
+        pty_cleanup_status(&second_reap)
+    ))
 }
 
 async fn cleanup_failed_pty_backend_start(
@@ -1153,15 +1224,51 @@ async fn start_node_backend_process(
             });
         }
     };
-    finish_pty_readiness_publication(
-        publication,
-        || kill_portable_child_async(pty_killer),
-        || wait_for_pty_exit_bounded(&mut exit_rx),
-        || {
-            clear_backend_process(app_handle, pid);
-        },
-    )
-    .await?;
+    match publication {
+        Ok(true) => {}
+        publication => {
+            let exit_rx = Arc::new(tokio::sync::Mutex::new(exit_rx));
+            let first_reap_exit = exit_rx.clone();
+            let second_reap_exit = exit_rx.clone();
+            let retained_exit = exit_rx.clone();
+            let retained_app = app_handle.clone();
+            return finish_pty_readiness_publication(
+                publication,
+                || {
+                    run_pty_cleanup_action_bounded(
+                        kill_portable_child_async(pty_killer),
+                        "PTY exact-child kill timed out",
+                    )
+                },
+                move || wait_for_pty_exit_bounded(first_reap_exit),
+                || {
+                    run_pty_cleanup_action_bounded(
+                        terminate_process_tree_async(pid),
+                        "PTY process-tree termination timed out",
+                    )
+                },
+                move || wait_for_pty_exit_bounded(second_reap_exit),
+                || {
+                    clear_backend_process(app_handle, pid);
+                },
+                move || async move {
+                    tauri::async_runtime::spawn(async move {
+                        clear_retained_pty_ownership_after_exit(
+                            async move {
+                                let mut retained_exit = retained_exit.lock().await;
+                                retained_exit.recv().await
+                            },
+                            move || {
+                                clear_backend_process(&retained_app, pid);
+                            },
+                        )
+                        .await;
+                    });
+                },
+            )
+            .await;
+        }
+    }
 
     let app_handle_logs = app_handle.clone();
     std::thread::spawn(move || {
@@ -2239,11 +2346,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pty_publication_error_kills_reaps_and_clears_with_combined_diagnostics() {
+    async fn pty_publication_cleanup_retains_ownership_when_exit_cannot_be_confirmed() {
         let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let kill_events = events.clone();
-        let reap_events = events.clone();
+        let first_reap_events = events.clone();
+        let tree_events = events.clone();
+        let second_reap_events = events.clone();
         let clear_events = events.clone();
+        let retain_events = events.clone();
+        let clear_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed_clear = clear_called.clone();
+        let watcher_clear_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed_watcher_clear = watcher_clear_called.clone();
 
         let error = super::finish_pty_readiness_publication(
             Err("gateway publication rejected".to_string()),
@@ -2252,17 +2366,109 @@ mod tests {
                 Err("portable child kill failed".to_string())
             },
             move || async move {
-                reap_events.lock().unwrap().push("reap");
-                Err("portable child reap timed out".to_string())
+                first_reap_events.lock().unwrap().push("first-reap");
+                Err("first reap timed out".to_string())
             },
-            move || clear_events.lock().unwrap().push("clear"),
+            move || async move {
+                tree_events.lock().unwrap().push("tree-fallback");
+                Err("process tree termination failed".to_string())
+            },
+            move || async move {
+                second_reap_events.lock().unwrap().push("second-reap");
+                Err("second reap timed out".to_string())
+            },
+            move || {
+                observed_clear.store(true, std::sync::atomic::Ordering::SeqCst);
+                clear_events.lock().unwrap().push("clear");
+            },
+            move || async move {
+                retain_events.lock().unwrap().push("retain-watcher");
+                super::clear_retained_pty_ownership_after_exit(
+                    async { None::<String> },
+                    move || {
+                        observed_watcher_clear.store(true, std::sync::atomic::Ordering::SeqCst);
+                    },
+                )
+                .await;
+            },
         )
         .await
         .expect_err("publication rejection must fail PTY startup");
 
-        assert_eq!(*events.lock().unwrap(), ["kill", "reap", "clear"]);
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                "kill",
+                "first-reap",
+                "tree-fallback",
+                "second-reap",
+                "retain-watcher"
+            ]
+        );
+        assert!(!clear_called.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!watcher_clear_called.load(std::sync::atomic::Ordering::SeqCst));
         assert!(error.contains("gateway publication rejected"), "{error}");
         assert!(error.contains("portable child kill failed"), "{error}");
-        assert!(error.contains("portable child reap timed out"), "{error}");
+        assert!(error.contains("first reap timed out"), "{error}");
+        assert!(error.contains("process tree termination failed"), "{error}");
+        assert!(error.contains("second reap timed out"), "{error}");
+        assert!(error.contains("ownership retained"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn pty_publication_tree_fallback_clears_only_after_confirmed_exit() {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let kill_events = events.clone();
+        let first_reap_events = events.clone();
+        let tree_events = events.clone();
+        let second_reap_events = events.clone();
+        let clear_events = events.clone();
+        let retain_events = events.clone();
+
+        let error = super::finish_pty_readiness_publication(
+            Ok(false),
+            move || async move {
+                kill_events.lock().unwrap().push("kill");
+                Err("portable child kill failed".to_string())
+            },
+            move || async move {
+                first_reap_events.lock().unwrap().push("first-reap");
+                Err("first reap timed out".to_string())
+            },
+            move || async move {
+                tree_events.lock().unwrap().push("tree-fallback");
+                Ok(())
+            },
+            move || async move {
+                second_reap_events.lock().unwrap().push("second-reap");
+                Ok(())
+            },
+            move || clear_events.lock().unwrap().push("clear"),
+            move || async move {
+                retain_events.lock().unwrap().push("retain-watcher");
+            },
+        )
+        .await
+        .expect_err("cancelled publication must fail PTY startup");
+
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                "kill",
+                "first-reap",
+                "tree-fallback",
+                "second-reap",
+                "clear"
+            ]
+        );
+        assert!(
+            error.contains("cancelled before PTY publication"),
+            "{error}"
+        );
+        assert!(error.contains("portable child kill failed"), "{error}");
+        assert!(error.contains("first reap timed out"), "{error}");
+        assert!(error.contains("tree fallback: ok"), "{error}");
+        assert!(error.contains("second reap: ok"), "{error}");
+        assert!(error.contains("ownership cleared"), "{error}");
     }
 }
