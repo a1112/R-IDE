@@ -159,6 +159,7 @@ The gateway applies the following policy:
 - Require exact public Origin for control mutations and upgrades; reject a foreign Origin when one is supplied on other requests.
 - Permit only the documented method and small body on startup-control routes.
 - Strip the gateway session cookie before proxying while preserving unrelated application cookies when required.
+- Reject backend attempts to overwrite the gateway session cookie while preserving unrelated response cookies.
 - Reject invalid Host, forwarded-host, absolute-form, and ambiguous path inputs.
 - Redact public ephemeral ports and session identifiers from persisted performance artifacts unless the schema explicitly stores a non-sensitive normalized fact.
 
