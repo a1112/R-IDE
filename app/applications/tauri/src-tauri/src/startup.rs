@@ -449,6 +449,56 @@ impl BackendSpawnStrategy {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackendSpawnPlan {
+    strategy: BackendSpawnStrategy,
+    watcher_process: bool,
+    warning: Option<String>,
+}
+
+impl BackendSpawnPlan {
+    pub fn for_backend_on_platform(
+        transport: BackendTransport,
+        watcher_process: bool,
+        windows: bool,
+    ) -> Result<Self, String> {
+        if windows && transport == BackendTransport::Pty {
+            return Ok(Self {
+                strategy: BackendSpawnStrategy::DirectPipes,
+                watcher_process: false,
+                warning: Some(
+                    "Windows PTY transport cannot be atomically assigned to a Job Object; falling back to direct transport with --no-cluster"
+                        .to_string(),
+                ),
+            });
+        }
+        Ok(Self {
+            strategy: BackendSpawnStrategy::for_backend(transport, watcher_process)?,
+            watcher_process,
+            warning: None,
+        })
+    }
+
+    pub fn for_current_platform(
+        transport: BackendTransport,
+        watcher_process: bool,
+    ) -> Result<Self, String> {
+        Self::for_backend_on_platform(transport, watcher_process, cfg!(windows))
+    }
+
+    pub fn strategy(&self) -> BackendSpawnStrategy {
+        self.strategy
+    }
+
+    pub fn watcher_process(&self) -> bool {
+        self.watcher_process
+    }
+
+    pub fn warning(&self) -> Option<&str> {
+        self.warning.as_deref()
+    }
+}
+
 impl BackendTransport {
     pub fn from_env_value(value: Option<&str>) -> Result<Self, String> {
         match value.map(str::trim).filter(|value| !value.is_empty()) {
@@ -723,6 +773,104 @@ pub fn parse_linux_listener_inodes(table: &str, port: u16) -> Result<Vec<String>
     Ok(listener_inodes)
 }
 
+pub fn parse_backend_process_group_members(
+    output: &str,
+    owned_pgid: i32,
+) -> Result<Vec<u32>, String> {
+    parse_backend_process_group_members_for_groups(output, &[owned_pgid])
+}
+
+fn parse_backend_process_group_members_for_groups(
+    output: &str,
+    owned_pgids: &[i32],
+) -> Result<Vec<u32>, String> {
+    if owned_pgids.is_empty() || owned_pgids.iter().any(|pgid| *pgid <= 0) {
+        return Err("Malformed backend process-group enumeration row".to_string());
+    }
+    let mut members = Vec::new();
+    for line in output.lines().filter(|line| !line.trim().is_empty()) {
+        let mut columns = line.split_whitespace();
+        let pid = columns
+            .next()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|pid| *pid > 0)
+            .ok_or_else(|| "Malformed backend process-group enumeration row".to_string())?;
+        let process_pgid = columns
+            .next()
+            .and_then(|value| value.parse::<i32>().ok())
+            .filter(|pgid| *pgid > 0)
+            .ok_or_else(|| "Malformed backend process-group enumeration row".to_string())?;
+        if columns.next().is_some() {
+            return Err("Malformed backend process-group enumeration row".to_string());
+        }
+        if owned_pgids.contains(&process_pgid) {
+            members.push(pid);
+        }
+    }
+    members.sort_unstable();
+    members.dedup();
+    Ok(members)
+}
+
+pub fn parse_backend_process_scope_members(
+    output: &str,
+    owned_pgids: &[i32],
+    owned_session_id: Option<i32>,
+) -> Result<(Vec<u32>, Vec<i32>), String> {
+    if owned_pgids.is_empty()
+        || owned_pgids.iter().any(|pgid| *pgid <= 0)
+        || owned_session_id.is_some_and(|session_id| session_id <= 0)
+    {
+        return Err("Malformed backend process-scope enumeration row".to_string());
+    }
+    let mut members = Vec::new();
+    let mut process_groups = Vec::new();
+    for line in output.lines().filter(|line| !line.trim().is_empty()) {
+        let mut columns = line.split_whitespace();
+        let pid = columns
+            .next()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|pid| *pid > 0)
+            .ok_or_else(|| "Malformed backend process-scope enumeration row".to_string())?;
+        let process_pgid = columns
+            .next()
+            .and_then(|value| value.parse::<i32>().ok())
+            .filter(|pgid| *pgid >= 0)
+            .ok_or_else(|| "Malformed backend process-scope enumeration row".to_string())?;
+        let session_id = columns
+            .next()
+            .and_then(|value| value.parse::<i32>().ok())
+            .filter(|session_id| *session_id >= 0)
+            .ok_or_else(|| "Malformed backend process-scope enumeration row".to_string())?;
+        if columns.next().is_some() {
+            return Err("Malformed backend process-scope enumeration row".to_string());
+        }
+        let owned = owned_session_id
+            .map(|owned_session_id| session_id == owned_session_id)
+            .unwrap_or_else(|| owned_pgids.contains(&process_pgid));
+        if owned {
+            if process_pgid == 0 || session_id == 0 {
+                return Err("Malformed backend process-scope enumeration row".to_string());
+            }
+            members.push(pid);
+            process_groups.push(process_pgid);
+        }
+    }
+    members.sort_unstable();
+    members.dedup();
+    process_groups.sort_unstable();
+    process_groups.dedup();
+    Ok((members, process_groups))
+}
+
+pub fn backend_process_session_column_name(macos: bool) -> &'static str {
+    if macos {
+        "sess="
+    } else {
+        "sid="
+    }
+}
+
 #[cfg(target_os = "macos")]
 async fn listener_is_owned_by(port: u16, owner_pid: u32) -> Result<bool, String> {
     let mut command = tokio::process::Command::new("/usr/sbin/lsof");
@@ -832,11 +980,15 @@ impl BackendStartupState {
                 actions
             }
             BackendStartupEvent::Exited(exit) => {
+                let mut actions = Vec::new();
+                if let Some(pid) = self.pid {
+                    actions.push(BackendStartupAction::TerminateProcessTree(pid));
+                    actions.push(BackendStartupAction::ReapOwnedChild(pid));
+                }
                 self.clear();
-                vec![
-                    BackendStartupAction::ClearState,
-                    BackendStartupAction::ReportUnexpectedExit(exit),
-                ]
+                actions.push(BackendStartupAction::ClearState);
+                actions.push(BackendStartupAction::ReportUnexpectedExit(exit));
+                actions
             }
         }
     }
@@ -876,6 +1028,680 @@ impl BackendStartupState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BackendStartToken(u64);
 
+#[derive(Clone, Debug)]
+pub(crate) struct BackendProcessTree {
+    root_pid: u32,
+    platform: std::sync::Arc<PlatformBackendProcessTree>,
+}
+
+impl BackendProcessTree {
+    fn new(root_pid: u32, platform: PlatformBackendProcessTree) -> Self {
+        Self {
+            root_pid,
+            platform: std::sync::Arc::new(platform),
+        }
+    }
+
+    pub(crate) fn root_pid(&self) -> u32 {
+        self.root_pid
+    }
+
+    pub(crate) fn terminate_and_confirm(&self, bound: Duration) -> Result<(), String> {
+        self.platform.terminate_and_confirm(self.root_pid, bound)
+    }
+
+    pub(crate) fn force_terminate_for_exit(&self, bound: Duration) -> Result<(), String> {
+        self.platform.force_terminate_for_exit(self.root_pid, bound)
+    }
+
+    pub(crate) fn process_ids_bounded(&self, bound: Duration) -> Result<Vec<u32>, String> {
+        self.platform.process_ids_bounded(bound)
+    }
+
+    pub(crate) fn same_owner(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.platform, &other.platform)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn active_process_count(&self) -> Result<u32, String> {
+        self.platform.active_process_count()
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn confirm_only_root_remains(&self, bound: Duration) -> Result<(), String> {
+        self.platform
+            .confirm_only_root_remains(self.root_pid, bound)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn kill_root(&self) -> Result<(), String> {
+        self.platform.kill_root(self.root_pid)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedBackendProcessTree {
+    platform: PreparedPlatformBackendProcessTree,
+}
+
+impl PreparedBackendProcessTree {
+    pub(crate) fn for_direct(command: &mut tokio::process::Command) -> Result<Self, String> {
+        PreparedPlatformBackendProcessTree::for_direct(command).map(|platform| Self { platform })
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn claim_direct(
+        self,
+        root_pid: u32,
+        root_process: windows_sys::Win32::Foundation::HANDLE,
+    ) -> Result<BackendProcessTree, String> {
+        self.platform.claim_direct(root_pid, root_process)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn claim_direct(self, root_pid: u32) -> Result<BackendProcessTree, String> {
+        self.platform.claim_direct(root_pid)
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn claim_pty_backend_process_tree(root_pid: u32) -> Result<BackendProcessTree, String> {
+    match claim_pty_backend_cleanup_tree(root_pid) {
+        Ok(tree) => Ok(tree),
+        Err(error) => {
+            log::warn!(
+                "PTY backend session syscall attestation was unavailable; retaining the portable-pty setsid ownership contract: {error}"
+            );
+            claim_spawned_pty_backend_session_scope(root_pid)
+        }
+    }
+}
+
+pub fn validate_pty_cleanup_process_group(
+    root_pid: u32,
+    observed_pgid: Option<i32>,
+    application_pgid: i32,
+) -> Result<i32, String> {
+    if root_pid == 0 || application_pgid <= 0 {
+        return Err("PTY cleanup process-group identity is invalid".to_string());
+    }
+    let pgid = observed_pgid
+        .filter(|pgid| *pgid > 0 && *pgid != application_pgid)
+        .ok_or_else(|| "PTY cleanup process-group identity is invalid".to_string())?;
+    Ok(pgid)
+}
+
+pub fn attest_pty_cleanup_session(
+    root_pid: u32,
+    actual_pgid: i32,
+    actual_session_id: i32,
+    application_pgid: i32,
+) -> Result<i32, String> {
+    let root_pid_i32 = i32::try_from(root_pid)
+        .map_err(|_| "PTY cleanup root process identity is invalid".to_string())?;
+    if actual_pgid != root_pid_i32 || actual_session_id != root_pid_i32 {
+        return Err("PTY cleanup root session could not be attested".to_string());
+    }
+    validate_pty_cleanup_process_group(root_pid, Some(actual_pgid), application_pgid)
+}
+
+#[cfg(unix)]
+pub(crate) fn claim_pty_backend_cleanup_tree(root_pid: u32) -> Result<BackendProcessTree, String> {
+    let root_pid_i32 = i32::try_from(root_pid)
+        .map_err(|_| format!("PTY backend pid {root_pid} does not fit a Unix process id"))?;
+    let actual_pgid = unsafe { libc::getpgid(root_pid_i32) };
+    let root_sid = unsafe { libc::getsid(root_pid_i32) };
+    let application_pgid = unsafe { libc::getpgrp() };
+    if actual_pgid == -1 && root_sid == -1 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(format!(
+                "PTY cleanup session identity query failed: {error}"
+            ));
+        }
+        validate_pty_cleanup_process_group(root_pid, Some(root_pid_i32), application_pgid)?;
+    } else {
+        attest_pty_cleanup_session(root_pid, actual_pgid, root_sid, application_pgid)?;
+    }
+    claim_spawned_pty_backend_session_scope(root_pid)
+}
+
+#[cfg(unix)]
+fn claim_spawned_pty_backend_session_scope(root_pid: u32) -> Result<BackendProcessTree, String> {
+    let root_pid_i32 = i32::try_from(root_pid)
+        .map_err(|_| format!("PTY backend pid {root_pid} does not fit a Unix process id"))?;
+    validate_pty_cleanup_process_group(root_pid, Some(root_pid_i32), unsafe { libc::getpgrp() })?;
+    Ok(BackendProcessTree::new(
+        root_pid,
+        PlatformBackendProcessTree {
+            pgids: vec![root_pid_i32],
+            session_id: Some(root_pid_i32),
+        },
+    ))
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct OwnedWindowsHandle(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+unsafe impl Send for OwnedWindowsHandle {}
+
+#[cfg(windows)]
+unsafe impl Sync for OwnedWindowsHandle {}
+
+#[cfg(windows)]
+impl Drop for OwnedWindowsHandle {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(self.0);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct PreparedPlatformBackendProcessTree {
+    job: OwnedWindowsHandle,
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct PlatformBackendProcessTree {
+    job: OwnedWindowsHandle,
+    #[allow(dead_code)]
+    root_process: OwnedWindowsHandle,
+}
+
+#[cfg(windows)]
+impl PreparedPlatformBackendProcessTree {
+    fn for_direct(command: &mut tokio::process::Command) -> Result<Self, String> {
+        use std::ffi::c_void;
+        use std::mem::size_of;
+        use windows_sys::Win32::System::JobObjects::{
+            CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+        use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
+
+        let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if job.is_null() {
+            return Err(format!(
+                "Failed to create backend Job Object: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let job = OwnedWindowsHandle(job);
+        let mut information = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        information.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured = unsafe {
+            SetInformationJobObject(
+                job.0,
+                JobObjectExtendedLimitInformation,
+                &information as *const _ as *const c_void,
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if configured == 0 {
+            return Err(format!(
+                "Failed to configure backend Job Object: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        command.creation_flags(CREATE_SUSPENDED);
+        Ok(Self { job })
+    }
+
+    fn claim_direct(
+        self,
+        root_pid: u32,
+        root_process: windows_sys::Win32::Foundation::HANDLE,
+    ) -> Result<BackendProcessTree, String> {
+        use windows_sys::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS};
+        use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        if root_process.is_null() {
+            return Err("Direct backend did not expose a Windows process handle".to_string());
+        }
+        if unsafe { AssignProcessToJobObject(self.job.0, root_process) } == 0 {
+            return Err(format!(
+                "Failed to assign suspended backend to its nested Job Object: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let mut duplicate = std::ptr::null_mut();
+        let current = unsafe { GetCurrentProcess() };
+        if unsafe {
+            DuplicateHandle(
+                current,
+                root_process,
+                current,
+                &mut duplicate,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        } == 0
+        {
+            return Err(format!(
+                "Failed to retain the backend root process identity: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        resume_suspended_process(root_pid)?;
+        Ok(BackendProcessTree::new(
+            root_pid,
+            PlatformBackendProcessTree {
+                job: self.job,
+                root_process: OwnedWindowsHandle(duplicate),
+            },
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn resume_suspended_process(root_pid: u32) -> Result<(), String> {
+    use std::mem::size_of;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+    };
+    use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(format!(
+            "Failed to enumerate the suspended backend thread: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let snapshot = OwnedWindowsHandle(snapshot);
+    let mut entry = THREADENTRY32 {
+        dwSize: size_of::<THREADENTRY32>() as u32,
+        ..Default::default()
+    };
+    let mut present = unsafe { Thread32First(snapshot.0, &mut entry) } != 0;
+    while present {
+        if entry.th32OwnerProcessID == root_pid {
+            let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
+            if thread.is_null() {
+                return Err(format!(
+                    "Failed to open the suspended backend thread: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            let resumed = unsafe { ResumeThread(thread) };
+            unsafe {
+                CloseHandle(thread);
+            }
+            if resumed == u32::MAX {
+                return Err(format!(
+                    "Failed to resume the assigned backend process: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            return Ok(());
+        }
+        present = unsafe { Thread32Next(snapshot.0, &mut entry) } != 0;
+    }
+    Err(format!(
+        "Suspended backend process {root_pid} did not expose a resumable thread"
+    ))
+}
+
+#[cfg(windows)]
+impl PlatformBackendProcessTree {
+    fn process_ids_bounded(&self, bound: Duration) -> Result<Vec<u32>, String> {
+        use std::ffi::c_void;
+        use std::mem::size_of;
+        use windows_sys::Win32::System::JobObjects::{
+            JobObjectBasicProcessIdList, QueryInformationJobObject, JOBOBJECT_BASIC_PROCESS_ID_LIST,
+        };
+
+        const MAX_PROCESS_IDS: usize = 4096;
+        if bound.is_zero() {
+            return Err("Backend Job process enumeration bound must be nonzero".to_string());
+        }
+        let started = std::time::Instant::now();
+        let byte_len = size_of::<JOBOBJECT_BASIC_PROCESS_ID_LIST>()
+            + (MAX_PROCESS_IDS - 1) * size_of::<usize>();
+        let word_len = byte_len.div_ceil(size_of::<usize>());
+        let mut storage = vec![0usize; word_len];
+        let information = storage
+            .as_mut_ptr()
+            .cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>();
+        if unsafe {
+            QueryInformationJobObject(
+                self.job.0,
+                JobObjectBasicProcessIdList,
+                information.cast::<c_void>(),
+                byte_len as u32,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(format!(
+                "Failed to enumerate backend Job Object processes: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if started.elapsed() > bound {
+            return Err(format!(
+                "Backend Job process enumeration exceeded {}ms",
+                bound.as_millis()
+            ));
+        }
+        let information = unsafe { &*information };
+        if information.NumberOfAssignedProcesses > information.NumberOfProcessIdsInList {
+            return Err(format!(
+                "Backend Job contains more than {MAX_PROCESS_IDS} processes"
+            ));
+        }
+        let count = information.NumberOfProcessIdsInList as usize;
+        let mut process_ids =
+            unsafe { std::slice::from_raw_parts(information.ProcessIdList.as_ptr(), count) }
+                .iter()
+                .map(|pid| {
+                    u32::try_from(*pid)
+                        .map_err(|_| format!("Backend Job process id {pid} does not fit u32"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+        process_ids.sort_unstable();
+        process_ids.dedup();
+        Ok(process_ids)
+    }
+
+    fn active_process_count(&self) -> Result<u32, String> {
+        use std::ffi::c_void;
+        use std::mem::size_of;
+        use windows_sys::Win32::System::JobObjects::{
+            JobObjectBasicAccountingInformation, QueryInformationJobObject,
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+        };
+        let mut information = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        if unsafe {
+            QueryInformationJobObject(
+                self.job.0,
+                JobObjectBasicAccountingInformation,
+                &mut information as *mut _ as *mut c_void,
+                size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(format!(
+                "Failed to query backend Job Object: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(information.ActiveProcesses)
+    }
+
+    fn terminate_and_confirm(&self, _root_pid: u32, bound: Duration) -> Result<(), String> {
+        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+        if bound.is_zero() {
+            return Err("Backend Job termination bound must be nonzero".to_string());
+        }
+        if unsafe { TerminateJobObject(self.job.0, 1) } == 0 {
+            return Err(format!(
+                "Failed to terminate backend Job Object: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let deadline = std::time::Instant::now() + bound;
+        loop {
+            if self.active_process_count()? == 0 {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "Backend Job Object remained nonempty after {}ms",
+                    bound.as_millis()
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn force_terminate_for_exit(&self, root_pid: u32, bound: Duration) -> Result<(), String> {
+        self.terminate_and_confirm(root_pid, bound)
+    }
+
+    #[allow(dead_code)]
+    fn kill_root(&self, _root_pid: u32) -> Result<(), String> {
+        use windows_sys::Win32::System::Threading::TerminateProcess;
+        if unsafe { TerminateProcess(self.root_process.0, 1) } == 0 {
+            return Err(format!(
+                "Failed to terminate the owned backend root: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct PreparedPlatformBackendProcessTree;
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct PlatformBackendProcessTree {
+    pgids: Vec<libc::pid_t>,
+    session_id: Option<libc::pid_t>,
+}
+
+#[cfg(unix)]
+impl PreparedPlatformBackendProcessTree {
+    fn for_direct(command: &mut tokio::process::Command) -> Result<Self, String> {
+        command.process_group(0);
+        Ok(Self)
+    }
+
+    fn claim_direct(self, root_pid: u32) -> Result<BackendProcessTree, String> {
+        let pgid = i32::try_from(root_pid)
+            .map_err(|_| format!("Backend pid {root_pid} does not fit a Unix process id"))?;
+        Ok(BackendProcessTree::new(
+            root_pid,
+            PlatformBackendProcessTree {
+                pgids: vec![pgid],
+                session_id: None,
+            },
+        ))
+    }
+}
+
+#[cfg(unix)]
+impl PlatformBackendProcessTree {
+    fn signal_process_groups(
+        process_groups: &[libc::pid_t],
+        signal: libc::c_int,
+    ) -> Result<(), String> {
+        let mut failures = Vec::new();
+        for pgid in process_groups {
+            if unsafe { libc::kill(-*pgid, signal) } == 0 {
+                continue;
+            }
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                failures.push(format!("process group {pgid}: {error}"));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "Failed to signal owned backend process groups: {}",
+                failures.join("; ")
+            ))
+        }
+    }
+
+    fn enumerate_scope_members(
+        owned_pgids: &[libc::pid_t],
+        owned_session_id: Option<libc::pid_t>,
+    ) -> Result<(Vec<u32>, Vec<i32>), String> {
+        let session_column = backend_process_session_column_name(cfg!(target_os = "macos"));
+        let output = std::process::Command::new("ps")
+            .args(["-A", "-o", "pid=", "-o", "pgid=", "-o", session_column])
+            .env("LC_ALL", "C")
+            .output()
+            .map_err(|error| format!("Failed to enumerate backend process scope: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "Process-scope enumeration exited with status {}",
+                output.status
+            ));
+        }
+        parse_backend_process_scope_members(
+            &String::from_utf8_lossy(&output.stdout),
+            owned_pgids,
+            owned_session_id,
+        )
+    }
+
+    fn scope_members_bounded(&self, bound: Duration) -> Result<(Vec<u32>, Vec<i32>), String> {
+        if bound.is_zero() {
+            return Err("Backend process-scope enumeration bound must be nonzero".to_string());
+        }
+        let pgids = self.pgids.clone();
+        let session_id = self.session_id;
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("ride-backend-scope-enumeration".to_string())
+            .spawn(move || {
+                let _ = sender.send(Self::enumerate_scope_members(&pgids, session_id));
+            })
+            .map_err(|error| format!("Failed to start process-scope enumeration: {error}"))?;
+        receiver.recv_timeout(bound).map_err(|error| match error {
+            std::sync::mpsc::RecvTimeoutError::Timeout => format!(
+                "Backend process-scope enumeration exceeded {}ms",
+                bound.as_millis()
+            ),
+            std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                "Backend process-scope enumeration worker disconnected".to_string()
+            }
+        })?
+    }
+
+    fn process_ids_bounded(&self, bound: Duration) -> Result<Vec<u32>, String> {
+        self.scope_members_bounded(bound)
+            .map(|(members, _)| members)
+    }
+
+    fn group_members(&self, bound: Duration) -> Result<Vec<u32>, String> {
+        self.process_ids_bounded(bound)
+    }
+
+    fn active_process_count(&self) -> Result<u32, String> {
+        u32::try_from(self.group_members(Duration::from_secs(2))?.len())
+            .map_err(|_| "Backend process group member count overflowed u32".to_string())
+    }
+
+    fn terminate_and_confirm(&self, root_pid: u32, bound: Duration) -> Result<(), String> {
+        if bound.is_zero() {
+            return Err("Backend process-scope termination bound must be nonzero".to_string());
+        }
+        let deadline = std::time::Instant::now() + bound;
+        let (_, process_groups) = self.scope_members_bounded(bound)?;
+        Self::signal_process_groups(&process_groups, libc::SIGTERM)?;
+        std::thread::sleep(
+            deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .min(Duration::from_millis(500)),
+        );
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        self.kill_scope_until_only_root_remains(root_pid, remaining)
+    }
+
+    fn force_terminate_for_exit(&self, root_pid: u32, bound: Duration) -> Result<(), String> {
+        self.kill_scope_until_only_root_remains(root_pid, bound)
+    }
+
+    fn kill_scope_until_only_root_remains(
+        &self,
+        root_pid: u32,
+        bound: Duration,
+    ) -> Result<(), String> {
+        if bound.is_zero() {
+            return Err("Backend process-scope kill bound must be nonzero".to_string());
+        }
+        let deadline = std::time::Instant::now() + bound;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(format!(
+                    "Backend process scope retained descendants after {}ms",
+                    bound.as_millis()
+                ));
+            }
+            let (members, process_groups) = self.scope_members_bounded(remaining)?;
+            Self::signal_process_groups(&process_groups, libc::SIGKILL)?;
+            if members.iter().all(|pid| *pid == root_pid) {
+                std::thread::sleep(
+                    deadline
+                        .saturating_duration_since(std::time::Instant::now())
+                        .min(Duration::from_millis(20)),
+                );
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if !remaining.is_zero()
+                    && self
+                        .scope_members_bounded(remaining)?
+                        .0
+                        .iter()
+                        .all(|pid| *pid == root_pid)
+                {
+                    return Ok(());
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn confirm_only_root_remains(&self, root_pid: u32, bound: Duration) -> Result<(), String> {
+        if bound.is_zero() {
+            return Err("Backend process-group confirmation bound must be nonzero".to_string());
+        }
+        let deadline = std::time::Instant::now() + bound;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(format!(
+                    "Backend process scope retained descendants after {}ms",
+                    bound.as_millis()
+                ));
+            }
+            let members = self.group_members(remaining)?;
+            if members.iter().all(|pid| *pid == root_pid) {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "Backend process scope retained descendants after {}ms",
+                    bound.as_millis()
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn kill_root(&self, root_pid: u32) -> Result<(), String> {
+        let root_pid = i32::try_from(root_pid)
+            .map_err(|_| format!("Backend pid {root_pid} does not fit a Unix process id"))?;
+        if unsafe { libc::kill(root_pid, libc::SIGKILL) } == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "Failed to terminate the owned backend root: {}",
+                std::io::Error::last_os_error()
+            ))
+        }
+    }
+}
+
 /// Serializes backend launch ownership with shutdown requests. A child may be
 /// registered only by the still-current launch reservation, so a stop request
 /// cannot be undone by a task that finishes spawning later.
@@ -885,6 +1711,8 @@ pub struct BackendOwnershipState {
     pending_start: Option<BackendStartToken>,
     pid: Option<u32>,
     stopping_pid: Option<u32>,
+    tree: Option<BackendProcessTree>,
+    root_exited: bool,
     stopping: bool,
 }
 
@@ -895,17 +1723,65 @@ impl BackendOwnershipState {
         self.pending_start = Some(token);
         self.pid = None;
         self.stopping_pid = None;
+        self.tree = None;
+        self.root_exited = false;
         self.stopping = false;
         token
     }
 
     pub fn register_spawn(&mut self, token: BackendStartToken, pid: u32) -> bool {
+        self.register_owned_spawn(token, pid, None)
+    }
+
+    pub(crate) fn register_tree(
+        &mut self,
+        token: BackendStartToken,
+        tree: BackendProcessTree,
+    ) -> bool {
+        let pid = tree.root_pid();
+        self.register_owned_spawn(token, pid, Some(tree))
+    }
+
+    pub(crate) fn retain_tree_for_cancelled_start(
+        &mut self,
+        token: BackendStartToken,
+        tree: BackendProcessTree,
+    ) -> bool {
+        if self.pending_start != Some(token) || self.tree.is_some() {
+            return false;
+        }
+        let pid = tree.root_pid();
+        self.pending_start = None;
+        self.pid = None;
+        self.stopping_pid = Some(pid);
+        self.tree = Some(tree);
+        self.root_exited = false;
+        self.stopping = true;
+        true
+    }
+
+    fn register_owned_spawn(
+        &mut self,
+        token: BackendStartToken,
+        pid: u32,
+        tree: Option<BackendProcessTree>,
+    ) -> bool {
         if self.stopping || self.pending_start != Some(token) {
             return false;
         }
         self.pending_start = None;
         self.pid = Some(pid);
+        self.tree = tree;
+        self.root_exited = false;
         true
+    }
+
+    pub(crate) fn request_tree_stop(&mut self) -> Option<BackendProcessTree> {
+        if self.stopping {
+            return self.tree.clone();
+        }
+        self.request_stop();
+        self.tree.clone()
     }
 
     pub fn request_stop(&mut self) -> Option<u32> {
@@ -931,6 +1807,8 @@ impl BackendOwnershipState {
     pub fn clear_spawn(&mut self, pid: u32) -> bool {
         if self.stopping_pid == Some(pid) {
             self.stopping_pid = None;
+            self.tree = None;
+            self.root_exited = false;
             self.stopping = false;
             return true;
         }
@@ -939,16 +1817,56 @@ impl BackendOwnershipState {
         }
         let was_stopping = self.stopping;
         self.pid = None;
+        self.tree = None;
+        self.root_exited = false;
         self.stopping = false;
         was_stopping
     }
 
+    pub(crate) fn clear_tree(&mut self, tree: &BackendProcessTree) -> bool {
+        if !self
+            .tree
+            .as_ref()
+            .is_some_and(|owned| owned.same_owner(tree))
+        {
+            return false;
+        }
+        self.clear_spawn(tree.root_pid())
+    }
+
+    /// Records that the owned generation's root exited without releasing its
+    /// process-tree ownership. Cleanup must still confirm the complete tree is
+    /// gone before `clear_spawn` can release the generation.
+    pub fn mark_root_exited(&mut self, pid: u32) -> bool {
+        if self.pid != Some(pid) && self.stopping_pid != Some(pid) {
+            return self.stopping;
+        }
+        self.root_exited = true;
+        self.stopping
+    }
+
+    pub(crate) fn mark_tree_root_exited(&mut self, tree: &BackendProcessTree) -> Option<bool> {
+        if !self
+            .tree
+            .as_ref()
+            .is_some_and(|owned| owned.same_owner(tree))
+        {
+            return None;
+        }
+        self.root_exited = true;
+        Some(self.stopping)
+    }
+
     pub fn pid(&self) -> Option<u32> {
-        self.pid
+        self.pid.filter(|_| !self.root_exited)
+    }
+
+    pub(crate) fn owned_root_pid(&self) -> Option<u32> {
+        self.pid.or(self.stopping_pid)
     }
 
     pub fn owns_active(&self, pid: u32) -> bool {
-        !self.stopping && self.pid == Some(pid)
+        !self.stopping && !self.root_exited && self.pid == Some(pid)
     }
 
     pub fn is_stopping(&self) -> bool {
@@ -961,6 +1879,11 @@ impl BackendOwnershipState {
 
     pub fn owns_process(&self, pid: u32) -> bool {
         self.pid == Some(pid) || self.stopping_pid == Some(pid)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn tree(&self) -> Option<BackendProcessTree> {
+        self.tree.clone()
     }
 }
 

@@ -8,15 +8,89 @@
  ********************************************************************************/
 
 use ride_tauri::startup::{
-    finish_backend_stop, parse_linux_listener_inodes, resolve_tauri_config_directory,
-    wait_for_loopback, wait_for_owned_loopback, BackendLaunchPlan, BackendOwnershipState,
-    BackendReadinessPolicy, BackendSpawnStrategy, BackendStartupAction, BackendStartupEvent,
-    BackendStartupState, BackendTransport, RuntimePathMode, RuntimePaths, RuntimePathsCache,
+    attest_pty_cleanup_session, backend_process_session_column_name, finish_backend_stop,
+    parse_backend_process_group_members, parse_backend_process_scope_members,
+    parse_linux_listener_inodes, resolve_tauri_config_directory,
+    validate_pty_cleanup_process_group, wait_for_loopback, wait_for_owned_loopback,
+    BackendLaunchPlan, BackendOwnershipState, BackendReadinessPolicy, BackendSpawnPlan,
+    BackendSpawnStrategy, BackendStartupAction, BackendStartupEvent, BackendStartupState,
+    BackendTransport, RuntimePathMode, RuntimePaths, RuntimePathsCache,
 };
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+
+#[test]
+fn process_group_enumeration_is_strict_and_never_drops_malformed_rows() {
+    assert_eq!(
+        parse_backend_process_group_members("4100 4100\n4101 4100\n4200 4200\n", 4100).unwrap(),
+        vec![4100, 4101]
+    );
+    for malformed in [
+        "4100 4100\nsecret 4100\n",
+        "4100 4100 extra\n",
+        "0 4100\n",
+        "4100 0\n",
+    ] {
+        let error = parse_backend_process_group_members(malformed, 4100).unwrap_err();
+        assert_eq!(error, "Malformed backend process-group enumeration row");
+        assert!(!error.contains(malformed));
+    }
+}
+
+#[test]
+fn session_enumeration_discovers_groups_after_their_leader_exits() {
+    assert_eq!(
+        parse_backend_process_scope_members(
+            "2 0 0\n4100 4100 4100\n4102 4101 4100\n4200 4200 4200\n",
+            &[4100],
+            Some(4100),
+        )
+        .unwrap(),
+        (vec![4100, 4102], vec![4100, 4101])
+    );
+
+    for malformed in [
+        "4100 4100\n",
+        "4100 4100 4100 extra\n",
+        "4100 4100 nope\n",
+        "4100 0 4100\n",
+    ] {
+        let error =
+            parse_backend_process_scope_members(malformed, &[4100], Some(4100)).unwrap_err();
+        assert_eq!(error, "Malformed backend process-scope enumeration row");
+        assert!(!error.contains(malformed));
+    }
+}
+
+#[test]
+fn process_scope_uses_each_platforms_supported_session_column() {
+    assert_eq!(backend_process_session_column_name(false), "sid=");
+    assert_eq!(backend_process_session_column_name(true), "sess=");
+}
+
+#[test]
+fn pty_cleanup_group_must_be_positive_and_separate_from_the_app_group() {
+    assert_eq!(
+        validate_pty_cleanup_process_group(4_100, Some(4_101), 4_000).unwrap(),
+        4_101
+    );
+    assert!(validate_pty_cleanup_process_group(4_100, None, 4_000).is_err());
+    assert!(validate_pty_cleanup_process_group(4_100, Some(0), 4_000).is_err());
+    assert!(validate_pty_cleanup_process_group(4_100, Some(4_000), 4_000).is_err());
+}
+
+#[test]
+fn pty_cleanup_attests_the_isolated_root_session() {
+    assert_eq!(
+        attest_pty_cleanup_session(4_100, 4_100, 4_100, 4_000).unwrap(),
+        4_100
+    );
+    assert!(attest_pty_cleanup_session(4_100, 4_101, 4_100, 4_000).is_err());
+    assert!(attest_pty_cleanup_session(4_100, 4_100, 4_101, 4_000).is_err());
+    assert!(attest_pty_cleanup_session(4_100, 4_000, 4_100, 4_000).is_err());
+}
 
 #[test]
 fn workspace_is_a_single_positional_argument() {
@@ -76,6 +150,34 @@ fn transport_selects_direct_pipe_or_pty_spawn_without_hybrid_stdio() {
             .expect("PTY can preserve watcher-process compatibility"),
         BackendSpawnStrategy::Pty
     );
+}
+
+#[test]
+fn windows_pty_falls_back_to_direct_without_a_watcher() {
+    let plan = BackendSpawnPlan::for_backend_on_platform(BackendTransport::Pty, true, true)
+        .expect("Windows PTY must have a safe direct fallback");
+
+    assert_eq!(plan.strategy(), BackendSpawnStrategy::DirectPipes);
+    assert!(!plan.watcher_process());
+    let warning = plan.warning().expect("fallback must be diagnosed");
+    assert!(warning.contains("PTY"), "{warning}");
+    assert!(warning.contains("direct"), "{warning}");
+    assert!(warning.len() <= 256, "warning must remain bounded");
+}
+
+#[test]
+fn unix_pty_preserves_the_watcher_when_tree_ownership_is_available() {
+    let plan = BackendSpawnPlan::for_backend_on_platform(BackendTransport::Pty, true, false)
+        .expect("Unix PTY process groups can own watcher descendants");
+
+    assert_eq!(plan.strategy(), BackendSpawnStrategy::Pty);
+    assert!(plan.watcher_process());
+    assert_eq!(plan.warning(), None);
+
+    let startup_source = include_str!("../src/startup.rs");
+    let sidecar_source = include_str!("../src/sidecar.rs");
+    assert!(startup_source.contains("claim_spawned_pty_backend_session_scope"));
+    assert!(!sidecar_source.contains("retain_unclaimed_pty_cleanup"));
 }
 
 #[test]
@@ -243,6 +345,8 @@ fn backend_exit_and_shutdown_clear_published_state() {
     assert_eq!(
         exited.observe(BackendStartupEvent::Exited("status 17".into())),
         [
+            BackendStartupAction::TerminateProcessTree(42),
+            BackendStartupAction::ReapOwnedChild(42),
             BackendStartupAction::ClearState,
             BackendStartupAction::ReportUnexpectedExit("status 17".into()),
         ]
@@ -329,6 +433,37 @@ fn a_stale_child_clear_cannot_release_the_current_stop_owner() {
     assert!(ownership.clear_spawn(42));
     assert!(!ownership.is_stopping());
     assert!(!ownership.has_owned_work());
+}
+
+#[test]
+fn an_exited_root_retains_generation_tree_ownership_until_confirmed_cleanup() {
+    let mut ownership = BackendOwnershipState::default();
+    let launch = ownership.reserve_start();
+    assert!(ownership.register_spawn(launch, 42));
+
+    assert!(!ownership.mark_root_exited(42));
+
+    assert_eq!(ownership.pid(), None);
+    assert!(ownership.has_owned_work());
+    assert!(ownership.owns_process(42));
+    assert_eq!(ownership.request_stop(), Some(42));
+    assert!(ownership.has_owned_work());
+
+    assert!(ownership.clear_spawn(42));
+    assert!(!ownership.has_owned_work());
+}
+
+#[test]
+fn a_stale_root_exit_cannot_change_the_current_generation() {
+    let mut ownership = BackendOwnershipState::default();
+    let launch = ownership.reserve_start();
+    assert!(ownership.register_spawn(launch, 42));
+
+    assert!(!ownership.mark_root_exited(7));
+
+    assert_eq!(ownership.pid(), Some(42));
+    assert!(ownership.owns_active(42));
+    assert!(!ownership.owns_process(7));
 }
 
 #[test]
@@ -478,12 +613,12 @@ fn production_uses_one_app_state_path_cache_and_the_shared_tauri_runtime() {
         "sidecar must not create a second Tokio runtime"
     );
     assert!(
-        sidecar_source.contains("terminate_and_reap_backend"),
-        "direct cleanup must reap its owned child after tree termination"
+        sidecar_source.contains("cleanup_owned_direct_backend"),
+        "direct cleanup must confirm its owned tree before releasing the reaped child"
     );
     assert!(
-        sidecar_source.contains("terminate_process_tree_async(pid).await"),
-        "PTY timeout cleanup must leave blocking process-tree termination off async workers"
+        sidecar_source.contains("terminate_owned_tree_async"),
+        "startup cleanup must leave owned-tree termination off async workers"
     );
     let direct_start = sidecar_source
         .split("async fn start_backend_direct_process")
@@ -499,21 +634,32 @@ fn production_uses_one_app_state_path_cache_and_the_shared_tauri_runtime() {
         "an unready direct child must consume the exact-child stop fallback"
     );
     assert!(direct_start.contains("wait_for_owned_loopback"));
-    assert!(direct_start.contains("child.try_wait()"));
+    assert!(direct_start.contains("observe_backend_root_exit"));
+    assert!(
+        !direct_start.contains("child.try_wait()"),
+        "Unix liveness checks must not reap the root before process-group cleanup"
+    );
     assert!(direct_start.contains("kill_on_drop(true)"));
     assert!(
         direct_start
-            .matches("kill_and_reap_backend_child(&mut child)")
+            .matches("cleanup_or_retain_owned_direct_backend(")
+            .count()
+            >= 6,
+        "startup failures and publication races must retain the owned-tree cleanup transaction"
+    );
+    assert!(
+        direct_start
+            .matches("retain_owned_direct_backend_cleanup(")
             .count()
             >= 2,
-        "readiness cancellation and publication races must kill before reaping"
+        "post-spawn setup failures must transfer child ownership to a cleanup retry task"
     );
     assert!(
         !direct_start.contains("backend_stdout_confirms_port"),
         "direct readiness must not depend on backend log formatting"
     );
     assert!(direct_start.contains("stop_fallback_rx.recv()"));
-    assert!(sidecar_source.contains("stop_fallback_rx.blocking_recv()"));
+    assert!(sidecar_source.contains("stop_rx.blocking_recv()"));
 }
 
 #[test]
@@ -567,20 +713,41 @@ fn closing_the_main_window_closes_tauri_secondary_windows() {
     let backend_stop = close_source
         .find("shutdown_application")
         .expect("ordered application shutdown in close handler");
+    let prevent_close = close_source
+        .find("api.prevent_close()")
+        .expect("failed cleanup prevents main-window destruction");
     let app_exit = close_source.find("app_handle.exit(0)").expect("app exit");
     assert!(backend_stop < app_exit);
+    assert!(backend_stop < prevent_close);
+
+    let exit_request_source = lib_source
+        .split("tauri::RunEvent::ExitRequested")
+        .nth(1)
+        .and_then(|source| source.split("tauri::RunEvent::Exit").next())
+        .expect("exit-request handler");
+    assert!(exit_request_source.contains("api.prevent_exit()"));
+
+    let retained_cleanup = lib_source
+        .split("fn retain_failed_application_cleanup")
+        .nth(1)
+        .and_then(|source| source.split("fn restore_main_window").next())
+        .expect("retained application cleanup helper");
+    assert!(retained_cleanup.contains("std::thread::spawn"));
+    assert!(retained_cleanup.contains("stop_backend_bounded"));
+    assert!(retained_cleanup.contains("force_release_backend_for_exit"));
 
     let shutdown_source = lib_source
         .split("fn shutdown_application")
         .nth(1)
         .and_then(|source| source.split("fn restore_main_window").next())
         .expect("ordered shutdown helper");
+    assert!(shutdown_source.contains("application_shutdown.run"));
     assert!(
         shutdown_source
             .find("gateway.shutdown")
             .expect("gateway stop")
             < shutdown_source
-                .find("sidecar::stop_backend")
-                .expect("backend process-tree cleanup")
+                .rfind("sidecar::stop_backend_bounded")
+                .expect("ordered backend process-tree cleanup")
     );
 }

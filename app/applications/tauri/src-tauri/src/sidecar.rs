@@ -9,9 +9,10 @@
 
 use crate::startup::{
     finish_backend_stop, resolve_tauri_config_directory, wait_for_owned_loopback,
-    BackendLaunchPlan, BackendReadinessPolicy, BackendSpawnStrategy, BackendStartToken,
-    BackendStartupAction, BackendStartupEvent, BackendStartupState, BackendTransport,
-    RuntimePathMode, RuntimePaths, StartupWindowCreatedGate,
+    BackendLaunchPlan, BackendProcessTree, BackendReadinessPolicy, BackendSpawnPlan,
+    BackendSpawnStrategy, BackendStartToken, BackendStartupAction, BackendStartupEvent,
+    BackendStartupState, BackendTransport, PreparedBackendProcessTree, RuntimePathMode,
+    RuntimePaths, StartupWindowCreatedGate,
 };
 use crate::startup_gateway::{BackendGeneration, GatewayState};
 use crate::startup_metrics::StartupMilestone;
@@ -36,6 +37,49 @@ pub(crate) const BACKEND_PORT: u16 = 3000;
 pub const BACKEND_CLEANUP_BOUND: Duration = Duration::from_secs(5);
 const BACKEND_PROBE_INTERVAL: Duration = Duration::from_millis(50);
 const BACKEND_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+
+#[derive(Clone, Debug)]
+pub(crate) struct BackendRootCrashEvidence {
+    root_pid: u32,
+    descendant_pids: Vec<u32>,
+    tree: BackendProcessTree,
+}
+
+impl BackendRootCrashEvidence {
+    fn capture(tree: BackendProcessTree, bound: Duration) -> Result<Self, String> {
+        let root_pid = tree.root_pid();
+        let descendant_pids = tree
+            .process_ids_bounded(bound)?
+            .into_iter()
+            .filter(|pid| *pid != root_pid)
+            .collect();
+        Ok(Self {
+            root_pid,
+            descendant_pids,
+            tree,
+        })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn root_pid(&self) -> u32 {
+        self.root_pid
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn descendant_pids(&self) -> &[u32] {
+        &self.descendant_pids
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn active_process_ids(&self, bound: Duration) -> Result<Vec<u32>, String> {
+        self.tree.process_ids_bounded(bound)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn active_process_count(&self) -> Result<u32, String> {
+        self.tree.active_process_count()
+    }
+}
 
 pub async fn race_backend_publication_with_exit<E, P, T>(
     child_exit: E,
@@ -283,6 +327,15 @@ struct BackendConfig {
     use_node: bool,
 }
 
+struct BackendProcessStart<'a> {
+    config_dir: PathBuf,
+    frontend_dir: Option<PathBuf>,
+    launch_plan: &'a BackendLaunchPlan,
+    backend_start: BackendStartToken,
+    publisher: BackendReadinessPublisher,
+    watcher_process: bool,
+}
+
 /// 查找并返回后端运行配置
 fn get_backend_config(paths: &RuntimePaths) -> BackendConfig {
     // 首先尝试找到 Node.js
@@ -437,6 +490,7 @@ async fn publish_backend_listening(
             let mut published_port = state.backend_port.lock().unwrap();
             record_backend_listening(app_handle);
             *published_port = Some(port);
+            set_backend_ready_pid_if_accepted(&state.backend_ready_pid, pid, true);
             true
         })
         .await?;
@@ -446,21 +500,81 @@ async fn publish_backend_listening(
     Ok(published)
 }
 
-fn register_backend_pid(
+fn prepare_direct_backend_tree(
+    command: &mut Command,
+) -> Result<PreparedBackendProcessTree, String> {
+    PreparedBackendProcessTree::for_direct(command)
+}
+
+#[cfg(windows)]
+fn claim_direct_backend_tree(
+    prepared: PreparedBackendProcessTree,
+    child: &tokio::process::Child,
+    pid: u32,
+) -> Result<crate::startup::BackendProcessTree, String> {
+    let root_process = child
+        .raw_handle()
+        .ok_or_else(|| "Direct backend did not expose a Windows process handle".to_string())?;
+    prepared.claim_direct(pid, root_process.cast())
+}
+
+#[cfg(unix)]
+fn claim_direct_backend_tree(
+    prepared: PreparedBackendProcessTree,
+    _child: &tokio::process::Child,
+    pid: u32,
+) -> Result<crate::startup::BackendProcessTree, String> {
+    prepared.claim_direct(pid)
+}
+
+#[cfg(windows)]
+fn ensure_backend_pty_tree_ownership_supported() -> Result<(), String> {
+    Err(
+        "RIDE_BACKEND_TRANSPORT=pty is unavailable on Windows because portable-pty cannot atomically assign the backend to its generation Job Object; use direct transport"
+            .to_string(),
+    )
+}
+
+#[cfg(unix)]
+fn ensure_backend_pty_tree_ownership_supported() -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(test)]
+fn backend_pty_tree_ownership_supported() -> bool {
+    ensure_backend_pty_tree_ownership_supported().is_ok()
+}
+
+#[cfg(unix)]
+fn claim_pty_backend_tree(pid: u32) -> Result<crate::startup::BackendProcessTree, String> {
+    crate::startup::claim_pty_backend_process_tree(pid)
+}
+
+#[cfg(windows)]
+fn claim_pty_backend_tree(_pid: u32) -> Result<crate::startup::BackendProcessTree, String> {
+    ensure_backend_pty_tree_ownership_supported()?;
+    unreachable!("unsupported Windows PTY ownership returned success")
+}
+
+fn register_backend_tree(
     app_handle: &AppHandle,
     start: BackendStartToken,
-    pid: u32,
+    tree: crate::startup::BackendProcessTree,
     stop_fallback: tokio::sync::mpsc::UnboundedSender<()>,
 ) -> bool {
+    let pid = tree.root_pid();
     app_handle
         .try_state::<crate::AppState>()
         .map(|state| {
             let mut ownership = state.backend_ownership.lock().unwrap();
-            if !ownership.register_spawn(start, pid) {
+            let registered = ownership.register_tree(start, tree.clone());
+            let retained =
+                registered || ownership.retain_tree_for_cancelled_start(start, tree.clone());
+            if !retained {
                 return false;
             }
             *state.backend_stop_fallback.lock().unwrap() = Some((pid, stop_fallback));
-            true
+            registered
         })
         .unwrap_or(false)
 }
@@ -554,6 +668,108 @@ fn clear_backend_process(app_handle: &AppHandle, pid: u32) -> bool {
     }
     state.backend_cleanup_notify.notify_waiters();
     stopping
+}
+
+fn clear_backend_tree(app_handle: &AppHandle, tree: &BackendProcessTree) -> bool {
+    let Some(state) = app_handle.try_state::<crate::AppState>() else {
+        return false;
+    };
+    let (owned, stopping) = {
+        let mut ownership = state.backend_ownership.lock().unwrap();
+        let owned = ownership
+            .tree()
+            .as_ref()
+            .is_some_and(|current| current.same_owner(tree));
+        let stopping = owned && ownership.clear_tree(tree);
+        (owned, stopping)
+    };
+    if owned {
+        let mut stop_fallback = state.backend_stop_fallback.lock().unwrap();
+        if stop_fallback.as_ref().map(|(owner, _)| *owner) == Some(tree.root_pid()) {
+            stop_fallback.take();
+        }
+        *state.backend_port.lock().unwrap() = None;
+        state.backend_cleanup_notify.notify_waiters();
+    }
+    stopping
+}
+
+fn mark_backend_root_exited(app_handle: &AppHandle, pid: u32) -> bool {
+    let Some(state) = app_handle.try_state::<crate::AppState>() else {
+        return false;
+    };
+    let stopping = state
+        .backend_ownership
+        .lock()
+        .unwrap()
+        .mark_root_exited(pid);
+    *state.backend_port.lock().unwrap() = None;
+    state.backend_cleanup_notify.notify_waiters();
+    stopping
+}
+
+fn mark_backend_tree_root_exited(
+    app_handle: &AppHandle,
+    tree: &BackendProcessTree,
+) -> Option<bool> {
+    let state = app_handle.try_state::<crate::AppState>()?;
+    let stopping = state
+        .backend_ownership
+        .lock()
+        .unwrap()
+        .mark_tree_root_exited(tree)?;
+    *state.backend_port.lock().unwrap() = None;
+    state.backend_cleanup_notify.notify_waiters();
+    Some(stopping)
+}
+
+#[cfg(unix)]
+fn observe_unix_backend_root_exit_without_reaping(pid: u32) -> Result<String, String> {
+    let pid = i32::try_from(pid)
+        .map_err(|_| format!("Backend pid {pid} does not fit a Unix process id"))?;
+    let mut information = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+    if unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            information.as_mut_ptr(),
+            libc::WEXITED | libc::WNOWAIT,
+        )
+    } != 0
+    {
+        return Err(format!(
+            "Failed to observe backend root exit without reaping: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let information = unsafe { information.assume_init() };
+    Ok(format!("waitid status {}", unsafe {
+        information.si_status()
+    }))
+}
+
+#[cfg(unix)]
+async fn observe_backend_root_exit(
+    _child: &mut tokio::process::Child,
+    pid: u32,
+) -> Result<(String, bool), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        observe_unix_backend_root_exit_without_reaping(pid).map(|exit| (exit, false))
+    })
+    .await
+    .map_err(|error| format!("Backend root observation task failed: {error}"))?
+}
+
+#[cfg(windows)]
+async fn observe_backend_root_exit(
+    child: &mut tokio::process::Child,
+    _pid: u32,
+) -> Result<(String, bool), String> {
+    child
+        .wait()
+        .await
+        .map(|status| (status.to_string(), true))
+        .map_err(|error| format!("Failed to wait for backend: {error}"))
 }
 
 fn complete_backend_start(app_handle: &AppHandle, start: BackendStartToken) {
@@ -705,6 +921,12 @@ fn return_post_spawn_setup_or_cleanup<T>(
 fn reap_portable_child_bounded(
     mut child: Box<dyn portable_pty::Child + Send + Sync>,
 ) -> Result<(), String> {
+    reap_portable_child_bounded_ref(child.as_mut())
+}
+
+fn reap_portable_child_bounded_ref(
+    child: &mut (dyn portable_pty::Child + Send + Sync),
+) -> Result<(), String> {
     const REAP_TIMEOUT: Duration = Duration::from_secs(5);
     const POLL_INTERVAL: Duration = Duration::from_millis(25);
     for force_kill in [false, true] {
@@ -776,6 +998,37 @@ fn pty_cleanup_status(result: &Result<(), String>) -> String {
         .as_ref()
         .map(|()| "ok".to_string())
         .unwrap_or_else(|error| error.chars().take(MAX_CHARS).collect())
+}
+
+fn finish_owned_tree_cleanup(
+    tree_termination: Result<(), String>,
+    root_reap: Result<(), String>,
+    release: impl FnOnce(),
+) -> Result<(), String> {
+    match (tree_termination, root_reap) {
+        (Ok(()), Ok(())) => {
+            release();
+            Ok(())
+        }
+        (Err(tree), Ok(())) => Err(tree),
+        (Ok(()), Err(reap)) => Err(reap),
+        (Err(tree), Err(reap)) => Err(format!("{tree}; {reap}")),
+    }
+}
+
+async fn finish_owned_tree_cleanup_async<Termination, Reap, ReapFuture, Release>(
+    tree_termination: Termination,
+    root_reap: Reap,
+    release: Release,
+) -> Result<(), String>
+where
+    Termination: Future<Output = Result<(), String>>,
+    Reap: FnOnce() -> ReapFuture,
+    ReapFuture: Future<Output = Result<(), String>>,
+    Release: FnOnce(),
+{
+    tree_termination.await?;
+    finish_owned_tree_cleanup(Ok(()), root_reap().await, release)
 }
 
 async fn finish_pty_readiness_publication<
@@ -973,15 +1226,389 @@ async fn wait_for_node_backend_readiness(
     }
 }
 
+#[cfg(unix)]
+async fn cleanup_owned_pty_before_watcher(
+    app_handle: &AppHandle,
+    tree: &BackendProcessTree,
+    mut child: Box<dyn portable_pty::Child + Send + Sync>,
+    stop_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+) -> Result<(), String> {
+    let termination = terminate_owned_tree_async(tree, BACKEND_CLEANUP_BOUND).await;
+    if let Err(error) = termination {
+        retain_owned_pty_cleanup(
+            app_handle.clone(),
+            tree.clone(),
+            child,
+            stop_rx,
+            error.clone(),
+        );
+        return Err(error);
+    }
+    let (child, reap) = tauri::async_runtime::spawn_blocking(move || {
+        let reap = reap_portable_child_bounded_ref(child.as_mut());
+        (child, reap)
+    })
+    .await
+    .map_err(|error| format!("PTY backend reap task failed: {error}"))?;
+    if let Err(error) = reap {
+        retain_owned_pty_cleanup(
+            app_handle.clone(),
+            tree.clone(),
+            child,
+            stop_rx,
+            error.clone(),
+        );
+        return Err(error);
+    }
+    finish_owned_tree_cleanup(Ok(()), Ok(()), || {
+        clear_backend_tree(app_handle, tree);
+    })
+}
+
+#[cfg(unix)]
+fn retain_owned_pty_cleanup(
+    app_handle: AppHandle,
+    tree: BackendProcessTree,
+    mut child: Box<dyn portable_pty::Child + Send + Sync>,
+    mut stop_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+    initial_error: String,
+) {
+    std::thread::spawn(move || {
+        let mut cleanup_error = initial_error;
+        loop {
+            log::error!(
+                "Retaining PTY backend process-tree ownership after cleanup failure: {cleanup_error}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+            while stop_rx.try_recv().is_ok() {}
+            match tree.terminate_and_confirm(BACKEND_CLEANUP_BOUND) {
+                Ok(()) => match reap_portable_child_bounded_ref(child.as_mut()) {
+                    Ok(()) => {
+                        clear_backend_tree(&app_handle, &tree);
+                        return;
+                    }
+                    Err(error) => cleanup_error = error,
+                },
+                Err(error) => cleanup_error = error,
+            }
+        }
+    });
+}
+
+#[cfg(unix)]
+type SharedPtyCleanupReceiver =
+    Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Result<(), String>>>>;
+
+#[cfg(unix)]
+async fn request_owned_pty_cleanup(
+    tree: &BackendProcessTree,
+    stop: &tokio::sync::mpsc::UnboundedSender<()>,
+    cleanup: &SharedPtyCleanupReceiver,
+) -> Result<(), String> {
+    let termination = terminate_owned_tree_async(tree, BACKEND_CLEANUP_BOUND).await;
+    let signal = stop
+        .send(())
+        .map_err(|_| "PTY backend cleanup watcher was unavailable".to_string());
+    let watcher = if signal.is_ok() {
+        let mut cleanup = cleanup.lock().await;
+        match tokio::time::timeout(BACKEND_CLEANUP_BOUND, cleanup.recv()).await {
+            Ok(Some(result)) => result,
+            Ok(None) => Err("PTY backend cleanup watcher closed without evidence".to_string()),
+            Err(_) => Err(format!(
+                "PTY backend watcher cleanup exceeded {}ms",
+                BACKEND_CLEANUP_BOUND.as_millis()
+            )),
+        }
+    } else {
+        signal
+    };
+    match (termination, watcher) {
+        (_, Ok(())) => Ok(()),
+        (Ok(()), Err(watcher)) => Err(watcher),
+        (Err(termination), Err(watcher)) => Err(format!("{termination}; {watcher}")),
+    }
+}
+
+#[cfg(unix)]
 async fn start_node_backend_process(
     app_handle: &AppHandle,
     config: &BackendConfig,
-    config_dir: PathBuf,
-    frontend_dir: Option<PathBuf>,
-    launch_plan: &BackendLaunchPlan,
-    backend_start: BackendStartToken,
-    publisher: BackendReadinessPublisher,
+    start: BackendProcessStart<'_>,
 ) -> Result<(), String> {
+    let BackendProcessStart {
+        config_dir,
+        frontend_dir,
+        launch_plan,
+        backend_start,
+        publisher,
+        watcher_process,
+    } = start;
+    ensure_backend_pty_tree_ownership_supported()?;
+    ensure_backend_port_available(BACKEND_PORT)?;
+    let script_path = node_runtime_path(&config.script_path);
+    let config_dir = node_runtime_path(&config_dir);
+    let frontend_dir = frontend_dir.map(|path| node_runtime_path(&path));
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 30,
+            cols: 120,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|error| format!("Failed to create backend PTY: {error}"))?;
+
+    let mut command = CommandBuilder::new(&config.node_exe);
+    remove_smoke_environment(&mut command);
+    command.arg(&script_path);
+    command.arg("--log-level=info");
+    command.arg(format!("--port={BACKEND_PORT}"));
+    command.arg("--hostname=127.0.0.1");
+    if let Some(backend_dir) = script_path.parent() {
+        command.cwd(backend_dir);
+    }
+    if !watcher_process {
+        command.arg("--no-cluster");
+    }
+    command.args(launch_plan.arguments());
+    if let Some(node_options) = backend_node_options() {
+        command.env("NODE_OPTIONS", node_options);
+    }
+    command.env("PATH", backend_child_path());
+    if let Some(frontend_dir) = frontend_dir {
+        command.env(
+            "RIDE_FRONTEND_DIR",
+            frontend_dir.to_string_lossy().to_string(),
+        );
+    }
+    if let Ok(user) = std::env::var("USER") {
+        command.env("LOGNAME", std::env::var("LOGNAME").unwrap_or(user));
+    }
+    command.env(
+        "TERM",
+        std::env::var("TERM").unwrap_or_else(|_| "dumb".to_string()),
+    );
+    command.env("NODE_ENV", "production");
+    command.env("THEIA_CONFIG_DIR", config_dir.to_string_lossy().to_string());
+    if let Some(public_authority) = publisher.theia_hosts() {
+        command.env("THEIA_HOSTS", public_authority);
+    }
+
+    let mut child = pair
+        .slave
+        .spawn_command(command)
+        .map_err(|error| format!("Failed to spawn backend in PTY: {error}"))?;
+    drop(pair.slave);
+    record_backend_spawned_before_window(app_handle);
+    let Some(pid) = child.process_id() else {
+        let cleanup = tauri::async_runtime::spawn_blocking(move || {
+            let _ = child.kill();
+            reap_portable_child_bounded(child)
+        })
+        .await
+        .map_err(|error| format!("Unidentified PTY backend cleanup task failed: {error}"))?;
+        clear_backend_state(app_handle);
+        return Err(match cleanup {
+            Ok(()) => "PTY backend process did not report a process id".to_string(),
+            Err(cleanup) => format!(
+                "PTY backend process did not report a process id; cleanup failed: {cleanup}"
+            ),
+        });
+    };
+    log::info!("Backend PTY process started with pid {pid}");
+    let tree = match claim_pty_backend_tree(pid) {
+        Ok(tree) => tree,
+        Err(error) => {
+            let cleanup = cleanup_failed_pty_backend_start(app_handle, child, Some(pid)).await;
+            return Err(match cleanup {
+                Ok(()) => error,
+                Err(cleanup) => format!("{error}; cleanup failed: {cleanup}"),
+            });
+        }
+    };
+    let (stop_tx, mut stop_rx) = tokio::sync::mpsc::unbounded_channel();
+    if !register_backend_tree(app_handle, backend_start, tree.clone(), stop_tx.clone()) {
+        let cleanup = cleanup_owned_pty_before_watcher(app_handle, &tree, child, stop_rx).await;
+        return Err(match cleanup {
+            Ok(()) => "Backend start was cancelled before PTY spawn completed".to_string(),
+            Err(cleanup) => format!(
+                "Backend start was cancelled before PTY spawn completed; cleanup failed: {cleanup}"
+            ),
+        });
+    }
+
+    let reader = match pair.master.try_clone_reader() {
+        Ok(reader) => reader,
+        Err(error) => {
+            let error = format!("Failed to clone backend PTY reader: {error}");
+            let cleanup = cleanup_owned_pty_before_watcher(app_handle, &tree, child, stop_rx).await;
+            return Err(match cleanup {
+                Ok(()) => error,
+                Err(cleanup) => format!("{error}; cleanup failed: {cleanup}"),
+            });
+        }
+    };
+    let pty_lifetime = pair.master;
+    send_signal(pid, "-CONT");
+    std::thread::spawn(move || {
+        for delay in [250_u64, 1000] {
+            std::thread::sleep(Duration::from_millis(delay));
+            send_signal(pid, "-CONT");
+        }
+    });
+
+    let (line_tx, mut line_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    std::thread::spawn(move || {
+        let reader = std::io::BufReader::new(reader);
+        for line in reader.lines().map_while(Result::ok) {
+            let _ = line_tx.send(line);
+        }
+    });
+    let (exit_tx, mut exit_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (cleanup_tx, cleanup_rx) = tokio::sync::mpsc::unbounded_channel();
+    let cleanup_rx = Arc::new(tokio::sync::Mutex::new(cleanup_rx));
+    let watcher_app = app_handle.clone();
+    let watcher_tree = tree.clone();
+    std::thread::spawn(move || {
+        let _pty_lifetime = pty_lifetime;
+        let exit =
+            observe_unix_backend_root_exit_without_reaping(pid).unwrap_or_else(|error| error);
+        if mark_backend_tree_root_exited(&watcher_app, &watcher_tree).is_none() {
+            log::warn!("Observed a stale PTY backend root exit for pid {pid}");
+        }
+        let _ = exit_tx.send(exit);
+        if stop_rx.blocking_recv().is_none() {
+            let _ = cleanup_tx.send(Err(
+                "PTY cleanup channel closed while process-group ownership was retained".to_string(),
+            ));
+        }
+        loop {
+            let result = match watcher_tree.terminate_and_confirm(BACKEND_CLEANUP_BOUND) {
+                Ok(()) => child
+                    .wait()
+                    .map(|_| ())
+                    .map_err(|error| format!("Failed to reap retained PTY backend root: {error}")),
+                Err(error) => Err(error),
+            };
+            match result {
+                Ok(()) => {
+                    clear_backend_tree(&watcher_app, &watcher_tree);
+                    let _ = cleanup_tx.send(Ok(()));
+                    return;
+                }
+                Err(error) => {
+                    let _ = cleanup_tx.send(Err(error.clone()));
+                    log::error!(
+                        "Retaining PTY backend ownership for another cleanup attempt: {error}"
+                    );
+                    std::thread::sleep(Duration::from_millis(100));
+                    while stop_rx.try_recv().is_ok() {}
+                }
+            }
+        }
+    });
+
+    let ready_port = match wait_for_node_backend_readiness(
+        &mut line_rx,
+        &mut exit_rx,
+        BACKEND_PORT,
+        Duration::from_secs(BACKEND_STARTUP_TIMEOUT),
+    )
+    .await
+    {
+        Ok(port) => port,
+        Err(failure) => {
+            let reason = failure.message();
+            let cleanup = request_owned_pty_cleanup(&tree, &stop_tx, &cleanup_rx).await;
+            return Err(match cleanup {
+                Ok(()) => reason,
+                Err(cleanup) => format!("{reason}; PTY cleanup failed: {cleanup}"),
+            });
+        }
+    };
+    if !owns_active_backend(app_handle, pid) {
+        let cleanup = request_owned_pty_cleanup(&tree, &stop_tx, &cleanup_rx).await;
+        return Err(match cleanup {
+            Ok(()) => "Backend start was cancelled before PTY readiness".to_string(),
+            Err(cleanup) => format!(
+                "Backend start was cancelled before PTY readiness; cleanup failed: {cleanup}"
+            ),
+        });
+    }
+    log::info!("Backend ready on port {ready_port}");
+    match race_backend_publication_with_exit(
+        exit_rx.recv(),
+        publish_backend_listening(app_handle, pid, ready_port, &publisher),
+    )
+    .await
+    {
+        Ok(Ok(true)) => {}
+        Ok(publication) => {
+            let reason = match publication {
+                Ok(false) => "Backend start was cancelled before PTY publication".to_string(),
+                Err(error) => error,
+                Ok(true) => unreachable!(),
+            };
+            let cleanup = request_owned_pty_cleanup(&tree, &stop_tx, &cleanup_rx).await;
+            return Err(match cleanup {
+                Ok(()) => reason,
+                Err(cleanup) => format!("{reason}; cleanup failed: {cleanup}"),
+            });
+        }
+        Err(exit) => {
+            let reason = exit
+                .map(|exit| {
+                    format!("Backend process exited before PTY readiness publication: {exit}")
+                })
+                .unwrap_or_else(|| {
+                    "Backend PTY exit channel closed before readiness publication".to_string()
+                });
+            let cleanup = request_owned_pty_cleanup(&tree, &stop_tx, &cleanup_rx).await;
+            return Err(match cleanup {
+                Ok(()) => reason,
+                Err(cleanup) => format!("{reason}; cleanup failed: {cleanup}"),
+            });
+        }
+    }
+
+    let app_handle_logs = app_handle.clone();
+    std::thread::spawn(move || {
+        while let Some(line) = line_rx.blocking_recv() {
+            log::info!("Backend stdout: {line}");
+            let _ = app_handle_logs.emit("backend-log", line);
+        }
+    });
+    let app_handle_exit = app_handle.clone();
+    let exit_publisher = publisher.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Some(exit) = exit_rx.recv().await {
+            clear_backend_state(&app_handle_exit);
+            if !is_backend_stopping(&app_handle_exit) {
+                let message = format!("Backend exited unexpectedly: {exit}");
+                log::error!("{message}");
+                let _ = app_handle_exit.emit("backend-error", message);
+                exit_publisher.backend_failed().await;
+            }
+        }
+    });
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn start_node_backend_process(
+    app_handle: &AppHandle,
+    config: &BackendConfig,
+    start: BackendProcessStart<'_>,
+) -> Result<(), String> {
+    let BackendProcessStart {
+        config_dir,
+        frontend_dir,
+        launch_plan,
+        backend_start,
+        publisher,
+        watcher_process,
+    } = start;
+    ensure_backend_pty_tree_ownership_supported()?;
     ensure_backend_port_available(BACKEND_PORT)?;
     let script_path = node_runtime_path(&config.script_path);
     let config_dir = node_runtime_path(&config_dir);
@@ -1005,7 +1632,7 @@ async fn start_node_backend_process(
     if let Some(backend_dir) = script_path.parent() {
         command.cwd(backend_dir);
     }
-    if !backend_use_watcher_process() {
+    if !watcher_process {
         command.arg("--no-cluster");
     }
     command.args(launch_plan.arguments());
@@ -1044,7 +1671,18 @@ async fn start_node_backend_process(
         log::info!("Backend process started with pid {}", pid);
         let (stop_fallback_tx, mut stop_fallback_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut stop_killer = child.clone_killer();
-        if !register_backend_pid(app_handle, backend_start, pid, stop_fallback_tx) {
+        let backend_tree = match claim_pty_backend_tree(pid) {
+            Ok(tree) => tree,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = tauri::async_runtime::spawn_blocking(move || {
+                    reap_portable_child_bounded(child)
+                })
+                .await;
+                return Err(error);
+            }
+        };
+        if !register_backend_tree(app_handle, backend_start, backend_tree, stop_fallback_tx) {
             let cleanup = terminate_process_tree_async(pid).await;
             if cleanup.is_err() {
                 let _ = child.kill();
@@ -1301,7 +1939,13 @@ async fn start_node_backend_process(
     std::thread::spawn(move || {
         if let Some(exit) = exit_rx.blocking_recv() {
             let stopping = child_pid
-                .map(|pid| clear_backend_process(&app_handle_exit, pid))
+                .map(|pid| {
+                    let stopping = mark_backend_root_exited(&app_handle_exit, pid);
+                    if stopping {
+                        clear_backend_process(&app_handle_exit, pid);
+                    }
+                    stopping
+                })
                 .unwrap_or_else(|| is_backend_stopping(&app_handle_exit));
             let clear_handle = app_handle_exit.clone();
             let report_handle = app_handle_exit.clone();
@@ -1328,6 +1972,16 @@ async fn terminate_process_tree_async(pid: u32) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || terminate_process_tree(pid))
         .await
         .map_err(|error| format!("Backend termination task failed: {error}"))?
+}
+
+async fn terminate_owned_tree_async(
+    tree: &BackendProcessTree,
+    bound: Duration,
+) -> Result<(), String> {
+    let tree = tree.clone();
+    tauri::async_runtime::spawn_blocking(move || tree.terminate_and_confirm(bound))
+        .await
+        .map_err(|error| format!("Owned backend tree termination task failed: {error}"))?
 }
 
 async fn reap_backend_child(child: &mut tokio::process::Child) -> Result<(), String> {
@@ -1382,44 +2036,113 @@ async fn terminate_and_reap_backend(
     }
 }
 
+async fn cleanup_owned_direct_backend(
+    app_handle: &AppHandle,
+    tree: &BackendProcessTree,
+    child: &mut tokio::process::Child,
+    root_already_reaped: bool,
+) -> Result<(), String> {
+    finish_owned_tree_cleanup_async(
+        terminate_owned_tree_async(tree, BACKEND_CLEANUP_BOUND),
+        || async {
+            if root_already_reaped {
+                Ok(())
+            } else {
+                reap_backend_child(child).await
+            }
+        },
+        || {
+            clear_backend_tree(app_handle, tree);
+        },
+    )
+    .await
+}
+
+fn retain_owned_direct_backend_cleanup(
+    app_handle: AppHandle,
+    tree: BackendProcessTree,
+    mut child: tokio::process::Child,
+    mut stop_fallback_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+    root_already_reaped: bool,
+    initial_error: String,
+) {
+    tauri::async_runtime::spawn(async move {
+        let mut cleanup_error = initial_error;
+        let mut stop_channel_open = true;
+        loop {
+            log::error!(
+                "Retaining backend process-tree ownership after cleanup failure: {cleanup_error}"
+            );
+            if stop_channel_open {
+                tokio::select! {
+                    signal = stop_fallback_rx.recv() => {
+                        stop_channel_open = signal.is_some();
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                }
+            } else {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            match cleanup_owned_direct_backend(&app_handle, &tree, &mut child, root_already_reaped)
+                .await
+            {
+                Ok(()) => return,
+                Err(error) => cleanup_error = error,
+            }
+        }
+    });
+}
+
+async fn cleanup_or_retain_owned_direct_backend(
+    app_handle: &AppHandle,
+    tree: BackendProcessTree,
+    mut child: tokio::process::Child,
+    stop_fallback_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+    root_already_reaped: bool,
+) -> Result<(), String> {
+    let cleanup =
+        cleanup_owned_direct_backend(app_handle, &tree, &mut child, root_already_reaped).await;
+    if let Err(error) = cleanup.as_ref() {
+        retain_owned_direct_backend_cleanup(
+            app_handle.clone(),
+            tree,
+            child,
+            stop_fallback_rx,
+            root_already_reaped,
+            error.clone(),
+        );
+    }
+    cleanup
+}
+
 async fn apply_backend_cleanup_actions(
     app_handle: &AppHandle,
+    tree: &BackendProcessTree,
     child: &mut tokio::process::Child,
     actions: impl IntoIterator<Item = BackendStartupAction>,
     publisher: &BackendReadinessPublisher,
 ) -> Result<(), String> {
-    let mut termination_error = None;
-    let mut owned_pid = None;
+    let mut cleanup_requested = false;
     for action in actions {
         match action {
-            BackendStartupAction::TerminateProcessTree(pid) => {
-                owned_pid = Some(pid);
-                if let Err(error) = terminate_process_tree_async(pid).await {
-                    let _ = child.start_kill();
-                    termination_error = Some(error);
+            BackendStartupAction::TerminateProcessTree(pid)
+            | BackendStartupAction::ReapOwnedChild(pid) => {
+                if pid != tree.root_pid() {
+                    return Err(format!(
+                        "Cleanup action targeted pid {pid}, but the owned tree root is {}",
+                        tree.root_pid()
+                    ));
                 }
+                cleanup_requested = true;
             }
-            BackendStartupAction::ReapOwnedChild(_) => {
-                if let Err(error) = reap_backend_child(child).await {
-                    termination_error = Some(match termination_error {
-                        Some(first) => format!("{first}; {error}"),
-                        None => error,
-                    });
-                }
-            }
-            BackendStartupAction::ClearState => {
-                if let Some(pid) = owned_pid {
-                    clear_backend_process(app_handle, pid);
-                } else {
-                    clear_backend_state(app_handle);
-                }
-            }
+            BackendStartupAction::ClearState => cleanup_requested = true,
             other => apply_backend_startup_actions(app_handle, [other], publisher).await?,
         }
     }
-    match termination_error {
-        Some(error) => Err(error),
-        None => Ok(()),
+    if cleanup_requested {
+        cleanup_owned_direct_backend(app_handle, tree, child, false).await
+    } else {
+        Ok(())
     }
 }
 
@@ -1486,12 +2209,16 @@ fn spawn_backend_pipe_log<R>(
 async fn start_backend_direct_process(
     app_handle: &AppHandle,
     config: &BackendConfig,
-    config_dir: PathBuf,
-    frontend_dir: Option<PathBuf>,
-    launch_plan: &BackendLaunchPlan,
-    backend_start: BackendStartToken,
-    publisher: BackendReadinessPublisher,
+    start: BackendProcessStart<'_>,
 ) -> Result<(), String> {
+    let BackendProcessStart {
+        config_dir,
+        frontend_dir,
+        launch_plan,
+        backend_start,
+        publisher,
+        watcher_process,
+    } = start;
     ensure_backend_port_available(BACKEND_PORT)?;
     let script_path = node_runtime_path(&config.script_path);
     let config_dir = node_runtime_path(&config_dir);
@@ -1509,7 +2236,7 @@ async fn start_backend_direct_process(
         if let Some(backend_dir) = script_path.parent() {
             command.current_dir(backend_dir);
         }
-        if !backend_use_watcher_process() {
+        if !watcher_process {
             command.arg("--no-cluster");
         }
         if let Some(node_options) = backend_node_options() {
@@ -1534,6 +2261,8 @@ async fn start_backend_direct_process(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
+    let prepared_tree = prepare_direct_backend_tree(&mut command)?;
+
     let mut child = command
         .spawn()
         .map_err(|error| format!("Failed to spawn backend with direct pipes: {error}"))?;
@@ -1548,10 +2277,32 @@ async fn start_backend_direct_process(
             )),
         };
     };
+    let backend_tree = match claim_direct_backend_tree(prepared_tree, &child, pid) {
+        Ok(tree) => tree,
+        Err(error) => {
+            let cleanup = kill_and_reap_backend_child(&mut child).await;
+            return Err(match cleanup {
+                Ok(()) => error,
+                Err(cleanup) => format!("{error}; suspended backend cleanup failed: {cleanup}"),
+            });
+        }
+    };
+    let lifecycle_tree = backend_tree.clone();
     let (stop_fallback_tx, mut stop_fallback_rx) = tokio::sync::mpsc::unbounded_channel();
-    if !register_backend_pid(app_handle, backend_start, pid, stop_fallback_tx) {
-        let cleanup = terminate_and_reap_backend(&mut child, Some(pid)).await;
-        clear_backend_state(app_handle);
+    if !register_backend_tree(
+        app_handle,
+        backend_start,
+        backend_tree.clone(),
+        stop_fallback_tx,
+    ) {
+        let cleanup = cleanup_or_retain_owned_direct_backend(
+            app_handle,
+            backend_tree.clone(),
+            child,
+            stop_fallback_rx,
+            false,
+        )
+        .await;
         return match cleanup {
             Ok(()) => Err("Backend start was cancelled before spawn completed".to_string()),
             Err(cleanup) => Err(format!(
@@ -1567,11 +2318,22 @@ async fn start_backend_direct_process(
         None => {
             let cleanup = apply_backend_cleanup_actions(
                 app_handle,
+                &backend_tree,
                 &mut child,
                 startup_state.observe(BackendStartupEvent::TimedOut),
                 &publisher,
             )
             .await;
+            if let Err(error) = cleanup.as_ref() {
+                retain_owned_direct_backend_cleanup(
+                    app_handle.clone(),
+                    backend_tree.clone(),
+                    child,
+                    stop_fallback_rx,
+                    false,
+                    error.clone(),
+                );
+            }
             return match cleanup {
                 Ok(()) => Err("Failed to capture backend stdout".to_string()),
                 Err(cleanup) => Err(format!(
@@ -1585,11 +2347,22 @@ async fn start_backend_direct_process(
         None => {
             let cleanup = apply_backend_cleanup_actions(
                 app_handle,
+                &backend_tree,
                 &mut child,
                 startup_state.observe(BackendStartupEvent::TimedOut),
                 &publisher,
             )
             .await;
+            if let Err(error) = cleanup.as_ref() {
+                retain_owned_direct_backend_cleanup(
+                    app_handle.clone(),
+                    backend_tree.clone(),
+                    child,
+                    stop_fallback_rx,
+                    false,
+                    error.clone(),
+                );
+            }
             return match cleanup {
                 Ok(()) => Err("Failed to capture backend stderr".to_string()),
                 Err(cleanup) => Err(format!(
@@ -1609,76 +2382,73 @@ async fn start_backend_direct_process(
     tokio::select! {
         biased;
         stop = stop_fallback_rx.recv() => {
-            let kill = if stop.is_some() {
-                child
-                    .start_kill()
-                    .map_err(|error| format!("Failed to stop unready backend child: {error}"))
+            let cleanup = cleanup_or_retain_owned_direct_backend(
+                app_handle,
+                backend_tree.clone(),
+                child,
+                stop_fallback_rx,
+                false,
+            ).await;
+            let reason = if stop.is_some() {
+                "Backend start was cancelled before readiness"
             } else {
-                Ok(())
+                "Backend cleanup channel closed before readiness"
             };
-            let reaped = reap_backend_child(&mut child).await;
-            clear_backend_process(app_handle, pid);
-            Err(match (kill, reaped) {
-                (Ok(()), Ok(())) => "Backend start was cancelled before readiness".to_string(),
-                (kill, reaped) => format!(
-                    "Backend start was cancelled before readiness; kill: {}; reap: {}",
-                    kill.err().unwrap_or_else(|| "ok".to_string()),
-                    reaped.err().unwrap_or_else(|| "ok".to_string())
-                ),
+            Err(match cleanup {
+                Ok(()) => reason.to_string(),
+                Err(cleanup) => format!("{reason}; cleanup failed: {cleanup}"),
             })
         }
-        status = child.wait() => {
-            match status {
-                Ok(status) => {
-                    clear_backend_process(app_handle, pid);
-                    Err(format!("Backend process exited before ready: {status}"))
-                }
-                Err(error) => {
-                    let cleanup = terminate_and_reap_backend(&mut child, Some(pid)).await;
-                    clear_backend_process(app_handle, pid);
-                    Err(match cleanup {
-                        Ok(()) => format!("Failed to wait for backend: {error}"),
-                        Err(cleanup) => format!(
-                            "Failed to wait for backend: {error}; cleanup failed: {cleanup}"
-                        ),
-                    })
-                }
-            }
+        exit = observe_backend_root_exit(&mut child, pid) => {
+            let (reason, root_reaped) = match exit {
+                Ok((exit, root_reaped)) => (
+                    format!("Backend process exited before ready: {exit}"),
+                    root_reaped,
+                ),
+                Err(error) => (error, false),
+            };
+            let cleanup = cleanup_or_retain_owned_direct_backend(
+                app_handle,
+                backend_tree.clone(),
+                child,
+                stop_fallback_rx,
+                root_reaped,
+            ).await;
+            Err(match cleanup {
+                Ok(()) => reason,
+                Err(cleanup) => format!("{reason}; cleanup failed: {cleanup}"),
+            })
         }
         ready = wait_for_owned_loopback(BACKEND_PORT, pid, readiness_policy) => {
             if let Err(error) = ready {
                 let cleanup = apply_backend_cleanup_actions(
                     app_handle,
+                    &backend_tree,
                     &mut child,
                     startup_state.observe(BackendStartupEvent::TimedOut),
                     &publisher,
                 ).await;
                 if let Err(cleanup) = cleanup {
-                    clear_backend_state(app_handle);
+                    retain_owned_direct_backend_cleanup(
+                        app_handle.clone(),
+                        backend_tree.clone(),
+                        child,
+                        stop_fallback_rx,
+                        false,
+                        cleanup.clone(),
+                    );
                     return Err(format!("{error}; process-tree cleanup failed: {cleanup}"));
                 }
                 return Err(error);
             }
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    clear_backend_process(app_handle, pid);
-                    return Err(format!("Backend process exited before ready: {status}"));
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    let cleanup = terminate_and_reap_backend(&mut child, Some(pid)).await;
-                    clear_backend_process(app_handle, pid);
-                    return Err(match cleanup {
-                        Ok(()) => format!("Failed to confirm backend liveness: {error}"),
-                        Err(cleanup) => format!(
-                            "Failed to confirm backend liveness: {error}; cleanup failed: {cleanup}"
-                        ),
-                    });
-                }
-            }
             if !owns_active_backend(app_handle, pid) {
-                let cleanup = kill_and_reap_backend_child(&mut child).await;
-                clear_backend_process(app_handle, pid);
+                let cleanup = cleanup_or_retain_owned_direct_backend(
+                    app_handle,
+                    backend_tree.clone(),
+                    child,
+                    stop_fallback_rx,
+                    false,
+                ).await;
                 return Err(match cleanup {
                     Ok(()) => "Backend start was cancelled before readiness".to_string(),
                     Err(cleanup) => format!(
@@ -1691,25 +2461,48 @@ async fn start_backend_direct_process(
                 startup_state.observe(BackendStartupEvent::LoopbackConnected),
                 &publisher,
             );
-            match race_backend_publication_with_exit(child.wait(), publication).await {
+            match race_backend_publication_with_exit(
+                observe_backend_root_exit(&mut child, pid),
+                publication,
+            ).await {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
-                    let cleanup = kill_and_reap_backend_child(&mut child).await;
-                    clear_backend_process(app_handle, pid);
+                    let cleanup = cleanup_or_retain_owned_direct_backend(
+                        app_handle,
+                        backend_tree.clone(),
+                        child,
+                        stop_fallback_rx,
+                        false,
+                    ).await;
                     return Err(match cleanup {
                         Ok(()) => error,
                         Err(cleanup) => format!("{error}; cleanup failed: {cleanup}"),
                     });
                 }
-                Err(Ok(status)) => {
-                    clear_backend_process(app_handle, pid);
-                    return Err(format!(
-                        "Backend process exited before readiness publication: {status}"
-                    ));
+                Err(Ok((exit, root_reaped))) => {
+                    let cleanup = cleanup_or_retain_owned_direct_backend(
+                        app_handle,
+                        backend_tree.clone(),
+                        child,
+                        stop_fallback_rx,
+                        root_reaped,
+                    ).await;
+                    let reason = format!(
+                        "Backend process exited before readiness publication: {exit}"
+                    );
+                    return Err(match cleanup {
+                        Ok(()) => reason,
+                        Err(cleanup) => format!("{reason}; cleanup failed: {cleanup}"),
+                    });
                 }
                 Err(Err(error)) => {
-                    let cleanup = terminate_and_reap_backend(&mut child, Some(pid)).await;
-                    clear_backend_process(app_handle, pid);
+                    let cleanup = cleanup_or_retain_owned_direct_backend(
+                        app_handle,
+                        backend_tree.clone(),
+                        child,
+                        stop_fallback_rx,
+                        false,
+                    ).await;
                     return Err(match cleanup {
                         Ok(()) => format!(
                             "Failed to wait for backend during readiness publication: {error}"
@@ -1722,24 +2515,23 @@ async fn start_backend_direct_process(
             }
             let app_handle_exit = app_handle.clone();
             let exit_publisher = publisher.clone();
+            #[cfg(unix)]
             tauri::async_runtime::spawn(async move {
-                let exit = tokio::select! {
-                    biased;
-                    stop = stop_fallback_rx.recv() => {
-                        if stop.is_some() {
-                            let _ = child.start_kill();
-                        }
-                        match child.wait().await {
-                            Ok(status) => status.to_string(),
-                            Err(error) => format!("wait failed after stop: {error}"),
-                        }
-                    }
-                    status = child.wait() => match status {
-                        Ok(status) => status.to_string(),
-                        Err(error) => format!("wait failed: {error}"),
-                    }
+                let exit = match tauri::async_runtime::spawn_blocking(move || {
+                    observe_unix_backend_root_exit_without_reaping(pid)
+                })
+                .await
+                {
+                    Ok(Ok(exit)) => exit,
+                    Ok(Err(error)) => error,
+                    Err(error) => format!("backend root observation task failed: {error}"),
                 };
-                let stopping = clear_backend_process(&app_handle_exit, pid);
+                let Some(stopping) =
+                    mark_backend_tree_root_exited(&app_handle_exit, &lifecycle_tree)
+                else {
+                    log::warn!("Ignored a stale Unix backend root exit for pid {pid}");
+                    return;
+                };
                 let clear_handle = app_handle_exit.clone();
                 let report_handle = app_handle_exit.clone();
                 handle_backend_process_exit(
@@ -1755,6 +2547,71 @@ async fn start_backend_direct_process(
                         });
                     },
                 );
+
+                if stop_fallback_rx.recv().await.is_none() {
+                    log::error!("Backend cleanup channel closed while Unix root identity was retained");
+                }
+                if let Err(error) = cleanup_or_retain_owned_direct_backend(
+                    &app_handle_exit,
+                    lifecycle_tree,
+                    child,
+                    stop_fallback_rx,
+                    false,
+                )
+                .await
+                {
+                    log::error!(
+                        "Backend process-group ownership retained for cleanup retry: {error}"
+                    );
+                }
+            });
+            #[cfg(windows)]
+            tauri::async_runtime::spawn(async move {
+                let (exit, reaped) = match child.wait().await {
+                    Ok(status) => (status.to_string(), Ok(())),
+                    Err(error) => (
+                        format!("wait failed: {error}"),
+                        Err(format!("Failed to reap backend root: {error}")),
+                    ),
+                };
+                let Some(stopping) =
+                    mark_backend_tree_root_exited(&app_handle_exit, &lifecycle_tree)
+                else {
+                    log::warn!("Ignored a stale Windows backend root exit for pid {pid}");
+                    return;
+                };
+                let clear_handle = app_handle_exit.clone();
+                let report_handle = app_handle_exit.clone();
+                handle_backend_process_exit(
+                    exit,
+                    stopping,
+                    move || clear_backend_state(&clear_handle),
+                    move |message| {
+                        log::error!("{message}");
+                        let _ = report_handle.emit("backend-error", message);
+                        let publisher = exit_publisher.clone();
+                        tauri::async_runtime::spawn(async move {
+                            publisher.backend_failed().await;
+                        });
+                    },
+                );
+                if stop_fallback_rx.recv().await.is_none() {
+                    log::error!("Backend cleanup channel closed while Windows Job ownership was retained");
+                }
+                let root_already_reaped = reaped.is_ok();
+                if let Err(error) = cleanup_or_retain_owned_direct_backend(
+                    &app_handle_exit,
+                    lifecycle_tree,
+                    child,
+                    stop_fallback_rx,
+                    root_already_reaped,
+                )
+                .await
+                {
+                    log::error!(
+                        "Backend Job ownership retained for watcher cleanup retry: {error}"
+                    );
+                }
             });
             Ok(())
         }
@@ -1799,34 +2656,27 @@ pub async fn start_backend_process(
     let frontend_dir = get_frontend_dir(&paths);
 
     if config.use_node {
-        let spawn_strategy = BackendSpawnStrategy::for_backend(
+        let spawn_plan = BackendSpawnPlan::for_current_platform(
             BackendTransport::from_env()?,
             backend_use_watcher_process(),
         )?;
-        return match spawn_strategy {
+        if let Some(warning) = spawn_plan.warning() {
+            log::warn!("{warning}");
+        }
+        let start = BackendProcessStart {
+            config_dir,
+            frontend_dir,
+            launch_plan,
+            backend_start,
+            publisher,
+            watcher_process: spawn_plan.watcher_process(),
+        };
+        return match spawn_plan.strategy() {
             BackendSpawnStrategy::DirectPipes => {
-                start_backend_direct_process(
-                    app_handle,
-                    &config,
-                    config_dir,
-                    frontend_dir,
-                    launch_plan,
-                    backend_start,
-                    publisher,
-                )
-                .await
+                start_backend_direct_process(app_handle, &config, start).await
             }
             BackendSpawnStrategy::Pty => {
-                start_node_backend_process(
-                    app_handle,
-                    &config,
-                    config_dir,
-                    frontend_dir,
-                    launch_plan,
-                    backend_start,
-                    publisher,
-                )
-                .await
+                start_node_backend_process(app_handle, &config, start).await
             }
         };
     }
@@ -1834,17 +2684,33 @@ pub async fn start_backend_process(
     start_backend_direct_process(
         app_handle,
         &config,
-        config_dir,
-        frontend_dir,
-        launch_plan,
-        backend_start,
-        publisher,
+        BackendProcessStart {
+            config_dir,
+            frontend_dir,
+            launch_plan,
+            backend_start,
+            publisher,
+            watcher_process: false,
+        },
     )
     .await
 }
 
+fn increment_backend_spawn_count(counter: &std::sync::atomic::AtomicU64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+        Some(count.saturating_add(1))
+    });
+}
+
+fn set_backend_ready_pid_if_accepted(ready_pid: &Mutex<Option<u32>>, pid: u32, accepted: bool) {
+    if accepted {
+        *ready_pid.lock().unwrap() = Some(pid);
+    }
+}
+
 fn record_backend_spawned_before_window(app_handle: &AppHandle) {
     if let Some(state) = app_handle.try_state::<crate::AppState>() {
+        increment_backend_spawn_count(&state.backend_spawn_count);
         if let Err(error) = state.startup_metrics.record_backend_spawned_before_window() {
             log::warn!("Failed to record overlapped backend spawn: {error}");
         }
@@ -1973,31 +2839,72 @@ pub async fn start_backend(
 }
 
 /// 停止后端进程
+fn clone_backend_stop_fallback(
+    fallback: &Mutex<Option<(u32, tokio::sync::mpsc::UnboundedSender<()>)>>,
+    pid: Option<u32>,
+) -> Option<tokio::sync::mpsc::UnboundedSender<()>> {
+    fallback
+        .lock()
+        .unwrap()
+        .as_ref()
+        .filter(|(owner, _)| Some(*owner) == pid)
+        .map(|(_, sender)| sender.clone())
+}
+
 pub fn stop_backend(app_handle: &AppHandle) -> Result<(), String> {
-    let (pid, stop_fallback) = app_handle
+    let (pid, tree, stop_fallback) = app_handle
         .try_state::<crate::AppState>()
         .map(|state| {
             let mut ownership = state.backend_ownership.lock().unwrap();
-            let pid = ownership.request_stop();
-            let mut fallback = state.backend_stop_fallback.lock().unwrap();
-            let stop_fallback = if fallback.as_ref().map(|(owner, _)| *owner) == pid {
-                fallback.take().map(|(_, sender)| sender)
-            } else {
-                None
-            };
+            let pid = ownership.owned_root_pid();
+            let tree = ownership.request_tree_stop();
+            let stop_fallback = clone_backend_stop_fallback(&state.backend_stop_fallback, pid);
             *state.backend_port.lock().unwrap() = None;
-            (pid, stop_fallback)
+            (pid, tree, stop_fallback)
         })
-        .unwrap_or((None, None));
+        .unwrap_or((None, None, None));
 
-    let termination = if let Some(pid) = pid {
-        log::info!("Stopping backend process tree rooted at pid {}", pid);
-        terminate_process_tree(pid)
+    let termination = if let Some(tree) = tree {
+        log::info!(
+            "Stopping owned backend process tree rooted at pid {}",
+            tree.root_pid()
+        );
+        tree.terminate_and_confirm(BACKEND_CLEANUP_BOUND)
+    } else if let Some(pid) = pid {
+        Err(format!(
+            "Backend pid {pid} has no durable process-tree owner; refusing unconfirmed pid-only cleanup"
+        ))
     } else {
         log::debug!("No backend process is registered; nothing to stop");
         Ok(())
     };
     finish_backend_stop(termination, stop_fallback)
+}
+
+/// Terminates only the currently owned backend root. This is intentionally
+/// crate-private for the authenticated smoke protocol and never registered as
+/// a Tauri command; descendants remain owned by the generation tree.
+#[allow(dead_code)] // Consumed by the separately owned authenticated smoke implementation.
+pub(crate) fn kill_owned_backend_root_for_smoke(
+    app_handle: &AppHandle,
+) -> Result<BackendRootCrashEvidence, String> {
+    let state = app_handle
+        .try_state::<crate::AppState>()
+        .ok_or_else(|| "Application state is unavailable".to_string())?;
+    let (pid, tree) = {
+        let ownership = state.backend_ownership.lock().unwrap();
+        let pid = ownership
+            .pid()
+            .ok_or_else(|| "No active backend root is owned".to_string())?;
+        let tree = ownership
+            .tree()
+            .ok_or_else(|| "Active backend has no durable process-tree ownership".to_string())?;
+        (pid, tree)
+    };
+    let evidence = BackendRootCrashEvidence::capture(tree, Duration::from_secs(1))?;
+    debug_assert_eq!(evidence.root_pid(), pid);
+    evidence.tree.kill_root()?;
+    Ok(evidence)
 }
 
 async fn wait_for_backend_ownership_release(
@@ -2022,7 +2929,7 @@ fn finish_bounded_backend_cleanup(
     bound: Duration,
 ) -> Result<(), String> {
     if cleanup_confirmed {
-        return stop_result;
+        return Ok(());
     }
     let cleanup = format!(
         "Backend child reap exceeded the {}ms cleanup bound",
@@ -2034,25 +2941,50 @@ fn finish_bounded_backend_cleanup(
     }
 }
 
+fn finish_forced_backend_exit_cleanup(
+    termination: Result<(), String>,
+    release: impl FnOnce(),
+) -> Result<(), String> {
+    termination?;
+    release();
+    Ok(())
+}
+
+#[cfg(test)]
 async fn serialize_backend_cleanup<C>(
-    cleanup_failure: &tokio::sync::Mutex<Option<String>>,
+    cleanup_gate: &Arc<tokio::sync::Mutex<()>>,
     deadline: tokio::time::Instant,
     cleanup: C,
 ) -> Result<(), String>
 where
     C: Future<Output = Result<(), String>>,
 {
-    let mut failure = tokio::time::timeout_at(deadline, cleanup_failure.lock())
+    let _guard = tokio::time::timeout_at(deadline, cleanup_gate.clone().lock_owned())
         .await
         .map_err(|_| "Backend cleanup coordination exceeded its bound".to_string())?;
-    if let Some(error) = failure.as_ref() {
-        return Err(error.clone());
+    cleanup.await
+}
+
+async fn await_cleanup_task_with_retained_gate<T>(
+    guard: tokio::sync::OwnedMutexGuard<()>,
+    deadline: tokio::time::Instant,
+    mut cleanup_task: tauri::async_runtime::JoinHandle<T>,
+    timeout_error: String,
+) -> Result<(tokio::sync::OwnedMutexGuard<()>, T), String>
+where
+    T: Send + 'static,
+{
+    match tokio::time::timeout_at(deadline, &mut cleanup_task).await {
+        Ok(Ok(result)) => Ok((guard, result)),
+        Ok(Err(error)) => Err(format!("Backend cleanup task failed: {error}")),
+        Err(_) => {
+            tauri::async_runtime::spawn(async move {
+                let _guard = guard;
+                let _ = cleanup_task.await;
+            });
+            Err(timeout_error)
+        }
     }
-    let result = cleanup.await;
-    if let Err(error) = result.as_ref() {
-        *failure = Some(error.clone());
-    }
-    result
 }
 
 pub async fn stop_backend_bounded(app_handle: &AppHandle, bound: Duration) -> Result<(), String> {
@@ -2063,31 +2995,67 @@ pub async fn stop_backend_bounded(app_handle: &AppHandle, bound: Duration) -> Re
         return Ok(());
     };
     let deadline = tokio::time::Instant::now() + bound;
-    serialize_backend_cleanup(&state.backend_cleanup_failure, deadline, async {
-        let wait_for_cleanup = state.backend_ownership.lock().unwrap().has_owned_work();
-        let stop_handle = app_handle.clone();
-        let stop_task = tauri::async_runtime::spawn_blocking(move || stop_backend(&stop_handle));
-        let stop_result = match tokio::time::timeout_at(deadline, stop_task).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(error)) => Err(format!("Backend stop task failed: {error}")),
-            Err(_) => Err(format!(
-                "Backend process-tree stop exceeded {}ms",
-                bound.as_millis()
-            )),
-        };
-        if !wait_for_cleanup && !state.backend_ownership.lock().unwrap().has_owned_work() {
-            return stop_result;
-        }
+    let cleanup_guard =
+        tokio::time::timeout_at(deadline, state.backend_cleanup_gate.clone().lock_owned())
+            .await
+            .map_err(|_| "Backend cleanup coordination exceeded its bound".to_string())?;
+    let wait_for_cleanup = state.backend_ownership.lock().unwrap().has_owned_work();
+    let stop_handle = app_handle.clone();
+    let stop_task = tauri::async_runtime::spawn_blocking(move || stop_backend(&stop_handle));
+    let timeout_error = format!("Backend process-tree stop exceeded {}ms", bound.as_millis());
+    let (_cleanup_guard, stop_result) =
+        await_cleanup_task_with_retained_gate(cleanup_guard, deadline, stop_task, timeout_error)
+            .await?;
+    if !wait_for_cleanup && !state.backend_ownership.lock().unwrap().has_owned_work() {
+        return stop_result;
+    }
 
-        let cleanup_confirmed = wait_for_backend_ownership_release(
-            &state.backend_ownership,
-            &state.backend_cleanup_notify,
-            deadline,
-        )
-        .await;
-        finish_bounded_backend_cleanup(stop_result, cleanup_confirmed, bound)
+    let cleanup_confirmed = wait_for_backend_ownership_release(
+        &state.backend_ownership,
+        &state.backend_cleanup_notify,
+        deadline,
+    )
+    .await;
+    finish_bounded_backend_cleanup(stop_result, cleanup_confirmed, bound)
+}
+
+pub async fn force_release_backend_for_exit(
+    app_handle: &AppHandle,
+    bound: Duration,
+) -> Result<(), String> {
+    if bound.is_zero() {
+        return Err("Forced backend cleanup bound must be nonzero".to_string());
+    }
+    let Some(state) = app_handle.try_state::<crate::AppState>() else {
+        return Ok(());
+    };
+    let deadline = tokio::time::Instant::now() + bound;
+    let cleanup_guard =
+        tokio::time::timeout_at(deadline, state.backend_cleanup_gate.clone().lock_owned())
+            .await
+            .map_err(|_| "Forced backend cleanup coordination exceeded its bound".to_string())?;
+    let tree = {
+        let ownership = state
+            .backend_ownership
+            .lock()
+            .map_err(|_| "backend ownership mutex is poisoned".to_string())?;
+        if !ownership.has_owned_work() {
+            return Ok(());
+        }
+        ownership
+            .tree()
+            .ok_or_else(|| "Forced backend cleanup has no owned process tree".to_string())?
+    };
+    let force_tree = tree.clone();
+    let force_task =
+        tauri::async_runtime::spawn_blocking(move || force_tree.force_terminate_for_exit(bound));
+    let timeout_error = format!("Forced backend cleanup exceeded {}ms", bound.as_millis());
+    let (_cleanup_guard, termination) =
+        await_cleanup_task_with_retained_gate(cleanup_guard, deadline, force_task, timeout_error)
+            .await?;
+    finish_forced_backend_exit_cleanup(termination, || {
+        clear_backend_tree(app_handle, &tree);
     })
-    .await
 }
 
 #[cfg(test)]
@@ -2150,23 +3118,63 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_root_reap_does_not_hide_process_tree_termination_failure() {
-        let error = super::finish_bounded_backend_cleanup(
+    fn confirmed_ownership_release_recovers_an_initial_tree_termination_failure() {
+        let result = super::finish_bounded_backend_cleanup(
             Err("process tree termination failed".to_string()),
             true,
             Duration::from_secs(5),
-        )
-        .unwrap_err();
-        assert_eq!(error, "process tree termination failed");
+        );
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn ownership_release_requires_tree_confirmation_and_root_reap() {
+        for (tree, reap, should_release) in [
+            (Ok(()), Ok(()), true),
+            (Err("tree failed".to_string()), Ok(()), false),
+            (Ok(()), Err("reap failed".to_string()), false),
+            (
+                Err("tree failed".to_string()),
+                Err("reap failed".to_string()),
+                false,
+            ),
+        ] {
+            let released = std::cell::Cell::new(false);
+            let result = super::finish_owned_tree_cleanup(tree, reap, || released.set(true));
+
+            assert_eq!(released.get(), should_release);
+            assert_eq!(result.is_ok(), should_release);
+        }
+    }
+
+    #[test]
+    fn backend_spawn_counter_saturates() {
+        let counter = std::sync::atomic::AtomicU64::new(u64::MAX - 1);
+
+        super::increment_backend_spawn_count(&counter);
+        super::increment_backend_spawn_count(&counter);
+
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn stale_ready_result_cannot_overwrite_the_accepted_backend_pid() {
+        let ready_pid = std::sync::Mutex::new(Some(41));
+
+        super::set_backend_ready_pid_if_accepted(&ready_pid, 42, false);
+        assert_eq!(*ready_pid.lock().unwrap(), Some(41));
+
+        super::set_backend_ready_pid_if_accepted(&ready_pid, 43, true);
+        assert_eq!(*ready_pid.lock().unwrap(), Some(43));
     }
 
     #[tokio::test]
-    async fn concurrent_cleanup_callers_share_the_first_sticky_failure() {
-        let cleanup_failure = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+    async fn serialized_cleanup_callers_retry_after_the_first_failure() {
+        let cleanup_gate = std::sync::Arc::new(tokio::sync::Mutex::new(()));
         let second_cleanup_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        let first_state = cleanup_failure.clone();
+        let first_state = cleanup_gate.clone();
         let first = tokio::spawn(async move {
             super::serialize_backend_cleanup(
                 &first_state,
@@ -2181,7 +3189,7 @@ mod tests {
         });
         entered_rx.await.unwrap();
 
-        let second_state = cleanup_failure.clone();
+        let second_state = cleanup_gate.clone();
         let observed_second_calls = second_cleanup_calls.clone();
         let second = tokio::spawn(async move {
             super::serialize_backend_cleanup(
@@ -2202,14 +3210,91 @@ mod tests {
             first.await.unwrap(),
             Err("process tree termination failed".to_string())
         );
-        assert_eq!(
-            second.await.unwrap(),
-            Err("process tree termination failed".to_string())
-        );
+        assert_eq!(second.await.unwrap(), Ok(()));
         assert_eq!(
             second_cleanup_calls.load(std::sync::atomic::Ordering::SeqCst),
-            0
+            1
         );
+    }
+
+    #[tokio::test]
+    async fn timed_out_blocking_cleanup_retains_the_serialization_gate() {
+        let cleanup_gate = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+        let guard = cleanup_gate.clone().lock_owned().await;
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let cleanup_task = tauri::async_runtime::spawn_blocking(move || {
+            release_rx.recv().unwrap();
+        });
+
+        let result = super::await_cleanup_task_with_retained_gate(
+            guard,
+            tokio::time::Instant::now() + Duration::from_millis(10),
+            cleanup_task,
+            "cleanup timed out".to_string(),
+        )
+        .await;
+        assert_eq!(result.unwrap_err(), "cleanup timed out");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), cleanup_gate.clone().lock_owned())
+                .await
+                .is_err()
+        );
+
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), cleanup_gate.lock_owned())
+            .await
+            .expect("cleanup gate is released after the blocking task exits");
+    }
+
+    #[tokio::test]
+    async fn tree_termination_failure_never_reaps_or_releases_the_root() {
+        let reaps = std::sync::atomic::AtomicUsize::new(0);
+        let released = std::cell::Cell::new(false);
+
+        let result = super::finish_owned_tree_cleanup_async(
+            async { Err("tree failed".to_string()) },
+            || async {
+                reaps.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+            || released.set(true),
+        )
+        .await;
+
+        assert_eq!(result, Err("tree failed".to_string()));
+        assert_eq!(reaps.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!released.get());
+    }
+
+    #[test]
+    fn stop_fallback_remains_registered_until_confirmed_cleanup() {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let fallback = std::sync::Mutex::new(Some((42, sender)));
+
+        let signal = super::clone_backend_stop_fallback(&fallback, Some(42))
+            .expect("matching fallback is cloned");
+        signal.send(()).expect("signal retained cleanup watcher");
+
+        assert_eq!(
+            fallback.lock().unwrap().as_ref().map(|(pid, _)| *pid),
+            Some(42)
+        );
+        assert_eq!(receiver.try_recv(), Ok(()));
+    }
+
+    #[test]
+    fn forced_exit_cleanup_releases_only_after_os_termination() {
+        for (termination, should_release) in [
+            (Ok(()), true),
+            (Err("os termination failed".to_string()), false),
+        ] {
+            let released = std::cell::Cell::new(false);
+            let result =
+                super::finish_forced_backend_exit_cleanup(termination, || released.set(true));
+
+            assert_eq!(released.get(), should_release);
+            assert_eq!(result.is_ok(), should_release);
+        }
     }
 
     #[test]
@@ -2523,6 +3608,94 @@ mod tests {
         super::initialize_windows_backend_pty_input(&mut input).expect("initialize ConPTY input");
 
         assert_eq!(input, b"\x1b[1;1R");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_job_keeps_owning_descendants_after_a_root_only_crash() {
+        let pid_file = std::env::temp_dir().join(format!(
+            "ride-backend-tree-descendant-{}.pid",
+            uuid::Uuid::new_v4()
+        ));
+        let script = format!(
+            "$child = Start-Process -FilePath $env:ComSpec -ArgumentList '/D /S /C ping -t 127.0.0.1 ^>NUL' -WindowStyle Hidden -PassThru; Set-Content -LiteralPath '{}' -Value $child.Id; Start-Sleep -Seconds 30",
+            pid_file.display()
+        );
+        let mut command = tokio::process::Command::new("powershell.exe");
+        command
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &script,
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+
+        let prepared = super::prepare_direct_backend_tree(&mut command)
+            .expect("prepare a suspended direct backend");
+        let mut child = command.spawn().expect("spawn suspended backend root");
+        let pid = child.id().expect("backend root pid");
+        let tree = super::claim_direct_backend_tree(prepared, &child, pid)
+            .expect("assign and resume the backend root");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !pid_file.exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            pid_file.exists(),
+            "backend root did not report its descendant"
+        );
+        let descendant_pid = std::fs::read_to_string(&pid_file)
+            .expect("read descendant pid")
+            .trim()
+            .parse::<u32>()
+            .expect("parse descendant pid");
+        let evidence =
+            super::BackendRootCrashEvidence::capture(tree.clone(), Duration::from_secs(1))
+                .expect("capture bounded owned-tree evidence");
+        assert_eq!(evidence.root_pid(), pid);
+        assert!(evidence.descendant_pids().contains(&descendant_pid));
+        tree.kill_root().expect("crash only the owned backend root");
+        child.wait().await.expect("reap crashed backend root");
+        assert!(
+            evidence
+                .active_process_ids(Duration::from_secs(1))
+                .expect("query old backend Job")
+                .contains(&descendant_pid),
+            "the descendant escaped when its root exited"
+        );
+
+        tree.terminate_and_confirm(Duration::from_secs(5))
+            .expect("terminate the retained backend Job");
+        assert!(evidence
+            .active_process_ids(Duration::from_secs(1))
+            .expect("query empty old Job")
+            .is_empty());
+        let mut cancelled = crate::startup::BackendOwnershipState::default();
+        let token = cancelled.reserve_start();
+        assert_eq!(cancelled.request_stop(), None);
+        assert!(cancelled.retain_tree_for_cancelled_start(token, tree.clone()));
+        assert!(cancelled.clear_tree(&tree));
+        assert!(
+            !cancelled.has_owned_work(),
+            "confirmed cleanup must fully release a tree retained after cancelled registration"
+        );
+        let _ = std::fs::remove_file(pid_file);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_pty_fails_closed_without_atomic_job_assignment_support() {
+        assert!(!super::backend_pty_tree_ownership_supported());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_pty_can_be_verified_as_an_owned_session_process_group() {
+        assert!(super::backend_pty_tree_ownership_supported());
     }
 
     #[test]

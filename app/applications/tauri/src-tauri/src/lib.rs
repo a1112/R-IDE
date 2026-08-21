@@ -25,8 +25,8 @@ use std::ffi::OsString;
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager};
 
 const MAX_PENDING_LAUNCH_INTENTS: usize = 64;
@@ -49,6 +49,13 @@ pub fn is_trusted_secondary_window_url(url: &tauri::Url, public_authority: &str)
         && url.path() == "/secondary-window.html"
         && url.query().is_none()
         && url.fragment().is_none()
+}
+
+fn should_record_smoke_document_lifecycle(
+    window_label: &str,
+    event: tauri::webview::PageLoadEvent,
+) -> bool {
+    window_label == "main" && event == tauri::webview::PageLoadEvent::Started
 }
 
 pub async fn shutdown_gateway_before_backend<G, B, E>(
@@ -129,9 +136,14 @@ impl ApplicationShutdown {
                 .map(|result| result.clone().expect("shutdown completion is present"))
                 .map_err(|_| "application shutdown completion channel closed".to_string())?,
             ApplicationShutdownRole::Leader => {
-                let result = match gateway_stop().await {
-                    Ok(()) => backend_cleanup().await,
-                    Err(error) => Err(error),
+                let gateway_result = gateway_stop().await;
+                let backend_result = backend_cleanup().await;
+                let result = match (gateway_result, backend_result) {
+                    (Ok(()), Ok(())) => Ok(()),
+                    (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+                    (Err(gateway), Err(backend)) => Err(format!(
+                        "gateway shutdown failed: {gateway}; backend cleanup failed: {backend}"
+                    )),
                 };
                 let stored_result = {
                     let mut state = self
@@ -236,10 +248,12 @@ fn configure_local_proxy_bypass() {
 // 全局状态：存储 Node.js 后端的端口号
 pub struct AppState {
     pub backend_port: Mutex<Option<u16>>,
+    pub backend_ready_pid: Mutex<Option<u32>>,
+    pub backend_spawn_count: AtomicU64,
     pub backend_ownership: Mutex<startup::BackendOwnershipState>,
     pub backend_stop_fallback: Mutex<Option<(u32, tokio::sync::mpsc::UnboundedSender<()>)>>,
     pub backend_cleanup_notify: tokio::sync::Notify,
-    pub backend_cleanup_failure: tokio::sync::Mutex<Option<String>>,
+    pub backend_cleanup_gate: Arc<tokio::sync::Mutex<()>>,
     pub backend_retries_stopped: std::sync::atomic::AtomicBool,
     pub downloads: download::DownloadManager,
     pub launch_intent_router: launch_intent::LaunchIntentRouter,
@@ -250,6 +264,8 @@ pub struct AppState {
     pub gateway: Mutex<Option<startup_gateway::StartupGateway>>,
     pub runtime_paths: startup::RuntimePathsCache,
     application_shutdown: ApplicationShutdown,
+    application_cleanup_retry_running: AtomicBool,
+    application_cleanup_recovered: AtomicBool,
 }
 
 impl AppState {
@@ -260,10 +276,12 @@ impl AppState {
     ) -> Self {
         Self {
             backend_port: Mutex::new(None),
+            backend_ready_pid: Mutex::new(None),
+            backend_spawn_count: AtomicU64::new(0),
             backend_ownership: Mutex::new(startup::BackendOwnershipState::default()),
             backend_stop_fallback: Mutex::new(None),
             backend_cleanup_notify: tokio::sync::Notify::new(),
-            backend_cleanup_failure: tokio::sync::Mutex::new(None),
+            backend_cleanup_gate: Arc::new(tokio::sync::Mutex::new(())),
             backend_retries_stopped: std::sync::atomic::AtomicBool::new(false),
             downloads: download::DownloadManager::new(),
             launch_intent_router: launch_intent::LaunchIntentRouter::new(
@@ -277,6 +295,8 @@ impl AppState {
             gateway: Mutex::new(None),
             runtime_paths: startup::RuntimePathsCache::default(),
             application_shutdown: ApplicationShutdown::new(),
+            application_cleanup_retry_running: AtomicBool::new(false),
+            application_cleanup_recovered: AtomicBool::new(false),
         }
     }
 }
@@ -376,6 +396,69 @@ fn shutdown_application(app_handle: &tauri::AppHandle) -> Result<(), String> {
     ))
 }
 
+fn retain_failed_application_cleanup(app_handle: &tauri::AppHandle) {
+    const STRICT_CLEANUP_ATTEMPTS_BEFORE_FORCE: u32 = 3;
+    let Some(state) = app_handle.try_state::<AppState>() else {
+        log::error!("Cannot retain failed application cleanup without managed state");
+        return;
+    };
+    if state
+        .application_cleanup_retry_running
+        .swap(true, Ordering::AcqRel)
+    {
+        return;
+    }
+
+    let app_handle = app_handle.clone();
+    std::thread::spawn(move || {
+        let mut failed_attempts = 0_u32;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            match tauri::async_runtime::block_on(sidecar::stop_backend_bounded(
+                &app_handle,
+                sidecar::BACKEND_CLEANUP_BOUND,
+            )) {
+                Ok(()) => {
+                    if let Some(state) = app_handle.try_state::<AppState>() {
+                        state
+                            .application_cleanup_recovered
+                            .store(true, Ordering::Release);
+                    }
+                    app_handle.exit(0);
+                    return;
+                }
+                Err(error) => {
+                    failed_attempts = failed_attempts.saturating_add(1);
+                    log::warn!("Retained application cleanup is still pending: {error}");
+                    if failed_attempts < STRICT_CLEANUP_ATTEMPTS_BEFORE_FORCE {
+                        continue;
+                    }
+                    match tauri::async_runtime::block_on(sidecar::force_release_backend_for_exit(
+                        &app_handle,
+                        sidecar::BACKEND_CLEANUP_BOUND,
+                    )) {
+                        Ok(()) => {
+                            if let Some(state) = app_handle.try_state::<AppState>() {
+                                state
+                                    .application_cleanup_recovered
+                                    .store(true, Ordering::Release);
+                            }
+                            app_handle.exit(0);
+                            return;
+                        }
+                        Err(force_error) => {
+                            log::error!(
+                            "Forced retained application cleanup is still pending: {force_error}"
+                        );
+                            failed_attempts = 0;
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
 fn restore_main_window(app: &tauri::AppHandle) {
     let Some(window) = app.get_webview_window("main") else {
         log::warn!("Cannot restore main window for desktop activation: window is unavailable");
@@ -435,10 +518,13 @@ fn install_shutdown_signal_handlers(app_handle: tauri::AppHandle) {
 
     std::thread::spawn(move || {
         if signals.forever().next().is_some() {
-            if let Err(e) = shutdown_application(&app_handle) {
-                log::warn!("Failed to stop application after shutdown signal: {}", e);
+            match shutdown_application(&app_handle) {
+                Ok(()) => app_handle.exit(0),
+                Err(e) => {
+                    log::warn!("Failed to stop application after shutdown signal: {}", e);
+                    retain_failed_application_cleanup(&app_handle);
+                }
             }
-            app_handle.exit(0);
         }
     });
 }
@@ -610,6 +696,17 @@ pub fn run() {
                     let secondary_window_app = app.handle().clone();
                     let window =
                         tauri::WebviewWindowBuilder::from_config(app.handle(), &main_window_config)?
+                            .on_page_load(|window, payload| {
+                                if should_record_smoke_document_lifecycle(
+                                    window.label(),
+                                    payload.event(),
+                                ) {
+                                    window
+                                        .state::<AppState>()
+                                        .smoke
+                                        .record_document_lifecycle(window.label());
+                                }
+                            })
                             .on_new_window(move |url, features| {
                                 let Some(public_authority) =
                                     trusted_secondary_window_authority(&secondary_window_app)
@@ -711,14 +808,28 @@ pub fn run() {
     app.run(|app_handle, event| match event {
         tauri::RunEvent::WindowEvent {
             label,
-            event: tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed,
+            event: tauri::WindowEvent::CloseRequested { api, .. },
             ..
         } if label == "main" => {
             close_secondary_windows(app_handle);
-            if let Err(error) = shutdown_application(app_handle) {
-                log::warn!("Failed to stop application while closing the main window: {error}");
+            match shutdown_application(app_handle) {
+                Ok(()) => app_handle.exit(0),
+                Err(error) => {
+                    log::warn!("Failed to stop application while closing the main window: {error}");
+                    api.prevent_close();
+                    retain_failed_application_cleanup(app_handle);
+                }
             }
-            app_handle.exit(0);
+        }
+        tauri::RunEvent::WindowEvent {
+            label,
+            event: tauri::WindowEvent::Destroyed,
+            ..
+        } if label == "main" => {
+            if let Err(error) = shutdown_application(app_handle) {
+                log::warn!("Failed to stop application after main-window destruction: {error}");
+                retain_failed_application_cleanup(app_handle);
+            }
         }
         #[cfg(target_os = "macos")]
         tauri::RunEvent::Opened { urls } => {
@@ -730,9 +841,21 @@ pub fn run() {
             );
             log_launch_intent_delivery_failures("macOS opened URL", report.failures);
         }
-        tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
+        tauri::RunEvent::ExitRequested { api, .. } => {
+            let cleanup_recovered = app_handle
+                .try_state::<AppState>()
+                .is_some_and(|state| state.application_cleanup_recovered.load(Ordering::Acquire));
+            if !cleanup_recovered {
+                if let Err(e) = shutdown_application(app_handle) {
+                    log::warn!("Failed to stop application during shutdown: {}", e);
+                    api.prevent_exit();
+                    retain_failed_application_cleanup(app_handle);
+                }
+            }
+        }
+        tauri::RunEvent::Exit => {
             if let Err(e) = shutdown_application(app_handle) {
-                log::warn!("Failed to stop application during shutdown: {}", e);
+                log::warn!("Application exited before cleanup completed: {}", e);
             }
         }
         _ => {}
@@ -754,6 +877,45 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::{mpsc, Arc};
     use std::time::Duration;
+
+    #[test]
+    fn smoke_document_lifecycle_counts_only_main_window_navigation_starts() {
+        assert!(should_record_smoke_document_lifecycle(
+            "main",
+            tauri::webview::PageLoadEvent::Started,
+        ));
+        assert!(!should_record_smoke_document_lifecycle(
+            "main",
+            tauri::webview::PageLoadEvent::Finished,
+        ));
+        assert!(!should_record_smoke_document_lifecycle(
+            "theia-secondary-1",
+            tauri::webview::PageLoadEvent::Started,
+        ));
+    }
+
+    #[tokio::test]
+    async fn gateway_shutdown_failure_still_runs_and_aggregates_backend_cleanup() {
+        let shutdown = ApplicationShutdown::new();
+        let backend_cleanup_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&backend_cleanup_calls);
+
+        let result = shutdown
+            .run(
+                || async { Err("gateway listener close failed".to_string()) },
+                move || async move {
+                    calls.fetch_add(1, AtomicOrdering::SeqCst);
+                    Err("backend tree cleanup failed".to_string())
+                },
+            )
+            .await;
+
+        assert_eq!(backend_cleanup_calls.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(
+            result,
+            Err("gateway shutdown failed: gateway listener close failed; backend cleanup failed: backend tree cleanup failed".to_string())
+        );
+    }
 
     #[tokio::test]
     async fn concurrent_application_shutdowns_wait_for_one_ordered_failure() {
