@@ -8,8 +8,8 @@
  ********************************************************************************/
 
 use ride_tauri::startup_metrics::{
-    RecordOutcome, StartupMetricError, StartupMetrics, StartupMilestone, StartupReport,
-    StartupReportWriter,
+    RecordOutcome, StartupMetricError, StartupMetrics, StartupMilestone, StartupMode,
+    StartupReport, StartupReportWriter,
 };
 use serde_json::Value;
 use std::fs;
@@ -147,8 +147,224 @@ impl StartupReportWriter for FailFinalOnceWriter {
 }
 
 #[test]
-fn report_records_monotonic_milestones_in_the_declared_order() {
-    let mut report = StartupReport::new("test-platform", "test-arch", 42);
+fn gateway_report_accepts_parallel_branches_without_rewriting_timestamps() {
+    let mut report = StartupReport::new("windows", "x86_64", 42, StartupMode::RustGateway);
+    assert_eq!(
+        report.record(StartupMilestone::ProcessStarted, 0),
+        Ok(RecordOutcome::Recorded)
+    );
+    assert_eq!(
+        report.record(StartupMilestone::GatewayListening, 5),
+        Ok(RecordOutcome::Recorded)
+    );
+    assert_eq!(
+        report.record(StartupMilestone::FrontendRequestStarted, 8),
+        Ok(RecordOutcome::Recorded)
+    );
+    assert_eq!(
+        report.record(StartupMilestone::FrontendBundleLoaded, 40),
+        Ok(RecordOutcome::Recorded)
+    );
+    assert_eq!(
+        report.record(StartupMilestone::BackendSpawned, 3),
+        Ok(RecordOutcome::Recorded)
+    );
+    assert_eq!(
+        report.record(StartupMilestone::BackendListening, 30),
+        Ok(RecordOutcome::Recorded)
+    );
+    assert_eq!(
+        report.record(StartupMilestone::RpcConnected, 45),
+        Ok(RecordOutcome::Recorded)
+    );
+
+    let value = serde_json::to_value(report).expect("serialize report");
+    assert_eq!(value["version"], 2);
+    assert_eq!(value["startupMode"], "rust-gateway");
+    assert_eq!(value["milestones"]["backend_spawned"], 3);
+    assert_eq!(value["milestones"]["frontend_bundle_loaded"], 40);
+}
+
+#[test]
+fn gateway_report_rejects_a_milestone_with_a_missing_predecessor() {
+    let mut report = StartupReport::new("windows", "x86_64", 42, StartupMode::RustGateway);
+    report
+        .record(StartupMilestone::ProcessStarted, 0)
+        .expect("process start");
+
+    assert_eq!(
+        report.record(StartupMilestone::FrontendBundleLoaded, 9),
+        Err(StartupMetricError::MissingPredecessor {
+            attempted: StartupMilestone::FrontendBundleLoaded,
+            required: StartupMilestone::FrontendRequestStarted,
+        })
+    );
+}
+
+#[test]
+fn gateway_report_rejects_a_timestamp_before_its_predecessor() {
+    let mut report = StartupReport::new("windows", "x86_64", 42, StartupMode::RustGateway);
+    report
+        .record(StartupMilestone::ProcessStarted, 0)
+        .expect("process start");
+    report
+        .record(StartupMilestone::BackendSpawned, 20)
+        .expect("backend spawn");
+
+    assert_eq!(
+        report.record(StartupMilestone::BackendListening, 19),
+        Err(StartupMetricError::PredecessorTimestamp {
+            attempted: StartupMilestone::BackendListening,
+            predecessor: StartupMilestone::BackendSpawned,
+            attempted_ms: 19,
+            predecessor_ms: 20,
+        })
+    );
+}
+
+#[test]
+fn gateway_report_rejects_gateway_only_milestones_in_legacy_mode() {
+    let mut report = StartupReport::new("windows", "x86_64", 42, StartupMode::LegacyExplicit);
+    report
+        .record(StartupMilestone::ProcessStarted, 0)
+        .expect("process start");
+
+    assert_eq!(
+        report.record(StartupMilestone::GatewayListening, 1),
+        Err(StartupMetricError::NotApplicable {
+            milestone: StartupMilestone::GatewayListening,
+            mode: StartupMode::LegacyExplicit,
+        })
+    );
+}
+
+#[test]
+fn gateway_report_selects_explicit_legacy_mode_before_recorder_construction() {
+    assert_eq!(StartupMode::from_env_value(None), StartupMode::RustGateway);
+    assert_eq!(
+        StartupMode::from_env_value(Some("legacy")),
+        StartupMode::LegacyExplicit
+    );
+}
+
+#[test]
+fn gateway_report_allows_one_early_fallback_and_publishes_the_corrected_mode() {
+    let (writes_tx, writes_rx) = mpsc::channel();
+    let metrics = StartupMetrics::with_clock_and_writer(
+        "windows",
+        "x86_64",
+        42,
+        StartupMode::RustGateway,
+        Arc::new(SequenceClock::new(vec![0])),
+        Box::new(CountingWriter { writes: writes_tx }),
+    );
+    metrics
+        .record(StartupMilestone::ProcessStarted)
+        .expect("process start");
+    writes_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("initial mode snapshot");
+
+    assert_eq!(
+        metrics.select_effective_mode(StartupMode::LegacyFallback),
+        Ok(())
+    );
+    let fallback = writes_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("fallback mode snapshot");
+    assert_eq!(fallback["startupMode"], "legacy-fallback");
+}
+
+#[test]
+fn gateway_report_rejects_late_and_invalid_mode_transitions() {
+    let (writes_tx, writes_rx) = mpsc::channel();
+    let metrics = StartupMetrics::with_clock_and_writer(
+        "windows",
+        "x86_64",
+        42,
+        StartupMode::RustGateway,
+        Arc::new(SequenceClock::new(vec![0, 3])),
+        Box::new(CountingWriter { writes: writes_tx }),
+    );
+    metrics
+        .record(StartupMilestone::ProcessStarted)
+        .expect("process start");
+    writes_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("process snapshot");
+    assert_eq!(
+        metrics.select_effective_mode(StartupMode::LegacyExplicit),
+        Err(StartupMetricError::InvalidModeTransition {
+            current: StartupMode::RustGateway,
+            requested: StartupMode::LegacyExplicit,
+        })
+    );
+
+    metrics
+        .record(StartupMilestone::BackendSpawned)
+        .expect("parallel backend start");
+    writes_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("backend snapshot");
+    assert_eq!(
+        metrics.select_effective_mode(StartupMode::LegacyFallback),
+        Err(StartupMetricError::ModeTransitionTooLate {
+            current: StartupMode::RustGateway,
+            requested: StartupMode::LegacyFallback,
+        })
+    );
+}
+
+#[test]
+fn gateway_report_recorder_preserves_backend_clock_observed_before_window() {
+    let (writes_tx, writes_rx) = mpsc::channel();
+    let metrics = StartupMetrics::with_clock_and_writer(
+        "windows",
+        "x86_64",
+        42,
+        StartupMode::RustGateway,
+        Arc::new(SequenceClock::new(vec![0, 5, 3, 700])),
+        Box::new(CountingWriter { writes: writes_tx }),
+    );
+    metrics
+        .record(StartupMilestone::ProcessStarted)
+        .expect("process start");
+    metrics
+        .record(StartupMilestone::GatewayListening)
+        .expect("gateway listening");
+    metrics
+        .record_backend_spawned_before_window()
+        .expect("backend spawned before window");
+    metrics
+        .record(StartupMilestone::NativeWindowVisible)
+        .expect("window visible");
+
+    let mut final_snapshot = None;
+    for _ in 0..4 {
+        let snapshot = writes_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("startup snapshot");
+        if snapshot["milestones"]
+            .get("native_window_visible")
+            .is_some()
+        {
+            final_snapshot = Some(snapshot);
+            break;
+        }
+    }
+    let report = final_snapshot.expect("window snapshot");
+    assert_eq!(report["milestones"]["backend_spawned"], 3);
+    assert_eq!(report["milestones"]["native_window_visible"], 700);
+}
+
+#[test]
+fn legacy_report_records_milestones_in_its_dependency_order() {
+    let mut report = StartupReport::new(
+        "test-platform",
+        "test-arch",
+        42,
+        StartupMode::LegacyExplicit,
+    );
 
     assert_eq!(
         report.record(StartupMilestone::ProcessStarted, 0),
@@ -185,7 +401,8 @@ fn report_records_monotonic_milestones_in_the_declared_order() {
 
     let value = serde_json::to_value(&report).expect("serialize report");
     assert_eq!(value["schema"], "ride.startup-report");
-    assert_eq!(value["version"], 1);
+    assert_eq!(value["version"], 2);
+    assert_eq!(value["startupMode"], "legacy-explicit");
     assert_eq!(value["platform"], "test-platform");
     assert_eq!(value["arch"], "test-arch");
     assert_eq!(value["pid"], 42);
@@ -194,7 +411,7 @@ fn report_records_monotonic_milestones_in_the_declared_order() {
 
 #[test]
 fn duplicate_is_idempotent_and_does_not_replace_the_original_duration() {
-    let mut report = StartupReport::new("test", "test", 1);
+    let mut report = StartupReport::new("test", "test", 1, StartupMode::LegacyExplicit);
     assert_eq!(
         report.record(StartupMilestone::ProcessStarted, 0),
         Ok(RecordOutcome::Recorded)
@@ -209,24 +426,20 @@ fn duplicate_is_idempotent_and_does_not_replace_the_original_duration() {
 }
 
 #[test]
-fn optional_milestones_can_be_skipped_without_weakening_ordering() {
-    let mut report = StartupReport::new("test", "test", 1);
+fn legacy_report_requires_each_declared_predecessor() {
+    let mut report = StartupReport::new("test", "test", 1, StartupMode::LegacyExplicit);
     report
         .record(StartupMilestone::ProcessStarted, 0)
         .expect("process start");
     report
         .record(StartupMilestone::BackendSpawned, 4)
         .expect("skipped native observation remains valid");
-    report
-        .record(StartupMilestone::PluginsStarted, 30)
-        .expect("no-file startup may skip target file");
-
     let before = serde_json::to_value(&report).expect("serialize before rejection");
     assert_eq!(
-        report.record(StartupMilestone::FrontendShellAttached, 31),
-        Err(StartupMetricError::OutOfOrder {
-            attempted: StartupMilestone::FrontendShellAttached,
-            latest: StartupMilestone::PluginsStarted,
+        report.record(StartupMilestone::PluginsStarted, 30),
+        Err(StartupMetricError::MissingPredecessor {
+            attempted: StartupMilestone::PluginsStarted,
+            required: StartupMilestone::TargetFileOpened,
         })
     );
     assert_eq!(
@@ -237,7 +450,7 @@ fn optional_milestones_can_be_skipped_without_weakening_ordering() {
 
 #[test]
 fn non_monotonic_duration_is_rejected_without_polluting_the_report() {
-    let mut report = StartupReport::new("test", "test", 1);
+    let mut report = StartupReport::new("test", "test", 1, StartupMode::LegacyExplicit);
     report
         .record(StartupMilestone::ProcessStarted, 10)
         .expect("process start");
@@ -245,9 +458,11 @@ fn non_monotonic_duration_is_rejected_without_polluting_the_report() {
 
     assert_eq!(
         report.record(StartupMilestone::BackendSpawned, 9),
-        Err(StartupMetricError::NonMonotonic {
+        Err(StartupMetricError::PredecessorTimestamp {
+            attempted: StartupMilestone::BackendSpawned,
+            predecessor: StartupMilestone::ProcessStarted,
             attempted_ms: 9,
-            latest_ms: 10,
+            predecessor_ms: 10,
         })
     );
     assert_eq!(
@@ -264,6 +479,7 @@ fn enabled_recorder_publishes_incrementally_readable_json() {
         "test-platform",
         "test-arch",
         77,
+        StartupMode::LegacyExplicit,
         Arc::new(SequenceClock::new(vec![0, 15, 22])),
     );
 
@@ -300,13 +516,14 @@ fn enabled_recorder_publishes_incrementally_readable_json() {
 }
 
 #[test]
-fn overlapped_backend_spawn_is_published_in_canonical_order_after_window_visibility() {
+fn legacy_backend_spawn_before_window_keeps_its_actual_timestamp() {
     let output = unique_report_path("overlapped-backend");
     let metrics = StartupMetrics::with_clock(
         Some(output.clone()),
         "test-platform",
         "test-arch",
         77,
+        StartupMode::LegacyExplicit,
         Arc::new(SequenceClock::new(vec![0, 100, 700])),
     );
 
@@ -315,28 +532,29 @@ fn overlapped_backend_spawn_is_published_in_canonical_order_after_window_visibil
         .expect("publish process start");
     metrics
         .record_backend_spawned_before_window()
-        .expect("hold overlapped backend spawn");
-    let before_window = wait_for_report_milestone(&output, "process_started");
-    assert_eq!(before_window["milestones"].get("backend_spawned"), None);
+        .expect("publish overlapped backend spawn");
+    let before_window = wait_for_report_milestone(&output, "backend_spawned");
+    assert_eq!(before_window["milestones"]["backend_spawned"], 100);
 
     metrics
         .record(StartupMilestone::NativeWindowVisible)
-        .expect("publish native window and held backend spawn");
-    let visible = wait_for_report_milestone(&output, "backend_spawned");
+        .expect("publish native window");
+    let visible = wait_for_report_milestone(&output, "native_window_visible");
     assert_eq!(visible["milestones"]["native_window_visible"], 700);
-    assert_eq!(visible["milestones"]["backend_spawned"], 700);
+    assert_eq!(visible["milestones"]["backend_spawned"], 100);
 
     fs::remove_file(output).expect("remove report");
 }
 
 #[test]
-fn overlapped_backend_readiness_waits_for_window_visibility_without_losing_v1_order() {
+fn legacy_backend_readiness_before_window_keeps_actual_timestamps() {
     let output = unique_report_path("overlapped-listening");
     let metrics = StartupMetrics::with_clock(
         Some(output.clone()),
         "test-platform",
         "test-arch",
         78,
+        StartupMode::LegacyExplicit,
         Arc::new(SequenceClock::new(vec![0, 100, 200, 700])),
     );
 
@@ -345,21 +563,21 @@ fn overlapped_backend_readiness_waits_for_window_visibility_without_losing_v1_or
         .expect("publish process start");
     metrics
         .record_backend_spawned_before_window()
-        .expect("hold overlapped backend spawn");
+        .expect("publish overlapped backend spawn");
     metrics
         .record_backend_listening_before_window()
-        .expect("hold overlapped backend readiness");
-    let before_window = wait_for_report_milestone(&output, "process_started");
-    assert_eq!(before_window["milestones"].get("backend_spawned"), None);
-    assert_eq!(before_window["milestones"].get("backend_listening"), None);
+        .expect("publish overlapped backend readiness");
+    let before_window = wait_for_report_milestone(&output, "backend_listening");
+    assert_eq!(before_window["milestones"]["backend_spawned"], 100);
+    assert_eq!(before_window["milestones"]["backend_listening"], 200);
 
     metrics
         .record(StartupMilestone::NativeWindowVisible)
-        .expect("publish all held backend phases");
-    let visible = wait_for_report_milestone(&output, "backend_listening");
+        .expect("publish native window");
+    let visible = wait_for_report_milestone(&output, "native_window_visible");
     assert_eq!(visible["milestones"]["native_window_visible"], 700);
-    assert_eq!(visible["milestones"]["backend_spawned"], 700);
-    assert_eq!(visible["milestones"]["backend_listening"], 700);
+    assert_eq!(visible["milestones"]["backend_spawned"], 100);
+    assert_eq!(visible["milestones"]["backend_listening"], 200);
 
     fs::remove_file(output).expect("remove report");
 }
@@ -373,6 +591,7 @@ fn blocked_writer_does_not_block_recording_and_preserves_snapshot_order() {
         "test-platform",
         "test-arch",
         77,
+        StartupMode::LegacyExplicit,
         Arc::new(SequenceClock::new(vec![0, 15])),
         Box::new(BlockingWriter {
             started: started_tx,
@@ -427,6 +646,7 @@ fn writer_retries_a_failed_snapshot_without_an_external_duplicate() {
         "test-platform",
         "test-arch",
         77,
+        StartupMode::LegacyExplicit,
         Arc::new(SequenceClock::new(vec![0])),
         Box::new(FailOnceWriter {
             attempts: attempts_tx,
@@ -457,6 +677,7 @@ fn duplicate_records_do_not_enqueue_additional_writer_calls() {
         "test-platform",
         "test-arch",
         77,
+        StartupMode::LegacyExplicit,
         Arc::new(SequenceClock::new(vec![0, 1, 2, 3, 4])),
         Box::new(CountingWriter { writes: writes_tx }),
     );
@@ -490,6 +711,7 @@ fn final_snapshot_is_persisted_after_its_first_write_fails() {
         "test-platform",
         "test-arch",
         77,
+        StartupMode::LegacyExplicit,
         Arc::new(SequenceClock::new(vec![0, 5, 10, 15, 20, 25, 30, 35])),
         Box::new(FailFinalOnceWriter {
             final_attempts: final_attempts.clone(),
@@ -558,6 +780,7 @@ fn disabled_recorder_never_creates_a_report() {
         "test-platform",
         "test-arch",
         77,
+        StartupMode::LegacyExplicit,
         Arc::new(SequenceClock::new(vec![0])),
     );
 

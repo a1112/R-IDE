@@ -28,7 +28,7 @@ const ROLES = [
   'terminal',
   'other',
 ];
-const MILESTONES = [
+const V1_MILESTONES = [
   'process_started',
   'native_window_visible',
   'backend_spawned',
@@ -38,6 +38,43 @@ const MILESTONES = [
   'plugins_started',
   'plugins_ready',
 ];
+const MILESTONE_PREDECESSORS = Object.freeze({
+  'rust-gateway': Object.freeze({
+    process_started: [],
+    gateway_listening: ['process_started'],
+    native_window_visible: ['gateway_listening'],
+    frontend_request_started: ['gateway_listening'],
+    frontend_bundle_loaded: ['frontend_request_started'],
+    backend_spawned: ['process_started'],
+    backend_listening: ['backend_spawned'],
+    rpc_connected: ['backend_listening', 'frontend_request_started'],
+    frontend_shell_attached: ['rpc_connected', 'frontend_bundle_loaded'],
+    target_file_opened: ['frontend_shell_attached'],
+    plugins_started: ['target_file_opened'],
+    plugins_ready: ['plugins_started'],
+  }),
+  'legacy-explicit': Object.freeze({
+    process_started: [],
+    native_window_visible: ['process_started'],
+    backend_spawned: ['process_started'],
+    backend_listening: ['backend_spawned'],
+    frontend_shell_attached: ['backend_listening', 'native_window_visible'],
+    target_file_opened: ['frontend_shell_attached'],
+    plugins_started: ['target_file_opened'],
+    plugins_ready: ['plugins_started'],
+  }),
+  'legacy-fallback': Object.freeze({
+    process_started: [],
+    native_window_visible: ['process_started'],
+    backend_spawned: ['process_started'],
+    backend_listening: ['backend_spawned'],
+    frontend_shell_attached: ['backend_listening', 'native_window_visible'],
+    target_file_opened: ['frontend_shell_attached'],
+    plugins_started: ['target_file_opened'],
+    plugins_ready: ['plugins_started'],
+  }),
+});
+const STARTUP_MODES = new Set(Object.keys(MILESTONE_PREDECESSORS));
 const NODE_TO_REPORT_PLATFORM = { win32: 'windows', darwin: 'macos', linux: 'linux' };
 const NODE_TO_REPORT_ARCH = { x64: 'x86_64', arm64: 'aarch64' };
 
@@ -186,24 +223,52 @@ function validateRoles(roles, label, expectedCount, expectedRss) {
 }
 
 function validateStartupReport(report, measurement, label) {
-  exactKeys(report, ['schema', 'version', 'platform', 'arch', 'pid', 'milestones'], `${label} startup report`);
-  if (report.schema !== 'ride.startup-report' || report.version !== 1) {
-    fail(`${label} startup report must use ride.startup-report@1`);
+  const reportKeys = report?.version === 2
+    ? ['schema', 'version', 'platform', 'arch', 'pid', 'startupMode', 'milestones']
+    : ['schema', 'version', 'platform', 'arch', 'pid', 'milestones'];
+  exactKeys(report, reportKeys, `${label} startup report`);
+  if (report.schema !== 'ride.startup-report' || ![1, 2].includes(report.version)) {
+    fail(`${label} startup report must use ride.startup-report@1 or @2`);
   }
   if (report.platform !== NODE_TO_REPORT_PLATFORM[measurement.platform]
       || report.arch !== NODE_TO_REPORT_ARCH[measurement.arch]) {
     fail(`${label} startup report platform or architecture is incompatible`);
   }
   positiveInteger(report.pid, `${label} startup report pid`);
-  exactKeys(report.milestones, MILESTONES, `${label} milestones`);
-  let previous = -1;
-  for (const milestone of MILESTONES) {
-    const value = nonNegativeInteger(report.milestones[milestone], `${label} ${milestone}`);
-    if (value < previous) {
-      fail(`${label} milestones must be monotonic`);
+  if (report.version === 1) {
+    exactKeys(report.milestones, V1_MILESTONES, `${label} milestones`);
+    let previous = -1;
+    for (const milestone of V1_MILESTONES) {
+      const value = nonNegativeInteger(report.milestones[milestone], `${label} ${milestone}`);
+      if (value < previous) {
+        fail(`${label} v1 milestones must be monotonic`);
+      }
+      previous = value;
     }
-    previous = value;
+    return undefined;
   }
+
+  if (!STARTUP_MODES.has(report.startupMode)) {
+    fail(`${label} startup report has unsupported startupMode ${report.startupMode}`);
+  }
+  const predecessors = MILESTONE_PREDECESSORS[report.startupMode];
+  exactKeys(report.milestones, Object.keys(predecessors), `${label} milestones`);
+  for (const milestone of Object.keys(predecessors)) {
+    nonNegativeInteger(report.milestones[milestone], `${label} ${milestone}`);
+  }
+  for (const [milestone, required] of Object.entries(predecessors)) {
+    for (const predecessor of required) {
+      if (!Object.hasOwn(report.milestones, predecessor)) {
+        fail(`${label} startup milestone ${milestone} requires predecessor ${predecessor}`);
+      }
+      if (report.milestones[milestone] < report.milestones[predecessor]) {
+        fail(
+          `${label} startup milestone ${milestone} timestamp precedes predecessor ${predecessor}`,
+        );
+      }
+    }
+  }
+  return report.startupMode;
 }
 
 function validateProcessIdentity(identity, label) {
@@ -216,10 +281,10 @@ function validateProcessIdentity(identity, label) {
   safeNumber(identity.startedAt, `${label} startedAt`);
 }
 
-function validateV2Run(run, measurement, index) {
-  const label = `candidate run ${index + 1}`;
+function validateMeasurementRun(run, measurement, measurementLabel, index) {
+  const label = `${measurementLabel} run ${index + 1}`;
   exactKeys(run, ['startupReport', 'metrics'], label);
-  validateStartupReport(run.startupReport, measurement, label);
+  const startupMode = validateStartupReport(run.startupReport, measurement, label);
   exactKeys(run.metrics, [
     'rootPid',
     'rootIdentity',
@@ -266,6 +331,7 @@ function validateV2Run(run, measurement, index) {
     }
   }
   validateRoles(run.metrics.roles, `${label} metrics`, processCount, rssBytes);
+  return startupMode;
 }
 
 function validateReportedMedians(measurement, label) {
@@ -305,10 +371,12 @@ function validateReportedMedians(measurement, label) {
   return expected;
 }
 
-function validateV2Measurement(measurement, label, { exactlyFive }) {
+function validateModernMeasurement(measurement, label, { exactlyFive, versions }) {
+  const isV3 = measurement?.version === 3;
   exactKeys(measurement, [
     'schema',
     'version',
+    ...(isV3 ? ['startupMode'] : []),
     'platform',
     'arch',
     'build',
@@ -316,8 +384,8 @@ function validateV2Measurement(measurement, label, { exactlyFive }) {
     'runs',
     'median',
   ], label);
-  if (measurement.schema !== MEASUREMENT_SCHEMA || measurement.version !== 2) {
-    fail(`${label} must use ${MEASUREMENT_SCHEMA}@2`);
+  if (measurement.schema !== MEASUREMENT_SCHEMA || !versions.includes(measurement.version)) {
+    fail(`${label} must use ${MEASUREMENT_SCHEMA}@${versions.join(' or @')}`);
   }
   nonEmptyString(measurement.platform, `${label} platform`);
   nonEmptyString(measurement.arch, `${label} architecture`);
@@ -332,11 +400,29 @@ function validateV2Measurement(measurement, label, { exactlyFive }) {
   if (measurement.runs.length === 0) {
     fail(`${label} must contain runs`);
   }
-  measurement.runs.forEach((run, index) => validateV2Run(run, measurement, index));
+  const runModes = measurement.runs.map((run, index) => (
+    validateMeasurementRun(run, measurement, label, index)
+  ));
+  if (isV3) {
+    if (!STARTUP_MODES.has(measurement.startupMode)) {
+      fail(`${label} has unsupported startupMode ${measurement.startupMode}`);
+    }
+    for (const [index, runMode] of runModes.entries()) {
+      if (runMode !== measurement.startupMode) {
+        fail(
+          `${label} run ${index + 1} startupMode does not match measurement startupMode; `
+          + 'mixed effective startup modes are not allowed',
+        );
+      }
+    }
+  } else if (runModes.some(mode => mode !== undefined)) {
+    fail(`${label} v2 baseline must contain historical startup report v1 runs`);
+  }
   return {
     measurement,
     hostFingerprint: measurement.host.fingerprint,
     medians: validateReportedMedians(measurement, label),
+    startupMode: isV3 ? measurement.startupMode : undefined,
   };
 }
 
@@ -455,7 +541,10 @@ function validateBaseline(measurement) {
   if (measurement?.version === 1) {
     return validateLegacyBaseline(measurement);
   }
-  return validateV2Measurement(measurement, 'baseline', { exactlyFive: false });
+  return validateModernMeasurement(measurement, 'baseline', {
+    exactlyFive: false,
+    versions: [2, 3],
+  });
 }
 
 function validateGain(value, label) {
@@ -477,7 +566,16 @@ export function compareTauriPerformance(
   const startupGain = validateGain(minStartupGain, 'minimum startup gain');
   const memoryGain = validateGain(minMemoryGain, 'minimum memory gain');
   const baseline = validateBaseline(baselineMeasurement);
-  const candidate = validateV2Measurement(candidateMeasurement, 'candidate', { exactlyFive: true });
+  const candidate = validateModernMeasurement(candidateMeasurement, 'candidate', {
+    exactlyFive: true,
+    versions: [3],
+  });
+  if (candidate.startupMode !== 'rust-gateway') {
+    fail(
+      `candidate startupMode ${candidate.startupMode} `
+      + 'is not eligible for optimized rust-gateway comparison',
+    );
+  }
   if (baseline.measurement.platform !== candidate.measurement.platform) {
     fail('baseline and candidate platform are incompatible');
   }
@@ -487,7 +585,7 @@ export function compareTauriPerformance(
   if (baseline.hostFingerprint !== candidate.hostFingerprint) {
     fail('baseline and candidate host fingerprint are incompatible');
   }
-  if (baseline.measurement.version === 2) {
+  if (baseline.measurement.version >= 2) {
     for (const field of [
       'profile',
       'profileSha256',

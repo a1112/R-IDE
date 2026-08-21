@@ -16,9 +16,9 @@ import process from 'node:process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const REPORT_SCHEMA = 'ride.startup-report';
-const REPORT_VERSION = 1;
+const REPORT_VERSION = 2;
 const MEASUREMENT_SCHEMA = 'ride.startup-measurement';
-const MEASUREMENT_VERSION = 2;
+const MEASUREMENT_VERSION = 3;
 const DIAGNOSTICS_OWNER_SCHEMA = 'ride.startup-diagnostics-owner';
 const DIAGNOSTICS_OWNER_VERSION = 1;
 const DIAGNOSTICS_OWNER_FILE = '.ride-startup-diagnostics-owner.json';
@@ -66,16 +66,43 @@ const PROCESS_ROLES = [
   'terminal',
   'other',
 ];
-const MILESTONES = [
-  'process_started',
-  'native_window_visible',
-  'backend_spawned',
-  'backend_listening',
-  'frontend_shell_attached',
-  'target_file_opened',
-  'plugins_started',
-  'plugins_ready',
-];
+const MILESTONE_PREDECESSORS = Object.freeze({
+  'rust-gateway': Object.freeze({
+    process_started: [],
+    gateway_listening: ['process_started'],
+    native_window_visible: ['gateway_listening'],
+    frontend_request_started: ['gateway_listening'],
+    frontend_bundle_loaded: ['frontend_request_started'],
+    backend_spawned: ['process_started'],
+    backend_listening: ['backend_spawned'],
+    rpc_connected: ['backend_listening', 'frontend_request_started'],
+    frontend_shell_attached: ['rpc_connected', 'frontend_bundle_loaded'],
+    target_file_opened: ['frontend_shell_attached'],
+    plugins_started: ['target_file_opened'],
+    plugins_ready: ['plugins_started'],
+  }),
+  'legacy-explicit': Object.freeze({
+    process_started: [],
+    native_window_visible: ['process_started'],
+    backend_spawned: ['process_started'],
+    backend_listening: ['backend_spawned'],
+    frontend_shell_attached: ['backend_listening', 'native_window_visible'],
+    target_file_opened: ['frontend_shell_attached'],
+    plugins_started: ['target_file_opened'],
+    plugins_ready: ['plugins_started'],
+  }),
+  'legacy-fallback': Object.freeze({
+    process_started: [],
+    native_window_visible: ['process_started'],
+    backend_spawned: ['process_started'],
+    backend_listening: ['backend_spawned'],
+    frontend_shell_attached: ['backend_listening', 'native_window_visible'],
+    target_file_opened: ['frontend_shell_attached'],
+    plugins_started: ['target_file_opened'],
+    plugins_ready: ['plugins_started'],
+  }),
+});
+const STARTUP_MODES = new Set(Object.keys(MILESTONE_PREDECESSORS));
 const RUST_PLATFORMS = new Set(['windows', 'linux', 'macos']);
 const RUST_ARCHITECTURES = new Set(['x86_64', 'aarch64']);
 const NODE_TO_RUST_PLATFORM = {
@@ -433,7 +460,7 @@ export function parseStartupReport(
   assertPlainObject(report, 'startup report');
   assertExactKeys(
     report,
-    new Set(['schema', 'version', 'platform', 'arch', 'pid', 'milestones']),
+    new Set(['schema', 'version', 'platform', 'arch', 'pid', 'startupMode', 'milestones']),
     'report',
   );
   if (report.schema !== REPORT_SCHEMA || report.version !== REPORT_VERSION) {
@@ -459,34 +486,44 @@ export function parseStartupReport(
   if (!Number.isSafeInteger(report.pid) || report.pid <= 0) {
     throw new Error('startup report pid must be a positive safe integer');
   }
+  if (!STARTUP_MODES.has(report.startupMode)) {
+    throw new Error(`unsupported startup mode ${report.startupMode}`);
+  }
   assertPlainObject(report.milestones, 'startup report milestones');
-  assertExactKeys(report.milestones, new Set(MILESTONES), 'milestone');
+  const predecessors = MILESTONE_PREDECESSORS[report.startupMode];
+  const applicableMilestones = Object.keys(predecessors);
+  assertExactKeys(report.milestones, new Set(applicableMilestones), 'milestone');
   if (phase !== 'incremental' && phase !== 'target' && phase !== 'final') {
     throw new Error(`unsupported startup report phase ${phase}`);
   }
   const milestoneKeys = Object.keys(report.milestones);
-  const expectedPrefix = MILESTONES.slice(0, milestoneKeys.length);
-  const requiredPrefixLength = phase === 'incremental' ? 1 : 6;
-  if (milestoneKeys.length < requiredPrefixLength
-      || milestoneKeys.some((milestone, index) => milestone !== expectedPrefix[index])) {
-    throw new Error(phase === 'incremental'
-      ? 'startup report must contain a non-empty canonical milestone prefix'
-      : 'startup report must contain the canonical milestone prefix through target_file_opened');
+  if (!Object.hasOwn(report.milestones, 'process_started')) {
+    throw new Error('startup report must contain process_started');
   }
-  if (phase === 'final' && milestoneKeys.length !== MILESTONES.length) {
-    throw new Error('startup report must contain the complete final milestone sequence');
+  if (phase !== 'incremental' && !Object.hasOwn(report.milestones, 'target_file_opened')) {
+    throw new Error('startup report must contain target_file_opened');
+  }
+  if (phase === 'final' && milestoneKeys.length !== applicableMilestones.length) {
+    throw new Error(`startup report must contain all ${report.startupMode} final milestones`);
   }
 
-  let latest = -1;
   for (const milestone of milestoneKeys) {
     const elapsed = report.milestones[milestone];
     if (!Number.isSafeInteger(elapsed) || elapsed < 0) {
       throw new Error(`milestone ${milestone} must be a non-negative safe integer`);
     }
-    if (elapsed < latest) {
-      throw new Error(`startup milestone ${milestone} is not monotonic`);
+  }
+  for (const milestone of milestoneKeys) {
+    for (const predecessor of predecessors[milestone]) {
+      if (!Object.hasOwn(report.milestones, predecessor)) {
+        throw new Error(`startup milestone ${milestone} requires predecessor ${predecessor}`);
+      }
+      if (report.milestones[milestone] < report.milestones[predecessor]) {
+        throw new Error(
+          `startup milestone ${milestone} timestamp precedes predecessor ${predecessor} timestamp`,
+        );
+      }
     }
-    latest = elapsed;
   }
   return report;
 }
@@ -2032,12 +2069,11 @@ export async function waitForStartupReport(
         expectedArch,
         phase: 'incremental',
       });
-      const milestoneCount = Object.keys(report.milestones).length;
       if (phase === 'process') {
         return report;
       }
       if (phase === 'target') {
-        if (milestoneCount >= 6) {
+        if (Object.hasOwn(report.milestones, 'target_file_opened')) {
           return parseStartupReport(serialized, {
             expectedPlatform,
             expectedArch,
@@ -2050,7 +2086,8 @@ export async function waitForStartupReport(
       if (phase !== 'final') {
         throw new Error(`unsupported startup report phase ${phase}`);
       }
-      if (milestoneCount === MILESTONES.length) {
+      const finalMilestones = Object.keys(MILESTONE_PREDECESSORS[report.startupMode]);
+      if (finalMilestones.every(milestone => Object.hasOwn(report.milestones, milestone))) {
         return parseStartupReport(serialized, {
           expectedPlatform,
           expectedArch,
@@ -3454,9 +3491,19 @@ export async function runMeasurementCampaign(
     }
   }
 
+  const effectiveModes = new Set(rawRuns.map(run => run.startupReport.startupMode));
+  if (effectiveModes.size !== 1) {
+    throw new Error('measurement campaign reported mixed effective startup modes');
+  }
+  const [startupMode] = effectiveModes;
+  if (!STARTUP_MODES.has(startupMode)) {
+    throw new Error(`measurement campaign reported unsupported startup mode ${startupMode}`);
+  }
+
   const measurement = {
     schema: MEASUREMENT_SCHEMA,
     version: MEASUREMENT_VERSION,
+    startupMode,
     platform: process.platform,
     arch: process.arch,
     build,

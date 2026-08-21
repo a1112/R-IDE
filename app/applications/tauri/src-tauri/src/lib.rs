@@ -209,7 +209,8 @@ pub fn run() {
             std::process::exit(1);
         }
     };
-    let startup_metrics = startup_metrics::StartupMetrics::from_env();
+    let requested_startup_mode = startup_metrics::StartupMode::from_env();
+    let startup_metrics = startup_metrics::StartupMetrics::from_env(requested_startup_mode);
     if let Err(error) = startup_metrics.record(startup_metrics::StartupMilestone::ProcessStarted) {
         eprintln!("Warning: failed to record process_started startup milestone: {error}");
     }
@@ -437,6 +438,7 @@ mod tests {
                 "test",
                 "test",
                 1,
+                startup_metrics::StartupMode::LegacyExplicit,
                 Arc::new(TestClock),
             ),
             |mut builder, plugin| {

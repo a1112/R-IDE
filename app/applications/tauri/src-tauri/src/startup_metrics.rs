@@ -17,17 +17,63 @@ use std::time::{Duration, Instant};
 
 pub const STARTUP_REPORT_ENV: &str = "RIDE_STARTUP_REPORT";
 pub const STARTUP_REPORT_SCHEMA: &str = "ride.startup-report";
-pub const STARTUP_REPORT_VERSION: u32 = 1;
+pub const STARTUP_REPORT_VERSION: u32 = 2;
+pub const STARTUP_MODE_ENV: &str = "RIDE_STARTUP_MODE";
 const STARTUP_REPORT_WRITE_ATTEMPTS: usize = 3;
 const STARTUP_REPORT_RETRY_DELAY_MS: u64 = 10;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StartupMode {
+    RustGateway,
+    LegacyExplicit,
+    LegacyFallback,
+}
+
+impl StartupMode {
+    pub fn from_env() -> Self {
+        Self::from_env_value(std::env::var(STARTUP_MODE_ENV).ok().as_deref())
+    }
+
+    pub fn from_env_value(value: Option<&str>) -> Self {
+        match value.map(str::trim) {
+            Some(value) if value.eq_ignore_ascii_case("legacy") => Self::LegacyExplicit,
+            _ => Self::RustGateway,
+        }
+    }
+
+    pub const fn predecessors(self, milestone: StartupMilestone) -> &'static [StartupMilestone] {
+        match self {
+            Self::RustGateway => milestone.gateway_predecessors(),
+            Self::LegacyExplicit | Self::LegacyFallback => milestone.legacy_predecessors(),
+        }
+    }
+
+    const fn is_applicable(self, milestone: StartupMilestone) -> bool {
+        match self {
+            Self::RustGateway => true,
+            Self::LegacyExplicit | Self::LegacyFallback => !matches!(
+                milestone,
+                StartupMilestone::GatewayListening
+                    | StartupMilestone::FrontendRequestStarted
+                    | StartupMilestone::FrontendBundleLoaded
+                    | StartupMilestone::RpcConnected
+            ),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StartupMilestone {
     ProcessStarted,
+    GatewayListening,
     NativeWindowVisible,
+    FrontendRequestStarted,
+    FrontendBundleLoaded,
     BackendSpawned,
     BackendListening,
+    RpcConnected,
     FrontendShellAttached,
     TargetFileOpened,
     PluginsStarted,
@@ -35,22 +81,35 @@ pub enum StartupMilestone {
 }
 
 impl StartupMilestone {
-    const ORDERED: [Self; 8] = [
-        Self::ProcessStarted,
-        Self::NativeWindowVisible,
-        Self::BackendSpawned,
-        Self::BackendListening,
-        Self::FrontendShellAttached,
-        Self::TargetFileOpened,
-        Self::PluginsStarted,
-        Self::PluginsReady,
-    ];
+    const fn gateway_predecessors(self) -> &'static [Self] {
+        match self {
+            Self::ProcessStarted => &[],
+            Self::GatewayListening | Self::BackendSpawned => &[Self::ProcessStarted],
+            Self::NativeWindowVisible | Self::FrontendRequestStarted => &[Self::GatewayListening],
+            Self::FrontendBundleLoaded => &[Self::FrontendRequestStarted],
+            Self::BackendListening => &[Self::BackendSpawned],
+            Self::RpcConnected => &[Self::BackendListening, Self::FrontendRequestStarted],
+            Self::FrontendShellAttached => &[Self::RpcConnected, Self::FrontendBundleLoaded],
+            Self::TargetFileOpened => &[Self::FrontendShellAttached],
+            Self::PluginsStarted => &[Self::TargetFileOpened],
+            Self::PluginsReady => &[Self::PluginsStarted],
+        }
+    }
 
-    fn index(self) -> usize {
-        Self::ORDERED
-            .iter()
-            .position(|candidate| *candidate == self)
-            .expect("all startup milestones have a declared order")
+    const fn legacy_predecessors(self) -> &'static [Self] {
+        match self {
+            Self::ProcessStarted => &[],
+            Self::NativeWindowVisible | Self::BackendSpawned => &[Self::ProcessStarted],
+            Self::BackendListening => &[Self::BackendSpawned],
+            Self::FrontendShellAttached => &[Self::BackendListening, Self::NativeWindowVisible],
+            Self::TargetFileOpened => &[Self::FrontendShellAttached],
+            Self::PluginsStarted => &[Self::TargetFileOpened],
+            Self::PluginsReady => &[Self::PluginsStarted],
+            Self::GatewayListening
+            | Self::FrontendRequestStarted
+            | Self::FrontendBundleLoaded
+            | Self::RpcConnected => &[],
+        }
     }
 
     pub fn is_frontend_reportable(self) -> bool {
@@ -69,11 +128,19 @@ pub struct StartupMilestoneDurations {
     #[serde(skip_serializing_if = "Option::is_none")]
     process_started: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    gateway_listening: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     native_window_visible: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    frontend_request_started: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    frontend_bundle_loaded: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     backend_spawned: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     backend_listening: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rpc_connected: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     frontend_shell_attached: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -88,9 +155,13 @@ impl StartupMilestoneDurations {
     fn get(&self, milestone: StartupMilestone) -> Option<u64> {
         match milestone {
             StartupMilestone::ProcessStarted => self.process_started,
+            StartupMilestone::GatewayListening => self.gateway_listening,
             StartupMilestone::NativeWindowVisible => self.native_window_visible,
+            StartupMilestone::FrontendRequestStarted => self.frontend_request_started,
+            StartupMilestone::FrontendBundleLoaded => self.frontend_bundle_loaded,
             StartupMilestone::BackendSpawned => self.backend_spawned,
             StartupMilestone::BackendListening => self.backend_listening,
+            StartupMilestone::RpcConnected => self.rpc_connected,
             StartupMilestone::FrontendShellAttached => self.frontend_shell_attached,
             StartupMilestone::TargetFileOpened => self.target_file_opened,
             StartupMilestone::PluginsStarted => self.plugins_started,
@@ -101,9 +172,13 @@ impl StartupMilestoneDurations {
     fn set(&mut self, milestone: StartupMilestone, duration_ms: u64) {
         let slot = match milestone {
             StartupMilestone::ProcessStarted => &mut self.process_started,
+            StartupMilestone::GatewayListening => &mut self.gateway_listening,
             StartupMilestone::NativeWindowVisible => &mut self.native_window_visible,
+            StartupMilestone::FrontendRequestStarted => &mut self.frontend_request_started,
+            StartupMilestone::FrontendBundleLoaded => &mut self.frontend_bundle_loaded,
             StartupMilestone::BackendSpawned => &mut self.backend_spawned,
             StartupMilestone::BackendListening => &mut self.backend_listening,
+            StartupMilestone::RpcConnected => &mut self.rpc_connected,
             StartupMilestone::FrontendShellAttached => &mut self.frontend_shell_attached,
             StartupMilestone::TargetFileOpened => &mut self.target_file_opened,
             StartupMilestone::PluginsStarted => &mut self.plugins_started,
@@ -112,11 +187,19 @@ impl StartupMilestoneDurations {
         *slot = Some(duration_ms);
     }
 
-    fn latest(&self) -> Option<(StartupMilestone, u64)> {
-        StartupMilestone::ORDERED
-            .iter()
-            .rev()
-            .find_map(|milestone| self.get(*milestone).map(|value| (*milestone, value)))
+    fn only_process_started(&self) -> bool {
+        self.process_started.is_some()
+            && self.gateway_listening.is_none()
+            && self.native_window_visible.is_none()
+            && self.frontend_request_started.is_none()
+            && self.frontend_bundle_loaded.is_none()
+            && self.backend_spawned.is_none()
+            && self.backend_listening.is_none()
+            && self.rpc_connected.is_none()
+            && self.frontend_shell_attached.is_none()
+            && self.target_file_opened.is_none()
+            && self.plugins_started.is_none()
+            && self.plugins_ready.is_none()
     }
 }
 
@@ -127,17 +210,25 @@ pub struct StartupReport {
     platform: String,
     arch: String,
     pid: u32,
+    #[serde(rename = "startupMode")]
+    startup_mode: StartupMode,
     milestones: StartupMilestoneDurations,
 }
 
 impl StartupReport {
-    pub fn new(platform: impl Into<String>, arch: impl Into<String>, pid: u32) -> Self {
+    pub fn new(
+        platform: impl Into<String>,
+        arch: impl Into<String>,
+        pid: u32,
+        startup_mode: StartupMode,
+    ) -> Self {
         Self {
             schema: STARTUP_REPORT_SCHEMA,
             version: STARTUP_REPORT_VERSION,
             platform: platform.into(),
             arch: arch.into(),
             pid,
+            startup_mode,
             milestones: StartupMilestoneDurations::default(),
         }
     }
@@ -151,23 +242,56 @@ impl StartupReport {
             return Ok(RecordOutcome::Duplicate);
         }
 
-        if let Some((latest, latest_ms)) = self.milestones.latest() {
-            if milestone.index() < latest.index() {
-                return Err(StartupMetricError::OutOfOrder {
+        if !self.startup_mode.is_applicable(milestone) {
+            return Err(StartupMetricError::NotApplicable {
+                milestone,
+                mode: self.startup_mode,
+            });
+        }
+
+        for predecessor in self.startup_mode.predecessors(milestone) {
+            let Some(predecessor_ms) = self.milestones.get(*predecessor) else {
+                return Err(StartupMetricError::MissingPredecessor {
                     attempted: milestone,
-                    latest,
+                    required: *predecessor,
                 });
-            }
-            if duration_ms < latest_ms {
-                return Err(StartupMetricError::NonMonotonic {
+            };
+            if duration_ms < predecessor_ms {
+                return Err(StartupMetricError::PredecessorTimestamp {
+                    attempted: milestone,
+                    predecessor: *predecessor,
                     attempted_ms: duration_ms,
-                    latest_ms,
+                    predecessor_ms,
                 });
             }
         }
 
         self.milestones.set(milestone, duration_ms);
         Ok(RecordOutcome::Recorded)
+    }
+
+    fn select_effective_mode(
+        &mut self,
+        requested: StartupMode,
+    ) -> Result<bool, StartupMetricError> {
+        if requested == self.startup_mode {
+            return Ok(false);
+        }
+        if self.startup_mode != StartupMode::RustGateway || requested != StartupMode::LegacyFallback
+        {
+            return Err(StartupMetricError::InvalidModeTransition {
+                current: self.startup_mode,
+                requested,
+            });
+        }
+        if !self.milestones.only_process_started() {
+            return Err(StartupMetricError::ModeTransitionTooLate {
+                current: self.startup_mode,
+                requested,
+            });
+        }
+        self.startup_mode = requested;
+        Ok(true)
     }
 }
 
@@ -180,13 +304,27 @@ pub enum RecordOutcome {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StartupMetricError {
-    OutOfOrder {
+    MissingPredecessor {
         attempted: StartupMilestone,
-        latest: StartupMilestone,
+        required: StartupMilestone,
     },
-    NonMonotonic {
+    PredecessorTimestamp {
+        attempted: StartupMilestone,
+        predecessor: StartupMilestone,
         attempted_ms: u64,
-        latest_ms: u64,
+        predecessor_ms: u64,
+    },
+    NotApplicable {
+        milestone: StartupMilestone,
+        mode: StartupMode,
+    },
+    InvalidModeTransition {
+        current: StartupMode,
+        requested: StartupMode,
+    },
+    ModeTransitionTooLate {
+        current: StartupMode,
+        requested: StartupMode,
     },
     ClockOverflow,
     RecorderPoisoned,
@@ -196,16 +334,33 @@ pub enum StartupMetricError {
 impl fmt::Display for StartupMetricError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::OutOfOrder { attempted, latest } => write!(
-                formatter,
-                "startup milestone {attempted:?} follows already-recorded {latest:?}"
-            ),
-            Self::NonMonotonic {
-                attempted_ms,
-                latest_ms,
+            Self::MissingPredecessor {
+                attempted,
+                required,
             } => write!(
                 formatter,
-                "startup elapsed time {attempted_ms}ms precedes {latest_ms}ms"
+                "startup milestone {attempted:?} requires {required:?}"
+            ),
+            Self::PredecessorTimestamp {
+                attempted,
+                predecessor,
+                attempted_ms,
+                predecessor_ms,
+            } => write!(
+                formatter,
+                "startup milestone {attempted:?} at {attempted_ms}ms precedes predecessor {predecessor:?} at {predecessor_ms}ms"
+            ),
+            Self::NotApplicable { milestone, mode } => write!(
+                formatter,
+                "startup milestone {milestone:?} is not applicable in {mode:?} mode"
+            ),
+            Self::InvalidModeTransition { current, requested } => write!(
+                formatter,
+                "startup mode cannot change from {current:?} to {requested:?}"
+            ),
+            Self::ModeTransitionTooLate { current, requested } => write!(
+                formatter,
+                "startup mode change from {current:?} to {requested:?} was requested after startup advanced"
             ),
             Self::ClockOverflow => formatter.write_str("startup elapsed time exceeds u64"),
             Self::RecorderPoisoned => formatter.write_str("startup recorder mutex is poisoned"),
@@ -243,8 +398,6 @@ impl ElapsedClock for MonotonicClock {
 struct StartupRecorderState {
     report: StartupReport,
     clock: Arc<dyn ElapsedClock>,
-    backend_spawned_before_window: bool,
-    backend_listening_before_window: bool,
 }
 
 #[derive(Debug)]
@@ -274,12 +427,13 @@ impl StartupReportWriter for AtomicStartupReportWriter {
 }
 
 impl StartupMetrics {
-    pub fn from_env() -> Self {
+    pub fn from_env(requested_mode: StartupMode) -> Self {
         Self::with_clock(
             std::env::var_os(STARTUP_REPORT_ENV).map(PathBuf::from),
             std::env::consts::OS,
             std::env::consts::ARCH,
             std::process::id(),
+            requested_mode,
             Arc::new(MonotonicClock::new()),
         )
     }
@@ -289,6 +443,7 @@ impl StartupMetrics {
         platform: impl Into<String>,
         arch: impl Into<String>,
         pid: u32,
+        requested_mode: StartupMode,
         clock: Arc<dyn ElapsedClock>,
     ) -> Self {
         let Some(output_path) = output_path else {
@@ -298,6 +453,7 @@ impl StartupMetrics {
             platform,
             arch,
             pid,
+            requested_mode,
             clock,
             Box::new(AtomicStartupReportWriter { output_path }),
         )
@@ -307,6 +463,7 @@ impl StartupMetrics {
         platform: impl Into<String>,
         arch: impl Into<String>,
         pid: u32,
+        requested_mode: StartupMode,
         clock: Arc<dyn ElapsedClock>,
         writer: Box<dyn StartupReportWriter>,
     ) -> Self {
@@ -314,10 +471,8 @@ impl StartupMetrics {
         Self {
             recorder: Some(Arc::new(StartupRecorder {
                 state: Mutex::new(StartupRecorderState {
-                    report: StartupReport::new(platform, arch, pid),
+                    report: StartupReport::new(platform, arch, pid, requested_mode),
                     clock,
-                    backend_spawned_before_window: false,
-                    backend_listening_before_window: false,
                 }),
                 snapshots,
             })),
@@ -336,26 +491,6 @@ impl StartupMetrics {
             let elapsed_ms = state.clock.elapsed_ms();
             let outcome = state.report.record(milestone, elapsed_ms)?;
             if outcome == RecordOutcome::Recorded {
-                if milestone == StartupMilestone::NativeWindowVisible
-                    && state.backend_spawned_before_window
-                {
-                    // Report v1 is a canonical phase sequence rather than an
-                    // unordered event trace. Parallel backend phases are
-                    // published at the first instant their complete prefix is
-                    // observable, without delaying the actual backend work.
-                    state
-                        .report
-                        .record(StartupMilestone::BackendSpawned, elapsed_ms)?;
-                    state.backend_spawned_before_window = false;
-                }
-                if milestone == StartupMilestone::NativeWindowVisible
-                    && state.backend_listening_before_window
-                {
-                    state
-                        .report
-                        .record(StartupMilestone::BackendListening, elapsed_ms)?;
-                    state.backend_listening_before_window = false;
-                }
                 // The unbounded send cannot wait for disk I/O. Keeping it in this
                 // critical section preserves mutation order for concurrent callers.
                 recorder
@@ -368,86 +503,36 @@ impl StartupMetrics {
         Ok(outcome)
     }
 
-    pub fn record_backend_spawned_before_window(
+    pub fn select_effective_mode(
         &self,
-    ) -> Result<RecordOutcome, StartupMetricError> {
+        requested_mode: StartupMode,
+    ) -> Result<(), StartupMetricError> {
         let Some(recorder) = &self.recorder else {
-            return Ok(RecordOutcome::Disabled);
+            return Ok(());
         };
         let mut state = recorder
             .state
             .lock()
             .map_err(|_| StartupMetricError::RecorderPoisoned)?;
-        let elapsed_ms = state.clock.elapsed_ms();
-        if state
-            .report
-            .milestones
-            .get(StartupMilestone::BackendSpawned)
-            .is_some()
-            || state.backend_spawned_before_window
-        {
-            return Ok(RecordOutcome::Duplicate);
+        if state.report.select_effective_mode(requested_mode)? {
+            recorder
+                .snapshots
+                .send(state.report.clone())
+                .map_err(|error| StartupMetricError::Write(error.to_string()))?;
         }
-        if state
-            .report
-            .milestones
-            .get(StartupMilestone::NativeWindowVisible)
-            .is_some()
-        {
-            let outcome = state
-                .report
-                .record(StartupMilestone::BackendSpawned, elapsed_ms)?;
-            if outcome == RecordOutcome::Recorded {
-                recorder
-                    .snapshots
-                    .send(state.report.clone())
-                    .map_err(|error| StartupMetricError::Write(error.to_string()))?;
-            }
-            return Ok(outcome);
-        }
-        state.backend_spawned_before_window = true;
-        Ok(RecordOutcome::Recorded)
+        Ok(())
+    }
+
+    pub fn record_backend_spawned_before_window(
+        &self,
+    ) -> Result<RecordOutcome, StartupMetricError> {
+        self.record(StartupMilestone::BackendSpawned)
     }
 
     pub fn record_backend_listening_before_window(
         &self,
     ) -> Result<RecordOutcome, StartupMetricError> {
-        let Some(recorder) = &self.recorder else {
-            return Ok(RecordOutcome::Disabled);
-        };
-        let mut state = recorder
-            .state
-            .lock()
-            .map_err(|_| StartupMetricError::RecorderPoisoned)?;
-        let elapsed_ms = state.clock.elapsed_ms();
-        if state
-            .report
-            .milestones
-            .get(StartupMilestone::BackendListening)
-            .is_some()
-            || state.backend_listening_before_window
-        {
-            return Ok(RecordOutcome::Duplicate);
-        }
-        if state
-            .report
-            .milestones
-            .get(StartupMilestone::NativeWindowVisible)
-            .is_some()
-        {
-            let outcome = state
-                .report
-                .record(StartupMilestone::BackendListening, elapsed_ms)?;
-            if outcome == RecordOutcome::Recorded {
-                recorder
-                    .snapshots
-                    .send(state.report.clone())
-                    .map_err(|error| StartupMetricError::Write(error.to_string()))?;
-            }
-            return Ok(outcome);
-        }
-        state.backend_listening_before_window = true;
-        Ok(RecordOutcome::Recorded)
+        self.record(StartupMilestone::BackendListening)
     }
 
     pub fn record_or_warn(&self, milestone: StartupMilestone) {

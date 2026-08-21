@@ -44,24 +44,41 @@ function roleMetrics(rssBytes) {
     : { processCount: 0, rssBytes: 0 }]));
 }
 
-function startupRun(targetFileOpenedMs, rssBytes, pid) {
+function startupRun(targetFileOpenedMs, rssBytes, pid, startupMode = 'rust-gateway') {
+  const milestones = startupMode === 'rust-gateway'
+    ? {
+      process_started: 0,
+      gateway_listening: 50,
+      native_window_visible: 100,
+      frontend_request_started: 60,
+      frontend_bundle_loaded: 800,
+      backend_spawned: 20,
+      backend_listening: 500,
+      rpc_connected: 600,
+      frontend_shell_attached: 1_000,
+      target_file_opened: targetFileOpenedMs,
+      plugins_started: targetFileOpenedMs + 10,
+      plugins_ready: targetFileOpenedMs + 20,
+    }
+    : {
+      process_started: 0,
+      native_window_visible: 100,
+      backend_spawned: 120,
+      backend_listening: 500,
+      frontend_shell_attached: 1_000,
+      target_file_opened: targetFileOpenedMs,
+      plugins_started: targetFileOpenedMs + 10,
+      plugins_ready: targetFileOpenedMs + 20,
+    };
   return {
     startupReport: {
       schema: 'ride.startup-report',
-      version: 1,
+      version: 2,
       platform: 'windows',
       arch: 'x86_64',
       pid,
-      milestones: {
-        process_started: 0,
-        native_window_visible: 100,
-        backend_spawned: 120,
-        backend_listening: 500,
-        frontend_shell_attached: 1_000,
-        target_file_opened: targetFileOpenedMs,
-        plugins_started: targetFileOpenedMs + 10,
-        plugins_ready: targetFileOpenedMs + 20,
-      },
+      startupMode,
+      milestones,
     },
     metrics: {
       rootPid: pid,
@@ -95,14 +112,16 @@ function measurement({
   arch = 'x64',
   fingerprint = HISTORICAL_BASELINE_MIGRATION.hostFingerprint,
   commit = '0123456789abcdef0123456789abcdef01234567',
+  startupMode = 'rust-gateway',
 } = {}) {
   const samples = Array.from(
     { length: runs },
-    (_, index) => startupRun(targetFileOpenedMs, rssBytes, 7_300 + index),
+    (_, index) => startupRun(targetFileOpenedMs, rssBytes, 7_300 + index, startupMode),
   );
   return {
     schema: 'ride.startup-measurement',
-    version: 2,
+    version: 3,
+    startupMode,
     platform,
     arch,
     build: {
@@ -123,11 +142,33 @@ function measurement({
   };
 }
 
+function existingV2Measurement(options = {}) {
+  const value = measurement(options);
+  value.version = 2;
+  delete value.startupMode;
+  for (const run of value.runs) {
+    const targetFileOpenedMs = run.startupReport.milestones.target_file_opened;
+    run.startupReport.version = 1;
+    delete run.startupReport.startupMode;
+    run.startupReport.milestones = {
+      process_started: 0,
+      native_window_visible: 100,
+      backend_spawned: 120,
+      backend_listening: 500,
+      frontend_shell_attached: 1_000,
+      target_file_opened: targetFileOpenedMs,
+      plugins_started: targetFileOpenedMs + 10,
+      plugins_ready: targetFileOpenedMs + 20,
+    };
+  }
+  return value;
+}
+
 function legacyBaseline() {
   return JSON.parse(fs.readFileSync(HISTORICAL_BASELINE_PATH, 'utf8'));
 }
 
-test('accepts exactly five compatible v2 runs at the fixed gain thresholds', () => {
+test('accepts exactly five compatible v3 rust-gateway runs at the fixed gain thresholds', () => {
   const baseline = measurement({ targetFileOpenedMs: 5_310, rssBytes: 1_154_154_496 });
   const candidate = measurement({ targetFileOpenedMs: 3_717, rssBytes: 1_038_739_046 });
 
@@ -147,6 +188,48 @@ test('accepts exactly five compatible v2 runs at the fixed gain thresholds', () 
       delta: 0,
     },
   });
+});
+
+test('accepts an existing v2 baseline with a v3 rust-gateway candidate', () => {
+  const baseline = existingV2Measurement({
+    targetFileOpenedMs: 5_310,
+    rssBytes: 1_154_154_496,
+  });
+  const candidate = measurement({ targetFileOpenedMs: 3_717, rssBytes: 1_038_739_046 });
+
+  assert.equal(compareTauriPerformance(baseline, candidate, {
+    minStartupGain: 30,
+    minMemoryGain: 10,
+  }).runs, 5);
+});
+
+test('rejects legacy and mixed-mode optimized candidates', () => {
+  const baseline = measurement({ targetFileOpenedMs: 5_310, rssBytes: 1_154_154_496 });
+  for (const startupMode of ['legacy-explicit', 'legacy-fallback']) {
+    assert.throws(
+      () => compareTauriPerformance(
+        baseline,
+        measurement({
+          targetFileOpenedMs: 3_000,
+          rssBytes: 900_000_000,
+          startupMode,
+        }),
+        { minStartupGain: 30, minMemoryGain: 10 },
+      ),
+      new RegExp(`candidate.*${startupMode}`, 'i'),
+    );
+  }
+
+  const mixed = measurement({ targetFileOpenedMs: 3_000, rssBytes: 900_000_000 });
+  mixed.runs[1] = startupRun(3_000, 900_000_000, 7_301, 'legacy-fallback');
+  assert.throws(
+    () => compareTauriPerformance(
+      baseline,
+      mixed,
+      { minStartupGain: 30, minMemoryGain: 10 },
+    ),
+    /mixed effective startup modes|does not match.*startupMode/i,
+  );
 });
 
 test('requires exactly five candidate runs', () => {
@@ -182,7 +265,7 @@ test('rejects incompatible platform, architecture, and host identity', () => {
   }
 });
 
-test('requires matching v2 build contracts while allowing the candidate commit to change', () => {
+test('requires matching modern build contracts while allowing the candidate commit to change', () => {
   const baseline = measurement({
     targetFileOpenedMs: 5_310,
     rssBytes: 1_154_154_496,
@@ -217,7 +300,7 @@ test('requires matching v2 build contracts while allowing the candidate commit t
   }
 });
 
-test('rejects missing build identity and non-strict v2 role data', () => {
+test('rejects missing build identity and non-strict modern role data', () => {
   const baseline = measurement({ targetFileOpenedMs: 5_310, rssBytes: 1_154_154_496 });
   const missingBuild = measurement({ targetFileOpenedMs: 3_000, rssBytes: 900_000_000 });
   delete missingBuild.build;
@@ -240,7 +323,7 @@ test('rejects missing build identity and non-strict v2 role data', () => {
   );
 });
 
-test('strict v2 schema rejects persisted executable paths', () => {
+test('strict v3 schema rejects persisted executable paths', () => {
   const baseline = measurement({ targetFileOpenedMs: 5_310, rssBytes: 1_154_154_496 });
   const candidate = measurement({ targetFileOpenedMs: 3_717, rssBytes: 1_038_739_046 });
   candidate.executable = 'C:\\sensitive\\ride-tauri.exe';

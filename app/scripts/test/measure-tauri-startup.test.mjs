@@ -228,10 +228,11 @@ function startupReport(milestones, overrides = {}) {
   const target = currentRustTarget();
   return {
     schema: 'ride.startup-report',
-    version: 1,
+    version: 2,
     platform: target.platform,
     arch: target.arch,
     pid: 7331,
+    startupMode: 'rust-gateway',
     milestones,
     ...overrides,
   };
@@ -239,10 +240,14 @@ function startupReport(milestones, overrides = {}) {
 
 const targetMilestones = {
   process_started: 0,
+  gateway_listening: 2,
   native_window_visible: 5,
-  backend_spawned: 10,
+  frontend_request_started: 4,
+  frontend_bundle_loaded: 40,
+  backend_spawned: 3,
   backend_listening: 20,
-  frontend_shell_attached: 30,
+  rpc_connected: 30,
+  frontend_shell_attached: 40,
   target_file_opened: 42,
 };
 
@@ -389,24 +394,33 @@ test('owned diagnostics are lstat-checked before reading their ownership sentine
   assert.ok(lstat < sentinelRead, 'lstat must reject symlinks before reading a sentinel');
 });
 
-test('startup report parser accepts the strict incremental schema', () => {
+test('startup report parser accepts v2 parallel branches without using key order', () => {
   const linuxTarget = { expectedPlatform: 'linux', expectedArch: 'x86_64', phase: 'target' };
   const report = parseStartupReport(JSON.stringify({
     schema: 'ride.startup-report',
-    version: 1,
+    version: 2,
     platform: 'linux',
     arch: 'x86_64',
     pid: 412,
+    startupMode: 'rust-gateway',
     milestones: {
       process_started: 0,
+      gateway_listening: 2,
       native_window_visible: 5,
-      backend_spawned: 10,
-      backend_listening: 20,
-      frontend_shell_attached: 30,
+      frontend_request_started: 4,
+      frontend_bundle_loaded: 40,
+      backend_spawned: 3,
+      backend_listening: 30,
+      rpc_connected: 35,
+      frontend_shell_attached: 40,
       target_file_opened: 42,
     },
   }), linuxTarget);
 
+  assert.equal(report.version, 2);
+  assert.equal(report.startupMode, 'rust-gateway');
+  assert.equal(report.milestones.backend_listening, 30);
+  assert.equal(report.milestones.frontend_bundle_loaded, 40);
   assert.equal(report.milestones.target_file_opened, 42);
   assert.throws(
     () => parseStartupReport(JSON.stringify({ ...report, outputPath: '/tmp/injected' }), linuxTarget),
@@ -423,17 +437,32 @@ test('startup report parser accepts the strict incremental schema', () => {
     () => parseStartupReport(JSON.stringify({
       ...report,
       milestones: {
-        process_started: 10,
-        native_window_visible: 9,
-        backend_spawned: 12,
-        backend_listening: 20,
-        frontend_shell_attached: 30,
-        target_file_opened: 42,
+        ...report.milestones,
+        backend_listening: 2,
       },
     }), linuxTarget),
-    /not monotonic/,
+    /backend_listening.*backend_spawned.*timestamp/i,
   );
   assert.throws(() => parseStartupReport('{'), /valid JSON/);
+});
+
+test('startup report parser rejects missing graph predecessors and unknown modes', () => {
+  const missingPredecessor = startupReport({
+    process_started: 0,
+    gateway_listening: 2,
+    frontend_bundle_loaded: 40,
+  });
+  assert.throws(
+    () => parseStartupReport(JSON.stringify(missingPredecessor), { phase: 'incremental' }),
+    /frontend_bundle_loaded.*requires.*frontend_request_started/i,
+  );
+
+  assert.throws(
+    () => parseStartupReport(JSON.stringify(startupReport(targetMilestones, {
+      startupMode: 'unknown-mode',
+    }))),
+    /unsupported startup mode unknown-mode/i,
+  );
 });
 
 test('startup report parser rejects unsupported or mismatched platform and architecture values', () => {
@@ -467,34 +496,20 @@ test('startup report parser rejects unsupported or mismatched platform and archi
   );
 });
 
-test('target and final report phases require complete canonical milestone prefixes', () => {
+test('target and final report phases require their mode-aware completion milestones', () => {
   assert.throws(
     () => parseStartupReport(JSON.stringify(startupReport({
       process_started: 0,
-      backend_spawned: 10,
-      backend_listening: 20,
-      frontend_shell_attached: 30,
-      target_file_opened: 42,
+      gateway_listening: 2,
     }))),
-    /canonical milestone prefix/,
-  );
-  assert.throws(
-    () => parseStartupReport(JSON.stringify(startupReport({
-      backend_spawned: 10,
-      process_started: 0,
-      native_window_visible: 5,
-      backend_listening: 20,
-      frontend_shell_attached: 30,
-      target_file_opened: 42,
-    }))),
-    /canonical milestone prefix/,
+    /target_file_opened/,
   );
   assert.throws(
     () => parseStartupReport(
       JSON.stringify(startupReport(targetMilestones)),
       { phase: 'final' },
     ),
-    /complete final milestone sequence/,
+    /all rust-gateway final milestones/,
   );
   assert.equal(
     parseStartupReport(
@@ -505,7 +520,7 @@ test('target and final report phases require complete canonical milestone prefix
   );
 });
 
-test('report waiter tolerates canonical partial snapshots until the target prefix is complete', async () => {
+test('report waiter tolerates causal partial snapshots until target_file_opened is present', async () => {
   const root = temporaryDirectory('incremental-report');
   const reportPath = path.join(root, 'startup.json');
   fs.writeFileSync(reportPath, JSON.stringify(startupReport({ process_started: 0 })));
@@ -5425,8 +5440,8 @@ test('failure artifacts bound and redact oversized logs and error messages', asy
   }
 });
 
-test('campaign v2 records build and host identity plus per-role medians', async () => {
-  const root = temporaryDirectory('campaign-v2');
+test('campaign v3 records effective mode, build and host identity plus per-role medians', async () => {
+  const root = temporaryDirectory('campaign-v3');
   const executable = path.join(root, 'R-IDE');
   const output = path.join(root, 'startup-metrics.json');
   touch(executable);
@@ -5479,10 +5494,11 @@ test('campaign v2 records build and host identity plus per-role medians', async 
     });
 
     assert.equal(measurement.schema, 'ride.startup-measurement');
-    assert.equal(measurement.version, 2);
+    assert.equal(measurement.version, 3);
+    assert.equal(measurement.startupMode, 'rust-gateway');
     assert.deepEqual(measurement.build, build);
     assert.deepEqual(measurement.host, host);
-    assert.equal(measurement.runs[0].startupReport.version, 1);
+    assert.equal(measurement.runs[0].startupReport.version, 2);
     assert.equal(Object.hasOwn(measurement, 'executable'), false);
     assert.doesNotMatch(JSON.stringify(measurement), /"commandLine"|"executable"/);
     assert.deepEqual(measurement.median.roles.backend, {
@@ -5494,6 +5510,36 @@ test('campaign v2 records build and host identity plus per-role medians', async 
       rssBytes: 90,
     });
     assert.deepEqual(JSON.parse(fs.readFileSync(output, 'utf8')), measurement);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('campaign rejects mixed effective startup modes', async () => {
+  const root = temporaryDirectory('campaign-mixed-startup-modes');
+  const executable = path.join(root, 'R-IDE');
+  const output = path.join(root, 'startup-metrics.json');
+  touch(executable);
+  let run = 0;
+  try {
+    await assert.rejects(
+      runMeasurementCampaign({
+        executable,
+        output,
+        runs: 2,
+        idleMs: 0,
+        timeoutMs: 100,
+        pollMs: 1,
+      }, campaignDependencies({
+        measure: async () => ({
+          startupReport: startupReport(finalMilestones, {
+            startupMode: run++ === 0 ? 'rust-gateway' : 'legacy-fallback',
+          }),
+          metrics: campaignMetrics(),
+        }),
+      })),
+      /mixed effective startup modes/i,
+    );
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
