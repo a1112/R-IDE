@@ -170,7 +170,7 @@ function rewriteDesktopHtml(source) {
   ].join('; ');
   const cspMeta = `  <meta http-equiv="Content-Security-Policy" content="${csp}">\n`;
   const localeScript = '    <script type="text/javascript" src="./ride-bootstrap.js" charset="utf-8"></script>\n';
-  const afterBundleScript = '<script type="text/javascript" src="./ride-after-bundle.js" charset="utf-8"></script>';
+  const afterBundleScript = '<script type="module" src="./ride-after-bundle.js" charset="utf-8"></script>';
 
   html = html.replace(
     /\s*<script>\s*if \(document\.head\)[\s\S]*?<\/script\b[^>]*>/,

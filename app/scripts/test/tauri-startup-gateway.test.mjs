@@ -224,14 +224,26 @@ test('generates one gateway document while retaining the explicit legacy fronten
   const html = fs.readFileSync(path.join(generated.gatewayDirectory, 'index.html'), 'utf8');
   const bridge = fs.readFileSync(path.join(generated.gatewayDirectory, 'ride-bootstrap.js'), 'utf8');
   const afterBundle = fs.readFileSync(path.join(generated.gatewayDirectory, 'ride-after-bundle.js'), 'utf8');
-  const scriptSources = [...html.matchAll(/<script\b[^>]*\bsrc=["']([^"']+)["'][^>]*><\/script>/gi)]
-    .map(match => match[1]);
+  const scripts = [...html.matchAll(/<script\b([^>]*)><\/script>/gi)].map(match => ({
+    attributes: match[1],
+    fullTag: match[0],
+    index: match.index,
+    source: /(?:^|\s)src=["']([^"']+)["']/i.exec(match[1])?.[1],
+  }));
+  const externalScripts = scripts.filter(script => script.source);
+  const scriptSources = externalScripts.map(script => script.source);
 
   assert.equal(scriptSources.filter(source => source === './bundle.js').length, 1);
   assert.deepEqual(scriptSources, ['./ride-bootstrap.js', './bundle.js', './ride-after-bundle.js']);
+  const [bootstrapScript, bundleScript, afterBundleScript] = externalScripts;
+  assert.ok(bootstrapScript.index < bundleScript.index);
+  assert.match(bundleScript.attributes, /(?:^|\s)type=["']module["']/i);
+  assert.doesNotMatch(bundleScript.attributes, /(?:^|\s)async(?:\s|=|$)/i);
+  assert.match(afterBundleScript.attributes, /(?:^|\s)type=["']module["']/i);
+  assert.doesNotMatch(afterBundleScript.attributes, /(?:^|\s)async(?:\s|=|$)/i);
   assert.match(
-    html,
-    /src=["']\.\/bundle\.js["'][^>]*><\/script>\s*<script[^>]*src=["']\.\/ride-after-bundle\.js["'][^>]*><\/script>/i,
+    html.slice(bundleScript.index + bundleScript.fullTag.length, afterBundleScript.index),
+    /^\s*$/,
   );
   assert.match(html, /Content-Security-Policy/);
   assert.match(html, /connect-src 'self'/);
