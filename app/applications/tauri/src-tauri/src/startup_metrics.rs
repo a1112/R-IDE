@@ -19,6 +19,8 @@ pub const STARTUP_REPORT_ENV: &str = "RIDE_STARTUP_REPORT";
 pub const STARTUP_REPORT_SCHEMA: &str = "ride.startup-report";
 pub const STARTUP_REPORT_VERSION: u32 = 2;
 pub const STARTUP_MODE_ENV: &str = "RIDE_STARTUP_MODE";
+const UNKNOWN_STARTUP_MODE_WARNING: &str =
+    "Unsupported RIDE_STARTUP_MODE; using explicit legacy startup mode";
 const STARTUP_REPORT_WRITE_ATTEMPTS: usize = 3;
 const STARTUP_REPORT_RETRY_DELAY_MS: u64 = 10;
 
@@ -32,13 +34,31 @@ pub enum StartupMode {
 
 impl StartupMode {
     pub fn from_env() -> Self {
-        Self::from_env_value(std::env::var(STARTUP_MODE_ENV).ok().as_deref())
+        let (mode, warning) =
+            Self::from_env_value_with_warning(std::env::var(STARTUP_MODE_ENV).ok().as_deref());
+        if let Some(warning) = warning {
+            // This runs before env_logger is initialized, so use stderr directly.
+            // The warning deliberately does not include the environment value.
+            eprintln!("Warning: {warning}");
+        }
+        mode
     }
 
     pub fn from_env_value(value: Option<&str>) -> Self {
+        Self::from_env_value_with_warning(value).0
+    }
+
+    pub fn from_env_value_with_warning(value: Option<&str>) -> (Self, Option<&'static str>) {
         match value.map(str::trim) {
-            Some(value) if value.eq_ignore_ascii_case("legacy") => Self::LegacyExplicit,
-            _ => Self::RustGateway,
+            None | Some("") => (Self::RustGateway, None),
+            Some(value) if value.eq_ignore_ascii_case("rust-gateway") => (Self::RustGateway, None),
+            Some(value)
+                if value.eq_ignore_ascii_case("legacy")
+                    || value.eq_ignore_ascii_case("legacy-explicit") =>
+            {
+                (Self::LegacyExplicit, None)
+            }
+            Some(_) => (Self::LegacyExplicit, Some(UNKNOWN_STARTUP_MODE_WARNING)),
         }
     }
 

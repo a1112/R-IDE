@@ -5515,30 +5515,71 @@ test('campaign v3 records effective mode, build and host identity plus per-role 
   }
 });
 
-test('campaign rejects mixed effective startup modes', async () => {
+test('campaign stops on run 2 mode mismatch and preserves failure diagnostics', async () => {
   const root = temporaryDirectory('campaign-mixed-startup-modes');
   const executable = path.join(root, 'R-IDE');
   const output = path.join(root, 'startup-metrics.json');
   touch(executable);
-  let run = 0;
+  let calls = 0;
+  const firstRun = {
+    startupReport: startupReport(finalMilestones),
+    metrics: campaignMetrics(),
+  };
+  const legacyMilestones = {
+    process_started: 0,
+    native_window_visible: 5,
+    backend_spawned: 3,
+    backend_listening: 20,
+    frontend_shell_attached: 40,
+    target_file_opened: 42,
+    plugins_started: 50,
+    plugins_ready: 60,
+  };
   try {
     await assert.rejects(
       runMeasurementCampaign({
         executable,
         output,
-        runs: 2,
+        runs: 3,
         idleMs: 0,
         timeoutMs: 100,
         pollMs: 1,
       }, campaignDependencies({
-        measure: async () => ({
-          startupReport: startupReport(finalMilestones, {
-            startupMode: run++ === 0 ? 'rust-gateway' : 'legacy-fallback',
-          }),
-          metrics: campaignMetrics(),
-        }),
+        measure: async options => {
+          calls++;
+          const measuredRun = calls === 1 ? firstRun : {
+            startupReport: startupReport(legacyMilestones, {
+              startupMode: 'legacy-fallback',
+            }),
+            metrics: campaignMetrics(),
+          };
+          fs.writeFileSync(options.reportPath, JSON.stringify(measuredRun.startupReport));
+          fs.writeFileSync(options.stdoutLogPath, `stdout run ${calls}\n`);
+          fs.writeFileSync(options.stderrLogPath, `stderr run ${calls}\n`);
+          return measuredRun;
+        },
       })),
       /mixed effective startup modes/i,
+    );
+
+    assert.equal(calls, 2, 'the campaign must stop before run 3');
+    assert.equal(fs.existsSync(output), false);
+    const diagnostic = JSON.parse(fs.readFileSync(
+      path.join(root, 'startup-metrics.failure.json'),
+      'utf8',
+    ));
+    assert.equal(diagnostic.status, 'failed');
+    assert.equal(diagnostic.runIndex, 2);
+    assert.match(diagnostic.error.message, /mixed effective startup modes/i);
+    assert.deepEqual(diagnostic.completedRuns, [firstRun]);
+    assert.equal(diagnostic.startupReport.startupMode, 'legacy-fallback');
+    assert.equal(
+      fs.readFileSync(path.resolve(root, diagnostic.logs.stdout), 'utf8'),
+      'stdout run 2\n',
+    );
+    assert.equal(
+      fs.readFileSync(path.resolve(root, diagnostic.logs.stderr), 'utf8'),
+      'stderr run 2\n',
     );
   } finally {
     fs.rmSync(root, { recursive: true, force: true });

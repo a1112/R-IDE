@@ -198,6 +198,19 @@ fn install_shutdown_signal_handlers(app_handle: tauri::AppHandle) {
 #[cfg(not(unix))]
 fn install_shutdown_signal_handlers(_app_handle: tauri::AppHandle) {}
 
+fn initialize_current_startup_metrics(
+    startup_metrics: &startup_metrics::StartupMetrics,
+    requested_mode: startup_metrics::StartupMode,
+) -> Result<(), startup_metrics::StartupMetricError> {
+    startup_metrics.record(startup_metrics::StartupMilestone::ProcessStarted)?;
+    if requested_mode == startup_metrics::StartupMode::RustGateway {
+        // Transitional until Task 6: replace this unconditional fallback with
+        // the actual Rust gateway bind outcome before mode-specific milestones.
+        startup_metrics.select_effective_mode(startup_metrics::StartupMode::LegacyFallback)?;
+    }
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let _startup_job_lease = match startup_job::create_for_current_process_if_requested(
@@ -211,8 +224,9 @@ pub fn run() {
     };
     let requested_startup_mode = startup_metrics::StartupMode::from_env();
     let startup_metrics = startup_metrics::StartupMetrics::from_env(requested_startup_mode);
-    if let Err(error) = startup_metrics.record(startup_metrics::StartupMilestone::ProcessStarted) {
-        eprintln!("Warning: failed to record process_started startup milestone: {error}");
+    if let Err(error) = initialize_current_startup_metrics(&startup_metrics, requested_startup_mode)
+    {
+        eprintln!("Warning: failed to initialize startup metrics: {error}");
     }
     configure_local_proxy_bypass();
     let _ = env_logger::try_init();
@@ -385,7 +399,20 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+
+    struct CapturingStartupReportWriter {
+        reports: mpsc::Sender<serde_json::Value>,
+    }
+
+    impl startup_metrics::StartupReportWriter for CapturingStartupReportWriter {
+        fn write(&mut self, report: &startup_metrics::StartupReport) -> std::io::Result<()> {
+            self.reports
+                .send(serde_json::to_value(report).expect("serialize startup report"))
+                .map_err(std::io::Error::other)
+        }
+    }
 
     struct ProbePlugin {
         setup: Box<dyn FnOnce(&AppState)>,
@@ -495,6 +522,85 @@ mod tests {
         fn elapsed_ms(&self) -> u64 {
             0
         }
+    }
+
+    #[test]
+    fn current_startup_without_mode_env_falls_back_and_reaches_target_file_opened() {
+        let requested_mode = startup_metrics::StartupMode::from_env_value(None);
+        assert_eq!(requested_mode, startup_metrics::StartupMode::RustGateway);
+        let (reports_tx, reports_rx) = mpsc::channel();
+        let metrics = startup_metrics::StartupMetrics::with_clock_and_writer(
+            "windows",
+            "x86_64",
+            42,
+            requested_mode,
+            Arc::new(TestClock),
+            Box::new(CapturingStartupReportWriter {
+                reports: reports_tx,
+            }),
+        );
+
+        initialize_current_startup_metrics(&metrics, requested_mode)
+            .expect("initialize current startup metrics");
+        for milestone in [
+            startup_metrics::StartupMilestone::BackendSpawned,
+            startup_metrics::StartupMilestone::BackendListening,
+            startup_metrics::StartupMilestone::NativeWindowVisible,
+            startup_metrics::StartupMilestone::FrontendShellAttached,
+            startup_metrics::StartupMilestone::TargetFileOpened,
+        ] {
+            metrics.record(milestone).expect("record current milestone");
+        }
+
+        let final_report = (0..7)
+            .map(|_| {
+                reports_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("published startup report")
+            })
+            .last()
+            .expect("final startup report");
+        assert_eq!(final_report["startupMode"], "legacy-fallback");
+        assert_eq!(final_report["milestones"]["target_file_opened"], 0);
+    }
+
+    #[test]
+    fn current_startup_keeps_explicit_legacy_mode_valid() {
+        let requested_mode = startup_metrics::StartupMode::from_env_value(Some("legacy"));
+        let (reports_tx, reports_rx) = mpsc::channel();
+        let metrics = startup_metrics::StartupMetrics::with_clock_and_writer(
+            "windows",
+            "x86_64",
+            42,
+            requested_mode,
+            Arc::new(TestClock),
+            Box::new(CapturingStartupReportWriter {
+                reports: reports_tx,
+            }),
+        );
+
+        initialize_current_startup_metrics(&metrics, requested_mode)
+            .expect("initialize explicit legacy startup metrics");
+        for milestone in [
+            startup_metrics::StartupMilestone::BackendSpawned,
+            startup_metrics::StartupMilestone::BackendListening,
+            startup_metrics::StartupMilestone::NativeWindowVisible,
+            startup_metrics::StartupMilestone::FrontendShellAttached,
+            startup_metrics::StartupMilestone::TargetFileOpened,
+        ] {
+            metrics.record(milestone).expect("record current milestone");
+        }
+
+        let final_report = (0..6)
+            .map(|_| {
+                reports_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("published startup report")
+            })
+            .last()
+            .expect("final startup report");
+        assert_eq!(final_report["startupMode"], "legacy-explicit");
+        assert_eq!(final_report["milestones"]["target_file_opened"], 0);
     }
 
     #[test]

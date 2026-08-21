@@ -242,8 +242,52 @@ fn gateway_report_rejects_gateway_only_milestones_in_legacy_mode() {
 fn gateway_report_selects_explicit_legacy_mode_before_recorder_construction() {
     assert_eq!(StartupMode::from_env_value(None), StartupMode::RustGateway);
     assert_eq!(
+        StartupMode::from_env_value(Some("   \t")),
+        StartupMode::RustGateway
+    );
+    assert_eq!(
+        StartupMode::from_env_value(Some("rust-gateway")),
+        StartupMode::RustGateway
+    );
+    assert_eq!(
         StartupMode::from_env_value(Some("legacy")),
         StartupMode::LegacyExplicit
+    );
+    assert_eq!(
+        StartupMode::from_env_value(Some("legacy-explicit")),
+        StartupMode::LegacyExplicit
+    );
+}
+
+#[test]
+fn gateway_report_fails_safe_for_unknown_non_empty_startup_mode_without_disclosing_it() {
+    let sensitive_value = "unknown-secret-mode";
+    let (mode, warning) = StartupMode::from_env_value_with_warning(Some(sensitive_value));
+
+    assert_eq!(mode, StartupMode::LegacyExplicit);
+    assert_eq!(
+        warning,
+        Some("Unsupported RIDE_STARTUP_MODE; using explicit legacy startup mode")
+    );
+    assert!(!warning.expect("warning").contains(sensitive_value));
+
+    for value in [
+        None,
+        Some(""),
+        Some("  "),
+        Some("rust-gateway"),
+        Some("legacy"),
+        Some("legacy-explicit"),
+    ] {
+        assert_eq!(
+            StartupMode::from_env_value_with_warning(value).1,
+            None,
+            "unexpected warning for {value:?}"
+        );
+    }
+    assert_eq!(
+        StartupMode::from_env_value_with_warning(Some("legacy-fallback")),
+        (StartupMode::LegacyExplicit, warning)
     );
 }
 
@@ -794,21 +838,39 @@ fn disabled_recorder_never_creates_a_report() {
 }
 
 #[test]
-fn frontend_allowlist_excludes_native_and_backend_milestones() {
+fn frontend_allowlist_excludes_every_native_backend_and_gateway_milestone() {
     for milestone in [
+        StartupMilestone::ProcessStarted,
+        StartupMilestone::GatewayListening,
+        StartupMilestone::NativeWindowVisible,
+        StartupMilestone::FrontendRequestStarted,
+        StartupMilestone::FrontendBundleLoaded,
+        StartupMilestone::BackendSpawned,
+        StartupMilestone::BackendListening,
+        StartupMilestone::RpcConnected,
         StartupMilestone::FrontendShellAttached,
         StartupMilestone::TargetFileOpened,
         StartupMilestone::PluginsStarted,
         StartupMilestone::PluginsReady,
     ] {
-        assert!(milestone.is_frontend_reportable(), "{milestone:?}");
-    }
-    for milestone in [
-        StartupMilestone::ProcessStarted,
-        StartupMilestone::NativeWindowVisible,
-        StartupMilestone::BackendSpawned,
-        StartupMilestone::BackendListening,
-    ] {
-        assert!(!milestone.is_frontend_reportable(), "{milestone:?}");
+        let expected = match milestone {
+            StartupMilestone::FrontendShellAttached
+            | StartupMilestone::TargetFileOpened
+            | StartupMilestone::PluginsStarted
+            | StartupMilestone::PluginsReady => true,
+            StartupMilestone::ProcessStarted
+            | StartupMilestone::GatewayListening
+            | StartupMilestone::NativeWindowVisible
+            | StartupMilestone::FrontendRequestStarted
+            | StartupMilestone::FrontendBundleLoaded
+            | StartupMilestone::BackendSpawned
+            | StartupMilestone::BackendListening
+            | StartupMilestone::RpcConnected => false,
+        };
+        assert_eq!(
+            milestone.is_frontend_reportable(),
+            expected,
+            "{milestone:?}"
+        );
     }
 }

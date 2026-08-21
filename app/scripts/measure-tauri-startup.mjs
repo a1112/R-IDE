@@ -3446,7 +3446,7 @@ export async function runMeasurementCampaign(
         fs.promises.writeFile(stdoutLogPath, ''),
         fs.promises.writeFile(stderrLogPath, ''),
       ]);
-      rawRuns.push(await measure({
+      const measuredRun = await measure({
         executable,
         codeFile,
         reportPath,
@@ -3464,8 +3464,13 @@ export async function runMeasurementCampaign(
           }
           runId = verifiedRunId;
         },
-      }));
-      validateRoleMetrics(rawRuns.at(-1)?.metrics?.roles, `measurement run ${runIndex}`);
+      });
+      const firstMode = rawRuns[0]?.startupReport?.startupMode;
+      if (firstMode !== undefined && measuredRun?.startupReport?.startupMode !== firstMode) {
+        throw new Error('measurement campaign reported mixed effective startup modes');
+      }
+      validateRoleMetrics(measuredRun?.metrics?.roles, `measurement run ${runIndex}`);
+      rawRuns.push(measuredRun);
     } catch (error) {
       const runSensitiveValues = [
         ...sensitiveValues,
