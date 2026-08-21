@@ -124,6 +124,12 @@ impl std::error::Error for GatewayLimitError {}
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct BackendGeneration(u64);
 
+impl BackendGeneration {
+    /// Sentinel used by the legacy launch path, which is not managed by a
+    /// gateway generation. Real gateway generations start at one.
+    pub(crate) const UNMANAGED: Self = Self(0);
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BackendLease {
     pub generation: BackendGeneration,
@@ -344,6 +350,20 @@ impl GatewayState {
         generation: BackendGeneration,
         backend_addr: SocketAddr,
     ) -> Result<(), GatewayError> {
+        self.backend_ready_if_current(generation, backend_addr, || true)
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn backend_ready_if_current<F>(
+        &self,
+        generation: BackendGeneration,
+        backend_addr: SocketAddr,
+        before_publish: F,
+    ) -> Result<bool, GatewayError>
+    where
+        F: FnOnce() -> bool + Send,
+    {
         Self::validate_backend_addr(backend_addr)?;
         let mut current = self.inner.current.lock().await;
         Self::require_current_generation(&current, generation)?;
@@ -356,6 +376,9 @@ impl GatewayState {
                 phase: current.snapshot.phase,
             });
         }
+        if !before_publish() {
+            return Ok(false);
+        }
 
         *current = PublishedBackend {
             snapshot: GatewaySnapshot {
@@ -366,7 +389,7 @@ impl GatewayState {
             backend_addr: Some(backend_addr),
         };
         self.inner.readiness.send_replace(current.clone());
-        Ok(())
+        Ok(true)
     }
 
     pub async fn fail_backend(

@@ -22,21 +22,43 @@ mod startup_job;
 pub mod startup_metrics;
 
 use std::ffi::OsString;
+use std::future::Future;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use tauri::{Emitter, Manager};
 
 const MAX_PENDING_LAUNCH_INTENTS: usize = 64;
+pub const GATEWAY_WINDOW_VISIBLE_DEADLINE: std::time::Duration =
+    std::time::Duration::from_millis(800);
 static NEXT_SECONDARY_WINDOW_ID: AtomicU64 = AtomicU64::new(1);
 
-fn is_trusted_secondary_window_url(url: &tauri::Url) -> bool {
-    url.scheme() == "http"
+pub fn is_trusted_secondary_window_url(url: &tauri::Url, public_authority: &str) -> bool {
+    let Ok(expected) = public_authority.parse::<SocketAddr>() else {
+        return false;
+    };
+    expected.ip() == Ipv4Addr::LOCALHOST
+        && url.scheme() == "http"
+        && url.username().is_empty()
+        && url.password().is_none()
         && url.host_str() == Some("127.0.0.1")
-        && url.port() == Some(sidecar::BACKEND_PORT)
+        && url.port() == Some(expected.port())
         && url.path() == "/secondary-window.html"
         && url.query().is_none()
         && url.fragment().is_none()
+}
+
+pub async fn shutdown_gateway_before_backend<G, B, E>(
+    gateway_stop: G,
+    backend_cleanup: B,
+) -> Result<(), E>
+where
+    G: Future<Output = ()>,
+    B: FnOnce() -> Result<(), E>,
+{
+    gateway_stop.await;
+    backend_cleanup()
 }
 
 fn configure_local_proxy_bypass() {
@@ -69,6 +91,8 @@ pub struct AppState {
     pub performance: performance::PerformanceSampler,
     pub smoke: smoke::SmokeProtocol,
     pub startup_metrics: startup_metrics::StartupMetrics,
+    pub startup_mode: Mutex<startup_metrics::StartupMode>,
+    pub gateway: Mutex<Option<startup_gateway::StartupGateway>>,
     pub runtime_paths: startup::RuntimePathsCache,
 }
 
@@ -76,6 +100,7 @@ impl AppState {
     fn new(
         initial_launch_intent: Option<launch_intent::LaunchIntent>,
         startup_metrics: startup_metrics::StartupMetrics,
+        startup_mode: startup_metrics::StartupMode,
     ) -> Self {
         Self {
             backend_port: Mutex::new(None),
@@ -89,6 +114,8 @@ impl AppState {
             performance: performance::PerformanceSampler::default(),
             smoke: smoke::SmokeProtocol::from_process_environment(),
             startup_metrics,
+            startup_mode: Mutex::new(startup_mode),
+            gateway: Mutex::new(None),
             runtime_paths: startup::RuntimePathsCache::default(),
         }
     }
@@ -115,6 +142,7 @@ fn configure_activation_builder<B, P, RegisterPlugin, ManageState>(
     activation_plugin: P,
     initial_launch_intent: Option<launch_intent::LaunchIntent>,
     startup_metrics: startup_metrics::StartupMetrics,
+    startup_mode: startup_metrics::StartupMode,
     register_plugin: RegisterPlugin,
     manage_state: ManageState,
 ) -> B
@@ -125,8 +153,51 @@ where
     let builder = register_plugin(builder, activation_plugin);
     manage_state(
         builder,
-        AppState::new(initial_launch_intent, startup_metrics),
+        AppState::new(initial_launch_intent, startup_metrics, startup_mode),
     )
+}
+
+fn trusted_secondary_window_authority(app: &tauri::AppHandle) -> Option<String> {
+    let state = app.try_state::<AppState>()?;
+    if let Some(gateway) = state.gateway.lock().ok()?.as_ref() {
+        return Some(gateway.public_authority());
+    }
+    let mode = *state.startup_mode.lock().ok()?;
+    match mode {
+        startup_metrics::StartupMode::LegacyExplicit
+        | startup_metrics::StartupMode::LegacyFallback => {
+            Some(format!("127.0.0.1:{}", sidecar::BACKEND_PORT))
+        }
+        startup_metrics::StartupMode::RustGateway => None,
+    }
+}
+
+fn register_gateway_capability(
+    app: &tauri::App,
+    spec: &startup::GatewayCapabilitySpec,
+) -> tauri::Result<()> {
+    let mut capability = tauri::ipc::CapabilityBuilder::new(spec.identifier.clone())
+        .local(false)
+        .remote(spec.origin.clone())
+        .windows(["main", "theia-secondary-*"]);
+    for permission in &spec.permissions {
+        capability = capability.permission(*permission);
+    }
+    app.add_capability(capability)
+}
+
+fn shutdown_application(app_handle: &tauri::AppHandle) -> Result<(), String> {
+    let gateway = app_handle
+        .try_state::<AppState>()
+        .and_then(|state| state.gateway.lock().ok()?.take());
+    tauri::async_runtime::block_on(shutdown_gateway_before_backend(
+        async move {
+            if let Some(gateway) = gateway {
+                gateway.shutdown().await;
+            }
+        },
+        || sidecar::stop_backend(app_handle),
+    ))
 }
 
 fn restore_main_window(app: &tauri::AppHandle) {
@@ -188,8 +259,8 @@ fn install_shutdown_signal_handlers(app_handle: tauri::AppHandle) {
 
     std::thread::spawn(move || {
         if signals.forever().next().is_some() {
-            if let Err(e) = sidecar::stop_backend(&app_handle) {
-                log::warn!("Failed to stop backend after shutdown signal: {}", e);
+            if let Err(e) = shutdown_application(&app_handle) {
+                log::warn!("Failed to stop application after shutdown signal: {}", e);
             }
             app_handle.exit(0);
         }
@@ -247,6 +318,7 @@ pub fn run() {
         }),
         initial_launch_intent,
         startup_metrics,
+        requested_startup_mode,
         |builder, plugin| builder.plugin(plugin),
         |builder, state| builder.manage(state),
     );
@@ -255,7 +327,7 @@ pub fn run() {
         .setup(move |app| {
             native_chrome::install_menu_event_bridge(app.handle());
 
-            let main_window_config = app
+            let mut main_window_config = app
                 .config()
                 .app
                 .windows
@@ -263,6 +335,36 @@ pub fn run() {
                 .find(|config| config.label == "main")
                 .cloned()
                 .ok_or_else(|| std::io::Error::other("missing main window configuration"))?;
+            let runtime_paths = sidecar::resolve_runtime_paths(app.handle())?;
+            let startup_metrics = app.state::<AppState>().startup_metrics.clone();
+            let mut launch = tauri::async_runtime::block_on(
+                startup::StartupCoordinator::new(requested_startup_mode, startup_metrics).launch(
+                    runtime_paths.gateway_frontend_directory(),
+                    main_window_config.url.clone(),
+                ),
+            )
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+            if let Some(reason) = launch.fallback_reason.as_deref() {
+                log::warn!("Startup gateway unavailable; using legacy fallback: {reason}");
+            }
+            *app.state::<AppState>().startup_mode.lock().unwrap() = launch.mode;
+
+            let readiness_publisher = match launch.gateway.as_ref() {
+                Some(gateway) => {
+                    let capability = startup::GatewayCapabilitySpec::for_gateway(gateway);
+                    register_gateway_capability(app, &capability)?;
+                    sidecar::BackendReadinessPublisher::gateway(
+                        gateway.state(),
+                        launch.backend_generation,
+                        gateway.public_authority(),
+                        launch.window_created_gate(),
+                    )
+                }
+                None => sidecar::BackendReadinessPublisher::legacy(),
+            };
+            main_window_config.url = launch.initial_url.clone();
+            *app.state::<AppState>().gateway.lock().unwrap() = launch.gateway.take();
+
             let app_handle = app.handle().clone();
             let backend_start = app
                 .state::<AppState>()
@@ -271,8 +373,13 @@ pub fn run() {
                 .unwrap()
                 .reserve_start();
             tauri::async_runtime::spawn(async move {
-                if let Err(e) =
-                    sidecar::start_backend(&app_handle, initial_workspace, backend_start).await
+                if let Err(e) = sidecar::start_backend(
+                    &app_handle,
+                    initial_workspace,
+                    backend_start,
+                    readiness_publisher,
+                )
+                .await
                 {
                     eprintln!("Failed to start backend: {}", e);
                 }
@@ -282,7 +389,15 @@ pub fn run() {
             let window =
                 tauri::WebviewWindowBuilder::from_config(app.handle(), &main_window_config)?
                     .on_new_window(move |url, features| {
-                        if !is_trusted_secondary_window_url(&url) {
+                        let Some(public_authority) =
+                            trusted_secondary_window_authority(&secondary_window_app)
+                        else {
+                            log::warn!(
+                        "Denied secondary-window navigation without an active startup authority"
+                    );
+                            return tauri::webview::NewWindowResponse::Deny;
+                        };
+                        if !is_trusted_secondary_window_url(&url, &public_authority) {
                             log::warn!("Denied untrusted secondary-window navigation: {url}");
                             return tauri::webview::NewWindowResponse::Deny;
                         }
@@ -313,17 +428,12 @@ pub fn run() {
                         }
                     })
                     .build()?;
+            launch.mark_window_created();
             native_chrome::configure_native_window(&window);
-            match window.is_visible() {
-                Ok(true) => app
-                    .state::<AppState>()
-                    .startup_metrics
-                    .record_or_warn(startup_metrics::StartupMilestone::NativeWindowVisible),
-                Ok(false) => {}
-                Err(error) => {
-                    log::warn!("Failed to observe initial main-window visibility: {error}")
-                }
-            }
+            window.show()?;
+            app.state::<AppState>()
+                .startup_metrics
+                .record_or_warn(startup_metrics::StartupMilestone::NativeWindowVisible);
 
             Ok(())
         })
@@ -360,8 +470,8 @@ pub fn run() {
             ..
         } if label == "main" => {
             close_secondary_windows(app_handle);
-            if let Err(error) = sidecar::stop_backend(app_handle) {
-                log::warn!("Failed to stop backend while closing the main window: {error}");
+            if let Err(error) = shutdown_application(app_handle) {
+                log::warn!("Failed to stop application while closing the main window: {error}");
             }
             app_handle.exit(0);
         }
@@ -376,24 +486,20 @@ pub fn run() {
             log_launch_intent_delivery_failures("macOS opened URL", report.failures);
         }
         tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
-            if let Err(e) = sidecar::stop_backend(app_handle) {
-                log::warn!("Failed to stop backend during shutdown: {}", e);
+            if let Err(e) = shutdown_application(app_handle) {
+                log::warn!("Failed to stop application during shutdown: {}", e);
             }
         }
         _ => {}
     });
 }
 
-fn initialize_current_startup_metrics(
+pub fn initialize_current_startup_metrics(
     startup_metrics: &startup_metrics::StartupMetrics,
     requested_mode: startup_metrics::StartupMode,
 ) -> Result<(), startup_metrics::StartupMetricError> {
     startup_metrics.record(startup_metrics::StartupMilestone::ProcessStarted)?;
-    if requested_mode == startup_metrics::StartupMode::RustGateway {
-        // Transitional until Task 6: replace this unconditional fallback with
-        // the actual Rust gateway bind outcome before mode-specific milestones.
-        startup_metrics.select_effective_mode(startup_metrics::StartupMode::LegacyFallback)?;
-    }
+    let _ = requested_mode;
     Ok(())
 }
 
@@ -469,6 +575,7 @@ mod tests {
                 startup_metrics::StartupMode::LegacyExplicit,
                 Arc::new(TestClock),
             ),
+            startup_metrics::StartupMode::LegacyExplicit,
             |mut builder, plugin| {
                 builder.assembly_order.push("plugin");
                 builder.plugin = Some(plugin);
@@ -500,7 +607,7 @@ mod tests {
     fn secondary_window_url_is_limited_to_the_packaged_theia_page() {
         let trusted = tauri::Url::parse("http://127.0.0.1:3000/secondary-window.html")
             .expect("trusted secondary-window URL");
-        assert!(is_trusted_secondary_window_url(&trusted));
+        assert!(is_trusted_secondary_window_url(&trusted, "127.0.0.1:3000"));
 
         for untrusted in [
             "https://127.0.0.1:3000/secondary-window.html",
@@ -512,7 +619,10 @@ mod tests {
             "https://example.com/secondary-window.html",
         ] {
             let url = tauri::Url::parse(untrusted).expect("untrusted URL fixture");
-            assert!(!is_trusted_secondary_window_url(&url), "accepted {url}");
+            assert!(
+                !is_trusted_secondary_window_url(&url, "127.0.0.1:3000"),
+                "accepted {url}"
+            );
         }
     }
 
@@ -526,7 +636,7 @@ mod tests {
     }
 
     #[test]
-    fn current_startup_without_mode_env_falls_back_and_reaches_target_file_opened() {
+    fn current_startup_without_mode_env_waits_for_gateway_bind_outcome() {
         let requested_mode = startup_metrics::StartupMode::from_env_value(None);
         assert_eq!(requested_mode, startup_metrics::StartupMode::RustGateway);
         let (reports_tx, reports_rx) = mpsc::channel();
@@ -543,26 +653,11 @@ mod tests {
 
         initialize_current_startup_metrics(&metrics, requested_mode)
             .expect("initialize current startup metrics");
-        for milestone in [
-            startup_metrics::StartupMilestone::BackendSpawned,
-            startup_metrics::StartupMilestone::BackendListening,
-            startup_metrics::StartupMilestone::NativeWindowVisible,
-            startup_metrics::StartupMilestone::FrontendShellAttached,
-            startup_metrics::StartupMilestone::TargetFileOpened,
-        ] {
-            metrics.record(milestone).expect("record current milestone");
-        }
-
-        let final_report = (0..7)
-            .map(|_| {
-                reports_rx
-                    .recv_timeout(Duration::from_secs(1))
-                    .expect("published startup report")
-            })
-            .last()
-            .expect("final startup report");
-        assert_eq!(final_report["startupMode"], "legacy-fallback");
-        assert_eq!(final_report["milestones"]["target_file_opened"], 0);
+        let initialized = reports_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("published startup report");
+        assert_eq!(initialized["startupMode"], "rust-gateway");
+        assert!(reports_rx.recv_timeout(Duration::from_millis(50)).is_err());
     }
 
     #[test]

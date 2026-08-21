@@ -11,13 +11,15 @@ use crate::startup::{
     finish_backend_stop, resolve_tauri_config_directory, wait_for_owned_loopback,
     BackendLaunchPlan, BackendReadinessPolicy, BackendSpawnStrategy, BackendStartToken,
     BackendStartupAction, BackendStartupEvent, BackendStartupState, BackendTransport,
-    RuntimePathMode, RuntimePaths,
+    RuntimePathMode, RuntimePaths, StartupWindowCreatedGate,
 };
+use crate::startup_gateway::{BackendGeneration, GatewayState};
 use crate::startup_metrics::StartupMilestone;
 use dirs::home_dir;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::fs;
 use std::io::BufRead;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
 use std::time::Duration;
@@ -30,6 +32,88 @@ const BACKEND_STARTUP_TIMEOUT: u64 = 240; // seconds
 pub(crate) const BACKEND_PORT: u16 = 3000;
 const BACKEND_PROBE_INTERVAL: Duration = Duration::from_millis(50);
 const BACKEND_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+
+#[derive(Clone)]
+pub enum BackendReadinessPublisher {
+    Legacy,
+    Gateway {
+        state: GatewayState,
+        generation: BackendGeneration,
+        public_authority: String,
+        window_created: StartupWindowCreatedGate,
+    },
+}
+
+impl BackendReadinessPublisher {
+    pub fn legacy() -> Self {
+        Self::Legacy
+    }
+
+    pub fn gateway(
+        state: GatewayState,
+        generation: BackendGeneration,
+        public_authority: String,
+        window_created: StartupWindowCreatedGate,
+    ) -> Self {
+        Self::Gateway {
+            state,
+            generation,
+            public_authority,
+            window_created,
+        }
+    }
+
+    pub fn theia_hosts(&self) -> Option<String> {
+        match self {
+            Self::Legacy => None,
+            Self::Gateway {
+                public_authority, ..
+            } => Some(public_authority.clone()),
+        }
+    }
+
+    pub async fn backend_ready(&self, backend_addr: SocketAddr) -> Result<(), String> {
+        self.backend_ready_after_window(backend_addr, || true)
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn backend_ready_after_window<F>(
+        &self,
+        backend_addr: SocketAddr,
+        before_publish: F,
+    ) -> Result<bool, String>
+    where
+        F: FnOnce() -> bool + Send,
+    {
+        match self {
+            Self::Legacy => Ok(before_publish()),
+            Self::Gateway {
+                state,
+                generation,
+                window_created,
+                ..
+            } => {
+                window_created.wait().await;
+                state
+                    .backend_ready_if_current(*generation, backend_addr, before_publish)
+                    .await
+                    .map_err(|error| error.to_string())
+            }
+        }
+    }
+
+    pub async fn backend_failed(&self) {
+        if let Self::Gateway {
+            state, generation, ..
+        } = self
+        {
+            if let Err(error) = state.fail_backend(*generation, "backend unavailable").await {
+                log::debug!("Gateway ignored backend failure publication: {error}");
+            }
+        }
+    }
+}
 
 trait BackendChildEnvironment {
     fn remove_environment(&mut self, name: &str);
@@ -53,7 +137,7 @@ fn remove_smoke_environment(command: &mut impl BackendChildEnvironment) {
     }
 }
 
-fn resolve_runtime_paths(app_handle: &AppHandle) -> Result<RuntimePaths, String> {
+pub(crate) fn resolve_runtime_paths(app_handle: &AppHandle) -> Result<RuntimePaths, String> {
     let state = app_handle.state::<crate::AppState>();
     state
         .runtime_paths
@@ -279,21 +363,31 @@ pub fn publish_backend_listening_in_order(
     publish(port);
 }
 
-fn publish_backend_listening(app_handle: &AppHandle, pid: u32, port: u16) -> bool {
-    let Some(state) = app_handle.try_state::<crate::AppState>() else {
-        return false;
-    };
-    let ownership = state.backend_ownership.lock().unwrap();
-    if !ownership.owns_active(pid) {
-        return false;
+async fn publish_backend_listening(
+    app_handle: &AppHandle,
+    pid: u32,
+    port: u16,
+    publisher: &BackendReadinessPublisher,
+) -> Result<bool, String> {
+    let published = publisher
+        .backend_ready_after_window(SocketAddr::from(([127, 0, 0, 1], port)), || {
+            let Some(state) = app_handle.try_state::<crate::AppState>() else {
+                return false;
+            };
+            let ownership = state.backend_ownership.lock().unwrap();
+            if !ownership.owns_active(pid) {
+                return false;
+            }
+            let mut published_port = state.backend_port.lock().unwrap();
+            record_backend_listening(app_handle);
+            *published_port = Some(port);
+            true
+        })
+        .await?;
+    if published && matches!(publisher, BackendReadinessPublisher::Legacy) {
+        announce_backend_port(app_handle, port);
     }
-    let mut published_port = state.backend_port.lock().unwrap();
-    record_backend_listening_before_window(app_handle);
-    *published_port = Some(port);
-    drop(published_port);
-    drop(ownership);
-    announce_backend_port(app_handle, port);
-    true
+    Ok(published)
 }
 
 fn register_backend_pid(
@@ -712,6 +806,7 @@ async fn start_node_backend_process(
     frontend_dir: Option<PathBuf>,
     launch_plan: &BackendLaunchPlan,
     backend_start: BackendStartToken,
+    publisher: BackendReadinessPublisher,
 ) -> Result<(), String> {
     ensure_backend_port_available(BACKEND_PORT)?;
     let script_path = node_runtime_path(&config.script_path);
@@ -759,6 +854,9 @@ async fn start_node_backend_process(
     );
     command.env("NODE_ENV", "production");
     command.env("THEIA_CONFIG_DIR", config_dir.to_string_lossy().to_string());
+    if let Some(public_authority) = publisher.theia_hosts() {
+        command.env("THEIA_HOSTS", public_authority);
+    }
 
     let mut child = pair
         .slave
@@ -953,7 +1051,7 @@ async fn start_node_backend_process(
     }
     log::info!("Backend ready on port {}", ready_port);
     let pid = child_pid.expect("PTY backend readiness requires an owned process id");
-    if !publish_backend_listening(app_handle, pid, ready_port) {
+    if !publish_backend_listening(app_handle, pid, ready_port, &publisher).await? {
         let fallback = kill_portable_child_async(pty_killer).await;
         let reaped = tokio::time::timeout(Duration::from_secs(5), exit_rx.recv()).await;
         clear_backend_process(app_handle, pid);
@@ -980,6 +1078,7 @@ async fn start_node_backend_process(
     });
 
     let app_handle_exit = app_handle.clone();
+    let exit_publisher = publisher.clone();
     std::thread::spawn(move || {
         if let Some(exit) = exit_rx.blocking_recv() {
             let stopping = child_pid
@@ -994,6 +1093,10 @@ async fn start_node_backend_process(
                 move |message| {
                     log::error!("{message}");
                     let _ = report_handle.emit("backend-error", message);
+                    let publisher = exit_publisher.clone();
+                    tauri::async_runtime::spawn(async move {
+                        publisher.backend_failed().await;
+                    });
                 },
             );
         }
@@ -1064,6 +1167,7 @@ async fn apply_backend_cleanup_actions(
     app_handle: &AppHandle,
     child: &mut tokio::process::Child,
     actions: impl IntoIterator<Item = BackendStartupAction>,
+    publisher: &BackendReadinessPublisher,
 ) -> Result<(), String> {
     let mut termination_error = None;
     let mut owned_pid = None;
@@ -1091,7 +1195,7 @@ async fn apply_backend_cleanup_actions(
                     clear_backend_state(app_handle);
                 }
             }
-            other => apply_backend_startup_actions(app_handle, [other]).await?,
+            other => apply_backend_startup_actions(app_handle, [other], publisher).await?,
         }
     }
     match termination_error {
@@ -1103,11 +1207,12 @@ async fn apply_backend_cleanup_actions(
 async fn apply_backend_startup_actions(
     app_handle: &AppHandle,
     actions: impl IntoIterator<Item = BackendStartupAction>,
+    publisher: &BackendReadinessPublisher,
 ) -> Result<(), String> {
     for action in actions {
         match action {
             BackendStartupAction::PublishReady { pid, port } => {
-                if !publish_backend_listening(app_handle, pid, port) {
+                if !publish_backend_listening(app_handle, pid, port, publisher).await? {
                     return Err("Backend start was cancelled before readiness publication".into());
                 }
             }
@@ -1138,8 +1243,12 @@ async fn apply_backend_startup_actions(
     Ok(())
 }
 
-fn spawn_backend_pipe_log<R>(app_handle: AppHandle, reader: R, stderr: bool)
-where
+fn spawn_backend_pipe_log<R>(
+    app_handle: AppHandle,
+    reader: R,
+    stderr: bool,
+    publisher: BackendReadinessPublisher,
+) where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
     tauri::async_runtime::spawn(async move {
@@ -1150,7 +1259,7 @@ where
             } else {
                 BackendStartupAction::LogStdout(line)
             };
-            let _ = apply_backend_startup_actions(&app_handle, [action]).await;
+            let _ = apply_backend_startup_actions(&app_handle, [action], &publisher).await;
         }
     });
 }
@@ -1162,6 +1271,7 @@ async fn start_backend_direct_process(
     frontend_dir: Option<PathBuf>,
     launch_plan: &BackendLaunchPlan,
     backend_start: BackendStartToken,
+    publisher: BackendReadinessPublisher,
 ) -> Result<(), String> {
     ensure_backend_port_available(BACKEND_PORT)?;
     let script_path = node_runtime_path(&config.script_path);
@@ -1191,6 +1301,9 @@ async fn start_backend_direct_process(
     command.args(launch_plan.arguments());
     command.env("NODE_ENV", "production");
     command.env("THEIA_CONFIG_DIR", config_dir);
+    if let Some(public_authority) = publisher.theia_hosts() {
+        command.env("THEIA_HOSTS", public_authority);
+    }
     if let Some(frontend_dir) = frontend_dir {
         command.env("RIDE_FRONTEND_DIR", frontend_dir);
     }
@@ -1237,6 +1350,7 @@ async fn start_backend_direct_process(
                 app_handle,
                 &mut child,
                 startup_state.observe(BackendStartupEvent::TimedOut),
+                &publisher,
             )
             .await;
             return match cleanup {
@@ -1254,6 +1368,7 @@ async fn start_backend_direct_process(
                 app_handle,
                 &mut child,
                 startup_state.observe(BackendStartupEvent::TimedOut),
+                &publisher,
             )
             .await;
             return match cleanup {
@@ -1264,8 +1379,8 @@ async fn start_backend_direct_process(
             };
         }
     };
-    spawn_backend_pipe_log(app_handle.clone(), stdout, false);
-    spawn_backend_pipe_log(app_handle.clone(), stderr, true);
+    spawn_backend_pipe_log(app_handle.clone(), stdout, false, publisher.clone());
+    spawn_backend_pipe_log(app_handle.clone(), stderr, true, publisher.clone());
 
     let readiness_policy = BackendReadinessPolicy::new(
         Duration::from_secs(BACKEND_STARTUP_TIMEOUT),
@@ -1317,6 +1432,7 @@ async fn start_backend_direct_process(
                     app_handle,
                     &mut child,
                     startup_state.observe(BackendStartupEvent::TimedOut),
+                    &publisher,
                 ).await;
                 if let Err(cleanup) = cleanup {
                     clear_backend_state(app_handle);
@@ -1354,6 +1470,7 @@ async fn start_backend_direct_process(
             if let Err(error) = apply_backend_startup_actions(
                 app_handle,
                 startup_state.observe(BackendStartupEvent::LoopbackConnected),
+                &publisher,
             ).await {
                 let cleanup = kill_and_reap_backend_child(&mut child).await;
                 clear_backend_process(app_handle, pid);
@@ -1363,6 +1480,7 @@ async fn start_backend_direct_process(
                 });
             }
             let app_handle_exit = app_handle.clone();
+            let exit_publisher = publisher.clone();
             tauri::async_runtime::spawn(async move {
                 let exit = tokio::select! {
                     biased;
@@ -1390,6 +1508,10 @@ async fn start_backend_direct_process(
                     move |message| {
                         log::error!("{message}");
                         let _ = report_handle.emit("backend-error", message);
+                        let publisher = exit_publisher.clone();
+                        tauri::async_runtime::spawn(async move {
+                            publisher.backend_failed().await;
+                        });
                     },
                 );
             });
@@ -1403,6 +1525,7 @@ pub async fn start_backend_process(
     app_handle: &AppHandle,
     launch_plan: &BackendLaunchPlan,
     backend_start: BackendStartToken,
+    publisher: BackendReadinessPublisher,
 ) -> Result<(), String> {
     let paths = resolve_runtime_paths(app_handle)?;
     let config = get_backend_config(&paths);
@@ -1450,6 +1573,7 @@ pub async fn start_backend_process(
                     frontend_dir,
                     launch_plan,
                     backend_start,
+                    publisher,
                 )
                 .await
             }
@@ -1461,6 +1585,7 @@ pub async fn start_backend_process(
                     frontend_dir,
                     launch_plan,
                     backend_start,
+                    publisher,
                 )
                 .await
             }
@@ -1474,6 +1599,7 @@ pub async fn start_backend_process(
         frontend_dir,
         launch_plan,
         backend_start,
+        publisher,
     )
     .await
 }
@@ -1486,11 +1612,11 @@ fn record_backend_spawned_before_window(app_handle: &AppHandle) {
     }
 }
 
-fn record_backend_listening_before_window(app_handle: &AppHandle) {
+fn record_backend_listening(app_handle: &AppHandle) {
     if let Some(state) = app_handle.try_state::<crate::AppState>() {
         if let Err(error) = state
             .startup_metrics
-            .record_backend_listening_before_window()
+            .record(StartupMilestone::BackendListening)
         {
             log::warn!("Failed to record overlapped backend readiness: {error}");
         }
@@ -1588,11 +1714,13 @@ pub async fn start_backend(
     app_handle: &AppHandle,
     workspace: Option<PathBuf>,
     backend_start: BackendStartToken,
+    publisher: BackendReadinessPublisher,
 ) -> Result<(), String> {
     let launch_plan = BackendLaunchPlan::new(workspace);
-    match start_backend_process(app_handle, &launch_plan, backend_start).await {
+    match start_backend_process(app_handle, &launch_plan, backend_start, publisher.clone()).await {
         Ok(()) => Ok(()),
         Err(error) => {
+            publisher.backend_failed().await;
             log::error!("Failed to start backend: {error}");
             let _ = app_handle.emit("backend-error", format!("Failed to start: {error}"));
             Err(error)

@@ -8,9 +8,202 @@
  ********************************************************************************/
 
 use std::ffi::OsString;
+use std::fmt;
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
+
+use crate::startup_gateway::{BackendGeneration, GatewayError, GatewayLimits, StartupGateway};
+use crate::startup_metrics::{StartupMetricError, StartupMetrics, StartupMode};
+
+pub const GATEWAY_CAPABILITY_PERMISSIONS: [&str; 12] = [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "allow-ride-frontend-ready",
+    "allow-ride-performance-snapshot",
+    "allow-ride-plugin-directories",
+    "allow-ride-record-startup-milestone",
+    "allow-ride-show-main-menu",
+    "allow-ride-smoke-complete",
+    "allow-ride-smoke-plan",
+    "allow-ride-smoke-record-step",
+    "allow-ride-start-window-drag",
+    "allow-ride-window-control",
+];
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GatewayCapabilitySpec {
+    pub identifier: String,
+    pub origin: String,
+    pub windows: [&'static str; 2],
+    pub permissions: Vec<&'static str>,
+}
+
+impl GatewayCapabilitySpec {
+    pub fn for_gateway(gateway: &StartupGateway) -> Self {
+        let authority = gateway.public_authority();
+        let port = authority
+            .rsplit_once(':')
+            .map(|(_, port)| port)
+            .expect("validated gateway authority contains a port");
+        Self {
+            identifier: format!("ride-gateway-{port}"),
+            origin: format!("http://{authority}"),
+            windows: ["main", "theia-secondary-*"],
+            permissions: GATEWAY_CAPABILITY_PERMISSIONS.to_vec(),
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct StartupWindowCreatedGate {
+    inner: Arc<StartupWindowCreatedGateInner>,
+}
+
+#[derive(Default)]
+struct StartupWindowCreatedGateInner {
+    created: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl StartupWindowCreatedGate {
+    pub fn mark_created(&self) {
+        self.inner.created.store(true, Ordering::Release);
+        self.inner.notify.notify_waiters();
+    }
+
+    pub async fn wait(&self) {
+        loop {
+            let notified = self.inner.notify.notified();
+            if self.inner.created.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+pub struct StartupLaunch {
+    pub mode: StartupMode,
+    pub initial_url: tauri::WebviewUrl,
+    pub gateway: Option<StartupGateway>,
+    pub backend_generation: BackendGeneration,
+    pub fallback_reason: Option<String>,
+    window_created: StartupWindowCreatedGate,
+}
+
+impl StartupLaunch {
+    pub fn window_created_gate(&self) -> StartupWindowCreatedGate {
+        self.window_created.clone()
+    }
+
+    pub fn mark_window_created(&self) {
+        self.window_created.mark_created();
+    }
+}
+
+#[derive(Debug)]
+pub enum StartupCoordinatorError {
+    Gateway(GatewayError),
+    Metrics(StartupMetricError),
+}
+
+impl fmt::Display for StartupCoordinatorError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Gateway(error) => write!(formatter, "startup gateway state failed: {error}"),
+            Self::Metrics(error) => write!(formatter, "startup metrics failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for StartupCoordinatorError {}
+
+pub struct StartupCoordinator {
+    requested_mode: StartupMode,
+    metrics: StartupMetrics,
+    limits: GatewayLimits,
+}
+
+impl StartupCoordinator {
+    pub fn new(requested_mode: StartupMode, metrics: StartupMetrics) -> Self {
+        Self::with_limits(requested_mode, metrics, GatewayLimits::default())
+    }
+
+    pub fn with_limits(
+        requested_mode: StartupMode,
+        metrics: StartupMetrics,
+        limits: GatewayLimits,
+    ) -> Self {
+        Self {
+            requested_mode,
+            metrics,
+            limits,
+        }
+    }
+
+    pub async fn launch(
+        self,
+        gateway_frontend_directory: PathBuf,
+        legacy_initial_url: tauri::WebviewUrl,
+    ) -> Result<StartupLaunch, StartupCoordinatorError> {
+        let window_created = StartupWindowCreatedGate::default();
+        if self.requested_mode != StartupMode::RustGateway {
+            return Ok(StartupLaunch {
+                mode: StartupMode::LegacyExplicit,
+                initial_url: legacy_initial_url,
+                gateway: None,
+                backend_generation: BackendGeneration::UNMANAGED,
+                fallback_reason: None,
+                window_created,
+            });
+        }
+
+        match StartupGateway::bind(
+            gateway_frontend_directory,
+            self.metrics.clone(),
+            self.limits,
+        )
+        .await
+        {
+            Ok(gateway) => {
+                let backend_generation = gateway
+                    .state()
+                    .begin_backend_start()
+                    .await
+                    .map_err(StartupCoordinatorError::Gateway)?;
+                let initial_url = tauri::WebviewUrl::External(gateway.bootstrap_url());
+                Ok(StartupLaunch {
+                    mode: StartupMode::RustGateway,
+                    initial_url,
+                    gateway: Some(gateway),
+                    backend_generation,
+                    fallback_reason: None,
+                    window_created,
+                })
+            }
+            Err(error) => {
+                self.metrics
+                    .select_effective_mode(StartupMode::LegacyFallback)
+                    .map_err(StartupCoordinatorError::Metrics)?;
+                Ok(StartupLaunch {
+                    mode: StartupMode::LegacyFallback,
+                    initial_url: legacy_initial_url,
+                    gateway: None,
+                    backend_generation: BackendGeneration::UNMANAGED,
+                    fallback_reason: Some(bounded_gateway_failure(&error)),
+                    window_created,
+                })
+            }
+        }
+    }
+}
+
+fn bounded_gateway_failure(error: &GatewayError) -> String {
+    const MAX_CHARS: usize = 256;
+    error.to_string().chars().take(MAX_CHARS).collect()
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BackendTransport {
@@ -572,16 +765,24 @@ pub struct RuntimePaths {
     backend_script: PathBuf,
     node_executable: PathBuf,
     frontend_directory: PathBuf,
+    gateway_frontend_directory: PathBuf,
     plugin_directory: PathBuf,
     config_directory: PathBuf,
 }
 
 impl RuntimePaths {
     pub fn resolve(mode: RuntimePathMode, config_directory: PathBuf) -> Result<Self, String> {
-        let (resource_root, backend_root, frontend_directory, plugin_directory) = match &mode {
+        let (
+            resource_root,
+            backend_root,
+            frontend_directory,
+            gateway_frontend_directory,
+            plugin_directory,
+        ) = match &mode {
             RuntimePathMode::Packaged(root) => (
                 root.clone(),
                 root.join("resources").join("backend"),
+                root.join("lib").join("frontend"),
                 root.join("lib").join("frontend"),
                 root.join("resources").join("plugins"),
             ),
@@ -592,6 +793,7 @@ impl RuntimePaths {
                     resource_root.clone(),
                     applications.join("browser").join("lib").join("backend"),
                     applications.join("browser").join("lib").join("frontend"),
+                    applications.join("tauri").join("browser-frontend"),
                     resource_root.join("plugins"),
                 )
             }
@@ -614,6 +816,7 @@ impl RuntimePaths {
             backend_script: backend_root.join("main.js"),
             node_executable,
             frontend_directory,
+            gateway_frontend_directory,
             plugin_directory,
             resource_root,
             config_directory,
@@ -638,6 +841,10 @@ impl RuntimePaths {
 
     pub fn frontend_directory(&self) -> PathBuf {
         self.frontend_directory.clone()
+    }
+
+    pub fn gateway_frontend_directory(&self) -> PathBuf {
+        self.gateway_frontend_directory.clone()
     }
 
     pub fn plugin_directory(&self) -> PathBuf {

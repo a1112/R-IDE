@@ -60,16 +60,9 @@ pub fn ride_frontend_ready(
     );
 
     let state = app.state::<AppState>();
-    let startup_metrics = state.startup_metrics.clone();
     let report = state.launch_intent_router.frontend_ready_after_show(
-        || {
-            let result = window.show();
-            if result.is_ok() {
-                startup_metrics.record_or_warn(StartupMilestone::NativeWindowVisible);
-            }
-            result
-        },
-        |error| log::warn!("Failed to show main window after frontend ready: {error}"),
+        || window.set_focus(),
+        |error| log::warn!("Failed to focus main window after frontend ready: {error}"),
         |intent| app.emit_to("main", "ride-open-request", intent),
     );
     for failure in report.failures {

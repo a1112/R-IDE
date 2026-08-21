@@ -7,6 +7,7 @@
  * SPDX-License-Identifier: MIT
  ********************************************************************************/
 
+use ride_tauri::initialize_current_startup_metrics;
 use ride_tauri::startup_metrics::{
     RecordOutcome, StartupMetricError, StartupMetrics, StartupMilestone, StartupMode,
     StartupReport, StartupReportWriter,
@@ -317,6 +318,28 @@ fn gateway_report_allows_one_early_fallback_and_publishes_the_corrected_mode() {
         .recv_timeout(Duration::from_secs(1))
         .expect("fallback mode snapshot");
     assert_eq!(fallback["startupMode"], "legacy-fallback");
+}
+
+#[test]
+fn current_gateway_initialization_waits_for_the_real_bind_outcome() {
+    let (writes_tx, writes_rx) = mpsc::channel();
+    let metrics = StartupMetrics::with_clock_and_writer(
+        "windows",
+        "x86_64",
+        42,
+        StartupMode::RustGateway,
+        Arc::new(SequenceClock::new(vec![0])),
+        Box::new(CountingWriter { writes: writes_tx }),
+    );
+
+    initialize_current_startup_metrics(&metrics, StartupMode::RustGateway)
+        .expect("record process start without choosing fallback");
+
+    let initialized = writes_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("initial gateway snapshot");
+    assert_eq!(initialized["startupMode"], "rust-gateway");
+    assert!(writes_rx.recv_timeout(Duration::from_millis(50)).is_err());
 }
 
 #[test]

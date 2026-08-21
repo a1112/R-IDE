@@ -521,8 +521,22 @@ fn closing_the_main_window_closes_tauri_secondary_windows() {
         .and_then(|source| source.split("#[cfg(target_os = \"macos\")]").next())
         .expect("main-window close handler");
     let backend_stop = close_source
-        .find("sidecar::stop_backend")
-        .expect("backend shutdown in close handler");
+        .find("shutdown_application")
+        .expect("ordered application shutdown in close handler");
     let app_exit = close_source.find("app_handle.exit(0)").expect("app exit");
     assert!(backend_stop < app_exit);
+
+    let shutdown_source = lib_source
+        .split("fn shutdown_application")
+        .nth(1)
+        .and_then(|source| source.split("fn restore_main_window").next())
+        .expect("ordered shutdown helper");
+    assert!(
+        shutdown_source
+            .find("gateway.shutdown")
+            .expect("gateway stop")
+            < shutdown_source
+                .find("sidecar::stop_backend")
+                .expect("backend process-tree cleanup")
+    );
 }

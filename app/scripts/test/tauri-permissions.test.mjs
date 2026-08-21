@@ -376,6 +376,37 @@ test('Tauri build copy rejects traversal requirements and source links or repars
   }
 });
 
+test('runtime gateway capability is exact, registered before WebView creation, and child-local', async () => {
+  const libSource = await readFile(path.join(tauriDirectory, 'src', 'lib.rs'), 'utf8');
+  const nativeChromeSource = await readFile(path.join(tauriDirectory, 'src', 'native_chrome.rs'), 'utf8');
+  const sidecarSource = await readFile(path.join(tauriDirectory, 'src', 'sidecar.rs'), 'utf8');
+  const capability = JSON.parse(await readFile(path.join(tauriDirectory, 'capabilities', 'default.json'), 'utf8'));
+
+  assert.match(libSource, /CapabilityBuilder::new/);
+  assert.match(libSource, /\.remote\([^\n]*origin/);
+  assert.match(libSource, /\.windows\(\["main",\s*"theia-secondary-\*"\]\)/);
+  assert.match(libSource, /add_capability/);
+  const setupSource = libSource.split('.setup(move |app|')[1]?.split('.invoke_handler')[0];
+  assert.ok(setupSource, 'expected Tauri setup source');
+  assert.ok(
+    setupSource.indexOf('register_gateway_capability') < setupSource.indexOf('WebviewWindowBuilder::from_config'),
+    'runtime gateway capability must be registered before the main WebView is created'
+  );
+  assert.equal(libSource.includes('http://127.0.0.1:*'), false);
+  assert.match(sidecarSource, /command\.env\("THEIA_HOSTS",\s*public_authority\)/);
+  assert.doesNotMatch(sidecarSource, /(?:std::env|env)::set_var\("THEIA_HOSTS"/);
+
+  const frontendReadySource = nativeChromeSource
+    .split('pub fn ride_frontend_ready')[1]
+    ?.split('#[tauri::command]')[0];
+  assert.ok(frontendReadySource, 'expected ride_frontend_ready source');
+  assert.match(frontendReadySource, /set_focus/);
+  assert.doesNotMatch(frontendReadySource, /\.show\(/);
+
+  assert.deepEqual(capability.remote?.urls, ['http://127.0.0.1:3000']);
+  assert.equal(capability.remote.urls.some(url => url.includes('*')), false);
+});
+
 test('generated Tauri frontend resources are symlink-free and remain exactly scoped', async () => {
   const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'ride-tauri-resource-contract-'));
   try {
