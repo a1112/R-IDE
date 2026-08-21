@@ -14,12 +14,14 @@ use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Empty, Full, StreamBody};
 use hyper::body::Frame;
 use hyper::header::{
-    CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HOST, LOCATION, ORIGIN, SET_COOKIE,
+    CACHE_CONTROL, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HOST, LOCATION, ORIGIN,
+    SET_COOKIE,
 };
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper::{Method, Request, Response, StatusCode};
-use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper::{HeaderMap, Method, Request, Response, StatusCode, Uri};
+use hyper_util::client::legacy::{connect::HttpConnector, Client};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use reqwest::Url;
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
@@ -47,6 +49,19 @@ const NOT_FOUND_BODY: &[u8] = b"Not Found";
 const INDEX_PATH: &str = "/index.html";
 const SESSION_COOKIE_NAME: &str = "ride_session";
 const STATIC_ASSET_CHUNK_SIZE: usize = 16 * 1024;
+const BACKEND_UNAVAILABLE_BODY: &[u8] = b"{\"error\":\"backend_unavailable\"}";
+const BACKEND_PROXY_FAILED_BODY: &[u8] = b"{\"error\":\"backend_proxy_failed\"}";
+const HOP_BY_HOP_HEADERS: [&str; 9] = [
+    "connection",
+    "proxy-connection",
+    "keep-alive",
+    "transfer-encoding",
+    "te",
+    "trailer",
+    "upgrade",
+    "proxy-authenticate",
+    "proxy-authorization",
+];
 
 type GatewayBody = BoxBody<Bytes, io::Error>;
 
@@ -75,6 +90,21 @@ impl fmt::Display for BackendAddressError {
 }
 
 impl std::error::Error for BackendAddressError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GatewayLimitError {
+    ZeroMaxConnections,
+}
+
+impl fmt::Display for GatewayLimitError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ZeroMaxConnections => formatter.write_str("max_connections must be nonzero"),
+        }
+    }
+}
+
+impl std::error::Error for GatewayLimitError {}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct BackendGeneration(u64);
@@ -138,6 +168,7 @@ pub enum GatewayError {
         observed: BackendGeneration,
     },
     InvalidBackendAddress(BackendAddressError),
+    InvalidLimits(GatewayLimitError),
     FrontendUnavailable,
     ListenerUnavailable,
     ListenerStopped,
@@ -180,6 +211,7 @@ impl fmt::Display for GatewayError {
                 "backend generation {expected:?} was superseded by {observed:?}"
             ),
             Self::InvalidBackendAddress(error) => error.fmt(formatter),
+            Self::InvalidLimits(error) => error.fmt(formatter),
             Self::FrontendUnavailable => write!(formatter, "frontend assets are unavailable"),
             Self::ListenerUnavailable => {
                 write!(formatter, "startup gateway listener is unavailable")
@@ -344,6 +376,14 @@ impl GatewayState {
     }
 
     pub async fn wait_for_backend(&self) -> Result<SocketAddr, GatewayError> {
+        self.wait_for_backend_with_timeout(self.inner.limits.backend_wait)
+            .await
+    }
+
+    async fn wait_for_backend_with_timeout(
+        &self,
+        backend_wait: Duration,
+    ) -> Result<SocketAddr, GatewayError> {
         let mut readiness = self.inner.readiness.subscribe();
         let mut shutdown = self.inner.shutdown.subscribe();
         let expected_generation = readiness.borrow().snapshot.generation;
@@ -387,7 +427,7 @@ impl GatewayState {
             }
         };
 
-        tokio::time::timeout(self.inner.limits.backend_wait, wait)
+        tokio::time::timeout(backend_wait, wait)
             .await
             .unwrap_or(Err(GatewayError::BackendWaitTimedOut(expected_generation)))
     }
@@ -491,6 +531,13 @@ struct StaticInventory {
 }
 
 #[derive(Clone)]
+struct BackendProxy {
+    client: Client<HttpConnector, hyper::body::Incoming>,
+    state: GatewayState,
+    limits: GatewayLimits,
+}
+
+#[derive(Clone)]
 struct StaticGatewayService {
     public_authority: String,
     public_origin: String,
@@ -498,6 +545,7 @@ struct StaticGatewayService {
     frontend_root: Arc<PathBuf>,
     assets: Arc<HashMap<NormalizedPath, StaticAsset>>,
     session: Arc<GatewaySession>,
+    backend_proxy: BackendProxy,
 }
 
 pub struct StartupGateway {
@@ -515,6 +563,11 @@ impl StartupGateway {
         metrics: StartupMetrics,
         limits: GatewayLimits,
     ) -> Result<Self, GatewayError> {
+        if limits.max_connections == 0 {
+            return Err(GatewayError::InvalidLimits(
+                GatewayLimitError::ZeroMaxConnections,
+            ));
+        }
         let inventory = tokio::task::spawn_blocking(move || build_static_inventory(&frontend_root))
             .await
             .map_err(|_| GatewayError::FrontendUnavailable)??;
@@ -537,6 +590,8 @@ impl StartupGateway {
         let bootstrap_path = format!("/_ride/bootstrap/{bootstrap_capability}");
         let session_value = Uuid::new_v4().to_string();
         debug_assert_ne!(bootstrap_capability, session_value);
+        let state = GatewayState::new(limits);
+        let backend_proxy = BackendProxy::new(state.clone(), limits);
         let service = StaticGatewayService {
             public_authority,
             public_origin,
@@ -548,8 +603,8 @@ impl StartupGateway {
                 bootstrap_path,
                 session_value,
             }),
+            backend_proxy,
         };
-        let state = GatewayState::new(limits);
         let (shutdown, shutdown_receiver) = watch::channel(false);
         let (accept_ready, ready) = oneshot::channel();
         let accept_state = state.clone();
@@ -593,6 +648,10 @@ impl StartupGateway {
 
     pub fn public_authority(&self) -> String {
         self.public_addr.to_string()
+    }
+
+    pub fn state(&self) -> GatewayState {
+        self.state.clone()
     }
 
     pub async fn shutdown(self) {
@@ -730,6 +789,64 @@ async fn serve_connection(
         .await;
 }
 
+impl BackendProxy {
+    fn new(state: GatewayState, limits: GatewayLimits) -> Self {
+        let mut builder = Client::builder(TokioExecutor::new());
+        builder.retry_canceled_requests(false);
+        Self {
+            client: builder.build(HttpConnector::new()),
+            state,
+            limits,
+        }
+    }
+
+    async fn forward(&self, mut request: Request<hyper::body::Incoming>) -> Response<GatewayBody> {
+        let backend_addr = match self
+            .state
+            .wait_for_backend_with_timeout(self.limits.backend_wait)
+            .await
+        {
+            Ok(backend_addr) => backend_addr,
+            Err(_) => return backend_unavailable(),
+        };
+        let backend_authority = backend_addr.to_string();
+        let path_and_query = request
+            .uri()
+            .path_and_query()
+            .cloned()
+            .unwrap_or_else(|| hyper::http::uri::PathAndQuery::from_static("/"));
+        let backend_uri = match Uri::builder()
+            .scheme("http")
+            .authority(backend_authority.as_str())
+            .path_and_query(path_and_query)
+            .build()
+        {
+            Ok(uri) => uri,
+            Err(_) => return backend_proxy_failed(),
+        };
+
+        *request.uri_mut() = backend_uri;
+        strip_gateway_session_cookie(request.headers_mut());
+        strip_hop_by_hop_headers(request.headers_mut());
+        let backend_host =
+            match hyper::header::HeaderValue::from_bytes(backend_authority.as_bytes()) {
+                Ok(host) => host,
+                Err(_) => return backend_proxy_failed(),
+            };
+        request.headers_mut().insert(HOST, backend_host);
+
+        let response = match self.client.request(request).await {
+            Ok(response) => response,
+            Err(_) => return backend_proxy_failed(),
+        };
+        let (mut parts, body) = response.into_parts();
+        strip_hop_by_hop_headers(&mut parts.headers);
+        strip_backend_session_cookie(&mut parts.headers);
+        let body = body.map_err(io::Error::other).boxed();
+        Response::from_parts(parts, body)
+    }
+}
+
 impl StaticGatewayService {
     async fn handle(&self, request: Request<hyper::body::Incoming>) -> Response<GatewayBody> {
         if !self.has_valid_request_envelope(&request) {
@@ -747,10 +864,11 @@ impl StaticGatewayService {
         if !self.has_valid_session(request.headers()) {
             return not_found();
         }
-        if route != RouteKind::Static {
-            return not_found();
+        match route {
+            RouteKind::Static => self.static_asset(request).await,
+            RouteKind::Backend => self.backend_proxy.forward(request).await,
+            RouteKind::Bootstrap | RouteKind::Control => not_found(),
         }
-        self.static_asset(request).await
     }
 
     fn has_valid_request_envelope(&self, request: &Request<hyper::body::Incoming>) -> bool {
@@ -1389,6 +1507,68 @@ fn fixed_content_type(path: &Path) -> Option<&'static str> {
     }
 }
 
+fn strip_hop_by_hop_headers(headers: &mut HeaderMap) {
+    let nominated = headers
+        .get_all(CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .filter_map(|name| hyper::header::HeaderName::from_bytes(name.trim().as_bytes()).ok())
+        .collect::<Vec<_>>();
+    for name in nominated {
+        headers.remove(name);
+    }
+    for name in HOP_BY_HOP_HEADERS {
+        headers.remove(name);
+    }
+}
+
+fn strip_gateway_session_cookie(headers: &mut HeaderMap) {
+    let original = headers.get_all(COOKIE).iter().cloned().collect::<Vec<_>>();
+    headers.remove(COOKIE);
+    for value in original {
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        let preserved = value
+            .split(';')
+            .map(str::trim)
+            .filter(|pair| {
+                pair.split_once('=')
+                    .is_none_or(|(name, _)| name.trim() != SESSION_COOKIE_NAME)
+            })
+            .filter(|pair| !pair.is_empty())
+            .collect::<Vec<_>>()
+            .join("; ");
+        if !preserved.is_empty() {
+            if let Ok(value) = hyper::header::HeaderValue::from_bytes(preserved.as_bytes()) {
+                headers.append(COOKIE, value);
+            }
+        }
+    }
+}
+
+fn strip_backend_session_cookie(headers: &mut HeaderMap) {
+    let original = headers
+        .get_all(SET_COOKIE)
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    headers.remove(SET_COOKIE);
+    for value in original {
+        let overwrites_gateway_session = value.to_str().ok().is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .and_then(|pair| pair.split_once('='))
+                .is_some_and(|(name, _)| name.trim() == SESSION_COOKIE_NAME)
+        });
+        if !overwrites_gateway_session {
+            headers.append(SET_COOKIE, value);
+        }
+    }
+}
+
 fn empty_body() -> GatewayBody {
     Empty::<Bytes>::new()
         .map_err(|never| match never {})
@@ -1415,6 +1595,29 @@ fn not_found() -> Response<GatewayBody> {
         .header(CACHE_CONTROL, "no-store")
         .body(full_body(NOT_FOUND_BODY))
         .expect("fixed not-found response must be valid")
+}
+
+fn backend_unavailable() -> Response<GatewayBody> {
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header(CONTENT_TYPE, "application/json")
+        .header(CONTENT_LENGTH, BACKEND_UNAVAILABLE_BODY.len())
+        .header(CACHE_CONTROL, "no-store")
+        .header("retry-after", "1")
+        .header("x-content-type-options", "nosniff")
+        .body(full_body(BACKEND_UNAVAILABLE_BODY))
+        .expect("fixed backend-unavailable response must be valid")
+}
+
+fn backend_proxy_failed() -> Response<GatewayBody> {
+    Response::builder()
+        .status(StatusCode::BAD_GATEWAY)
+        .header(CONTENT_TYPE, "application/json")
+        .header(CONTENT_LENGTH, BACKEND_PROXY_FAILED_BODY.len())
+        .header(CACHE_CONTROL, "no-store")
+        .header("x-content-type-options", "nosniff")
+        .body(full_body(BACKEND_PROXY_FAILED_BODY))
+        .expect("fixed backend-proxy-failed response must be valid")
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

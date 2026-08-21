@@ -8,16 +8,20 @@
  ********************************************************************************/
 
 use bytes::Bytes;
-use futures_util::poll;
-use http_body_util::{BodyExt, Empty};
+use futures_util::{future::BoxFuture, poll, stream, FutureExt};
+use http_body_util::combinators::UnsyncBoxBody;
+use http_body_util::{BodyExt, Empty, Full, StreamBody};
+use hyper::body::{Frame, Incoming};
 use hyper::header::{
     CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HOST, LOCATION, SET_COOKIE,
 };
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use ride_tauri::startup_gateway::{
-    BackendAddressError, BackendGeneration, BackendPhase, GatewayError, GatewayLimits,
-    GatewayState, PathError, RouteKind, RouteTable, StartupGateway,
+    BackendAddressError, BackendGeneration, BackendPhase, GatewayError, GatewayLimitError,
+    GatewayLimits, GatewayState, PathError, RouteKind, RouteTable, StartupGateway,
 };
 use ride_tauri::startup_metrics::{
     ElapsedClock, StartupMetrics, StartupMilestone, StartupMode, StartupReport, StartupReportWriter,
@@ -26,16 +30,91 @@ use std::fs;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{oneshot, Mutex};
+use tokio::task::{JoinHandle, JoinSet};
 use uuid::Uuid;
 
 const EXPECTED_STATIC_ASSET_CHUNK_SIZE: usize = 16 * 1024;
+const STREAM_CHUNK_COUNT: usize = 512;
+const STREAM_CHUNK_SIZE: usize = 65_536;
+const STREAM_BYTE_COUNT: usize = STREAM_CHUNK_COUNT * STREAM_CHUNK_SIZE;
+const UPLOAD_CHUNK: &[u8; STREAM_CHUNK_SIZE] = &[7_u8; STREAM_CHUNK_SIZE];
+const DOWNLOAD_CHUNK: &[u8; STREAM_CHUNK_SIZE] = &[9_u8; STREAM_CHUNK_SIZE];
+
+type TestBody = UnsyncBoxBody<Bytes, io::Error>;
+type FakeBackendHandler =
+    Arc<dyn Fn(Request<Incoming>) -> BoxFuture<'static, Response<TestBody>> + Send + Sync>;
+
+struct FakeBackend {
+    addr: SocketAddr,
+    shutdown: Option<oneshot::Sender<()>>,
+    task: JoinHandle<()>,
+}
+
+impl FakeBackend {
+    async fn spawn(handler: FakeBackendHandler) -> Self {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown, mut shutdown_receiver) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut connections = JoinSet::new();
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_receiver => break,
+                    completed = connections.join_next(), if !connections.is_empty() => {
+                        let _ = completed;
+                    }
+                    accepted = listener.accept() => {
+                        let (stream, _) = accepted.unwrap();
+                        let handler = handler.clone();
+                        connections.spawn(async move {
+                            let service = service_fn(move |request| {
+                                let handler = handler.clone();
+                                async move { Ok::<_, std::convert::Infallible>(handler(request).await) }
+                            });
+                            let _ = http1::Builder::new()
+                                .serve_connection(TokioIo::new(stream), service)
+                                .await;
+                        });
+                    }
+                }
+            }
+            connections.abort_all();
+            while connections.join_next().await.is_some() {}
+        });
+        Self {
+            addr,
+            shutdown: Some(shutdown),
+            task,
+        }
+    }
+
+    async fn shutdown(mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        self.task.await.unwrap();
+    }
+}
+
+fn empty_test_body() -> TestBody {
+    Empty::<Bytes>::new()
+        .map_err(|never| match never {})
+        .boxed_unsync()
+}
+
+fn full_test_body(body: impl Into<Bytes>) -> TestBody {
+    Full::new(body.into())
+        .map_err(|never| match never {})
+        .boxed_unsync()
+}
 
 struct TemporaryFrontend {
     root: PathBuf,
@@ -127,7 +206,26 @@ async fn send_request(
     target: &str,
     headers: &[(&str, &str)],
 ) -> Response<hyper::body::Incoming> {
-    let stream = TcpStream::connect(gateway_addr(gateway)).await.unwrap();
+    send_request_to(
+        gateway_addr(gateway),
+        gateway.public_authority(),
+        method,
+        target,
+        headers,
+        empty_test_body(),
+    )
+    .await
+}
+
+async fn send_request_to(
+    gateway_addr: SocketAddr,
+    public_authority: String,
+    method: Method,
+    target: &str,
+    headers: &[(&str, &str)],
+    body: TestBody,
+) -> Response<hyper::body::Incoming> {
+    let stream = TcpStream::connect(gateway_addr).await.unwrap();
     let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
         .await
         .unwrap();
@@ -140,13 +238,13 @@ async fn send_request(
         .iter()
         .any(|(name, _)| name.eq_ignore_ascii_case(HOST.as_str()))
     {
-        request = request.header(HOST, gateway.public_authority());
+        request = request.header(HOST, public_authority);
     }
     for (name, value) in headers {
         request = request.header(*name, *value);
     }
     sender
-        .send_request(request.body(Empty::<Bytes>::new()).unwrap())
+        .send_request(request.body(body).unwrap())
         .await
         .unwrap()
 }
@@ -425,7 +523,7 @@ async fn get_and_head_reject_a_replaced_parent_even_for_the_same_file_identity()
 }
 
 #[tokio::test]
-async fn invalid_unknown_directory_and_symlink_paths_return_bounded_not_found() {
+async fn invalid_paths_are_not_found_and_non_inventory_paths_are_backend_owned() {
     let frontend = TemporaryFrontend::new();
     let external_root = frontend
         .root
@@ -437,7 +535,16 @@ async fn invalid_unknown_directory_and_symlink_paths_return_bounded_not_found() 
     fs::write(&external_file, b"private path and token material").unwrap();
     symlink_file(&external_file, &frontend.root.join("escape.js")).unwrap();
 
-    let gateway = bind_gateway(&frontend).await;
+    let gateway = StartupGateway::bind(
+        frontend.root.clone(),
+        disabled_metrics(),
+        GatewayLimits {
+            backend_wait: Duration::from_millis(10),
+            ..GatewayLimits::test_defaults()
+        },
+    )
+    .await
+    .unwrap();
     let capability = gateway
         .bootstrap_url()
         .path_segments()
@@ -453,9 +560,6 @@ async fn invalid_unknown_directory_and_symlink_paths_return_bounded_not_found() 
         "/assets\\secret.js",
         "/nul%00.js",
         "/%252e%252e/secret.js",
-        "/missing.js",
-        "/assets/",
-        "/escape.js",
     ] {
         let response =
             send_request(&gateway, Method::GET, target, &[(COOKIE.as_str(), &cookie)]).await;
@@ -466,6 +570,22 @@ async fn invalid_unknown_directory_and_symlink_paths_return_bounded_not_found() 
         );
         let body = response_bytes(response).await;
         assert!(body.len() <= 32, "target {target:?}");
+        let body = String::from_utf8_lossy(&body);
+        assert!(!body.contains(&capability));
+        assert!(!body.contains(&cookie));
+        assert!(!body.contains(frontend.root.to_string_lossy().as_ref()));
+        assert!(!body.contains(external_root.to_string_lossy().as_ref()));
+    }
+    for target in ["/missing.js", "/assets/", "/escape.js"] {
+        let response =
+            send_request(&gateway, Method::GET, target, &[(COOKIE.as_str(), &cookie)]).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "target {target:?}"
+        );
+        let body = response_bytes(response).await;
+        assert!(body.len() <= 256, "target {target:?}");
         let body = String::from_utf8_lossy(&body);
         assert!(!body.contains(&capability));
         assert!(!body.contains(&cookie));
@@ -596,6 +716,25 @@ async fn shutdown_is_bounded_and_releases_the_loopback_listener() {
         .expect("gateway shutdown exceeded its drain bound");
     assert!(socket_closes_within(idle_connection, Duration::from_millis(250)).await);
     assert!(TcpStream::connect(address).await.is_err());
+}
+
+#[tokio::test]
+async fn bind_rejects_zero_max_connections_with_a_typed_bounded_error() {
+    let frontend = TemporaryFrontend::new();
+    let result = StartupGateway::bind(
+        frontend.root.clone(),
+        disabled_metrics(),
+        GatewayLimits {
+            max_connections: 0,
+            ..GatewayLimits::test_defaults()
+        },
+    )
+    .await;
+
+    match result {
+        Err(GatewayError::InvalidLimits(GatewayLimitError::ZeroMaxConnections)) => {}
+        _ => panic!("zero max_connections did not return the typed configuration error"),
+    }
 }
 
 #[tokio::test]
@@ -1054,4 +1193,539 @@ fn route_inventory_is_rejected_by_the_same_path_rules_as_requests() {
         RouteTable::new(["/bundle.js", "/%252e%252e/hidden.js"]),
         Err(PathError::DoubleEncoding)
     ));
+}
+
+#[tokio::test]
+async fn http_proxy_timeout_is_retryable_and_bounded() {
+    let frontend = TemporaryFrontend::new();
+    let gateway = StartupGateway::bind(
+        frontend.root.clone(),
+        disabled_metrics(),
+        GatewayLimits {
+            backend_wait: Duration::from_millis(25),
+            ..GatewayLimits::test_defaults()
+        },
+    )
+    .await
+    .unwrap();
+    let cookie = bootstrap_session(&gateway).await;
+
+    let response = send_request(
+        &gateway,
+        Method::GET,
+        "/api/not-ready",
+        &[(COOKIE.as_str(), &cookie)],
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers().get("retry-after").unwrap(), "1");
+    assert_eq!(
+        response.headers().get(CONTENT_TYPE).unwrap(),
+        "application/json"
+    );
+    let body = response_bytes(response).await;
+    assert!(body.len() <= 256);
+    assert_eq!(
+        body,
+        Bytes::from_static(b"{\"error\":\"backend_unavailable\"}")
+    );
+    gateway.shutdown().await;
+}
+
+#[tokio::test]
+async fn http_proxy_static_bundle_completes_while_backend_request_is_blocked() {
+    let backend = FakeBackend::spawn(Arc::new(|_request| {
+        async move {
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(full_test_body("backend ready"))
+                .unwrap()
+        }
+        .boxed()
+    }))
+    .await;
+    let frontend = TemporaryFrontend::new();
+    let gateway = StartupGateway::bind(
+        frontend.root.clone(),
+        disabled_metrics(),
+        GatewayLimits {
+            backend_wait: Duration::from_secs(2),
+            ..GatewayLimits::test_defaults()
+        },
+    )
+    .await
+    .unwrap();
+    let cookie = bootstrap_session(&gateway).await;
+    let state = gateway.state();
+    let generation = state.begin_backend_start().await.unwrap();
+    let gateway_addr = gateway_addr(&gateway);
+    let public_authority = gateway.public_authority();
+    let waiting_cookie = cookie.clone();
+    let waiting = tokio::spawn(async move {
+        send_request_to(
+            gateway_addr,
+            public_authority,
+            Method::GET,
+            "/api/waits-for-backend",
+            &[(COOKIE.as_str(), waiting_cookie.as_str())],
+            empty_test_body(),
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert!(!waiting.is_finished());
+
+    let bundle = tokio::time::timeout(
+        Duration::from_millis(250),
+        send_request(
+            &gateway,
+            Method::GET,
+            "/bundle.js",
+            &[(COOKIE.as_str(), &cookie)],
+        ),
+    )
+    .await
+    .expect("static bundle waited for backend readiness");
+    assert_eq!(bundle.status(), StatusCode::OK);
+    assert_eq!(
+        response_bytes(bundle).await,
+        Bytes::from_static(b"globalThis.ride = true;")
+    );
+
+    state.backend_ready(generation, backend.addr).await.unwrap();
+    let backend_response = waiting.await.unwrap();
+    assert_eq!(backend_response.status(), StatusCode::OK);
+    gateway.shutdown().await;
+    backend.shutdown().await;
+}
+
+#[derive(Debug)]
+struct ObservedProxyRequest {
+    method: Method,
+    target: String,
+    headers: hyper::HeaderMap,
+    body: Bytes,
+}
+
+#[tokio::test]
+async fn http_proxy_preserves_end_to_end_request_and_response_semantics() {
+    let (observed_sender, observed_receiver) = oneshot::channel();
+    let observed_sender = Arc::new(Mutex::new(Some(observed_sender)));
+    let backend = FakeBackend::spawn(Arc::new(move |request| {
+        let observed_sender = observed_sender.clone();
+        async move {
+            let method = request.method().clone();
+            let target = request.uri().to_string();
+            let headers = request.headers().clone();
+            let body = request.into_body().collect().await.unwrap().to_bytes();
+            observed_sender
+                .lock()
+                .await
+                .take()
+                .unwrap()
+                .send(ObservedProxyRequest {
+                    method,
+                    target,
+                    headers,
+                    body,
+                })
+                .unwrap();
+            Response::builder()
+                .status(StatusCode::CREATED)
+                .header("x-response-value", "first")
+                .header("x-response-value", "second")
+                .header(SET_COOKIE, "theme=dark; Path=/")
+                .header(SET_COOKIE, "ride_session=backend-value; Path=/")
+                .header(SET_COOKIE, "application=value; HttpOnly")
+                .header("connection", "x-response-hop")
+                .header("x-response-hop", "private")
+                .header("keep-alive", "timeout=5")
+                .header("proxy-authenticate", "Basic realm=private")
+                .body(full_test_body("proxied response"))
+                .unwrap()
+        }
+        .boxed()
+    }))
+    .await;
+    let frontend = TemporaryFrontend::new();
+    let gateway = bind_gateway(&frontend).await;
+    let cookie = bootstrap_session(&gateway).await;
+    let state = gateway.state();
+    let generation = state.begin_backend_start().await.unwrap();
+    let gateway_addr = gateway_addr(&gateway);
+    let public_authority = gateway.public_authority();
+    let public_origin = format!("http://{public_authority}");
+    let cookie_header = format!("theme=dark; {cookie}; application=value");
+    let pending = tokio::spawn(async move {
+        send_request_to(
+            gateway_addr,
+            public_authority,
+            Method::POST,
+            "/api/items?limit=2&order=desc",
+            &[
+                (COOKIE.as_str(), cookie_header.as_str()),
+                ("origin", public_origin.as_str()),
+                ("x-request-value", "first"),
+                ("x-request-value", "second"),
+                ("connection", "x-request-hop, keep-alive"),
+                ("x-request-hop", "private"),
+                ("proxy-connection", "keep-alive"),
+                ("keep-alive", "timeout=5"),
+                ("te", "trailers"),
+                ("trailer", "x-trailer"),
+                ("proxy-authorization", "Basic private"),
+            ],
+            full_test_body("proxied request"),
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert!(!pending.is_finished());
+    state.backend_ready(generation, backend.addr).await.unwrap();
+
+    let response = pending.await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(
+        response
+            .headers()
+            .get_all("x-response-value")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["first", "second"]
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get_all(SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["theme=dark; Path=/", "application=value; HttpOnly"]
+    );
+    for removed in [
+        "connection",
+        "x-response-hop",
+        "keep-alive",
+        "proxy-authenticate",
+    ] {
+        assert!(
+            !response.headers().contains_key(removed),
+            "response leaked {removed}"
+        );
+    }
+    assert_eq!(
+        response_bytes(response).await,
+        Bytes::from_static(b"proxied response")
+    );
+
+    let observed = observed_receiver.await.unwrap();
+    assert_eq!(observed.method, Method::POST);
+    assert_eq!(observed.target, "/api/items?limit=2&order=desc");
+    assert_eq!(observed.body, Bytes::from_static(b"proxied request"));
+    assert_eq!(
+        observed.headers.get(HOST).unwrap(),
+        backend.addr.to_string().as_str()
+    );
+    assert_eq!(
+        observed
+            .headers
+            .get_all("x-request-value")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["first", "second"]
+    );
+    assert_eq!(
+        observed.headers.get(COOKIE).unwrap(),
+        "theme=dark; application=value"
+    );
+    assert_eq!(
+        observed.headers.get("origin").unwrap(),
+        format!("http://{}", gateway.public_authority()).as_str()
+    );
+    for removed in [
+        "connection",
+        "x-request-hop",
+        "proxy-connection",
+        "keep-alive",
+        "te",
+        "trailer",
+        "proxy-authorization",
+    ] {
+        assert!(
+            !observed.headers.contains_key(removed),
+            "request leaked {removed}"
+        );
+    }
+    gateway.shutdown().await;
+    backend.shutdown().await;
+}
+
+#[tokio::test]
+async fn http_proxy_authenticates_before_rejecting_excess_waiters() {
+    let frontend = TemporaryFrontend::new();
+    let gateway = StartupGateway::bind(
+        frontend.root.clone(),
+        disabled_metrics(),
+        GatewayLimits {
+            backend_wait: Duration::from_secs(2),
+            max_waiters: 0,
+            ..GatewayLimits::test_defaults()
+        },
+    )
+    .await
+    .unwrap();
+    let cookie = bootstrap_session(&gateway).await;
+
+    let anonymous = send_request(&gateway, Method::GET, "/api/private", &[]).await;
+    assert_eq!(anonymous.status(), StatusCode::NOT_FOUND);
+
+    let started = tokio::time::Instant::now();
+    let saturated = send_request(
+        &gateway,
+        Method::GET,
+        "/api/private",
+        &[(COOKIE.as_str(), &cookie)],
+    )
+    .await;
+    assert!(started.elapsed() < Duration::from_millis(250));
+    assert_eq!(saturated.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(saturated.headers().get("retry-after").unwrap(), "1");
+    assert_eq!(
+        response_bytes(saturated).await,
+        Bytes::from_static(b"{\"error\":\"backend_unavailable\"}")
+    );
+    gateway.shutdown().await;
+}
+
+#[tokio::test]
+async fn http_proxy_backend_failure_releases_all_waiting_requests() {
+    let frontend = TemporaryFrontend::new();
+    let gateway = StartupGateway::bind(
+        frontend.root.clone(),
+        disabled_metrics(),
+        GatewayLimits {
+            backend_wait: Duration::from_secs(5),
+            max_waiters: 4,
+            ..GatewayLimits::test_defaults()
+        },
+    )
+    .await
+    .unwrap();
+    let cookie = bootstrap_session(&gateway).await;
+    let state = gateway.state();
+    let generation = state.begin_backend_start().await.unwrap();
+    let mut requests = Vec::new();
+    for index in 0..4 {
+        let gateway_addr = gateway_addr(&gateway);
+        let public_authority = gateway.public_authority();
+        let cookie = cookie.clone();
+        requests.push(tokio::spawn(async move {
+            send_request_to(
+                gateway_addr,
+                public_authority,
+                Method::POST,
+                &format!("/api/waiter/{index}"),
+                &[(COOKIE.as_str(), cookie.as_str())],
+                full_test_body(format!("request-{index}")),
+            )
+            .await
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert!(requests.iter().all(|request| !request.is_finished()));
+
+    state
+        .fail_backend(generation, "private child process details")
+        .await
+        .unwrap();
+    for request in requests {
+        let response = tokio::time::timeout(Duration::from_millis(250), request)
+            .await
+            .expect("backend failure did not release a waiter")
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers().get("retry-after").unwrap(), "1");
+        let body = response_bytes(response).await;
+        assert_eq!(
+            body,
+            Bytes::from_static(b"{\"error\":\"backend_unavailable\"}")
+        );
+        assert!(!String::from_utf8_lossy(&body).contains("private"));
+    }
+    gateway.shutdown().await;
+}
+
+#[tokio::test]
+async fn http_proxy_connect_failure_is_bounded_and_never_echoes_private_authority() {
+    let unused_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let unused_addr = unused_listener.local_addr().unwrap();
+    drop(unused_listener);
+    let frontend = TemporaryFrontend::new();
+    let gateway = bind_gateway(&frontend).await;
+    let cookie = bootstrap_session(&gateway).await;
+    let state = gateway.state();
+    let generation = state.begin_backend_start().await.unwrap();
+    state.backend_ready(generation, unused_addr).await.unwrap();
+
+    let response = send_request(
+        &gateway,
+        Method::POST,
+        "/api/connect-failure",
+        &[(COOKIE.as_str(), &cookie)],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        response.headers().get(CONTENT_TYPE).unwrap(),
+        "application/json"
+    );
+    let body = response_bytes(response).await;
+    assert!(body.len() <= 256);
+    assert_eq!(
+        body,
+        Bytes::from_static(b"{\"error\":\"backend_proxy_failed\"}")
+    );
+    assert!(!String::from_utf8_lossy(&body).contains(&unused_addr.to_string()));
+    gateway.shutdown().await;
+}
+
+#[test]
+fn http_proxy_disables_hyper_automatic_request_retries() {
+    let source = include_str!("../src/startup_gateway.rs");
+    assert!(
+        source.contains("retry_canceled_requests(false)"),
+        "the proxy client must never replay an ordinary HTTP request"
+    );
+}
+
+#[tokio::test]
+async fn http_proxy_streams_32_mib_upload_and_download_without_aggregation() {
+    let upload_produced = Arc::new(AtomicUsize::new(0));
+    let download_produced = Arc::new(AtomicUsize::new(0));
+    let (first_upload_sender, first_upload_receiver) = oneshot::channel();
+    let first_upload_sender = Arc::new(Mutex::new(Some(first_upload_sender)));
+    let (upload_total_sender, upload_total_receiver) = oneshot::channel();
+    let upload_total_sender = Arc::new(Mutex::new(Some(upload_total_sender)));
+    let backend_download_produced = download_produced.clone();
+    let backend = FakeBackend::spawn(Arc::new(move |request| {
+        let first_upload_sender = first_upload_sender.clone();
+        let upload_total_sender = upload_total_sender.clone();
+        let download_produced = backend_download_produced.clone();
+        async move {
+            let mut body = request.into_body();
+            let mut upload_total = 0_usize;
+            while let Some(frame) = body.frame().await {
+                let frame = frame.unwrap();
+                if let Some(data) = frame.data_ref() {
+                    assert!(data.iter().all(|byte| *byte == 7));
+                    upload_total += data.len();
+                    if let Some(sender) = first_upload_sender.lock().await.take() {
+                        let _ = sender.send(());
+                    }
+                }
+            }
+            upload_total_sender
+                .lock()
+                .await
+                .take()
+                .unwrap()
+                .send(upload_total)
+                .unwrap();
+
+            let download_stream = stream::unfold(0_usize, move |index| {
+                let download_produced = download_produced.clone();
+                async move {
+                    if index == STREAM_CHUNK_COUNT {
+                        return None;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    download_produced.fetch_add(1, Ordering::SeqCst);
+                    Some((
+                        Ok::<_, io::Error>(Frame::data(Bytes::from_static(DOWNLOAD_CHUNK))),
+                        index + 1,
+                    ))
+                }
+            });
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "application/octet-stream")
+                .body(StreamBody::new(download_stream).boxed_unsync())
+                .unwrap()
+        }
+        .boxed()
+    }))
+    .await;
+    let frontend = TemporaryFrontend::new();
+    let gateway = bind_gateway(&frontend).await;
+    let cookie = bootstrap_session(&gateway).await;
+    let state = gateway.state();
+    let generation = state.begin_backend_start().await.unwrap();
+    state.backend_ready(generation, backend.addr).await.unwrap();
+
+    let producer_counter = upload_produced.clone();
+    let upload_stream = stream::unfold(0_usize, move |index| {
+        let producer_counter = producer_counter.clone();
+        async move {
+            if index == STREAM_CHUNK_COUNT {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            producer_counter.fetch_add(1, Ordering::SeqCst);
+            Some((
+                Ok::<_, io::Error>(Frame::data(Bytes::from_static(UPLOAD_CHUNK))),
+                index + 1,
+            ))
+        }
+    });
+    let gateway_addr = gateway_addr(&gateway);
+    let public_authority = gateway.public_authority();
+    let upload_request = tokio::spawn(async move {
+        send_request_to(
+            gateway_addr,
+            public_authority,
+            Method::POST,
+            "/large-transfer?kind=stream",
+            &[(COOKIE.as_str(), cookie.as_str())],
+            StreamBody::new(upload_stream).boxed_unsync(),
+        )
+        .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(2), first_upload_receiver)
+        .await
+        .expect("backend did not receive the first streamed upload chunk")
+        .unwrap();
+    assert!(
+        upload_produced.load(Ordering::SeqCst) < STREAM_CHUNK_COUNT,
+        "gateway buffered the complete upload before forwarding"
+    );
+
+    let response = tokio::time::timeout(Duration::from_secs(10), upload_request)
+        .await
+        .expect("streaming upload did not complete")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        download_produced.load(Ordering::SeqCst) < STREAM_CHUNK_COUNT,
+        "gateway buffered the complete download before returning response headers"
+    );
+
+    let mut body = response.into_body();
+    let mut download_total = 0_usize;
+    while let Some(frame) = body.frame().await {
+        let frame = frame.unwrap();
+        if let Some(data) = frame.data_ref() {
+            assert!(data.iter().all(|byte| *byte == 9));
+            download_total += data.len();
+        }
+    }
+    assert_eq!(upload_total_receiver.await.unwrap(), STREAM_BYTE_COUNT);
+    assert_eq!(download_total, STREAM_BYTE_COUNT);
+    assert_eq!(upload_produced.load(Ordering::SeqCst), STREAM_CHUNK_COUNT);
+    assert_eq!(download_produced.load(Ordering::SeqCst), STREAM_CHUNK_COUNT);
+    gateway.shutdown().await;
+    backend.shutdown().await;
 }
