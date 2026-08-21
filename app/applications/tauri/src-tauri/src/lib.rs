@@ -32,6 +32,7 @@ use tauri::{Emitter, Manager};
 const MAX_PENDING_LAUNCH_INTENTS: usize = 64;
 pub const GATEWAY_WINDOW_VISIBLE_DEADLINE: std::time::Duration =
     std::time::Duration::from_millis(800);
+pub const GATEWAY_BIND_CLEANUP_GRACE: std::time::Duration = std::time::Duration::from_millis(50);
 pub const WINDOW_PRESENTATION_BUDGET: std::time::Duration = std::time::Duration::from_millis(200);
 static NEXT_SECONDARY_WINDOW_ID: AtomicU64 = AtomicU64::new(1);
 

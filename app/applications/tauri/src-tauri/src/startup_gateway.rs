@@ -855,7 +855,7 @@ pub struct StartupGateway {
     state: GatewayState,
     shutdown: watch::Sender<bool>,
     shutdown_drain: Duration,
-    accept_task: JoinHandle<()>,
+    accept_task: Option<JoinHandle<()>>,
 }
 
 struct PendingAcceptTask {
@@ -1073,7 +1073,7 @@ impl StartupGateway {
             state,
             shutdown,
             shutdown_drain: limits.shutdown_drain,
-            accept_task,
+            accept_task: Some(accept_task),
         })
     }
 
@@ -1094,16 +1094,39 @@ impl StartupGateway {
         self.state.clone()
     }
 
-    pub async fn shutdown(self) {
+    pub async fn shutdown(mut self) {
         self.state.shutdown().await;
         self.shutdown.send_replace(true);
-        let mut accept_task = self.accept_task;
+        let Some(mut accept_task) = self.accept_task.take() else {
+            return;
+        };
         match tokio::time::timeout(self.shutdown_drain, &mut accept_task).await {
             Ok(result) => observe_accept_task_result(result),
             Err(_) => {
                 accept_task.abort();
                 observe_accept_task_result(accept_task.await);
             }
+        }
+    }
+
+    pub(crate) async fn abort(mut self) {
+        self.shutdown.send_replace(true);
+        let accept_task = self.accept_task.take();
+        if let Some(task) = accept_task.as_ref() {
+            task.abort();
+        }
+        self.state.shutdown().await;
+        if let Some(task) = accept_task {
+            observe_accept_task_result(task.await);
+        }
+    }
+}
+
+impl Drop for StartupGateway {
+    fn drop(&mut self) {
+        self.shutdown.send_replace(true);
+        if let Some(task) = self.accept_task.take() {
+            task.abort();
         }
     }
 }

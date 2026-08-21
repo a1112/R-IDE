@@ -102,6 +102,7 @@ pub struct StartupVisibilityDeadline {
     started_at: tokio::time::Instant,
     absolute_deadline: tokio::time::Instant,
     presentation_budget: Duration,
+    cleanup_grace: Duration,
 }
 
 impl StartupVisibilityDeadline {
@@ -110,11 +111,32 @@ impl StartupVisibilityDeadline {
         visible_after: Duration,
         presentation_budget: Duration,
     ) -> Result<Self, &'static str> {
+        Self::with_cleanup_grace(
+            started_at,
+            visible_after,
+            presentation_budget,
+            crate::GATEWAY_BIND_CLEANUP_GRACE,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn with_cleanup_grace(
+        started_at: tokio::time::Instant,
+        visible_after: Duration,
+        presentation_budget: Duration,
+        cleanup_grace: Duration,
+    ) -> Result<Self, &'static str> {
         if visible_after.is_zero() {
             return Err("window visibility deadline must be nonzero");
         }
-        if presentation_budget.is_zero() || presentation_budget >= visible_after {
-            return Err("window presentation budget must be nonzero and below the deadline");
+        if presentation_budget.is_zero() || cleanup_grace.is_zero() {
+            return Err("window presentation budget and bind cleanup grace must be nonzero");
+        }
+        let reserved = presentation_budget
+            .checked_add(cleanup_grace)
+            .ok_or("reserved startup budget overflowed")?;
+        if reserved >= visible_after {
+            return Err("reserved startup budgets must be below the visibility deadline");
         }
         let absolute_deadline = started_at
             .checked_add(visible_after)
@@ -123,6 +145,7 @@ impl StartupVisibilityDeadline {
             started_at,
             absolute_deadline,
             presentation_budget,
+            cleanup_grace,
         })
     }
 
@@ -138,10 +161,14 @@ impl StartupVisibilityDeadline {
         self.presentation_budget
     }
 
+    pub fn cleanup_deadline(self) -> tokio::time::Instant {
+        self.absolute_deadline
+            .checked_sub(self.presentation_budget)
+            .expect("validated presentation budget must fit the absolute deadline")
+    }
+
     pub fn bind_deadline(self, now: tokio::time::Instant) -> Option<tokio::time::Instant> {
-        let bind_deadline = self
-            .absolute_deadline
-            .checked_sub(self.presentation_budget)?;
+        let bind_deadline = self.cleanup_deadline().checked_sub(self.cleanup_grace)?;
         (now < bind_deadline).then_some(bind_deadline)
     }
 }
@@ -266,8 +293,10 @@ impl StartupCoordinator {
         bind_gateway: B,
     ) -> Result<StartupLaunch, StartupCoordinatorError>
     where
-        B: FnOnce(PathBuf, StartupMetrics, GatewayLimits, GatewayBindCancellation) -> BindFuture,
-        BindFuture: Future<Output = Result<StartupGateway, GatewayError>>,
+        B: FnOnce(PathBuf, StartupMetrics, GatewayLimits, GatewayBindCancellation) -> BindFuture
+            + Send
+            + 'static,
+        BindFuture: Future<Output = Result<StartupGateway, GatewayError>> + Send + 'static,
     {
         let window_created = StartupWindowCreatedGate::default();
         if self.requested_mode != StartupMode::RustGateway {
@@ -293,23 +322,42 @@ impl StartupCoordinator {
             );
         };
         let cancellation = GatewayBindCancellation::new();
-        let mut bind = Box::pin(bind_gateway(
-            gateway_frontend_directory,
-            self.metrics.clone(),
-            self.limits,
-            cancellation.clone(),
-        ));
-        let bind_result = match tokio::time::timeout_at(bind_deadline, &mut bind).await {
-            Ok(result) => result,
+        let bind_metrics = self.metrics.clone();
+        let bind_limits = self.limits;
+        let bind_cancellation = cancellation.clone();
+        let mut bind_task = tokio::spawn(async move {
+            bind_gateway(
+                gateway_frontend_directory,
+                bind_metrics,
+                bind_limits,
+                bind_cancellation,
+            )
+            .await
+        });
+        let bind_result = match tokio::time::timeout_at(bind_deadline, &mut bind_task).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => {
+                return self.legacy_fallback(
+                    legacy_initial_url,
+                    window_created,
+                    "startup gateway bind task stopped before completion",
+                );
+            }
             Err(_) => {
                 cancellation.cancel();
-                if let Ok(gateway) = bind.await {
-                    gateway.shutdown().await;
+                let cleanup_deadline = self.visibility_deadline.cleanup_deadline();
+                match tokio::time::timeout_at(cleanup_deadline, &mut bind_task).await {
+                    Ok(Ok(Ok(gateway))) => gateway.abort().await,
+                    Ok(Ok(Err(_))) | Ok(Err(_)) => {}
+                    Err(_) => {
+                        bind_task.abort();
+                        let _ = bind_task.await;
+                    }
                 }
                 return self.legacy_fallback(
                     legacy_initial_url,
                     window_created,
-                    "startup gateway initialization exceeded its bind budget while preserving the window presentation budget",
+                    "startup gateway initialization exceeded its bind budget and bounded cleanup grace while preserving the window presentation budget",
                 );
             }
         };

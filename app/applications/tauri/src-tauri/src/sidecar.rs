@@ -715,6 +715,47 @@ async fn kill_portable_child_async(
         .map_err(|error| format!("Failed to kill PTY backend: {error}"))
 }
 
+async fn wait_for_pty_exit_bounded(
+    exit_rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+) -> Result<(), String> {
+    match tokio::time::timeout(Duration::from_secs(5), exit_rx.recv()).await {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err("PTY backend exit channel closed before reap".to_string()),
+        Err(_) => Err("PTY backend reap timed out".to_string()),
+    }
+}
+
+async fn finish_pty_readiness_publication<Kill, KillFuture, Reap, ReapFuture, Clear>(
+    publication: Result<bool, String>,
+    kill: Kill,
+    reap: Reap,
+    clear: Clear,
+) -> Result<(), String>
+where
+    Kill: FnOnce() -> KillFuture,
+    KillFuture: Future<Output = Result<(), String>>,
+    Reap: FnOnce() -> ReapFuture,
+    ReapFuture: Future<Output = Result<(), String>>,
+    Clear: FnOnce(),
+{
+    let publication_error = match publication {
+        Ok(true) => return Ok(()),
+        Ok(false) => "Backend start was cancelled before PTY publication".to_string(),
+        Err(error) => error,
+    };
+    let kill = kill().await;
+    let reap = reap().await;
+    clear();
+    match (kill, reap) {
+        (Ok(()), Ok(())) => Err(publication_error),
+        (kill, reap) => Err(format!(
+            "{publication_error}; PTY cleanup failed: kill: {}; reap: {}",
+            kill.err().unwrap_or_else(|| "ok".to_string()),
+            reap.err().unwrap_or_else(|| "ok".to_string())
+        )),
+    }
+}
+
 async fn cleanup_failed_pty_backend_start(
     app_handle: &AppHandle,
     mut child: Box<dyn portable_pty::Child + Send + Sync>,
@@ -1095,13 +1136,13 @@ async fn start_node_backend_process(
     }
     log::info!("Backend ready on port {}", ready_port);
     let pid = child_pid.expect("PTY backend readiness requires an owned process id");
-    let published = match race_backend_publication_with_exit(
+    let publication = match race_backend_publication_with_exit(
         exit_rx.recv(),
         publish_backend_listening(app_handle, pid, ready_port, &publisher),
     )
     .await
     {
-        Ok(published) => published?,
+        Ok(published) => published,
         Err(exit) => {
             clear_backend_process(app_handle, pid);
             return Err(match exit {
@@ -1112,23 +1153,15 @@ async fn start_node_backend_process(
             });
         }
     };
-    if !published {
-        let fallback = kill_portable_child_async(pty_killer).await;
-        let reaped = tokio::time::timeout(Duration::from_secs(5), exit_rx.recv()).await;
-        clear_backend_process(app_handle, pid);
-        return Err(match (fallback, reaped) {
-            (_, Ok(Some(_))) => "Backend start was cancelled before PTY publication".to_string(),
-            (fallback, reaped) => format!(
-                "Backend start was cancelled before PTY publication; kill: {}; reap: {}",
-                fallback.err().unwrap_or_else(|| "ok".to_string()),
-                match reaped {
-                    Ok(None) => "wait channel closed",
-                    Err(_) => "timed out",
-                    Ok(Some(_)) => "ok",
-                }
-            ),
-        });
-    }
+    finish_pty_readiness_publication(
+        publication,
+        || kill_portable_child_async(pty_killer),
+        || wait_for_pty_exit_bounded(&mut exit_rx),
+        || {
+            clear_backend_process(app_handle, pid);
+        },
+    )
+    .await?;
 
     let app_handle_logs = app_handle.clone();
     std::thread::spawn(move || {
@@ -2203,5 +2236,33 @@ mod tests {
             },
         );
         assert_eq!(*stopping_events.borrow(), ["clear"]);
+    }
+
+    #[tokio::test]
+    async fn pty_publication_error_kills_reaps_and_clears_with_combined_diagnostics() {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let kill_events = events.clone();
+        let reap_events = events.clone();
+        let clear_events = events.clone();
+
+        let error = super::finish_pty_readiness_publication(
+            Err("gateway publication rejected".to_string()),
+            move || async move {
+                kill_events.lock().unwrap().push("kill");
+                Err("portable child kill failed".to_string())
+            },
+            move || async move {
+                reap_events.lock().unwrap().push("reap");
+                Err("portable child reap timed out".to_string())
+            },
+            move || clear_events.lock().unwrap().push("clear"),
+        )
+        .await
+        .expect_err("publication rejection must fail PTY startup");
+
+        assert_eq!(*events.lock().unwrap(), ["kill", "reap", "clear"]);
+        assert!(error.contains("gateway publication rejected"), "{error}");
+        assert!(error.contains("portable child kill failed"), "{error}");
+        assert!(error.contains("portable child reap timed out"), "{error}");
     }
 }

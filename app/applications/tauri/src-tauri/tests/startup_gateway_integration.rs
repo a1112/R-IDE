@@ -17,7 +17,7 @@ use ride_tauri::startup_metrics::{
     ElapsedClock, StartupMetrics, StartupMilestone, StartupMode, StartupReport, StartupReportWriter,
 };
 use ride_tauri::{
-    is_trusted_secondary_window_url, shutdown_gateway_before_backend,
+    is_trusted_secondary_window_url, shutdown_gateway_before_backend, GATEWAY_BIND_CLEANUP_GRACE,
     GATEWAY_WINDOW_VISIBLE_DEADLINE, WINDOW_PRESENTATION_BUDGET,
 };
 use std::fs;
@@ -28,6 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 use tauri::WebviewUrl;
+use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
@@ -75,6 +76,14 @@ impl StartupReportWriter for ChannelWriter {
         self.0
             .send(serde_json::to_value(report).expect("serialize startup report"))
             .map_err(io::Error::other)
+    }
+}
+
+struct DropFlag(Arc<AtomicBool>);
+
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
     }
 }
 
@@ -359,7 +368,15 @@ fn visibility_deadline_is_captured_before_setup_and_never_restarts_at_coordinato
 
     assert_eq!(
         visibility.bind_deadline(coordinator_reached_at),
-        Some(started_at + GATEWAY_WINDOW_VISIBLE_DEADLINE - WINDOW_PRESENTATION_BUDGET)
+        Some(
+            started_at + GATEWAY_WINDOW_VISIBLE_DEADLINE
+                - WINDOW_PRESENTATION_BUDGET
+                - GATEWAY_BIND_CLEANUP_GRACE
+        )
+    );
+    assert_eq!(
+        visibility.cleanup_deadline(),
+        started_at + GATEWAY_WINDOW_VISIBLE_DEADLINE - WINDOW_PRESENTATION_BUDGET
     );
 
     let run_source = include_str!("../src/lib.rs");
@@ -512,6 +529,98 @@ async fn exhausted_bind_budget_falls_back_without_attempting_gateway() {
         .fallback_reason
         .as_deref()
         .is_some_and(|reason| reason.contains("presentation budget") && reason.len() <= 256));
+}
+
+#[tokio::test]
+async fn permanently_pending_binder_is_aborted_within_cleanup_grace() {
+    let started_at = tokio::time::Instant::now();
+    let visibility = StartupVisibilityDeadline::with_cleanup_grace(
+        started_at,
+        Duration::from_millis(300),
+        Duration::from_millis(100),
+        Duration::from_millis(40),
+    )
+    .unwrap();
+    let bind_dropped = Arc::new(AtomicBool::new(false));
+    let observed_drop = Arc::clone(&bind_dropped);
+
+    let launch = tokio::time::timeout(
+        Duration::from_secs(1),
+        StartupCoordinator::with_limits(
+            StartupMode::RustGateway,
+            disabled_metrics(StartupMode::RustGateway),
+            GatewayLimits::test_defaults(),
+            visibility,
+        )
+        .launch_with_gateway_bind(
+            PathBuf::from("unused"),
+            legacy_url(),
+            move |_frontend, _metrics, _limits, _cancellation| async move {
+                let _drop = DropFlag(observed_drop);
+                std::future::pending::<Result<StartupGateway, GatewayError>>().await
+            },
+        ),
+    )
+    .await
+    .expect("pending binder exceeded its absolute software budget")
+    .expect("pending gateway fallback");
+
+    assert_eq!(launch.mode, StartupMode::LegacyFallback);
+    assert!(bind_dropped.load(Ordering::SeqCst));
+    assert!(tokio::time::Instant::now() < visibility.absolute_deadline());
+    assert!(launch
+        .fallback_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("cleanup grace") && reason.len() <= 256));
+}
+
+#[tokio::test]
+async fn gateway_returned_after_timeout_is_fast_aborted_and_releases_its_listener() {
+    let frontend = TemporaryFrontend::new();
+    let gateway_limits = GatewayLimits {
+        shutdown_drain: Duration::from_secs(2),
+        ..GatewayLimits::test_defaults()
+    };
+    let gateway = StartupGateway::bind(
+        frontend.root.clone(),
+        disabled_metrics(StartupMode::RustGateway),
+        gateway_limits,
+    )
+    .await
+    .expect("gateway fixture");
+    let address: SocketAddr = gateway.public_authority().parse().unwrap();
+    let started_at = tokio::time::Instant::now();
+    let visibility = StartupVisibilityDeadline::with_cleanup_grace(
+        started_at,
+        Duration::from_millis(300),
+        Duration::from_millis(100),
+        Duration::from_millis(40),
+    )
+    .unwrap();
+
+    let launch = StartupCoordinator::with_limits(
+        StartupMode::RustGateway,
+        disabled_metrics(StartupMode::RustGateway),
+        GatewayLimits::test_defaults(),
+        visibility,
+    )
+    .launch_with_gateway_bind(
+        frontend.root.clone(),
+        legacy_url(),
+        move |_frontend, _metrics, _limits, cancellation| async move {
+            cancellation.cancelled().await;
+            Ok(gateway)
+        },
+    )
+    .await
+    .expect("late-success gateway fallback");
+
+    assert_eq!(launch.mode, StartupMode::LegacyFallback);
+    assert!(tokio::time::Instant::now() < visibility.absolute_deadline());
+    let rebound = TcpListener::bind(address)
+        .await
+        .expect("late-success gateway retained its listener");
+    drop(rebound);
 }
 
 #[tokio::test]
