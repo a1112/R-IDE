@@ -285,6 +285,29 @@ fn a_registered_child_is_returned_for_stop_and_cannot_be_revived() {
     assert!(!ownership.register_spawn(launch, 42));
     assert_eq!(ownership.pid(), None);
     assert!(ownership.is_stopping());
+    assert!(ownership.has_owned_work());
+    assert!(ownership.owns_process(42));
+
+    assert!(ownership.clear_spawn(42));
+    assert!(!ownership.is_stopping());
+    assert!(!ownership.has_owned_work());
+    assert!(!ownership.owns_process(42));
+}
+
+#[test]
+fn a_stale_child_clear_cannot_release_the_current_stop_owner() {
+    let mut ownership = BackendOwnershipState::default();
+    let launch = ownership.reserve_start();
+    assert!(ownership.register_spawn(launch, 42));
+    assert_eq!(ownership.request_stop(), Some(42));
+
+    assert!(ownership.clear_spawn(7));
+    assert!(ownership.is_stopping());
+    assert!(ownership.owns_process(42));
+
+    assert!(ownership.clear_spawn(42));
+    assert!(!ownership.is_stopping());
+    assert!(!ownership.has_owned_work());
 }
 
 #[test]

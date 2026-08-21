@@ -33,6 +33,7 @@ use tokio::process::Command;
 
 const BACKEND_STARTUP_TIMEOUT: u64 = 240; // seconds
 pub(crate) const BACKEND_PORT: u16 = 3000;
+pub const BACKEND_CLEANUP_BOUND: Duration = Duration::from_secs(5);
 const BACKEND_PROBE_INTERVAL: Duration = Duration::from_millis(50);
 const BACKEND_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 
@@ -538,17 +539,20 @@ fn clear_backend_process(app_handle: &AppHandle, pid: u32) -> bool {
     let Some(state) = app_handle.try_state::<crate::AppState>() else {
         return false;
     };
-    let mut ownership = state.backend_ownership.lock().unwrap();
-    let owns_process = ownership.pid() == Some(pid);
-    let stopping = ownership.clear_spawn(pid);
-    if !owns_process {
-        return stopping;
+    let (owns_process, stopping) = {
+        let mut ownership = state.backend_ownership.lock().unwrap();
+        let owns_process = ownership.pid() == Some(pid);
+        let stopping = ownership.clear_spawn(pid);
+        (owns_process, stopping)
+    };
+    if owns_process {
+        let mut stop_fallback = state.backend_stop_fallback.lock().unwrap();
+        if stop_fallback.as_ref().map(|(owner, _)| *owner) == Some(pid) {
+            stop_fallback.take();
+        }
+        *state.backend_port.lock().unwrap() = None;
     }
-    let mut stop_fallback = state.backend_stop_fallback.lock().unwrap();
-    if stop_fallback.as_ref().map(|(owner, _)| *owner) == Some(pid) {
-        stop_fallback.take();
-    }
-    *state.backend_port.lock().unwrap() = None;
+    state.backend_cleanup_notify.notify_waiters();
     stopping
 }
 
@@ -1977,6 +1981,64 @@ pub fn stop_backend(app_handle: &AppHandle) -> Result<(), String> {
         Ok(())
     };
     finish_backend_stop(termination, stop_fallback)
+}
+
+pub async fn stop_backend_bounded(app_handle: &AppHandle, bound: Duration) -> Result<(), String> {
+    if bound.is_zero() {
+        return Err("Backend cleanup bound must be nonzero".to_string());
+    }
+    let Some(state) = app_handle.try_state::<crate::AppState>() else {
+        return Ok(());
+    };
+    let expected_pid = state.backend_ownership.lock().unwrap().pid();
+    let deadline = tokio::time::Instant::now() + bound;
+    let stop_handle = app_handle.clone();
+    let stop_task = tauri::async_runtime::spawn_blocking(move || stop_backend(&stop_handle));
+    let stop_result = match tokio::time::timeout_at(deadline, stop_task).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => Err(format!("Backend stop task failed: {error}")),
+        Err(_) => Err(format!(
+            "Backend process-tree stop exceeded {}ms",
+            bound.as_millis()
+        )),
+    };
+    let Some(expected_pid) = expected_pid else {
+        return stop_result;
+    };
+
+    let cleanup_confirmed = loop {
+        let notified = state.backend_cleanup_notify.notified();
+        if !state
+            .backend_ownership
+            .lock()
+            .unwrap()
+            .owns_process(expected_pid)
+        {
+            break true;
+        }
+        if tokio::time::timeout_at(deadline, notified).await.is_err() {
+            break !state
+                .backend_ownership
+                .lock()
+                .unwrap()
+                .owns_process(expected_pid);
+        }
+    };
+    if cleanup_confirmed {
+        if let Err(error) = stop_result {
+            log::warn!("Backend cleanup was confirmed after a stop warning: {error}");
+        }
+        Ok(())
+    } else {
+        let cleanup = format!(
+            "Backend child reap exceeded the {}ms cleanup bound",
+            bound.as_millis()
+        );
+        match stop_result {
+            Ok(()) => Err(cleanup),
+            Err(stop) => Err(format!("{stop}; {cleanup}")),
+        }
+    }
 }
 
 #[cfg(test)]

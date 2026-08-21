@@ -63,6 +63,68 @@ where
     backend_cleanup()
 }
 
+pub async fn begin_gateway_retry_after_cleanup<C, E>(
+    state: &startup_gateway::GatewayState,
+    failed_generation: startup_gateway::BackendGeneration,
+    cleanup: C,
+) -> Result<startup_gateway::BackendGeneration, String>
+where
+    C: Future<Output = Result<(), E>>,
+    E: std::fmt::Display,
+{
+    cleanup
+        .await
+        .map_err(|error| format!("Backend cleanup before retry failed: {error}"))?;
+    state
+        .begin_backend_retry(failed_generation)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+async fn run_backend_retry_coordinator(
+    app_handle: tauri::AppHandle,
+    workspace: Option<PathBuf>,
+    state: startup_gateway::GatewayState,
+    public_authority: String,
+    window_created: startup::StartupWindowCreatedGate,
+    mut retries: tokio::sync::mpsc::Receiver<startup_gateway::RetryRequest>,
+) {
+    while let Some(request) = retries.recv().await {
+        let generation = match begin_gateway_retry_after_cleanup(
+            &state,
+            request.generation(),
+            sidecar::stop_backend_bounded(&app_handle, sidecar::BACKEND_CLEANUP_BOUND),
+        )
+        .await
+        {
+            Ok(generation) => generation,
+            Err(error) => {
+                log::warn!("Backend retry was rejected after cleanup: {error}");
+                continue;
+            }
+        };
+        let backend_start = {
+            let app_state = app_handle.state::<AppState>();
+            let mut ownership = app_state.backend_ownership.lock().unwrap();
+            if app_state.backend_retries_stopped.load(Ordering::Acquire) {
+                break;
+            }
+            ownership.reserve_start()
+        };
+        let publisher = sidecar::BackendReadinessPublisher::gateway(
+            state.clone(),
+            generation,
+            public_authority.clone(),
+            window_created.clone(),
+        );
+        if let Err(error) =
+            sidecar::start_backend(&app_handle, workspace.clone(), backend_start, publisher).await
+        {
+            log::warn!("Backend retry generation failed: {error}");
+        }
+    }
+}
+
 fn configure_local_proxy_bypass() {
     for name in ["NO_PROXY", "no_proxy"] {
         let mut entries = std::env::var(name)
@@ -88,6 +150,8 @@ pub struct AppState {
     pub backend_port: Mutex<Option<u16>>,
     pub backend_ownership: Mutex<startup::BackendOwnershipState>,
     pub backend_stop_fallback: Mutex<Option<(u32, tokio::sync::mpsc::UnboundedSender<()>)>>,
+    pub backend_cleanup_notify: tokio::sync::Notify,
+    pub backend_retries_stopped: std::sync::atomic::AtomicBool,
     pub downloads: download::DownloadManager,
     pub launch_intent_router: launch_intent::LaunchIntentRouter,
     pub performance: performance::PerformanceSampler,
@@ -108,6 +172,8 @@ impl AppState {
             backend_port: Mutex::new(None),
             backend_ownership: Mutex::new(startup::BackendOwnershipState::default()),
             backend_stop_fallback: Mutex::new(None),
+            backend_cleanup_notify: tokio::sync::Notify::new(),
+            backend_retries_stopped: std::sync::atomic::AtomicBool::new(false),
             downloads: download::DownloadManager::new(),
             launch_intent_router: launch_intent::LaunchIntentRouter::new(
                 MAX_PENDING_LAUNCH_INTENTS,
@@ -189,17 +255,26 @@ fn register_gateway_capability(
 }
 
 fn shutdown_application(app_handle: &tauri::AppHandle) -> Result<(), String> {
-    let gateway = app_handle
-        .try_state::<AppState>()
-        .and_then(|state| state.gateway.lock().ok()?.take());
-    tauri::async_runtime::block_on(shutdown_gateway_before_backend(
-        async move {
-            if let Some(gateway) = gateway {
-                gateway.shutdown().await;
-            }
-        },
-        || sidecar::stop_backend(app_handle),
-    ))
+    let gateway = if let Some(state) = app_handle.try_state::<AppState>() {
+        let _ownership = state
+            .backend_ownership
+            .lock()
+            .map_err(|_| "backend ownership mutex is poisoned".to_string())?;
+        state.backend_retries_stopped.store(true, Ordering::Release);
+        state
+            .gateway
+            .lock()
+            .map_err(|_| "gateway mutex is poisoned".to_string())?
+            .take()
+    } else {
+        None
+    };
+    tauri::async_runtime::block_on(async move {
+        if let Some(gateway) = gateway {
+            gateway.shutdown().await;
+        }
+        sidecar::stop_backend_bounded(app_handle, sidecar::BACKEND_CLEANUP_BOUND).await
+    })
 }
 
 fn restore_main_window(app: &tauri::AppHandle) {
@@ -367,6 +442,7 @@ pub fn run() {
                     }
                     *app.state::<AppState>().startup_mode.lock().unwrap() = launch.mode;
 
+                    let window_created_gate = launch.window_created_gate();
                     let readiness_publisher = match launch.gateway.as_ref() {
                         Some(gateway) => {
                             let capability = startup::GatewayCapabilitySpec::for_gateway(gateway);
@@ -375,7 +451,7 @@ pub fn run() {
                                 gateway.state(),
                                 launch.backend_generation,
                                 gateway.public_authority(),
-                                launch.window_created_gate(),
+                                window_created_gate.clone(),
                             )
                         }
                         None => sidecar::BackendReadinessPublisher::legacy(),
@@ -386,9 +462,20 @@ pub fn run() {
                         )
                         .into());
                     }
+                    let retry_coordinator = launch.gateway.as_mut().and_then(|gateway| {
+                        gateway.take_retry_requests().map(|requests| {
+                            (
+                                requests,
+                                gateway.state(),
+                                gateway.public_authority(),
+                                window_created_gate.clone(),
+                            )
+                        })
+                    });
                     *app.state::<AppState>().gateway.lock().unwrap() = launch.gateway.take();
 
                     let app_handle = app.handle().clone();
+                    let retry_workspace = initial_workspace.clone();
                     let backend_start = app
                         .state::<AppState>()
                         .backend_ownership
@@ -407,6 +494,19 @@ pub fn run() {
                             eprintln!("Failed to start backend: {}", e);
                         }
                     });
+                    if let Some((requests, state, public_authority, window_created)) =
+                        retry_coordinator
+                    {
+                        let retry_app_handle = app.handle().clone();
+                        tauri::async_runtime::spawn(run_backend_retry_coordinator(
+                            retry_app_handle,
+                            retry_workspace,
+                            state,
+                            public_authority,
+                            window_created,
+                            requests,
+                        ));
+                    }
 
                     let secondary_window_app = app.handle().clone();
                     let window =
@@ -554,6 +654,52 @@ mod tests {
     use super::*;
     use std::sync::{mpsc, Arc};
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn retry_generation_waits_for_cleanup_and_then_advances_once() {
+        let state =
+            startup_gateway::GatewayState::new(startup_gateway::GatewayLimits::test_defaults());
+        let first = state.begin_backend_start().await.unwrap();
+        state.fail_backend(first, "first failed").await.unwrap();
+        let (cleanup_done, cleanup_wait) = tokio::sync::oneshot::channel();
+        let retry_state = state.clone();
+        let retry = tokio::spawn(async move {
+            begin_gateway_retry_after_cleanup(&retry_state, first, async move {
+                cleanup_wait.await.map_err(|_| "cleanup cancelled")?;
+                Ok::<(), &str>(())
+            })
+            .await
+        });
+
+        tokio::task::yield_now().await;
+        let before_cleanup = state.snapshot().await;
+        assert_eq!(before_cleanup.generation, first);
+        assert_eq!(before_cleanup.phase, startup_gateway::BackendPhase::Failed);
+        cleanup_done.send(()).unwrap();
+        let second = retry.await.unwrap().unwrap();
+        assert!(second > first);
+        let after_cleanup = state.snapshot().await;
+        assert_eq!(after_cleanup.generation, second);
+        assert_eq!(after_cleanup.phase, startup_gateway::BackendPhase::Starting);
+    }
+
+    #[tokio::test]
+    async fn failed_cleanup_keeps_the_failed_generation_without_auto_restart() {
+        let state =
+            startup_gateway::GatewayState::new(startup_gateway::GatewayLimits::test_defaults());
+        let first = state.begin_backend_start().await.unwrap();
+        state.fail_backend(first, "first failed").await.unwrap();
+
+        let error = begin_gateway_retry_after_cleanup(&state, first, async {
+            Err::<(), _>("cleanup failed")
+        })
+        .await
+        .unwrap_err();
+        assert!(error.contains("cleanup failed"));
+        let snapshot = state.snapshot().await;
+        assert_eq!(snapshot.generation, first);
+        assert_eq!(snapshot.phase, startup_gateway::BackendPhase::Failed);
+    }
 
     struct CapturingStartupReportWriter {
         reports: mpsc::Sender<serde_json::Value>,

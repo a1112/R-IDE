@@ -884,6 +884,7 @@ pub struct BackendOwnershipState {
     generation: u64,
     pending_start: Option<BackendStartToken>,
     pid: Option<u32>,
+    stopping_pid: Option<u32>,
     stopping: bool,
 }
 
@@ -893,6 +894,7 @@ impl BackendOwnershipState {
         let token = BackendStartToken(self.generation);
         self.pending_start = Some(token);
         self.pid = None;
+        self.stopping_pid = None;
         self.stopping = false;
         token
     }
@@ -909,10 +911,17 @@ impl BackendOwnershipState {
     pub fn request_stop(&mut self) -> Option<u32> {
         self.stopping = true;
         self.pending_start = None;
-        self.pid.take()
+        let pid = self.pid.take();
+        self.stopping_pid = pid;
+        pid
     }
 
     pub fn clear_spawn(&mut self, pid: u32) -> bool {
+        if self.stopping_pid == Some(pid) {
+            self.stopping_pid = None;
+            self.stopping = false;
+            return true;
+        }
         if self.pid != Some(pid) {
             return self.stopping;
         }
@@ -932,6 +941,14 @@ impl BackendOwnershipState {
 
     pub fn is_stopping(&self) -> bool {
         self.stopping
+    }
+
+    pub fn has_owned_work(&self) -> bool {
+        self.pending_start.is_some() || self.pid.is_some() || self.stopping_pid.is_some()
+    }
+
+    pub fn owns_process(&self, pid: u32) -> bool {
+        self.pid == Some(pid) || self.stopping_pid == Some(pid)
     }
 }
 
