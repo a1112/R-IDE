@@ -101,6 +101,7 @@ const frontendBootstrap = `(() => {
     retry = window.document.createElement('button');
     retry.type = 'button';
     retry.textContent = 'Retry';
+    retry.setAttribute('data-ride-startup-retry', 'true');
     retry.setAttribute('style', 'padding:8px 16px;border:0;border-radius:6px;background:#1677ff;color:white;font:inherit;cursor:pointer');
     retry.addEventListener('click', () => {
       if (currentGeneration === undefined || retriedGeneration === currentGeneration || retry.disabled) {

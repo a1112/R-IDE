@@ -357,6 +357,7 @@ test('failed state renders one bounded alert and retry remains idempotent per ge
     element => element.tagName === 'BUTTON' && element.textContent === 'Retry',
   )[0];
   assert.ok(retry);
+  assert.equal(retry.getAttribute('data-ride-startup-retry'), 'true');
   retry.click();
   retry.click();
   await Promise.resolve();
