@@ -20,8 +20,9 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use ride_tauri::startup_gateway::{
-    BackendAddressError, BackendGeneration, BackendPhase, GatewayError, GatewayLimitError,
-    GatewayLimits, GatewayState, PathError, RouteKind, RouteTable, StartupGateway,
+    BackendAddressError, BackendGeneration, BackendPhase, GatewayBindCancellation,
+    GatewayBindObserver, GatewayBindStage, GatewayError, GatewayLimitError, GatewayLimits,
+    GatewayState, PathError, RouteKind, RouteTable, StartupGateway,
 };
 use ride_tauri::startup_metrics::{
     ElapsedClock, StartupMetrics, StartupMilestone, StartupMode, StartupReport, StartupReportWriter,
@@ -30,9 +31,9 @@ use std::fs;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::task::Poll;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1048,6 +1049,115 @@ async fn shutdown_is_bounded_and_releases_the_loopback_listener() {
         .expect("gateway shutdown exceeded its drain bound");
     assert!(socket_closes_within(idle_connection, Duration::from_millis(250)).await);
     assert!(TcpStream::connect(address).await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancellable_bind_joins_inventory_worker_before_returning() {
+    let frontend = TemporaryFrontend::new();
+    let cancellation = GatewayBindCancellation::new();
+    let task_cancellation = cancellation.clone();
+    let (stage_sender, mut stages) = tokio::sync::mpsc::unbounded_channel();
+    let (release_sender, release_receiver) = mpsc::channel();
+    let release_receiver = Arc::new(StdMutex::new(release_receiver));
+    let observer_release = Arc::clone(&release_receiver);
+    let blocked = Arc::new(AtomicBool::new(false));
+    let observer_blocked = Arc::clone(&blocked);
+    let observer = GatewayBindObserver::new(move |stage| {
+        let should_block = matches!(stage, GatewayBindStage::InventoryResource)
+            && !observer_blocked.swap(true, Ordering::SeqCst);
+        let _ = stage_sender.send(stage);
+        if should_block {
+            observer_release
+                .lock()
+                .unwrap()
+                .recv()
+                .expect("release inventory observer");
+        }
+    });
+    let bind = tokio::spawn(StartupGateway::bind_cancellable_observed(
+        frontend.root.clone(),
+        disabled_metrics(),
+        GatewayLimits::test_defaults(),
+        task_cancellation,
+        observer,
+    ));
+
+    loop {
+        if matches!(
+            stages.recv().await,
+            Some(GatewayBindStage::InventoryResource)
+        ) {
+            break;
+        }
+    }
+    cancellation.cancel();
+    release_sender.send(()).unwrap();
+
+    let result = tokio::time::timeout(Duration::from_secs(1), bind)
+        .await
+        .expect("inventory cancellation cleanup timed out")
+        .expect("inventory bind task panicked");
+    assert!(matches!(result, Err(GatewayError::BindCancelled)));
+    let mut remaining = Vec::new();
+    while let Ok(stage) = stages.try_recv() {
+        remaining.push(stage);
+    }
+    assert!(remaining.contains(&GatewayBindStage::InventoryFinished));
+    assert!(!remaining
+        .iter()
+        .any(|stage| matches!(stage, GatewayBindStage::ListenerBound(_))));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancellable_bind_joins_accept_task_and_immediately_releases_listener() {
+    let frontend = TemporaryFrontend::new();
+    let cancellation = GatewayBindCancellation::new();
+    let task_cancellation = cancellation.clone();
+    let (stage_sender, mut stages) = tokio::sync::mpsc::unbounded_channel();
+    let (release_sender, release_receiver) = mpsc::channel();
+    let release_receiver = Arc::new(StdMutex::new(release_receiver));
+    let observer_release = Arc::clone(&release_receiver);
+    let observer = GatewayBindObserver::new(move |stage| {
+        let should_block = matches!(stage, GatewayBindStage::AcceptLoopReady(_));
+        let _ = stage_sender.send(stage);
+        if should_block {
+            observer_release
+                .lock()
+                .unwrap()
+                .recv()
+                .expect("release accept observer");
+        }
+    });
+    let bind = tokio::spawn(StartupGateway::bind_cancellable_observed(
+        frontend.root.clone(),
+        disabled_metrics(),
+        GatewayLimits::test_defaults(),
+        task_cancellation,
+        observer,
+    ));
+
+    let address = loop {
+        if let Some(GatewayBindStage::AcceptLoopReady(address)) = stages.recv().await {
+            break address;
+        }
+    };
+    cancellation.cancel();
+    release_sender.send(()).unwrap();
+
+    let result = tokio::time::timeout(Duration::from_secs(1), bind)
+        .await
+        .expect("accept cancellation cleanup timed out")
+        .expect("accept bind task panicked");
+    assert!(matches!(result, Err(GatewayError::BindCancelled)));
+    let mut remaining = Vec::new();
+    while let Ok(stage) = stages.try_recv() {
+        remaining.push(stage);
+    }
+    assert!(remaining.contains(&GatewayBindStage::AcceptLoopJoined(address)));
+    let rebound = TcpListener::bind(address)
+        .await
+        .expect("cancelled accept loop retained its listener");
+    drop(rebound);
 }
 
 #[tokio::test]

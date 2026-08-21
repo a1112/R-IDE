@@ -32,6 +32,7 @@ use tauri::{Emitter, Manager};
 const MAX_PENDING_LAUNCH_INTENTS: usize = 64;
 pub const GATEWAY_WINDOW_VISIBLE_DEADLINE: std::time::Duration =
     std::time::Duration::from_millis(800);
+pub const WINDOW_PRESENTATION_BUDGET: std::time::Duration = std::time::Duration::from_millis(200);
 static NEXT_SECONDARY_WINDOW_ID: AtomicU64 = AtomicU64::new(1);
 
 pub fn is_trusted_secondary_window_url(url: &tauri::Url, public_authority: &str) -> bool {
@@ -272,6 +273,12 @@ fn install_shutdown_signal_handlers(_app_handle: tauri::AppHandle) {}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let visibility_deadline = startup::StartupVisibilityDeadline::new(
+        tokio::time::Instant::now(),
+        GATEWAY_WINDOW_VISIBLE_DEADLINE,
+        WINDOW_PRESENTATION_BUDGET,
+    )
+    .expect("the static window visibility budget must be valid");
     let _startup_job_lease = match startup_job::create_for_current_process_if_requested(
         std::env::var_os(startup_metrics::STARTUP_REPORT_ENV).is_some(),
     ) {
@@ -338,107 +345,140 @@ pub fn run() {
             let runtime_paths = sidecar::resolve_runtime_paths(app.handle())?;
             let startup_metrics = app.state::<AppState>().startup_metrics.clone();
             let mut launch = tauri::async_runtime::block_on(
-                startup::StartupCoordinator::new(requested_startup_mode, startup_metrics).launch(
+                startup::StartupCoordinator::new(
+                    requested_startup_mode,
+                    startup_metrics,
+                    visibility_deadline,
+                )
+                .launch(
                     runtime_paths.gateway_frontend_directory(),
                     main_window_config.url.clone(),
                 ),
             )
             .map_err(|error| std::io::Error::other(error.to_string()))?;
-            if let Some(reason) = launch.fallback_reason.as_deref() {
-                log::warn!("Startup gateway unavailable; using legacy fallback: {reason}");
-            }
-            *app.state::<AppState>().startup_mode.lock().unwrap() = launch.mode;
+            let presentation = startup::present_startup_window(
+                visibility_deadline,
+                || -> Result<tauri::WebviewWindow, Box<dyn std::error::Error>> {
+                    if let Some(reason) = launch.fallback_reason.as_deref() {
+                        log::warn!(
+                            "Startup gateway unavailable; using legacy fallback: {reason}"
+                        );
+                    }
+                    *app.state::<AppState>().startup_mode.lock().unwrap() = launch.mode;
 
-            let readiness_publisher = match launch.gateway.as_ref() {
-                Some(gateway) => {
-                    let capability = startup::GatewayCapabilitySpec::for_gateway(gateway);
-                    register_gateway_capability(app, &capability)?;
-                    sidecar::BackendReadinessPublisher::gateway(
-                        gateway.state(),
-                        launch.backend_generation,
-                        gateway.public_authority(),
-                        launch.window_created_gate(),
-                    )
-                }
-                None => sidecar::BackendReadinessPublisher::legacy(),
-            };
-            if !launch.dispatch_initial_navigation(|url| main_window_config.url = url) {
-                return Err(std::io::Error::other(
-                    "main window initial navigation was already dispatched",
-                )
-                .into());
-            }
-            *app.state::<AppState>().gateway.lock().unwrap() = launch.gateway.take();
-
-            let app_handle = app.handle().clone();
-            let backend_start = app
-                .state::<AppState>()
-                .backend_ownership
-                .lock()
-                .unwrap()
-                .reserve_start();
-            tauri::async_runtime::spawn(async move {
-                if let Err(e) = sidecar::start_backend(
-                    &app_handle,
-                    initial_workspace,
-                    backend_start,
-                    readiness_publisher,
-                )
-                .await
-                {
-                    eprintln!("Failed to start backend: {}", e);
-                }
-            });
-
-            let secondary_window_app = app.handle().clone();
-            let window =
-                tauri::WebviewWindowBuilder::from_config(app.handle(), &main_window_config)?
-                    .on_new_window(move |url, features| {
-                        let Some(public_authority) =
-                            trusted_secondary_window_authority(&secondary_window_app)
-                        else {
-                            log::warn!(
-                        "Denied secondary-window navigation without an active startup authority"
-                    );
-                            return tauri::webview::NewWindowResponse::Deny;
-                        };
-                        if !is_trusted_secondary_window_url(&url, &public_authority) {
-                            log::warn!("Denied untrusted secondary-window navigation: {url}");
-                            return tauri::webview::NewWindowResponse::Deny;
+                    let readiness_publisher = match launch.gateway.as_ref() {
+                        Some(gateway) => {
+                            let capability = startup::GatewayCapabilitySpec::for_gateway(gateway);
+                            register_gateway_capability(app, &capability)?;
+                            sidecar::BackendReadinessPublisher::gateway(
+                                gateway.state(),
+                                launch.backend_generation,
+                                gateway.public_authority(),
+                                launch.window_created_gate(),
+                            )
                         }
-
-                        let id = NEXT_SECONDARY_WINDOW_ID.fetch_add(1, Ordering::Relaxed);
-                        let label = format!("theia-secondary-{id}");
-                        let blank_url = tauri::Url::parse("about:blank")
-                            .expect("the static secondary-window bootstrap URL must be valid");
-                        let builder = tauri::WebviewWindowBuilder::new(
-                            &secondary_window_app,
-                            label,
-                            tauri::WebviewUrl::External(blank_url),
+                        None => sidecar::BackendReadinessPublisher::legacy(),
+                    };
+                    if !launch.dispatch_initial_navigation(|url| main_window_config.url = url) {
+                        return Err(std::io::Error::other(
+                            "main window initial navigation was already dispatched",
                         )
-                        .window_features(features)
-                        .title("R-IDE")
-                        .on_document_title_changed(|window, title| {
-                            if let Err(error) = window.set_title(&title) {
-                                log::warn!("Failed to update secondary-window title: {error}");
-                            }
-                        });
+                        .into());
+                    }
+                    *app.state::<AppState>().gateway.lock().unwrap() = launch.gateway.take();
 
-                        match builder.build() {
-                            Ok(window) => tauri::webview::NewWindowResponse::Create { window },
-                            Err(error) => {
-                                log::warn!("Failed to create secondary Tauri window: {error}");
-                                tauri::webview::NewWindowResponse::Deny
-                            }
+                    let app_handle = app.handle().clone();
+                    let backend_start = app
+                        .state::<AppState>()
+                        .backend_ownership
+                        .lock()
+                        .unwrap()
+                        .reserve_start();
+                    tauri::async_runtime::spawn(async move {
+                        if let Err(e) = sidecar::start_backend(
+                            &app_handle,
+                            initial_workspace,
+                            backend_start,
+                            readiness_publisher,
+                        )
+                        .await
+                        {
+                            eprintln!("Failed to start backend: {}", e);
                         }
-                    })
-                    .build()?;
-            launch.mark_window_created();
-            native_chrome::configure_native_window(&window);
-            window.show()?;
+                    });
+
+                    let secondary_window_app = app.handle().clone();
+                    let window =
+                        tauri::WebviewWindowBuilder::from_config(app.handle(), &main_window_config)?
+                            .on_new_window(move |url, features| {
+                                let Some(public_authority) =
+                                    trusted_secondary_window_authority(&secondary_window_app)
+                                else {
+                                    log::warn!(
+                                        "Denied secondary-window navigation without an active startup authority"
+                                    );
+                                    return tauri::webview::NewWindowResponse::Deny;
+                                };
+                                if !is_trusted_secondary_window_url(&url, &public_authority) {
+                                    log::warn!(
+                                        "Denied untrusted secondary-window navigation: {url}"
+                                    );
+                                    return tauri::webview::NewWindowResponse::Deny;
+                                }
+
+                                let id =
+                                    NEXT_SECONDARY_WINDOW_ID.fetch_add(1, Ordering::Relaxed);
+                                let label = format!("theia-secondary-{id}");
+                                let blank_url = tauri::Url::parse("about:blank").expect(
+                                    "the static secondary-window bootstrap URL must be valid",
+                                );
+                                let builder = tauri::WebviewWindowBuilder::new(
+                                    &secondary_window_app,
+                                    label,
+                                    tauri::WebviewUrl::External(blank_url),
+                                )
+                                .window_features(features)
+                                .title("R-IDE")
+                                .on_document_title_changed(|window, title| {
+                                    if let Err(error) = window.set_title(&title) {
+                                        log::warn!(
+                                            "Failed to update secondary-window title: {error}"
+                                        );
+                                    }
+                                });
+
+                                match builder.build() {
+                                    Ok(window) => {
+                                        tauri::webview::NewWindowResponse::Create { window }
+                                    }
+                                    Err(error) => {
+                                        log::warn!(
+                                            "Failed to create secondary Tauri window: {error}"
+                                        );
+                                        tauri::webview::NewWindowResponse::Deny
+                                    }
+                                }
+                            })
+                            .build()?;
+                    launch.mark_window_created();
+                    Ok(window)
+                },
+                |window| {
+                    native_chrome::configure_native_window(window);
+                    Ok(window.show()?)
+                },
+                tokio::time::Instant::now,
+            )?;
             app.state::<AppState>()
                 .startup_metrics
                 .record_or_warn(startup_metrics::StartupMilestone::NativeWindowVisible);
+            if !presentation.shown_within_deadline {
+                log::warn!(
+                    "Native window became visible after the absolute {}ms startup deadline (presentation budget: {}ms)",
+                    GATEWAY_WINDOW_VISIBLE_DEADLINE.as_millis(),
+                    WINDOW_PRESENTATION_BUDGET.as_millis()
+                );
+            }
 
             Ok(())
         })

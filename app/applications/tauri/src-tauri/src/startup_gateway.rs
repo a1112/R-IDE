@@ -38,6 +38,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -71,6 +72,80 @@ const HOP_BY_HOP_HEADERS: [&str; 9] = [
     "proxy-authenticate",
     "proxy-authorization",
 ];
+
+#[derive(Clone, Default)]
+pub struct GatewayBindCancellation {
+    inner: Arc<GatewayBindCancellationInner>,
+}
+
+#[derive(Default)]
+struct GatewayBindCancellationInner {
+    cancelled: AtomicBool,
+    notify: Notify,
+}
+
+impl GatewayBindCancellation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        if !self.inner.cancelled.swap(true, Ordering::AcqRel) {
+            self.inner.notify.notify_waiters();
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.inner.cancelled.load(Ordering::Acquire)
+    }
+
+    pub async fn cancelled(&self) {
+        loop {
+            let notified = self.inner.notify.notified();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn check(&self) -> Result<(), GatewayError> {
+        if self.is_cancelled() {
+            Err(GatewayError::BindCancelled)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GatewayBindStage {
+    InventoryStarted,
+    InventoryResource,
+    InventoryFinished,
+    ListenerBound(SocketAddr),
+    AcceptLoopReady(SocketAddr),
+    AcceptLoopJoined(SocketAddr),
+}
+
+#[derive(Clone, Default)]
+pub struct GatewayBindObserver {
+    callback: Option<Arc<dyn Fn(GatewayBindStage) + Send + Sync>>,
+}
+
+impl GatewayBindObserver {
+    pub fn new(callback: impl Fn(GatewayBindStage) + Send + Sync + 'static) -> Self {
+        Self {
+            callback: Some(Arc::new(callback)),
+        }
+    }
+
+    fn record(&self, stage: GatewayBindStage) {
+        if let Some(callback) = &self.callback {
+            callback(stage);
+        }
+    }
+}
 
 type GatewayBody = BoxBody<Bytes, io::Error>;
 
@@ -208,6 +283,7 @@ pub enum GatewayError {
     FrontendUnavailable,
     ListenerUnavailable,
     ListenerStopped,
+    BindCancelled,
     GenerationExhausted,
     ShuttingDown,
 }
@@ -253,6 +329,7 @@ impl fmt::Display for GatewayError {
                 write!(formatter, "startup gateway listener is unavailable")
             }
             Self::ListenerStopped => write!(formatter, "startup gateway listener stopped"),
+            Self::BindCancelled => write!(formatter, "startup gateway bind was cancelled"),
             Self::GenerationExhausted => write!(formatter, "backend generation exhausted"),
             Self::ShuttingDown => write!(formatter, "startup gateway is shutting down"),
         }
@@ -781,21 +858,52 @@ pub struct StartupGateway {
     accept_task: JoinHandle<()>,
 }
 
-struct PendingAcceptTask(Option<JoinHandle<()>>);
+struct PendingAcceptTask {
+    task: Option<JoinHandle<()>>,
+    shutdown: watch::Sender<bool>,
+    state: GatewayState,
+    public_addr: SocketAddr,
+    observer: GatewayBindObserver,
+}
 
 impl PendingAcceptTask {
-    fn new(task: JoinHandle<()>) -> Self {
-        Self(Some(task))
+    fn new(
+        task: JoinHandle<()>,
+        shutdown: watch::Sender<bool>,
+        state: GatewayState,
+        public_addr: SocketAddr,
+        observer: GatewayBindObserver,
+    ) -> Self {
+        Self {
+            task: Some(task),
+            shutdown,
+            state,
+            public_addr,
+            observer,
+        }
     }
 
     fn commit(mut self) -> JoinHandle<()> {
-        self.0.take().expect("pending accept task must be present")
+        self.task
+            .take()
+            .expect("pending accept task must be present")
+    }
+
+    async fn cancel_and_join(mut self) {
+        self.state.shutdown().await;
+        self.shutdown.send_replace(true);
+        if let Some(task) = self.task.take() {
+            task.abort();
+            observe_accept_task_result(task.await);
+        }
+        self.observer
+            .record(GatewayBindStage::AcceptLoopJoined(self.public_addr));
     }
 }
 
 impl Drop for PendingAcceptTask {
     fn drop(&mut self) {
-        if let Some(task) = self.0.take() {
+        if let Some(task) = self.task.take() {
             task.abort();
         }
     }
@@ -806,6 +914,39 @@ impl StartupGateway {
         frontend_root: PathBuf,
         metrics: StartupMetrics,
         limits: GatewayLimits,
+    ) -> Result<Self, GatewayError> {
+        Self::bind_cancellable(
+            frontend_root,
+            metrics,
+            limits,
+            GatewayBindCancellation::new(),
+        )
+        .await
+    }
+
+    pub async fn bind_cancellable(
+        frontend_root: PathBuf,
+        metrics: StartupMetrics,
+        limits: GatewayLimits,
+        cancellation: GatewayBindCancellation,
+    ) -> Result<Self, GatewayError> {
+        Self::bind_cancellable_observed(
+            frontend_root,
+            metrics,
+            limits,
+            cancellation,
+            GatewayBindObserver::default(),
+        )
+        .await
+    }
+
+    #[doc(hidden)]
+    pub async fn bind_cancellable_observed(
+        frontend_root: PathBuf,
+        metrics: StartupMetrics,
+        limits: GatewayLimits,
+        cancellation: GatewayBindCancellation,
+        observer: GatewayBindObserver,
     ) -> Result<Self, GatewayError> {
         if limits.max_connections == 0 {
             return Err(GatewayError::InvalidLimits(
@@ -822,21 +963,30 @@ impl StartupGateway {
                 GatewayLimitError::ZeroWebSocketUpgradeTimeout,
             ));
         }
-        let inventory = tokio::task::spawn_blocking(move || build_static_inventory(&frontend_root))
-            .await
-            .map_err(|_| GatewayError::FrontendUnavailable)??;
+        cancellation.check()?;
+        let inventory_cancellation = cancellation.clone();
+        let inventory_observer = observer.clone();
+        let inventory = tokio::task::spawn_blocking(move || {
+            build_static_inventory(&frontend_root, &inventory_cancellation, &inventory_observer)
+        })
+        .await
+        .map_err(|_| GatewayError::FrontendUnavailable)??;
+        cancellation.check()?;
         let routes = RouteTable {
             static_paths: inventory.assets.keys().cloned().collect(),
         };
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .map_err(|_| GatewayError::ListenerUnavailable)?;
+        cancellation.check()?;
         let public_addr = listener
             .local_addr()
             .map_err(|_| GatewayError::ListenerUnavailable)?;
         if public_addr.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) || public_addr.port() == 0 {
             return Err(GatewayError::ListenerUnavailable);
         }
+        observer.record(GatewayBindStage::ListenerBound(public_addr));
+        cancellation.check()?;
 
         let public_authority = public_addr.to_string();
         let public_origin = format!("http://{public_authority}");
@@ -867,26 +1017,53 @@ impl StartupGateway {
             backend_proxy,
             tunnels,
         };
+        cancellation.check()?;
         let (shutdown, shutdown_receiver) = watch::channel(false);
         let (accept_ready, ready) = oneshot::channel();
         let accept_state = state.clone();
-        let accept_task = PendingAcceptTask::new(tokio::spawn(async move {
-            let accept_loop = run_accept_loop(
-                listener,
-                service,
-                accept_state.clone(),
-                shutdown_receiver,
-                limits.max_connections,
-                limits.http_header_read_timeout,
-                limits.shutdown_drain,
-                accept_ready,
-            );
-            if AssertUnwindSafe(accept_loop).catch_unwind().await.is_err() {
-                log::warn!("Startup gateway accept loop panicked.");
-                accept_state.shutdown().await;
+        let accept_task = PendingAcceptTask::new(
+            tokio::spawn(async move {
+                let accept_loop = run_accept_loop(
+                    listener,
+                    service,
+                    accept_state.clone(),
+                    shutdown_receiver,
+                    limits.max_connections,
+                    limits.http_header_read_timeout,
+                    limits.shutdown_drain,
+                    accept_ready,
+                );
+                if AssertUnwindSafe(accept_loop).catch_unwind().await.is_err() {
+                    log::warn!("Startup gateway accept loop panicked.");
+                    accept_state.shutdown().await;
+                }
+            }),
+            shutdown.clone(),
+            state.clone(),
+            public_addr,
+            observer.clone(),
+        );
+        let ready = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => None,
+            ready = ready => Some(ready),
+        };
+        match ready {
+            Some(Ok(())) => {}
+            Some(Err(_)) => {
+                accept_task.cancel_and_join().await;
+                return Err(GatewayError::ListenerStopped);
             }
-        }));
-        ready.await.map_err(|_| GatewayError::ListenerStopped)?;
+            None => {
+                accept_task.cancel_and_join().await;
+                return Err(GatewayError::BindCancelled);
+            }
+        }
+        observer.record(GatewayBindStage::AcceptLoopReady(public_addr));
+        if cancellation.is_cancelled() {
+            accept_task.cancel_and_join().await;
+            return Err(GatewayError::BindCancelled);
+        }
         metrics.record_or_warn(StartupMilestone::GatewayListening);
         let accept_task = accept_task.commit();
 
@@ -1464,27 +1641,56 @@ fn request_attempts_upgrade(headers: &HeaderMap) -> bool {
         .unwrap_or(true)
 }
 
-fn build_static_inventory(frontend_root: &Path) -> Result<StaticInventory, GatewayError> {
+struct InventoryStageGuard {
+    observer: GatewayBindObserver,
+}
+
+impl Drop for InventoryStageGuard {
+    fn drop(&mut self) {
+        self.observer.record(GatewayBindStage::InventoryFinished);
+    }
+}
+
+fn build_static_inventory(
+    frontend_root: &Path,
+    cancellation: &GatewayBindCancellation,
+    observer: &GatewayBindObserver,
+) -> Result<StaticInventory, GatewayError> {
+    observer.record(GatewayBindStage::InventoryStarted);
+    let _inventory_stage = InventoryStageGuard {
+        observer: observer.clone(),
+    };
+    cancellation.check()?;
     let canonical_root =
         std_fs::canonicalize(frontend_root).map_err(|_| GatewayError::FrontendUnavailable)?;
+    cancellation.check()?;
     let root_metadata =
         std_fs::metadata(&canonical_root).map_err(|_| GatewayError::FrontendUnavailable)?;
+    cancellation.check()?;
     if !root_metadata.is_dir() {
         return Err(GatewayError::FrontendUnavailable);
     }
     let root_identity = secure_static_root_identity(&canonical_root)
         .map_err(|_| GatewayError::FrontendUnavailable)?;
+    cancellation.check()?;
 
     let mut assets = HashMap::new();
     let mut directories = vec![canonical_root.clone()];
     while let Some(directory) = directories.pop() {
+        cancellation.check()?;
         let entries =
             std_fs::read_dir(&directory).map_err(|_| GatewayError::FrontendUnavailable)?;
+        cancellation.check()?;
         for entry in entries {
+            cancellation.check()?;
+            observer.record(GatewayBindStage::InventoryResource);
+            cancellation.check()?;
             let entry = entry.map_err(|_| GatewayError::FrontendUnavailable)?;
+            cancellation.check()?;
             let path = entry.path();
             let metadata =
                 std_fs::symlink_metadata(&path).map_err(|_| GatewayError::FrontendUnavailable)?;
+            cancellation.check()?;
             let file_type = metadata.file_type();
             if file_type.is_symlink() {
                 continue;
@@ -1499,13 +1705,16 @@ fn build_static_inventory(frontend_root: &Path) -> Result<StaticInventory, Gatew
             let Some(content_type) = fixed_content_type(&path) else {
                 continue;
             };
+            cancellation.check()?;
             let canonical_path =
                 std_fs::canonicalize(&path).map_err(|_| GatewayError::FrontendUnavailable)?;
+            cancellation.check()?;
             if !canonical_path.starts_with(&canonical_root) {
                 continue;
             }
             let canonical_metadata =
                 std_fs::metadata(&canonical_path).map_err(|_| GatewayError::FrontendUnavailable)?;
+            cancellation.check()?;
             if !canonical_metadata.is_file() {
                 continue;
             }
@@ -1516,6 +1725,7 @@ fn build_static_inventory(frontend_root: &Path) -> Result<StaticInventory, Gatew
             let binding =
                 capture_bound_static_file(&canonical_root, &relative_components, root_identity)
                     .map_err(|_| GatewayError::FrontendUnavailable)?;
+            cancellation.check()?;
             let url_path = path_to_url_path(relative)?;
             let normalized =
                 NormalizedPath::parse(&url_path).map_err(|_| GatewayError::FrontendUnavailable)?;
@@ -1533,9 +1743,11 @@ fn build_static_inventory(frontend_root: &Path) -> Result<StaticInventory, Gatew
                     cache_control,
                 },
             );
+            cancellation.check()?;
         }
     }
 
+    cancellation.check()?;
     let index = assets
         .get(&NormalizedPath(INDEX_PATH.to_string()))
         .cloned()

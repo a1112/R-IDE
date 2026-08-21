@@ -9,8 +9,8 @@
 
 use ride_tauri::sidecar::{race_backend_publication_with_exit, BackendReadinessPublisher};
 use ride_tauri::startup::{
-    GatewayCapabilitySpec, RuntimePathMode, RuntimePaths, StartupCoordinator,
-    GATEWAY_CAPABILITY_PERMISSIONS,
+    present_startup_window, GatewayCapabilitySpec, RuntimePathMode, RuntimePaths,
+    StartupCoordinator, StartupVisibilityDeadline, GATEWAY_CAPABILITY_PERMISSIONS,
 };
 use ride_tauri::startup_gateway::{BackendPhase, GatewayError, GatewayLimits, StartupGateway};
 use ride_tauri::startup_metrics::{
@@ -18,7 +18,7 @@ use ride_tauri::startup_metrics::{
 };
 use ride_tauri::{
     is_trusted_secondary_window_url, shutdown_gateway_before_backend,
-    GATEWAY_WINDOW_VISIBLE_DEADLINE,
+    GATEWAY_WINDOW_VISIBLE_DEADLINE, WINDOW_PRESENTATION_BUDGET,
 };
 use std::fs;
 use std::io;
@@ -28,7 +28,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 use tauri::WebviewUrl;
-use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
@@ -79,16 +78,17 @@ impl StartupReportWriter for ChannelWriter {
     }
 }
 
-struct DropFlag(Arc<AtomicBool>);
-
-impl Drop for DropFlag {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::SeqCst);
-    }
-}
-
 fn disabled_metrics(mode: StartupMode) -> StartupMetrics {
     StartupMetrics::with_clock(None, "test", "test", 1, mode, Arc::new(ZeroClock))
+}
+
+fn test_visibility_deadline() -> StartupVisibilityDeadline {
+    StartupVisibilityDeadline::new(
+        tokio::time::Instant::now(),
+        Duration::from_secs(5),
+        Duration::from_millis(100),
+    )
+    .expect("test visibility deadline")
 }
 
 fn legacy_url() -> WebviewUrl {
@@ -113,6 +113,7 @@ async fn gateway_mode_opens_the_window_before_backend_readiness() {
         StartupMode::RustGateway,
         metrics,
         GatewayLimits::test_defaults(),
+        test_visibility_deadline(),
     )
     .launch(frontend.root.clone(), legacy_url())
     .await
@@ -184,6 +185,7 @@ async fn gateway_failure_falls_back_once_and_explicit_legacy_never_attempts_gate
         StartupMode::RustGateway,
         fallback_metrics,
         GatewayLimits::test_defaults(),
+        test_visibility_deadline(),
     )
     .launch(missing.clone(), legacy_url())
     .await
@@ -204,6 +206,7 @@ async fn gateway_failure_falls_back_once_and_explicit_legacy_never_attempts_gate
         StartupMode::LegacyExplicit,
         disabled_metrics(StartupMode::LegacyExplicit),
         GatewayLimits::test_defaults(),
+        test_visibility_deadline(),
     )
     .launch(missing, legacy_url())
     .await
@@ -221,6 +224,7 @@ async fn backend_readiness_publishes_private_generation_without_navigation() {
         StartupMode::RustGateway,
         disabled_metrics(StartupMode::RustGateway),
         GatewayLimits::test_defaults(),
+        test_visibility_deadline(),
     )
     .launch(frontend.root.clone(), legacy_url())
     .await
@@ -299,6 +303,7 @@ async fn same_generation_exit_while_window_gate_waits_never_publishes_backend() 
         StartupMode::RustGateway,
         disabled_metrics(StartupMode::RustGateway),
         GatewayLimits::test_defaults(),
+        test_visibility_deadline(),
     )
     .launch(frontend.root.clone(), legacy_url())
     .await
@@ -341,62 +346,172 @@ async fn same_generation_exit_while_window_gate_waits_never_publishes_backend() 
     launch.gateway.take().unwrap().shutdown().await;
 }
 
-#[tokio::test]
-async fn slow_gateway_bind_falls_back_within_deadline_and_releases_listener() {
-    let frontend = TemporaryFrontend::new();
-    let deadline = Duration::from_millis(20);
-    let bind_dropped = Arc::new(AtomicBool::new(false));
-    let observed_drop = Arc::clone(&bind_dropped);
-    let (address_sender, address_receiver) = oneshot::channel();
-    let started = tokio::time::Instant::now();
+#[test]
+fn visibility_deadline_is_captured_before_setup_and_never_restarts_at_coordinator() {
+    let started_at = tokio::time::Instant::now();
+    let visibility = StartupVisibilityDeadline::new(
+        started_at,
+        GATEWAY_WINDOW_VISIBLE_DEADLINE,
+        WINDOW_PRESENTATION_BUDGET,
+    )
+    .unwrap();
+    let coordinator_reached_at = started_at + Duration::from_millis(125);
 
-    let launch = StartupCoordinator::with_limits_and_deadline(
+    assert_eq!(
+        visibility.bind_deadline(coordinator_reached_at),
+        Some(started_at + GATEWAY_WINDOW_VISIBLE_DEADLINE - WINDOW_PRESENTATION_BUDGET)
+    );
+
+    let run_source = include_str!("../src/lib.rs");
+    let captured = run_source
+        .find("let visibility_deadline")
+        .expect("run captures visibility deadline");
+    let startup_job = run_source
+        .find("let _startup_job_lease")
+        .expect("run initializes startup job");
+    let startup_metrics = run_source
+        .find("let startup_metrics")
+        .expect("run initializes startup metrics");
+    assert!(captured < startup_job && captured < startup_metrics);
+}
+
+#[tokio::test]
+async fn normal_slow_and_failed_gateway_paths_enter_show_inside_reserved_budget() {
+    let frontend = TemporaryFrontend::new();
+
+    let normal_visibility = StartupVisibilityDeadline::new(
+        tokio::time::Instant::now(),
+        Duration::from_millis(500),
+        Duration::from_millis(250),
+    )
+    .unwrap();
+    let mut normal = StartupCoordinator::with_limits(
         StartupMode::RustGateway,
         disabled_metrics(StartupMode::RustGateway),
         GatewayLimits::test_defaults(),
-        deadline,
+        normal_visibility,
+    )
+    .launch(frontend.root.clone(), legacy_url())
+    .await
+    .expect("normal gateway launch");
+    let normal_show = Arc::new(AtomicBool::new(false));
+    let observed_normal_show = Arc::clone(&normal_show);
+    let normal_presentation = present_startup_window(
+        normal_visibility,
+        || Ok::<_, String>(()),
+        move |_| {
+            observed_normal_show.store(true, Ordering::SeqCst);
+            Ok(())
+        },
+        tokio::time::Instant::now,
+    )
+    .unwrap();
+    assert_eq!(normal.mode, StartupMode::RustGateway);
+    assert!(normal_show.load(Ordering::SeqCst));
+    assert!(normal_presentation.show_started_within_deadline);
+    assert!(normal_presentation.shown_within_deadline);
+    normal.gateway.take().unwrap().shutdown().await;
+
+    let slow_visibility = StartupVisibilityDeadline::new(
+        tokio::time::Instant::now(),
+        Duration::from_millis(300),
+        Duration::from_millis(180),
+    )
+    .unwrap();
+    let cancellation_observed = Arc::new(AtomicBool::new(false));
+    let observed_cancellation = Arc::clone(&cancellation_observed);
+    let slow = StartupCoordinator::with_limits(
+        StartupMode::RustGateway,
+        disabled_metrics(StartupMode::RustGateway),
+        GatewayLimits::test_defaults(),
+        slow_visibility,
     )
     .launch_with_gateway_bind(
         frontend.root.clone(),
         legacy_url(),
-        move |_frontend, _metrics, _limits| async move {
-            let _drop_flag = DropFlag(observed_drop);
-            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-                .await
-                .map_err(|_| GatewayError::ListenerUnavailable)?;
-            address_sender.send(listener.local_addr().unwrap()).unwrap();
-            std::future::pending::<Result<StartupGateway, GatewayError>>().await
+        move |_frontend, _metrics, _limits, cancellation| async move {
+            cancellation.cancelled().await;
+            observed_cancellation.store(true, Ordering::SeqCst);
+            Err::<StartupGateway, _>(GatewayError::BindCancelled)
         },
     )
     .await
-    .expect("deadline fallback");
+    .expect("slow gateway fallback");
+    let slow_presentation = present_startup_window(
+        slow_visibility,
+        || Ok::<_, String>(()),
+        |_| Ok(()),
+        tokio::time::Instant::now,
+    )
+    .unwrap();
+    assert_eq!(slow.mode, StartupMode::LegacyFallback);
+    assert!(cancellation_observed.load(Ordering::SeqCst));
+    assert!(slow_presentation.show_started_within_deadline);
+    assert!(slow_presentation.shown_within_deadline);
+
+    let failed_visibility = StartupVisibilityDeadline::new(
+        tokio::time::Instant::now(),
+        Duration::from_millis(300),
+        Duration::from_millis(180),
+    )
+    .unwrap();
+    let missing = frontend.root.join("missing");
+    let failed = StartupCoordinator::with_limits(
+        StartupMode::RustGateway,
+        disabled_metrics(StartupMode::RustGateway),
+        GatewayLimits::test_defaults(),
+        failed_visibility,
+    )
+    .launch(missing, legacy_url())
+    .await
+    .expect("failed gateway fallback");
+    let failed_presentation = present_startup_window(
+        failed_visibility,
+        || Ok::<_, String>(()),
+        |_| Ok(()),
+        tokio::time::Instant::now,
+    )
+    .unwrap();
+    assert_eq!(failed.mode, StartupMode::LegacyFallback);
+    assert!(failed_presentation.show_started_within_deadline);
+    assert!(failed_presentation.shown_within_deadline);
+}
+
+#[tokio::test]
+async fn exhausted_bind_budget_falls_back_without_attempting_gateway() {
+    let now = tokio::time::Instant::now();
+    let visibility = StartupVisibilityDeadline::new(
+        now - Duration::from_millis(650),
+        Duration::from_millis(800),
+        Duration::from_millis(200),
+    )
+    .unwrap();
+    let attempted = Arc::new(AtomicBool::new(false));
+    let observed_attempt = Arc::clone(&attempted);
+
+    let launch = StartupCoordinator::with_limits(
+        StartupMode::RustGateway,
+        disabled_metrics(StartupMode::RustGateway),
+        GatewayLimits::test_defaults(),
+        visibility,
+    )
+    .launch_with_gateway_bind(
+        PathBuf::from("unused"),
+        legacy_url(),
+        move |_frontend, _metrics, _limits, _cancellation| async move {
+            observed_attempt.store(true, Ordering::SeqCst);
+            Err::<StartupGateway, _>(GatewayError::ListenerUnavailable)
+        },
+    )
+    .await
+    .expect("budget-exhausted fallback");
 
     assert_eq!(launch.mode, StartupMode::LegacyFallback);
-    assert!(launch.gateway.is_none());
-    assert_eq!(launch.initial_url, legacy_url());
-    assert!(
-        launch
-            .fallback_reason
-            .as_deref()
-            .is_some_and(
-                |reason| reason.contains("window visibility deadline") && reason.len() <= 256
-            )
-    );
-    assert!(started.elapsed() < Duration::from_millis(250));
-    assert!(bind_dropped.load(Ordering::SeqCst));
-
-    let bound_address = address_receiver.await.expect("slow binder address");
-    let rebound = TcpListener::bind(bound_address)
-        .await
-        .expect("timed-out binder must release its listener");
-    drop(rebound);
-
-    let navigation_count = Arc::new(Mutex::new(0_u8));
-    let observed_navigation = Arc::clone(&navigation_count);
-    assert!(launch.dispatch_initial_navigation(move |_| {
-        *observed_navigation.lock().unwrap() += 1;
-    }));
-    assert_eq!(*navigation_count.lock().unwrap(), 1);
+    assert!(!attempted.load(Ordering::SeqCst));
+    assert!(launch
+        .fallback_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("presentation budget") && reason.len() <= 256));
 }
 
 #[tokio::test]
@@ -406,6 +521,7 @@ async fn stale_generation_never_runs_the_readiness_publication_callback() {
         StartupMode::RustGateway,
         disabled_metrics(StartupMode::RustGateway),
         GatewayLimits::test_defaults(),
+        test_visibility_deadline(),
     )
     .launch(frontend.root.clone(), legacy_url())
     .await
@@ -448,6 +564,7 @@ async fn gateway_capability_and_secondary_window_are_scoped_to_the_runtime_origi
         StartupMode::RustGateway,
         disabled_metrics(StartupMode::RustGateway),
         GatewayLimits::test_defaults(),
+        test_visibility_deadline(),
     )
     .launch(frontend.root.clone(), legacy_url())
     .await

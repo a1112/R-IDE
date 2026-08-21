@@ -15,7 +15,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use crate::startup_gateway::{BackendGeneration, GatewayError, GatewayLimits, StartupGateway};
+use crate::startup_gateway::{
+    BackendGeneration, GatewayBindCancellation, GatewayError, GatewayLimits, StartupGateway,
+};
 use crate::startup_metrics::{StartupMetricError, StartupMetrics, StartupMode};
 
 pub const GATEWAY_CAPABILITY_PERMISSIONS: [&str; 12] = [
@@ -95,6 +97,81 @@ pub struct StartupLaunch {
     initial_navigation_dispatched: AtomicBool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StartupVisibilityDeadline {
+    started_at: tokio::time::Instant,
+    absolute_deadline: tokio::time::Instant,
+    presentation_budget: Duration,
+}
+
+impl StartupVisibilityDeadline {
+    pub fn new(
+        started_at: tokio::time::Instant,
+        visible_after: Duration,
+        presentation_budget: Duration,
+    ) -> Result<Self, &'static str> {
+        if visible_after.is_zero() {
+            return Err("window visibility deadline must be nonzero");
+        }
+        if presentation_budget.is_zero() || presentation_budget >= visible_after {
+            return Err("window presentation budget must be nonzero and below the deadline");
+        }
+        let absolute_deadline = started_at
+            .checked_add(visible_after)
+            .ok_or("window visibility deadline overflowed")?;
+        Ok(Self {
+            started_at,
+            absolute_deadline,
+            presentation_budget,
+        })
+    }
+
+    pub fn started_at(self) -> tokio::time::Instant {
+        self.started_at
+    }
+
+    pub fn absolute_deadline(self) -> tokio::time::Instant {
+        self.absolute_deadline
+    }
+
+    pub fn presentation_budget(self) -> Duration {
+        self.presentation_budget
+    }
+
+    pub fn bind_deadline(self, now: tokio::time::Instant) -> Option<tokio::time::Instant> {
+        let bind_deadline = self
+            .absolute_deadline
+            .checked_sub(self.presentation_budget)?;
+        (now < bind_deadline).then_some(bind_deadline)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WindowPresentationObservation {
+    pub show_started_at: tokio::time::Instant,
+    pub shown_at: tokio::time::Instant,
+    pub show_started_within_deadline: bool,
+    pub shown_within_deadline: bool,
+}
+
+pub fn present_startup_window<Window, Error>(
+    visibility: StartupVisibilityDeadline,
+    prepare: impl FnOnce() -> Result<Window, Error>,
+    show: impl FnOnce(&Window) -> Result<(), Error>,
+    mut now: impl FnMut() -> tokio::time::Instant,
+) -> Result<WindowPresentationObservation, Error> {
+    let window = prepare()?;
+    let show_started_at = now();
+    show(&window)?;
+    let shown_at = now();
+    Ok(WindowPresentationObservation {
+        show_started_at,
+        shown_at,
+        show_started_within_deadline: show_started_at <= visibility.absolute_deadline(),
+        shown_within_deadline: shown_at <= visibility.absolute_deadline(),
+    })
+}
+
 impl StartupLaunch {
     pub fn window_created_gate(&self) -> StartupWindowCreatedGate {
         self.window_created.clone()
@@ -138,38 +215,34 @@ pub struct StartupCoordinator {
     requested_mode: StartupMode,
     metrics: StartupMetrics,
     limits: GatewayLimits,
-    gateway_deadline: Duration,
+    visibility_deadline: StartupVisibilityDeadline,
 }
 
 impl StartupCoordinator {
-    pub fn new(requested_mode: StartupMode, metrics: StartupMetrics) -> Self {
-        Self::with_limits(requested_mode, metrics, GatewayLimits::default())
+    pub fn new(
+        requested_mode: StartupMode,
+        metrics: StartupMetrics,
+        visibility_deadline: StartupVisibilityDeadline,
+    ) -> Self {
+        Self::with_limits(
+            requested_mode,
+            metrics,
+            GatewayLimits::default(),
+            visibility_deadline,
+        )
     }
 
     pub fn with_limits(
         requested_mode: StartupMode,
         metrics: StartupMetrics,
         limits: GatewayLimits,
-    ) -> Self {
-        Self::with_limits_and_deadline(
-            requested_mode,
-            metrics,
-            limits,
-            crate::GATEWAY_WINDOW_VISIBLE_DEADLINE,
-        )
-    }
-
-    pub fn with_limits_and_deadline(
-        requested_mode: StartupMode,
-        metrics: StartupMetrics,
-        limits: GatewayLimits,
-        gateway_deadline: Duration,
+        visibility_deadline: StartupVisibilityDeadline,
     ) -> Self {
         Self {
             requested_mode,
             metrics,
             limits,
-            gateway_deadline,
+            visibility_deadline,
         }
     }
 
@@ -181,7 +254,7 @@ impl StartupCoordinator {
         self.launch_with_gateway_bind(
             gateway_frontend_directory,
             legacy_initial_url,
-            StartupGateway::bind,
+            StartupGateway::bind_cancellable,
         )
         .await
     }
@@ -193,7 +266,7 @@ impl StartupCoordinator {
         bind_gateway: B,
     ) -> Result<StartupLaunch, StartupCoordinatorError>
     where
-        B: FnOnce(PathBuf, StartupMetrics, GatewayLimits) -> BindFuture,
+        B: FnOnce(PathBuf, StartupMetrics, GatewayLimits, GatewayBindCancellation) -> BindFuture,
         BindFuture: Future<Output = Result<StartupGateway, GatewayError>>,
     {
         let window_created = StartupWindowCreatedGate::default();
@@ -209,17 +282,40 @@ impl StartupCoordinator {
             });
         }
 
-        match tokio::time::timeout(
-            self.gateway_deadline,
-            bind_gateway(
-                gateway_frontend_directory,
-                self.metrics.clone(),
-                self.limits,
-            ),
-        )
-        .await
-        {
-            Ok(Ok(gateway)) => {
+        let Some(bind_deadline) = self
+            .visibility_deadline
+            .bind_deadline(tokio::time::Instant::now())
+        else {
+            return self.legacy_fallback(
+                legacy_initial_url,
+                window_created,
+                "startup gateway bind budget was exhausted while preserving the window presentation budget",
+            );
+        };
+        let cancellation = GatewayBindCancellation::new();
+        let mut bind = Box::pin(bind_gateway(
+            gateway_frontend_directory,
+            self.metrics.clone(),
+            self.limits,
+            cancellation.clone(),
+        ));
+        let bind_result = match tokio::time::timeout_at(bind_deadline, &mut bind).await {
+            Ok(result) => result,
+            Err(_) => {
+                cancellation.cancel();
+                if let Ok(gateway) = bind.await {
+                    gateway.shutdown().await;
+                }
+                return self.legacy_fallback(
+                    legacy_initial_url,
+                    window_created,
+                    "startup gateway initialization exceeded its bind budget while preserving the window presentation budget",
+                );
+            }
+        };
+
+        match bind_result {
+            Ok(gateway) => {
                 let backend_generation = gateway
                     .state()
                     .begin_backend_start()
@@ -236,29 +332,32 @@ impl StartupCoordinator {
                     initial_navigation_dispatched: AtomicBool::new(false),
                 })
             }
-            bind_result => {
-                self.metrics
-                    .select_effective_mode(StartupMode::LegacyFallback)
-                    .map_err(StartupCoordinatorError::Metrics)?;
-                let fallback_reason = match bind_result {
-                    Ok(Err(error)) => bounded_gateway_failure(&error),
-                    Err(_) => bounded_gateway_failure_text(&format!(
-                        "startup gateway initialization exceeded the {}ms window visibility deadline",
-                        self.gateway_deadline.as_millis()
-                    )),
-                    Ok(Ok(_)) => unreachable!("successful gateway bind handled above"),
-                };
-                Ok(StartupLaunch {
-                    mode: StartupMode::LegacyFallback,
-                    initial_url: legacy_initial_url,
-                    gateway: None,
-                    backend_generation: BackendGeneration::UNMANAGED,
-                    fallback_reason: Some(fallback_reason),
-                    window_created,
-                    initial_navigation_dispatched: AtomicBool::new(false),
-                })
-            }
+            Err(error) => self.legacy_fallback(
+                legacy_initial_url,
+                window_created,
+                &bounded_gateway_failure(&error),
+            ),
         }
+    }
+
+    fn legacy_fallback(
+        self,
+        legacy_initial_url: tauri::WebviewUrl,
+        window_created: StartupWindowCreatedGate,
+        reason: &str,
+    ) -> Result<StartupLaunch, StartupCoordinatorError> {
+        self.metrics
+            .select_effective_mode(StartupMode::LegacyFallback)
+            .map_err(StartupCoordinatorError::Metrics)?;
+        Ok(StartupLaunch {
+            mode: StartupMode::LegacyFallback,
+            initial_url: legacy_initial_url,
+            gateway: None,
+            backend_generation: BackendGeneration::UNMANAGED,
+            fallback_reason: Some(bounded_gateway_failure_text(reason)),
+            window_created,
+            initial_navigation_dispatched: AtomicBool::new(false),
+        })
     }
 }
 
