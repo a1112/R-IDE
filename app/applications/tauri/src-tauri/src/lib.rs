@@ -371,34 +371,46 @@ fn register_gateway_capability(
     app.add_capability(capability)
 }
 
-fn shutdown_application(app_handle: &tauri::AppHandle) -> Result<(), String> {
+async fn shutdown_application(app_handle: &tauri::AppHandle) -> Result<(), String> {
     let Some(state) = app_handle.try_state::<AppState>() else {
-        return tauri::async_runtime::block_on(sidecar::stop_backend_bounded(
-            app_handle,
-            sidecar::BACKEND_CLEANUP_BOUND,
-        ));
+        return sidecar::stop_backend_bounded(app_handle, sidecar::BACKEND_CLEANUP_BOUND).await;
     };
-    tauri::async_runtime::block_on(state.application_shutdown.run(
-        || async {
-            let gateway = {
-                let _ownership = state
-                    .backend_ownership
-                    .lock()
-                    .map_err(|_| "backend ownership mutex is poisoned".to_string())?;
-                state.backend_retries_stopped.store(true, Ordering::Release);
-                state
-                    .gateway
-                    .lock()
-                    .map_err(|_| "gateway mutex is poisoned".to_string())?
-                    .take()
-            };
-            if let Some(gateway) = gateway {
-                gateway.shutdown().await;
+    state
+        .application_shutdown
+        .run(
+            || async {
+                let gateway = {
+                    let _ownership = state
+                        .backend_ownership
+                        .lock()
+                        .map_err(|_| "backend ownership mutex is poisoned".to_string())?;
+                    state.backend_retries_stopped.store(true, Ordering::Release);
+                    state
+                        .gateway
+                        .lock()
+                        .map_err(|_| "gateway mutex is poisoned".to_string())?
+                        .take()
+                };
+                if let Some(gateway) = gateway {
+                    gateway.shutdown().await;
+                }
+                Ok(())
+            },
+            || sidecar::stop_backend_bounded(app_handle, sidecar::BACKEND_CLEANUP_BOUND),
+        )
+        .await
+}
+
+fn request_application_shutdown(app_handle: tauri::AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        match shutdown_application(&app_handle).await {
+            Ok(()) => app_handle.exit(0),
+            Err(error) => {
+                log::warn!("Failed to stop application during asynchronous shutdown: {error}");
+                retain_failed_application_cleanup(&app_handle);
             }
-            Ok(())
-        },
-        || sidecar::stop_backend_bounded(app_handle, sidecar::BACKEND_CLEANUP_BOUND),
-    ))
+        }
+    });
 }
 
 fn retain_failed_application_cleanup(app_handle: &tauri::AppHandle) {
@@ -523,7 +535,7 @@ fn install_shutdown_signal_handlers(app_handle: tauri::AppHandle) {
 
     std::thread::spawn(move || {
         if signals.forever().next().is_some() {
-            match shutdown_application(&app_handle) {
+            match tauri::async_runtime::block_on(shutdown_application(&app_handle)) {
                 Ok(()) => app_handle.exit(0),
                 Err(e) => {
                     log::warn!("Failed to stop application after shutdown signal: {}", e);
@@ -822,25 +834,16 @@ pub fn run() {
             event: tauri::WindowEvent::CloseRequested { api, .. },
             ..
         } if label == "main" => {
+            api.prevent_close();
             close_secondary_windows(app_handle);
-            match shutdown_application(app_handle) {
-                Ok(()) => app_handle.exit(0),
-                Err(error) => {
-                    log::warn!("Failed to stop application while closing the main window: {error}");
-                    api.prevent_close();
-                    retain_failed_application_cleanup(app_handle);
-                }
-            }
+            request_application_shutdown(app_handle.clone());
         }
         tauri::RunEvent::WindowEvent {
             label,
             event: tauri::WindowEvent::Destroyed,
             ..
         } if label == "main" => {
-            if let Err(error) = shutdown_application(app_handle) {
-                log::warn!("Failed to stop application after main-window destruction: {error}");
-                retain_failed_application_cleanup(app_handle);
-            }
+            request_application_shutdown(app_handle.clone());
         }
         #[cfg(target_os = "macos")]
         tauri::RunEvent::Opened { urls } => {
@@ -857,7 +860,7 @@ pub fn run() {
                 .try_state::<AppState>()
                 .is_some_and(|state| state.application_cleanup_recovered.load(Ordering::Acquire));
             if !cleanup_recovered {
-                if let Err(e) = shutdown_application(app_handle) {
+                if let Err(e) = tauri::async_runtime::block_on(shutdown_application(app_handle)) {
                     log::warn!("Failed to stop application during shutdown: {}", e);
                     api.prevent_exit();
                     retain_failed_application_cleanup(app_handle);
@@ -865,7 +868,7 @@ pub fn run() {
             }
         }
         tauri::RunEvent::Exit => {
-            if let Err(e) = shutdown_application(app_handle) {
+            if let Err(e) = tauri::async_runtime::block_on(shutdown_application(app_handle)) {
                 log::warn!("Application exited before cleanup completed: {}", e);
             }
         }

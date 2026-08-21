@@ -710,15 +710,14 @@ fn closing_the_main_window_closes_tauri_secondary_windows() {
         .nth(1)
         .and_then(|source| source.split("#[cfg(target_os = \"macos\")]").next())
         .expect("main-window close handler");
-    let backend_stop = close_source
-        .find("shutdown_application")
-        .expect("ordered application shutdown in close handler");
     let prevent_close = close_source
         .find("api.prevent_close()")
-        .expect("failed cleanup prevents main-window destruction");
-    let app_exit = close_source.find("app_handle.exit(0)").expect("app exit");
-    assert!(backend_stop < app_exit);
-    assert!(backend_stop < prevent_close);
+        .expect("main-window destruction is deferred during cleanup");
+    let scheduled_shutdown = close_source
+        .find("request_application_shutdown(app_handle.clone())")
+        .expect("application shutdown is scheduled off the window callback");
+    assert!(prevent_close < scheduled_shutdown);
+    assert!(!close_source.contains("block_on"));
 
     let exit_request_source = lib_source
         .split("tauri::RunEvent::ExitRequested")
@@ -737,11 +736,12 @@ fn closing_the_main_window_closes_tauri_secondary_windows() {
     assert!(retained_cleanup.contains("force_release_backend_for_exit"));
 
     let shutdown_source = lib_source
-        .split("fn shutdown_application")
+        .split("async fn shutdown_application")
         .nth(1)
         .and_then(|source| source.split("fn restore_main_window").next())
         .expect("ordered shutdown helper");
-    assert!(shutdown_source.contains("application_shutdown.run"));
+    assert!(shutdown_source.contains("application_shutdown"));
+    assert!(shutdown_source.contains(".run("));
     assert!(
         shutdown_source
             .find("gateway.shutdown")
@@ -750,4 +750,13 @@ fn closing_the_main_window_closes_tauri_secondary_windows() {
                 .rfind("sidecar::stop_backend_bounded")
                 .expect("ordered backend process-tree cleanup")
     );
+
+    let request_source = lib_source
+        .split("fn request_application_shutdown")
+        .nth(1)
+        .and_then(|source| source.split("fn retain_failed_application_cleanup").next())
+        .expect("non-blocking shutdown request helper");
+    assert!(request_source.contains("tauri::async_runtime::spawn"));
+    assert!(request_source.contains("shutdown_application(&app_handle).await"));
+    assert!(request_source.contains("app_handle.exit(0)"));
 }
