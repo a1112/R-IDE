@@ -1273,10 +1273,16 @@ async fn milestone_control_route_is_allowlisted_one_shot_and_strictly_bounded() 
     )
     .await
     .unwrap();
-    metrics
-        .record(StartupMilestone::FrontendRequestStarted)
-        .unwrap();
     let cookie = bootstrap_session(&gateway).await;
+    let index = send_request(
+        &gateway,
+        Method::GET,
+        "/",
+        &[(COOKIE.as_str(), cookie.as_str())],
+    )
+    .await;
+    assert_eq!(index.status(), StatusCode::OK);
+    receive_report_with_milestone(&reports, "frontend_request_started");
     let origin = format!("http://{}", gateway.public_authority());
     let body = br#"{"milestone":"frontend_bundle_loaded"}"#.to_vec();
     let length = body.len().to_string();

@@ -2003,6 +2003,10 @@ impl StaticGatewayService {
         let Some(asset) = self.assets.get(&path) else {
             return not_found();
         };
+        if request.method() == Method::GET && path.0 == "/" {
+            self.metrics
+                .record_or_warn(StartupMilestone::FrontendRequestStarted);
+        }
         let asset = asset.clone();
         let frontend_root = self.frontend_root.clone();
         let opened = tokio::task::spawn_blocking(move || {
