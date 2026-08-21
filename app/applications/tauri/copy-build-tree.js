@@ -170,6 +170,7 @@ function rewriteDesktopHtml(source) {
   ].join('; ');
   const cspMeta = `  <meta http-equiv="Content-Security-Policy" content="${csp}">\n`;
   const localeScript = '    <script type="text/javascript" src="./ride-bootstrap.js" charset="utf-8"></script>\n';
+  const afterBundleScript = '<script type="text/javascript" src="./ride-after-bundle.js" charset="utf-8"></script>';
 
   html = html.replace(
     /\s*<script>\s*if \(document\.head\)[\s\S]*?<\/script\b[^>]*>/,
@@ -184,7 +185,7 @@ function rewriteDesktopHtml(source) {
     throw new Error('Frontend index.html does not contain the bundle.js script tag.');
   }
   html = html.replace(bundleScript, (_match, indent, attributes) =>
-    `${localeScript}${indent}<script${attributes}></script>`
+    `${localeScript}${indent}<script${attributes}></script>\n${indent}${afterBundleScript}`
   );
   for (const script of html.matchAll(/<script\b([^>]*)>[\s\S]*?<\/script\b[^>]*>/gi)) {
     if (!/(?:^|\s)src\s*=/i.test(script[1])) {

@@ -32,34 +32,120 @@ const requiredFiles = [
   'bundle.css',
 ];
 
-try {
-  assertRequiredRegularFiles(sourceDir, requiredFiles);
-} catch (error) {
-  console.error('Required Theia frontend build artifacts are missing:');
-  console.error(`  - ${error.message}`);
-  console.error('\nBuild the browser application first from the app workspace:');
-  console.error('  yarn --cwd applications/browser build:prod');
-  process.exit(1);
-}
-
 const frontendBootstrap = `(() => {
   'use strict';
 
-  if (window.localStorage.getItem('localeId')) {
-    return;
+  if (!window.localStorage.getItem('localeId')) {
+    const requestedLocale = new URLSearchParams(window.location.search).get('ride_locale');
+    const languages = [
+      requestedLocale,
+      ...(Array.isArray(window.navigator.languages) ? window.navigator.languages : []),
+      window.navigator.language
+    ];
+    const language = languages.find(candidate => typeof candidate === 'string' && /^(zh|en)([-_]|$)/i.test(candidate));
+    if (language) {
+      window.localStorage.setItem('localeId', /^zh/i.test(language) ? 'zh-cn' : 'en');
+    }
   }
 
-  const requestedLocale = new URLSearchParams(window.location.search).get('ride_locale');
-  const languages = [
-    requestedLocale,
-    ...(Array.isArray(window.navigator.languages) ? window.navigator.languages : []),
-    window.navigator.language
-  ];
-  const language = languages.find(candidate => typeof candidate === 'string' && /^(zh|en)([-_]|$)/i.test(candidate));
-  if (language) {
-    window.localStorage.setItem('localeId', /^zh/i.test(language) ? 'zh-cn' : 'en');
-  }
+  const diagnosticLimit = 4096;
+  const oneShots = Object.create(null);
+  const once = (name, operation) => {
+    if (!oneShots[name]) {
+      oneShots[name] = operation();
+    }
+    return oneShots[name];
+  };
+
+  window.__rideStartup = Object.freeze({
+    markBundleLoaded() {
+      return once('frontend_bundle_loaded', () => window.fetch('/_ride/startup/milestones', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ milestone: 'frontend_bundle_loaded' })
+      }).then(() => undefined, () => undefined));
+    }
+  });
+
+  let currentGeneration;
+  let retriedGeneration;
+  let overlay;
+  let diagnostic;
+  let retry;
+
+  const removeOverlay = () => {
+    overlay?.remove();
+    overlay = undefined;
+    diagnostic = undefined;
+    retry = undefined;
+  };
+
+  const ensureOverlay = () => {
+    if (overlay) {
+      return;
+    }
+    overlay = window.document.createElement('section');
+    overlay.setAttribute('role', 'alert');
+    overlay.setAttribute('aria-live', 'assertive');
+    overlay.setAttribute('style', 'position:fixed;inset:0;z-index:2147483647;display:grid;place-items:center;padding:32px;background:rgba(20,22,26,.92);color:#f5f5f5;font:14px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif');
+
+    const panel = window.document.createElement('div');
+    panel.setAttribute('style', 'width:min(560px,100%);padding:24px;border:1px solid rgba(255,255,255,.16);border-radius:12px;background:#202328;box-shadow:0 24px 64px rgba(0,0,0,.35)');
+    const title = window.document.createElement('strong');
+    title.textContent = 'R-IDE backend failed to start';
+    diagnostic = window.document.createElement('pre');
+    diagnostic.setAttribute('data-ride-startup-diagnostic', 'true');
+    diagnostic.setAttribute('style', 'max-height:240px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;color:#d7d7d7');
+    retry = window.document.createElement('button');
+    retry.type = 'button';
+    retry.textContent = 'Retry';
+    retry.setAttribute('style', 'padding:8px 16px;border:0;border-radius:6px;background:#1677ff;color:white;font:inherit;cursor:pointer');
+    retry.addEventListener('click', () => {
+      if (currentGeneration === undefined || retriedGeneration === currentGeneration || retry.disabled) {
+        return;
+      }
+      retriedGeneration = currentGeneration;
+      retry.disabled = true;
+      void window.fetch('/_ride/startup/retry', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ generation: currentGeneration })
+      }).catch(() => undefined);
+    });
+    panel.append(title, diagnostic, retry);
+    overlay.append(panel);
+    window.document.body.appendChild(overlay);
+  };
+
+  const states = new window.EventSource('/_ride/startup/events', { withCredentials: true });
+  states.addEventListener('state', event => {
+    let update;
+    try {
+      update = JSON.parse(event.data);
+    } catch {
+      return;
+    }
+    if (!update || (typeof update.generation !== 'number' && typeof update.generation !== 'string')) {
+      return;
+    }
+    if (update.generation !== currentGeneration) {
+      currentGeneration = update.generation;
+      retriedGeneration = undefined;
+    }
+    if (update.state === 'failed') {
+      ensureOverlay();
+      diagnostic.textContent = String(update.diagnostic ?? 'Backend unavailable.').slice(0, diagnosticLimit);
+      retry.disabled = retriedGeneration === currentGeneration;
+    } else if (update.state === 'ready') {
+      removeOverlay();
+    }
+  });
 })();
+`;
+
+const afterBundleScript = `window.__rideStartup?.markBundleLoaded();
 `;
 
 const bootstrapHtml = `<!DOCTYPE html>
@@ -156,24 +242,50 @@ const tauriBootstrapScript = `(() => {
 })();
 `;
 
-console.log('Copying frontend resources...');
-publishDirectoryAtomic(targetDir, stagingDirectory => {
-  copyRegularTree(sourceDir, stagingDirectory, {
-    includeSourceMaps: process.env.RIDE_COPY_SOURCEMAPS === '1',
+function copyFrontendResources(options = {}) {
+  const resolvedSourceDir = path.resolve(options.sourceDir ?? sourceDir);
+  const resolvedTargetDir = path.resolve(options.targetDir ?? targetDir);
+  const resolvedTauriFrontendDir = path.resolve(options.tauriFrontendDir ?? tauriFrontendDir);
+  const includeSourceMaps = options.includeSourceMaps ?? process.env.RIDE_COPY_SOURCEMAPS === '1';
+
+  assertRequiredRegularFiles(resolvedSourceDir, requiredFiles);
+  publishDirectoryAtomic(resolvedTargetDir, stagingDirectory => {
+    copyRegularTree(resolvedSourceDir, stagingDirectory, { includeSourceMaps });
+    const htmlPath = path.join(stagingDirectory, 'index.html');
+    fs.writeFileSync(htmlPath, rewriteDesktopHtml(fs.readFileSync(htmlPath, 'utf8')));
+    fs.writeFileSync(path.join(stagingDirectory, 'ride-bootstrap.js'), frontendBootstrap);
+    fs.writeFileSync(path.join(stagingDirectory, 'ride-after-bundle.js'), afterBundleScript);
   });
-  const htmlPath = path.join(stagingDirectory, 'index.html');
-  fs.writeFileSync(htmlPath, rewriteDesktopHtml(fs.readFileSync(htmlPath, 'utf8')));
-  fs.writeFileSync(path.join(stagingDirectory, 'ride-bootstrap.js'), frontendBootstrap);
-});
-console.log('✓ Recursively copied frontend assets with desktop CSP and locale bootstrap');
 
-publishDirectoryAtomic(tauriFrontendDir, stagingDirectory => {
-  fs.writeFileSync(path.join(stagingDirectory, 'index.html'), bootstrapHtml);
-  fs.writeFileSync(path.join(stagingDirectory, 'bootstrap.js'), tauriBootstrapScript);
-});
-console.log('✓ Created Tauri bootstrap frontend');
+  publishDirectoryAtomic(resolvedTauriFrontendDir, stagingDirectory => {
+    fs.writeFileSync(path.join(stagingDirectory, 'index.html'), bootstrapHtml);
+    fs.writeFileSync(path.join(stagingDirectory, 'bootstrap.js'), tauriBootstrapScript);
+  });
+}
 
-console.log('Frontend resources copied successfully!');
-console.log('Source:', sourceDir);
-console.log('Target:', targetDir);
-console.log('Bootstrap:', tauriFrontendDir);
+function main() {
+  try {
+    console.log('Copying frontend resources...');
+    copyFrontendResources();
+    console.log('✓ Recursively copied frontend assets with desktop CSP and startup bridge');
+    console.log('✓ Created explicit legacy Tauri bootstrap frontend');
+    console.log('Frontend resources copied successfully!');
+    console.log('Source:', sourceDir);
+    console.log('Target:', targetDir);
+    console.log('Bootstrap:', tauriFrontendDir);
+  } catch (error) {
+    console.error('Unable to generate Tauri frontend resources:');
+    console.error(`  - ${error.message}`);
+    console.error('\nBuild the browser application first from the app workspace:');
+    console.error('  yarn --cwd applications/browser build:prod');
+    process.exitCode = 1;
+  }
+}
+
+if (require.main === module) {
+  main();
+}
+
+module.exports = {
+  copyFrontendResources,
+};
