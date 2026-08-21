@@ -271,6 +271,7 @@ pub struct AppState {
 impl AppState {
     fn new(
         initial_launch_intent: Option<launch_intent::LaunchIntent>,
+        smoke: smoke::SmokeProtocol,
         startup_metrics: startup_metrics::StartupMetrics,
         startup_mode: startup_metrics::StartupMode,
     ) -> Self {
@@ -289,7 +290,7 @@ impl AppState {
                 initial_launch_intent,
             ),
             performance: performance::PerformanceSampler::default(),
-            smoke: smoke::SmokeProtocol::from_process_environment(),
+            smoke,
             startup_metrics,
             startup_mode: Mutex::new(startup_mode),
             gateway: Mutex::new(None),
@@ -320,9 +321,7 @@ where
 fn configure_activation_builder<B, P, RegisterPlugin, ManageState>(
     builder: B,
     activation_plugin: P,
-    initial_launch_intent: Option<launch_intent::LaunchIntent>,
-    startup_metrics: startup_metrics::StartupMetrics,
-    startup_mode: startup_metrics::StartupMode,
+    state: AppState,
     register_plugin: RegisterPlugin,
     manage_state: ManageState,
 ) -> B
@@ -331,10 +330,16 @@ where
     ManageState: FnOnce(B, AppState) -> B,
 {
     let builder = register_plugin(builder, activation_plugin);
-    manage_state(
-        builder,
-        AppState::new(initial_launch_intent, startup_metrics, startup_mode),
-    )
+    manage_state(builder, state)
+}
+
+fn select_initial_workspace(
+    initial_launch_intent: Option<&launch_intent::LaunchIntent>,
+    validated_smoke_workspace: Option<PathBuf>,
+) -> Option<PathBuf> {
+    initial_launch_intent
+        .map(|intent| intent.workspace.clone())
+        .or(validated_smoke_workspace)
 }
 
 fn trusted_secondary_window_authority(app: &tauri::AppHandle) -> Option<String> {
@@ -568,9 +573,17 @@ pub fn run() {
         launch_intent::LaunchSource::Initial,
         1,
     );
-    let initial_workspace = initial_launch_intent
-        .as_ref()
-        .map(|intent| intent.workspace.clone());
+    let smoke = smoke::SmokeProtocol::from_process_environment();
+    let initial_workspace = select_initial_workspace(
+        initial_launch_intent.as_ref(),
+        smoke.active_workspace_root(),
+    );
+    let state = AppState::new(
+        initial_launch_intent,
+        smoke,
+        startup_metrics,
+        requested_startup_mode,
+    );
 
     let builder = configure_activation_builder(
         tauri::Builder::default(),
@@ -584,9 +597,7 @@ pub fn run() {
             );
             log_launch_intent_delivery_failures("single-instance", report.failures);
         }),
-        initial_launch_intent,
-        startup_metrics,
-        requested_startup_mode,
+        state,
         |builder, plugin| builder.plugin(plugin),
         |builder, state| builder.manage(state),
     );
@@ -1096,16 +1107,19 @@ mod tests {
                 assembly_order: Vec::new(),
             },
             probe,
-            Some(initial.clone()),
-            startup_metrics::StartupMetrics::with_clock(
-                None,
-                "test",
-                "test",
-                1,
+            AppState::new(
+                Some(initial.clone()),
+                smoke::SmokeProtocol::from_environment(&Default::default(), Path::new(".")),
+                startup_metrics::StartupMetrics::with_clock(
+                    None,
+                    "test",
+                    "test",
+                    1,
+                    startup_metrics::StartupMode::LegacyExplicit,
+                    Arc::new(TestClock),
+                ),
                 startup_metrics::StartupMode::LegacyExplicit,
-                Arc::new(TestClock),
             ),
-            startup_metrics::StartupMode::LegacyExplicit,
             |mut builder, plugin| {
                 builder.assembly_order.push("plugin");
                 builder.plugin = Some(plugin);
@@ -1131,6 +1145,33 @@ mod tests {
             Ok::<_, ()>(())
         });
         assert_eq!(delivered, vec![initial]);
+    }
+
+    #[test]
+    fn explicit_launch_workspace_precedes_smoke_workspace() {
+        let launch = launch_intent::LaunchIntent {
+            id: 1,
+            source: launch_intent::LaunchSource::Initial,
+            workspace: PathBuf::from("explicit-workspace"),
+            files: vec![PathBuf::from("explicit-workspace/initial.R")],
+        };
+
+        assert_eq!(
+            select_initial_workspace(
+                Some(&launch),
+                Some(PathBuf::from("validated-smoke-workspace")),
+            ),
+            Some(PathBuf::from("explicit-workspace"))
+        );
+    }
+
+    #[test]
+    fn validated_smoke_workspace_fills_empty_launch_context() {
+        assert_eq!(
+            select_initial_workspace(None, Some(PathBuf::from("validated-smoke-workspace"))),
+            Some(PathBuf::from("validated-smoke-workspace"))
+        );
+        assert_eq!(select_initial_workspace(None, None), None);
     }
 
     #[test]

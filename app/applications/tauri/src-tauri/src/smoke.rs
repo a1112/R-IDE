@@ -370,6 +370,7 @@ struct SmokeProgress {
 
 struct ActiveProtocol {
     plan: SmokePlan,
+    workspace_root: PathBuf,
     report_target: ReportTarget,
     replacer: Arc<dyn ReportReplacer>,
     session_proof: String,
@@ -507,6 +508,14 @@ impl SmokeProtocol {
             backend_retry_process: Mutex::new(None),
             document_lifecycle_count: AtomicU64::new(0),
             completion_gate: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    pub(crate) fn active_workspace_root(&self) -> Option<PathBuf> {
+        let state = self.state.lock().ok()?;
+        match &*state {
+            ProtocolState::Active(active) => Some(active.workspace_root.clone()),
+            ProtocolState::Disabled | ProtocolState::Rejected => None,
         }
     }
 
@@ -1697,16 +1706,20 @@ fn build_active_protocol(
         return Err(());
     }
 
+    let workspace = normalize_relative_path(&parsed_spec.workspace, true)?;
+    let workspace_root = canonical_smoke_workspace(&owned_root, &workspace)?;
+
     Ok(ActiveProtocol {
         plan: SmokePlan {
             spec_sha256: sha256(&spec.bytes),
             scenario: parsed_spec.scenario,
             profile: parsed_spec.profile,
-            workspace: normalize_relative_path(&parsed_spec.workspace, true)?,
+            workspace,
             files: validate_files(&parsed_spec.files)?,
             actions: validate_actions(&parsed_spec.actions)?,
             action_timeout_ms: parsed_spec.action_timeout_ms,
         },
+        workspace_root,
         report_target,
         replacer,
         session_proof: new_session_proof(),
@@ -1745,6 +1758,14 @@ fn canonical_owned_root(cwd: &Path) -> Result<PathBuf, ()> {
     }
     let canonical = dunce::canonicalize(cwd).map_err(|_| ())?;
     if !canonical.is_dir() {
+        return Err(());
+    }
+    Ok(canonical)
+}
+
+fn canonical_smoke_workspace(owned_root: &Path, workspace: &str) -> Result<PathBuf, ()> {
+    let canonical = dunce::canonicalize(owned_root.join(workspace)).map_err(|_| ())?;
+    if !canonical.is_dir() || !canonical.starts_with(owned_root) {
         return Err(());
     }
     Ok(canonical)
@@ -2921,6 +2942,32 @@ mod tests {
         assert_eq!(protocol.plan().mode, SmokeMode::Disabled);
         assert_eq!(requested.into_inner(), SMOKE_ENV_NAMES);
         assert!(!cwd_called.get(), "disabled fast path must not resolve cwd");
+    }
+
+    #[test]
+    fn active_smoke_protocol_exposes_only_its_validated_workspace_root() {
+        let fixture = TestFixture::new();
+        let protocol = SmokeProtocol::from_environment(
+            &fixture.environment("workspace-root-token"),
+            &fixture.root,
+        );
+
+        assert_eq!(
+            protocol.active_workspace_root(),
+            Some(dunce::canonicalize(&fixture.root).expect("canonical fixture root"))
+        );
+
+        let disabled = SmokeProtocol::from_environment(&BTreeMap::new(), &fixture.root);
+        assert_eq!(disabled.active_workspace_root(), None);
+
+        let rejected = SmokeProtocol::from_environment(
+            &BTreeMap::from([(
+                OsString::from(SPEC_ENV),
+                OsString::from("incomplete-smoke-environment"),
+            )]),
+            &fixture.root,
+        );
+        assert_eq!(rejected.active_workspace_root(), None);
     }
 
     #[test]
