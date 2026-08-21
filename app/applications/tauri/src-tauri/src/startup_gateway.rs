@@ -15,7 +15,7 @@ use http_body_util::{BodyExt, Empty, Full, StreamBody};
 use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper::header::{
     CACHE_CONTROL, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HOST, LOCATION, ORIGIN,
-    SET_COOKIE, TRANSFER_ENCODING,
+    SET_COOKIE, TRANSFER_ENCODING, UPGRADE,
 };
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -30,6 +30,7 @@ use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs as std_fs;
+use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::panic::AssertUnwindSafe;
@@ -39,7 +40,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::fs::File;
-use tokio::io::AsyncReadExt;
+use tokio::io::{copy_bidirectional, AsyncReadExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{oneshot, watch, Mutex, Semaphore};
 use tokio::task::{JoinError, JoinHandle, JoinSet};
@@ -54,6 +55,8 @@ const STATIC_ASSET_CHUNK_SIZE: usize = 16 * 1024;
 const BACKEND_UNAVAILABLE_BODY: &[u8] = b"{\"error\":\"backend_unavailable\"}";
 const BACKEND_PROXY_FAILED_BODY: &[u8] = b"{\"error\":\"backend_proxy_failed\"}";
 const INVALID_HTTP_MESSAGE_BODY: &[u8] = b"{\"error\":\"invalid_http_message\"}";
+const SOCKET_IO_PATH: &str = "/socket.io/";
+const SOCKET_IO_WEBSOCKET_QUERY: &str = "EIO=4&transport=websocket";
 const HOP_BY_HOP_HEADERS: [&str; 9] = [
     "connection",
     "proxy-connection",
@@ -559,10 +562,94 @@ struct StaticInventory {
 }
 
 #[derive(Clone)]
+struct TunnelRegistry {
+    inner: Arc<Mutex<TunnelRegistryInner>>,
+}
+
+struct TunnelRegistryInner {
+    accepting: bool,
+    tasks: JoinSet<()>,
+}
+
+impl TunnelRegistry {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(TunnelRegistryInner {
+                accepting: true,
+                tasks: JoinSet::new(),
+            })),
+        }
+    }
+
+    async fn spawn(&self, future: impl Future<Output = ()> + Send + 'static) -> bool {
+        let mut inner = self.inner.lock().await;
+        while let Some(result) = inner.tasks.try_join_next() {
+            observe_tunnel_task_result(result);
+        }
+        if !inner.accepting {
+            return false;
+        }
+        inner.tasks.spawn(future);
+        true
+    }
+
+    async fn shutdown(&self, drain: Duration) {
+        let mut tasks = {
+            let mut inner = self.inner.lock().await;
+            inner.accepting = false;
+            std::mem::replace(&mut inner.tasks, JoinSet::new())
+        };
+        let deadline = tokio::time::sleep(drain);
+        tokio::pin!(deadline);
+        while !tasks.is_empty() {
+            tokio::select! {
+                _ = &mut deadline => {
+                    tasks.abort_all();
+                    break;
+                }
+                completed = tasks.join_next() => {
+                    if let Some(result) = completed {
+                        observe_tunnel_task_result(result);
+                    }
+                }
+            }
+        }
+        while let Some(result) = tasks.join_next().await {
+            observe_tunnel_task_result(result);
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RpcMilestoneRecorder {
+    metrics: StartupMetrics,
+    generations: Arc<Mutex<HashSet<BackendGeneration>>>,
+}
+
+impl RpcMilestoneRecorder {
+    fn new(metrics: StartupMetrics) -> Self {
+        Self {
+            metrics,
+            generations: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+
+    async fn record_connected(&self, generation: BackendGeneration) {
+        if !self.generations.lock().await.insert(generation) {
+            return;
+        }
+        self.metrics.record_or_warn(StartupMilestone::RpcConnected);
+    }
+}
+
+#[derive(Clone)]
 struct BackendProxy {
     pool: Arc<Mutex<Option<GenerationBackendClient>>>,
     state: GatewayState,
     limits: GatewayLimits,
+    public_origin: String,
+    tunnels: TunnelRegistry,
+    rpc_milestones: RpcMilestoneRecorder,
 }
 
 struct GenerationBackendClient {
@@ -634,6 +721,7 @@ struct StaticGatewayService {
     assets: Arc<HashMap<NormalizedPath, StaticAsset>>,
     session: Arc<GatewaySession>,
     backend_proxy: BackendProxy,
+    tunnels: TunnelRegistry,
 }
 
 pub struct StartupGateway {
@@ -679,7 +767,14 @@ impl StartupGateway {
         let session_value = Uuid::new_v4().to_string();
         debug_assert_ne!(bootstrap_capability, session_value);
         let state = GatewayState::new(limits);
-        let backend_proxy = BackendProxy::new(state.clone(), limits);
+        let tunnels = TunnelRegistry::new();
+        let backend_proxy = BackendProxy::new(
+            state.clone(),
+            limits,
+            public_origin.clone(),
+            tunnels.clone(),
+            RpcMilestoneRecorder::new(metrics.clone()),
+        );
         let service = StaticGatewayService {
             public_authority,
             public_origin,
@@ -692,6 +787,7 @@ impl StartupGateway {
                 session_value,
             }),
             backend_proxy,
+            tunnels,
         };
         let (shutdown, shutdown_receiver) = watch::channel(false);
         let (accept_ready, ready) = oneshot::channel();
@@ -777,6 +873,17 @@ fn observe_connection_task_result(result: Result<(), JoinError>) {
     }
 }
 
+fn observe_tunnel_task_result(result: Result<(), JoinError>) {
+    let Some(diagnostic) = join_error_diagnostic(&result) else {
+        return;
+    };
+    if result.as_ref().is_err_and(JoinError::is_cancelled) {
+        log::debug!("Startup gateway tunnel task was cancelled.");
+    } else {
+        log::warn!("Startup gateway tunnel task panicked: {diagnostic}");
+    }
+}
+
 fn observe_accept_task_result(result: Result<(), JoinError>) {
     if let Err(error) = result {
         if error.is_cancelled() {
@@ -857,6 +964,7 @@ async fn run_accept_loop(
     while let Some(result) = connections.join_next().await {
         observe_connection_task_result(result);
     }
+    service.tunnels.shutdown(shutdown_drain).await;
 }
 
 async fn serve_connection(
@@ -874,15 +982,25 @@ async fn serve_connection(
         .header_read_timeout(http_header_read_timeout);
     let _ = builder
         .serve_connection(TokioIo::new(stream), request_service)
+        .with_upgrades()
         .await;
 }
 
 impl BackendProxy {
-    fn new(state: GatewayState, limits: GatewayLimits) -> Self {
+    fn new(
+        state: GatewayState,
+        limits: GatewayLimits,
+        public_origin: String,
+        tunnels: TunnelRegistry,
+        rpc_milestones: RpcMilestoneRecorder,
+    ) -> Self {
         Self {
             pool: Arc::new(Mutex::new(None)),
             state,
             limits,
+            public_origin,
+            tunnels,
+            rpc_milestones,
         }
     }
 
@@ -913,7 +1031,18 @@ impl BackendProxy {
         Some(client)
     }
 
-    async fn forward(&self, mut request: Request<hyper::body::Incoming>) -> Response<GatewayBody> {
+    async fn forward(&self, request: Request<hyper::body::Incoming>) -> Response<GatewayBody> {
+        match proxy_request_kind(&request, &self.public_origin) {
+            Ok(ProxyRequestKind::Http) => self.forward_http(request).await,
+            Ok(ProxyRequestKind::WebSocket) => self.forward_websocket(request).await,
+            Err(_) => invalid_http_message(),
+        }
+    }
+
+    async fn forward_http(
+        &self,
+        mut request: Request<hyper::body::Incoming>,
+    ) -> Response<GatewayBody> {
         strip_gateway_session_cookie(request.headers_mut());
         if normalize_message_framing(request.headers_mut()).is_err()
             || strip_hop_by_hop_headers(request.headers_mut()).is_err()
@@ -992,6 +1121,98 @@ impl BackendProxy {
         let body = body.map_err(io::Error::other).boxed();
         Response::from_parts(parts, body)
     }
+
+    async fn forward_websocket(
+        &self,
+        mut request: Request<hyper::body::Incoming>,
+    ) -> Response<GatewayBody> {
+        let public_upgrade = hyper::upgrade::on(&mut request);
+        strip_gateway_session_cookie(request.headers_mut());
+        if normalize_message_framing(request.headers_mut()).is_err()
+            || strip_hop_by_hop_headers(request.headers_mut()).is_err()
+        {
+            return invalid_http_message();
+        }
+        restore_websocket_upgrade_headers(request.headers_mut());
+
+        let backend_lease = match self
+            .state
+            .wait_for_backend_lease_with_timeout(self.limits.backend_wait)
+            .await
+        {
+            Ok(backend_lease) => backend_lease,
+            Err(_) => return backend_unavailable(),
+        };
+        let Some(client) = self.client_for_generation(backend_lease).await else {
+            return backend_unavailable();
+        };
+        let backend_authority = backend_lease.address.to_string();
+        let path_and_query = request
+            .uri()
+            .path_and_query()
+            .cloned()
+            .expect("validated Socket.IO target must have path and query");
+        let backend_uri = match Uri::builder()
+            .scheme("http")
+            .authority(backend_authority.as_str())
+            .path_and_query(path_and_query)
+            .build()
+        {
+            Ok(uri) => uri,
+            Err(_) => return backend_proxy_failed(),
+        };
+        *request.uri_mut() = backend_uri;
+        let backend_host =
+            match hyper::header::HeaderValue::from_bytes(backend_authority.as_bytes()) {
+                Ok(host) => host,
+                Err(_) => return backend_proxy_failed(),
+            };
+        request.headers_mut().insert(HOST, backend_host);
+        if !self.state.backend_lease_is_current(backend_lease).await {
+            return backend_unavailable();
+        }
+
+        let (parts, body) = request.into_parts();
+        let (upload_completion, _upload_completed) = oneshot::channel();
+        let request =
+            Request::from_parts(parts, UploadCompletionBody::new(body, upload_completion));
+        let mut response = match tokio::time::timeout(
+            self.limits.backend_response_header_timeout,
+            client.request(request),
+        )
+        .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(_)) | Err(_) => return backend_proxy_failed(),
+        };
+        if response.status() != StatusCode::SWITCHING_PROTOCOLS
+            || validate_websocket_upgrade_response(&response).is_err()
+            || !self.state.backend_lease_is_current(backend_lease).await
+        {
+            return backend_proxy_failed();
+        }
+        let backend_upgrade = hyper::upgrade::on(&mut response);
+        let (mut parts, _body) = response.into_parts();
+        if normalize_message_framing(&mut parts.headers).is_err()
+            || strip_hop_by_hop_headers(&mut parts.headers).is_err()
+        {
+            return backend_proxy_failed();
+        }
+        strip_backend_session_cookie(&mut parts.headers);
+        restore_websocket_upgrade_headers(&mut parts.headers);
+
+        let tunnel = run_websocket_tunnel(
+            public_upgrade,
+            backend_upgrade,
+            self.state.clone(),
+            backend_lease,
+            self.rpc_milestones.clone(),
+        );
+        if !self.tunnels.spawn(tunnel).await {
+            return backend_unavailable();
+        }
+        Response::from_parts(parts, empty_body())
+    }
 }
 
 impl StaticGatewayService {
@@ -1009,6 +1230,9 @@ impl StaticGatewayService {
             return self.bootstrap(request).await;
         }
         if !self.has_valid_session(request.headers()) {
+            return not_found();
+        }
+        if route != RouteKind::Backend && request_attempts_upgrade(request.headers()) {
             return not_found();
         }
         match route {
@@ -1141,6 +1365,15 @@ impl StaticGatewayService {
             .body(stream_static_file(file, asset.binding.content_length))
             .expect("fixed static response must be valid")
     }
+}
+
+fn request_attempts_upgrade(headers: &HeaderMap) -> bool {
+    if headers.contains_key(UPGRADE) {
+        return true;
+    }
+    connection_header_tokens(headers)
+        .map(|tokens| tokens.iter().any(|name| name == UPGRADE))
+        .unwrap_or(true)
 }
 
 fn build_static_inventory(frontend_root: &Path) -> Result<StaticInventory, GatewayError> {
@@ -1655,9 +1888,179 @@ fn fixed_content_type(path: &Path) -> Option<&'static str> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProxyRequestKind {
+    Http,
+    WebSocket,
+}
+
+fn proxy_request_kind(
+    request: &Request<Incoming>,
+    public_origin: &str,
+) -> Result<ProxyRequestKind, ProxyHeaderError> {
+    let connection_tokens = connection_header_tokens(request.headers())?;
+    let requests_upgrade = connection_tokens.iter().any(|name| name == UPGRADE);
+    if !requests_upgrade {
+        let websocket_intent = request
+            .headers()
+            .get_all(UPGRADE)
+            .iter()
+            .any(|value| trim_ows(value.as_bytes()).eq_ignore_ascii_case(b"websocket"))
+            || request.headers().contains_key("sec-websocket-key")
+            || request.headers().contains_key("sec-websocket-version");
+        if websocket_intent {
+            return Err(ProxyHeaderError::InvalidUpgrade);
+        }
+        return Ok(ProxyRequestKind::Http);
+    }
+    if request.method() != Method::GET
+        || request.version() != hyper::Version::HTTP_11
+        || request.uri().path() != SOCKET_IO_PATH
+        || request.uri().query() != Some(SOCKET_IO_WEBSOCKET_QUERY)
+        || request.headers().contains_key(CONTENT_LENGTH)
+        || request.headers().contains_key(TRANSFER_ENCODING)
+        || !request.body().is_end_stream()
+        || !single_header_equals(request.headers(), UPGRADE, b"websocket")
+        || !single_header_equals(request.headers(), ORIGIN, public_origin.as_bytes())
+        || !single_header_equals(request.headers(), "sec-websocket-version", b"13")
+        || !has_valid_websocket_key(request.headers())
+    {
+        return Err(ProxyHeaderError::InvalidUpgrade);
+    }
+    Ok(ProxyRequestKind::WebSocket)
+}
+
+fn validate_websocket_upgrade_response<B>(response: &Response<B>) -> Result<(), ProxyHeaderError> {
+    let connection_tokens = connection_header_tokens(response.headers())?;
+    if !connection_tokens.iter().any(|name| name == UPGRADE)
+        || !single_header_equals(response.headers(), UPGRADE, b"websocket")
+        || !has_single_visible_header(response.headers(), "sec-websocket-accept")
+    {
+        return Err(ProxyHeaderError::InvalidUpgrade);
+    }
+    Ok(())
+}
+
+fn single_header_equals(
+    headers: &HeaderMap,
+    name: impl hyper::header::AsHeaderName,
+    expected: &[u8],
+) -> bool {
+    let mut values = headers.get_all(name).iter();
+    let Some(value) = values.next() else {
+        return false;
+    };
+    values.next().is_none() && trim_ows(value.as_bytes()).eq_ignore_ascii_case(expected)
+}
+
+fn has_single_visible_header(headers: &HeaderMap, name: impl hyper::header::AsHeaderName) -> bool {
+    let mut values = headers.get_all(name).iter();
+    let Some(value) = values.next() else {
+        return false;
+    };
+    values.next().is_none()
+        && !value.as_bytes().is_empty()
+        && value
+            .as_bytes()
+            .iter()
+            .all(|byte| (b'!'..=b'~').contains(byte))
+}
+
+fn has_valid_websocket_key(headers: &HeaderMap) -> bool {
+    let mut values = headers.get_all("sec-websocket-key").iter();
+    let Some(value) = values.next() else {
+        return false;
+    };
+    let value = trim_ows(value.as_bytes());
+    values.next().is_none()
+        && value.len() == 24
+        && value[..22]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/'))
+        && &value[22..] == b"=="
+}
+
+fn restore_websocket_upgrade_headers(headers: &mut HeaderMap) {
+    headers.insert(
+        CONNECTION,
+        hyper::header::HeaderValue::from_static("upgrade"),
+    );
+    headers.insert(
+        UPGRADE,
+        hyper::header::HeaderValue::from_static("websocket"),
+    );
+}
+
+async fn run_websocket_tunnel(
+    public_upgrade: hyper::upgrade::OnUpgrade,
+    backend_upgrade: hyper::upgrade::OnUpgrade,
+    state: GatewayState,
+    lease: BackendLease,
+    rpc_milestones: RpcMilestoneRecorder,
+) {
+    let mut readiness = state.inner.readiness.subscribe();
+    let mut shutdown = state.inner.shutdown.subscribe();
+    if !published_backend_matches_lease(&readiness.borrow(), lease) || *shutdown.borrow() {
+        return;
+    }
+    let upgrades = async { tokio::try_join!(public_upgrade, backend_upgrade) };
+    tokio::pin!(upgrades);
+    let (public, private) = loop {
+        tokio::select! {
+            result = &mut upgrades => {
+                let Ok(upgrades) = result else {
+                    return;
+                };
+                break upgrades;
+            }
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return;
+                }
+            }
+            changed = readiness.changed() => {
+                if changed.is_err() || !published_backend_matches_lease(&readiness.borrow(), lease) {
+                    return;
+                }
+            }
+        }
+    };
+    if !state.backend_lease_is_current(lease).await {
+        return;
+    }
+    rpc_milestones.record_connected(lease.generation).await;
+
+    let mut public = TokioIo::new(public);
+    let mut private = TokioIo::new(private);
+    let tunnel = copy_bidirectional(&mut public, &mut private);
+    tokio::pin!(tunnel);
+    loop {
+        tokio::select! {
+            _ = &mut tunnel => return,
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return;
+                }
+            }
+            changed = readiness.changed() => {
+                if changed.is_err() || !published_backend_matches_lease(&readiness.borrow(), lease) {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn published_backend_matches_lease(published: &PublishedBackend, lease: BackendLease) -> bool {
+    published.snapshot.generation == lease.generation
+        && published.snapshot.phase == BackendPhase::Ready
+        && published.backend_addr == Some(lease.address)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProxyHeaderError {
     InvalidFraming,
     InvalidConnection,
+    InvalidUpgrade,
 }
 
 fn normalize_message_framing(headers: &mut HeaderMap) -> Result<(), ProxyHeaderError> {
@@ -1735,6 +2138,19 @@ fn trim_ows(mut value: &[u8]) -> &[u8] {
 }
 
 fn strip_hop_by_hop_headers(headers: &mut HeaderMap) -> Result<(), ProxyHeaderError> {
+    let nominated = connection_header_tokens(headers)?;
+    for name in nominated {
+        headers.remove(name);
+    }
+    for name in HOP_BY_HOP_HEADERS {
+        headers.remove(name);
+    }
+    Ok(())
+}
+
+fn connection_header_tokens(
+    headers: &HeaderMap,
+) -> Result<Vec<hyper::header::HeaderName>, ProxyHeaderError> {
     let mut nominated = Vec::new();
     for value in headers.get_all(CONNECTION).iter() {
         for token in value.as_bytes().split(|byte| *byte == b',') {
@@ -1748,13 +2164,7 @@ fn strip_hop_by_hop_headers(headers: &mut HeaderMap) -> Result<(), ProxyHeaderEr
             );
         }
     }
-    for name in nominated {
-        headers.remove(name);
-    }
-    for name in HOP_BY_HOP_HEADERS {
-        headers.remove(name);
-    }
-    Ok(())
+    Ok(nominated)
 }
 
 fn is_tchar(byte: u8) -> bool {
