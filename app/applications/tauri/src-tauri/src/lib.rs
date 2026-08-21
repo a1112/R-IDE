@@ -17,6 +17,7 @@ pub mod performance;
 pub mod sidecar;
 pub mod smoke;
 pub mod startup;
+pub mod startup_gateway;
 mod startup_job;
 pub mod startup_metrics;
 
