@@ -100,6 +100,7 @@ async fn run_backend_retry_coordinator(
             Ok(generation) => generation,
             Err(error) => {
                 log::warn!("Backend retry was rejected after cleanup: {error}");
+                request.complete(false);
                 continue;
             }
         };
@@ -107,6 +108,7 @@ async fn run_backend_retry_coordinator(
             let app_state = app_handle.state::<AppState>();
             let mut ownership = app_state.backend_ownership.lock().unwrap();
             if app_state.backend_retries_stopped.load(Ordering::Acquire) {
+                request.complete(false);
                 break;
             }
             ownership.reserve_start()
@@ -117,6 +119,7 @@ async fn run_backend_retry_coordinator(
             public_authority.clone(),
             window_created.clone(),
         );
+        request.complete(true);
         if let Err(error) =
             sidecar::start_backend(&app_handle, workspace.clone(), backend_start, publisher).await
         {
@@ -677,7 +680,7 @@ mod tests {
         assert_eq!(before_cleanup.phase, startup_gateway::BackendPhase::Failed);
         cleanup_done.send(()).unwrap();
         let second = retry.await.unwrap().unwrap();
-        assert!(second > first);
+        assert_eq!(second.as_u64(), first.as_u64() + 1);
         let after_cleanup = state.snapshot().await;
         assert_eq!(after_cleanup.generation, second);
         assert_eq!(after_cleanup.phase, startup_gateway::BackendPhase::Starting);
@@ -879,14 +882,15 @@ mod tests {
             metrics.record(milestone).expect("record current milestone");
         }
 
-        let final_report = (0..6)
-            .map(|_| {
+        let mut final_report = None;
+        for _ in 0..6 {
+            final_report = Some(
                 reports_rx
                     .recv_timeout(Duration::from_secs(1))
-                    .expect("published startup report")
-            })
-            .last()
-            .expect("final startup report");
+                    .expect("published startup report"),
+            );
+        }
+        let final_report = final_report.expect("final startup report");
         assert_eq!(final_report["startupMode"], "legacy-explicit");
         assert_eq!(final_report["milestones"]["target_file_opened"], 0);
     }

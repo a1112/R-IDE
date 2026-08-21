@@ -24,7 +24,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, Url};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -554,6 +554,20 @@ fn clear_backend_process(app_handle: &AppHandle, pid: u32) -> bool {
     }
     state.backend_cleanup_notify.notify_waiters();
     stopping
+}
+
+fn complete_backend_start(app_handle: &AppHandle, start: BackendStartToken) {
+    let Some(state) = app_handle.try_state::<crate::AppState>() else {
+        return;
+    };
+    if state
+        .backend_ownership
+        .lock()
+        .unwrap()
+        .complete_start(start)
+    {
+        state.backend_cleanup_notify.notify_waiters();
+    }
 }
 
 fn backend_node_options() -> Option<String> {
@@ -1767,13 +1781,11 @@ pub async fn start_backend_process(
                 config.script_path
             ));
         }
-    } else {
-        if !config.script_path.exists() {
-            return Err(format!(
-                "Backend binary not found at: {:?}",
-                config.script_path
-            ));
-        }
+    } else if !config.script_path.exists() {
+        return Err(format!(
+            "Backend binary not found at: {:?}",
+            config.script_path
+        ));
     }
 
     log::info!(
@@ -1944,15 +1956,20 @@ pub async fn start_backend(
     publisher: BackendReadinessPublisher,
 ) -> Result<(), String> {
     let launch_plan = BackendLaunchPlan::new(workspace);
-    match start_backend_process(app_handle, &launch_plan, backend_start, publisher.clone()).await {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            publisher.backend_failed().await;
-            log::error!("Failed to start backend: {error}");
-            let _ = app_handle.emit("backend-error", format!("Failed to start: {error}"));
-            Err(error)
-        }
-    }
+    let result =
+        match start_backend_process(app_handle, &launch_plan, backend_start, publisher.clone())
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                publisher.backend_failed().await;
+                log::error!("Failed to start backend: {error}");
+                let _ = app_handle.emit("backend-error", format!("Failed to start: {error}"));
+                Err(error)
+            }
+        };
+    complete_backend_start(app_handle, backend_start);
+    result
 }
 
 /// 停止后端进程
@@ -1983,6 +2000,40 @@ pub fn stop_backend(app_handle: &AppHandle) -> Result<(), String> {
     finish_backend_stop(termination, stop_fallback)
 }
 
+async fn wait_for_backend_ownership_release(
+    ownership: &Mutex<crate::startup::BackendOwnershipState>,
+    cleanup_notify: &tokio::sync::Notify,
+    deadline: tokio::time::Instant,
+) -> bool {
+    loop {
+        let notified = cleanup_notify.notified();
+        if !ownership.lock().unwrap().has_owned_work() {
+            return true;
+        }
+        if tokio::time::timeout_at(deadline, notified).await.is_err() {
+            return !ownership.lock().unwrap().has_owned_work();
+        }
+    }
+}
+
+fn finish_bounded_backend_cleanup(
+    stop_result: Result<(), String>,
+    cleanup_confirmed: bool,
+    bound: Duration,
+) -> Result<(), String> {
+    if cleanup_confirmed {
+        return stop_result;
+    }
+    let cleanup = format!(
+        "Backend child reap exceeded the {}ms cleanup bound",
+        bound.as_millis()
+    );
+    match stop_result {
+        Ok(()) => Err(cleanup),
+        Err(stop) => Err(format!("{stop}; {cleanup}")),
+    }
+}
+
 pub async fn stop_backend_bounded(app_handle: &AppHandle, bound: Duration) -> Result<(), String> {
     if bound.is_zero() {
         return Err("Backend cleanup bound must be nonzero".to_string());
@@ -1990,7 +2041,7 @@ pub async fn stop_backend_bounded(app_handle: &AppHandle, bound: Duration) -> Re
     let Some(state) = app_handle.try_state::<crate::AppState>() else {
         return Ok(());
     };
-    let expected_pid = state.backend_ownership.lock().unwrap().pid();
+    let wait_for_cleanup = state.backend_ownership.lock().unwrap().has_owned_work();
     let deadline = tokio::time::Instant::now() + bound;
     let stop_handle = app_handle.clone();
     let stop_task = tauri::async_runtime::spawn_blocking(move || stop_backend(&stop_handle));
@@ -2002,43 +2053,17 @@ pub async fn stop_backend_bounded(app_handle: &AppHandle, bound: Duration) -> Re
             bound.as_millis()
         )),
     };
-    let Some(expected_pid) = expected_pid else {
+    if !wait_for_cleanup {
         return stop_result;
-    };
-
-    let cleanup_confirmed = loop {
-        let notified = state.backend_cleanup_notify.notified();
-        if !state
-            .backend_ownership
-            .lock()
-            .unwrap()
-            .owns_process(expected_pid)
-        {
-            break true;
-        }
-        if tokio::time::timeout_at(deadline, notified).await.is_err() {
-            break !state
-                .backend_ownership
-                .lock()
-                .unwrap()
-                .owns_process(expected_pid);
-        }
-    };
-    if cleanup_confirmed {
-        if let Err(error) = stop_result {
-            log::warn!("Backend cleanup was confirmed after a stop warning: {error}");
-        }
-        Ok(())
-    } else {
-        let cleanup = format!(
-            "Backend child reap exceeded the {}ms cleanup bound",
-            bound.as_millis()
-        );
-        match stop_result {
-            Ok(()) => Err(cleanup),
-            Err(stop) => Err(format!("{stop}; {cleanup}")),
-        }
     }
+
+    let cleanup_confirmed = wait_for_backend_ownership_release(
+        &state.backend_ownership,
+        &state.backend_cleanup_notify,
+        deadline,
+    )
+    .await;
+    finish_bounded_backend_cleanup(stop_result, cleanup_confirmed, bound)
 }
 
 #[cfg(test)]
@@ -2051,6 +2076,65 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
     use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn bounded_cleanup_waits_for_cancelled_spawn_and_exact_pid_reap() {
+        let ownership = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::startup::BackendOwnershipState::default(),
+        ));
+        let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+        let start = ownership.lock().unwrap().reserve_start();
+        assert_eq!(ownership.lock().unwrap().request_stop(), None);
+
+        let pending_ownership = ownership.clone();
+        let pending_notify = notify.clone();
+        let pending_wait = tokio::spawn(async move {
+            super::wait_for_backend_ownership_release(
+                &pending_ownership,
+                &pending_notify,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!pending_wait.is_finished());
+        assert!(ownership.lock().unwrap().complete_start(start));
+        notify.notify_waiters();
+        assert!(pending_wait.await.unwrap());
+
+        let start = ownership.lock().unwrap().reserve_start();
+        assert!(ownership.lock().unwrap().register_spawn(start, 42));
+        assert_eq!(ownership.lock().unwrap().request_stop(), Some(42));
+        assert_eq!(ownership.lock().unwrap().request_stop(), None);
+        let pid_ownership = ownership.clone();
+        let pid_notify = notify.clone();
+        let pid_wait = tokio::spawn(async move {
+            super::wait_for_backend_ownership_release(
+                &pid_ownership,
+                &pid_notify,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+        });
+        assert!(ownership.lock().unwrap().clear_spawn(7));
+        notify.notify_waiters();
+        tokio::task::yield_now().await;
+        assert!(!pid_wait.is_finished());
+        assert!(ownership.lock().unwrap().clear_spawn(42));
+        notify.notify_waiters();
+        assert!(pid_wait.await.unwrap());
+    }
+
+    #[test]
+    fn confirmed_root_reap_does_not_hide_process_tree_termination_failure() {
+        let error = super::finish_bounded_backend_cleanup(
+            Err("process tree termination failed".to_string()),
+            true,
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert_eq!(error, "process tree termination failed");
+    }
 
     #[test]
     fn backend_child_environment_removes_smoke_secrets_and_preserves_unrelated_values() {
@@ -2222,6 +2306,50 @@ mod tests {
             "{error:?}"
         );
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn backend_readiness_observes_a_real_child_exit_before_ready() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("reserve unused port");
+        let port = listener.local_addr().expect("listener address").port();
+        drop(listener);
+        let (_line_tx, mut line_rx) = mpsc::unbounded_channel();
+        let (exit_tx, mut exit_rx) = mpsc::unbounded_channel();
+        let child = tokio::spawn(async move {
+            #[cfg(windows)]
+            let mut child = tokio::process::Command::new("cmd")
+                .args(["/C", "exit", "17"])
+                .spawn()
+                .expect("spawn failing child");
+            #[cfg(not(windows))]
+            let mut child = tokio::process::Command::new("sh")
+                .args(["-c", "exit 17"])
+                .spawn()
+                .expect("spawn failing child");
+            let status = child.wait().await.expect("wait for failing child");
+            exit_tx
+                .send(status.to_string())
+                .expect("publish child exit");
+        });
+
+        let error = wait_for_node_backend_readiness(
+            &mut line_rx,
+            &mut exit_rx,
+            port,
+            Duration::from_secs(30),
+        )
+        .await
+        .expect_err("an exited child cannot become ready");
+        child.await.unwrap();
+
+        assert!(
+            matches!(
+                error,
+                super::BackendReadinessFailure::ChildExited(ref exit)
+                    if exit.contains("17")
+            ),
+            "{error:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

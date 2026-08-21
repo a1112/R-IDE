@@ -910,10 +910,22 @@ impl BackendOwnershipState {
 
     pub fn request_stop(&mut self) -> Option<u32> {
         self.stopping = true;
-        self.pending_start = None;
         let pid = self.pid.take();
-        self.stopping_pid = pid;
+        if pid.is_some() {
+            self.stopping_pid = pid;
+        }
         pid
+    }
+
+    pub fn complete_start(&mut self, token: BackendStartToken) -> bool {
+        if self.pending_start != Some(token) {
+            return false;
+        }
+        self.pending_start = None;
+        if self.stopping_pid.is_none() && self.pid.is_none() {
+            self.stopping = false;
+        }
+        true
     }
 
     pub fn clear_spawn(&mut self, pid: u32) -> bool {

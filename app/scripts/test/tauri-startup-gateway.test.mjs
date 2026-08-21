@@ -147,6 +147,7 @@ function createStorage() {
 function executeBridge(script) {
   const document = new FakeDocument();
   const requests = [];
+  const fetchResponses = [];
   const eventSources = [];
   const navigation = { reloads: 0, replacements: [] };
   const logs = [];
@@ -179,7 +180,7 @@ function executeBridge(script) {
     EventSource: FakeEventSource,
     fetch: async (url, options) => {
       requests.push({ url, options });
-      return { ok: true };
+      return fetchResponses.shift() ?? { ok: true, status: 202 };
     },
     localStorage,
     sessionStorage,
@@ -209,6 +210,7 @@ function executeBridge(script) {
   return {
     document,
     eventSources,
+    fetchResponses,
     localStorage,
     logs,
     navigation,
@@ -399,4 +401,27 @@ test('failed state renders one bounded alert and retry remains idempotent per ge
   assert.deepEqual(harness.localStorage.entries(), [['localeId', 'zh-cn']]);
   assert.deepEqual(harness.logs, []);
   assert.equal(harness.eventSources.length, 1);
+});
+
+test('a rejected retry response re-enables the same failed generation without reloading', async t => {
+  const generated = createGeneratedFrontend();
+  t.after(() => fs.rmSync(generated.fixture, { recursive: true, force: true }));
+  const bridge = fs.readFileSync(path.join(generated.gatewayDirectory, 'ride-bootstrap.js'), 'utf8');
+  const harness = executeBridge(bridge);
+
+  harness.eventSources[0].emitState({ state: 'failed', generation: 7, diagnostic: 'failed' });
+  const retry = harness.document.findAll(element => element.tagName === 'BUTTON')[0];
+  harness.fetchResponses.push({ ok: false, status: 503 });
+  retry.click();
+  await Promise.resolve();
+  await Promise.resolve();
+
+  assert.equal(retry.disabled, false);
+  retry.click();
+  await Promise.resolve();
+  assert.equal(
+    harness.requests.filter(request => request.url === '/_ride/startup/retry').length,
+    2,
+  );
+  assert.deepEqual(harness.navigation, { reloads: 0, replacements: [] });
 });

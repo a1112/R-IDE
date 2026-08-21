@@ -1078,6 +1078,10 @@ async fn startup_status_requires_the_exact_host_and_session_cookie() {
         let response = send_request(&gateway, Method::GET, "/_ride/startup/status", &headers).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert_eq!(
+            response.headers().get("x-content-type-options").unwrap(),
+            "nosniff"
+        );
+        assert_eq!(
             response_bytes(response).await,
             Bytes::from_static(b"Not Found")
         );
@@ -1164,6 +1168,7 @@ async fn retry_control_route_admits_one_owner_until_the_request_is_released() {
         (CONTENT_TYPE.as_str(), "application/json"),
         (CONTENT_LENGTH.as_str(), length.as_str()),
     ];
+    let mut retries = gateway.take_retry_requests().unwrap();
 
     let left = send_request_to(
         gateway_addr(&gateway),
@@ -1181,7 +1186,27 @@ async fn retry_control_route_admits_one_owner_until_the_request_is_released() {
         &headers,
         full_test_body(body.clone()),
     );
-    let (left, right) = tokio::join!(left, right);
+    let requests = async { tokio::join!(left, right) };
+    let admit_owner = async {
+        let owner = tokio::time::timeout(Duration::from_secs(1), retries.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(owner.generation(), generation);
+
+        let conflict = send_request_to(
+            gateway_addr(&gateway),
+            gateway.public_authority(),
+            Method::POST,
+            "/_ride/startup/retry",
+            &headers,
+            full_test_body(body.clone()),
+        )
+        .await;
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        owner.complete(true);
+    };
+    let ((left, right), ()) = tokio::join!(requests, admit_owner);
     let statuses = [left.status(), right.status()];
     assert_eq!(
         statuses
@@ -1198,25 +1223,20 @@ async fn retry_control_route_admits_one_owner_until_the_request_is_released() {
         1
     );
 
-    let mut retries = gateway.take_retry_requests().unwrap();
-    let owner = tokio::time::timeout(Duration::from_secs(1), retries.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(owner.generation(), generation);
-
-    let conflict = send_request_to(
+    let rejected = send_request_to(
         gateway_addr(&gateway),
         gateway.public_authority(),
         Method::POST,
         "/_ride/startup/retry",
         &headers,
         full_test_body(body.clone()),
-    )
-    .await;
-    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    );
+    let reject_owner = async {
+        retries.recv().await.unwrap().complete(false);
+    };
+    let (rejected, ()) = tokio::join!(rejected, reject_owner);
+    assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
 
-    drop(owner);
     let accepted = send_request_to(
         gateway_addr(&gateway),
         gateway.public_authority(),
@@ -1224,10 +1244,12 @@ async fn retry_control_route_admits_one_owner_until_the_request_is_released() {
         "/_ride/startup/retry",
         &headers,
         full_test_body(body),
-    )
-    .await;
+    );
+    let accept_owner = async {
+        retries.recv().await.unwrap().complete(true);
+    };
+    let (accepted, ()) = tokio::join!(accepted, accept_owner);
     assert_eq!(accepted.status(), StatusCode::ACCEPTED);
-    drop(retries.recv().await.unwrap());
     gateway.shutdown().await;
 }
 
@@ -1393,13 +1415,29 @@ async fn shutdown_is_bounded_and_releases_the_loopback_listener() {
     .await
     .unwrap();
     let address = gateway_addr(&gateway);
+    let state = gateway.state();
     let idle_connection = open_partial_request(&gateway).await;
 
-    tokio::time::timeout(Duration::from_millis(250), gateway.shutdown())
+    let shutdown = tokio::spawn(gateway.shutdown());
+    tokio::time::timeout(Duration::from_millis(250), async {
+        loop {
+            if state.snapshot().await.phase == BackendPhase::Stopping {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("gateway did not publish stopping");
+    assert!(
+        TcpStream::connect(address).await.is_err(),
+        "listener must close before Stopping is published"
+    );
+    tokio::time::timeout(Duration::from_millis(250), shutdown)
         .await
-        .expect("gateway shutdown exceeded its drain bound");
+        .expect("gateway shutdown exceeded its drain bound")
+        .unwrap();
     assert!(socket_closes_within(idle_connection, Duration::from_millis(250)).await);
-    assert!(TcpStream::connect(address).await.is_err());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1721,6 +1759,29 @@ async fn same_backend_generation_transitions_from_starting_to_ready() {
     assert_eq!(ready.generation, generation);
     assert_eq!(ready.phase, BackendPhase::Ready);
     assert_eq!(ready.diagnostic, None);
+}
+
+#[tokio::test]
+async fn deterministic_failures_remain_failed_until_each_explicit_retry() {
+    let state = GatewayState::new(GatewayLimits::test_defaults());
+    let first = state.begin_backend_start().await.unwrap();
+    state
+        .fail_backend(first, "deterministic failure")
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert_eq!(state.snapshot().await.generation, first);
+    assert_eq!(state.snapshot().await.phase, BackendPhase::Failed);
+
+    let second = state.begin_backend_retry(first).await.unwrap();
+    assert_eq!(second.as_u64(), first.as_u64() + 1);
+    state
+        .fail_backend(second, "deterministic failure")
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert_eq!(state.snapshot().await.generation, second);
+    assert_eq!(state.snapshot().await.phase, BackendPhase::Failed);
 }
 
 #[tokio::test]
@@ -3126,7 +3187,7 @@ async fn http_proxy_streams_32_mib_upload_and_download_without_aggregation() {
             .await
             .expect("streaming download ended before its first data frame")
             .unwrap();
-        if let Some(data) = frame.into_data().ok() {
+        if let Ok(data) = frame.into_data() {
             break data;
         }
     };
@@ -3509,7 +3570,7 @@ async fn websocket_proxy_never_downgrades_a_malformed_websocket_attempt_to_http(
 }
 
 #[tokio::test]
-async fn websocket_proxy_terminates_tunnel_when_backend_generation_changes() {
+async fn ready_backend_crash_closes_streams_returns_503_and_allows_one_new_generation() {
     let backend = FakeWebSocketBackend::spawn_echo().await;
     let replacement_backend = FakeWebSocketBackend::spawn_echo().await;
     let frontend = TemporaryFrontend::new();
@@ -3541,16 +3602,29 @@ async fn websocket_proxy_terminates_tunnel_when_backend_generation_changes() {
         .fail_backend(generation, "private generation diagnostic")
         .await
         .unwrap();
+    let terminal = tokio::time::timeout(Duration::from_secs(1), socket.next())
+        .await
+        .expect("backend failure did not terminate the public tunnel");
+    assert!(terminal.is_none() || terminal.is_some_and(|message| message.is_err()));
+    let unavailable = send_request(
+        &gateway,
+        Method::GET,
+        "/api/after-backend-crash",
+        &[(COOKIE.as_str(), &cookie)],
+    )
+    .await;
+    assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        response_bytes(unavailable).await,
+        Bytes::from_static(b"{\"error\":\"backend_unavailable\"}")
+    );
+
     let next_generation = state.begin_backend_start().await.unwrap();
     assert!(next_generation > generation);
     state
         .backend_ready(next_generation, replacement_backend.addr)
         .await
         .unwrap();
-    let terminal = tokio::time::timeout(Duration::from_secs(1), socket.next())
-        .await
-        .expect("generation change did not terminate the public tunnel");
-    assert!(terminal.is_none() || terminal.is_some_and(|message| message.is_err()));
 
     assert_eq!(backend.finish().await.len(), 1);
     let (mut replacement, _) = tokio::time::timeout(Duration::from_secs(1), async {

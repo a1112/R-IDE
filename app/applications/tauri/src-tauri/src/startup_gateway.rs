@@ -206,6 +206,10 @@ impl BackendGeneration {
     /// Sentinel used by the legacy launch path, which is not managed by a
     /// gateway generation. Real gateway generations start at one.
     pub(crate) const UNMANAGED: Self = Self(0);
+
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -272,11 +276,18 @@ struct RetryAdmission {
 pub struct RetryRequest {
     generation: BackendGeneration,
     pending: Arc<AtomicBool>,
+    completion: Option<oneshot::Sender<bool>>,
 }
 
 impl RetryRequest {
     pub fn generation(&self) -> BackendGeneration {
         self.generation
+    }
+
+    pub fn complete(mut self, accepted: bool) {
+        if let Some(completion) = self.completion.take() {
+            let _ = completion.send(accepted);
+        }
     }
 }
 
@@ -294,7 +305,7 @@ impl RetryAdmission {
         }
     }
 
-    fn try_submit(&self, generation: BackendGeneration) -> Result<(), ()> {
+    fn try_submit(&self, generation: BackendGeneration) -> Result<oneshot::Receiver<bool>, ()> {
         if self
             .pending
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -302,11 +313,14 @@ impl RetryAdmission {
         {
             return Err(());
         }
+        let (completion, completed) = oneshot::channel();
         let request = RetryRequest {
             generation,
             pending: self.pending.clone(),
+            completion: Some(completion),
         };
-        self.sender.try_send(request).map_err(|_| ())
+        self.sender.try_send(request).map_err(|_| ())?;
+        Ok(completed)
     }
 }
 
@@ -976,11 +990,13 @@ pub struct StartupGateway {
     shutdown: watch::Sender<bool>,
     shutdown_drain: Duration,
     accept_task: Option<JoinHandle<()>>,
+    accept_stopped: Option<oneshot::Receiver<()>>,
     retry_requests: Option<mpsc::Receiver<RetryRequest>>,
 }
 
 struct PendingAcceptTask {
     task: Option<JoinHandle<()>>,
+    accept_stopped: Option<oneshot::Receiver<()>>,
     shutdown: watch::Sender<bool>,
     state: GatewayState,
     public_addr: SocketAddr,
@@ -990,6 +1006,7 @@ struct PendingAcceptTask {
 impl PendingAcceptTask {
     fn new(
         task: JoinHandle<()>,
+        accept_stopped: oneshot::Receiver<()>,
         shutdown: watch::Sender<bool>,
         state: GatewayState,
         public_addr: SocketAddr,
@@ -997,6 +1014,7 @@ impl PendingAcceptTask {
     ) -> Self {
         Self {
             task: Some(task),
+            accept_stopped: Some(accept_stopped),
             shutdown,
             state,
             public_addr,
@@ -1004,10 +1022,15 @@ impl PendingAcceptTask {
         }
     }
 
-    fn commit(mut self) -> JoinHandle<()> {
-        self.task
-            .take()
-            .expect("pending accept task must be present")
+    fn commit(mut self) -> (JoinHandle<()>, oneshot::Receiver<()>) {
+        (
+            self.task
+                .take()
+                .expect("pending accept task must be present"),
+            self.accept_stopped
+                .take()
+                .expect("pending accept-stop receiver must be present"),
+        )
     }
 
     async fn cancel_and_join(mut self) {
@@ -1144,6 +1167,7 @@ impl StartupGateway {
         cancellation.check()?;
         let (shutdown, shutdown_receiver) = watch::channel(false);
         let (accept_ready, ready) = oneshot::channel();
+        let (accept_stopped_sender, accept_stopped) = oneshot::channel();
         let accept_state = state.clone();
         let accept_task = PendingAcceptTask::new(
             tokio::spawn(async move {
@@ -1152,16 +1176,20 @@ impl StartupGateway {
                     service,
                     accept_state.clone(),
                     shutdown_receiver,
-                    limits.max_connections,
-                    limits.http_header_read_timeout,
-                    limits.shutdown_drain,
+                    AcceptLoopLimits {
+                        max_connections: limits.max_connections,
+                        http_header_read_timeout: limits.http_header_read_timeout,
+                        shutdown_drain: limits.shutdown_drain,
+                    },
                     accept_ready,
+                    accept_stopped_sender,
                 );
                 if AssertUnwindSafe(accept_loop).catch_unwind().await.is_err() {
                     log::warn!("Startup gateway accept loop panicked.");
                     accept_state.shutdown().await;
                 }
             }),
+            accept_stopped,
             shutdown.clone(),
             state.clone(),
             public_addr,
@@ -1189,7 +1217,7 @@ impl StartupGateway {
             return Err(GatewayError::BindCancelled);
         }
         metrics.record_or_warn(StartupMilestone::GatewayListening);
-        let accept_task = accept_task.commit();
+        let (accept_task, accept_stopped) = accept_task.commit();
 
         Ok(Self {
             public_addr,
@@ -1198,6 +1226,7 @@ impl StartupGateway {
             shutdown,
             shutdown_drain: limits.shutdown_drain,
             accept_task: Some(accept_task),
+            accept_stopped: Some(accept_stopped),
             retry_requests: Some(retry_requests),
         })
     }
@@ -1224,12 +1253,24 @@ impl StartupGateway {
     }
 
     pub async fn shutdown(mut self) {
-        self.state.shutdown().await;
+        let deadline = tokio::time::Instant::now() + self.shutdown_drain;
         self.shutdown.send_replace(true);
+        if let Some(accept_stopped) = self.accept_stopped.take() {
+            if tokio::time::timeout_at(deadline, accept_stopped)
+                .await
+                .is_err()
+            {
+                if let Some(task) = self.accept_task.take() {
+                    task.abort();
+                    observe_accept_task_result(task.await);
+                }
+            }
+        }
+        self.state.shutdown().await;
         let Some(mut accept_task) = self.accept_task.take() else {
             return;
         };
-        match tokio::time::timeout(self.shutdown_drain, &mut accept_task).await {
+        match tokio::time::timeout_at(deadline, &mut accept_task).await {
             Ok(result) => observe_accept_task_result(result),
             Err(_) => {
                 accept_task.abort();
@@ -1302,18 +1343,26 @@ fn observe_accept_task_result(result: Result<(), JoinError>) {
     }
 }
 
+#[derive(Clone, Copy)]
+struct AcceptLoopLimits {
+    max_connections: usize,
+    http_header_read_timeout: Duration,
+    shutdown_drain: Duration,
+}
+
 async fn run_accept_loop(
     listener: TcpListener,
     service: StaticGatewayService,
     state: GatewayState,
     mut shutdown: watch::Receiver<bool>,
-    max_connections: usize,
-    http_header_read_timeout: Duration,
-    shutdown_drain: Duration,
+    limits: AcceptLoopLimits,
     accept_ready: oneshot::Sender<()>,
+    accept_stopped: oneshot::Sender<()>,
 ) {
     let mut connections = JoinSet::new();
-    let connection_limit = Arc::new(Semaphore::new(max_connections.min(Semaphore::MAX_PERMITS)));
+    let connection_limit = Arc::new(Semaphore::new(
+        limits.max_connections.min(Semaphore::MAX_PERMITS),
+    ));
     if accept_ready.send(()).is_err() {
         state.shutdown().await;
         return;
@@ -1347,14 +1396,15 @@ async fn run_accept_loop(
                 let service = service.clone();
                 connections.spawn(async move {
                     let _connection_permit = connection_permit;
-                    serve_connection(stream, service, http_header_read_timeout).await;
+                    serve_connection(stream, service, limits.http_header_read_timeout).await;
                 });
             }
         }
     }
     drop(listener);
+    let _ = accept_stopped.send(());
 
-    let drain = tokio::time::sleep(shutdown_drain);
+    let drain = tokio::time::sleep(limits.shutdown_drain);
     tokio::pin!(drain);
     while !connections.is_empty() {
         tokio::select! {
@@ -1372,7 +1422,7 @@ async fn run_accept_loop(
     while let Some(result) = connections.join_next().await {
         observe_connection_task_result(result);
     }
-    service.tunnels.shutdown(shutdown_drain).await;
+    service.tunnels.shutdown(limits.shutdown_drain).await;
 }
 
 async fn serve_connection(
@@ -1789,10 +1839,14 @@ impl StaticGatewayService {
         if snapshot.phase != BackendPhase::Failed || snapshot.generation != generation {
             return control_error(StatusCode::CONFLICT, b"retry_conflict");
         }
-        if self.retry_admission.try_submit(generation).is_err() {
-            return control_error(StatusCode::CONFLICT, b"retry_conflict");
+        let completion = match self.retry_admission.try_submit(generation) {
+            Ok(completion) => completion,
+            Err(()) => return control_error(StatusCode::CONFLICT, b"retry_conflict"),
+        };
+        match completion.await {
+            Ok(true) => control_empty(StatusCode::ACCEPTED),
+            Ok(false) | Err(_) => control_error(StatusCode::SERVICE_UNAVAILABLE, b"retry_failed"),
         }
-        control_empty(StatusCode::ACCEPTED)
     }
 
     async fn read_mutating_control_json(
@@ -1988,7 +2042,7 @@ fn request_attempts_upgrade(headers: &HeaderMap) -> bool {
         return true;
     }
     connection_header_tokens(headers)
-        .map(|tokens| tokens.iter().any(|name| name == UPGRADE))
+        .map(|tokens| tokens.contains(&UPGRADE))
         .unwrap_or(true)
 }
 
@@ -2555,7 +2609,7 @@ fn proxy_request_kind(
     public_origin: &str,
 ) -> Result<ProxyRequestKind, ProxyHeaderError> {
     let connection_tokens = connection_header_tokens(request.headers())?;
-    let requests_upgrade = connection_tokens.iter().any(|name| name == UPGRADE);
+    let requests_upgrade = connection_tokens.contains(&UPGRADE);
     if !requests_upgrade {
         let websocket_intent = request
             .headers()
@@ -2565,7 +2619,7 @@ fn proxy_request_kind(
             || request.headers().contains_key("sec-websocket-key")
             || request.headers().contains_key("sec-websocket-version");
         if websocket_intent {
-            return Err(ProxyHeaderError::InvalidUpgrade);
+            return Err(ProxyHeaderError::Upgrade);
         }
         return Ok(ProxyRequestKind::Http);
     }
@@ -2573,7 +2627,7 @@ fn proxy_request_kind(
         .iter()
         .any(is_protected_websocket_handshake_header)
     {
-        return Err(ProxyHeaderError::InvalidUpgrade);
+        return Err(ProxyHeaderError::Upgrade);
     }
     let client_key = validated_websocket_key(request.headers());
     let offered_protocols = validated_websocket_protocol_offers(request.headers())?;
@@ -2589,7 +2643,7 @@ fn proxy_request_kind(
         || !single_header_equals(request.headers(), "sec-websocket-version", b"13")
         || client_key.is_none()
     {
-        return Err(ProxyHeaderError::InvalidUpgrade);
+        return Err(ProxyHeaderError::Upgrade);
     }
     Ok(ProxyRequestKind::WebSocket(ValidatedWebSocketHandshake {
         expected_accept: websocket_accept(client_key.expect("validated above")),
@@ -2609,7 +2663,7 @@ fn validate_websocket_upgrade_response<B>(
     if connection_tokens
         .iter()
         .any(is_protected_websocket_response_header)
-        || !connection_tokens.iter().any(|name| name == UPGRADE)
+        || !connection_tokens.contains(&UPGRADE)
         || !single_header_equals(response.headers(), UPGRADE, b"websocket")
         || !single_header_exactly_equals(
             response.headers(),
@@ -2618,7 +2672,7 @@ fn validate_websocket_upgrade_response<B>(
         )
         || response.headers().contains_key("sec-websocket-extensions")
     {
-        return Err(ProxyHeaderError::InvalidUpgrade);
+        return Err(ProxyHeaderError::Upgrade);
     }
     validate_backend_websocket_protocol(response.headers_mut(), &handshake.offered_protocols)
 }
@@ -2685,7 +2739,7 @@ fn validated_websocket_protocol_offers(
                     .iter()
                     .any(|offered: &Vec<u8>| offered.as_slice() == protocol)
             {
-                return Err(ProxyHeaderError::InvalidUpgrade);
+                return Err(ProxyHeaderError::Upgrade);
             }
             protocols.push(protocol.to_vec());
         }
@@ -2706,7 +2760,7 @@ fn validate_backend_websocket_protocol(
         return Ok(());
     }
     if values.len() != 1 {
-        return Err(ProxyHeaderError::InvalidUpgrade);
+        return Err(ProxyHeaderError::Upgrade);
     }
     let selected = trim_ows(&values[0]);
     if selected.is_empty()
@@ -2715,10 +2769,10 @@ fn validate_backend_websocket_protocol(
             .iter()
             .any(|offered| offered.as_slice() == selected)
     {
-        return Err(ProxyHeaderError::InvalidUpgrade);
+        return Err(ProxyHeaderError::Upgrade);
     }
-    let selected = hyper::header::HeaderValue::from_bytes(selected)
-        .map_err(|_| ProxyHeaderError::InvalidUpgrade)?;
+    let selected =
+        hyper::header::HeaderValue::from_bytes(selected).map_err(|_| ProxyHeaderError::Upgrade)?;
     headers.insert("sec-websocket-protocol", selected);
     Ok(())
 }
@@ -2897,16 +2951,16 @@ fn published_backend_matches_lease(published: &PublishedBackend, lease: BackendL
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProxyHeaderError {
-    InvalidFraming,
-    InvalidConnection,
-    InvalidUpgrade,
+    Framing,
+    Connection,
+    Upgrade,
 }
 
 fn normalize_message_framing(headers: &mut HeaderMap) -> Result<(), ProxyHeaderError> {
     let content_length = validated_content_length(headers)?;
     let has_transfer_encoding = validate_plain_chunked_transfer_encoding(headers)?;
     if content_length.is_some() && has_transfer_encoding {
-        return Err(ProxyHeaderError::InvalidFraming);
+        return Err(ProxyHeaderError::Framing);
     }
     headers.remove(CONTENT_LENGTH);
     headers.remove(TRANSFER_ENCODING);
@@ -2919,20 +2973,20 @@ fn validated_content_length(headers: &HeaderMap) -> Result<Option<u64>, ProxyHea
         for candidate in value.as_bytes().split(|byte| *byte == b',') {
             let candidate = trim_ows(candidate);
             if candidate.is_empty() {
-                return Err(ProxyHeaderError::InvalidFraming);
+                return Err(ProxyHeaderError::Framing);
             }
             let mut length = 0_u64;
             for byte in candidate {
                 if !byte.is_ascii_digit() {
-                    return Err(ProxyHeaderError::InvalidFraming);
+                    return Err(ProxyHeaderError::Framing);
                 }
                 length = length
                     .checked_mul(10)
                     .and_then(|current| current.checked_add(u64::from(*byte - b'0')))
-                    .ok_or(ProxyHeaderError::InvalidFraming)?;
+                    .ok_or(ProxyHeaderError::Framing)?;
             }
             if parsed.is_some_and(|current| current != length) {
-                return Err(ProxyHeaderError::InvalidFraming);
+                return Err(ProxyHeaderError::Framing);
             }
             parsed = Some(length);
         }
@@ -2946,17 +3000,15 @@ fn validate_plain_chunked_transfer_encoding(headers: &HeaderMap) -> Result<bool,
         for coding in value.as_bytes().split(|byte| *byte == b',') {
             let coding = trim_ows(coding);
             if coding.is_empty() || !coding.eq_ignore_ascii_case(b"chunked") {
-                return Err(ProxyHeaderError::InvalidFraming);
+                return Err(ProxyHeaderError::Framing);
             }
-            count = count
-                .checked_add(1)
-                .ok_or(ProxyHeaderError::InvalidFraming)?;
+            count = count.checked_add(1).ok_or(ProxyHeaderError::Framing)?;
         }
     }
     match count {
         0 => Ok(false),
         1 => Ok(true),
-        _ => Err(ProxyHeaderError::InvalidFraming),
+        _ => Err(ProxyHeaderError::Framing),
     }
 }
 
@@ -2995,11 +3047,11 @@ fn connection_header_tokens(
         for token in value.as_bytes().split(|byte| *byte == b',') {
             let token = trim_ows(token);
             if token.is_empty() || !token.iter().copied().all(is_tchar) {
-                return Err(ProxyHeaderError::InvalidConnection);
+                return Err(ProxyHeaderError::Connection);
             }
             nominated.push(
                 hyper::header::HeaderName::from_bytes(token)
-                    .map_err(|_| ProxyHeaderError::InvalidConnection)?,
+                    .map_err(|_| ProxyHeaderError::Connection)?,
             );
         }
     }
@@ -3187,6 +3239,7 @@ fn not_found() -> Response<GatewayBody> {
         .header(CONTENT_TYPE, "text/plain; charset=utf-8")
         .header(CONTENT_LENGTH, NOT_FOUND_BODY.len())
         .header(CACHE_CONTROL, "no-store")
+        .header("x-content-type-options", "nosniff")
         .body(full_body(NOT_FOUND_BODY))
         .expect("fixed not-found response must be valid")
 }

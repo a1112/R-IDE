@@ -271,13 +271,14 @@ async fn backend_readiness_publishes_private_generation_without_navigation() {
         .expect("gateway navigation decision"));
 
     assert_eq!(gateway.state().wait_for_backend().await.unwrap(), private);
-    let observed = navigations.lock().unwrap();
-    assert_eq!(observed.len(), 1);
-    assert!(matches!(
-        observed.first(),
-        Some(WebviewUrl::External(url)) if url.path().starts_with("/_ride/bootstrap/")
-    ));
-    drop(observed);
+    {
+        let observed = navigations.lock().unwrap();
+        assert_eq!(observed.len(), 1);
+        assert!(matches!(
+            observed.first(),
+            Some(WebviewUrl::External(url)) if url.path().starts_with("/_ride/bootstrap/")
+        ));
+    }
 
     let legacy = BackendReadinessPublisher::legacy();
     let legacy_navigations = Arc::new(Mutex::new(Vec::new()));
@@ -293,12 +294,14 @@ async fn backend_readiness_publishes_private_generation_without_navigation() {
             duplicate_legacy_navigation.lock().unwrap().push(url);
         })
         .expect("duplicate legacy readiness navigation"));
-    let legacy_observed = legacy_navigations.lock().unwrap();
-    assert_eq!(legacy_observed.len(), 1);
-    assert_eq!(
-        legacy_observed[0].as_str(),
-        "http://127.0.0.1:3000/?ride_locale=zh-CN"
-    );
+    {
+        let legacy_observed = legacy_navigations.lock().unwrap();
+        assert_eq!(legacy_observed.len(), 1);
+        assert_eq!(
+            legacy_observed[0].as_str(),
+            "http://127.0.0.1:3000/?ride_locale=zh-CN"
+        );
+    }
     assert_eq!(publisher.theia_hosts(), Some(gateway.public_authority()));
     assert_eq!(legacy.theia_hosts(), None);
 
@@ -692,7 +695,7 @@ async fn gateway_capability_and_secondary_window_are_scoped_to_the_runtime_origi
     let trusted = tauri::Url::parse(&format!("{origin}/secondary-window.html")).unwrap();
     assert!(is_trusted_secondary_window_url(&trusted, &authority));
     for untrusted in [
-        format!("http://127.0.0.1:3000/secondary-window.html"),
+        "http://127.0.0.1:3000/secondary-window.html".to_string(),
         format!("http://user@{authority}/secondary-window.html"),
         format!("{origin}/other.html"),
         format!("{origin}/secondary-window.html?target=external"),

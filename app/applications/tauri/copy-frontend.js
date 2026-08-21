@@ -108,12 +108,25 @@ const frontendBootstrap = `(() => {
       }
       retriedGeneration = currentGeneration;
       retry.disabled = true;
+      const requestedGeneration = currentGeneration;
+      const releaseRejectedRetry = () => {
+        if (currentGeneration === requestedGeneration
+          && retriedGeneration === requestedGeneration
+          && currentState === 'failed') {
+          retriedGeneration = undefined;
+          retry.disabled = false;
+        }
+      };
       void window.fetch('/_ride/startup/retry', {
         method: 'POST',
         credentials: 'same-origin',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ generation: currentGeneration })
-      }).catch(() => undefined);
+      }).then(response => {
+        if (response.status !== 202) {
+          releaseRejectedRetry();
+        }
+      }, releaseRejectedRetry);
     });
     panel.append(title, diagnostic, retry);
     overlay.append(panel);

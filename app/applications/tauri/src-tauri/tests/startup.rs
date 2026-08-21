@@ -271,6 +271,11 @@ fn a_stop_request_between_launch_reservation_and_spawn_rejects_registration() {
     assert!(!ownership.register_spawn(launch, 42));
     assert_eq!(ownership.pid(), None);
     assert!(ownership.is_stopping());
+    assert!(ownership.has_owned_work());
+
+    assert!(ownership.complete_start(launch));
+    assert!(!ownership.is_stopping());
+    assert!(!ownership.has_owned_work());
 }
 
 #[test]
@@ -281,6 +286,7 @@ fn a_registered_child_is_returned_for_stop_and_cannot_be_revived() {
     assert!(ownership.owns_active(42));
 
     assert_eq!(ownership.request_stop(), Some(42));
+    assert_eq!(ownership.request_stop(), None);
     assert!(!ownership.owns_active(42));
     assert!(!ownership.register_spawn(launch, 42));
     assert_eq!(ownership.pid(), None);
@@ -292,6 +298,21 @@ fn a_registered_child_is_returned_for_stop_and_cannot_be_revived() {
     assert!(!ownership.is_stopping());
     assert!(!ownership.has_owned_work());
     assert!(!ownership.owns_process(42));
+}
+
+#[test]
+fn repeated_stop_preserves_the_exact_child_awaiting_reap() {
+    let mut ownership = BackendOwnershipState::default();
+    let launch = ownership.reserve_start();
+    assert!(ownership.register_spawn(launch, 42));
+
+    assert_eq!(ownership.request_stop(), Some(42));
+    assert_eq!(ownership.request_stop(), None);
+    assert!(ownership.owns_process(42));
+    assert!(ownership.has_owned_work());
+
+    assert!(ownership.clear_spawn(42));
+    assert!(!ownership.has_owned_work());
 }
 
 #[test]
