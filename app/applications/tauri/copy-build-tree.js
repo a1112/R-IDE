@@ -29,6 +29,28 @@ function assertRegularDirectory(candidate, label) {
   }
 }
 
+function assertSymlinkFreeTree(root) {
+  assertRegularDirectory(root, 'Generated frontend root');
+  const visit = candidate => {
+    assertWithin(root, candidate);
+    const stat = fs.lstatSync(candidate);
+    if (stat.isSymbolicLink()) {
+      throw new Error(`Generated frontend contains a symbolic link or reparse point: ${candidate}`);
+    }
+    if (stat.isFile()) {
+      return;
+    }
+    if (!stat.isDirectory()) {
+      throw new Error(`Generated frontend contains a non-regular asset: ${candidate}`);
+    }
+    for (const entry of fs.readdirSync(candidate, { withFileTypes: true })) {
+      assertSafeEntryName(entry.name);
+      visit(path.join(candidate, entry.name));
+    }
+  };
+  visit(path.resolve(root));
+}
+
 function copyRegularTree(sourceRoot, targetRoot, options = {}) {
   const includeSourceMaps = options.includeSourceMaps === true;
   const copyEntry = (source, target) => {
@@ -58,6 +80,7 @@ function copyRegularTree(sourceRoot, targetRoot, options = {}) {
 
   assertRegularDirectory(sourceRoot, 'Build source');
   copyEntry(sourceRoot, targetRoot);
+  assertSymlinkFreeTree(targetRoot);
 }
 
 function createSiblingPath(target, purpose) {
@@ -313,6 +336,7 @@ function assertRequiredRegularFiles(sourceRoot, requiredFiles) {
 
 module.exports = {
   assertRequiredRegularFiles,
+  assertSymlinkFreeTree,
   canonicalDigest,
   copyRegularTree,
   publishDirectoryAtomic,

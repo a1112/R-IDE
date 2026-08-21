@@ -7,15 +7,492 @@
  * SPDX-License-Identifier: MIT
  ********************************************************************************/
 
+use bytes::Bytes;
 use futures_util::poll;
+use http_body_util::{BodyExt, Empty};
+use hyper::header::{
+    CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HOST, LOCATION, SET_COOKIE,
+};
+use hyper::{Method, Request, Response, StatusCode};
+use hyper_util::rt::TokioIo;
 use ride_tauri::startup_gateway::{
     BackendAddressError, BackendGeneration, BackendPhase, GatewayError, GatewayLimits,
-    GatewayState, PathError, RouteKind, RouteTable,
+    GatewayState, PathError, RouteKind, RouteTable, StartupGateway,
 };
-use ride_tauri::startup_metrics::StartupMode;
-use std::net::SocketAddr;
+use ride_tauri::startup_metrics::{
+    ElapsedClock, StartupMetrics, StartupMilestone, StartupMode, StartupReport, StartupReportWriter,
+};
+use std::fs;
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
+use tokio::net::TcpStream;
+use uuid::Uuid;
+
+const EXPECTED_STATIC_ASSET_CHUNK_SIZE: usize = 16 * 1024;
+
+struct TemporaryFrontend {
+    root: PathBuf,
+}
+
+impl TemporaryFrontend {
+    fn new() -> Self {
+        let root = std::env::temp_dir().join(format!("ride-startup-gateway-{}", Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        fs::write(
+            root.join("index.html"),
+            b"<!doctype html><title>R-IDE</title>",
+        )
+        .unwrap();
+        fs::write(root.join("bundle.js"), b"globalThis.ride = true;").unwrap();
+        fs::write(root.join("bundle.css"), b"body { color: white; }").unwrap();
+        fs::write(root.join("chunk.0123456789abcdef.js"), b"export default 1;").unwrap();
+        fs::create_dir(root.join("assets")).unwrap();
+        Self { root }
+    }
+
+    fn write_large_asset(&self, relative: &str, size: usize) -> Vec<u8> {
+        let bytes = (0..size)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        fs::write(self.root.join(relative), &bytes).unwrap();
+        bytes
+    }
+}
+
+impl Drop for TemporaryFrontend {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+#[derive(Debug)]
+struct ZeroClock;
+
+impl ElapsedClock for ZeroClock {
+    fn elapsed_ms(&self) -> u64 {
+        0
+    }
+}
+
+#[derive(Debug)]
+struct SettableClock(AtomicU64);
+
+impl ElapsedClock for SettableClock {
+    fn elapsed_ms(&self) -> u64 {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+struct ChannelWriter(mpsc::Sender<StartupReport>);
+
+impl StartupReportWriter for ChannelWriter {
+    fn write(&mut self, report: &StartupReport) -> io::Result<()> {
+        self.0
+            .send(report.clone())
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "report receiver closed"))
+    }
+}
+
+fn disabled_metrics() -> StartupMetrics {
+    StartupMetrics::with_clock(
+        None,
+        "test",
+        "test",
+        1,
+        StartupMode::RustGateway,
+        Arc::new(ZeroClock),
+    )
+}
+
+async fn bind_gateway(frontend: &TemporaryFrontend) -> StartupGateway {
+    StartupGateway::bind(
+        frontend.root.clone(),
+        disabled_metrics(),
+        GatewayLimits::test_defaults(),
+    )
+    .await
+    .unwrap()
+}
+
+async fn send_request(
+    gateway: &StartupGateway,
+    method: Method,
+    target: &str,
+    headers: &[(&str, &str)],
+) -> Response<hyper::body::Incoming> {
+    let stream = TcpStream::connect(gateway_addr(gateway)).await.unwrap();
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let mut request = Request::builder().method(method).uri(target);
+    if !headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case(HOST.as_str()))
+    {
+        request = request.header(HOST, gateway.public_authority());
+    }
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    sender
+        .send_request(request.body(Empty::<Bytes>::new()).unwrap())
+        .await
+        .unwrap()
+}
+
+fn gateway_addr(gateway: &StartupGateway) -> SocketAddr {
+    gateway.public_authority().parse().unwrap()
+}
+
+async fn response_bytes(response: Response<hyper::body::Incoming>) -> Bytes {
+    response.into_body().collect().await.unwrap().to_bytes()
+}
+
+async fn bootstrap_session(gateway: &StartupGateway) -> String {
+    let response = send_request(gateway, Method::GET, gateway.bootstrap_url().path(), &[]).await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    response
+        .headers()
+        .get(SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string()
+}
+
+#[cfg(unix)]
+fn symlink_file(original: &Path, link: &Path) -> io::Result<()> {
+    std::os::unix::fs::symlink(original, link)
+}
+
+#[cfg(windows)]
+fn symlink_file(original: &Path, link: &Path) -> io::Result<()> {
+    std::os::windows::fs::symlink_file(original, link)
+}
+
+#[tokio::test]
+async fn one_time_bootstrap_sets_a_host_only_strict_session_and_redirects_to_root() {
+    let frontend = TemporaryFrontend::new();
+    let gateway = bind_gateway(&frontend).await;
+    assert_eq!(gateway_addr(&gateway).ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+    assert_ne!(gateway_addr(&gateway).port(), 0);
+
+    let bootstrap_url = gateway.bootstrap_url();
+    assert_eq!(bootstrap_url.host_str(), Some("127.0.0.1"));
+    assert_eq!(bootstrap_url.port(), Some(gateway_addr(&gateway).port()));
+    let capability = bootstrap_url.path_segments().unwrap().next_back().unwrap();
+    assert_eq!(Uuid::parse_str(capability).unwrap().get_version_num(), 4);
+
+    let response = send_request(&gateway, Method::GET, bootstrap_url.path(), &[]).await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers().get(LOCATION).unwrap(), "/");
+    assert_eq!(response.headers().get(CACHE_CONTROL).unwrap(), "no-store");
+    assert_eq!(response.headers().get_all(SET_COOKIE).iter().count(), 1);
+    let set_cookie = response
+        .headers()
+        .get(SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(set_cookie.starts_with("ride_session="));
+    assert!(set_cookie.contains("; Path=/"));
+    assert!(set_cookie.contains("; HttpOnly"));
+    assert!(set_cookie.contains("; SameSite=Strict"));
+    assert!(!set_cookie.contains("Domain="));
+    assert!(!set_cookie.contains("Secure"));
+    assert!(!set_cookie.contains("__Host-"));
+    let session = set_cookie
+        .split(';')
+        .next()
+        .unwrap()
+        .strip_prefix("ride_session=")
+        .unwrap();
+    assert_eq!(Uuid::parse_str(session).unwrap().get_version_num(), 4);
+    assert_ne!(session, capability);
+    assert!(response_bytes(response).await.is_empty());
+
+    let replay = send_request(&gateway, Method::GET, bootstrap_url.path(), &[]).await;
+    assert_eq!(replay.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        response_bytes(replay).await,
+        Bytes::from_static(b"Not Found")
+    );
+    gateway.shutdown().await;
+}
+
+#[tokio::test]
+async fn authenticated_index_and_assets_are_available_before_backend_readiness() {
+    let frontend = TemporaryFrontend::new();
+    let gateway = bind_gateway(&frontend).await;
+
+    let anonymous = send_request(&gateway, Method::GET, "/", &[]).await;
+    assert_eq!(anonymous.status(), StatusCode::NOT_FOUND);
+
+    let cookie = bootstrap_session(&gateway).await;
+    let index = send_request(&gateway, Method::GET, "/", &[(COOKIE.as_str(), &cookie)]).await;
+    assert_eq!(index.status(), StatusCode::OK);
+    assert_eq!(
+        index.headers().get(CONTENT_TYPE).unwrap(),
+        "text/html; charset=utf-8"
+    );
+    assert_eq!(index.headers().get(CACHE_CONTROL).unwrap(), "no-store");
+    let index_length = index.headers().get(CONTENT_LENGTH).unwrap().clone();
+    assert_eq!(
+        response_bytes(index).await,
+        Bytes::from_static(b"<!doctype html><title>R-IDE</title>")
+    );
+
+    let head = send_request(&gateway, Method::HEAD, "/", &[(COOKIE.as_str(), &cookie)]).await;
+    assert_eq!(head.status(), StatusCode::OK);
+    assert_eq!(head.headers().get(CONTENT_LENGTH).unwrap(), index_length);
+    assert!(response_bytes(head).await.is_empty());
+
+    let bundle = send_request(
+        &gateway,
+        Method::GET,
+        "/bundle.js",
+        &[(COOKIE.as_str(), &cookie)],
+    )
+    .await;
+    assert_eq!(bundle.status(), StatusCode::OK);
+    assert_eq!(
+        bundle.headers().get(CONTENT_TYPE).unwrap(),
+        "text/javascript; charset=utf-8"
+    );
+    assert_eq!(bundle.headers().get(CACHE_CONTROL).unwrap(), "no-cache");
+
+    let hashed = send_request(
+        &gateway,
+        Method::GET,
+        "/chunk.0123456789abcdef.js",
+        &[(COOKIE.as_str(), &cookie)],
+    )
+    .await;
+    assert_eq!(hashed.status(), StatusCode::OK);
+    assert_eq!(
+        hashed.headers().get(CACHE_CONTROL).unwrap(),
+        "public, max-age=31536000, immutable"
+    );
+    gateway.shutdown().await;
+}
+
+#[tokio::test]
+async fn invalid_unknown_directory_and_symlink_paths_return_bounded_not_found() {
+    let frontend = TemporaryFrontend::new();
+    let external_root = frontend
+        .root
+        .parent()
+        .unwrap()
+        .join(format!("ride-startup-gateway-external-{}", Uuid::new_v4()));
+    fs::create_dir(&external_root).unwrap();
+    let external_file = external_root.join("secret.js");
+    fs::write(&external_file, b"private path and token material").unwrap();
+    symlink_file(&external_file, &frontend.root.join("escape.js")).unwrap();
+
+    let gateway = bind_gateway(&frontend).await;
+    let capability = gateway
+        .bootstrap_url()
+        .path_segments()
+        .unwrap()
+        .next_back()
+        .unwrap()
+        .to_string();
+    let cookie = bootstrap_session(&gateway).await;
+    for target in [
+        "/%2e%2e/secret.js",
+        "/assets%2fsecret.js",
+        "/assets%5csecret.js",
+        "/assets\\secret.js",
+        "/nul%00.js",
+        "/%252e%252e/secret.js",
+        "/missing.js",
+        "/assets/",
+        "/escape.js",
+    ] {
+        let response =
+            send_request(&gateway, Method::GET, target, &[(COOKIE.as_str(), &cookie)]).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "target {target:?}"
+        );
+        let body = response_bytes(response).await;
+        assert!(body.len() <= 32, "target {target:?}");
+        let body = String::from_utf8_lossy(&body);
+        assert!(!body.contains(&capability));
+        assert!(!body.contains(&cookie));
+        assert!(!body.contains(frontend.root.to_string_lossy().as_ref()));
+        assert!(!body.contains(external_root.to_string_lossy().as_ref()));
+    }
+
+    gateway.shutdown().await;
+    fs::remove_dir_all(external_root).unwrap();
+}
+
+#[tokio::test]
+async fn foreign_authority_origin_forwarding_and_absolute_targets_are_rejected() {
+    let frontend = TemporaryFrontend::new();
+    let gateway = bind_gateway(&frontend).await;
+    let cookie = bootstrap_session(&gateway).await;
+    let public_authority = gateway.public_authority();
+    let public_origin = format!("http://{public_authority}");
+    let absolute_target = format!("{public_origin}/");
+    let foreign_host_headers = [
+        (HOST.as_str(), "localhost:1"),
+        (COOKIE.as_str(), cookie.as_str()),
+    ];
+    let foreign_origin_headers = [
+        ("origin", "http://example.invalid"),
+        (COOKIE.as_str(), cookie.as_str()),
+    ];
+    let forwarded_host_headers = [
+        ("x-forwarded-host", public_authority.as_str()),
+        (COOKIE.as_str(), cookie.as_str()),
+    ];
+    let forwarded_headers = [
+        ("forwarded", "host=127.0.0.1"),
+        (COOKIE.as_str(), cookie.as_str()),
+    ];
+    let absolute_headers = [(COOKIE.as_str(), cookie.as_str())];
+    let cases: [(&str, &[(&str, &str)]); 5] = [
+        ("/", &foreign_host_headers),
+        ("/", &foreign_origin_headers),
+        ("/", &forwarded_host_headers),
+        ("/", &forwarded_headers),
+        (&absolute_target, &absolute_headers),
+    ];
+    for (target, headers) in cases {
+        let response = send_request(&gateway, Method::GET, target, headers).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "target {target:?}"
+        );
+        assert_eq!(
+            response_bytes(response).await,
+            Bytes::from_static(b"Not Found")
+        );
+    }
+
+    let allowed = send_request(
+        &gateway,
+        Method::GET,
+        "/",
+        &[(COOKIE.as_str(), &cookie), ("origin", &public_origin)],
+    )
+    .await;
+    assert_eq!(allowed.status(), StatusCode::OK);
+    gateway.shutdown().await;
+}
+
+#[tokio::test]
+async fn large_static_assets_stream_incrementally_over_http() {
+    let frontend = TemporaryFrontend::new();
+    let expected = frontend.write_large_asset(
+        "large.js",
+        EXPECTED_STATIC_ASSET_CHUNK_SIZE * 3 + EXPECTED_STATIC_ASSET_CHUNK_SIZE / 2,
+    );
+    let gateway = bind_gateway(&frontend).await;
+    let cookie = bootstrap_session(&gateway).await;
+    let response = send_request(
+        &gateway,
+        Method::GET,
+        "/large.js",
+        &[(COOKIE.as_str(), &cookie)],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(CONTENT_LENGTH).unwrap(),
+        expected.len().to_string().as_str()
+    );
+
+    let mut body = response.into_body();
+    let mut observed = Vec::with_capacity(expected.len());
+    let mut frame_count = 0;
+    while let Some(frame) = body.frame().await {
+        let frame = frame.unwrap();
+        if let Some(data) = frame.data_ref() {
+            frame_count += 1;
+            observed.extend_from_slice(data);
+        }
+    }
+    // HTTP/1.1 does not preserve Body frame boundaries, so Hyper may merge
+    // adjacent 16 KiB server reads. The module-level stream test verifies the
+    // producer's exact bound; this real-socket test verifies incremental delivery.
+    assert!(frame_count >= 2);
+    assert_eq!(observed, expected);
+    gateway.shutdown().await;
+}
+
+#[tokio::test]
+async fn shutdown_is_bounded_and_releases_the_loopback_listener() {
+    let frontend = TemporaryFrontend::new();
+    let gateway = StartupGateway::bind(
+        frontend.root.clone(),
+        disabled_metrics(),
+        GatewayLimits {
+            shutdown_drain: Duration::from_millis(25),
+            ..GatewayLimits::test_defaults()
+        },
+    )
+    .await
+    .unwrap();
+    let address = gateway_addr(&gateway);
+    let _idle_connection = TcpStream::connect(address).await.unwrap();
+
+    tokio::time::timeout(Duration::from_millis(250), gateway.shutdown())
+        .await
+        .expect("gateway shutdown exceeded its drain bound");
+    assert!(TcpStream::connect(address).await.is_err());
+}
+
+#[tokio::test]
+async fn bind_records_gateway_listening_once_after_the_accept_loop_is_ready() {
+    let frontend = TemporaryFrontend::new();
+    let clock = Arc::new(SettableClock(AtomicU64::new(0)));
+    let (reports, receiver) = mpsc::channel();
+    let metrics = StartupMetrics::with_clock_and_writer(
+        "test",
+        "test",
+        1,
+        StartupMode::RustGateway,
+        clock.clone(),
+        Box::new(ChannelWriter(reports)),
+    );
+    metrics.record(StartupMilestone::ProcessStarted).unwrap();
+    receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+    clock.0.store(7, Ordering::SeqCst);
+
+    let gateway = StartupGateway::bind(
+        frontend.root.clone(),
+        metrics,
+        GatewayLimits::test_defaults(),
+    )
+    .await
+    .unwrap();
+    assert!(TcpStream::connect(gateway_addr(&gateway)).await.is_ok());
+    let report = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(
+        serde_json::to_value(report).unwrap()["milestones"]["gateway_listening"],
+        7
+    );
+    assert!(receiver.recv_timeout(Duration::from_millis(50)).is_err());
+    gateway.shutdown().await;
+}
 
 #[test]
 fn startup_mode_defaults_to_rust_gateway_and_accepts_explicit_legacy() {

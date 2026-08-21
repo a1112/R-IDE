@@ -16,6 +16,7 @@ const productDirectory = path.join(appDirectory, 'theia-extensions', 'product', 
 const require = createRequire(import.meta.url);
 const {
   assertRequiredRegularFiles,
+  assertSymlinkFreeTree,
   canonicalDigest,
   copyRegularTree,
   publishDirectoryAtomic,
@@ -370,6 +371,41 @@ test('Tauri build copy rejects traversal requirements and source links or repars
 
     assert.throws(() => assertRequiredRegularFiles(source, ['../external/payload.js']), /unsafe/);
     assert.throws(() => copyRegularTree(source, target), /symbolic link|reparse point/);
+  } finally {
+    fs.rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+test('generated Tauri frontend resources are symlink-free and remain exactly scoped', async () => {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'ride-tauri-resource-contract-'));
+  try {
+    const source = path.join(fixture, 'source');
+    const generated = path.join(fixture, 'generated');
+    const external = path.join(fixture, 'external');
+    fs.mkdirSync(source);
+    fs.writeFileSync(path.join(source, 'index.html'), '<!doctype html>');
+    fs.writeFileSync(path.join(source, 'bundle.js'), 'bundle');
+    fs.mkdirSync(external);
+    fs.writeFileSync(path.join(external, 'payload.js'), 'external');
+
+    copyRegularTree(source, generated);
+    assert.doesNotThrow(() => assertSymlinkFreeTree(generated));
+    fs.symlinkSync(external, path.join(generated, 'linked'), process.platform === 'win32' ? 'junction' : 'dir');
+    assert.throws(() => assertSymlinkFreeTree(generated), /symbolic link|reparse point/);
+
+    const tauriConfig = JSON.parse(await readFile(path.join(tauriDirectory, 'tauri.conf.json'), 'utf8'));
+    const generatedFrontendScopes = [
+      tauriConfig.build?.frontendDist,
+      ...Object.keys(tauriConfig.bundle?.resources ?? {})
+        .filter(sourcePath => sourcePath.includes('frontend')),
+    ].sort();
+    assert.deepEqual(generatedFrontendScopes, ['../browser-frontend', '../tauri-frontend']);
+    assert.equal(tauriConfig.bundle.resources['../browser-frontend'], 'lib/frontend');
+    assert.equal(
+      Object.keys(tauriConfig.bundle.resources)
+        .some(sourcePath => ['*', '?', '[', ']'].some(marker => sourcePath.includes(marker))),
+      false,
+    );
   } finally {
     fs.rmSync(fixture, { recursive: true, force: true });
   }
