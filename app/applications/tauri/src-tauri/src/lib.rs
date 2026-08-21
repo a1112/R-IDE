@@ -198,19 +198,6 @@ fn install_shutdown_signal_handlers(app_handle: tauri::AppHandle) {
 #[cfg(not(unix))]
 fn install_shutdown_signal_handlers(_app_handle: tauri::AppHandle) {}
 
-fn initialize_current_startup_metrics(
-    startup_metrics: &startup_metrics::StartupMetrics,
-    requested_mode: startup_metrics::StartupMode,
-) -> Result<(), startup_metrics::StartupMetricError> {
-    startup_metrics.record(startup_metrics::StartupMilestone::ProcessStarted)?;
-    if requested_mode == startup_metrics::StartupMode::RustGateway {
-        // Transitional until Task 6: replace this unconditional fallback with
-        // the actual Rust gateway bind outcome before mode-specific milestones.
-        startup_metrics.select_effective_mode(startup_metrics::StartupMode::LegacyFallback)?;
-    }
-    Ok(())
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let _startup_job_lease = match startup_job::create_for_current_process_if_requested(
@@ -394,6 +381,19 @@ pub fn run() {
         }
         _ => {}
     });
+}
+
+fn initialize_current_startup_metrics(
+    startup_metrics: &startup_metrics::StartupMetrics,
+    requested_mode: startup_metrics::StartupMode,
+) -> Result<(), startup_metrics::StartupMetricError> {
+    startup_metrics.record(startup_metrics::StartupMilestone::ProcessStarted)?;
+    if requested_mode == startup_metrics::StartupMode::RustGateway {
+        // Transitional until Task 6: replace this unconditional fallback with
+        // the actual Rust gateway bind outcome before mode-specific milestones.
+        startup_metrics.select_effective_mode(startup_metrics::StartupMode::LegacyFallback)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
