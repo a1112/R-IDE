@@ -24,6 +24,7 @@ import {
   discoverMarkedProcessSnapshot,
   discoverExecutable,
   filterSpawnEnvironment,
+  parseStartupReport,
   readCampaignMetadata,
   redactDiagnosticText,
   requestGracefulProcessClose,
@@ -32,6 +33,7 @@ import {
   waitForStartupReport,
 } from './measure-tauri-startup.mjs';
 import {
+  SMOKE_PROTOCOL_VERSION,
   SMOKE_SCENARIOS,
   SMOKE_SCENARIO_REQUIREMENTS,
   validateSmokeProgress,
@@ -113,6 +115,21 @@ function scenarioDefinition(scenario) {
     files: requirement.fileCount === 0 ? [] : ['first.R', 'second.R'],
     actions: [...requirement.actions],
   };
+}
+
+function validateRustGatewayStartupReport(value) {
+  let report;
+  try {
+    report = parseStartupReport(JSON.stringify(value), { phase: 'final' });
+  } catch (error) {
+    throw new Error('packaged smoke startup report must contain all required v2 final milestones', {
+      cause: error,
+    });
+  }
+  if (report.startupMode !== 'rust-gateway') {
+    throw new Error('packaged smoke startup report must use rust-gateway mode');
+  }
+  return report;
 }
 
 function assertRunMatchesScenario(run, scenario) {
@@ -224,7 +241,7 @@ export async function createSmokeRunArtifacts({
     initializeGitWorkspace(workspace, definition.files, preparedSourceEnvironment.environment);
     const spec = validateSmokeSpec({
       schema: 'ride.tauri-packaged-smoke-spec',
-      version: 1,
+      version: SMOKE_PROTOCOL_VERSION,
       scenario,
       profile: definition.profile,
       workspace: '.',
@@ -791,6 +808,14 @@ function defaultDependencies(options) {
     waitForForwardingStarted: waitForForwardingStartedDefault,
     waitForInstanceExit: waitForPackagedSmokeInstanceExit,
     waitForFinalReport: waitForPackagedSmokeFinalReport,
+    waitForStartupFinalReport: ({ run, first, budget }) => waitForStartupReport(
+      first.startupReportPath,
+      {
+        timeoutMs: remainingPhaseBudget(budget),
+        pollMs: Math.min(10, remainingPhaseBudget(budget)),
+        phase: 'final',
+      },
+    ),
     requestGracefulClose: (instance, { budget }) => requestGracefulProcessClose(
       instance.identity,
       instance.platform ?? process.platform,
@@ -964,6 +989,20 @@ export async function runPackagedSmoke(options, injectedDependencies) {
     if (finalReport.status !== 'passed') {
       throw new Error(finalReport.diagnostic.message);
     }
+    const startupReport = validateRustGatewayStartupReport(
+      await dependencies.waitForStartupFinalReport({
+        run,
+        first,
+        budget: phaseBudget('final startup report'),
+      }),
+    );
+    const firstPid = first.identity?.pid ?? first.child.pid;
+    if (startupReport.pid !== firstPid) {
+      throw new Error('final startup report pid does not match the first packaged process');
+    }
+    if (startupReport.startupMode !== finalReport.startupMode) {
+      throw new Error('smoke and startup reports must agree on rust-gateway mode');
+    }
     const gracefulBudget = phaseBudget('first instance graceful exit');
     await dependencies.requestGracefulClose(first, { run, budget: gracefulBudget });
     await dependencies.waitForInstanceExit(first, {
@@ -1050,7 +1089,7 @@ export function parsePackagedSmokeArguments(argv) {
     parsed[key] = key === 'timeoutMs' ? Number(value) : value;
   }
   if (!SMOKE_SCENARIOS.includes(parsed.scenario)) {
-    throw new Error('scenario must be critical-file, critical-empty, or full-file');
+    throw new Error('scenario must be critical-file, critical-empty, full-file, or backend-retry');
   }
   parsed.timeoutMs = strictTimeout(parsed.timeoutMs, 'timeout-ms');
   if (parsed.bundleRoot !== undefined && parsed.executable !== undefined) {

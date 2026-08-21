@@ -13,10 +13,13 @@ export const SMOKE_SCHEMAS = Object.freeze({
   report: 'ride.tauri-packaged-smoke',
 });
 
+export const SMOKE_PROTOCOL_VERSION = 2;
+
 export const SMOKE_SCENARIOS = Object.freeze([
   'critical-file',
   'critical-empty',
   'full-file',
+  'backend-retry',
 ]);
 
 export const SMOKE_ACTIONS = Object.freeze([
@@ -27,6 +30,11 @@ export const SMOKE_ACTIONS = Object.freeze([
   'packaged-plugin-command',
   'secondary-window',
   'second-file-forwarding',
+]);
+
+const CANONICAL_SMOKE_ACTIONS = Object.freeze([
+  ...SMOKE_ACTIONS,
+  'backend-retry',
 ]);
 
 export const SMOKE_SCENARIO_REQUIREMENTS = deepFreeze({
@@ -44,6 +52,11 @@ export const SMOKE_SCENARIO_REQUIREMENTS = deepFreeze({
     profile: 'full',
     fileCount: 2,
     actions: [...SMOKE_ACTIONS],
+  },
+  'backend-retry': {
+    profile: 'tauri-critical',
+    fileCount: 0,
+    actions: ['backend-retry'],
   },
 });
 
@@ -73,6 +86,19 @@ const REPORT_KEYS = Object.freeze([
   'durationMs',
   'diagnostic',
   'steps',
+  'startupMode',
+  'documentLifecycleCount',
+  'gatewayAuthority',
+  'backendAuthority',
+  'backendGenerationBefore',
+  'backendGenerationAfter',
+  'backendRootPidBefore',
+  'backendRootPidAfter',
+  'backendReadyPidAfter',
+  'backendDescendantPidsBefore',
+  'backendSpawnCountBefore',
+  'backendSpawnCountAfter',
+  'oldBackendTreeProcessCountAfterCleanup',
 ]);
 const PROGRESS_KEYS = Object.freeze([
   'schema',
@@ -99,6 +125,7 @@ const ACTION_FAILURE_CODES = Object.freeze(['action-failed', 'action-timeout']);
 const MAX_DIAGNOSTIC_CODE_LENGTH = 64;
 const MAX_DIAGNOSTIC_MESSAGE_LENGTH = 256;
 const DIAGNOSTIC_CODE_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const LOOPBACK_AUTHORITY_PATTERN = /^127\.0\.0\.1:([1-9][0-9]{0,4})$/;
 const DIAGNOSTIC_CATALOG = Object.freeze({
   'startup-failed': 'Application startup failed.',
   'action-failed': 'Smoke action failed.',
@@ -223,7 +250,7 @@ function validateActions(value, label = 'Smoke spec actions') {
   let previousIndex = -1;
   for (let index = 0; index < actions.length; index += 1) {
     const action = actions[index];
-    const actionIndex = SMOKE_ACTIONS.indexOf(action);
+    const actionIndex = CANONICAL_SMOKE_ACTIONS.indexOf(action);
     if (actionIndex < 0) {
       fail(`${label} has unsupported action at index ${index}`);
     }
@@ -261,6 +288,140 @@ function nonNegativeSafeInteger(value, label) {
     fail(`${label} must be a non-negative safe integer`);
   }
   return value;
+}
+
+function positiveSafeInteger(value, label) {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    fail(`${label} must be a positive safe integer`);
+  }
+  return value;
+}
+
+function boundedProcessIds(value, rootPid, label) {
+  if (!Array.isArray(value) || value.length > 64) {
+    fail(`${label} must be a bounded process id array`);
+  }
+  const seen = new Set();
+  return value.map((pid, index) => {
+    if (!Object.hasOwn(value, index)) {
+      fail(`${label} must be dense`);
+    }
+    const validated = positiveSafeInteger(pid, `${label}[${index}]`);
+    if (validated === rootPid || seen.has(validated)) {
+      fail(`${label} must contain unique non-root descendant process ids`);
+    }
+    seen.add(validated);
+    return validated;
+  });
+}
+
+function validateLoopbackAuthority(value, label) {
+  if (typeof value !== 'string' || value.length > 21) {
+    fail(`${label} must be a bounded private loopback authority`);
+  }
+  const match = LOOPBACK_AUTHORITY_PATTERN.exec(value);
+  const port = match === null ? 0 : Number(match[1]);
+  if (match === null || port > 65_535 || String(port) !== match[1]) {
+    fail(`${label} must be a canonical private loopback authority with a nonzero port`);
+  }
+  return { authority: value, port };
+}
+
+function validateNativeObservations(value, scenario, status) {
+  if (value.startupMode !== 'rust-gateway') {
+    fail('Smoke report native observation startupMode must be rust-gateway');
+  }
+  if (value.documentLifecycleCount !== 1) {
+    fail('Smoke report native observation document lifecycle count must be exactly one');
+  }
+  const gateway = validateLoopbackAuthority(
+    value.gatewayAuthority,
+    'Smoke report native observation gatewayAuthority',
+  );
+  const backend = validateLoopbackAuthority(
+    value.backendAuthority,
+    'Smoke report native observation backendAuthority',
+  );
+  if (backend.authority !== '127.0.0.1:3000') {
+    fail('Smoke report native observation backendAuthority must be the private backend authority');
+  }
+  if (gateway.authority === backend.authority) {
+    fail('Smoke report native observation gateway and backend authorities must be distinct');
+  }
+  const before = positiveSafeInteger(
+    value.backendGenerationBefore,
+    'Smoke report native observation backendGenerationBefore',
+  );
+  const after = positiveSafeInteger(
+    value.backendGenerationAfter,
+    'Smoke report native observation backendGenerationAfter',
+  );
+  const rootBefore = positiveSafeInteger(
+    value.backendRootPidBefore,
+    'Smoke report native observation backendRootPidBefore',
+  );
+  const rootAfter = positiveSafeInteger(
+    value.backendRootPidAfter,
+    'Smoke report native observation backendRootPidAfter',
+  );
+  const readyPidAfter = positiveSafeInteger(
+    value.backendReadyPidAfter,
+    'Smoke report native observation backendReadyPidAfter',
+  );
+  const descendantsBefore = boundedProcessIds(
+    value.backendDescendantPidsBefore,
+    rootBefore,
+    'Smoke report native observation backendDescendantPidsBefore',
+  );
+  const spawnCountBefore = positiveSafeInteger(
+    value.backendSpawnCountBefore,
+    'Smoke report native observation backendSpawnCountBefore',
+  );
+  const spawnCountAfter = positiveSafeInteger(
+    value.backendSpawnCountAfter,
+    'Smoke report native observation backendSpawnCountAfter',
+  );
+  const oldTreeProcessCount = nonNegativeSafeInteger(
+    value.oldBackendTreeProcessCountAfterCleanup,
+    'Smoke report native observation oldBackendTreeProcessCountAfterCleanup',
+  );
+  if (status === 'passed' && scenario === 'backend-retry' && after !== before + 1) {
+    fail('Smoke report backend-retry must advance exactly one backend generation');
+  }
+  if (status === 'passed' && scenario !== 'backend-retry' && after !== before) {
+    fail('Smoke report native observation generation must remain stable');
+  }
+  if (status === 'passed' && readyPidAfter !== rootAfter) {
+    fail('Smoke report native observation ready pid must match the owned backend root');
+  }
+  if (status === 'passed' && scenario === 'backend-retry'
+    && (rootAfter === rootBefore
+      || descendantsBefore.length === 0
+      || spawnCountAfter !== spawnCountBefore + 1
+      || oldTreeProcessCount !== 0)) {
+    fail('Smoke report backend retry must prove one spawn after complete old process-tree cleanup');
+  }
+  if (status === 'passed' && scenario !== 'backend-retry'
+    && (rootAfter !== rootBefore
+      || spawnCountAfter !== spawnCountBefore
+      || oldTreeProcessCount !== 0)) {
+    fail('Smoke report native observation backend process identity must remain stable');
+  }
+  return {
+    startupMode: value.startupMode,
+    documentLifecycleCount: value.documentLifecycleCount,
+    gatewayAuthority: gateway.authority,
+    backendAuthority: backend.authority,
+    backendGenerationBefore: before,
+    backendGenerationAfter: after,
+    backendRootPidBefore: rootBefore,
+    backendRootPidAfter: rootAfter,
+    backendReadyPidAfter: readyPidAfter,
+    backendDescendantPidsBefore: descendantsBefore,
+    backendSpawnCountBefore: spawnCountBefore,
+    backendSpawnCountAfter: spawnCountAfter,
+    oldBackendTreeProcessCountAfterCleanup: oldTreeProcessCount,
+  };
 }
 
 function validateDiagnostic(value, label) {
@@ -312,7 +473,7 @@ function validateReportTransitions(value, expectedActions, {
     const transition = transitions[index];
     const label = `${artifact} transition ${index}`;
     exactKeys(transition, TRANSITION_KEYS, label);
-    const actionIndex = SMOKE_ACTIONS.indexOf(transition.action);
+    const actionIndex = CANONICAL_SMOKE_ACTIONS.indexOf(transition.action);
     if (actionIndex < 0) {
       fail(`${label} has unsupported action`);
     }
@@ -382,8 +543,8 @@ export function validateSmokeSpec(value) {
   if (value.schema !== SMOKE_SCHEMAS.spec) {
     fail(`Smoke spec schema must be ${SMOKE_SCHEMAS.spec}`);
   }
-  if (value.version !== 1) {
-    fail('Smoke spec version must be 1');
+  if (value.version !== SMOKE_PROTOCOL_VERSION) {
+    fail(`Smoke spec version must be ${SMOKE_PROTOCOL_VERSION}`);
   }
 
   const scenario = enumValue(value.scenario, SMOKE_SCENARIOS, 'Smoke spec scenario');
@@ -417,8 +578,8 @@ export function validateSmokeProgress(value, expected) {
   if (value.schema !== SMOKE_SCHEMAS.progress) {
     fail(`Smoke progress schema must be ${SMOKE_SCHEMAS.progress}`);
   }
-  if (value.version !== 1) {
-    fail('Smoke progress version must be 1');
+  if (value.version !== SMOKE_PROTOCOL_VERSION) {
+    fail(`Smoke progress version must be ${SMOKE_PROTOCOL_VERSION}`);
   }
 
   const specSha256 = validateSha256(value.specSha256, 'Smoke progress specSha256');
@@ -460,8 +621,8 @@ export function validateSmokeReport(value, expected) {
   if (value.schema !== SMOKE_SCHEMAS.report) {
     fail(`Smoke report schema must be ${SMOKE_SCHEMAS.report}`);
   }
-  if (value.version !== 1) {
-    fail('Smoke report version must be 1');
+  if (value.version !== SMOKE_PROTOCOL_VERSION) {
+    fail(`Smoke report version must be ${SMOKE_PROTOCOL_VERSION}`);
   }
 
   const specSha256 = validateSha256(value.specSha256, 'Smoke report specSha256');
@@ -477,6 +638,7 @@ export function validateSmokeReport(value, expected) {
     fail('Smoke report status must be passed or failed');
   }
   const status = value.status;
+  const native = validateNativeObservations(value, scenario, status);
   const failurePhase = value.failurePhase;
   if (failurePhase !== null && !FAILURE_PHASES.includes(failurePhase)) {
     fail('Smoke report failurePhase must be null or a supported failure phase');
@@ -545,5 +707,6 @@ export function validateSmokeReport(value, expected) {
     durationMs,
     diagnostic,
     steps: transitions,
+    ...native,
   });
 }

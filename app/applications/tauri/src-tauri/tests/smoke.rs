@@ -9,8 +9,8 @@
 
 use ride_tauri::smoke::{
     CompleteRequest, FailurePhase, RecordStepRequest, SmokeAction, SmokeDiagnostic, SmokeMode,
-    SmokeProfile, SmokeProtocol, SmokeScenario, SmokeStepState, SmokeTerminalStatus,
-    SmokeUpdateResponse, SmokeUpdateStatus,
+    SmokeNativeObservations, SmokeProfile, SmokeProtocol, SmokeScenario, SmokeStepState,
+    SmokeTerminalStatus, SmokeUpdateResponse, SmokeUpdateStatus,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -57,7 +57,7 @@ impl Fixture {
     fn write_spec(&self, token: &str, overrides: Value) -> PathBuf {
         let mut spec = json!({
             "schema": "ride.tauri-packaged-smoke-spec",
-            "version": 1,
+            "version": 2,
             "scenario": "critical-file",
             "profile": "tauri-critical",
             "workspace": ".",
@@ -133,6 +133,34 @@ fn complete_passed(duration_ms: u64) -> CompleteRequest {
     }
 }
 
+fn native_observations(before: u64, after: u64) -> SmokeNativeObservations {
+    SmokeNativeObservations {
+        startup_mode: "rust-gateway".to_string(),
+        document_lifecycle_count: 1,
+        gateway_authority: "127.0.0.1:49152".to_string(),
+        backend_authority: "127.0.0.1:3000".to_string(),
+        backend_generation_before: before,
+        backend_generation_after: after,
+        backend_root_pid_before: 4_100,
+        backend_root_pid_after: 4_100,
+        backend_ready_pid_after: 4_100,
+        backend_descendant_pids_before: Vec::new(),
+        backend_spawn_count_before: 1,
+        backend_spawn_count_after: 1,
+        old_backend_tree_process_count_after_cleanup: 0,
+    }
+}
+
+fn backend_retry_native_observations(before: u64, after: u64) -> SmokeNativeObservations {
+    SmokeNativeObservations {
+        backend_root_pid_after: 4_200,
+        backend_ready_pid_after: 4_200,
+        backend_descendant_pids_before: vec![4_101],
+        backend_spawn_count_after: 2,
+        ..native_observations(before, after)
+    }
+}
+
 fn complete_actions_from(
     protocol: &SmokeProtocol,
     proof: &str,
@@ -183,6 +211,261 @@ fn smoke_protocol_is_disabled_when_all_environment_variables_are_absent() {
     assert_eq!(plan.mode, SmokeMode::Disabled);
     assert!(plan.plan.is_none());
     assert!(plan.diagnostic.is_none());
+}
+
+#[test]
+fn smoke_report_contains_strict_native_rust_gateway_observations() {
+    let fixture = Fixture::new();
+    let protocol = SmokeProtocol::from_environment(
+        &fixture.environment("native-observations-token", json!({})),
+        &fixture.root,
+    );
+    protocol.record_document_lifecycle("main");
+    protocol.record_document_lifecycle("theia-secondary-1");
+    let proof = active_session_proof(&protocol);
+    let duration_ms = complete_all_actions(&protocol, &proof);
+
+    protocol
+        .complete_with_observations(
+            &proof,
+            complete_passed(duration_ms),
+            native_observations(3, 3),
+        )
+        .expect("complete native smoke report");
+
+    let report: Value =
+        serde_json::from_slice(&fs::read(fixture.report_path()).expect("read native smoke report"))
+            .expect("parse native smoke report");
+    assert_eq!(report["startupMode"], "rust-gateway");
+    assert_eq!(report["documentLifecycleCount"], 1);
+    assert_eq!(report["gatewayAuthority"], "127.0.0.1:49152");
+    assert_eq!(report["backendAuthority"], "127.0.0.1:3000");
+    assert_eq!(report["backendGenerationBefore"], 3);
+    assert_eq!(report["backendGenerationAfter"], 3);
+    assert_eq!(report["backendRootPidBefore"], 4_100);
+    assert_eq!(report["backendRootPidAfter"], 4_100);
+    assert_eq!(report["backendReadyPidAfter"], 4_100);
+    assert_eq!(report["backendDescendantPidsBefore"], json!([]));
+    assert_eq!(report["backendSpawnCountBefore"], 1);
+    assert_eq!(report["backendSpawnCountAfter"], 1);
+    assert_eq!(report["oldBackendTreeProcessCountAfterCleanup"], 0);
+}
+
+#[test]
+fn smoke_rejects_invalid_or_unredacted_native_observations_before_publish() {
+    for invalid in [
+        SmokeNativeObservations {
+            startup_mode: "legacy-fallback".to_string(),
+            ..native_observations(1, 1)
+        },
+        SmokeNativeObservations {
+            document_lifecycle_count: 2,
+            ..native_observations(1, 1)
+        },
+        SmokeNativeObservations {
+            gateway_authority: "http://127.0.0.1:49152/private".to_string(),
+            ..native_observations(1, 1)
+        },
+        SmokeNativeObservations {
+            backend_authority: "127.0.0.1:49152".to_string(),
+            ..native_observations(1, 1)
+        },
+        SmokeNativeObservations {
+            backend_root_pid_before: 0,
+            ..native_observations(1, 1)
+        },
+        SmokeNativeObservations {
+            backend_ready_pid_after: 4_101,
+            ..native_observations(1, 1)
+        },
+        SmokeNativeObservations {
+            backend_descendant_pids_before: vec![4_100],
+            ..native_observations(1, 1)
+        },
+        SmokeNativeObservations {
+            backend_descendant_pids_before: vec![4_101, 4_101],
+            ..native_observations(1, 1)
+        },
+        SmokeNativeObservations {
+            backend_spawn_count_after: 2,
+            ..native_observations(1, 1)
+        },
+        SmokeNativeObservations {
+            old_backend_tree_process_count_after_cleanup: 1,
+            ..native_observations(1, 1)
+        },
+    ] {
+        let fixture = Fixture::new();
+        let protocol = SmokeProtocol::from_environment(
+            &fixture.environment("invalid-native-token", json!({})),
+            &fixture.root,
+        );
+        let proof = active_session_proof(&protocol);
+        let duration_ms = complete_all_actions(&protocol, &proof);
+        let progress = fs::read(fixture.report_path()).expect("read progress before rejection");
+        assert_eq!(
+            protocol
+                .complete_with_observations(&proof, complete_passed(duration_ms), invalid)
+                .expect_err("invalid native observation is rejected"),
+            ride_tauri::smoke::SmokeError {
+                code: "smoke-request-rejected",
+                message: "Smoke protocol request was rejected.",
+            }
+        );
+        assert_eq!(
+            fs::read(fixture.report_path()).expect("read progress after rejection"),
+            progress,
+        );
+    }
+}
+
+#[test]
+fn invalid_completion_does_not_bind_native_observations_before_atomic_publish() {
+    let fixture = Fixture::new();
+    let protocol = SmokeProtocol::from_environment(
+        &fixture.environment("native-observation-rollback-token", json!({})),
+        &fixture.root,
+    );
+    let proof = active_session_proof(&protocol);
+    let duration_ms = complete_all_actions(&protocol, &proof);
+    let invalid = CompleteRequest {
+        duration_ms: 0,
+        ..complete_passed(duration_ms)
+    };
+    assert!(protocol
+        .complete_with_observations(&proof, invalid, native_observations(1, 1))
+        .is_err());
+
+    let replacement = SmokeNativeObservations {
+        gateway_authority: "127.0.0.1:49153".to_string(),
+        backend_generation_before: 2,
+        backend_generation_after: 2,
+        ..native_observations(1, 1)
+    };
+    protocol
+        .complete_with_observations(&proof, complete_passed(duration_ms), replacement)
+        .expect("valid completion can replace observations rejected before publish");
+    let report: Value = serde_json::from_slice(
+        &fs::read(fixture.report_path()).expect("read atomic completion report"),
+    )
+    .expect("parse atomic completion report");
+    assert_eq!(report["gatewayAuthority"], "127.0.0.1:49153");
+    assert_eq!(report["backendGenerationBefore"], 2);
+}
+
+#[test]
+fn backend_retry_uses_a_dedicated_native_observed_action_and_exactly_one_generation() {
+    let fixture = Fixture::new();
+    let protocol = SmokeProtocol::from_environment(
+        &fixture.environment(
+            "backend-retry-token",
+            json!({
+                "scenario": "backend-retry",
+                "files": [],
+                "actions": ["backend-retry"]
+            }),
+        ),
+        &fixture.root,
+    );
+    let plan_response = protocol.plan();
+    let proof = plan_response
+        .session_proof
+        .expect("backend retry session proof");
+    let plan = plan_response.plan.expect("backend retry frontend plan");
+    assert_eq!(plan.scenario, SmokeScenario::BackendRetry);
+    assert_eq!(plan.actions, [SmokeAction::BackendRetry]);
+    assert!(protocol
+        .record_step(
+            &proof,
+            step(SmokeAction::BackendRetry, SmokeStepState::Started, 0),
+        )
+        .is_err());
+    assert!(protocol
+        .record_backend_retry_step(
+            "wrong-proof",
+            step(SmokeAction::BackendRetry, SmokeStepState::Started, 0),
+            9,
+        )
+        .is_err());
+    protocol
+        .record_backend_retry_step(
+            &proof,
+            step(SmokeAction::BackendRetry, SmokeStepState::Started, 0),
+            9,
+        )
+        .expect("capture authenticated generation before the product retry action");
+    assert!(protocol
+        .record_backend_retry_step(
+            &proof,
+            step(SmokeAction::BackendRetry, SmokeStepState::Passed, 1),
+            9,
+        )
+        .is_err());
+    protocol
+        .record_backend_retry_step(
+            &proof,
+            step(SmokeAction::BackendRetry, SmokeStepState::Passed, 1),
+            10,
+        )
+        .expect("capture authenticated generation after the product retry action");
+    let duration_ms = 1;
+
+    assert!(protocol
+        .complete(&proof, complete_passed(duration_ms))
+        .is_err());
+
+    assert!(protocol
+        .complete_with_observations(
+            &proof,
+            complete_passed(duration_ms),
+            native_observations(9, 9),
+        )
+        .is_err());
+
+    for invalid in [
+        SmokeNativeObservations {
+            backend_root_pid_after: 4_100,
+            backend_ready_pid_after: 4_100,
+            ..backend_retry_native_observations(9, 10)
+        },
+        SmokeNativeObservations {
+            backend_descendant_pids_before: Vec::new(),
+            ..backend_retry_native_observations(9, 10)
+        },
+        SmokeNativeObservations {
+            backend_spawn_count_after: 3,
+            ..backend_retry_native_observations(9, 10)
+        },
+        SmokeNativeObservations {
+            old_backend_tree_process_count_after_cleanup: 1,
+            ..backend_retry_native_observations(9, 10)
+        },
+    ] {
+        assert!(protocol
+            .complete_with_observations(&proof, complete_passed(duration_ms), invalid)
+            .is_err());
+    }
+    protocol
+        .complete_with_observations(
+            &proof,
+            complete_passed(duration_ms),
+            backend_retry_native_observations(9, 10),
+        )
+        .expect("one backend retry generation is accepted");
+    let report: Value = serde_json::from_slice(
+        &fs::read(fixture.report_path()).expect("read backend retry report"),
+    )
+    .expect("parse backend retry report");
+    assert_eq!(report["scenario"], "backend-retry");
+    assert_eq!(report["backendGenerationBefore"], 9);
+    assert_eq!(report["backendGenerationAfter"], 10);
+    assert_eq!(report["backendRootPidBefore"], 4_100);
+    assert_eq!(report["backendRootPidAfter"], 4_200);
+    assert_eq!(report["backendReadyPidAfter"], 4_200);
+    assert_eq!(report["backendDescendantPidsBefore"], json!([4_101]));
+    assert_eq!(report["backendSpawnCountBefore"], 1);
+    assert_eq!(report["backendSpawnCountAfter"], 2);
+    assert_eq!(report["oldBackendTreeProcessCountAfterCleanup"], 0);
 }
 
 #[test]
@@ -412,6 +695,7 @@ fn smoke_protocol_matches_node_contract_constants_and_rejects_non_parity_fixture
             SmokeScenario::CriticalFile,
             SmokeScenario::CriticalEmpty,
             SmokeScenario::FullFile,
+            SmokeScenario::BackendRetry,
         ]
     );
     assert_eq!(
@@ -462,6 +746,12 @@ fn smoke_protocol_matches_node_contract_constants_and_rejects_non_parity_fixture
                 "second-file-forwarding"
             ]),
         ),
+        (
+            "backend-retry",
+            "tauri-critical",
+            json!([]),
+            json!(["backend-retry"]),
+        ),
     ] {
         let fixture = Fixture::new();
         let protocol = SmokeProtocol::from_environment(
@@ -481,7 +771,7 @@ fn smoke_protocol_matches_node_contract_constants_and_rejects_non_parity_fixture
 
     for invalid in [
         json!({ "schema": "ride.tauri-packaged-smoke-spec@1" }),
-        json!({ "version": 2 }),
+        json!({ "version": 1 }),
         json!({ "scenario": "unknown" }),
         json!({ "profile": "unknown" }),
         json!({ "workspace": "../outside" }),
@@ -1008,7 +1298,7 @@ fn smoke_protocol_persists_only_bounded_closed_atomic_terminal_reports() {
     assert!(bytes.len() < 4 * 1024 * 1024);
     let report: Value = serde_json::from_slice(&bytes).expect("parse smoke report");
     assert_eq!(report["schema"], "ride.tauri-packaged-smoke");
-    assert_eq!(report["version"], 1);
+    assert_eq!(report["version"], 2);
     assert_eq!(report["specSha256"], expected_spec_sha);
     assert_eq!(report["status"], "passed");
     assert_eq!(report["failurePhase"], Value::Null);
@@ -1765,7 +2055,7 @@ fn temporary_report_count(parent: &Path) -> usize {
 fn smoke_spec_value(token: &str, overrides: Value) -> Value {
     let mut value = json!({
         "schema": "ride.tauri-packaged-smoke-spec",
-        "version": 1,
+        "version": 2,
         "scenario": "critical-file",
         "profile": "tauri-critical",
         "workspace": ".",
@@ -2071,6 +2361,14 @@ fn smoke_rust_and_node_spec_acceptance_matches() {
             }),
         ),
         smoke_spec_value(token, json!({ "scenario": "full-file", "profile": "full" })),
+        smoke_spec_value(
+            token,
+            json!({
+                "scenario": "backend-retry",
+                "files": [],
+                "actions": ["backend-retry"]
+            }),
+        ),
         smoke_spec_value(token, json!({ "profile": "full" })),
         smoke_spec_value(token, json!({ "files": [] })),
         smoke_spec_value(
@@ -2120,8 +2418,8 @@ fn smoke_rust_and_node_spec_acceptance_matches() {
     assert_eq!(
         rust,
         [
-            true, true, true, false, false, false, false, false, false, false, false, false, false,
-            false, false, false
+            true, true, true, true, false, false, false, false, false, false, false, false, false,
+            false, false, false, false
         ]
     );
 }

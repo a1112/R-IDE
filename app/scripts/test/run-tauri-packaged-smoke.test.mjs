@@ -36,6 +36,48 @@ const digest = 'a'.repeat(64);
 const RUST_PLATFORM = { win32: 'windows', darwin: 'macos', linux: 'linux' }[process.platform];
 const RUST_ARCH = { x64: 'x86_64', arm64: 'aarch64' }[process.arch];
 
+const NATIVE_OBSERVATIONS = Object.freeze({
+  startupMode: 'rust-gateway',
+  documentLifecycleCount: 1,
+  gatewayAuthority: '127.0.0.1:49152',
+  backendAuthority: '127.0.0.1:3000',
+  backendGenerationBefore: 1,
+  backendGenerationAfter: 1,
+  backendRootPidBefore: 4100,
+  backendRootPidAfter: 4100,
+  backendReadyPidAfter: 4100,
+  backendDescendantPidsBefore: [],
+  backendSpawnCountBefore: 1,
+  backendSpawnCountAfter: 1,
+  oldBackendTreeProcessCountAfterCleanup: 0,
+});
+
+function startupReport(overrides = {}) {
+  return {
+    schema: 'ride.startup-report',
+    version: 2,
+    platform: RUST_PLATFORM,
+    arch: RUST_ARCH,
+    pid: 10,
+    startupMode: 'rust-gateway',
+    milestones: {
+      process_started: 0,
+      gateway_listening: 1,
+      native_window_visible: 2,
+      frontend_request_started: 1,
+      frontend_bundle_loaded: 3,
+      backend_spawned: 1,
+      backend_listening: 2,
+      rpc_connected: 3,
+      frontend_shell_attached: 4,
+      target_file_opened: 5,
+      plugins_started: 6,
+      plugins_ready: 7,
+    },
+    ...overrides,
+  };
+}
+
 function transitionSteps({ forwardingStarted = false } = {}) {
   const steps = [];
   for (const [index, action] of SMOKE_ACTIONS.entries()) {
@@ -52,7 +94,7 @@ function progress() {
   const steps = transitionSteps({ forwardingStarted: true });
   return {
     schema: 'ride.tauri-packaged-smoke-progress',
-    version: 1,
+    version: 2,
     specSha256: digest,
     scenario: 'critical-file',
     profile: 'tauri-critical',
@@ -65,7 +107,7 @@ function report(overrides = {}) {
   const steps = transitionSteps();
   return {
     schema: 'ride.tauri-packaged-smoke',
-    version: 1,
+    version: 2,
     specSha256: digest,
     scenario: 'critical-file',
     profile: 'tauri-critical',
@@ -74,6 +116,7 @@ function report(overrides = {}) {
     durationMs: steps.at(-1).durationMs,
     diagnostic: null,
     steps,
+    ...NATIVE_OBSERVATIONS,
     ...overrides,
   };
 }
@@ -109,6 +152,10 @@ function fixtureDependencies(events, overrides = {}) {
     waitForForwardingStarted: async () => { events.push('wait-forwarding-started'); return progress(); },
     waitForInstanceExit: async instance => { events.push(`wait-${instance.kind}-exit`); },
     waitForFinalReport: async () => { events.push('wait-final'); return report(); },
+    waitForStartupFinalReport: async () => {
+      events.push('wait-startup-final');
+      return startupReport();
+    },
     requestGracefulClose: async () => { events.push('graceful-close'); },
     cleanupInstances: async () => { events.push('verify-cleanup'); },
     validateLogs: async () => { events.push('validate-logs'); },
@@ -132,6 +179,7 @@ test('orchestration follows the exact two-instance packaged smoke order', async 
     'launch-second',
     'wait-second-exit',
     'wait-final',
+    'wait-startup-final',
     'graceful-close',
     'wait-first-exit',
     'verify-cleanup',
@@ -461,7 +509,7 @@ function writeStartupFixture(file, exitCode, linger = false) {
   fs.writeFileSync(file, [
     'const fs = require(\'node:fs\');',
     'const report = {',
-    "  schema: 'ride.startup-report', version: 1,",
+    "  schema: 'ride.startup-report', version: 2, startupMode: 'rust-gateway',",
     `  platform: '${RUST_PLATFORM}', arch: '${RUST_ARCH}', pid: process.pid,`,
     '  milestones: { process_started: 0 },',
     '};',
@@ -1035,6 +1083,7 @@ test('successful orchestration removes its real temporary workspace', async () =
         ...report(),
         specSha256: run.context.specSha256,
       }),
+      waitForStartupFinalReport: async () => startupReport(),
       requestGracefulClose: async () => undefined,
       cleanupInstances: async () => undefined,
       validateLogs: async () => undefined,
@@ -1111,6 +1160,10 @@ test('CLI parser accepts only strict packaged smoke options', () => {
   assert.throws(() => parsePackagedSmokeArguments(['--scenario', 'unknown']), /scenario/i);
   assert.throws(() => parsePackagedSmokeArguments(['--scenario', 'critical-file', '--wat']), /unknown/i);
   assert.throws(() => parsePackagedSmokeArguments(['--scenario', 'critical-file', '--timeout-ms', '0']), /timeout/i);
+  assert.equal(
+    parsePackagedSmokeArguments(['--scenario', 'backend-retry']).scenario,
+    'backend-retry',
+  );
 });
 
 test('CLI rejects unknown Windows and POSIX absolute arguments without echoing them', () => {
@@ -1177,7 +1230,7 @@ test('critical-empty launches no file or forwarding instance and proves shell pl
       events.push('wait-final');
       return {
         schema: 'ride.tauri-packaged-smoke',
-        version: 1,
+        version: 2,
         specSha256: digest,
         scenario: 'critical-empty',
         profile: 'tauri-critical',
@@ -1186,6 +1239,7 @@ test('critical-empty launches no file or forwarding instance and proves shell pl
         durationMs: steps.at(-1).durationMs,
         diagnostic: null,
         steps,
+        ...NATIVE_OBSERVATIONS,
       };
     },
   });
@@ -1196,6 +1250,7 @@ test('critical-empty launches no file or forwarding instance and proves shell pl
     'create',
     'launch-first',
     'wait-final',
+    'wait-startup-final',
     'graceful-close',
     'wait-first-exit',
     'verify-cleanup',
@@ -1278,6 +1333,7 @@ test('full-file requires the full run context and preserves two-instance orchest
     'launch-second',
     'wait-second-exit',
     'wait-final',
+    'wait-startup-final',
     'graceful-close',
     'wait-first-exit',
     'verify-cleanup',
@@ -1307,13 +1363,75 @@ test('runner rejects a run context that weakens its requested scenario before la
   assert.deepEqual(events, ['create', 'temp-cleanup']);
 });
 
-test('scenario artifacts bind critical-empty and full-file to exact plans', async () => {
+test('backend-retry runner contract accepts only the dedicated action and native transition', async () => {
+  const events = [];
+  const actions = ['backend-retry'];
+  const retryRun = {
+    ...fixtureRun(),
+    files: [],
+    absoluteFiles: [],
+    context: {
+      specSha256: digest,
+      scenario: 'backend-retry',
+      profile: 'tauri-critical',
+      actions,
+    },
+  };
+  const steps = actions.flatMap((action, index) => [
+    { action, state: 'started', durationMs: index * 2, diagnostic: null },
+    { action, state: 'passed', durationMs: index * 2 + 1, diagnostic: null },
+  ]);
+  const dependencies = fixtureDependencies(events, {
+    createRun: async () => { events.push('create'); return retryRun; },
+    waitForFinalReport: async () => {
+      events.push('wait-final');
+      return report({
+        scenario: 'backend-retry',
+        durationMs: steps.at(-1).durationMs,
+        steps,
+        backendGenerationBefore: 4,
+        backendGenerationAfter: 5,
+        backendRootPidBefore: 4100,
+        backendRootPidAfter: 4200,
+        backendReadyPidAfter: 4200,
+        backendDescendantPidsBefore: [4101],
+        backendSpawnCountBefore: 1,
+        backendSpawnCountAfter: 2,
+        oldBackendTreeProcessCountAfterCleanup: 0,
+      });
+    },
+  });
+
+  const result = await runPackagedSmoke(
+    { scenario: 'backend-retry', timeoutMs: 30_000 },
+    dependencies,
+  );
+  assert.equal(result.backendGenerationAfter, 5);
+  assert.equal(events.includes('launch-second'), false);
+  assert.equal(events.includes('wait-startup-final'), true);
+});
+
+test('runner rejects non-rust or incomplete v2 startup reports', async () => {
+  for (const badReport of [
+    startupReport({ startupMode: 'legacy-fallback' }),
+    startupReport({ milestones: { process_started: 0 } }),
+  ]) {
+    await assert.rejects(
+      runPackagedSmoke(options, fixtureDependencies([], {
+        waitForStartupFinalReport: async () => badReport,
+      })),
+      /rust-gateway|final milestones/i,
+    );
+  }
+});
+
+test('scenario artifacts bind critical-empty, full-file, and backend-retry to exact plans', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ride-smoke-scenarios-'));
   const executable = path.join(root, 'R-IDE.exe');
   fs.writeFileSync(executable, 'fixture');
   const runs = [];
   try {
-    for (const scenario of ['critical-empty', 'full-file']) {
+    for (const scenario of ['critical-empty', 'full-file', 'backend-retry']) {
       runs.push(await createSmokeRunArtifacts({
         executable,
         scenario,
@@ -1323,13 +1441,17 @@ test('scenario artifacts bind critical-empty and full-file to exact plans', asyn
         sourceEnvironment: { PATH: process.env.PATH ?? '' },
       }));
     }
-    const [empty, full] = runs.map(run => JSON.parse(fs.readFileSync(run.specPath, 'utf8')));
+    const [empty, full, retry] = runs.map(run => JSON.parse(fs.readFileSync(run.specPath, 'utf8')));
     assert.deepEqual(empty.files, []);
     assert.deepEqual(empty.actions, ['terminal-sentinel', 'packaged-plugin-command']);
     assert.equal(empty.profile, 'tauri-critical');
     assert.deepEqual(full.files, ['first.R', 'second.R']);
     assert.deepEqual(full.actions, [...SMOKE_ACTIONS]);
     assert.equal(full.profile, 'full');
+    assert.equal(retry.scenario, 'backend-retry');
+    assert.deepEqual(retry.files, []);
+    assert.deepEqual(retry.actions, ['backend-retry']);
+    assert.equal(retry.profile, 'tauri-critical');
   } finally {
     for (const run of runs) {
       fs.rmSync(run.runRoot, { recursive: true, force: true });

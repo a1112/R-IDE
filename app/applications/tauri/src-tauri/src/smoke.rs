@@ -16,7 +16,9 @@ use std::fmt;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 const SPEC_ENV: &str = "RIDE_TAURI_SMOKE_SPEC";
 const REPORT_ENV: &str = "RIDE_TAURI_SMOKE_REPORT";
@@ -25,12 +27,13 @@ pub(crate) const SMOKE_ENV_NAMES: [&str; 3] = [SPEC_ENV, REPORT_ENV, TOKEN_ENV];
 const SPEC_SCHEMA: &str = "ride.tauri-packaged-smoke-spec";
 const PROGRESS_SCHEMA: &str = "ride.tauri-packaged-smoke-progress";
 const REPORT_SCHEMA: &str = "ride.tauri-packaged-smoke";
-const PROTOCOL_VERSION: u32 = 1;
+const PROTOCOL_VERSION: u32 = 2;
 const MAX_SPEC_BYTES: u64 = 1024 * 1024;
 const MAX_REPORT_BYTES: u64 = 4 * 1024 * 1024;
 const MIN_ACTION_TIMEOUT_MS: u64 = 1_000;
 const MAX_ACTION_TIMEOUT_MS: u64 = 300_000;
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+const MAX_BACKEND_DESCENDANT_PIDS: usize = 64;
 #[cfg(windows)]
 const WINDOWS_REPLACE_RETRY_LIMIT: std::time::Duration = std::time::Duration::from_millis(250);
 #[cfg(windows)]
@@ -42,10 +45,16 @@ pub enum SmokeScenario {
     CriticalFile,
     CriticalEmpty,
     FullFile,
+    BackendRetry,
 }
 
 impl SmokeScenario {
-    pub const ALL: [Self; 3] = [Self::CriticalFile, Self::CriticalEmpty, Self::FullFile];
+    pub const ALL: [Self; 4] = [
+        Self::CriticalFile,
+        Self::CriticalEmpty,
+        Self::FullFile,
+        Self::BackendRetry,
+    ];
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -65,6 +74,7 @@ pub enum SmokeAction {
     PackagedPluginCommand,
     SecondaryWindow,
     SecondFileForwarding,
+    BackendRetry,
 }
 
 impl SmokeAction {
@@ -79,10 +89,13 @@ impl SmokeAction {
     ];
 
     fn index(self) -> usize {
-        Self::ALL
-            .iter()
-            .position(|candidate| *candidate == self)
-            .expect("all smoke actions have a canonical index")
+        match self {
+            Self::BackendRetry => Self::ALL.len(),
+            action => Self::ALL
+                .iter()
+                .position(|candidate| *candidate == action)
+                .expect("all smoke actions have a canonical index"),
+        }
     }
 }
 
@@ -98,6 +111,7 @@ impl SmokeScenario {
             SmokeAction::TerminalSentinel,
             SmokeAction::PackagedPluginCommand,
         ];
+        const BACKEND_RETRY_ACTIONS: [SmokeAction; 1] = [SmokeAction::BackendRetry];
         match self {
             Self::CriticalFile => SmokeScenarioRequirements {
                 profile: SmokeProfile::TauriCritical,
@@ -113,6 +127,11 @@ impl SmokeScenario {
                 profile: SmokeProfile::Full,
                 file_count: 2,
                 actions: &SmokeAction::ALL,
+            },
+            Self::BackendRetry => SmokeScenarioRequirements {
+                profile: SmokeProfile::TauriCritical,
+                file_count: 0,
+                actions: &BACKEND_RETRY_ACTIONS,
             },
         }
     }
@@ -250,6 +269,24 @@ pub struct SmokeUpdateResponse {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SmokeNativeObservations {
+    pub startup_mode: String,
+    pub document_lifecycle_count: u64,
+    pub gateway_authority: String,
+    pub backend_authority: String,
+    pub backend_generation_before: u64,
+    pub backend_generation_after: u64,
+    pub backend_root_pid_before: u64,
+    pub backend_root_pid_after: u64,
+    pub backend_ready_pid_after: u64,
+    pub backend_descendant_pids_before: Vec<u64>,
+    pub backend_spawn_count_before: u64,
+    pub backend_spawn_count_after: u64,
+    pub old_backend_tree_process_count_after_cleanup: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct SmokeError {
     pub code: &'static str,
     pub message: &'static str,
@@ -315,6 +352,8 @@ struct SmokeReport {
     duration_ms: u64,
     diagnostic: Option<SmokeDiagnostic>,
     steps: Vec<SmokeTransition>,
+    #[serde(flatten)]
+    native: SmokeNativeObservations,
 }
 
 #[derive(Debug, Serialize)]
@@ -343,6 +382,15 @@ struct ActiveProtocol {
     action_failure: Option<SmokeDiagnostic>,
     terminal: bool,
     completion: Option<(CompleteRequest, SmokeUpdateResponse)>,
+    native_observations: Option<SmokeNativeObservations>,
+    backend_retry_generation_before: Option<u64>,
+    backend_retry_generation_after: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+struct BackendRetryProcessObservation {
+    crash: crate::sidecar::BackendRootCrashEvidence,
+    spawn_count_before: u64,
 }
 
 enum ProtocolState {
@@ -353,6 +401,9 @@ enum ProtocolState {
 
 pub struct SmokeProtocol {
     state: Mutex<ProtocolState>,
+    backend_retry_process: Mutex<Option<BackendRetryProcessObservation>>,
+    document_lifecycle_count: AtomicU64,
+    completion_gate: tokio::sync::Mutex<()>,
 }
 
 impl fmt::Debug for SmokeProtocol {
@@ -433,6 +484,9 @@ impl SmokeProtocol {
         ) {
             Ok(active) => Self {
                 state: Mutex::new(ProtocolState::Active(Box::new(active))),
+                backend_retry_process: Mutex::new(None),
+                document_lifecycle_count: AtomicU64::new(0),
+                completion_gate: tokio::sync::Mutex::new(()),
             },
             Err(()) => Self::rejected(),
         }
@@ -441,13 +495,68 @@ impl SmokeProtocol {
     fn rejected() -> Self {
         Self {
             state: Mutex::new(ProtocolState::Rejected),
+            backend_retry_process: Mutex::new(None),
+            document_lifecycle_count: AtomicU64::new(0),
+            completion_gate: tokio::sync::Mutex::new(()),
         }
     }
 
     fn disabled() -> Self {
         Self {
             state: Mutex::new(ProtocolState::Disabled),
+            backend_retry_process: Mutex::new(None),
+            document_lifecycle_count: AtomicU64::new(0),
+            completion_gate: tokio::sync::Mutex::new(()),
         }
+    }
+
+    pub fn record_document_lifecycle(&self, window_label: &str) {
+        if window_label == "main" {
+            let _ = self.document_lifecycle_count.fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |count| Some(count.saturating_add(1).min(MAX_SAFE_INTEGER)),
+            );
+        }
+    }
+
+    fn document_lifecycle_count(&self) -> u64 {
+        self.document_lifecycle_count.load(Ordering::Acquire)
+    }
+
+    fn has_backend_retry_process_observation(&self) -> Result<bool, SmokeError> {
+        self.backend_retry_process
+            .lock()
+            .map(|observation| observation.is_some())
+            .map_err(|_| SmokeError::rejected())
+    }
+
+    fn record_backend_retry_process_observation(
+        &self,
+        crash: crate::sidecar::BackendRootCrashEvidence,
+        spawn_count_before: u64,
+    ) -> Result<(), SmokeError> {
+        let mut observation = self
+            .backend_retry_process
+            .lock()
+            .map_err(|_| SmokeError::rejected())?;
+        if observation.is_some() {
+            return Err(SmokeError::rejected());
+        }
+        *observation = Some(BackendRetryProcessObservation {
+            crash,
+            spawn_count_before,
+        });
+        Ok(())
+    }
+
+    fn backend_retry_process_observation(
+        &self,
+    ) -> Result<Option<BackendRetryProcessObservation>, SmokeError> {
+        self.backend_retry_process
+            .lock()
+            .map(|observation| observation.clone())
+            .map_err(|_| SmokeError::rejected())
     }
 
     pub fn plan(&self) -> SmokePlanResponse {
@@ -516,22 +625,23 @@ impl SmokeProtocol {
         session_proof: &str,
         request: RecordStepRequest,
     ) -> Result<SmokeUpdateResponse, SmokeError> {
-        let mut state = self.state.lock().map_err(|_| SmokeError::rejected())?;
-        let active = match &mut *state {
-            ProtocolState::Disabled => return Ok(disabled_update()),
-            ProtocolState::Rejected => return Ok(rejected_update()),
-            ProtocolState::Active(active) => active,
-        };
-        if !constant_time_proof_matches(&active.session_proof, session_proof) {
-            return Err(SmokeError::rejected());
-        }
-        record_step_active(active, request)
+        self.record_step_with_backend_generation(session_proof, request, None)
     }
 
-    pub fn complete(
+    pub fn record_backend_retry_step(
         &self,
         session_proof: &str,
-        request: CompleteRequest,
+        request: RecordStepRequest,
+        observed_generation: u64,
+    ) -> Result<SmokeUpdateResponse, SmokeError> {
+        self.record_step_with_backend_generation(session_proof, request, Some(observed_generation))
+    }
+
+    fn record_step_with_backend_generation(
+        &self,
+        session_proof: &str,
+        request: RecordStepRequest,
+        observed_generation: Option<u64>,
     ) -> Result<SmokeUpdateResponse, SmokeError> {
         let mut state = self.state.lock().map_err(|_| SmokeError::rejected())?;
         let active = match &mut *state {
@@ -542,7 +652,129 @@ impl SmokeProtocol {
         if !constant_time_proof_matches(&active.session_proof, session_proof) {
             return Err(SmokeError::rejected());
         }
-        complete_active(active, request)
+        record_step_active(active, request, observed_generation)
+    }
+
+    #[doc(hidden)]
+    /// Direct protocol-test compatibility path. The Tauri production command collects native
+    /// observations independently and never calls this method.
+    pub fn complete(
+        &self,
+        session_proof: &str,
+        request: CompleteRequest,
+    ) -> Result<SmokeUpdateResponse, SmokeError> {
+        let observations = self.test_harness_observations(session_proof)?;
+        self.complete_with_observations(session_proof, request, observations)
+    }
+
+    pub fn complete_with_observations(
+        &self,
+        session_proof: &str,
+        request: CompleteRequest,
+        observations: SmokeNativeObservations,
+    ) -> Result<SmokeUpdateResponse, SmokeError> {
+        let mut state = self.state.lock().map_err(|_| SmokeError::rejected())?;
+        let active = match &mut *state {
+            ProtocolState::Disabled => return Ok(disabled_update()),
+            ProtocolState::Rejected => return Ok(rejected_update()),
+            ProtocolState::Active(active) => active,
+        };
+        if !constant_time_proof_matches(&active.session_proof, session_proof) {
+            return Err(SmokeError::rejected());
+        }
+        if active.completion.is_none() {
+            validate_new_completion(active, &request)?;
+        }
+        validate_native_observations(active.plan.scenario, request.status, &observations)?;
+        match active.native_observations.as_ref() {
+            Some(recorded) if recorded != &observations => return Err(SmokeError::rejected()),
+            Some(_) => {}
+            None => {}
+        }
+        complete_active(active, request, observations)
+    }
+
+    // Direct protocol tests use stable observations. Backend-retry cannot pass through this helper
+    // because it never fabricates a generation change.
+    fn test_harness_observations(
+        &self,
+        session_proof: &str,
+    ) -> Result<SmokeNativeObservations, SmokeError> {
+        let state = self.state.lock().map_err(|_| SmokeError::rejected())?;
+        let ProtocolState::Active(active) = &*state else {
+            return Ok(test_harness_native_observations());
+        };
+        if !constant_time_proof_matches(&active.session_proof, session_proof) {
+            return Err(SmokeError::rejected());
+        }
+        if let Some(observations) = active.native_observations.as_ref() {
+            return Ok(observations.clone());
+        }
+        Ok(test_harness_native_observations())
+    }
+
+    fn prepare_complete_command(
+        &self,
+        value: serde_json::Value,
+    ) -> Result<PreparedCompletion, SmokeError> {
+        let envelope = serde_json::from_value::<SmokeCommandEnvelope<CompleteRequest>>(value)
+            .map_err(|_| SmokeError::rejected())?;
+        let state = self.state.lock().map_err(|_| SmokeError::rejected())?;
+        let active = match &*state {
+            ProtocolState::Active(active) => active,
+            ProtocolState::Disabled | ProtocolState::Rejected => return Err(SmokeError::rejected()),
+        };
+        if !constant_time_proof_matches(&active.session_proof, &envelope.session_proof) {
+            return Err(SmokeError::rejected());
+        }
+        if let Some((completed_request, _)) = active.completion.as_ref() {
+            if completed_request != &envelope.request {
+                return Err(SmokeError::rejected());
+            }
+        } else {
+            validate_new_completion(active, &envelope.request)?;
+        }
+        Ok(PreparedCompletion {
+            session_proof: envelope.session_proof,
+            request: envelope.request,
+            scenario: active.plan.scenario,
+            observations: active.native_observations.clone(),
+            backend_retry_generation_before: active.backend_retry_generation_before,
+            backend_retry_generation_after: active.backend_retry_generation_after,
+        })
+    }
+
+    fn prepare_record_step_command(
+        &self,
+        value: serde_json::Value,
+    ) -> Result<PreparedStep, SmokeError> {
+        let envelope = serde_json::from_value::<SmokeCommandEnvelope<RecordStepRequest>>(value)
+            .map_err(|_| SmokeError::rejected())?;
+        let state = self.state.lock().map_err(|_| SmokeError::rejected())?;
+        let ProtocolState::Active(active) = &*state else {
+            return Err(SmokeError::rejected());
+        };
+        if !constant_time_proof_matches(&active.session_proof, &envelope.session_proof) {
+            return Err(SmokeError::rejected());
+        }
+        let is_replay = active.last_record_request.as_ref() == Some(&envelope.request);
+        let recorded_generation =
+            if is_replay && envelope.request.action == SmokeAction::BackendRetry {
+                match envelope.request.state {
+                    SmokeStepState::Started => active.backend_retry_generation_before,
+                    SmokeStepState::Passed | SmokeStepState::Failed => {
+                        active.backend_retry_generation_after
+                    }
+                }
+            } else {
+                None
+            };
+        Ok(PreparedStep {
+            session_proof: envelope.session_proof,
+            request: envelope.request,
+            is_replay,
+            recorded_generation,
+        })
     }
 
     fn non_active_update(&self) -> Result<Option<SmokeUpdateResponse>, SmokeError> {
@@ -558,11 +790,24 @@ impl SmokeProtocol {
 fn record_step_active(
     active: &mut ActiveProtocol,
     request: RecordStepRequest,
+    observed_generation: Option<u64>,
 ) -> Result<SmokeUpdateResponse, SmokeError> {
     if active.terminal {
         return Err(SmokeError::rejected());
     }
     if active.last_record_request.as_ref() == Some(&request) {
+        let recorded_generation = match request.state {
+            SmokeStepState::Started => active.backend_retry_generation_before,
+            SmokeStepState::Passed | SmokeStepState::Failed => {
+                active.backend_retry_generation_after
+            }
+        };
+        if (request.action == SmokeAction::BackendRetry
+            && recorded_generation != observed_generation)
+            || (request.action != SmokeAction::BackendRetry && observed_generation.is_some())
+        {
+            return Err(SmokeError::rejected());
+        }
         return active
             .last_record_response
             .clone()
@@ -582,6 +827,8 @@ fn record_step_active(
     let mut next_action = active.next_action;
     let mut pending_action = active.pending_action;
     let mut action_failure = active.action_failure.clone();
+    let mut backend_retry_generation_before = active.backend_retry_generation_before;
+    let mut backend_retry_generation_after = active.backend_retry_generation_after;
     match request.state {
         SmokeStepState::Started => {
             if request.diagnostic.is_some()
@@ -590,10 +837,33 @@ fn record_step_active(
             {
                 return Err(SmokeError::rejected());
             }
+            if request.action == SmokeAction::BackendRetry {
+                let generation = validate_observed_generation(observed_generation)?;
+                if active.plan.scenario != SmokeScenario::BackendRetry
+                    || backend_retry_generation_before.is_some()
+                    || backend_retry_generation_after.is_some()
+                {
+                    return Err(SmokeError::rejected());
+                }
+                backend_retry_generation_before = Some(generation);
+            } else if observed_generation.is_some() {
+                return Err(SmokeError::rejected());
+            }
             pending_action = Some(request.action);
         }
         SmokeStepState::Passed => {
             if request.diagnostic.is_some() || pending_action != Some(request.action) {
+                return Err(SmokeError::rejected());
+            }
+            if request.action == SmokeAction::BackendRetry {
+                let generation = validate_observed_generation(observed_generation)?;
+                let expected =
+                    backend_retry_generation_before.and_then(|before| before.checked_add(1));
+                if backend_retry_generation_after.is_some() || expected != Some(generation) {
+                    return Err(SmokeError::rejected());
+                }
+                backend_retry_generation_after = Some(generation);
+            } else if observed_generation.is_some() {
                 return Err(SmokeError::rejected());
             }
             pending_action = None;
@@ -607,6 +877,17 @@ fn record_step_active(
                 || !diagnostic.is_exact_catalog_entry()
                 || !matches!(diagnostic.code.as_str(), "action-failed" | "action-timeout")
             {
+                return Err(SmokeError::rejected());
+            }
+            if request.action == SmokeAction::BackendRetry {
+                let generation = validate_observed_generation(observed_generation)?;
+                if backend_retry_generation_before.is_none()
+                    || backend_retry_generation_after.is_some()
+                {
+                    return Err(SmokeError::rejected());
+                }
+                backend_retry_generation_after = Some(generation);
+            } else if observed_generation.is_some() {
                 return Err(SmokeError::rejected());
             }
             pending_action = None;
@@ -646,15 +927,24 @@ fn record_step_active(
     active.next_action = next_action;
     active.pending_action = pending_action;
     active.action_failure = action_failure;
+    active.backend_retry_generation_before = backend_retry_generation_before;
+    active.backend_retry_generation_after = backend_retry_generation_after;
     active.transitions = transitions;
     active.last_record_request = Some(request);
     active.last_record_response = Some(response.clone());
     Ok(response)
 }
 
+fn validate_observed_generation(generation: Option<u64>) -> Result<u64, SmokeError> {
+    generation
+        .filter(|generation| *generation > 0 && *generation <= MAX_SAFE_INTEGER)
+        .ok_or_else(SmokeError::rejected)
+}
+
 fn complete_active(
     active: &mut ActiveProtocol,
     request: CompleteRequest,
+    observations: SmokeNativeObservations,
 ) -> Result<SmokeUpdateResponse, SmokeError> {
     if let Some((completed_request, response)) = active.completion.as_ref() {
         return if completed_request == &request {
@@ -663,18 +953,7 @@ fn complete_active(
             Err(SmokeError::rejected())
         };
     }
-    if active.terminal || active.pending_action.is_some() {
-        return Err(SmokeError::rejected());
-    }
-    let last_duration = active
-        .transitions
-        .last()
-        .map_or(0, |transition| transition.duration_ms);
-    if request.duration_ms > MAX_SAFE_INTEGER || request.duration_ms < last_duration {
-        return Err(SmokeError::rejected());
-    }
-
-    validate_completion(active, &request)?;
+    validate_new_completion(active, &request)?;
     let report = SmokeReport {
         schema: REPORT_SCHEMA,
         version: PROTOCOL_VERSION,
@@ -686,6 +965,7 @@ fn complete_active(
         duration_ms: request.duration_ms,
         diagnostic: request.diagnostic.clone(),
         steps: active.transitions.clone(),
+        native: observations.clone(),
     };
     let publish = write_report_atomically(&active.report_target, &report, active.replacer.as_ref())
         .map_err(|_| SmokeError::rejected())?;
@@ -699,6 +979,7 @@ fn complete_active(
         },
     };
     active.terminal = true;
+    active.native_observations = Some(observations);
     active.completion = Some((request, response.clone()));
     Ok(response)
 }
@@ -711,6 +992,124 @@ fn constant_time_proof_matches(expected: &str, actual: &str) -> bool {
         difference |= usize::from(*expected_byte ^ actual.get(index).copied().unwrap_or(0));
     }
     difference == 0
+}
+
+fn test_harness_native_observations() -> SmokeNativeObservations {
+    SmokeNativeObservations {
+        startup_mode: "rust-gateway".to_string(),
+        document_lifecycle_count: 1,
+        gateway_authority: "127.0.0.1:49152".to_string(),
+        backend_authority: "127.0.0.1:3000".to_string(),
+        backend_generation_before: 1,
+        backend_generation_after: 1,
+        backend_root_pid_before: 4_100,
+        backend_root_pid_after: 4_100,
+        backend_ready_pid_after: 4_100,
+        backend_descendant_pids_before: Vec::new(),
+        backend_spawn_count_before: 1,
+        backend_spawn_count_after: 1,
+        old_backend_tree_process_count_after_cleanup: 0,
+    }
+}
+
+fn validate_native_observations(
+    scenario: SmokeScenario,
+    status: SmokeTerminalStatus,
+    observations: &SmokeNativeObservations,
+) -> Result<(), SmokeError> {
+    let gateway = parse_loopback_authority(&observations.gateway_authority)?;
+    let backend = parse_loopback_authority(&observations.backend_authority)?;
+    if observations.startup_mode != "rust-gateway"
+        || observations.document_lifecycle_count != 1
+        || observations.backend_authority != "127.0.0.1:3000"
+        || gateway == backend
+        || observations.backend_generation_before == 0
+        || observations.backend_generation_before > MAX_SAFE_INTEGER
+        || observations.backend_generation_after == 0
+        || observations.backend_generation_after > MAX_SAFE_INTEGER
+        || !is_safe_positive_integer(observations.backend_root_pid_before)
+        || !is_safe_positive_integer(observations.backend_root_pid_after)
+        || !is_safe_positive_integer(observations.backend_ready_pid_after)
+        || !is_safe_positive_integer(observations.backend_spawn_count_before)
+        || !is_safe_positive_integer(observations.backend_spawn_count_after)
+        || observations.old_backend_tree_process_count_after_cleanup > MAX_SAFE_INTEGER
+        || observations.backend_descendant_pids_before.len() > MAX_BACKEND_DESCENDANT_PIDS
+    {
+        return Err(SmokeError::rejected());
+    }
+    let mut descendants = HashSet::with_capacity(observations.backend_descendant_pids_before.len());
+    for pid in &observations.backend_descendant_pids_before {
+        if !is_safe_positive_integer(*pid)
+            || *pid == observations.backend_root_pid_before
+            || !descendants.insert(*pid)
+        {
+            return Err(SmokeError::rejected());
+        }
+    }
+    if status == SmokeTerminalStatus::Passed {
+        let expected_after = if scenario == SmokeScenario::BackendRetry {
+            observations.backend_generation_before.checked_add(1)
+        } else {
+            Some(observations.backend_generation_before)
+        };
+        if expected_after != Some(observations.backend_generation_after)
+            || observations.backend_ready_pid_after != observations.backend_root_pid_after
+            || observations.old_backend_tree_process_count_after_cleanup != 0
+        {
+            return Err(SmokeError::rejected());
+        }
+        if scenario == SmokeScenario::BackendRetry {
+            if observations.backend_root_pid_before == observations.backend_root_pid_after
+                || observations.backend_descendant_pids_before.is_empty()
+                || observations.backend_spawn_count_before.checked_add(1)
+                    != Some(observations.backend_spawn_count_after)
+            {
+                return Err(SmokeError::rejected());
+            }
+        } else if observations.backend_root_pid_before != observations.backend_root_pid_after
+            || observations.backend_spawn_count_before != observations.backend_spawn_count_after
+        {
+            return Err(SmokeError::rejected());
+        }
+    }
+    Ok(())
+}
+
+fn is_safe_positive_integer(value: u64) -> bool {
+    value > 0 && value <= MAX_SAFE_INTEGER
+}
+
+fn parse_loopback_authority(value: &str) -> Result<std::net::SocketAddr, SmokeError> {
+    if value.len() > 21 {
+        return Err(SmokeError::rejected());
+    }
+    let authority = value
+        .parse::<std::net::SocketAddr>()
+        .map_err(|_| SmokeError::rejected())?;
+    if authority.ip() != std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        || authority.port() == 0
+        || authority.to_string() != value
+    {
+        return Err(SmokeError::rejected());
+    }
+    Ok(authority)
+}
+
+fn validate_new_completion(
+    active: &ActiveProtocol,
+    request: &CompleteRequest,
+) -> Result<(), SmokeError> {
+    if active.terminal || active.pending_action.is_some() {
+        return Err(SmokeError::rejected());
+    }
+    let last_duration = active
+        .transitions
+        .last()
+        .map_or(0, |transition| transition.duration_ms);
+    if request.duration_ms > MAX_SAFE_INTEGER || request.duration_ms < last_duration {
+        return Err(SmokeError::rejected());
+    }
+    validate_completion(active, request)
 }
 
 fn validate_completion(
@@ -796,19 +1195,366 @@ pub fn ride_smoke_plan(state: tauri::State<'_, AppState>) -> SmokePlanResponse {
 }
 
 #[tauri::command]
-pub fn ride_smoke_record_step(
+pub async fn ride_smoke_record_step(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     request: serde_json::Value,
 ) -> Result<SmokeUpdateResponse, SmokeError> {
-    state.smoke.record_step_command(request)
+    if let Some(response) = state.smoke.non_active_update()? {
+        return Ok(response);
+    }
+    let _command = state.smoke.completion_gate.lock().await;
+    let prepared = state.smoke.prepare_record_step_command(request)?;
+    if prepared.request.action == SmokeAction::BackendRetry {
+        let step_state = prepared.request.state;
+        let generation = match prepared.recorded_generation {
+            Some(generation) => generation,
+            None => {
+                let require_ready = step_state != SmokeStepState::Failed;
+                observe_backend_generation(&state, require_ready).await?
+            }
+        };
+        let response = state.smoke.record_backend_retry_step(
+            &prepared.session_proof,
+            prepared.request,
+            generation,
+        )?;
+        let process_observation_missing = !state.smoke.has_backend_retry_process_observation()?;
+        if step_state == SmokeStepState::Started
+            && prepared.is_replay
+            && process_observation_missing
+        {
+            log::warn!(
+                "Replaying committed backend-retry start because native root-crash evidence is missing"
+            );
+        }
+        if step_state == SmokeStepState::Started && process_observation_missing {
+            let spawn_count_before = state.backend_spawn_count.load(Ordering::Acquire);
+            let evidence = tokio::task::spawn_blocking(move || {
+                crate::sidecar::kill_owned_backend_root_for_smoke(&app)
+            })
+            .await
+            .map_err(|_| SmokeError::rejected())?
+            .map_err(|_| SmokeError::rejected())?;
+            state
+                .smoke
+                .record_backend_retry_process_observation(evidence, spawn_count_before)?;
+        }
+        Ok(response)
+    } else {
+        state
+            .smoke
+            .record_step(&prepared.session_proof, prepared.request)
+    }
 }
 
 #[tauri::command]
-pub fn ride_smoke_complete(
+pub async fn ride_smoke_complete(
     state: tauri::State<'_, AppState>,
     request: serde_json::Value,
 ) -> Result<SmokeUpdateResponse, SmokeError> {
-    state.smoke.complete_command(request)
+    if let Some(response) = state.smoke.non_active_update()? {
+        return Ok(response);
+    }
+    let _command = state.smoke.completion_gate.lock().await;
+    let prepared = state.smoke.prepare_complete_command(request)?;
+    let observations = match prepared.observations {
+        Some(observations) => observations,
+        None => {
+            collect_native_observations(
+                &state,
+                prepared.scenario,
+                prepared.request.status,
+                prepared.backend_retry_generation_before,
+                prepared.backend_retry_generation_after,
+            )
+            .await?
+        }
+    };
+    state
+        .smoke
+        .complete_with_observations(&prepared.session_proof, prepared.request, observations)
+}
+
+struct PreparedCompletion {
+    session_proof: String,
+    request: CompleteRequest,
+    scenario: SmokeScenario,
+    observations: Option<SmokeNativeObservations>,
+    backend_retry_generation_before: Option<u64>,
+    backend_retry_generation_after: Option<u64>,
+}
+
+struct BackendProcessObservationValues {
+    root_pid_before: u64,
+    root_pid_after: u64,
+    ready_pid_after: u64,
+    descendant_pids_before: Vec<u64>,
+    spawn_count_before: u64,
+    spawn_count_after: u64,
+    old_tree_process_count_after_cleanup: u64,
+}
+
+struct PreparedStep {
+    session_proof: String,
+    request: RecordStepRequest,
+    is_replay: bool,
+    recorded_generation: Option<u64>,
+}
+
+async fn observe_backend_generation(
+    state: &AppState,
+    require_ready: bool,
+) -> Result<u64, SmokeError> {
+    let gateway_state = {
+        let gateway = state.gateway.lock().map_err(|_| SmokeError::rejected())?;
+        gateway.as_ref().ok_or_else(SmokeError::rejected)?.state()
+    };
+    let snapshot = gateway_state.snapshot().await;
+    if require_ready && snapshot.phase != crate::startup_gateway::BackendPhase::Ready {
+        return Err(SmokeError::rejected());
+    }
+    validate_observed_generation(Some(snapshot.generation.as_u64()))
+}
+
+async fn collect_native_observations(
+    state: &AppState,
+    scenario: SmokeScenario,
+    status: SmokeTerminalStatus,
+    backend_retry_generation_before: Option<u64>,
+    backend_retry_generation_after: Option<u64>,
+) -> Result<SmokeNativeObservations, SmokeError> {
+    let startup_mode = *state
+        .startup_mode
+        .lock()
+        .map_err(|_| SmokeError::rejected())?;
+    let (gateway_authority, gateway_state) = {
+        let gateway = state.gateway.lock().map_err(|_| SmokeError::rejected())?;
+        let gateway = gateway.as_ref().ok_or_else(SmokeError::rejected)?;
+        (gateway.public_authority(), gateway.state())
+    };
+    let snapshot = gateway_state.snapshot().await;
+    if status == SmokeTerminalStatus::Passed
+        && snapshot.phase != crate::startup_gateway::BackendPhase::Ready
+    {
+        return Err(SmokeError::rejected());
+    }
+    let published_backend_port = *state
+        .backend_port
+        .lock()
+        .map_err(|_| SmokeError::rejected())?;
+    let backend_port = select_report_backend_port(status, published_backend_port)?;
+    let (before_generation, after_generation) = select_observed_backend_generations(
+        scenario,
+        snapshot.generation.as_u64(),
+        backend_retry_generation_before,
+        backend_retry_generation_after,
+    )?;
+    let process = collect_backend_process_observations(state, scenario, status).await?;
+    let observations = SmokeNativeObservations {
+        startup_mode: match startup_mode {
+            crate::startup_metrics::StartupMode::RustGateway => "rust-gateway",
+            crate::startup_metrics::StartupMode::LegacyExplicit => "legacy-explicit",
+            crate::startup_metrics::StartupMode::LegacyFallback => "legacy-fallback",
+        }
+        .to_string(),
+        document_lifecycle_count: state.smoke.document_lifecycle_count(),
+        gateway_authority,
+        backend_authority: format!("127.0.0.1:{backend_port}"),
+        backend_generation_before: before_generation,
+        backend_generation_after: after_generation,
+        backend_root_pid_before: process.root_pid_before,
+        backend_root_pid_after: process.root_pid_after,
+        backend_ready_pid_after: process.ready_pid_after,
+        backend_descendant_pids_before: process.descendant_pids_before,
+        backend_spawn_count_before: process.spawn_count_before,
+        backend_spawn_count_after: process.spawn_count_after,
+        old_backend_tree_process_count_after_cleanup: process.old_tree_process_count_after_cleanup,
+    };
+    validate_native_observations(scenario, status, &observations)?;
+    Ok(observations)
+}
+
+async fn collect_backend_process_observations(
+    state: &AppState,
+    scenario: SmokeScenario,
+    status: SmokeTerminalStatus,
+) -> Result<BackendProcessObservationValues, SmokeError> {
+    let (active_root_pid, owned_root_pid, current_tree) = {
+        let ownership = state
+            .backend_ownership
+            .lock()
+            .map_err(|_| SmokeError::rejected())?;
+        let active = ownership.pid();
+        let owned = ownership.owned_root_pid();
+        let tree = ownership.tree();
+        if tree
+            .as_ref()
+            .is_some_and(|tree| Some(tree.root_pid()) != owned)
+        {
+            return Err(SmokeError::rejected());
+        }
+        (active, owned, tree)
+    };
+    let ready_pid = *state
+        .backend_ready_pid
+        .lock()
+        .map_err(|_| SmokeError::rejected())?;
+    let spawn_count_after = state.backend_spawn_count.load(Ordering::Acquire);
+    let retry_observation = if scenario == SmokeScenario::BackendRetry {
+        state.smoke.backend_retry_process_observation()?
+    } else {
+        None
+    };
+    let crash_root = retry_observation
+        .as_ref()
+        .map(|observation| observation.crash.root_pid());
+    let root_pid_after = select_report_backend_root(
+        status,
+        active_root_pid,
+        owned_root_pid,
+        ready_pid.or(crash_root),
+    )?;
+    let ready_pid_after = ready_pid.or(crash_root).unwrap_or(root_pid_after);
+    let current_process_ids = match current_tree {
+        Some(tree) => {
+            let result = tokio::task::spawn_blocking(move || {
+                tree.process_ids_bounded(Duration::from_secs(1))
+            })
+            .await
+            .map_err(|_| SmokeError::rejected())?;
+            match result {
+                Ok(processes) => processes,
+                Err(_) if status == SmokeTerminalStatus::Failed => Vec::new(),
+                Err(_) => return Err(SmokeError::rejected()),
+            }
+        }
+        None if status == SmokeTerminalStatus::Failed => Vec::new(),
+        None => return Err(SmokeError::rejected()),
+    };
+    validate_current_backend_tree_liveness(status, root_pid_after, &current_process_ids)?;
+
+    if scenario == SmokeScenario::BackendRetry {
+        let observation = match retry_observation {
+            Some(observation) => observation,
+            None if status == SmokeTerminalStatus::Failed => {
+                return Ok(BackendProcessObservationValues {
+                    root_pid_before: u64::from(root_pid_after),
+                    root_pid_after: u64::from(root_pid_after),
+                    ready_pid_after: u64::from(ready_pid_after),
+                    descendant_pids_before: current_process_ids
+                        .into_iter()
+                        .filter(|pid| *pid != root_pid_after)
+                        .map(u64::from)
+                        .collect(),
+                    spawn_count_before: spawn_count_after,
+                    spawn_count_after,
+                    old_tree_process_count_after_cleanup: 0,
+                });
+            }
+            None => return Err(SmokeError::rejected()),
+        };
+        let crash = observation.crash.clone();
+        let old_tree_process_count_after_cleanup = match tokio::task::spawn_blocking(move || {
+            crash.active_process_ids(Duration::from_secs(1))
+        })
+        .await
+        .map_err(|_| SmokeError::rejected())?
+        {
+            Ok(processes) => processes.len() as u64,
+            Err(_) if status == SmokeTerminalStatus::Failed => 1,
+            Err(_) => return Err(SmokeError::rejected()),
+        };
+        Ok(BackendProcessObservationValues {
+            root_pid_before: u64::from(observation.crash.root_pid()),
+            root_pid_after: u64::from(root_pid_after),
+            ready_pid_after: u64::from(ready_pid_after),
+            descendant_pids_before: observation
+                .crash
+                .descendant_pids()
+                .iter()
+                .copied()
+                .map(u64::from)
+                .collect(),
+            spawn_count_before: observation.spawn_count_before,
+            spawn_count_after,
+            old_tree_process_count_after_cleanup,
+        })
+    } else {
+        Ok(BackendProcessObservationValues {
+            root_pid_before: u64::from(root_pid_after),
+            root_pid_after: u64::from(root_pid_after),
+            ready_pid_after: u64::from(ready_pid_after),
+            descendant_pids_before: current_process_ids
+                .into_iter()
+                .filter(|pid| *pid != root_pid_after)
+                .map(u64::from)
+                .collect(),
+            spawn_count_before: spawn_count_after,
+            spawn_count_after,
+            old_tree_process_count_after_cleanup: 0,
+        })
+    }
+}
+
+fn select_report_backend_root(
+    status: SmokeTerminalStatus,
+    active_root_pid: Option<u32>,
+    owned_root_pid: Option<u32>,
+    last_ready_pid: Option<u32>,
+) -> Result<u32, SmokeError> {
+    if status == SmokeTerminalStatus::Passed {
+        active_root_pid.ok_or_else(SmokeError::rejected)
+    } else {
+        active_root_pid
+            .or(owned_root_pid)
+            .or(last_ready_pid)
+            .ok_or_else(SmokeError::rejected)
+    }
+}
+
+fn select_report_backend_port(
+    status: SmokeTerminalStatus,
+    published_port: Option<u16>,
+) -> Result<u16, SmokeError> {
+    match (status, published_port) {
+        (SmokeTerminalStatus::Passed, Some(port)) => Ok(port),
+        (SmokeTerminalStatus::Passed, None) => Err(SmokeError::rejected()),
+        (SmokeTerminalStatus::Failed, port) => Ok(port.unwrap_or(crate::sidecar::BACKEND_PORT)),
+    }
+}
+
+fn validate_current_backend_tree_liveness(
+    status: SmokeTerminalStatus,
+    root_pid: u32,
+    process_ids: &[u32],
+) -> Result<(), SmokeError> {
+    if status == SmokeTerminalStatus::Passed && !process_ids.contains(&root_pid) {
+        return Err(SmokeError::rejected());
+    }
+    Ok(())
+}
+
+fn select_observed_backend_generations(
+    scenario: SmokeScenario,
+    current_generation: u64,
+    backend_retry_generation_before: Option<u64>,
+    backend_retry_generation_after: Option<u64>,
+) -> Result<(u64, u64), SmokeError> {
+    let current = validate_observed_generation(Some(current_generation))?;
+    if scenario == SmokeScenario::BackendRetry {
+        let before = validate_observed_generation(backend_retry_generation_before)?;
+        let after = validate_observed_generation(backend_retry_generation_after)?;
+        if after != current {
+            return Err(SmokeError::rejected());
+        }
+        Ok((before, after))
+    } else if backend_retry_generation_before.is_some() || backend_retry_generation_after.is_some()
+    {
+        Err(SmokeError::rejected())
+    } else {
+        Ok((current, current))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -973,6 +1719,9 @@ fn build_active_protocol(
         action_failure: None,
         terminal: false,
         completion: None,
+        native_observations: None,
+        backend_retry_generation_before: None,
+        backend_retry_generation_after: None,
     })
 }
 
@@ -2043,6 +2792,85 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn passed_native_observation_requires_the_current_owned_root_to_be_alive() {
+        assert!(validate_current_backend_tree_liveness(
+            SmokeTerminalStatus::Passed,
+            4_200,
+            &[4_200, 4_201],
+        )
+        .is_ok());
+        assert!(validate_current_backend_tree_liveness(
+            SmokeTerminalStatus::Passed,
+            4_200,
+            &[4_201],
+        )
+        .is_err());
+        assert!(
+            validate_current_backend_tree_liveness(SmokeTerminalStatus::Failed, 4_200, &[],)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn failed_native_observation_can_report_after_the_current_backend_is_gone() {
+        assert_eq!(
+            select_report_backend_root(SmokeTerminalStatus::Failed, None, None, Some(4_100))
+                .unwrap(),
+            4_100
+        );
+        assert!(select_report_backend_root(
+            SmokeTerminalStatus::Passed,
+            None,
+            Some(4_100),
+            Some(4_100),
+        )
+        .is_err());
+        assert_eq!(
+            select_report_backend_port(SmokeTerminalStatus::Failed, None).unwrap(),
+            crate::sidecar::BACKEND_PORT
+        );
+        assert!(select_report_backend_port(SmokeTerminalStatus::Passed, None).is_err());
+    }
+
+    #[test]
+    fn backend_retry_prepare_replays_the_committed_native_generation() {
+        let fixture = TestFixture::new();
+        let protocol = SmokeProtocol::from_environment(
+            &fixture.backend_retry_environment("backend-retry-replay-token"),
+            &fixture.root,
+        );
+        let proof = protocol
+            .plan()
+            .session_proof
+            .expect("backend retry session proof");
+        let started = RecordStepRequest {
+            action: SmokeAction::BackendRetry,
+            state: SmokeStepState::Started,
+            duration_ms: 0,
+            diagnostic: None,
+        };
+        let envelope = json!({
+            "sessionProof": &proof,
+            "request": &started,
+        });
+
+        let initial = protocol
+            .prepare_record_step_command(envelope.clone())
+            .expect("prepare first started command");
+        assert!(!initial.is_replay);
+        assert_eq!(initial.recorded_generation, None);
+
+        protocol
+            .record_backend_retry_step(&proof, started, 9)
+            .expect("commit started generation");
+        let replay = protocol
+            .prepare_record_step_command(envelope)
+            .expect("prepare response-loss replay");
+        assert!(replay.is_replay);
+        assert_eq!(replay.recorded_generation, Some(9));
+    }
+
+    #[test]
     fn smoke_spec_is_read_from_the_validated_no_follow_handle() {
         let original = br#"{"schema":"from-open-handle"}"#.to_vec();
         let mut validated_handle = Cursor::new(original.clone());
@@ -2561,6 +3389,39 @@ mod tests {
                     OsString::from(SPEC_ENV),
                     dunce::canonicalize(spec_path)
                         .expect("canonical unit spec")
+                        .into_os_string(),
+                ),
+                (
+                    OsString::from(REPORT_ENV),
+                    self.report_path().into_os_string(),
+                ),
+                (OsString::from(TOKEN_ENV), OsString::from(token)),
+            ])
+        }
+
+        fn backend_retry_environment(&self, token: &str) -> BTreeMap<OsString, OsString> {
+            let spec_path = self.root.join("backend-retry-spec.json");
+            let spec = json!({
+                "schema": SPEC_SCHEMA,
+                "version": PROTOCOL_VERSION,
+                "scenario": "backend-retry",
+                "profile": "tauri-critical",
+                "workspace": ".",
+                "files": [],
+                "actions": [SmokeAction::BackendRetry],
+                "tokenSha256": sha256(token.as_bytes()),
+                "actionTimeoutMs": 30_000
+            });
+            fs::write(
+                &spec_path,
+                serde_json::to_vec(&spec).expect("serialize backend retry unit spec"),
+            )
+            .expect("write backend retry unit spec");
+            BTreeMap::from([
+                (
+                    OsString::from(SPEC_ENV),
+                    dunce::canonicalize(spec_path)
+                        .expect("canonical backend retry unit spec")
                         .into_os_string(),
                 ),
                 (

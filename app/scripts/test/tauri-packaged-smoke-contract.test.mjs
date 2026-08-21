@@ -29,11 +29,29 @@ const FILE_ACTIONS = [
   'secondary-window',
   'second-file-forwarding',
 ];
+const EMPTY_ACTIONS = ['terminal-sentinel', 'packaged-plugin-command'];
+const BACKEND_RETRY_ACTIONS = ['backend-retry'];
+
+const NATIVE_OBSERVATIONS = Object.freeze({
+  startupMode: 'rust-gateway',
+  documentLifecycleCount: 1,
+  gatewayAuthority: '127.0.0.1:49152',
+  backendAuthority: '127.0.0.1:3000',
+  backendGenerationBefore: 1,
+  backendGenerationAfter: 1,
+  backendRootPidBefore: 4100,
+  backendRootPidAfter: 4100,
+  backendReadyPidAfter: 4100,
+  backendDescendantPidsBefore: [],
+  backendSpawnCountBefore: 1,
+  backendSpawnCountAfter: 1,
+  oldBackendTreeProcessCountAfterCleanup: 0,
+});
 
 function smokeSpec(overrides = {}) {
   return {
     schema: 'ride.tauri-packaged-smoke-spec',
-    version: 1,
+    version: 2,
     scenario: 'critical-file',
     profile: 'tauri-critical',
     workspace: '.',
@@ -53,7 +71,7 @@ function smokeReport(overrides = {}) {
   const status = overrides.status ?? 'passed';
   return {
     schema: 'ride.tauri-packaged-smoke',
-    version: 1,
+    version: 2,
     specSha256: 'b'.repeat(64),
     scenario: 'critical-file',
     profile: 'tauri-critical',
@@ -67,6 +85,7 @@ function smokeReport(overrides = {}) {
       transition('terminal-sentinel', 'started', 25),
       transition('terminal-sentinel', 'passed', 75),
     ],
+    ...NATIVE_OBSERVATIONS,
     ...overrides,
   };
 }
@@ -74,7 +93,7 @@ function smokeReport(overrides = {}) {
 function smokeProgress(overrides = {}) {
   return {
     schema: 'ride.tauri-packaged-smoke-progress',
-    version: 1,
+    version: 2,
     specSha256: 'b'.repeat(64),
     scenario: 'critical-file',
     profile: 'tauri-critical',
@@ -154,6 +173,7 @@ test('exports immutable canonical schemas, scenarios, and ordered actions', () =
     'critical-file',
     'critical-empty',
     'full-file',
+    'backend-retry',
   ]);
   assert.deepEqual(SMOKE_ACTIONS, FILE_ACTIONS);
 
@@ -173,12 +193,17 @@ test('exports immutable exact requirements for every packaged smoke scenario', (
     'critical-empty': {
       profile: 'tauri-critical',
       fileCount: 0,
-      actions: ['terminal-sentinel', 'packaged-plugin-command'],
+      actions: EMPTY_ACTIONS,
     },
     'full-file': {
       profile: 'full',
       fileCount: 2,
       actions: [...SMOKE_ACTIONS],
+    },
+    'backend-retry': {
+      profile: 'tauri-critical',
+      fileCount: 0,
+      actions: BACKEND_RETRY_ACTIONS,
     },
   });
   assert.equal(Object.isFrozen(SMOKE_SCENARIO_REQUIREMENTS), true);
@@ -194,9 +219,10 @@ test('binds every smoke scenario to its exact profile, file count, and action co
     smokeSpec({
       scenario: 'critical-empty',
       files: [],
-      actions: ['terminal-sentinel', 'packaged-plugin-command'],
+      actions: EMPTY_ACTIONS,
     }),
     smokeSpec({ scenario: 'full-file', profile: 'full' }),
+    smokeSpec({ scenario: 'backend-retry', files: [], actions: BACKEND_RETRY_ACTIONS }),
   ];
   valid.forEach(candidate => assert.doesNotThrow(() => validateSmokeSpec(candidate)));
 
@@ -207,6 +233,7 @@ test('binds every smoke scenario to its exact profile, file count, and action co
     smokeSpec({ scenario: 'critical-empty', files: ['unexpected.R'], actions: ['terminal-sentinel', 'packaged-plugin-command'] }),
     smokeSpec({ scenario: 'critical-empty', files: [], actions: ['terminal-sentinel'] }),
     smokeSpec({ scenario: 'full-file', profile: 'tauri-critical' }),
+    smokeSpec({ scenario: 'backend-retry', files: ['unexpected.R'], actions: BACKEND_RETRY_ACTIONS }),
   ]) {
     assert.throws(() => validateSmokeSpec(candidate), /scenario requirements/i);
   }
@@ -620,6 +647,80 @@ test('accepts a completed ordered report and returns a normalized copy', () => {
   assert.notEqual(report, input);
   assert.notEqual(report.steps, input.steps);
   assert.notEqual(report.steps[0], input.steps[0]);
+});
+
+test('requires strict redacted rust-gateway native observations', () => {
+  const invalid = [
+    ['startupMode', 'legacy-fallback'],
+    ['documentLifecycleCount', 0],
+    ['documentLifecycleCount', 2],
+    ['gatewayAuthority', 'localhost:49152'],
+    ['gatewayAuthority', '127.0.0.1:0'],
+    ['gatewayAuthority', '127.0.0.1:3000'],
+    ['backendAuthority', 'localhost:3000'],
+    ['backendAuthority', '127.0.0.1:49152'],
+    ['backendGenerationBefore', 0],
+    ['backendGenerationAfter', Number.MAX_SAFE_INTEGER + 1],
+  ];
+  for (const [field, value] of invalid) {
+    assert.throws(
+      () => validateSmokeReport(smokeReport({ [field]: value }), REPORT_CONTEXT),
+      /native observation|rust-gateway|document lifecycle|authority|generation/i,
+    );
+  }
+
+  assert.deepEqual(
+    validateSmokeReport(smokeReport(), REPORT_CONTEXT),
+    smokeReport(),
+  );
+});
+
+test('backend-retry reports advance exactly one backend generation', () => {
+  const context = {
+    specSha256: 'b'.repeat(64),
+    scenario: 'backend-retry',
+    profile: 'tauri-critical',
+    actions: BACKEND_RETRY_ACTIONS,
+  };
+  const steps = BACKEND_RETRY_ACTIONS.flatMap((action, index) => [
+    transition(action, 'started', index * 2),
+    transition(action, 'passed', index * 2 + 1),
+  ]);
+  const retryReport = smokeReport({
+    scenario: 'backend-retry',
+    durationMs: steps.at(-1).durationMs,
+    steps,
+    backendGenerationBefore: 7,
+    backendGenerationAfter: 8,
+    backendRootPidBefore: 4100,
+    backendRootPidAfter: 4200,
+    backendReadyPidAfter: 4200,
+    backendDescendantPidsBefore: [4101],
+    backendSpawnCountBefore: 1,
+    backendSpawnCountAfter: 2,
+    oldBackendTreeProcessCountAfterCleanup: 0,
+  });
+
+  assert.equal(validateSmokeReport(retryReport, context).backendGenerationAfter, 8);
+  for (const backendGenerationAfter of [7, 9]) {
+    assert.throws(
+      () => validateSmokeReport({ ...retryReport, backendGenerationAfter }, context),
+      /exactly one backend generation/i,
+    );
+  }
+  for (const overrides of [
+    { backendRootPidAfter: 4100 },
+    { backendReadyPidAfter: 4100 },
+    { backendDescendantPidsBefore: [] },
+    { backendDescendantPidsBefore: [4100] },
+    { backendSpawnCountAfter: 3 },
+    { oldBackendTreeProcessCountAfterCleanup: 1 },
+  ]) {
+    assert.throws(
+      () => validateSmokeReport({ ...retryReport, ...overrides }, context),
+      /backend retry|process tree|spawn|descendant|ready pid/i,
+    );
+  }
 });
 
 test('requires exact report, transition, diagnostic, and context keys', () => {
