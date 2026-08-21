@@ -249,7 +249,7 @@ test('generates one gateway document while retaining the explicit legacy fronten
     /^\s*$/,
   );
   assert.match(html, /Content-Security-Policy/);
-  assert.match(html, /connect-src 'self'/);
+  assert.match(html, /connect-src 'self' data: http: https: ws: wss:/);
   assert.match(bridge, /localeId/);
   assert.match(bridge, /ride_locale/);
   assert.equal(afterBundle.trim(), 'window.__rideStartup?.markBundleLoaded();');

@@ -167,7 +167,7 @@ function rewriteDesktopHtml(source) {
     "style-src 'self' 'unsafe-inline'",
     "img-src 'self' data: blob: https:",
     "font-src 'self' data:",
-    "connect-src 'self' http: https: ws: wss:",
+    "connect-src 'self' data: http: https: ws: wss:",
     "worker-src 'self' blob:",
     "frame-src 'self' http: https:",
     "object-src 'none'",

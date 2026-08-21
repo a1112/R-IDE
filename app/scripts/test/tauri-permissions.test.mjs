@@ -269,6 +269,7 @@ test('desktop HTML rewrite preserves module scripts and rejects remaining inline
   </head><body><script type="module" src="./bundle.js" charset="utf-8"></script></body></html>`;
   const html = rewriteDesktopHtml(source);
   assert.match(html, /Content-Security-Policy/);
+  assert.match(html, /connect-src 'self' data: http: https: ws: wss:/);
   assert.match(html, /<script type="text\/javascript" src="\.\/ride-bootstrap\.js"/);
   assert.match(html, /<script type="module" src="\.\/bundle\.js" charset="utf-8"><\/script>/);
   assert.doesNotMatch(html, /<script\b(?![^>]*\bsrc=)[^>]*>/);
