@@ -2034,6 +2034,27 @@ fn finish_bounded_backend_cleanup(
     }
 }
 
+async fn serialize_backend_cleanup<C>(
+    cleanup_failure: &tokio::sync::Mutex<Option<String>>,
+    deadline: tokio::time::Instant,
+    cleanup: C,
+) -> Result<(), String>
+where
+    C: Future<Output = Result<(), String>>,
+{
+    let mut failure = tokio::time::timeout_at(deadline, cleanup_failure.lock())
+        .await
+        .map_err(|_| "Backend cleanup coordination exceeded its bound".to_string())?;
+    if let Some(error) = failure.as_ref() {
+        return Err(error.clone());
+    }
+    let result = cleanup.await;
+    if let Err(error) = result.as_ref() {
+        *failure = Some(error.clone());
+    }
+    result
+}
+
 pub async fn stop_backend_bounded(app_handle: &AppHandle, bound: Duration) -> Result<(), String> {
     if bound.is_zero() {
         return Err("Backend cleanup bound must be nonzero".to_string());
@@ -2041,29 +2062,32 @@ pub async fn stop_backend_bounded(app_handle: &AppHandle, bound: Duration) -> Re
     let Some(state) = app_handle.try_state::<crate::AppState>() else {
         return Ok(());
     };
-    let wait_for_cleanup = state.backend_ownership.lock().unwrap().has_owned_work();
     let deadline = tokio::time::Instant::now() + bound;
-    let stop_handle = app_handle.clone();
-    let stop_task = tauri::async_runtime::spawn_blocking(move || stop_backend(&stop_handle));
-    let stop_result = match tokio::time::timeout_at(deadline, stop_task).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(error)) => Err(format!("Backend stop task failed: {error}")),
-        Err(_) => Err(format!(
-            "Backend process-tree stop exceeded {}ms",
-            bound.as_millis()
-        )),
-    };
-    if !wait_for_cleanup {
-        return stop_result;
-    }
+    serialize_backend_cleanup(&state.backend_cleanup_failure, deadline, async {
+        let wait_for_cleanup = state.backend_ownership.lock().unwrap().has_owned_work();
+        let stop_handle = app_handle.clone();
+        let stop_task = tauri::async_runtime::spawn_blocking(move || stop_backend(&stop_handle));
+        let stop_result = match tokio::time::timeout_at(deadline, stop_task).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => Err(format!("Backend stop task failed: {error}")),
+            Err(_) => Err(format!(
+                "Backend process-tree stop exceeded {}ms",
+                bound.as_millis()
+            )),
+        };
+        if !wait_for_cleanup && !state.backend_ownership.lock().unwrap().has_owned_work() {
+            return stop_result;
+        }
 
-    let cleanup_confirmed = wait_for_backend_ownership_release(
-        &state.backend_ownership,
-        &state.backend_cleanup_notify,
-        deadline,
-    )
-    .await;
-    finish_bounded_backend_cleanup(stop_result, cleanup_confirmed, bound)
+        let cleanup_confirmed = wait_for_backend_ownership_release(
+            &state.backend_ownership,
+            &state.backend_cleanup_notify,
+            deadline,
+        )
+        .await;
+        finish_bounded_backend_cleanup(stop_result, cleanup_confirmed, bound)
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -2134,6 +2158,58 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error, "process tree termination failed");
+    }
+
+    #[tokio::test]
+    async fn concurrent_cleanup_callers_share_the_first_sticky_failure() {
+        let cleanup_failure = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let second_cleanup_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let first_state = cleanup_failure.clone();
+        let first = tokio::spawn(async move {
+            super::serialize_backend_cleanup(
+                &first_state,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                async move {
+                    entered_tx.send(()).unwrap();
+                    release_rx.await.unwrap();
+                    Err("process tree termination failed".to_string())
+                },
+            )
+            .await
+        });
+        entered_rx.await.unwrap();
+
+        let second_state = cleanup_failure.clone();
+        let observed_second_calls = second_cleanup_calls.clone();
+        let second = tokio::spawn(async move {
+            super::serialize_backend_cleanup(
+                &second_state,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                async move {
+                    observed_second_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!second.is_finished());
+        release_tx.send(()).unwrap();
+
+        assert_eq!(
+            first.await.unwrap(),
+            Err("process tree termination failed".to_string())
+        );
+        assert_eq!(
+            second.await.unwrap(),
+            Err("process tree termination failed".to_string())
+        );
+        assert_eq!(
+            second_cleanup_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
     }
 
     #[test]

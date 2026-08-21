@@ -154,6 +154,7 @@ pub struct AppState {
     pub backend_ownership: Mutex<startup::BackendOwnershipState>,
     pub backend_stop_fallback: Mutex<Option<(u32, tokio::sync::mpsc::UnboundedSender<()>)>>,
     pub backend_cleanup_notify: tokio::sync::Notify,
+    pub backend_cleanup_failure: tokio::sync::Mutex<Option<String>>,
     pub backend_retries_stopped: std::sync::atomic::AtomicBool,
     pub downloads: download::DownloadManager,
     pub launch_intent_router: launch_intent::LaunchIntentRouter,
@@ -176,6 +177,7 @@ impl AppState {
             backend_ownership: Mutex::new(startup::BackendOwnershipState::default()),
             backend_stop_fallback: Mutex::new(None),
             backend_cleanup_notify: tokio::sync::Notify::new(),
+            backend_cleanup_failure: tokio::sync::Mutex::new(None),
             backend_retries_stopped: std::sync::atomic::AtomicBool::new(false),
             downloads: download::DownloadManager::new(),
             launch_intent_router: launch_intent::LaunchIntentRouter::new(
