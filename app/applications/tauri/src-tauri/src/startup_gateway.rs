@@ -45,7 +45,9 @@ use std::time::Duration;
 use tokio::fs::File;
 use tokio::io::{copy_bidirectional, AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{oneshot, watch, Mutex, Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{
+    broadcast, mpsc, oneshot, watch, Mutex, Notify, OwnedSemaphorePermit, Semaphore,
+};
 use tokio::task::{JoinError, JoinHandle, JoinSet};
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
@@ -55,6 +57,7 @@ const NOT_FOUND_BODY: &[u8] = b"Not Found";
 const INDEX_PATH: &str = "/index.html";
 const SESSION_COOKIE_NAME: &str = "ride_session";
 const STATIC_ASSET_CHUNK_SIZE: usize = 16 * 1024;
+const CONTROL_BODY_LIMIT: usize = 256;
 const BACKEND_UNAVAILABLE_BODY: &[u8] = b"{\"error\":\"backend_unavailable\"}";
 const BACKEND_PROXY_FAILED_BODY: &[u8] = b"{\"error\":\"backend_proxy_failed\"}";
 const INVALID_HTTP_MESSAGE_BODY: &[u8] = b"{\"error\":\"invalid_http_message\"}";
@@ -260,6 +263,53 @@ pub struct GatewaySnapshot {
     pub diagnostic: Option<String>,
 }
 
+#[derive(Clone)]
+struct RetryAdmission {
+    pending: Arc<AtomicBool>,
+    sender: mpsc::Sender<RetryRequest>,
+}
+
+pub struct RetryRequest {
+    generation: BackendGeneration,
+    pending: Arc<AtomicBool>,
+}
+
+impl RetryRequest {
+    pub fn generation(&self) -> BackendGeneration {
+        self.generation
+    }
+}
+
+impl Drop for RetryRequest {
+    fn drop(&mut self) {
+        self.pending.store(false, Ordering::Release);
+    }
+}
+
+impl RetryAdmission {
+    fn new(sender: mpsc::Sender<RetryRequest>) -> Self {
+        Self {
+            pending: Arc::new(AtomicBool::new(false)),
+            sender,
+        }
+    }
+
+    fn try_submit(&self, generation: BackendGeneration) -> Result<(), ()> {
+        if self
+            .pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(());
+        }
+        let request = RetryRequest {
+            generation,
+            pending: self.pending.clone(),
+        };
+        self.sender.try_send(request).map_err(|_| ())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GatewayError {
     StaleGeneration(BackendGeneration),
@@ -347,6 +397,7 @@ struct PublishedBackend {
 struct GatewayInner {
     current: Mutex<PublishedBackend>,
     readiness: watch::Sender<PublishedBackend>,
+    events: broadcast::Sender<GatewaySnapshot>,
     shutdown: watch::Sender<bool>,
     waiters: Arc<Semaphore>,
     limits: GatewayLimits,
@@ -368,11 +419,13 @@ impl GatewayState {
             backend_addr: None,
         };
         let (readiness, _) = watch::channel(initial.clone());
+        let (events, _) = broadcast::channel(64);
         let (shutdown, _) = watch::channel(false);
         Self {
             inner: Arc::new(GatewayInner {
                 current: Mutex::new(initial),
                 readiness,
+                events,
                 shutdown,
                 waiters: Arc::new(Semaphore::new(limits.max_waiters)),
                 limits,
@@ -381,11 +434,29 @@ impl GatewayState {
     }
 
     pub async fn begin_backend_start(&self) -> Result<BackendGeneration, GatewayError> {
+        self.begin_backend_start_after(None).await
+    }
+
+    pub async fn begin_backend_retry(
+        &self,
+        failed_generation: BackendGeneration,
+    ) -> Result<BackendGeneration, GatewayError> {
+        self.begin_backend_start_after(Some(failed_generation))
+            .await
+    }
+
+    async fn begin_backend_start_after(
+        &self,
+        failed_generation: Option<BackendGeneration>,
+    ) -> Result<BackendGeneration, GatewayError> {
         if *self.inner.shutdown.borrow() {
             return Err(GatewayError::ShuttingDown);
         }
 
         let mut current = self.inner.current.lock().await;
+        if let Some(expected) = failed_generation {
+            Self::require_current_generation(&current, expected)?;
+        }
         match current.snapshot.phase {
             BackendPhase::Failed => {}
             BackendPhase::Starting => {
@@ -418,7 +489,7 @@ impl GatewayState {
             },
             backend_addr: None,
         };
-        self.inner.readiness.send_replace(current.clone());
+        self.publish(&current);
         Ok(generation)
     }
 
@@ -465,7 +536,7 @@ impl GatewayState {
             },
             backend_addr: Some(backend_addr),
         };
-        self.inner.readiness.send_replace(current.clone());
+        self.publish(&current);
         Ok(true)
     }
 
@@ -497,12 +568,18 @@ impl GatewayState {
             },
             backend_addr: None,
         };
-        self.inner.readiness.send_replace(current.clone());
+        self.publish(&current);
         Ok(())
     }
 
     pub async fn snapshot(&self) -> GatewaySnapshot {
         self.inner.current.lock().await.snapshot.clone()
+    }
+
+    async fn subscribe_events(&self) -> (GatewaySnapshot, broadcast::Receiver<GatewaySnapshot>) {
+        let current = self.inner.current.lock().await;
+        let events = self.inner.events.subscribe();
+        (current.snapshot.clone(), events)
     }
 
     async fn backend_lease_is_current(&self, lease: BackendLease) -> bool {
@@ -580,8 +657,13 @@ impl GatewayState {
         current.snapshot.phase = BackendPhase::Stopping;
         current.snapshot.diagnostic = None;
         current.backend_addr = None;
-        self.inner.readiness.send_replace(current.clone());
+        self.publish(&current);
         self.inner.shutdown.send_replace(true);
+    }
+
+    fn publish(&self, current: &PublishedBackend) {
+        self.inner.readiness.send_replace(current.clone());
+        let _ = self.inner.events.send(current.snapshot.clone());
     }
 
     fn require_current_generation(
@@ -787,6 +869,42 @@ struct UploadCompletionBody {
     completion: Option<oneshot::Sender<()>>,
 }
 
+struct SseBody {
+    receiver: mpsc::Receiver<Bytes>,
+    cancel: Option<oneshot::Sender<()>>,
+}
+
+impl Body for SseBody {
+    type Data = Bytes;
+    type Error = io::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let body = self.get_mut();
+        Pin::new(&mut body.receiver)
+            .poll_recv(context)
+            .map(|item| item.map(|bytes| Ok(Frame::data(bytes))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.receiver.is_closed() && self.receiver.is_empty()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::default()
+    }
+}
+
+impl Drop for SseBody {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
+    }
+}
+
 impl UploadCompletionBody {
     fn new(inner: Incoming, completion: oneshot::Sender<()>) -> Self {
         let mut body = Self {
@@ -847,6 +965,8 @@ struct StaticGatewayService {
     session: Arc<GatewaySession>,
     backend_proxy: BackendProxy,
     tunnels: TunnelRegistry,
+    metrics: StartupMetrics,
+    retry_admission: RetryAdmission,
 }
 
 pub struct StartupGateway {
@@ -856,6 +976,7 @@ pub struct StartupGateway {
     shutdown: watch::Sender<bool>,
     shutdown_drain: Duration,
     accept_task: Option<JoinHandle<()>>,
+    retry_requests: Option<mpsc::Receiver<RetryRequest>>,
 }
 
 struct PendingAcceptTask {
@@ -996,6 +1117,7 @@ impl StartupGateway {
         debug_assert_ne!(bootstrap_capability, session_value);
         let state = GatewayState::new(limits);
         let tunnels = TunnelRegistry::new(limits.max_tunnels);
+        let (retry_sender, retry_requests) = mpsc::channel(1);
         let backend_proxy = BackendProxy::new(
             state.clone(),
             limits,
@@ -1016,6 +1138,8 @@ impl StartupGateway {
             }),
             backend_proxy,
             tunnels,
+            metrics: metrics.clone(),
+            retry_admission: RetryAdmission::new(retry_sender),
         };
         cancellation.check()?;
         let (shutdown, shutdown_receiver) = watch::channel(false);
@@ -1074,6 +1198,7 @@ impl StartupGateway {
             shutdown,
             shutdown_drain: limits.shutdown_drain,
             accept_task: Some(accept_task),
+            retry_requests: Some(retry_requests),
         })
     }
 
@@ -1092,6 +1217,10 @@ impl StartupGateway {
 
     pub fn state(&self) -> GatewayState {
         self.state.clone()
+    }
+
+    pub fn take_retry_requests(&mut self) -> Option<mpsc::Receiver<RetryRequest>> {
+        self.retry_requests.take()
     }
 
     pub async fn shutdown(mut self) {
@@ -1526,8 +1655,207 @@ impl StaticGatewayService {
         match route {
             RouteKind::Static => self.static_asset(request).await,
             RouteKind::Backend => self.backend_proxy.forward(request).await,
-            RouteKind::Bootstrap | RouteKind::Control => not_found(),
+            RouteKind::Control => self.control(request).await,
+            RouteKind::Bootstrap => not_found(),
         }
+    }
+
+    async fn control(&self, request: Request<hyper::body::Incoming>) -> Response<GatewayBody> {
+        let Ok(path) = NormalizedPath::parse(request.uri().path()) else {
+            return not_found();
+        };
+        match path.0.as_str() {
+            "/_ride/startup/status" => self.startup_status(request).await,
+            "/_ride/startup/events" => self.startup_events(request).await,
+            "/_ride/startup/milestones" => self.startup_milestone(request).await,
+            "/_ride/startup/retry" => self.startup_retry(request).await,
+            _ => not_found(),
+        }
+    }
+
+    async fn startup_status(
+        &self,
+        request: Request<hyper::body::Incoming>,
+    ) -> Response<GatewayBody> {
+        if request.uri().query().is_some() {
+            return not_found();
+        }
+        if request.method() != Method::GET {
+            return control_error(StatusCode::METHOD_NOT_ALLOWED, b"method_not_allowed");
+        }
+        control_json(
+            StatusCode::OK,
+            browser_snapshot_json(&self.backend_proxy.state.snapshot().await),
+        )
+    }
+
+    async fn startup_events(
+        &self,
+        request: Request<hyper::body::Incoming>,
+    ) -> Response<GatewayBody> {
+        if request.uri().query().is_some() {
+            return not_found();
+        }
+        if request.method() != Method::GET {
+            return control_error(StatusCode::METHOD_NOT_ALLOWED, b"method_not_allowed");
+        }
+
+        let state = self.backend_proxy.state.clone();
+        let (initial, mut states) = state.subscribe_events().await;
+        let (events, receiver) = mpsc::channel(4);
+        let (cancel, mut cancelled) = oneshot::channel();
+        tokio::spawn(async move {
+            let mut last = initial;
+            if events.try_send(browser_snapshot_sse(&last)).is_err()
+                || last.phase == BackendPhase::Stopping
+            {
+                return;
+            }
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut cancelled => break,
+                    received = states.recv() => {
+                        let current = match received {
+                            Ok(current) => current,
+                            Err(broadcast::error::RecvError::Lagged(_)) => state.snapshot().await,
+                            Err(broadcast::error::RecvError::Closed) => break,
+                        };
+                        if current != last {
+                            if events.try_send(browser_snapshot_sse(&current)).is_err() {
+                                break;
+                            }
+                            last = current;
+                        }
+                        if last.phase == BackendPhase::Stopping {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "text/event-stream")
+            .header(CACHE_CONTROL, "no-store")
+            .header("x-content-type-options", "nosniff")
+            .header(CONNECTION, "keep-alive")
+            .body(
+                SseBody {
+                    receiver,
+                    cancel: Some(cancel),
+                }
+                .boxed(),
+            )
+            .expect("fixed startup event response must be valid")
+    }
+
+    async fn startup_milestone(
+        &self,
+        request: Request<hyper::body::Incoming>,
+    ) -> Response<GatewayBody> {
+        let body = match self.read_mutating_control_json(request).await {
+            Ok(body) => body,
+            Err(response) => return response,
+        };
+        if body != serde_json::json!({ "milestone": "frontend_bundle_loaded" }) {
+            return control_error(StatusCode::BAD_REQUEST, b"invalid_milestone");
+        }
+        self.metrics
+            .record_or_warn(StartupMilestone::FrontendBundleLoaded);
+        control_empty(StatusCode::NO_CONTENT)
+    }
+
+    async fn startup_retry(
+        &self,
+        request: Request<hyper::body::Incoming>,
+    ) -> Response<GatewayBody> {
+        let body = match self.read_mutating_control_json(request).await {
+            Ok(body) => body,
+            Err(response) => return response,
+        };
+        let Some(generation) = body
+            .as_object()
+            .filter(|object| object.len() == 1)
+            .and_then(|object| object.get("generation"))
+            .and_then(serde_json::Value::as_u64)
+            .filter(|generation| *generation > 0 && *generation <= 9_007_199_254_740_991)
+            .map(BackendGeneration)
+        else {
+            return control_error(StatusCode::BAD_REQUEST, b"invalid_generation");
+        };
+        let snapshot = self.backend_proxy.state.snapshot().await;
+        if snapshot.phase != BackendPhase::Failed || snapshot.generation != generation {
+            return control_error(StatusCode::CONFLICT, b"retry_conflict");
+        }
+        if self.retry_admission.try_submit(generation).is_err() {
+            return control_error(StatusCode::CONFLICT, b"retry_conflict");
+        }
+        control_empty(StatusCode::ACCEPTED)
+    }
+
+    async fn read_mutating_control_json(
+        &self,
+        request: Request<hyper::body::Incoming>,
+    ) -> Result<serde_json::Value, Response<GatewayBody>> {
+        if request.uri().query().is_some() {
+            return Err(not_found());
+        }
+        if request.method() != Method::POST {
+            return Err(control_error(
+                StatusCode::METHOD_NOT_ALLOWED,
+                b"method_not_allowed",
+            ));
+        }
+        if !single_header_equals(request.headers(), ORIGIN, self.public_origin.as_bytes()) {
+            return Err(not_found());
+        }
+        if !single_header_equals(request.headers(), CONTENT_TYPE, b"application/json") {
+            return Err(control_error(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                b"unsupported_media_type",
+            ));
+        }
+        if request.headers().contains_key(TRANSFER_ENCODING) {
+            return Err(control_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                b"body_too_large",
+            ));
+        }
+        let mut lengths = request.headers().get_all(CONTENT_LENGTH).iter();
+        let Some(length) = lengths.next() else {
+            return Err(control_error(
+                StatusCode::LENGTH_REQUIRED,
+                b"length_required",
+            ));
+        };
+        if lengths.next().is_some() {
+            return Err(control_error(StatusCode::BAD_REQUEST, b"invalid_length"));
+        }
+        let Some(length) = length
+            .to_str()
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+        else {
+            return Err(control_error(StatusCode::BAD_REQUEST, b"invalid_length"));
+        };
+        if length > CONTROL_BODY_LIMIT {
+            return Err(control_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                b"body_too_large",
+            ));
+        }
+        let collected = request.into_body().collect().await;
+        let Ok(collected) = collected else {
+            return Err(control_error(StatusCode::BAD_REQUEST, b"invalid_body"));
+        };
+        let body = collected.to_bytes();
+        if body.len() != length || body.len() > CONTROL_BODY_LIMIT {
+            return Err(control_error(StatusCode::BAD_REQUEST, b"invalid_length"));
+        }
+        serde_json::from_slice(&body)
+            .map_err(|_| control_error(StatusCode::BAD_REQUEST, b"invalid_json"))
     }
 
     fn has_valid_request_envelope(&self, request: &Request<hyper::body::Incoming>) -> bool {
@@ -2789,6 +3117,68 @@ fn full_body(bytes: &'static [u8]) -> GatewayBody {
     Full::new(Bytes::from_static(bytes))
         .map_err(|never| match never {})
         .boxed()
+}
+
+fn bytes_body(bytes: Bytes) -> GatewayBody {
+    Full::new(bytes).map_err(|never| match never {}).boxed()
+}
+
+fn browser_snapshot_json(snapshot: &GatewaySnapshot) -> Bytes {
+    let state = match snapshot.phase {
+        BackendPhase::Starting => "starting",
+        BackendPhase::Ready => "ready",
+        BackendPhase::Failed => "failed",
+        BackendPhase::Stopping => "stopping",
+    };
+    let mut value = serde_json::json!({
+        "state": state,
+        "generation": snapshot.generation.0,
+    });
+    if let Some(diagnostic) = snapshot.diagnostic.as_deref() {
+        value["diagnostic"] =
+            serde_json::Value::String(diagnostic.chars().take(4096).collect::<String>());
+    }
+    Bytes::from(serde_json::to_vec(&value).expect("bounded gateway snapshot must serialize"))
+}
+
+fn browser_snapshot_sse(snapshot: &GatewaySnapshot) -> Bytes {
+    let json = browser_snapshot_json(snapshot);
+    let mut event = Vec::with_capacity(json.len() + 22);
+    event.extend_from_slice(b"event: state\ndata: ");
+    event.extend_from_slice(&json);
+    event.extend_from_slice(b"\n\n");
+    Bytes::from(event)
+}
+
+fn control_json(status: StatusCode, body: Bytes) -> Response<GatewayBody> {
+    Response::builder()
+        .status(status)
+        .header(CONTENT_TYPE, "application/json")
+        .header(CONTENT_LENGTH, body.len())
+        .header(CACHE_CONTROL, "no-store")
+        .header("x-content-type-options", "nosniff")
+        .body(bytes_body(body))
+        .expect("fixed control JSON response must be valid")
+}
+
+fn control_empty(status: StatusCode) -> Response<GatewayBody> {
+    Response::builder()
+        .status(status)
+        .header(CONTENT_LENGTH, 0)
+        .header(CACHE_CONTROL, "no-store")
+        .header("x-content-type-options", "nosniff")
+        .body(empty_body())
+        .expect("fixed empty control response must be valid")
+}
+
+fn control_error(status: StatusCode, error: &'static [u8]) -> Response<GatewayBody> {
+    let body = Bytes::from(
+        serde_json::to_vec(&serde_json::json!({
+            "error": std::str::from_utf8(error).expect("static control error is UTF-8"),
+        }))
+        .expect("fixed control error must serialize"),
+    );
+    control_json(status, body)
 }
 
 fn not_found() -> Response<GatewayBody> {

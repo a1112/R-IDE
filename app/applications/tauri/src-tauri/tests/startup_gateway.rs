@@ -7,7 +7,7 @@
  * SPDX-License-Identifier: MIT
  ********************************************************************************/
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures_util::{future::BoxFuture, poll, stream, FutureExt, SinkExt, StreamExt};
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Empty, Full, StreamBody};
@@ -400,6 +400,32 @@ fn gateway_addr(gateway: &StartupGateway) -> SocketAddr {
 
 async fn response_bytes(response: Response<hyper::body::Incoming>) -> Bytes {
     response.into_body().collect().await.unwrap().to_bytes()
+}
+
+async fn next_sse_state(
+    body: &mut hyper::body::Incoming,
+    buffered: &mut BytesMut,
+) -> serde_json::Value {
+    loop {
+        if let Some(end) = buffered.windows(2).position(|window| window == b"\n\n") {
+            let event = buffered.split_to(end + 2);
+            let event = std::str::from_utf8(&event).unwrap();
+            assert!(event.lines().any(|line| line == "event: state"));
+            let data = event
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .expect("SSE state data");
+            return serde_json::from_str(data).unwrap();
+        }
+        let frame = tokio::time::timeout(Duration::from_secs(1), body.frame())
+            .await
+            .expect("SSE frame timed out")
+            .expect("SSE stream closed before the next state")
+            .unwrap();
+        if let Some(data) = frame.data_ref() {
+            buffered.extend_from_slice(data);
+        }
+    }
 }
 
 async fn bootstrap_session(gateway: &StartupGateway) -> String {
@@ -983,6 +1009,331 @@ async fn foreign_authority_origin_forwarding_and_absolute_targets_are_rejected()
     )
     .await;
     assert_eq!(allowed.status(), StatusCode::OK);
+    gateway.shutdown().await;
+}
+
+#[tokio::test]
+async fn authenticated_startup_status_returns_a_bounded_public_snapshot() {
+    let frontend = TemporaryFrontend::new();
+    let gateway = bind_gateway(&frontend).await;
+    gateway.state().begin_backend_start().await.unwrap();
+    let cookie = bootstrap_session(&gateway).await;
+
+    let response = send_request(
+        &gateway,
+        Method::GET,
+        "/_ride/startup/status",
+        &[(COOKIE.as_str(), &cookie)],
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(CONTENT_TYPE).unwrap(),
+        "application/json"
+    );
+    assert_eq!(response.headers().get(CACHE_CONTROL).unwrap(), "no-store");
+    assert_eq!(
+        response.headers().get("x-content-type-options").unwrap(),
+        "nosniff"
+    );
+    let body = response_bytes(response).await;
+    assert!(body.len() <= 256);
+    let snapshot: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(snapshot["state"], "starting");
+    assert_eq!(snapshot["generation"], 1);
+    assert!(snapshot["generation"]
+        .as_u64()
+        .is_some_and(|value| value > 0));
+    assert!(snapshot.get("diagnostic").is_none());
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert!(!body.contains(&cookie));
+    assert!(!body.contains(
+        gateway
+            .bootstrap_url()
+            .path_segments()
+            .unwrap()
+            .next_back()
+            .unwrap()
+    ));
+
+    gateway.shutdown().await;
+}
+
+#[tokio::test]
+async fn startup_status_requires_the_exact_host_and_session_cookie() {
+    let frontend = TemporaryFrontend::new();
+    let gateway = bind_gateway(&frontend).await;
+    gateway.state().begin_backend_start().await.unwrap();
+    let cookie = bootstrap_session(&gateway).await;
+
+    for headers in [
+        Vec::new(),
+        vec![(COOKIE.as_str(), "ride_session=wrong")],
+        vec![
+            (HOST.as_str(), "localhost:1"),
+            (COOKIE.as_str(), cookie.as_str()),
+        ],
+    ] {
+        let response = send_request(&gateway, Method::GET, "/_ride/startup/status", &headers).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            response_bytes(response).await,
+            Bytes::from_static(b"Not Found")
+        );
+    }
+
+    gateway.shutdown().await;
+}
+
+#[tokio::test]
+async fn startup_events_publish_initial_failure_and_stopping_states_then_close() {
+    let frontend = TemporaryFrontend::new();
+    let gateway = bind_gateway(&frontend).await;
+    let state = gateway.state();
+    let generation = state.begin_backend_start().await.unwrap();
+    let cookie = bootstrap_session(&gateway).await;
+
+    let response = send_request(
+        &gateway,
+        Method::GET,
+        "/_ride/startup/events",
+        &[(COOKIE.as_str(), &cookie)],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(CONTENT_TYPE).unwrap(),
+        "text/event-stream"
+    );
+    assert_eq!(response.headers().get(CACHE_CONTROL).unwrap(), "no-store");
+    assert_eq!(
+        response.headers().get("x-content-type-options").unwrap(),
+        "nosniff"
+    );
+    let mut body = response.into_body();
+    let mut buffered = BytesMut::new();
+    let initial = next_sse_state(&mut body, &mut buffered).await;
+    assert_eq!(initial["state"], "starting");
+    assert_eq!(initial["generation"], 1);
+
+    state
+        .backend_ready(generation, "127.0.0.1:3010".parse().unwrap())
+        .await
+        .unwrap();
+    state
+        .fail_backend(generation, "private process output must not leak")
+        .await
+        .unwrap();
+    let ready = next_sse_state(&mut body, &mut buffered).await;
+    assert_eq!(ready["state"], "ready");
+    assert_eq!(ready["generation"], 1);
+    let failed = next_sse_state(&mut body, &mut buffered).await;
+    assert_eq!(failed["state"], "failed");
+    assert_eq!(failed["generation"], 1);
+    assert_eq!(
+        failed["diagnostic"],
+        "Backend process failed before becoming ready."
+    );
+    assert!(!failed.to_string().contains("private process output"));
+
+    gateway.shutdown().await;
+    let stopping = next_sse_state(&mut body, &mut buffered).await;
+    assert_eq!(stopping["state"], "stopping");
+    assert_eq!(stopping["generation"], 1);
+    assert!(tokio::time::timeout(Duration::from_secs(1), body.frame())
+        .await
+        .expect("SSE body did not close")
+        .is_none());
+}
+
+#[tokio::test]
+async fn retry_control_route_admits_one_owner_until_the_request_is_released() {
+    let frontend = TemporaryFrontend::new();
+    let mut gateway = bind_gateway(&frontend).await;
+    let state = gateway.state();
+    let generation = state.begin_backend_start().await.unwrap();
+    state.fail_backend(generation, "retryable").await.unwrap();
+    let cookie = bootstrap_session(&gateway).await;
+    let origin = format!("http://{}", gateway.public_authority());
+    let body = serde_json::to_vec(&serde_json::json!({ "generation": 1 })).unwrap();
+    let length = body.len().to_string();
+    let headers = [
+        (COOKIE.as_str(), cookie.as_str()),
+        (ORIGIN.as_str(), origin.as_str()),
+        (CONTENT_TYPE.as_str(), "application/json"),
+        (CONTENT_LENGTH.as_str(), length.as_str()),
+    ];
+
+    let left = send_request_to(
+        gateway_addr(&gateway),
+        gateway.public_authority(),
+        Method::POST,
+        "/_ride/startup/retry",
+        &headers,
+        full_test_body(body.clone()),
+    );
+    let right = send_request_to(
+        gateway_addr(&gateway),
+        gateway.public_authority(),
+        Method::POST,
+        "/_ride/startup/retry",
+        &headers,
+        full_test_body(body.clone()),
+    );
+    let (left, right) = tokio::join!(left, right);
+    let statuses = [left.status(), right.status()];
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == StatusCode::ACCEPTED)
+            .count(),
+        1
+    );
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == StatusCode::CONFLICT)
+            .count(),
+        1
+    );
+
+    let mut retries = gateway.take_retry_requests().unwrap();
+    let owner = tokio::time::timeout(Duration::from_secs(1), retries.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(owner.generation(), generation);
+
+    let conflict = send_request_to(
+        gateway_addr(&gateway),
+        gateway.public_authority(),
+        Method::POST,
+        "/_ride/startup/retry",
+        &headers,
+        full_test_body(body.clone()),
+    )
+    .await;
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+
+    drop(owner);
+    let accepted = send_request_to(
+        gateway_addr(&gateway),
+        gateway.public_authority(),
+        Method::POST,
+        "/_ride/startup/retry",
+        &headers,
+        full_test_body(body),
+    )
+    .await;
+    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+    drop(retries.recv().await.unwrap());
+    gateway.shutdown().await;
+}
+
+#[tokio::test]
+async fn milestone_control_route_is_allowlisted_one_shot_and_strictly_bounded() {
+    let frontend = TemporaryFrontend::new();
+    let (report_sender, reports) = mpsc::channel();
+    let metrics = StartupMetrics::with_clock_and_writer(
+        "test",
+        "test",
+        1,
+        StartupMode::RustGateway,
+        Arc::new(ZeroClock),
+        Box::new(ChannelWriter(report_sender)),
+    );
+    metrics.record(StartupMilestone::ProcessStarted).unwrap();
+    let gateway = StartupGateway::bind(
+        frontend.root.clone(),
+        metrics.clone(),
+        GatewayLimits::test_defaults(),
+    )
+    .await
+    .unwrap();
+    metrics
+        .record(StartupMilestone::FrontendRequestStarted)
+        .unwrap();
+    let cookie = bootstrap_session(&gateway).await;
+    let origin = format!("http://{}", gateway.public_authority());
+    let body = br#"{"milestone":"frontend_bundle_loaded"}"#.to_vec();
+    let length = body.len().to_string();
+    let headers = [
+        (COOKIE.as_str(), cookie.as_str()),
+        (ORIGIN.as_str(), origin.as_str()),
+        (CONTENT_TYPE.as_str(), "application/json"),
+        (CONTENT_LENGTH.as_str(), length.as_str()),
+    ];
+
+    for _ in 0..2 {
+        let response = send_request_to(
+            gateway_addr(&gateway),
+            gateway.public_authority(),
+            Method::POST,
+            "/_ride/startup/milestones",
+            &headers,
+            full_test_body(body.clone()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(response.headers().get(CACHE_CONTROL).unwrap(), "no-store");
+        assert_eq!(
+            response.headers().get("x-content-type-options").unwrap(),
+            "nosniff"
+        );
+    }
+    receive_report_with_milestone(&reports, "frontend_bundle_loaded");
+    assert!(reports.recv_timeout(Duration::from_millis(50)).is_err());
+
+    let no_origin = send_request_to(
+        gateway_addr(&gateway),
+        gateway.public_authority(),
+        Method::POST,
+        "/_ride/startup/milestones",
+        &[
+            (COOKIE.as_str(), cookie.as_str()),
+            (CONTENT_TYPE.as_str(), "application/json"),
+            (CONTENT_LENGTH.as_str(), length.as_str()),
+        ],
+        full_test_body(body.clone()),
+    )
+    .await;
+    assert_eq!(no_origin.status(), StatusCode::NOT_FOUND);
+
+    let wrong_type = send_request_to(
+        gateway_addr(&gateway),
+        gateway.public_authority(),
+        Method::POST,
+        "/_ride/startup/milestones",
+        &[
+            (COOKIE.as_str(), cookie.as_str()),
+            (ORIGIN.as_str(), origin.as_str()),
+            (CONTENT_TYPE.as_str(), "text/plain"),
+            (CONTENT_LENGTH.as_str(), length.as_str()),
+        ],
+        full_test_body(body),
+    )
+    .await;
+    assert_eq!(wrong_type.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+    let oversized = vec![b'x'; 257];
+    let oversized_length = oversized.len().to_string();
+    let response = send_request_to(
+        gateway_addr(&gateway),
+        gateway.public_authority(),
+        Method::POST,
+        "/_ride/startup/milestones",
+        &[
+            (COOKIE.as_str(), cookie.as_str()),
+            (ORIGIN.as_str(), origin.as_str()),
+            (CONTENT_TYPE.as_str(), "application/json"),
+            (CONTENT_LENGTH.as_str(), oversized_length.as_str()),
+        ],
+        full_test_body(oversized),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
     gateway.shutdown().await;
 }
 
