@@ -63,6 +63,7 @@ const BACKEND_PROXY_FAILED_BODY: &[u8] = b"{\"error\":\"backend_proxy_failed\"}"
 const INVALID_HTTP_MESSAGE_BODY: &[u8] = b"{\"error\":\"invalid_http_message\"}";
 const SOCKET_IO_PATH: &str = "/socket.io/";
 const SOCKET_IO_WEBSOCKET_QUERY: &str = "EIO=4&transport=websocket";
+const ENGINE_IO_SESSION_ID_LENGTH: usize = 20;
 const WEBSOCKET_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const HOP_BY_HOP_HEADERS: [&str; 9] = [
     "connection",
@@ -2638,7 +2639,7 @@ fn proxy_request_kind(
     if request.method() != Method::GET
         || request.version() != hyper::Version::HTTP_11
         || request.uri().path() != SOCKET_IO_PATH
-        || request.uri().query() != Some(SOCKET_IO_WEBSOCKET_QUERY)
+        || !is_socket_io_websocket_query(request.uri().query())
         || request.headers().contains_key(CONTENT_LENGTH)
         || request.headers().contains_key(TRANSFER_ENCODING)
         || !request.body().is_end_stream()
@@ -2653,6 +2654,25 @@ fn proxy_request_kind(
         expected_accept: websocket_accept(client_key.expect("validated above")),
         offered_protocols,
     }))
+}
+
+fn is_socket_io_websocket_query(query: Option<&str>) -> bool {
+    let Some(query) = query else {
+        return false;
+    };
+    if query == SOCKET_IO_WEBSOCKET_QUERY {
+        return true;
+    }
+    let Some(session_id) = query
+        .strip_prefix(SOCKET_IO_WEBSOCKET_QUERY)
+        .and_then(|suffix| suffix.strip_prefix("&sid="))
+    else {
+        return false;
+    };
+    session_id.len() == ENGINE_IO_SESSION_ID_LENGTH
+        && session_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 fn is_protected_websocket_handshake_header(name: &hyper::header::HeaderName) -> bool {

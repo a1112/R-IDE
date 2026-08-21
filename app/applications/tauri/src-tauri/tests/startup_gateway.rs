@@ -3290,6 +3290,30 @@ async fn websocket_proxy_tunnels_socket_io_frames_and_rewrites_only_private_host
 }
 
 #[tokio::test]
+async fn websocket_proxy_accepts_engine_io_polling_session_upgrade_query() {
+    let backend = FakeWebSocketBackend::spawn_echo().await;
+    let frontend = TemporaryFrontend::new();
+    let gateway = bind_gateway(&frontend).await;
+    let cookie = bootstrap_session(&gateway).await;
+    let state = gateway.state();
+    let generation = state.begin_backend_start().await.unwrap();
+    state.backend_ready(generation, backend.addr).await.unwrap();
+    let public_origin = format!("http://{}", gateway.public_authority());
+    let target = "/socket.io/?EIO=4&transport=websocket&sid=n5ToRpZ9m1tS1OEIAAAA";
+    let request = websocket_client_request(&gateway, Some(&cookie), target, Some(&public_origin));
+
+    let (mut socket, response) = connect_async(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+    consume_backend_websocket_greeting(&mut socket).await;
+    socket.close(None).await.unwrap();
+
+    let observed = backend.finish().await;
+    assert_eq!(observed.len(), 1);
+    assert_eq!(observed[0].target, target);
+    gateway.shutdown().await;
+}
+
+#[tokio::test]
 async fn websocket_tunnel_limit_rejects_before_backend_contact_and_releases_after_client_close() {
     let backend = FakeWebSocketBackend::spawn_echo_connections(2).await;
     let frontend = TemporaryFrontend::new();
@@ -3525,6 +3549,24 @@ async fn websocket_proxy_fails_closed_for_invalid_auth_origin_route_and_handshak
         websocket_failure_status(wrong_socket_io_target).await,
         StatusCode::BAD_REQUEST
     );
+
+    for target in [
+        "/socket.io/?EIO=4&transport=websocket&sid=",
+        "/socket.io/?EIO=4&transport=websocket&sid=AAAAAAAAAAAAAAAAAAA",
+        "/socket.io/?EIO=4&transport=websocket&sid=AAAAAAAAAAAAAAAAAAAAA",
+        "/socket.io/?EIO=4&transport=websocket&sid=AAAAAAAAAAAAAAAAAAA+",
+        "/socket.io/?EIO=4&transport=websocket&sid=AAAAAAAAAAAAAAAAAAAA&extra=1",
+        "/socket.io/?EIO=4&transport=websocket&sid=AAAAAAAAAAAAAAAAAAAA&sid=BBBBBBBBBBBBBBBBBBBB",
+        "/socket.io/?transport=websocket&EIO=4&sid=AAAAAAAAAAAAAAAAAAAA",
+    ] {
+        let malformed_query =
+            websocket_client_request(&gateway, Some(&cookie), target, Some(&public_origin));
+        assert_eq!(
+            websocket_failure_status(malformed_query).await,
+            StatusCode::BAD_REQUEST,
+            "target {target:?}"
+        );
+    }
 
     let malformed = format!(
         "GET /socket.io/?EIO=4&transport=websocket HTTP/1.1\r\nHost: {}\r\nCookie: {cookie}\r\nOrigin: {public_origin}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\r\n",
