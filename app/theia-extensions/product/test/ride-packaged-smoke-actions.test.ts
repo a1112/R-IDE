@@ -1372,10 +1372,56 @@ test('smoke action accepts only the planned second file from a single-instance o
     preparation.dispose();
 });
 
+test('smoke action clicks the real startup Retry control and waits for the existing document to recover', async () => {
+    let retryVisible = false;
+    let alertVisible = true;
+    let clicks = 0;
+    const retry = {
+        disabled: false,
+        click: () => {
+            clicks++;
+        }
+    };
+    const startupDocument = {
+        querySelector: (selector: string) => {
+            if (selector === '[data-ride-startup-retry="true"]') {
+                return retryVisible ? retry : null;
+            }
+            if (selector === '[role="alert"]') {
+                return alertVisible ? {} : null;
+            }
+            return null;
+        }
+    };
+    const actions = new RidePackagedSmokeActionService(workspaceServices({
+        startupDocument,
+        pollIntervalMs: 1,
+        pollTimeoutMs: 100
+    }));
+    const operation = actions.backendRetry(plan({
+        scenario: 'backend-retry',
+        files: Object.freeze([]),
+        actions: Object.freeze<RideSmokeAction[]>(['backend-retry'])
+    }));
+
+    await turn();
+    assert.equal(clicks, 0);
+    retryVisible = true;
+    while (clicks === 0) {
+        await turn();
+    }
+    assert.equal(clicks, 1);
+    alertVisible = false;
+
+    assert.equal(await outcomeWithin(operation), undefined);
+    assert.equal(clicks, 1);
+});
+
 test('smoke action Task 5 methods fail safely when their production services are unavailable', async () => {
     const actions = new RidePackagedSmokeActionService(workspaceServices());
     await assert.rejects(actions.packagedPluginCommand(plan()), /Smoke action unavailable\./);
     await assert.rejects(actions.secondaryWindow(plan()), /Smoke action unavailable\./);
+    await assert.rejects(actions.backendRetry(plan()), /Smoke action unavailable\./);
     await assert.rejects(actions.waitForSecondFile(plan({ files: Object.freeze(['startup.R', 'forwarded.R']) })), /Smoke action unavailable\./);
 });
 

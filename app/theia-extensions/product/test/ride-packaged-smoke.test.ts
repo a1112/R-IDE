@@ -68,6 +68,15 @@ function criticalEmptyPlan(): RideSmokePlan {
     };
 }
 
+function backendRetryPlan(): RideSmokePlan {
+    return {
+        ...smokePlan(['backend-retry']),
+        scenario: 'backend-retry',
+        profile: 'tauri-critical',
+        files: []
+    };
+}
+
 function activeCriticalEmptyPlan(): unknown {
     return {
         mode: 'active',
@@ -310,6 +319,7 @@ function actions(
         scmStatus: action('scm-status'),
         packagedPluginCommand: action('packaged-plugin-command'),
         secondaryWindow: action('secondary-window'),
+        backendRetry: action('backend-retry'),
         prepareSecondFile: () => ({ dispose: () => undefined }),
         waitForSecondFile: action('second-file-forwarding'),
         ...overrides
@@ -823,7 +833,8 @@ test('packaged smoke binds active plans to the exact cross-language scenario mat
     const validPlans: RideSmokePlan[] = [
         { ...smokePlan([...FULL_ACTIONS]), scenario: 'critical-file', profile: 'tauri-critical' },
         { ...smokePlan([...EMPTY_ACTIONS]), scenario: 'critical-empty', profile: 'tauri-critical', files: [] },
-        { ...smokePlan([...FULL_ACTIONS]), scenario: 'full-file', profile: 'full' }
+        { ...smokePlan([...FULL_ACTIONS]), scenario: 'full-file', profile: 'full' },
+        backendRetryPlan()
     ];
     for (const plan of validPlans) {
         let actionResolutions = 0;

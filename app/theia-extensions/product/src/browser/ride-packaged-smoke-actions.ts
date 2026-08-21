@@ -135,6 +135,15 @@ interface OpenRequestsLike {
     ) => Disposable;
 }
 
+interface StartupElementLike {
+    readonly disabled?: boolean;
+    click?(): void;
+}
+
+interface StartupDocumentLike {
+    querySelector(selector: string): StartupElementLike | null;
+}
+
 interface ArmedSecondFileObservation extends Disposable {
     readonly expectedFile: string;
     readonly completion: Promise<void>;
@@ -152,6 +161,7 @@ export interface RidePackagedSmokeActionServices {
     readonly commandRegistry?: CommandRegistryLike;
     readonly applicationShell?: ApplicationShellLike;
     readonly openRequests?: OpenRequestsLike;
+    readonly startupDocument?: StartupDocumentLike;
     readonly backendIsWindows?: boolean;
     readonly pollIntervalMs?: number;
     readonly pollTimeoutMs?: number;
@@ -430,6 +440,31 @@ export class RidePackagedSmokeActionService implements RidePackagedSmokeActions,
                 throw this.error('Smoke action failed.');
             }
             while (widget.secondaryWindow === undefined) {
+                await run.delay(this.pollIntervalMs);
+            }
+        }, plan.actionTimeoutMs);
+    }
+
+    backendRetry(plan: RideSmokePlan): Promise<void> {
+        return this.runAction(plan, async run => {
+            const startupDocument: StartupDocumentLike | undefined = this.services.startupDocument
+                ?? (typeof globalThis.document === 'object'
+                    ? globalThis.document as unknown as StartupDocumentLike
+                    : undefined);
+            if (!startupDocument) {
+                throw this.error('Smoke action unavailable.');
+            }
+            let retry: StartupElementLike | null = null;
+            while (!retry || retry.disabled === true || typeof retry.click !== 'function') {
+                run.assertActive();
+                retry = startupDocument.querySelector('[data-ride-startup-retry="true"]');
+                if (!retry || retry.disabled === true || typeof retry.click !== 'function') {
+                    await run.delay(this.pollIntervalMs);
+                }
+            }
+            run.assertActive();
+            retry.click();
+            while (startupDocument.querySelector('[role="alert"]') !== null) {
                 await run.delay(this.pollIntervalMs);
             }
         }, plan.actionTimeoutMs);

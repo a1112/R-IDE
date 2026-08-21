@@ -19,11 +19,12 @@ export type RideSmokeAction =
     | 'scm-status'
     | 'packaged-plugin-command'
     | 'secondary-window'
-    | 'second-file-forwarding';
+    | 'second-file-forwarding'
+    | 'backend-retry';
 
 export interface RideSmokePlan {
     readonly specSha256: string;
-    readonly scenario: 'critical-file' | 'critical-empty' | 'full-file';
+    readonly scenario: 'critical-file' | 'critical-empty' | 'full-file' | 'backend-retry';
     readonly profile: 'tauri-critical' | 'full';
     readonly workspace: string;
     readonly files: readonly string[];
@@ -65,6 +66,7 @@ export interface RidePackagedSmokeActions {
     scmStatus(plan: RideSmokePlan): Promise<void>;
     packagedPluginCommand(plan: RideSmokePlan): Promise<void>;
     secondaryWindow(plan: RideSmokePlan): Promise<void>;
+    backendRetry(plan: RideSmokePlan): Promise<void>;
     prepareSecondFile(plan: RideSmokePlan): Disposable;
     waitForSecondFile(plan: RideSmokePlan): Promise<void>;
 }
@@ -130,7 +132,7 @@ type ParsedPlanResponse =
     | { readonly kind: 'active'; readonly session: ActiveSmokeSession }
     | { readonly kind: 'malformed'; readonly sessionProof?: string };
 
-const ACTIONS: readonly RideSmokeAction[] = [
+const FILE_ACTIONS: readonly RideSmokeAction[] = [
     'editor-save',
     'terminal-sentinel',
     'workspace-search',
@@ -139,18 +141,21 @@ const ACTIONS: readonly RideSmokeAction[] = [
     'secondary-window',
     'second-file-forwarding'
 ];
+const ACTIONS: readonly RideSmokeAction[] = [...FILE_ACTIONS, 'backend-retry'];
 const CRITICAL_EMPTY_ACTIONS: readonly RideSmokeAction[] = [
     'terminal-sentinel',
     'packaged-plugin-command'
 ];
+const BACKEND_RETRY_ACTIONS: readonly RideSmokeAction[] = ['backend-retry'];
 const SCENARIO_REQUIREMENTS: Readonly<Record<RideSmokePlan['scenario'], {
     readonly profile: RideSmokePlan['profile'];
     readonly fileCount: number;
     readonly actions: readonly RideSmokeAction[];
 }>> = Object.freeze({
-    'critical-file': Object.freeze({ profile: 'tauri-critical', fileCount: 2, actions: ACTIONS }),
+    'critical-file': Object.freeze({ profile: 'tauri-critical', fileCount: 2, actions: FILE_ACTIONS }),
     'critical-empty': Object.freeze({ profile: 'tauri-critical', fileCount: 0, actions: CRITICAL_EMPTY_ACTIONS }),
-    'full-file': Object.freeze({ profile: 'full', fileCount: 2, actions: ACTIONS })
+    'full-file': Object.freeze({ profile: 'full', fileCount: 2, actions: FILE_ACTIONS }),
+    'backend-retry': Object.freeze({ profile: 'tauri-critical', fileCount: 0, actions: BACKEND_RETRY_ACTIONS })
 });
 const PLAN_RESPONSE_KEYS = ['mode', 'plan', 'sessionProof', 'diagnostic'] as const;
 const PLAN_KEYS = [
@@ -334,6 +339,7 @@ export class RidePackagedSmokeContribution implements FrontendApplicationContrib
             case 'packaged-plugin-command': return smokeActions.packagedPluginCommand(plan);
             case 'secondary-window': return smokeActions.secondaryWindow(plan);
             case 'second-file-forwarding': return smokeActions.waitForSecondFile(plan);
+            case 'backend-retry': return smokeActions.backendRetry(plan);
         }
     }
 
@@ -546,7 +552,8 @@ function parseActivePlan(value: unknown): RideSmokePlan | undefined {
 }
 
 function isScenario(value: unknown): value is RideSmokePlan['scenario'] {
-    return value === 'critical-file' || value === 'critical-empty' || value === 'full-file';
+    return value === 'critical-file' || value === 'critical-empty' || value === 'full-file'
+        || value === 'backend-retry';
 }
 
 function isProfile(value: unknown): value is RideSmokePlan['profile'] {
