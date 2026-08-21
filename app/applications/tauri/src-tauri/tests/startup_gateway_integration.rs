@@ -7,12 +7,12 @@
  * SPDX-License-Identifier: MIT
  ********************************************************************************/
 
-use ride_tauri::sidecar::BackendReadinessPublisher;
+use ride_tauri::sidecar::{race_backend_publication_with_exit, BackendReadinessPublisher};
 use ride_tauri::startup::{
     GatewayCapabilitySpec, RuntimePathMode, RuntimePaths, StartupCoordinator,
     GATEWAY_CAPABILITY_PERMISSIONS,
 };
-use ride_tauri::startup_gateway::{BackendPhase, GatewayLimits};
+use ride_tauri::startup_gateway::{BackendPhase, GatewayError, GatewayLimits, StartupGateway};
 use ride_tauri::startup_metrics::{
     ElapsedClock, StartupMetrics, StartupMilestone, StartupMode, StartupReport, StartupReportWriter,
 };
@@ -28,6 +28,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 use tauri::WebviewUrl;
+use tokio::net::TcpListener;
+use tokio::sync::oneshot;
 use uuid::Uuid;
 
 struct TemporaryFrontend {
@@ -74,6 +76,14 @@ impl StartupReportWriter for ChannelWriter {
         self.0
             .send(serde_json::to_value(report).expect("serialize startup report"))
             .map_err(io::Error::other)
+    }
+}
+
+struct DropFlag(Arc<AtomicBool>);
+
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
     }
 }
 
@@ -222,23 +232,171 @@ async fn backend_readiness_publishes_private_generation_without_navigation() {
         gateway.public_authority(),
         launch.window_created_gate(),
     );
-    let navigation_count = 1;
+    let navigations = Arc::new(Mutex::new(Vec::new()));
+    let first_navigation = Arc::clone(&navigations);
+    assert!(launch.dispatch_initial_navigation(move |url| {
+        first_navigation.lock().unwrap().push(url);
+    }));
+    let duplicate_navigation = Arc::clone(&navigations);
+    assert!(!launch.dispatch_initial_navigation(move |url| {
+        duplicate_navigation.lock().unwrap().push(url);
+    }));
     launch.mark_window_created();
     let private = SocketAddr::from((Ipv4Addr::LOCALHOST, 32124));
     publisher
         .backend_ready(private)
         .await
         .expect("publish readiness");
+    let gateway_navigation = Arc::clone(&navigations);
+    assert!(!publisher
+        .dispatch_readiness_navigation(private.port(), None, move |url| {
+            gateway_navigation
+                .lock()
+                .unwrap()
+                .push(WebviewUrl::External(url));
+        })
+        .expect("gateway navigation decision"));
 
     assert_eq!(gateway.state().wait_for_backend().await.unwrap(), private);
+    let observed = navigations.lock().unwrap();
+    assert_eq!(observed.len(), 1);
+    assert!(matches!(
+        observed.first(),
+        Some(WebviewUrl::External(url)) if url.path().starts_with("/_ride/bootstrap/")
+    ));
+    drop(observed);
+
+    let legacy = BackendReadinessPublisher::legacy();
+    let legacy_navigations = Arc::new(Mutex::new(Vec::new()));
+    let first_legacy_navigation = Arc::clone(&legacy_navigations);
+    assert!(legacy
+        .dispatch_readiness_navigation(3000, Some("zh-CN"), move |url| {
+            first_legacy_navigation.lock().unwrap().push(url);
+        })
+        .expect("legacy readiness navigation"));
+    let duplicate_legacy_navigation = Arc::clone(&legacy_navigations);
+    assert!(!legacy
+        .dispatch_readiness_navigation(3000, Some("zh-CN"), move |url| {
+            duplicate_legacy_navigation.lock().unwrap().push(url);
+        })
+        .expect("duplicate legacy readiness navigation"));
+    let legacy_observed = legacy_navigations.lock().unwrap();
+    assert_eq!(legacy_observed.len(), 1);
     assert_eq!(
-        navigation_count, 1,
-        "readiness must not navigate the main window"
+        legacy_observed[0].as_str(),
+        "http://127.0.0.1:3000/?ride_locale=zh-CN"
     );
     assert_eq!(publisher.theia_hosts(), Some(gateway.public_authority()));
-    assert_eq!(BackendReadinessPublisher::legacy().theia_hosts(), None);
+    assert_eq!(legacy.theia_hosts(), None);
 
     launch.gateway.take().unwrap().shutdown().await;
+}
+
+#[tokio::test]
+async fn same_generation_exit_while_window_gate_waits_never_publishes_backend() {
+    let frontend = TemporaryFrontend::new();
+    let mut launch = StartupCoordinator::with_limits(
+        StartupMode::RustGateway,
+        disabled_metrics(StartupMode::RustGateway),
+        GatewayLimits::test_defaults(),
+    )
+    .launch(frontend.root.clone(), legacy_url())
+    .await
+    .expect("gateway launch");
+    let gateway = launch.gateway.as_ref().unwrap();
+    let publisher = BackendReadinessPublisher::gateway(
+        gateway.state(),
+        launch.backend_generation,
+        gateway.public_authority(),
+        launch.window_created_gate(),
+    );
+    let backend_listening_recorded = Arc::new(AtomicBool::new(false));
+    let observed_recording = Arc::clone(&backend_listening_recorded);
+    let (exit_sender, exit_receiver) = oneshot::channel();
+
+    let publication = tokio::spawn(async move {
+        race_backend_publication_with_exit(
+            async move { exit_receiver.await.expect("fake child exit") },
+            publisher.backend_ready_after_window(
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 32126)),
+                move || {
+                    observed_recording.store(true, Ordering::SeqCst);
+                    true
+                },
+            ),
+        )
+        .await
+    });
+    tokio::task::yield_now().await;
+    exit_sender.send("exit code: 1").unwrap();
+
+    let outcome = publication.await.expect("publication race task");
+    assert!(matches!(outcome, Err("exit code: 1")));
+    assert!(!backend_listening_recorded.load(Ordering::SeqCst));
+    let snapshot = gateway.state().snapshot().await;
+    assert_eq!(snapshot.generation, launch.backend_generation);
+    assert_eq!(snapshot.phase, BackendPhase::Starting);
+
+    launch.mark_window_created();
+    launch.gateway.take().unwrap().shutdown().await;
+}
+
+#[tokio::test]
+async fn slow_gateway_bind_falls_back_within_deadline_and_releases_listener() {
+    let frontend = TemporaryFrontend::new();
+    let deadline = Duration::from_millis(20);
+    let bind_dropped = Arc::new(AtomicBool::new(false));
+    let observed_drop = Arc::clone(&bind_dropped);
+    let (address_sender, address_receiver) = oneshot::channel();
+    let started = tokio::time::Instant::now();
+
+    let launch = StartupCoordinator::with_limits_and_deadline(
+        StartupMode::RustGateway,
+        disabled_metrics(StartupMode::RustGateway),
+        GatewayLimits::test_defaults(),
+        deadline,
+    )
+    .launch_with_gateway_bind(
+        frontend.root.clone(),
+        legacy_url(),
+        move |_frontend, _metrics, _limits| async move {
+            let _drop_flag = DropFlag(observed_drop);
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .map_err(|_| GatewayError::ListenerUnavailable)?;
+            address_sender.send(listener.local_addr().unwrap()).unwrap();
+            std::future::pending::<Result<StartupGateway, GatewayError>>().await
+        },
+    )
+    .await
+    .expect("deadline fallback");
+
+    assert_eq!(launch.mode, StartupMode::LegacyFallback);
+    assert!(launch.gateway.is_none());
+    assert_eq!(launch.initial_url, legacy_url());
+    assert!(
+        launch
+            .fallback_reason
+            .as_deref()
+            .is_some_and(
+                |reason| reason.contains("window visibility deadline") && reason.len() <= 256
+            )
+    );
+    assert!(started.elapsed() < Duration::from_millis(250));
+    assert!(bind_dropped.load(Ordering::SeqCst));
+
+    let bound_address = address_receiver.await.expect("slow binder address");
+    let rebound = TcpListener::bind(bound_address)
+        .await
+        .expect("timed-out binder must release its listener");
+    drop(rebound);
+
+    let navigation_count = Arc::new(Mutex::new(0_u8));
+    let observed_navigation = Arc::clone(&navigation_count);
+    assert!(launch.dispatch_initial_navigation(move |_| {
+        *observed_navigation.lock().unwrap() += 1;
+    }));
+    assert_eq!(*navigation_count.lock().unwrap(), 1);
 }
 
 #[tokio::test]

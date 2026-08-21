@@ -18,10 +18,13 @@ use crate::startup_metrics::StartupMilestone;
 use dirs::home_dir;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::fs;
+use std::future::Future;
 use std::io::BufRead;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, Url};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -33,9 +36,26 @@ pub(crate) const BACKEND_PORT: u16 = 3000;
 const BACKEND_PROBE_INTERVAL: Duration = Duration::from_millis(50);
 const BACKEND_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 
+pub async fn race_backend_publication_with_exit<E, P, T>(
+    child_exit: E,
+    publication: P,
+) -> Result<T, E::Output>
+where
+    E: Future,
+    P: Future<Output = T>,
+{
+    tokio::select! {
+        biased;
+        exit = child_exit => Err(exit),
+        published = publication => Ok(published),
+    }
+}
+
 #[derive(Clone)]
 pub enum BackendReadinessPublisher {
-    Legacy,
+    Legacy {
+        navigation_dispatched: Arc<AtomicBool>,
+    },
     Gateway {
         state: GatewayState,
         generation: BackendGeneration,
@@ -46,7 +66,9 @@ pub enum BackendReadinessPublisher {
 
 impl BackendReadinessPublisher {
     pub fn legacy() -> Self {
-        Self::Legacy
+        Self::Legacy {
+            navigation_dispatched: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     pub fn gateway(
@@ -65,7 +87,7 @@ impl BackendReadinessPublisher {
 
     pub fn theia_hosts(&self) -> Option<String> {
         match self {
-            Self::Legacy => None,
+            Self::Legacy { .. } => None,
             Self::Gateway {
                 public_authority, ..
             } => Some(public_authority.clone()),
@@ -87,7 +109,7 @@ impl BackendReadinessPublisher {
         F: FnOnce() -> bool + Send,
     {
         match self {
-            Self::Legacy => Ok(before_publish()),
+            Self::Legacy { .. } => Ok(before_publish()),
             Self::Gateway {
                 state,
                 generation,
@@ -101,6 +123,34 @@ impl BackendReadinessPublisher {
                     .map_err(|error| error.to_string())
             }
         }
+    }
+
+    pub fn dispatch_readiness_navigation(
+        &self,
+        port: u16,
+        locale: Option<&str>,
+        navigate: impl FnOnce(Url),
+    ) -> Result<bool, String> {
+        let navigation_dispatched = match self {
+            Self::Gateway { .. } => return Ok(false),
+            Self::Legacy {
+                navigation_dispatched,
+            } => navigation_dispatched,
+        };
+        if navigation_dispatched
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(false);
+        }
+
+        let mut url = Url::parse(&format!("http://127.0.0.1:{port}/"))
+            .map_err(|error| format!("Failed to build backend frontend URL: {error}"))?;
+        if let Some(locale) = locale {
+            url.query_pairs_mut().append_pair("ride_locale", locale);
+        }
+        navigate(url);
+        Ok(true)
     }
 
     pub async fn backend_failed(&self) {
@@ -349,9 +399,14 @@ fn get_frontend_dir(paths: &RuntimePaths) -> Option<PathBuf> {
     None
 }
 
-fn announce_backend_port(app_handle: &AppHandle, port: u16) {
-    let _ = app_handle.emit("backend-ready", port);
-    navigate_main_window_to_backend(app_handle, port);
+fn announce_backend_port(app_handle: &AppHandle, port: u16, publisher: &BackendReadinessPublisher) {
+    let locale = system_locale();
+    if let Err(error) = publisher.dispatch_readiness_navigation(port, locale.as_deref(), |url| {
+        let _ = app_handle.emit("backend-ready", port);
+        navigate_main_window_to_backend(app_handle, url);
+    }) {
+        log::warn!("Failed to prepare backend navigation: {error}");
+    }
 }
 
 pub fn publish_backend_listening_in_order(
@@ -384,8 +439,8 @@ async fn publish_backend_listening(
             true
         })
         .await?;
-    if published && matches!(publisher, BackendReadinessPublisher::Legacy) {
-        announce_backend_port(app_handle, port);
+    if published {
+        announce_backend_port(app_handle, port, publisher);
     }
     Ok(published)
 }
@@ -409,22 +464,11 @@ fn register_backend_pid(
         .unwrap_or(false)
 }
 
-fn navigate_main_window_to_backend(app_handle: &AppHandle, port: u16) {
+fn navigate_main_window_to_backend(app_handle: &AppHandle, url: Url) {
     let Some(window) = app_handle.get_webview_window("main") else {
         log::warn!("Main window is not available for backend navigation");
         return;
     };
-
-    let mut url = match Url::parse(&format!("http://127.0.0.1:{}/", port)) {
-        Ok(url) => url,
-        Err(e) => {
-            log::warn!("Failed to build backend frontend URL: {}", e);
-            return;
-        }
-    };
-    if let Some(locale) = system_locale() {
-        url.query_pairs_mut().append_pair("ride_locale", &locale);
-    }
 
     let target = url.clone();
     if let Err(e) = app_handle.run_on_main_thread(move || {
@@ -1051,7 +1095,24 @@ async fn start_node_backend_process(
     }
     log::info!("Backend ready on port {}", ready_port);
     let pid = child_pid.expect("PTY backend readiness requires an owned process id");
-    if !publish_backend_listening(app_handle, pid, ready_port, &publisher).await? {
+    let published = match race_backend_publication_with_exit(
+        exit_rx.recv(),
+        publish_backend_listening(app_handle, pid, ready_port, &publisher),
+    )
+    .await
+    {
+        Ok(published) => published?,
+        Err(exit) => {
+            clear_backend_process(app_handle, pid);
+            return Err(match exit {
+                Some(exit) => {
+                    format!("Backend process exited before PTY readiness publication: {exit}")
+                }
+                None => "Backend PTY exit channel closed before readiness publication".to_string(),
+            });
+        }
+    };
+    if !published {
         let fallback = kill_portable_child_async(pty_killer).await;
         let reaped = tokio::time::timeout(Duration::from_secs(5), exit_rx.recv()).await;
         clear_backend_process(app_handle, pid);
@@ -1467,17 +1528,39 @@ async fn start_backend_direct_process(
                     ),
                 });
             }
-            if let Err(error) = apply_backend_startup_actions(
+            let publication = apply_backend_startup_actions(
                 app_handle,
                 startup_state.observe(BackendStartupEvent::LoopbackConnected),
                 &publisher,
-            ).await {
-                let cleanup = kill_and_reap_backend_child(&mut child).await;
-                clear_backend_process(app_handle, pid);
-                return Err(match cleanup {
-                    Ok(()) => error,
-                    Err(cleanup) => format!("{error}; cleanup failed: {cleanup}"),
-                });
+            );
+            match race_backend_publication_with_exit(child.wait(), publication).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    let cleanup = kill_and_reap_backend_child(&mut child).await;
+                    clear_backend_process(app_handle, pid);
+                    return Err(match cleanup {
+                        Ok(()) => error,
+                        Err(cleanup) => format!("{error}; cleanup failed: {cleanup}"),
+                    });
+                }
+                Err(Ok(status)) => {
+                    clear_backend_process(app_handle, pid);
+                    return Err(format!(
+                        "Backend process exited before readiness publication: {status}"
+                    ));
+                }
+                Err(Err(error)) => {
+                    let cleanup = terminate_and_reap_backend(&mut child, Some(pid)).await;
+                    clear_backend_process(app_handle, pid);
+                    return Err(match cleanup {
+                        Ok(()) => format!(
+                            "Failed to wait for backend during readiness publication: {error}"
+                        ),
+                        Err(cleanup) => format!(
+                            "Failed to wait for backend during readiness publication: {error}; cleanup failed: {cleanup}"
+                        ),
+                    });
+                }
             }
             let app_handle_exit = app_handle.clone();
             let exit_publisher = publisher.clone();

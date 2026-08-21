@@ -362,7 +362,12 @@ pub fn run() {
                 }
                 None => sidecar::BackendReadinessPublisher::legacy(),
             };
-            main_window_config.url = launch.initial_url.clone();
+            if !launch.dispatch_initial_navigation(|url| main_window_config.url = url) {
+                return Err(std::io::Error::other(
+                    "main window initial navigation was already dispatched",
+                )
+                .into());
+            }
             *app.state::<AppState>().gateway.lock().unwrap() = launch.gateway.take();
 
             let app_handle = app.handle().clone();

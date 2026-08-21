@@ -9,6 +9,7 @@
 
 use std::ffi::OsString;
 use std::fmt;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -91,6 +92,7 @@ pub struct StartupLaunch {
     pub backend_generation: BackendGeneration,
     pub fallback_reason: Option<String>,
     window_created: StartupWindowCreatedGate,
+    initial_navigation_dispatched: AtomicBool,
 }
 
 impl StartupLaunch {
@@ -100,6 +102,18 @@ impl StartupLaunch {
 
     pub fn mark_window_created(&self) {
         self.window_created.mark_created();
+    }
+
+    pub fn dispatch_initial_navigation(&self, navigate: impl FnOnce(tauri::WebviewUrl)) -> bool {
+        if self
+            .initial_navigation_dispatched
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        navigate(self.initial_url.clone());
+        true
     }
 }
 
@@ -124,6 +138,7 @@ pub struct StartupCoordinator {
     requested_mode: StartupMode,
     metrics: StartupMetrics,
     limits: GatewayLimits,
+    gateway_deadline: Duration,
 }
 
 impl StartupCoordinator {
@@ -136,10 +151,25 @@ impl StartupCoordinator {
         metrics: StartupMetrics,
         limits: GatewayLimits,
     ) -> Self {
+        Self::with_limits_and_deadline(
+            requested_mode,
+            metrics,
+            limits,
+            crate::GATEWAY_WINDOW_VISIBLE_DEADLINE,
+        )
+    }
+
+    pub fn with_limits_and_deadline(
+        requested_mode: StartupMode,
+        metrics: StartupMetrics,
+        limits: GatewayLimits,
+        gateway_deadline: Duration,
+    ) -> Self {
         Self {
             requested_mode,
             metrics,
             limits,
+            gateway_deadline,
         }
     }
 
@@ -148,6 +178,24 @@ impl StartupCoordinator {
         gateway_frontend_directory: PathBuf,
         legacy_initial_url: tauri::WebviewUrl,
     ) -> Result<StartupLaunch, StartupCoordinatorError> {
+        self.launch_with_gateway_bind(
+            gateway_frontend_directory,
+            legacy_initial_url,
+            StartupGateway::bind,
+        )
+        .await
+    }
+
+    pub async fn launch_with_gateway_bind<B, BindFuture>(
+        self,
+        gateway_frontend_directory: PathBuf,
+        legacy_initial_url: tauri::WebviewUrl,
+        bind_gateway: B,
+    ) -> Result<StartupLaunch, StartupCoordinatorError>
+    where
+        B: FnOnce(PathBuf, StartupMetrics, GatewayLimits) -> BindFuture,
+        BindFuture: Future<Output = Result<StartupGateway, GatewayError>>,
+    {
         let window_created = StartupWindowCreatedGate::default();
         if self.requested_mode != StartupMode::RustGateway {
             return Ok(StartupLaunch {
@@ -157,17 +205,21 @@ impl StartupCoordinator {
                 backend_generation: BackendGeneration::UNMANAGED,
                 fallback_reason: None,
                 window_created,
+                initial_navigation_dispatched: AtomicBool::new(false),
             });
         }
 
-        match StartupGateway::bind(
-            gateway_frontend_directory,
-            self.metrics.clone(),
-            self.limits,
+        match tokio::time::timeout(
+            self.gateway_deadline,
+            bind_gateway(
+                gateway_frontend_directory,
+                self.metrics.clone(),
+                self.limits,
+            ),
         )
         .await
         {
-            Ok(gateway) => {
+            Ok(Ok(gateway)) => {
                 let backend_generation = gateway
                     .state()
                     .begin_backend_start()
@@ -181,19 +233,29 @@ impl StartupCoordinator {
                     backend_generation,
                     fallback_reason: None,
                     window_created,
+                    initial_navigation_dispatched: AtomicBool::new(false),
                 })
             }
-            Err(error) => {
+            bind_result => {
                 self.metrics
                     .select_effective_mode(StartupMode::LegacyFallback)
                     .map_err(StartupCoordinatorError::Metrics)?;
+                let fallback_reason = match bind_result {
+                    Ok(Err(error)) => bounded_gateway_failure(&error),
+                    Err(_) => bounded_gateway_failure_text(&format!(
+                        "startup gateway initialization exceeded the {}ms window visibility deadline",
+                        self.gateway_deadline.as_millis()
+                    )),
+                    Ok(Ok(_)) => unreachable!("successful gateway bind handled above"),
+                };
                 Ok(StartupLaunch {
                     mode: StartupMode::LegacyFallback,
                     initial_url: legacy_initial_url,
                     gateway: None,
                     backend_generation: BackendGeneration::UNMANAGED,
-                    fallback_reason: Some(bounded_gateway_failure(&error)),
+                    fallback_reason: Some(fallback_reason),
                     window_created,
+                    initial_navigation_dispatched: AtomicBool::new(false),
                 })
             }
         }
@@ -201,8 +263,12 @@ impl StartupCoordinator {
 }
 
 fn bounded_gateway_failure(error: &GatewayError) -> String {
+    bounded_gateway_failure_text(&error.to_string())
+}
+
+fn bounded_gateway_failure_text(reason: &str) -> String {
     const MAX_CHARS: usize = 256;
-    error.to_string().chars().take(MAX_CHARS).collect()
+    reason.chars().take(MAX_CHARS).collect()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -781,6 +781,26 @@ pub struct StartupGateway {
     accept_task: JoinHandle<()>,
 }
 
+struct PendingAcceptTask(Option<JoinHandle<()>>);
+
+impl PendingAcceptTask {
+    fn new(task: JoinHandle<()>) -> Self {
+        Self(Some(task))
+    }
+
+    fn commit(mut self) -> JoinHandle<()> {
+        self.0.take().expect("pending accept task must be present")
+    }
+}
+
+impl Drop for PendingAcceptTask {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
+}
+
 impl StartupGateway {
     pub async fn bind(
         frontend_root: PathBuf,
@@ -850,7 +870,7 @@ impl StartupGateway {
         let (shutdown, shutdown_receiver) = watch::channel(false);
         let (accept_ready, ready) = oneshot::channel();
         let accept_state = state.clone();
-        let accept_task = tokio::spawn(async move {
+        let accept_task = PendingAcceptTask::new(tokio::spawn(async move {
             let accept_loop = run_accept_loop(
                 listener,
                 service,
@@ -865,9 +885,10 @@ impl StartupGateway {
                 log::warn!("Startup gateway accept loop panicked.");
                 accept_state.shutdown().await;
             }
-        });
+        }));
         ready.await.map_err(|_| GatewayError::ListenerStopped)?;
         metrics.record_or_warn(StartupMilestone::GatewayListening);
+        let accept_task = accept_task.commit();
 
         Ok(Self {
             public_addr,
