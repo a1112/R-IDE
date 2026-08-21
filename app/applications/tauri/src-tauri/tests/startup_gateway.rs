@@ -1338,10 +1338,17 @@ async fn http_proxy_preserves_end_to_end_request_and_response_semantics() {
                 .header(SET_COOKIE, "theme=dark; Path=/")
                 .header(SET_COOKIE, "ride_session=backend-value; Path=/")
                 .header(SET_COOKIE, "application=value; HttpOnly")
-                .header("connection", "x-response-hop")
+                .header("connection", "x-response-hop, x-response-hop-second")
                 .header("x-response-hop", "private")
+                .header("x-response-hop-second", "private")
+                .header("proxy-connection", "keep-alive")
                 .header("keep-alive", "timeout=5")
+                .header("transfer-encoding", "gzip, chunked")
+                .header("te", "trailers")
+                .header("trailer", "x-response-trailer")
+                .header("upgrade", "h2c")
                 .header("proxy-authenticate", "Basic realm=private")
+                .header("proxy-authorization", "Basic private")
                 .body(full_test_body("proxied response"))
                 .unwrap()
         }
@@ -1368,12 +1375,19 @@ async fn http_proxy_preserves_end_to_end_request_and_response_semantics() {
                 ("origin", public_origin.as_str()),
                 ("x-request-value", "first"),
                 ("x-request-value", "second"),
-                ("connection", "x-request-hop, keep-alive"),
+                (
+                    "connection",
+                    "x-request-hop, x-request-hop-second, keep-alive",
+                ),
                 ("x-request-hop", "private"),
+                ("x-request-hop-second", "private"),
                 ("proxy-connection", "keep-alive"),
                 ("keep-alive", "timeout=5"),
+                ("transfer-encoding", "gzip, chunked"),
                 ("te", "trailers"),
                 ("trailer", "x-trailer"),
+                ("upgrade", "h2c"),
+                ("proxy-authenticate", "Basic realm=private"),
                 ("proxy-authorization", "Basic private"),
             ],
             full_test_body("proxied request"),
@@ -1407,14 +1421,25 @@ async fn http_proxy_preserves_end_to_end_request_and_response_semantics() {
     for removed in [
         "connection",
         "x-response-hop",
+        "x-response-hop-second",
+        "proxy-connection",
         "keep-alive",
+        "te",
+        "trailer",
+        "upgrade",
         "proxy-authenticate",
+        "proxy-authorization",
     ] {
         assert!(
             !response.headers().contains_key(removed),
             "response leaked {removed}"
         );
     }
+    assert!(response
+        .headers()
+        .get_all("transfer-encoding")
+        .iter()
+        .all(|value| !value.to_str().unwrap().contains("gzip")));
     assert_eq!(
         response_bytes(response).await,
         Bytes::from_static(b"proxied response")
@@ -1448,10 +1473,13 @@ async fn http_proxy_preserves_end_to_end_request_and_response_semantics() {
     for removed in [
         "connection",
         "x-request-hop",
+        "x-request-hop-second",
         "proxy-connection",
         "keep-alive",
         "te",
         "trailer",
+        "upgrade",
+        "proxy-authenticate",
         "proxy-authorization",
     ] {
         assert!(
@@ -1459,6 +1487,11 @@ async fn http_proxy_preserves_end_to_end_request_and_response_semantics() {
             "request leaked {removed}"
         );
     }
+    assert!(observed
+        .headers
+        .get_all("transfer-encoding")
+        .iter()
+        .all(|value| !value.to_str().unwrap().contains("gzip")));
     gateway.shutdown().await;
     backend.shutdown().await;
 }
@@ -1714,7 +1747,22 @@ async fn http_proxy_streams_32_mib_upload_and_download_without_aggregation() {
     );
 
     let mut body = response.into_body();
-    let mut download_total = 0_usize;
+    let first_data = loop {
+        let frame = body
+            .frame()
+            .await
+            .expect("streaming download ended before its first data frame")
+            .unwrap();
+        if let Some(data) = frame.into_data().ok() {
+            break data;
+        }
+    };
+    assert!(first_data.iter().all(|byte| *byte == 9));
+    assert!(
+        download_produced.load(Ordering::SeqCst) < STREAM_CHUNK_COUNT,
+        "gateway buffered the complete download before forwarding its first body frame"
+    );
+    let mut download_total = first_data.len();
     while let Some(frame) = body.frame().await {
         let frame = frame.unwrap();
         if let Some(data) = frame.data_ref() {
