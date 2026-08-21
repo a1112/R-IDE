@@ -74,6 +74,7 @@ struct ObservedWebSocketHandshake {
 
 struct FakeWebSocketBackend {
     addr: SocketAddr,
+    accepted: Arc<AtomicUsize>,
     task: JoinHandle<Vec<ObservedWebSocketHandshake>>,
 }
 
@@ -85,90 +86,112 @@ impl FakeWebSocketBackend {
     async fn spawn_echo_connections(connection_count: usize) -> Self {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let task_accepted = accepted.clone();
         let task = tokio::spawn(async move {
-            let mut handshakes = Vec::with_capacity(connection_count);
-            for _ in 0..connection_count {
+            let mut connections = JoinSet::new();
+            for index in 0..connection_count {
                 let (stream, _) = listener.accept().await.unwrap();
-                let observed = Arc::new(std::sync::Mutex::new(None));
-                let callback_observed = observed.clone();
-                let mut socket = accept_hdr_async(
-                    stream,
-                    move |request: &WebSocketRequest, mut response: WebSocketResponse| {
-                        *callback_observed.lock().unwrap() = Some(ObservedWebSocketHandshake {
-                            target: request.uri().to_string(),
-                            host: request
-                                .headers()
-                                .get(HOST)
-                                .unwrap()
-                                .to_str()
-                                .unwrap()
-                                .to_string(),
-                            origin: request
-                                .headers()
-                                .get(ORIGIN)
-                                .unwrap()
-                                .to_str()
-                                .unwrap()
-                                .to_string(),
-                            cookie: request
-                                .headers()
-                                .get(COOKIE)
-                                .map(|value| value.to_str().unwrap().to_string()),
-                        });
-                        response
-                            .headers_mut()
-                            .append(SET_COOKIE, "theme=dark; Path=/".parse().unwrap());
-                        response.headers_mut().append(
-                            SET_COOKIE,
-                            "ride_session=backend-value; Path=/".parse().unwrap(),
-                        );
-                        Ok(response)
-                    },
-                )
-                .await
-                .unwrap();
+                task_accepted.fetch_add(1, Ordering::SeqCst);
+                connections.spawn(async move {
+                    let observed = Arc::new(std::sync::Mutex::new(None));
+                    let callback_observed = observed.clone();
+                    let mut socket = accept_hdr_async(
+                        stream,
+                        move |request: &WebSocketRequest, mut response: WebSocketResponse| {
+                            *callback_observed.lock().unwrap() = Some(ObservedWebSocketHandshake {
+                                target: request.uri().to_string(),
+                                host: request
+                                    .headers()
+                                    .get(HOST)
+                                    .unwrap()
+                                    .to_str()
+                                    .unwrap()
+                                    .to_string(),
+                                origin: request
+                                    .headers()
+                                    .get(ORIGIN)
+                                    .unwrap()
+                                    .to_str()
+                                    .unwrap()
+                                    .to_string(),
+                                cookie: request
+                                    .headers()
+                                    .get(COOKIE)
+                                    .map(|value| value.to_str().unwrap().to_string()),
+                            });
+                            response
+                                .headers_mut()
+                                .append(SET_COOKIE, "theme=dark; Path=/".parse().unwrap());
+                            response.headers_mut().append(
+                                SET_COOKIE,
+                                "ride_session=backend-value; Path=/".parse().unwrap(),
+                            );
+                            Ok(response)
+                        },
+                    )
+                    .await
+                    .unwrap();
 
-                socket
-                    .send(Message::Text("backend-text".into()))
-                    .await
-                    .unwrap();
-                socket
-                    .send(Message::Binary(vec![9_u8, 8, 7].into()))
-                    .await
-                    .unwrap();
-                while let Some(message) = socket.next().await {
-                    let Ok(message) = message else {
-                        break;
-                    };
-                    match message {
-                        message @ (Message::Text(_) | Message::Binary(_)) => {
-                            if socket.send(message).await.is_err() {
-                                break;
-                            }
-                        }
-                        Message::Close(frame) => {
-                            let _ = socket.close(frame).await;
+                    socket
+                        .send(Message::Text("backend-text".into()))
+                        .await
+                        .unwrap();
+                    socket
+                        .send(Message::Binary(vec![9_u8, 8, 7].into()))
+                        .await
+                        .unwrap();
+                    while let Some(message) = socket.next().await {
+                        let Ok(message) = message else {
                             break;
-                        }
-                        Message::Ping(payload) => {
-                            if socket.send(Message::Pong(payload)).await.is_err() {
+                        };
+                        match message {
+                            message @ (Message::Text(_) | Message::Binary(_)) => {
+                                if socket.send(message).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Message::Close(frame) => {
+                                let _ = socket.close(frame).await;
                                 break;
                             }
+                            Message::Ping(payload) => {
+                                if socket.send(Message::Pong(payload)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Message::Pong(_) | Message::Frame(_) => {}
                         }
-                        Message::Pong(_) | Message::Frame(_) => {}
                     }
-                }
-                handshakes.push(
-                    Arc::try_unwrap(observed)
-                        .unwrap()
-                        .into_inner()
-                        .unwrap()
-                        .unwrap(),
-                );
+                    (
+                        index,
+                        Arc::try_unwrap(observed)
+                            .unwrap()
+                            .into_inner()
+                            .unwrap()
+                            .unwrap(),
+                    )
+                });
             }
+            let mut handshakes = Vec::with_capacity(connection_count);
+            while let Some(result) = connections.join_next().await {
+                handshakes.push(result.unwrap());
+            }
+            handshakes.sort_by_key(|(index, _)| *index);
             handshakes
+                .into_iter()
+                .map(|(_, handshake)| handshake)
+                .collect()
         });
-        Self { addr, task }
+        Self {
+            addr,
+            accepted,
+            task,
+        }
+    }
+
+    fn accepted_connections(&self) -> usize {
+        self.accepted.load(Ordering::SeqCst)
     }
 
     async fn finish(self) -> Vec<ObservedWebSocketHandshake> {
@@ -415,6 +438,24 @@ fn websocket_client_request(
     request
 }
 
+fn fixed_key_websocket_client_request(
+    gateway: &StartupGateway,
+    cookie: &str,
+    origin: &str,
+) -> WebSocketRequest {
+    let mut request = websocket_client_request(
+        gateway,
+        Some(cookie),
+        "/socket.io/?EIO=4&transport=websocket",
+        Some(origin),
+    );
+    request.headers_mut().insert(
+        "sec-websocket-key",
+        "dGhlIHNhbXBsZSBub25jZQ==".parse().unwrap(),
+    );
+    request
+}
+
 async fn consume_backend_websocket_greeting<S>(socket: &mut tokio_tungstenite::WebSocketStream<S>)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -572,7 +613,7 @@ fn raw_authenticated_request(
 
 struct RawResponseBackend {
     addr: SocketAddr,
-    task: JoinHandle<()>,
+    task: JoinHandle<Vec<Vec<u8>>>,
 }
 
 impl RawResponseBackend {
@@ -580,6 +621,7 @@ impl RawResponseBackend {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
+            let mut requests = Vec::with_capacity(responses.len());
             for response in responses {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut request = Vec::new();
@@ -590,15 +632,21 @@ impl RawResponseBackend {
                     request.extend_from_slice(&buffer[..read]);
                     assert!(request.len() <= 16 * 1024);
                 }
+                requests.push(request);
                 stream.write_all(&response).await.unwrap();
                 let _ = stream.shutdown().await;
             }
+            requests
         });
         Self { addr, task }
     }
 
     async fn finish(self) {
-        self.task.await.unwrap();
+        let _ = self.finish_with_requests().await;
+    }
+
+    async fn finish_with_requests(self) -> Vec<Vec<u8>> {
+        self.task.await.unwrap()
     }
 }
 
@@ -1019,6 +1067,42 @@ async fn bind_rejects_zero_max_connections_with_a_typed_bounded_error() {
         Err(GatewayError::InvalidLimits(GatewayLimitError::ZeroMaxConnections)) => {}
         _ => panic!("zero max_connections did not return the typed configuration error"),
     }
+}
+
+#[tokio::test]
+async fn bind_rejects_zero_websocket_limits_with_typed_bounded_errors() {
+    let frontend = TemporaryFrontend::new();
+    let zero_tunnels = StartupGateway::bind(
+        frontend.root.clone(),
+        disabled_metrics(),
+        GatewayLimits {
+            max_tunnels: 0,
+            ..GatewayLimits::test_defaults()
+        },
+    )
+    .await;
+    assert!(matches!(
+        zero_tunnels,
+        Err(GatewayError::InvalidLimits(
+            GatewayLimitError::ZeroMaxTunnels
+        ))
+    ));
+
+    let zero_upgrade_timeout = StartupGateway::bind(
+        frontend.root.clone(),
+        disabled_metrics(),
+        GatewayLimits {
+            websocket_upgrade_timeout: Duration::ZERO,
+            ..GatewayLimits::test_defaults()
+        },
+    )
+    .await;
+    assert!(matches!(
+        zero_upgrade_timeout,
+        Err(GatewayError::InvalidLimits(
+            GatewayLimitError::ZeroWebSocketUpgradeTimeout
+        ))
+    ));
 }
 
 #[tokio::test]
@@ -2678,6 +2762,196 @@ async fn websocket_proxy_tunnels_socket_io_frames_and_rewrites_only_private_host
 }
 
 #[tokio::test]
+async fn websocket_tunnel_limit_rejects_before_backend_contact_and_releases_after_client_close() {
+    let backend = FakeWebSocketBackend::spawn_echo_connections(2).await;
+    let frontend = TemporaryFrontend::new();
+    let gateway = StartupGateway::bind(
+        frontend.root.clone(),
+        disabled_metrics(),
+        GatewayLimits {
+            max_tunnels: 1,
+            ..GatewayLimits::test_defaults()
+        },
+    )
+    .await
+    .unwrap();
+    let cookie = bootstrap_session(&gateway).await;
+    let state = gateway.state();
+    let generation = state.begin_backend_start().await.unwrap();
+    state.backend_ready(generation, backend.addr).await.unwrap();
+    let public_origin = format!("http://{}", gateway.public_authority());
+
+    let first_request = websocket_client_request(
+        &gateway,
+        Some(&cookie),
+        "/socket.io/?EIO=4&transport=websocket",
+        Some(&public_origin),
+    );
+    let (mut first, _) = connect_async(first_request).await.unwrap();
+    consume_backend_websocket_greeting(&mut first).await;
+    assert_eq!(backend.accepted_connections(), 1);
+
+    let saturated_request = websocket_client_request(
+        &gateway,
+        Some(&cookie),
+        "/socket.io/?EIO=4&transport=websocket",
+        Some(&public_origin),
+    );
+    let started = tokio::time::Instant::now();
+    let (status, body) = websocket_failure_details(saturated_request).await;
+    assert!(started.elapsed() < Duration::from_millis(250));
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        body.as_deref(),
+        Some(b"{\"error\":\"backend_unavailable\"}".as_slice())
+    );
+    assert!(body.as_ref().is_some_and(|body| body.len() <= 64));
+    assert_eq!(backend.accepted_connections(), 1);
+
+    first.close(None).await.unwrap();
+    drop(first);
+    let (mut replacement, _) = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let request = websocket_client_request(
+                &gateway,
+                Some(&cookie),
+                "/socket.io/?EIO=4&transport=websocket",
+                Some(&public_origin),
+            );
+            match connect_async(request).await {
+                Ok(connection) => break connection,
+                Err(tokio_tungstenite::tungstenite::Error::Http(response))
+                    if response.status() == StatusCode::SERVICE_UNAVAILABLE =>
+                {
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => panic!("replacement WebSocket failed: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("released tunnel permit did not admit a replacement");
+    consume_backend_websocket_greeting(&mut replacement).await;
+    replacement.close(None).await.unwrap();
+
+    assert_eq!(backend.finish().await.len(), 2);
+    gateway.shutdown().await;
+}
+
+#[tokio::test]
+async fn websocket_public_abort_before_backend_101_releases_permit_without_rpc() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let backend_addr = listener.local_addr().unwrap();
+    let (first_observed_sender, first_observed) = oneshot::channel();
+    let (release_first_sender, release_first) = oneshot::channel();
+    let backend_task = tokio::spawn(async move {
+        let (mut first, _) = listener.accept().await.unwrap();
+        let mut first_headers = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        while !first_headers.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = first.read(&mut buffer).await.unwrap();
+            assert_ne!(read, 0);
+            first_headers.extend_from_slice(&buffer[..read]);
+        }
+        let _ = first_observed_sender.send(());
+        let first_task = tokio::spawn(async move {
+            let _ = release_first.await;
+            let _ = first
+                .write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n")
+                .await;
+            let _ = first.shutdown().await;
+        });
+
+        let (mut replacement, _) = listener.accept().await.unwrap();
+        let mut replacement_headers = Vec::new();
+        while !replacement_headers
+            .windows(4)
+            .any(|window| window == b"\r\n\r\n")
+        {
+            let read = replacement.read(&mut buffer).await.unwrap();
+            assert_ne!(read, 0);
+            replacement_headers.extend_from_slice(&buffer[..read]);
+        }
+        replacement
+            .write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n")
+            .await
+            .unwrap();
+        let _ = replacement.shutdown().await;
+        first_task.await.unwrap();
+    });
+    let (reports_sender, reports) = mpsc::channel();
+    let metrics = StartupMetrics::with_clock_and_writer(
+        "test",
+        "test",
+        14,
+        StartupMode::RustGateway,
+        Arc::new(ZeroClock),
+        Box::new(ChannelWriter(reports_sender)),
+    );
+    metrics.record(StartupMilestone::ProcessStarted).unwrap();
+    let frontend = TemporaryFrontend::new();
+    let gateway = StartupGateway::bind(
+        frontend.root.clone(),
+        metrics.clone(),
+        GatewayLimits {
+            backend_response_header_timeout: Duration::from_secs(5),
+            max_tunnels: 1,
+            ..GatewayLimits::test_defaults()
+        },
+    )
+    .await
+    .unwrap();
+    let cookie = bootstrap_session(&gateway).await;
+    metrics
+        .record(StartupMilestone::FrontendRequestStarted)
+        .unwrap();
+    metrics.record(StartupMilestone::BackendSpawned).unwrap();
+    let state = gateway.state();
+    let generation = state.begin_backend_start().await.unwrap();
+    state.backend_ready(generation, backend_addr).await.unwrap();
+    metrics.record(StartupMilestone::BackendListening).unwrap();
+    receive_report_with_milestone(&reports, "backend_listening");
+    let public_origin = format!("http://{}", gateway.public_authority());
+
+    let mut public = TcpStream::connect(gateway_addr(&gateway)).await.unwrap();
+    let request = format!(
+        "GET /socket.io/?EIO=4&transport=websocket HTTP/1.1\r\nHost: {}\r\nCookie: {cookie}\r\nOrigin: {public_origin}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+        gateway.public_authority()
+    );
+    public.write_all(request.as_bytes()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), first_observed)
+        .await
+        .expect("backend did not observe the first upgrade")
+        .unwrap();
+    drop(public);
+    assert!(reports.recv_timeout(Duration::from_millis(50)).is_err());
+
+    let (replacement, _) = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let replacement_request =
+                fixed_key_websocket_client_request(&gateway, &cookie, &public_origin);
+            match connect_async(replacement_request).await {
+                Ok(connection) => break connection,
+                Err(tokio_tungstenite::tungstenite::Error::Http(response))
+                    if response.status() == StatusCode::SERVICE_UNAVAILABLE =>
+                {
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => panic!("replacement WebSocket failed: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("public abort before backend 101 did not release the tunnel permit");
+    drop(replacement);
+    receive_report_with_milestone(&reports, "rpc_connected");
+    let _ = release_first_sender.send(());
+    backend_task.await.unwrap();
+    assert!(reports.recv_timeout(Duration::from_millis(50)).is_err());
+    gateway.shutdown().await;
+}
+
+#[tokio::test]
 async fn websocket_proxy_fails_closed_for_invalid_auth_origin_route_and_handshake() {
     let frontend = TemporaryFrontend::new();
     let gateway = bind_gateway(&frontend).await;
@@ -2776,8 +3050,18 @@ async fn websocket_proxy_never_downgrades_a_malformed_websocket_attempt_to_http(
 #[tokio::test]
 async fn websocket_proxy_terminates_tunnel_when_backend_generation_changes() {
     let backend = FakeWebSocketBackend::spawn_echo().await;
+    let replacement_backend = FakeWebSocketBackend::spawn_echo().await;
     let frontend = TemporaryFrontend::new();
-    let gateway = bind_gateway(&frontend).await;
+    let gateway = StartupGateway::bind(
+        frontend.root.clone(),
+        disabled_metrics(),
+        GatewayLimits {
+            max_tunnels: 1,
+            ..GatewayLimits::test_defaults()
+        },
+    )
+    .await
+    .unwrap();
     let cookie = bootstrap_session(&gateway).await;
     let state = gateway.state();
     let generation = state.begin_backend_start().await.unwrap();
@@ -2798,12 +3082,40 @@ async fn websocket_proxy_terminates_tunnel_when_backend_generation_changes() {
         .unwrap();
     let next_generation = state.begin_backend_start().await.unwrap();
     assert!(next_generation > generation);
+    state
+        .backend_ready(next_generation, replacement_backend.addr)
+        .await
+        .unwrap();
     let terminal = tokio::time::timeout(Duration::from_secs(1), socket.next())
         .await
         .expect("generation change did not terminate the public tunnel");
     assert!(terminal.is_none() || terminal.is_some_and(|message| message.is_err()));
 
     assert_eq!(backend.finish().await.len(), 1);
+    let (mut replacement, _) = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let replacement_request = websocket_client_request(
+                &gateway,
+                Some(&cookie),
+                "/socket.io/?EIO=4&transport=websocket",
+                Some(&public_origin),
+            );
+            match connect_async(replacement_request).await {
+                Ok(connection) => break connection,
+                Err(tokio_tungstenite::tungstenite::Error::Http(response))
+                    if response.status() == StatusCode::SERVICE_UNAVAILABLE =>
+                {
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => panic!("replacement WebSocket failed: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("generation change did not release the tunnel permit");
+    consume_backend_websocket_greeting(&mut replacement).await;
+    replacement.close(None).await.unwrap();
+    assert_eq!(replacement_backend.finish().await.len(), 1);
     gateway.shutdown().await;
 }
 
@@ -2843,17 +3155,28 @@ async fn websocket_proxy_propagates_backend_close_to_the_public_side() {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let backend_addr = listener.local_addr().unwrap();
     let backend_task = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        let mut socket = accept_hdr_async(
-            stream,
-            |_request: &WebSocketRequest, response: WebSocketResponse| Ok(response),
-        )
-        .await
-        .unwrap();
-        socket.close(None).await.unwrap();
+        for _ in 0..2 {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_hdr_async(
+                stream,
+                |_request: &WebSocketRequest, response: WebSocketResponse| Ok(response),
+            )
+            .await
+            .unwrap();
+            socket.close(None).await.unwrap();
+        }
     });
     let frontend = TemporaryFrontend::new();
-    let gateway = bind_gateway(&frontend).await;
+    let gateway = StartupGateway::bind(
+        frontend.root.clone(),
+        disabled_metrics(),
+        GatewayLimits {
+            max_tunnels: 1,
+            ..GatewayLimits::test_defaults()
+        },
+    )
+    .await
+    .unwrap();
     let cookie = bootstrap_session(&gateway).await;
     let state = gateway.state();
     let generation = state.begin_backend_start().await.unwrap();
@@ -2877,6 +3200,34 @@ async fn websocket_proxy_propagates_backend_close_to_the_public_side() {
         .await
         .expect("backend close did not terminate the public stream");
     assert!(terminal.is_none() || terminal.is_some_and(|message| message.is_err()));
+
+    let (mut replacement, _) = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let replacement_request = websocket_client_request(
+                &gateway,
+                Some(&cookie),
+                "/socket.io/?EIO=4&transport=websocket",
+                Some(&public_origin),
+            );
+            match connect_async(replacement_request).await {
+                Ok(connection) => break connection,
+                Err(tokio_tungstenite::tungstenite::Error::Http(response))
+                    if response.status() == StatusCode::SERVICE_UNAVAILABLE =>
+                {
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => panic!("replacement WebSocket failed: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("backend close did not release the tunnel permit");
+    let close = tokio::time::timeout(Duration::from_secs(1), replacement.next())
+        .await
+        .expect("replacement backend close was not forwarded")
+        .expect("replacement public socket ended before receiving close")
+        .unwrap();
+    assert!(matches!(close, Message::Close(_)));
     backend_task.await.unwrap();
     gateway.shutdown().await;
 }
@@ -3110,6 +3461,277 @@ async fn websocket_proxy_rejects_connection_nominated_protected_headers_before_b
         assert!(reports.recv_timeout(Duration::from_millis(100)).is_err());
     }
 
+    let noncanonical_key = format!(
+        "GET /socket.io/?EIO=4&transport=websocket HTTP/1.1\r\nHost: {}\r\nCookie: {cookie}\r\nOrigin: {public_origin}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZR==\r\n\r\n",
+        gateway.public_authority()
+    );
+    let response = raw_http_exchange(gateway_addr(&gateway), noncanonical_key.as_bytes()).await;
+    assert!(response.starts_with(b"HTTP/1.1 400"));
+    assert!(response.len() <= 1024);
+    assert_eq!(deliveries.load(Ordering::SeqCst), 0);
+    assert!(reports.recv_timeout(Duration::from_millis(100)).is_err());
+
     gateway.shutdown().await;
     backend.shutdown().await;
+}
+
+#[tokio::test]
+async fn websocket_proxy_rejects_backend_connection_nominations_of_protected_response_headers() {
+    let protected = [
+        "Sec-WebSocket-Accept",
+        "Sec-WebSocket-Protocol",
+        "Sec-WebSocket-Extensions",
+        "Sec-WebSocket-Version",
+        "Set-Cookie",
+        "Cookie",
+        "Origin",
+        "Host",
+    ];
+    let responses = protected
+        .iter()
+        .map(|name| {
+            format!(
+                "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade, {name}\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Protocol: chat\r\nSec-WebSocket-Extensions: permessage-deflate\r\nSet-Cookie: theme=dark\r\nCookie: backend=value\r\nOrigin: http://backend.invalid\r\nHost: backend.invalid\r\n\r\n"
+            )
+            .into_bytes()
+        })
+        .collect();
+    let backend = RawResponseBackend::spawn(responses).await;
+    let (reports_sender, reports) = mpsc::channel();
+    let metrics = StartupMetrics::with_clock_and_writer(
+        "test",
+        "test",
+        11,
+        StartupMode::RustGateway,
+        Arc::new(ZeroClock),
+        Box::new(ChannelWriter(reports_sender)),
+    );
+    metrics.record(StartupMilestone::ProcessStarted).unwrap();
+    let frontend = TemporaryFrontend::new();
+    let gateway = StartupGateway::bind(
+        frontend.root.clone(),
+        metrics.clone(),
+        GatewayLimits {
+            max_tunnels: 1,
+            ..GatewayLimits::test_defaults()
+        },
+    )
+    .await
+    .unwrap();
+    let cookie = bootstrap_session(&gateway).await;
+    metrics
+        .record(StartupMilestone::FrontendRequestStarted)
+        .unwrap();
+    metrics.record(StartupMilestone::BackendSpawned).unwrap();
+    let state = gateway.state();
+    let generation = state.begin_backend_start().await.unwrap();
+    state.backend_ready(generation, backend.addr).await.unwrap();
+    metrics.record(StartupMilestone::BackendListening).unwrap();
+    receive_report_with_milestone(&reports, "backend_listening");
+    let public_origin = format!("http://{}", gateway.public_authority());
+
+    for name in protected {
+        let request = fixed_key_websocket_client_request(&gateway, &cookie, &public_origin);
+        let (status, body) = websocket_failure_details(request).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{name}");
+        assert_eq!(
+            body.as_deref(),
+            Some(b"{\"error\":\"backend_proxy_failed\"}".as_slice()),
+            "{name}"
+        );
+        assert!(body.as_ref().is_some_and(|body| body.len() <= 64), "{name}");
+        assert!(reports.recv_timeout(Duration::from_millis(50)).is_err());
+    }
+
+    gateway.shutdown().await;
+    backend.finish().await;
+}
+
+#[tokio::test]
+async fn websocket_proxy_rejects_duplicate_unoffered_and_malformed_backend_protocols_without_rpc() {
+    let backend = RawResponseBackend::spawn(vec![
+        b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Protocol: chat\r\nSec-WebSocket-Protocol: chat\r\n\r\n".to_vec(),
+        b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Protocol: unoffered\r\n\r\n".to_vec(),
+        b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Protocol: bad protocol\r\n\r\n".to_vec(),
+    ])
+    .await;
+    let (reports_sender, reports) = mpsc::channel();
+    let metrics = StartupMetrics::with_clock_and_writer(
+        "test",
+        "test",
+        12,
+        StartupMode::RustGateway,
+        Arc::new(ZeroClock),
+        Box::new(ChannelWriter(reports_sender)),
+    );
+    metrics.record(StartupMilestone::ProcessStarted).unwrap();
+    let frontend = TemporaryFrontend::new();
+    let gateway = StartupGateway::bind(
+        frontend.root.clone(),
+        metrics.clone(),
+        GatewayLimits {
+            max_tunnels: 1,
+            ..GatewayLimits::test_defaults()
+        },
+    )
+    .await
+    .unwrap();
+    let cookie = bootstrap_session(&gateway).await;
+    metrics
+        .record(StartupMilestone::FrontendRequestStarted)
+        .unwrap();
+    metrics.record(StartupMilestone::BackendSpawned).unwrap();
+    let state = gateway.state();
+    let generation = state.begin_backend_start().await.unwrap();
+    state.backend_ready(generation, backend.addr).await.unwrap();
+    metrics.record(StartupMilestone::BackendListening).unwrap();
+    receive_report_with_milestone(&reports, "backend_listening");
+    let public_origin = format!("http://{}", gateway.public_authority());
+
+    for case in ["duplicate", "unoffered", "malformed"] {
+        let mut request = fixed_key_websocket_client_request(&gateway, &cookie, &public_origin);
+        request
+            .headers_mut()
+            .insert("sec-websocket-protocol", "chat".parse().unwrap());
+        let (status, body) = websocket_failure_details(request).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{case}");
+        assert_eq!(
+            body.as_deref(),
+            Some(b"{\"error\":\"backend_proxy_failed\"}".as_slice()),
+            "{case}"
+        );
+        assert!(body.as_ref().is_some_and(|body| body.len() <= 64), "{case}");
+        assert!(reports.recv_timeout(Duration::from_millis(50)).is_err());
+    }
+
+    gateway.shutdown().await;
+    backend.finish().await;
+}
+
+#[tokio::test]
+async fn websocket_proxy_allows_no_protocol_or_one_exactly_offered_protocol() {
+    let backend = RawResponseBackend::spawn(vec![
+        b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n".to_vec(),
+        b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Protocol: chat\r\n\r\n".to_vec(),
+    ])
+    .await;
+    let frontend = TemporaryFrontend::new();
+    let gateway = StartupGateway::bind(
+        frontend.root.clone(),
+        disabled_metrics(),
+        GatewayLimits {
+            max_tunnels: 1,
+            ..GatewayLimits::test_defaults()
+        },
+    )
+    .await
+    .unwrap();
+    let cookie = bootstrap_session(&gateway).await;
+    let state = gateway.state();
+    let generation = state.begin_backend_start().await.unwrap();
+    state.backend_ready(generation, backend.addr).await.unwrap();
+    let public_origin = format!("http://{}", gateway.public_authority());
+
+    let no_selection = fixed_key_websocket_client_request(&gateway, &cookie, &public_origin);
+    let (socket, response) = connect_async(no_selection).await.unwrap();
+    assert!(!response.headers().contains_key("sec-websocket-protocol"));
+    drop(socket);
+
+    let (_, response) = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let mut selected =
+                fixed_key_websocket_client_request(&gateway, &cookie, &public_origin);
+            selected
+                .headers_mut()
+                .insert("sec-websocket-protocol", "superchat, chat".parse().unwrap());
+            match connect_async(selected).await {
+                Ok(connection) => break connection,
+                Err(tokio_tungstenite::tungstenite::Error::Http(response))
+                    if response.status() == StatusCode::SERVICE_UNAVAILABLE =>
+                {
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => panic!("selected protocol WebSocket failed: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("no-protocol tunnel did not release its permit");
+    assert_eq!(
+        response.headers().get("sec-websocket-protocol").unwrap(),
+        "chat"
+    );
+
+    gateway.shutdown().await;
+    backend.finish().await;
+}
+
+#[tokio::test]
+async fn websocket_proxy_rejects_backend_extensions_and_strips_browser_extension_offers() {
+    let backend = RawResponseBackend::spawn(vec![
+        b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Extensions: permessage-deflate\r\n\r\n".to_vec(),
+        b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n".to_vec(),
+    ])
+    .await;
+    let (reports_sender, reports) = mpsc::channel();
+    let metrics = StartupMetrics::with_clock_and_writer(
+        "test",
+        "test",
+        13,
+        StartupMode::RustGateway,
+        Arc::new(ZeroClock),
+        Box::new(ChannelWriter(reports_sender)),
+    );
+    metrics.record(StartupMilestone::ProcessStarted).unwrap();
+    let frontend = TemporaryFrontend::new();
+    let gateway = StartupGateway::bind(
+        frontend.root.clone(),
+        metrics.clone(),
+        GatewayLimits {
+            max_tunnels: 1,
+            ..GatewayLimits::test_defaults()
+        },
+    )
+    .await
+    .unwrap();
+    let cookie = bootstrap_session(&gateway).await;
+    metrics
+        .record(StartupMilestone::FrontendRequestStarted)
+        .unwrap();
+    metrics.record(StartupMilestone::BackendSpawned).unwrap();
+    let state = gateway.state();
+    let generation = state.begin_backend_start().await.unwrap();
+    state.backend_ready(generation, backend.addr).await.unwrap();
+    metrics.record(StartupMilestone::BackendListening).unwrap();
+    receive_report_with_milestone(&reports, "backend_listening");
+    let public_origin = format!("http://{}", gateway.public_authority());
+
+    let unsolicited = fixed_key_websocket_client_request(&gateway, &cookie, &public_origin);
+    let (status, body) = websocket_failure_details(unsolicited).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        body.as_deref(),
+        Some(b"{\"error\":\"backend_proxy_failed\"}".as_slice())
+    );
+    assert!(body.as_ref().is_some_and(|body| body.len() <= 64));
+    assert!(reports.recv_timeout(Duration::from_millis(50)).is_err());
+
+    let mut browser_offer = fixed_key_websocket_client_request(&gateway, &cookie, &public_origin);
+    browser_offer.headers_mut().insert(
+        "sec-websocket-extensions",
+        "permessage-deflate; client_max_window_bits"
+            .parse()
+            .unwrap(),
+    );
+    let (socket, response) = connect_async(browser_offer).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+    assert!(!response.headers().contains_key("sec-websocket-extensions"));
+    drop(socket);
+    receive_report_with_milestone(&reports, "rpc_connected");
+
+    gateway.shutdown().await;
+    let requests = backend.finish_with_requests().await;
+    assert_eq!(requests.len(), 2);
+    let browser_backend_request = String::from_utf8_lossy(&requests[1]).to_ascii_lowercase();
+    assert!(!browser_backend_request.contains("sec-websocket-extensions:"));
 }

@@ -42,9 +42,9 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::fs::File;
-use tokio::io::{copy_bidirectional, AsyncReadExt};
+use tokio::io::{copy_bidirectional, AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{oneshot, watch, Mutex, Semaphore};
+use tokio::sync::{oneshot, watch, Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::{JoinError, JoinHandle, JoinSet};
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
@@ -103,12 +103,18 @@ impl std::error::Error for BackendAddressError {}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GatewayLimitError {
     ZeroMaxConnections,
+    ZeroMaxTunnels,
+    ZeroWebSocketUpgradeTimeout,
 }
 
 impl fmt::Display for GatewayLimitError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ZeroMaxConnections => formatter.write_str("max_connections must be nonzero"),
+            Self::ZeroMaxTunnels => formatter.write_str("max_tunnels must be nonzero"),
+            Self::ZeroWebSocketUpgradeTimeout => {
+                formatter.write_str("websocket_upgrade_timeout must be nonzero")
+            }
         }
     }
 }
@@ -130,7 +136,9 @@ pub struct GatewayLimits {
     pub backend_response_header_timeout: Duration,
     pub max_waiters: usize,
     pub max_connections: usize,
+    pub max_tunnels: usize,
     pub http_header_read_timeout: Duration,
+    pub websocket_upgrade_timeout: Duration,
     pub shutdown_drain: Duration,
 }
 
@@ -141,7 +149,9 @@ impl GatewayLimits {
             backend_response_header_timeout: Duration::from_secs(1),
             max_waiters: 8,
             max_connections: 16,
+            max_tunnels: 4,
             http_header_read_timeout: Duration::from_secs(1),
+            websocket_upgrade_timeout: Duration::from_secs(1),
             shutdown_drain: Duration::from_millis(100),
         }
     }
@@ -154,7 +164,9 @@ impl Default for GatewayLimits {
             backend_response_header_timeout: Duration::from_secs(30),
             max_waiters: 64,
             max_connections: 128,
+            max_tunnels: 64,
             http_header_read_timeout: Duration::from_secs(10),
+            websocket_upgrade_timeout: Duration::from_secs(5),
             shutdown_drain: Duration::from_secs(2),
         }
     }
@@ -567,6 +579,7 @@ struct StaticInventory {
 #[derive(Clone)]
 struct TunnelRegistry {
     inner: Arc<Mutex<TunnelRegistryInner>>,
+    permits: Arc<Semaphore>,
 }
 
 struct TunnelRegistryInner {
@@ -575,13 +588,18 @@ struct TunnelRegistryInner {
 }
 
 impl TunnelRegistry {
-    fn new() -> Self {
+    fn new(max_tunnels: usize) -> Self {
         Self {
             inner: Arc::new(Mutex::new(TunnelRegistryInner {
                 accepting: true,
                 tasks: JoinSet::new(),
             })),
+            permits: Arc::new(Semaphore::new(max_tunnels.min(Semaphore::MAX_PERMITS))),
         }
+    }
+
+    fn try_acquire(&self) -> Option<OwnedSemaphorePermit> {
+        self.permits.clone().try_acquire_owned().ok()
     }
 
     async fn spawn(&self, future: impl Future<Output = ()> + Send + 'static) -> bool {
@@ -600,6 +618,7 @@ impl TunnelRegistry {
         let mut tasks = {
             let mut inner = self.inner.lock().await;
             inner.accepting = false;
+            self.permits.close();
             std::mem::replace(&mut inner.tasks, JoinSet::new())
         };
         let deadline = tokio::time::sleep(drain);
@@ -626,21 +645,24 @@ impl TunnelRegistry {
 #[derive(Clone)]
 struct RpcMilestoneRecorder {
     metrics: StartupMetrics,
-    generations: Arc<Mutex<HashSet<BackendGeneration>>>,
+    last_recorded_generation: Arc<Mutex<Option<BackendGeneration>>>,
 }
 
 impl RpcMilestoneRecorder {
     fn new(metrics: StartupMetrics) -> Self {
         Self {
             metrics,
-            generations: Arc::new(Mutex::new(HashSet::new())),
+            last_recorded_generation: Arc::new(Mutex::new(None)),
         }
     }
 
     async fn record_connected(&self, generation: BackendGeneration) {
-        if !self.generations.lock().await.insert(generation) {
+        let mut last_recorded = self.last_recorded_generation.lock().await;
+        if last_recorded.is_some_and(|recorded| generation <= recorded) {
             return;
         }
+        *last_recorded = Some(generation);
+        drop(last_recorded);
         self.metrics.record_or_warn(StartupMilestone::RpcConnected);
     }
 }
@@ -747,6 +769,16 @@ impl StartupGateway {
                 GatewayLimitError::ZeroMaxConnections,
             ));
         }
+        if limits.max_tunnels == 0 {
+            return Err(GatewayError::InvalidLimits(
+                GatewayLimitError::ZeroMaxTunnels,
+            ));
+        }
+        if limits.websocket_upgrade_timeout.is_zero() {
+            return Err(GatewayError::InvalidLimits(
+                GatewayLimitError::ZeroWebSocketUpgradeTimeout,
+            ));
+        }
         let inventory = tokio::task::spawn_blocking(move || build_static_inventory(&frontend_root))
             .await
             .map_err(|_| GatewayError::FrontendUnavailable)??;
@@ -770,7 +802,7 @@ impl StartupGateway {
         let session_value = Uuid::new_v4().to_string();
         debug_assert_ne!(bootstrap_capability, session_value);
         let state = GatewayState::new(limits);
-        let tunnels = TunnelRegistry::new();
+        let tunnels = TunnelRegistry::new(limits.max_tunnels);
         let backend_proxy = BackendProxy::new(
             state.clone(),
             limits,
@@ -1132,6 +1164,9 @@ impl BackendProxy {
         mut request: Request<hyper::body::Incoming>,
         handshake: ValidatedWebSocketHandshake,
     ) -> Response<GatewayBody> {
+        let Some(tunnel_permit) = self.tunnels.try_acquire() else {
+            return backend_unavailable();
+        };
         let public_upgrade = hyper::upgrade::on(&mut request);
         strip_gateway_session_cookie(request.headers_mut());
         if normalize_message_framing(request.headers_mut()).is_err()
@@ -1139,6 +1174,7 @@ impl BackendProxy {
         {
             return invalid_http_message();
         }
+        request.headers_mut().remove("sec-websocket-extensions");
         restore_websocket_upgrade_headers(request.headers_mut());
 
         let backend_lease = match self
@@ -1192,7 +1228,7 @@ impl BackendProxy {
             Ok(Err(_)) | Err(_) => return backend_proxy_failed(),
         };
         if response.status() != StatusCode::SWITCHING_PROTOCOLS
-            || validate_websocket_upgrade_response(&response, &handshake.expected_accept).is_err()
+            || validate_websocket_upgrade_response(&mut response, &handshake).is_err()
             || !self.state.backend_lease_is_current(backend_lease).await
         {
             return backend_proxy_failed();
@@ -1213,6 +1249,8 @@ impl BackendProxy {
             self.state.clone(),
             backend_lease,
             self.rpc_milestones.clone(),
+            self.limits.websocket_upgrade_timeout,
+            tunnel_permit,
         );
         if !self.tunnels.spawn(tunnel).await {
             return backend_unavailable();
@@ -1902,6 +1940,7 @@ enum ProxyRequestKind {
 #[derive(Clone, Debug)]
 struct ValidatedWebSocketHandshake {
     expected_accept: hyper::header::HeaderValue,
+    offered_protocols: Vec<Vec<u8>>,
 }
 
 fn proxy_request_kind(
@@ -1930,6 +1969,7 @@ fn proxy_request_kind(
         return Err(ProxyHeaderError::InvalidUpgrade);
     }
     let client_key = validated_websocket_key(request.headers());
+    let offered_protocols = validated_websocket_protocol_offers(request.headers())?;
     if request.method() != Method::GET
         || request.version() != hyper::Version::HTTP_11
         || request.uri().path() != SOCKET_IO_PATH
@@ -1946,6 +1986,7 @@ fn proxy_request_kind(
     }
     Ok(ProxyRequestKind::WebSocket(ValidatedWebSocketHandshake {
         expected_accept: websocket_accept(client_key.expect("validated above")),
+        offered_protocols,
     }))
 }
 
@@ -1954,21 +1995,33 @@ fn is_protected_websocket_handshake_header(name: &hyper::header::HeaderName) -> 
 }
 
 fn validate_websocket_upgrade_response<B>(
-    response: &Response<B>,
-    expected_accept: &hyper::header::HeaderValue,
+    response: &mut Response<B>,
+    handshake: &ValidatedWebSocketHandshake,
 ) -> Result<(), ProxyHeaderError> {
     let connection_tokens = connection_header_tokens(response.headers())?;
-    if !connection_tokens.iter().any(|name| name == UPGRADE)
+    if connection_tokens
+        .iter()
+        .any(is_protected_websocket_response_header)
+        || !connection_tokens.iter().any(|name| name == UPGRADE)
         || !single_header_equals(response.headers(), UPGRADE, b"websocket")
         || !single_header_exactly_equals(
             response.headers(),
             "sec-websocket-accept",
-            expected_accept,
+            &handshake.expected_accept,
         )
+        || response.headers().contains_key("sec-websocket-extensions")
     {
         return Err(ProxyHeaderError::InvalidUpgrade);
     }
-    Ok(())
+    validate_backend_websocket_protocol(response.headers_mut(), &handshake.offered_protocols)
+}
+
+fn is_protected_websocket_response_header(name: &hyper::header::HeaderName) -> bool {
+    name == HOST
+        || name == ORIGIN
+        || name == COOKIE
+        || name == SET_COOKIE
+        || name.as_str().starts_with("sec-websocket-")
 }
 
 fn single_header_equals(
@@ -1999,13 +2052,68 @@ fn validated_websocket_key(headers: &HeaderMap) -> Option<&[u8]> {
     let mut values = headers.get_all("sec-websocket-key").iter();
     let value = values.next()?;
     let value = trim_ows(value.as_bytes());
-    (values.next().is_none()
-        && value.len() == 24
-        && value[..22]
+    if values.next().is_some()
+        || value.len() != 24
+        || !value[..22]
             .iter()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/'))
-        && &value[22..] == b"==")
-        .then_some(value)
+        || &value[22..] != b"=="
+    {
+        return None;
+    }
+    let decoded = BASE64_STANDARD.decode(value).ok()?;
+    (decoded.len() == 16 && BASE64_STANDARD.encode(decoded).as_bytes() == value).then_some(value)
+}
+
+fn validated_websocket_protocol_offers(
+    headers: &HeaderMap,
+) -> Result<Vec<Vec<u8>>, ProxyHeaderError> {
+    let mut protocols = Vec::new();
+    for value in headers.get_all("sec-websocket-protocol").iter() {
+        for protocol in value.as_bytes().split(|byte| *byte == b',') {
+            let protocol = trim_ows(protocol);
+            if protocol.is_empty()
+                || !protocol.iter().copied().all(is_tchar)
+                || protocols
+                    .iter()
+                    .any(|offered: &Vec<u8>| offered.as_slice() == protocol)
+            {
+                return Err(ProxyHeaderError::InvalidUpgrade);
+            }
+            protocols.push(protocol.to_vec());
+        }
+    }
+    Ok(protocols)
+}
+
+fn validate_backend_websocket_protocol(
+    headers: &mut HeaderMap,
+    offered_protocols: &[Vec<u8>],
+) -> Result<(), ProxyHeaderError> {
+    let values = headers
+        .get_all("sec-websocket-protocol")
+        .iter()
+        .map(|value| value.as_bytes().to_vec())
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return Ok(());
+    }
+    if values.len() != 1 {
+        return Err(ProxyHeaderError::InvalidUpgrade);
+    }
+    let selected = trim_ows(&values[0]);
+    if selected.is_empty()
+        || !selected.iter().copied().all(is_tchar)
+        || !offered_protocols
+            .iter()
+            .any(|offered| offered.as_slice() == selected)
+    {
+        return Err(ProxyHeaderError::InvalidUpgrade);
+    }
+    let selected = hyper::header::HeaderValue::from_bytes(selected)
+        .map_err(|_| ProxyHeaderError::InvalidUpgrade)?;
+    headers.insert("sec-websocket-protocol", selected);
+    Ok(())
 }
 
 fn websocket_accept(client_key: &[u8]) -> hyper::header::HeaderValue {
@@ -2034,18 +2142,21 @@ async fn run_websocket_tunnel(
     state: GatewayState,
     lease: BackendLease,
     rpc_milestones: RpcMilestoneRecorder,
+    upgrade_timeout: Duration,
+    _tunnel_permit: OwnedSemaphorePermit,
 ) {
     let mut readiness = state.inner.readiness.subscribe();
     let mut shutdown = state.inner.shutdown.subscribe();
     if !published_backend_matches_lease(&readiness.borrow(), lease) || *shutdown.borrow() {
         return;
     }
-    let upgrades = async { tokio::try_join!(public_upgrade, backend_upgrade) };
+    let upgrades =
+        establish_websocket_upgrade_pair(public_upgrade, backend_upgrade, upgrade_timeout);
     tokio::pin!(upgrades);
     let (public, private) = loop {
         tokio::select! {
             result = &mut upgrades => {
-                let Ok(upgrades) = result else {
+                let Some(upgrades) = result else {
                     return;
                 };
                 break upgrades;
@@ -2067,13 +2178,17 @@ async fn run_websocket_tunnel(
     }
     rpc_milestones.record_connected(lease.generation).await;
 
-    let mut public = TokioIo::new(public);
-    let mut private = TokioIo::new(private);
+    let eof = Arc::new(Notify::new());
+    let mut public = TunnelIo::new(TokioIo::new(public), eof.clone());
+    let mut private = TunnelIo::new(TokioIo::new(private), eof.clone());
     let tunnel = copy_bidirectional(&mut public, &mut private);
+    let either_side_closed = eof.notified();
     tokio::pin!(tunnel);
+    tokio::pin!(either_side_closed);
     loop {
         tokio::select! {
             _ = &mut tunnel => return,
+            _ = &mut either_side_closed => return,
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     return;
@@ -2085,6 +2200,85 @@ async fn run_websocket_tunnel(
                 }
             }
         }
+    }
+}
+
+async fn establish_websocket_upgrade_pair<PublicFuture, BackendFuture, Public, Backend, Error>(
+    public_upgrade: PublicFuture,
+    backend_upgrade: BackendFuture,
+    timeout: Duration,
+) -> Option<(Public, Backend)>
+where
+    PublicFuture: Future<Output = Result<Public, Error>>,
+    BackendFuture: Future<Output = Result<Backend, Error>>,
+{
+    tokio::time::timeout(timeout, async move {
+        tokio::try_join!(public_upgrade, backend_upgrade).ok()
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+struct TunnelIo<T> {
+    inner: T,
+    eof: Arc<Notify>,
+}
+
+impl<T> TunnelIo<T> {
+    fn new(inner: T, eof: Arc<Notify>) -> Self {
+        Self { inner, eof }
+    }
+}
+
+impl<T> AsyncRead for TunnelIo<T>
+where
+    T: AsyncRead + Unpin,
+{
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let filled_before = buffer.filled().len();
+        let result = Pin::new(&mut self.inner).poll_read(context, buffer);
+        if matches!(result, Poll::Ready(Ok(()))) && buffer.filled().len() == filled_before {
+            self.eof.notify_one();
+        }
+        result
+    }
+}
+
+impl<T> AsyncWrite for TunnelIo<T>
+where
+    T: AsyncWrite + Unpin,
+{
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(context, buffer)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(context)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(context)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffers: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write_vectored(context, buffers)
     }
 }
 
@@ -2619,5 +2813,111 @@ mod tests {
             vec![STATIC_ASSET_CHUNK_SIZE, STATIC_ASSET_CHUNK_SIZE, 37]
         );
         assert_eq!(observed, expected);
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_pair_establishment_is_bounded() {
+        let result = establish_websocket_upgrade_pair(
+            std::future::pending::<Result<(), ()>>(),
+            std::future::ready(Ok::<(), ()>(())),
+            Duration::from_millis(10),
+        )
+        .await;
+
+        assert!(result.is_none());
+        assert_eq!(
+            establish_websocket_upgrade_pair(
+                std::future::ready(Ok::<u8, ()>(1)),
+                std::future::ready(Ok::<u8, ()>(2)),
+                Duration::from_secs(1),
+            )
+            .await,
+            Some((1, 2))
+        );
+    }
+
+    #[tokio::test]
+    async fn tunnel_registry_shutdown_aborts_tasks_and_releases_permits() {
+        let registry = TunnelRegistry::new(1);
+        let permit = registry.try_acquire().unwrap();
+        let (started_sender, started) = oneshot::channel();
+        assert!(
+            registry
+                .spawn(async move {
+                    let _permit = permit;
+                    let _ = started_sender.send(());
+                    std::future::pending::<()>().await;
+                })
+                .await
+        );
+        started.await.unwrap();
+        assert_eq!(registry.permits.available_permits(), 0);
+
+        registry.shutdown(Duration::from_millis(10)).await;
+
+        assert!(registry.permits.is_closed());
+        assert_eq!(registry.permits.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_timeout_releases_tunnel_permit() {
+        let registry = TunnelRegistry::new(1);
+        let permit = registry.try_acquire().unwrap();
+        assert!(
+            registry
+                .spawn(async move {
+                    let _permit = permit;
+                    let _ = establish_websocket_upgrade_pair(
+                        std::future::pending::<Result<(), ()>>(),
+                        std::future::ready(Ok::<(), ()>(())),
+                        Duration::from_millis(10),
+                    )
+                    .await;
+                })
+                .await
+        );
+
+        let replacement = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(permit) = registry.try_acquire() {
+                    break permit;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("upgrade timeout did not release the tunnel permit");
+        drop(replacement);
+        registry.shutdown(Duration::from_millis(10)).await;
+    }
+
+    #[tokio::test]
+    async fn rpc_milestone_generation_tracking_is_monotonic_and_constant_space() {
+        #[derive(Debug)]
+        struct ZeroClock;
+
+        impl crate::startup_metrics::ElapsedClock for ZeroClock {
+            fn elapsed_ms(&self) -> u64 {
+                0
+            }
+        }
+
+        let metrics = StartupMetrics::with_clock(
+            None,
+            "test",
+            "test",
+            1,
+            crate::startup_metrics::StartupMode::RustGateway,
+            Arc::new(ZeroClock),
+        );
+        let recorder = RpcMilestoneRecorder::new(metrics);
+        recorder.record_connected(BackendGeneration(1)).await;
+        recorder.record_connected(BackendGeneration(2)).await;
+        recorder.record_connected(BackendGeneration(1)).await;
+
+        assert_eq!(
+            *recorder.last_recorded_generation.lock().await,
+            Some(BackendGeneration(2))
+        );
     }
 }
