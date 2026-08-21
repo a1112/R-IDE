@@ -184,7 +184,7 @@ Shutdown stops accepting requests, cancels readiness waiters, closes or drains a
 
 ## Startup measurement contract
 
-Add optional native/browser milestones while versioning the campaign schema as needed:
+Version the campaign schema to v2 and add native/browser milestones:
 
 - `gateway_listening`
 - `frontend_request_started`
@@ -198,6 +198,22 @@ Reports identify the effective startup mode:
 - `rust-gateway`
 - `legacy-explicit`
 - `legacy-fallback`
+
+Schema v2 validates milestone causality as a dependency graph instead of forcing every event into one global order. The frontend and backend branches may therefore finish in either order without rewriting their timestamps:
+
+- `gateway_listening` depends on `process_started`.
+- `backend_spawned` depends on `process_started`.
+- `native_window_visible` depends on `gateway_listening`.
+- `frontend_request_started` depends on `gateway_listening`.
+- `frontend_bundle_loaded` depends on `frontend_request_started`.
+- `backend_listening` depends on `backend_spawned`.
+- `rpc_connected` depends on `backend_listening` and `frontend_request_started`.
+- `frontend_shell_attached` depends on `rpc_connected` and `frontend_bundle_loaded`.
+- `target_file_opened` depends on `frontend_shell_attached`.
+- `plugins_started` depends on `target_file_opened`.
+- `plugins_ready` depends on `plugins_started`.
+
+Each one-shot event is accepted only after its declared predecessors and must have a timestamp greater than or equal to every predecessor. Independent events, such as `frontend_bundle_loaded` and `backend_listening`, have no ordering constraint. Gateway-mode reports must never publish a delayed surrogate timestamp to make concurrent events appear sequential. The v1 canonicalization remains readable only for legacy evidence.
 
 The optimized comparator accepts only `rust-gateway`, exact build/profile identity, five complete runs, and all required milestones. It preserves current same-host/platform/architecture compatibility checks.
 
@@ -227,7 +243,7 @@ Use a delayed fake backend and real loopback sockets to prove:
 ### Frontend and build tests
 
 - Generated HTML contains exactly one real application module entry.
-- The startup bridge reports ordered, one-shot milestones.
+- The startup bridge reports one-shot milestones that satisfy the v2 dependency graph.
 - Backend failure UI is bounded, accessible, and retryable.
 - The real Theia document is initialized once and is not reloaded when backend readiness changes.
 - The Tauri critical and explicit full profiles contain the bridge and valid frontend inventory.
