@@ -91,7 +91,7 @@ Create a Rust `startup_gateway` module with five internal responsibilities:
 - `StaticAssetService`: exact packaged-root resolution, MIME selection, caching policy, HEAD/range behavior where required, and traversal/symlink rejection.
 - `BackendProxy`: streaming HTTP forwarding, Socket.IO upgrade tunneling, hop-by-hop header filtering, backpressure, and bounded readiness waiting.
 - `GatewaySession`: one-time bootstrap capability, session cookie validation, exact-origin checks, and redaction-safe diagnostics.
-- `StartupControl`: authenticated status, retry, and browser milestone endpoints used by the pre-bundle startup bridge.
+- `StartupControl`: authenticated status, event stream, retry, and browser milestone endpoints used by the pre-bundle startup bridge.
 
 The module runs on Tauri's existing Tokio runtime and does not start another helper executable.
 
@@ -112,14 +112,14 @@ Only one backend generation may start at a time. A retry receives a new ownershi
 
 Keep the current direct-pipe Node spawn path, process ownership checks, loopback listener ownership verification, bounded startup timeout, and process-tree cleanup. The Node endpoint remains private implementation state. The gateway authority is supplied through `THEIA_HOSTS` so Theia's WebSocket origin validator accepts only the public application origin.
 
-`backend-ready` publication changes from navigating the main window to notifying the gateway readiness channel. Existing backend milestone ordering remains authoritative.
+`backend-ready` publication changes from navigating the main window to notifying the gateway readiness channel. Sidecar events publish their actual timestamps into the mode-aware milestone dependency graph.
 
 ### Frontend startup bridge
 
 Generate a small, dependency-free module before the main bundle. It:
 
-- reports frontend request and bundle milestones to authenticated gateway endpoints;
-- observes backend state without polling more frequently than a bounded backoff schedule;
+- lets the gateway record the authenticated frontend request and reports bundle completion to an authenticated gateway endpoint;
+- observes backend state through one authenticated event stream without polling;
 - displays a native-looking error overlay only after a terminal backend failure;
 - offers one retry action that maps to the Rust startup state machine;
 - removes its own UI when RPC/frontend readiness is confirmed.
@@ -133,12 +133,14 @@ The gateway binds an OS-assigned port on `127.0.0.1`. Static resolution uses an 
 1. Normalize and percent-decode the request path exactly once.
 2. Reject NULs, parent traversal, ambiguous separators, non-regular files, and symlink escapes.
 3. Serve a matching static asset with its expected MIME and cache policy.
-4. Reserve `/__ride/*` for bounded authenticated startup-control routes.
+4. Reserve `/_ride/*` for bounded authenticated startup-control routes.
 5. Treat every other valid route as backend-owned and proxy it after readiness.
 
 Static assets never wait for Node. Backend requests wait on a `tokio::sync::watch`-style readiness signal with a strict deadline and waiter bound. A request that cannot safely wait receives `503 Service Unavailable` and `Retry-After`; Socket.IO remains responsible for normal connection retry.
 
 Request and response bodies are streamed. The gateway must not aggregate file upload/download bodies, plugin archives, or WebSocket traffic in memory. Slow clients and backend stalls are bounded by per-phase deadlines and cancellation on shutdown.
+
+Static files, including the main bundle, are also streamed from asynchronous file handles instead of being copied into a new whole-file buffer for each request.
 
 WebSocket and Socket.IO upgrade traffic is tunneled bidirectionally after the backend handshake succeeds. The proxy preserves the public application origin for Theia validation while routing transport to the private backend authority. Hop-by-hop headers and the gateway's own session cookie are not forwarded as ordinary application metadata.
 
@@ -148,11 +150,13 @@ Secondary windows use the same authenticated gateway origin. Trusted-secondary-w
 
 The listener is loopback-only. At startup Rust creates a cryptographically unpredictable process-local capability. The main WebView receives a bootstrap path containing that capability. A valid one-time bootstrap request sets an HttpOnly, SameSite session cookie and redirects to the stable final root URL.
 
+Because the public port is ephemeral, Tauri registers a runtime capability for the exact bound `http://127.0.0.1:<port>` origin before creating the WebView. The static legacy capability remains restricted to port 3000. No localhost-port wildcard is permitted.
+
 The gateway applies the following policy:
 
 - Never persist or log the bootstrap capability or session value.
 - Require the current session for static, control, proxy, and upgrade routes after bootstrap.
-- Require exact public Origin for dynamic and upgraded requests.
+- Require exact public Origin for control mutations and upgrades; reject a foreign Origin when one is supplied on other requests.
 - Permit only the documented method and small body on startup-control routes.
 - Strip the gateway session cookie before proxying while preserving unrelated application cookies when required.
 - Reject invalid Host, forwarded-host, absolute-form, and ambiguous path inputs.
@@ -199,7 +203,7 @@ Reports identify the effective startup mode:
 - `legacy-explicit`
 - `legacy-fallback`
 
-Schema v2 validates milestone causality as a dependency graph instead of forcing every event into one global order. The frontend and backend branches may therefore finish in either order without rewriting their timestamps:
+Schema v2 validates milestone causality as a dependency graph instead of forcing every event into one global order. In `rust-gateway` mode, the frontend and backend branches may therefore finish in either order without rewriting their timestamps:
 
 - `gateway_listening` depends on `process_started`.
 - `backend_spawned` depends on `process_started`.
@@ -213,7 +217,7 @@ Schema v2 validates milestone causality as a dependency graph instead of forcing
 - `plugins_started` depends on `target_file_opened`.
 - `plugins_ready` depends on `plugins_started`.
 
-Each one-shot event is accepted only after its declared predecessors and must have a timestamp greater than or equal to every predecessor. Independent events, such as `frontend_bundle_loaded` and `backend_listening`, have no ordering constraint. Gateway-mode reports must never publish a delayed surrogate timestamp to make concurrent events appear sequential. The v1 canonicalization remains readable only for legacy evidence.
+Each one-shot event is accepted only after its declared predecessors and must have a timestamp greater than or equal to every predecessor. Independent events, such as `frontend_bundle_loaded` and `backend_listening`, have no ordering constraint. Fresh `legacy-explicit` and `legacy-fallback` v2 reports use a reduced dependency graph rooted at `process_started` and omit gateway-only milestones; they also preserve actual timestamps. Gateway-mode reports must never publish a delayed surrogate timestamp to make concurrent events appear sequential. The v1 canonicalization remains readable only for historical evidence.
 
 The optimized comparator accepts only `rust-gateway`, exact build/profile identity, five complete runs, and all required milestones. It preserves current same-host/platform/architecture compatibility checks.
 
