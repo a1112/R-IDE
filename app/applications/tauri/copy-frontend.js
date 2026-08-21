@@ -69,6 +69,7 @@ const frontendBootstrap = `(() => {
   });
 
   let currentGeneration;
+  let currentState;
   let retriedGeneration;
   let overlay;
   let diagnostic;
@@ -119,6 +120,12 @@ const frontendBootstrap = `(() => {
     window.document.body.appendChild(overlay);
   };
 
+  const stateOrder = Object.freeze({
+    starting: 0,
+    ready: 1,
+    stopping: 2,
+    failed: 3
+  });
   const states = new window.EventSource('/_ride/startup/events', { withCredentials: true });
   states.addEventListener('state', event => {
     let update;
@@ -127,19 +134,31 @@ const frontendBootstrap = `(() => {
     } catch {
       return;
     }
-    if (!update || (typeof update.generation !== 'number' && typeof update.generation !== 'string')) {
+    if (!update
+      || !Number.isSafeInteger(update.generation)
+      || update.generation <= 0
+      || !Object.prototype.hasOwnProperty.call(stateOrder, update.state)) {
+      return;
+    }
+    if (currentGeneration !== undefined && update.generation < currentGeneration) {
+      return;
+    }
+    if (update.generation === currentGeneration && stateOrder[update.state] < stateOrder[currentState]) {
       return;
     }
     if (update.generation !== currentGeneration) {
       currentGeneration = update.generation;
       retriedGeneration = undefined;
     }
+    currentState = update.state;
     if (update.state === 'failed') {
       ensureOverlay();
       diagnostic.textContent = String(update.diagnostic ?? 'Backend unavailable.').slice(0, diagnosticLimit);
       retry.disabled = retriedGeneration === currentGeneration;
     } else if (update.state === 'ready') {
       removeOverlay();
+    } else if (retry) {
+      retry.disabled = true;
     }
   });
 })();

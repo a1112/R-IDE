@@ -11,6 +11,7 @@ const testDirectory = path.dirname(fileURLToPath(import.meta.url));
 const appDirectory = path.resolve(testDirectory, '../..');
 const productionTauriDirectory = path.join(appDirectory, 'applications', 'tauri');
 const require = createRequire(import.meta.url);
+const { rewriteDesktopHtml } = require(path.join(productionTauriDirectory, 'copy-build-tree.js'));
 
 function createGeneratedFrontend() {
   const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'ride-startup-gateway-'));
@@ -289,6 +290,49 @@ test('bridge uses one state stream and reports bundle completion once with same-
   assert.deepEqual(JSON.parse(milestones[0].options.body), { milestone: 'frontend_bundle_loaded' });
 });
 
+test('bridge rejects malformed, stale, and non-monotonic startup state updates', t => {
+  const generated = createGeneratedFrontend();
+  t.after(() => fs.rmSync(generated.fixture, { recursive: true, force: true }));
+  const bridge = fs.readFileSync(path.join(generated.gatewayDirectory, 'ride-bootstrap.js'), 'utf8');
+  const harness = executeBridge(bridge);
+  const states = harness.eventSources[0];
+  const alertCount = () => harness.document.findAll(
+    element => element.getAttribute('role') === 'alert',
+  ).length;
+
+  for (const generation of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, '7', null]) {
+    states.emitState({ state: 'failed', generation, diagnostic: 'invalid generation' });
+    assert.equal(alertCount(), 0);
+  }
+
+  states.emitState({ state: 'ready', generation: 7 });
+  states.emitState({ state: 'future-protocol-state', generation: 8 });
+  states.emitState({ state: 'failed', generation: 7, diagnostic: 'same-generation crash' });
+  assert.equal(alertCount(), 1, 'unknown state must not advance the accepted generation');
+
+  states.emitState({ state: 'ready', generation: 7 });
+  states.emitState({ state: 'starting', generation: 7 });
+  assert.equal(alertCount(), 1, 'failed is terminal within one generation');
+
+  states.emitState({ state: 'ready', generation: 8 });
+  assert.equal(alertCount(), 0, 'a newer generation may recover');
+  states.emitState({ state: 'failed', generation: 7, diagnostic: 'stale lower generation' });
+  assert.equal(alertCount(), 0);
+
+  states.emitState({ state: 'failed', generation: 8, diagnostic: 'ready backend crashed' });
+  assert.equal(alertCount(), 1, 'ready to failed is a valid same-generation crash transition');
+  states.emitState({ state: 'ready', generation: 7 });
+  assert.equal(alertCount(), 1, 'a lower ready event cannot clear the current failure');
+});
+
+test('desktop rewrite rejects duplicate bundle script entries before mutation', () => {
+  const duplicate = `<!doctype html><html><head></head><body>
+    <script type="module" src="./bundle.js"></script>
+    <script type="module" src="./bundle.js"></script>
+  </body></html>`;
+  assert.throws(() => rewriteDesktopHtml(duplicate), /exactly one bundle\.js script/i);
+});
+
 test('failed state renders one bounded alert and retry remains idempotent per generation', async t => {
   const generated = createGeneratedFrontend();
   t.after(() => fs.rmSync(generated.fixture, { recursive: true, force: true }));
@@ -325,6 +369,13 @@ test('failed state renders one bounded alert and retry remains idempotent per ge
   await Promise.resolve();
   assert.equal(harness.requests.filter(request => request.url === '/_ride/startup/retry').length, 1);
 
+  harness.eventSources[0].emitState({ state: 'starting', generation: 8 });
+  assert.equal(retry.disabled, true);
+  retry.click();
+  await Promise.resolve();
+  assert.equal(harness.requests.filter(request => request.url === '/_ride/startup/retry').length, 1);
+  harness.eventSources[0].emitState({ state: 'stopping', generation: 8 });
+  assert.equal(retry.disabled, true);
   harness.eventSources[0].emitState({ state: 'failed', generation: 8, diagnostic: 'second failure' });
   assert.equal(retry.disabled, false);
   retry.click();
@@ -334,6 +385,8 @@ test('failed state renders one bounded alert and retry remains idempotent per ge
   assert.deepEqual(JSON.parse(retries[1].options.body), { generation: 8 });
 
   harness.eventSources[0].emitState({ state: 'ready', generation: 8 });
+  assert.equal(harness.document.findAll(element => element.getAttribute('role') === 'alert').length, 1);
+  harness.eventSources[0].emitState({ state: 'ready', generation: 9 });
   assert.equal(harness.document.findAll(element => element.getAttribute('role') === 'alert').length, 0);
   assert.deepEqual(harness.navigation, { reloads: 0, replacements: [] });
   assert.deepEqual(harness.sessionStorage.entries(), []);

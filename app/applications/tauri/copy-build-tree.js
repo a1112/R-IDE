@@ -154,6 +154,12 @@ function publishDirectoryAtomic(target, populate, options = {}) {
 }
 
 function rewriteDesktopHtml(source) {
+  const bundleScripts = [...source.matchAll(/<script\b([^>]*)>/gi)].filter(match =>
+    /(?:^|\s)src\s*=\s*(["'])\.\/bundle\.js\1(?:\s|$)/i.test(match[1])
+  );
+  if (bundleScripts.length !== 1) {
+    throw new Error(`Desktop index.html must contain exactly one bundle.js script entry; found ${bundleScripts.length}.`);
+  }
   let html = source;
   const csp = [
     "default-src 'self'",
@@ -180,7 +186,7 @@ function rewriteDesktopHtml(source) {
     throw new Error('Frontend index.html does not contain a closing head tag.');
   }
   html = html.replace(/<\/head>/i, `${cspMeta}</head>`);
-  const bundleScript = /([ \t]*)<script\b([^>]*\bsrc=["']\.\/bundle\.js["'][^>]*)><\/script\b[^>]*>/i;
+  const bundleScript = /([ \t]*)<script\b((?=[^>]*\ssrc\s*=\s*["']\.\/bundle\.js["'])[^>]*)><\/script\b[^>]*>/i;
   if (!bundleScript.test(html)) {
     throw new Error('Frontend index.html does not contain the bundle.js script tag.');
   }
