@@ -9,7 +9,7 @@
 
 use crate::startup_metrics::{StartupMetrics, StartupMilestone};
 use bytes::Bytes;
-use futures_util::TryStreamExt;
+use futures_util::{FutureExt, TryStreamExt};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Empty, Full, StreamBody};
 use hyper::body::Frame;
@@ -19,14 +19,18 @@ use hyper::header::{
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use reqwest::Url;
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
+#[cfg(unix)]
+use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::fmt;
 use std::fs as std_fs;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,7 +38,7 @@ use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{oneshot, watch, Mutex, Semaphore};
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::{JoinError, JoinHandle, JoinSet};
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
@@ -42,7 +46,6 @@ const BROWSER_BACKEND_FAILURE: &str = "Backend process failed before becoming re
 const NOT_FOUND_BODY: &[u8] = b"Not Found";
 const INDEX_PATH: &str = "/index.html";
 const SESSION_COOKIE_NAME: &str = "ride_session";
-const IMMUTABLE_CACHE: &str = "public, max-age=31536000, immutable";
 const STATIC_ASSET_CHUNK_SIZE: usize = 16 * 1024;
 
 type GatewayBody = BoxBody<Bytes, io::Error>;
@@ -80,6 +83,8 @@ pub struct BackendGeneration(u64);
 pub struct GatewayLimits {
     pub backend_wait: Duration,
     pub max_waiters: usize,
+    pub max_connections: usize,
+    pub http_header_read_timeout: Duration,
     pub shutdown_drain: Duration,
 }
 
@@ -88,6 +93,8 @@ impl GatewayLimits {
         Self {
             backend_wait: Duration::from_secs(1),
             max_waiters: 8,
+            max_connections: 16,
+            http_header_read_timeout: Duration::from_secs(1),
             shutdown_drain: Duration::from_millis(100),
         }
     }
@@ -98,6 +105,8 @@ impl Default for GatewayLimits {
         Self {
             backend_wait: Duration::from_secs(5),
             max_waiters: 64,
+            max_connections: 128,
+            http_header_read_timeout: Duration::from_secs(10),
             shutdown_drain: Duration::from_secs(2),
         }
     }
@@ -448,26 +457,45 @@ impl GatewayState {
     }
 }
 
-#[derive(Clone, Debug)]
-struct StaticAsset {
-    canonical_path: PathBuf,
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct StaticFileIdentity {
+    volume: u64,
+    file: [u8; 16],
+}
+
+#[derive(Clone)]
+struct BoundStaticFile {
+    root_identity: StaticFileIdentity,
+    parent_identities: Vec<StaticFileIdentity>,
+    file_identity: StaticFileIdentity,
     content_length: u64,
+}
+
+#[derive(Clone)]
+struct StaticAsset {
+    relative_components: Vec<OsString>,
+    binding: BoundStaticFile,
     content_type: &'static str,
     cache_control: &'static str,
 }
 
-#[derive(Debug)]
 struct GatewaySession {
     bootstrap_capability: Mutex<Option<String>>,
     bootstrap_path: String,
     session_value: String,
 }
 
-#[derive(Clone, Debug)]
+struct StaticInventory {
+    canonical_root: PathBuf,
+    assets: HashMap<NormalizedPath, StaticAsset>,
+}
+
+#[derive(Clone)]
 struct StaticGatewayService {
     public_authority: String,
     public_origin: String,
     routes: RouteTable,
+    frontend_root: Arc<PathBuf>,
     assets: Arc<HashMap<NormalizedPath, StaticAsset>>,
     session: Arc<GatewaySession>,
 }
@@ -487,11 +515,11 @@ impl StartupGateway {
         metrics: StartupMetrics,
         limits: GatewayLimits,
     ) -> Result<Self, GatewayError> {
-        let assets = tokio::task::spawn_blocking(move || build_static_inventory(&frontend_root))
+        let inventory = tokio::task::spawn_blocking(move || build_static_inventory(&frontend_root))
             .await
             .map_err(|_| GatewayError::FrontendUnavailable)??;
         let routes = RouteTable {
-            static_paths: assets.keys().cloned().collect(),
+            static_paths: inventory.assets.keys().cloned().collect(),
         };
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
@@ -513,7 +541,8 @@ impl StartupGateway {
             public_authority,
             public_origin,
             routes,
-            assets: Arc::new(assets),
+            frontend_root: Arc::new(inventory.canonical_root),
+            assets: Arc::new(inventory.assets),
             session: Arc::new(GatewaySession {
                 bootstrap_capability: Mutex::new(Some(bootstrap_capability.clone())),
                 bootstrap_path,
@@ -524,14 +553,22 @@ impl StartupGateway {
         let (shutdown, shutdown_receiver) = watch::channel(false);
         let (accept_ready, ready) = oneshot::channel();
         let accept_state = state.clone();
-        let accept_task = tokio::spawn(run_accept_loop(
-            listener,
-            service,
-            accept_state,
-            shutdown_receiver,
-            limits.shutdown_drain,
-            accept_ready,
-        ));
+        let accept_task = tokio::spawn(async move {
+            let accept_loop = run_accept_loop(
+                listener,
+                service,
+                accept_state.clone(),
+                shutdown_receiver,
+                limits.max_connections,
+                limits.http_header_read_timeout,
+                limits.shutdown_drain,
+                accept_ready,
+            );
+            if AssertUnwindSafe(accept_loop).catch_unwind().await.is_err() {
+                log::warn!("Startup gateway accept loop panicked.");
+                accept_state.shutdown().await;
+            }
+        });
         ready.await.map_err(|_| GatewayError::ListenerStopped)?;
         metrics.record_or_warn(StartupMilestone::GatewayListening);
 
@@ -562,12 +599,43 @@ impl StartupGateway {
         self.state.shutdown().await;
         self.shutdown.send_replace(true);
         let mut accept_task = self.accept_task;
-        if tokio::time::timeout(self.shutdown_drain, &mut accept_task)
-            .await
-            .is_err()
-        {
-            accept_task.abort();
-            let _ = accept_task.await;
+        match tokio::time::timeout(self.shutdown_drain, &mut accept_task).await {
+            Ok(result) => observe_accept_task_result(result),
+            Err(_) => {
+                accept_task.abort();
+                observe_accept_task_result(accept_task.await);
+            }
+        }
+    }
+}
+
+fn join_error_diagnostic<T>(result: &Result<T, JoinError>) -> Option<&'static str> {
+    match result {
+        Ok(_) => None,
+        Err(error) if error.is_cancelled() => {
+            Some("Startup gateway connection task was cancelled.")
+        }
+        Err(_) => Some("Startup gateway connection task panicked."),
+    }
+}
+
+fn observe_connection_task_result(result: Result<(), JoinError>) {
+    let Some(diagnostic) = join_error_diagnostic(&result) else {
+        return;
+    };
+    if result.as_ref().is_err_and(JoinError::is_cancelled) {
+        log::debug!("{diagnostic}");
+    } else {
+        log::warn!("{diagnostic}");
+    }
+}
+
+fn observe_accept_task_result(result: Result<(), JoinError>) {
+    if let Err(error) = result {
+        if error.is_cancelled() {
+            log::debug!("Startup gateway accept task was cancelled during bounded shutdown.");
+        } else {
+            log::warn!("Startup gateway accept task panicked.");
         }
     }
 }
@@ -577,10 +645,13 @@ async fn run_accept_loop(
     service: StaticGatewayService,
     state: GatewayState,
     mut shutdown: watch::Receiver<bool>,
+    max_connections: usize,
+    http_header_read_timeout: Duration,
     shutdown_drain: Duration,
     accept_ready: oneshot::Sender<()>,
 ) {
     let mut connections = JoinSet::new();
+    let connection_limit = Arc::new(Semaphore::new(max_connections.min(Semaphore::MAX_PERMITS)));
     if accept_ready.send(()).is_err() {
         state.shutdown().await;
         return;
@@ -588,9 +659,15 @@ async fn run_accept_loop(
 
     loop {
         tokio::select! {
+            biased;
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     break;
+                }
+            }
+            completed = connections.join_next(), if !connections.is_empty() => {
+                if let Some(result) = completed {
+                    observe_connection_task_result(result);
                 }
             }
             accepted = listener.accept() => {
@@ -601,12 +678,16 @@ async fn run_accept_loop(
                 if !peer_addr.ip().is_loopback() {
                     continue;
                 }
+                let Ok(connection_permit) = connection_limit.clone().try_acquire_owned() else {
+                    drop(stream);
+                    continue;
+                };
                 let service = service.clone();
                 connections.spawn(async move {
-                    serve_connection(stream, service).await;
+                    let _connection_permit = connection_permit;
+                    serve_connection(stream, service, http_header_read_timeout).await;
                 });
             }
-            Some(_) = connections.join_next(), if !connections.is_empty() => {}
         }
     }
     drop(listener);
@@ -619,17 +700,32 @@ async fn run_accept_loop(
                 connections.abort_all();
                 break;
             }
-            _ = connections.join_next() => {}
+            completed = connections.join_next() => {
+                if let Some(result) = completed {
+                    observe_connection_task_result(result);
+                }
+            }
         }
+    }
+    while let Some(result) = connections.join_next().await {
+        observe_connection_task_result(result);
     }
 }
 
-async fn serve_connection(stream: TcpStream, service: StaticGatewayService) {
+async fn serve_connection(
+    stream: TcpStream,
+    service: StaticGatewayService,
+    http_header_read_timeout: Duration,
+) {
     let request_service = service_fn(move |request| {
         let service = service.clone();
         async move { Ok::<_, Infallible>(service.handle(request).await) }
     });
-    let _ = http1::Builder::new()
+    let mut builder = http1::Builder::new();
+    builder
+        .timer(TokioTimer::new())
+        .header_read_timeout(http_header_read_timeout);
+    let _ = builder
         .serve_connection(TokioIo::new(stream), request_service)
         .await;
 }
@@ -748,30 +844,41 @@ impl StaticGatewayService {
         let Some(asset) = self.assets.get(&path) else {
             return not_found();
         };
+        let asset = asset.clone();
+        let frontend_root = self.frontend_root.clone();
+        let opened = tokio::task::spawn_blocking(move || {
+            reopen_bound_static_file(frontend_root.as_ref(), &asset).map(|file| (file, asset))
+        })
+        .await;
+        let (file, asset) = match opened {
+            Ok(Ok(opened)) => opened,
+            Ok(Err(_)) => return not_found(),
+            Err(_) => {
+                log::warn!("Startup gateway asset validation task failed.");
+                return not_found();
+            }
+        };
         let response = Response::builder()
             .status(StatusCode::OK)
             .header(CONTENT_TYPE, asset.content_type)
-            .header(CONTENT_LENGTH, asset.content_length)
+            .header(CONTENT_LENGTH, asset.binding.content_length)
             .header(CACHE_CONTROL, asset.cache_control)
             .header("x-content-type-options", "nosniff");
 
         if request.method() == Method::HEAD {
+            drop(file);
             return response
                 .body(empty_body())
                 .expect("fixed static HEAD response must be valid");
         }
-        let Ok(file) = File::open(&asset.canonical_path).await else {
-            return not_found();
-        };
+        let file = File::from_std(file);
         response
-            .body(stream_static_file(file, asset.content_length))
+            .body(stream_static_file(file, asset.binding.content_length))
             .expect("fixed static response must be valid")
     }
 }
 
-fn build_static_inventory(
-    frontend_root: &Path,
-) -> Result<HashMap<NormalizedPath, StaticAsset>, GatewayError> {
+fn build_static_inventory(frontend_root: &Path) -> Result<StaticInventory, GatewayError> {
     let canonical_root =
         std_fs::canonicalize(frontend_root).map_err(|_| GatewayError::FrontendUnavailable)?;
     let root_metadata =
@@ -779,6 +886,8 @@ fn build_static_inventory(
     if !root_metadata.is_dir() {
         return Err(GatewayError::FrontendUnavailable);
     }
+    let root_identity = secure_static_root_identity(&canonical_root)
+        .map_err(|_| GatewayError::FrontendUnavailable)?;
 
     let mut assets = HashMap::new();
     let mut directories = vec![canonical_root.clone()];
@@ -817,21 +926,23 @@ fn build_static_inventory(
             let relative = canonical_path
                 .strip_prefix(&canonical_root)
                 .map_err(|_| GatewayError::FrontendUnavailable)?;
+            let relative_components = relative_path_components(relative)?;
+            let binding =
+                capture_bound_static_file(&canonical_root, &relative_components, root_identity)
+                    .map_err(|_| GatewayError::FrontendUnavailable)?;
             let url_path = path_to_url_path(relative)?;
             let normalized =
                 NormalizedPath::parse(&url_path).map_err(|_| GatewayError::FrontendUnavailable)?;
             let cache_control = if relative == Path::new("index.html") {
                 "no-store"
-            } else if has_content_hash(relative) {
-                IMMUTABLE_CACHE
             } else {
                 "no-cache"
             };
             assets.insert(
                 normalized,
                 StaticAsset {
-                    canonical_path,
-                    content_length: canonical_metadata.len(),
+                    relative_components,
+                    binding,
                     content_type,
                     cache_control,
                 },
@@ -844,7 +955,404 @@ fn build_static_inventory(
         .cloned()
         .ok_or(GatewayError::FrontendUnavailable)?;
     assets.insert(NormalizedPath("/".to_string()), index);
-    Ok(assets)
+    Ok(StaticInventory {
+        canonical_root,
+        assets,
+    })
+}
+
+fn relative_path_components(relative: &Path) -> Result<Vec<OsString>, GatewayError> {
+    let components = relative
+        .components()
+        .map(|component| match component {
+            std::path::Component::Normal(value) => Ok(value.to_os_string()),
+            _ => Err(GatewayError::FrontendUnavailable),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if components.is_empty() {
+        Err(GatewayError::FrontendUnavailable)
+    } else {
+        Ok(components)
+    }
+}
+
+struct OpenedStaticFile {
+    file: std_fs::File,
+    root_identity: StaticFileIdentity,
+    parent_identities: Vec<StaticFileIdentity>,
+    file_identity: StaticFileIdentity,
+    content_length: u64,
+}
+
+fn capture_bound_static_file(
+    root: &Path,
+    relative_components: &[OsString],
+    expected_root_identity: StaticFileIdentity,
+) -> io::Result<BoundStaticFile> {
+    let opened = platform_open_static_file(root, relative_components)?;
+    if opened.root_identity != expected_root_identity {
+        return Err(static_asset_changed());
+    }
+    Ok(BoundStaticFile {
+        root_identity: opened.root_identity,
+        parent_identities: opened.parent_identities,
+        file_identity: opened.file_identity,
+        content_length: opened.content_length,
+    })
+}
+
+fn reopen_bound_static_file(root: &Path, asset: &StaticAsset) -> io::Result<std_fs::File> {
+    let opened = platform_open_static_file(root, &asset.relative_components)?;
+    if opened.root_identity != asset.binding.root_identity
+        || opened.parent_identities != asset.binding.parent_identities
+        || opened.file_identity != asset.binding.file_identity
+        || opened.content_length != asset.binding.content_length
+    {
+        return Err(static_asset_changed());
+    }
+    Ok(opened.file)
+}
+
+fn static_asset_changed() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "static asset identity changed",
+    )
+}
+
+#[cfg(unix)]
+fn secure_static_root_identity(root: &Path) -> io::Result<StaticFileIdentity> {
+    let directory = unix_open_directory_path(root)?;
+    let facts = unix_file_facts(&directory)?;
+    if !facts.is_directory {
+        return Err(static_asset_changed());
+    }
+    unix_file_identity(&directory)
+}
+
+#[cfg(unix)]
+fn platform_open_static_file(
+    root: &Path,
+    relative_components: &[OsString],
+) -> io::Result<OpenedStaticFile> {
+    use std::os::fd::AsRawFd;
+
+    let (parents, file_name) = relative_components.split_at(
+        relative_components
+            .len()
+            .checked_sub(1)
+            .ok_or_else(static_asset_changed)?,
+    );
+    let mut directory = unix_open_directory_path(root)?;
+    let root_facts = unix_file_facts(&directory)?;
+    if !root_facts.is_directory {
+        return Err(static_asset_changed());
+    }
+    let root_identity = unix_file_identity(&directory)?;
+    let mut parent_identities = Vec::with_capacity(parents.len());
+    for component in parents {
+        directory = unix_open_at(
+            directory.as_raw_fd(),
+            component,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )?;
+        let facts = unix_file_facts(&directory)?;
+        if !facts.is_directory {
+            return Err(static_asset_changed());
+        }
+        parent_identities.push(unix_file_identity(&directory)?);
+    }
+    let file = unix_open_at(
+        directory.as_raw_fd(),
+        &file_name[0],
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+    )?;
+    let facts = unix_file_facts(&file)?;
+    if !facts.is_file {
+        return Err(static_asset_changed());
+    }
+    let file_identity = unix_file_identity(&file)?;
+    Ok(OpenedStaticFile {
+        file,
+        root_identity,
+        parent_identities,
+        file_identity,
+        content_length: facts.length,
+    })
+}
+
+#[cfg(unix)]
+fn unix_open_directory_path(path: &Path) -> io::Result<std_fs::File> {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid static root"))?;
+    let descriptor = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(unsafe { std_fs::File::from_raw_fd(descriptor) })
+    }
+}
+
+#[cfg(unix)]
+fn unix_open_at(
+    directory: std::os::fd::RawFd,
+    name: &OsStr,
+    flags: i32,
+) -> io::Result<std_fs::File> {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid static path"))?;
+    let descriptor = unsafe { libc::openat(directory, name.as_ptr(), flags) };
+    if descriptor < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(unsafe { std_fs::File::from_raw_fd(descriptor) })
+    }
+}
+
+#[cfg(unix)]
+struct StaticFileFacts {
+    is_file: bool,
+    is_directory: bool,
+    length: u64,
+}
+
+#[cfg(unix)]
+fn unix_file_facts(file: &std_fs::File) -> io::Result<StaticFileFacts> {
+    use std::os::fd::AsRawFd;
+
+    let mut status = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    if unsafe { libc::fstat(file.as_raw_fd(), status.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let status = unsafe { status.assume_init() };
+    let kind = status.st_mode & libc::S_IFMT;
+    Ok(StaticFileFacts {
+        is_file: kind == libc::S_IFREG,
+        is_directory: kind == libc::S_IFDIR,
+        length: status.st_size.try_into().unwrap_or(u64::MAX),
+    })
+}
+
+#[cfg(unix)]
+fn unix_file_identity(file: &std_fs::File) -> io::Result<StaticFileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file.metadata()?;
+    let mut identity = [0_u8; 16];
+    identity[..8].copy_from_slice(&metadata.ino().to_le_bytes());
+    Ok(StaticFileIdentity {
+        volume: metadata.dev(),
+        file: identity,
+    })
+}
+
+#[cfg(windows)]
+fn secure_static_root_identity(root: &Path) -> io::Result<StaticFileIdentity> {
+    let directory = windows_open_directory_no_follow(root)?;
+    let facts = windows_file_facts(&directory)?;
+    if !facts.is_directory || facts.is_reparse_point {
+        return Err(static_asset_changed());
+    }
+    windows_file_identity(&directory)
+}
+
+#[cfg(windows)]
+fn platform_open_static_file(
+    root: &Path,
+    relative_components: &[OsString],
+) -> io::Result<OpenedStaticFile> {
+    let (parents, file_name) = relative_components.split_at(
+        relative_components
+            .len()
+            .checked_sub(1)
+            .ok_or_else(static_asset_changed)?,
+    );
+    let root_directory = windows_open_directory_no_follow(root)?;
+    let root_facts = windows_file_facts(&root_directory)?;
+    if !root_facts.is_directory || root_facts.is_reparse_point {
+        return Err(static_asset_changed());
+    }
+    let root_identity = windows_file_identity(&root_directory)?;
+    let mut held_directories = vec![root_directory];
+    let mut parent_identities = Vec::with_capacity(parents.len());
+    let mut current_path = root.to_path_buf();
+    for component in parents {
+        current_path.push(component);
+        let directory = windows_open_directory_no_follow(&current_path)?;
+        let facts = windows_file_facts(&directory)?;
+        if !facts.is_directory || facts.is_reparse_point {
+            return Err(static_asset_changed());
+        }
+        parent_identities.push(windows_file_identity(&directory)?);
+        held_directories.push(directory);
+    }
+    current_path.push(&file_name[0]);
+    let file = windows_open_regular_file_no_follow(&current_path)?;
+    let facts = windows_file_facts(&file)?;
+    if !facts.is_file || facts.is_reparse_point {
+        return Err(static_asset_changed());
+    }
+    let file_identity = windows_file_identity(&file)?;
+    drop(held_directories);
+    Ok(OpenedStaticFile {
+        file,
+        root_identity,
+        parent_identities,
+        file_identity,
+        content_length: facts.length,
+    })
+}
+
+#[cfg(windows)]
+fn windows_open_directory_no_follow(path: &Path) -> io::Result<std_fs::File> {
+    use windows_sys::Win32::Foundation::GENERIC_READ;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+
+    windows_open_file(
+        path,
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+    )
+}
+
+#[cfg(windows)]
+fn windows_open_regular_file_no_follow(path: &Path) -> io::Result<std_fs::File> {
+    use windows_sys::Win32::Foundation::GENERIC_READ;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, OPEN_EXISTING,
+    };
+
+    windows_open_file(
+        path,
+        GENERIC_READ,
+        FILE_SHARE_READ,
+        OPEN_EXISTING,
+        FILE_FLAG_OPEN_REPARSE_POINT,
+    )
+}
+
+#[cfg(windows)]
+fn windows_open_file(
+    path: &Path,
+    access: u32,
+    sharing: u32,
+    creation: u32,
+    flags: u32,
+) -> io::Result<std_fs::File> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::CreateFileW;
+
+    let path = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let handle = unsafe {
+        CreateFileW(
+            path.as_ptr(),
+            access,
+            sharing,
+            std::ptr::null(),
+            creation,
+            flags,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(unsafe { std_fs::File::from_raw_handle(handle) })
+    }
+}
+
+#[cfg(windows)]
+struct StaticFileFacts {
+    is_file: bool,
+    is_directory: bool,
+    is_reparse_point: bool,
+    length: u64,
+}
+
+#[cfg(windows)]
+fn windows_file_facts(file: &std_fs::File) -> io::Result<StaticFileFacts> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileBasicInfo, FileStandardInfo, GetFileInformationByHandleEx, FILE_ATTRIBUTE_DIRECTORY,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_BASIC_INFO, FILE_STANDARD_INFO,
+    };
+
+    let mut basic = FILE_BASIC_INFO::default();
+    let mut standard = FILE_STANDARD_INFO::default();
+    let basic_ok = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileBasicInfo,
+            (&mut basic as *mut FILE_BASIC_INFO).cast(),
+            std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    };
+    let standard_ok = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileStandardInfo,
+            (&mut standard as *mut FILE_STANDARD_INFO).cast(),
+            std::mem::size_of::<FILE_STANDARD_INFO>() as u32,
+        )
+    };
+    if basic_ok == 0 || standard_ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let is_directory = basic.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+    Ok(StaticFileFacts {
+        is_file: !is_directory,
+        is_directory,
+        is_reparse_point: basic.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0,
+        length: standard.EndOfFile.try_into().unwrap_or(u64::MAX),
+    })
+}
+
+#[cfg(windows)]
+fn windows_file_identity(file: &std_fs::File) -> io::Result<StaticFileIdentity> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileIdInfo, GetFileInformationByHandleEx, FILE_ID_INFO,
+    };
+
+    let mut identity = FILE_ID_INFO::default();
+    let success = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileIdInfo,
+            (&mut identity as *mut FILE_ID_INFO).cast(),
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+    };
+    if success == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(StaticFileIdentity {
+            volume: identity.VolumeSerialNumber,
+            file: identity.FileId.Identifier,
+        })
+    }
 }
 
 fn path_to_url_path(relative: &Path) -> Result<String, GatewayError> {
@@ -879,14 +1387,6 @@ fn fixed_content_type(path: &Path) -> Option<&'static str> {
         "woff2" => Some("font/woff2"),
         _ => None,
     }
-}
-
-fn has_content_hash(path: &Path) -> bool {
-    path.file_stem()
-        .and_then(|stem| stem.to_str())
-        .into_iter()
-        .flat_map(|stem| stem.split(['.', '-']))
-        .any(|segment| segment.len() >= 8 && segment.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
 fn empty_body() -> GatewayBody {
@@ -1073,6 +1573,29 @@ impl RouteTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn join_error_diagnostics_are_static_and_redacted() {
+        let panic_task = tokio::spawn(async {
+            panic!("secret-capability C:\\sensitive\\frontend");
+        });
+        let panic_result = panic_task.await;
+        assert_eq!(
+            join_error_diagnostic(&panic_result),
+            Some("Startup gateway connection task panicked.")
+        );
+        let panic_diagnostic = join_error_diagnostic(&panic_result).unwrap();
+        assert!(!panic_diagnostic.contains("secret-capability"));
+        assert!(!panic_diagnostic.contains("sensitive"));
+
+        let cancelled_task = tokio::spawn(std::future::pending::<()>());
+        cancelled_task.abort();
+        let cancelled_result = cancelled_task.await;
+        assert_eq!(
+            join_error_diagnostic(&cancelled_result),
+            Some("Startup gateway connection task was cancelled.")
+        );
+    }
 
     #[tokio::test]
     async fn static_asset_body_emits_fixed_size_reader_stream_frames() {

@@ -394,15 +394,21 @@ test('generated Tauri frontend resources are symlink-free and remain exactly sco
     assert.throws(() => assertSymlinkFreeTree(generated), /symbolic link|reparse point/);
 
     const tauriConfig = JSON.parse(await readFile(path.join(tauriDirectory, 'tauri.conf.json'), 'utf8'));
-    const generatedFrontendScopes = [
-      tauriConfig.build?.frontendDist,
-      ...Object.keys(tauriConfig.bundle?.resources ?? {})
-        .filter(sourcePath => sourcePath.includes('frontend')),
-    ].sort();
-    assert.deepEqual(generatedFrontendScopes, ['../browser-frontend', '../tauri-frontend']);
-    assert.equal(tauriConfig.bundle.resources['../browser-frontend'], 'lib/frontend');
+    const resources = tauriConfig.bundle?.resources ?? {};
+    assert.equal(tauriConfig.build?.frontendDist, '../tauri-frontend');
+    assert.equal(resources['../browser-frontend'], 'lib/frontend');
+    assert.equal(resources['../tauri-frontend'], undefined);
+    assert.deepEqual(
+      Object.fromEntries(Object.entries(resources).filter(([sourcePath, targetPath]) =>
+        sourcePath === '../browser-frontend'
+          || sourcePath === '../tauri-frontend'
+          || targetPath === 'lib/frontend'
+          || targetPath === 'tauri-frontend'
+      )),
+      { '../browser-frontend': 'lib/frontend' },
+    );
     assert.equal(
-      Object.keys(tauriConfig.bundle.resources)
+      Object.keys(resources)
         .some(sourcePath => ['*', '?', '[', ']'].some(marker => sourcePath.includes(marker))),
       false,
     );

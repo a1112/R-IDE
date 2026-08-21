@@ -31,6 +31,7 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use uuid::Uuid;
 
@@ -173,6 +174,52 @@ async fn bootstrap_session(gateway: &StartupGateway) -> String {
         .to_string()
 }
 
+async fn open_partial_request(gateway: &StartupGateway) -> TcpStream {
+    let mut stream = TcpStream::connect(gateway_addr(gateway)).await.unwrap();
+    stream
+        .write_all(format!("GET / HTTP/1.1\r\nHost: {}\r\n", gateway.public_authority()).as_bytes())
+        .await
+        .unwrap();
+    stream
+}
+
+async fn socket_closes_within(mut stream: TcpStream, duration: Duration) -> bool {
+    tokio::time::timeout(duration, async move {
+        let mut buffer = [0_u8; 256];
+        loop {
+            match stream.read(&mut buffer).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+        }
+    })
+    .await
+    .is_ok()
+}
+
+async fn raw_anonymous_get(gateway: &StartupGateway) -> Vec<u8> {
+    let mut stream = TcpStream::connect(gateway_addr(gateway)).await.unwrap();
+    let request = format!(
+        "GET / HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        gateway.public_authority()
+    );
+    if stream.write_all(request.as_bytes()).await.is_err() {
+        return Vec::new();
+    }
+    let mut response = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_millis(100), async {
+        let mut buffer = [0_u8; 512];
+        loop {
+            match stream.read(&mut buffer).await {
+                Ok(0) | Err(_) => break,
+                Ok(read) => response.extend_from_slice(&buffer[..read]),
+            }
+        }
+    })
+    .await;
+    response
+}
+
 #[cfg(unix)]
 fn symlink_file(original: &Path, link: &Path) -> io::Result<()> {
     std::os::unix::fs::symlink(original, link)
@@ -181,6 +228,39 @@ fn symlink_file(original: &Path, link: &Path) -> io::Result<()> {
 #[cfg(windows)]
 fn symlink_file(original: &Path, link: &Path) -> io::Result<()> {
     std::os::windows::fs::symlink_file(original, link)
+}
+
+#[cfg(unix)]
+fn link_creation_is_unavailable(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(code) if matches!(code, libc::EPERM | libc::EOPNOTSUPP | libc::ENOSYS)
+    )
+}
+
+#[cfg(windows)]
+fn link_creation_is_unavailable(error: &io::Error) -> bool {
+    use windows_sys::Win32::Foundation::{ERROR_NOT_SUPPORTED, ERROR_PRIVILEGE_NOT_HELD};
+
+    matches!(
+        error.raw_os_error(),
+        Some(code)
+            if code == ERROR_PRIVILEGE_NOT_HELD as i32 || code == ERROR_NOT_SUPPORTED as i32
+    )
+}
+
+async fn assert_bounded_not_found_for_get_and_head(
+    gateway: &StartupGateway,
+    cookie: &str,
+    path: &str,
+) {
+    for method in [Method::GET, Method::HEAD] {
+        let response =
+            send_request(gateway, method.clone(), path, &[(COOKIE.as_str(), cookie)]).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {path}");
+        let body = response_bytes(response).await;
+        assert!(body.len() <= 32, "{method} {path}");
+    }
 }
 
 #[tokio::test]
@@ -282,10 +362,65 @@ async fn authenticated_index_and_assets_are_available_before_backend_readiness()
     )
     .await;
     assert_eq!(hashed.status(), StatusCode::OK);
-    assert_eq!(
-        hashed.headers().get(CACHE_CONTROL).unwrap(),
-        "public, max-age=31536000, immutable"
-    );
+    assert_eq!(hashed.headers().get(CACHE_CONTROL).unwrap(), "no-cache");
+    gateway.shutdown().await;
+}
+
+#[tokio::test]
+async fn get_and_head_reject_a_regular_asset_replaced_after_bind() {
+    let frontend = TemporaryFrontend::new();
+    let gateway = bind_gateway(&frontend).await;
+    let cookie = bootstrap_session(&gateway).await;
+    let asset = frontend.root.join("bundle.js");
+    fs::rename(&asset, frontend.root.join("bundle.bound.js")).unwrap();
+    fs::write(&asset, b"globalThis.replacedWithLongerContent = true;").unwrap();
+
+    assert_bounded_not_found_for_get_and_head(&gateway, &cookie, "/bundle.js").await;
+    gateway.shutdown().await;
+}
+
+#[tokio::test]
+async fn get_and_head_reject_a_final_symlink_installed_after_bind() {
+    let frontend = TemporaryFrontend::new();
+    let external = frontend.root.with_file_name(format!(
+        "ride-startup-gateway-link-target-{}",
+        Uuid::new_v4()
+    ));
+    fs::write(&external, b"body { color: red; }").unwrap();
+    let gateway = bind_gateway(&frontend).await;
+    let cookie = bootstrap_session(&gateway).await;
+    let asset = frontend.root.join("bundle.css");
+    fs::rename(&asset, frontend.root.join("bundle.bound.css")).unwrap();
+    if let Err(error) = symlink_file(&external, &asset) {
+        gateway.shutdown().await;
+        fs::remove_file(&external).unwrap();
+        if link_creation_is_unavailable(&error) {
+            eprintln!("skipping symlink replacement assertion: platform link creation unavailable");
+            return;
+        }
+        panic!("create replacement symlink: {error}");
+    }
+
+    assert_bounded_not_found_for_get_and_head(&gateway, &cookie, "/bundle.css").await;
+    gateway.shutdown().await;
+    fs::remove_file(external).unwrap();
+}
+
+#[tokio::test]
+async fn get_and_head_reject_a_replaced_parent_even_for_the_same_file_identity() {
+    let frontend = TemporaryFrontend::new();
+    let parent = frontend.root.join("nested");
+    fs::create_dir(&parent).unwrap();
+    fs::write(parent.join("asset.js"), b"same identity through hard link").unwrap();
+    let gateway = bind_gateway(&frontend).await;
+    let cookie = bootstrap_session(&gateway).await;
+
+    let original_parent = frontend.root.join("nested.bound");
+    fs::rename(&parent, &original_parent).unwrap();
+    fs::create_dir(&parent).unwrap();
+    fs::hard_link(original_parent.join("asset.js"), parent.join("asset.js")).unwrap();
+
+    assert_bounded_not_found_for_get_and_head(&gateway, &cookie, "/nested/asset.js").await;
     gateway.shutdown().await;
 }
 
@@ -445,6 +580,8 @@ async fn shutdown_is_bounded_and_releases_the_loopback_listener() {
         frontend.root.clone(),
         disabled_metrics(),
         GatewayLimits {
+            max_connections: 1,
+            http_header_read_timeout: Duration::from_secs(30),
             shutdown_drain: Duration::from_millis(25),
             ..GatewayLimits::test_defaults()
         },
@@ -452,12 +589,101 @@ async fn shutdown_is_bounded_and_releases_the_loopback_listener() {
     .await
     .unwrap();
     let address = gateway_addr(&gateway);
-    let _idle_connection = TcpStream::connect(address).await.unwrap();
+    let idle_connection = open_partial_request(&gateway).await;
 
     tokio::time::timeout(Duration::from_millis(250), gateway.shutdown())
         .await
         .expect("gateway shutdown exceeded its drain bound");
+    assert!(socket_closes_within(idle_connection, Duration::from_millis(250)).await);
     assert!(TcpStream::connect(address).await.is_err());
+}
+
+#[tokio::test]
+async fn connection_saturation_closes_over_limit_sockets_before_http_work() {
+    let frontend = TemporaryFrontend::new();
+    let gateway = StartupGateway::bind(
+        frontend.root.clone(),
+        disabled_metrics(),
+        GatewayLimits {
+            max_connections: 1,
+            http_header_read_timeout: Duration::from_secs(5),
+            ..GatewayLimits::test_defaults()
+        },
+    )
+    .await
+    .unwrap();
+    let mut first = open_partial_request(&gateway).await;
+    let second = TcpStream::connect(gateway_addr(&gateway)).await.unwrap();
+
+    assert!(socket_closes_within(second, Duration::from_millis(250)).await);
+    let mut probe = [0_u8; 1];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), first.read(&mut probe))
+            .await
+            .is_err(),
+        "the permit-owning partial request closed before its configured timeout"
+    );
+    drop(first);
+    gateway.shutdown().await;
+}
+
+#[tokio::test]
+async fn header_timeout_closes_silent_clients_and_releases_the_connection_permit() {
+    let frontend = TemporaryFrontend::new();
+    let gateway = StartupGateway::bind(
+        frontend.root.clone(),
+        disabled_metrics(),
+        GatewayLimits {
+            max_connections: 1,
+            http_header_read_timeout: Duration::from_millis(30),
+            ..GatewayLimits::test_defaults()
+        },
+    )
+    .await
+    .unwrap();
+    let first = open_partial_request(&gateway).await;
+
+    assert!(socket_closes_within(first, Duration::from_millis(250)).await);
+    let response = raw_anonymous_get(&gateway).await;
+    assert!(
+        response.starts_with(b"HTTP/1.1 404"),
+        "released permit did not admit a complete request"
+    );
+    gateway.shutdown().await;
+}
+
+#[tokio::test]
+async fn client_cancellation_releases_the_connection_permit() {
+    let frontend = TemporaryFrontend::new();
+    let gateway = StartupGateway::bind(
+        frontend.root.clone(),
+        disabled_metrics(),
+        GatewayLimits {
+            max_connections: 1,
+            http_header_read_timeout: Duration::from_secs(5),
+            ..GatewayLimits::test_defaults()
+        },
+    )
+    .await
+    .unwrap();
+    let first = open_partial_request(&gateway).await;
+    let saturation_probe = TcpStream::connect(gateway_addr(&gateway)).await.unwrap();
+    assert!(socket_closes_within(saturation_probe, Duration::from_millis(250)).await);
+    drop(first);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+    loop {
+        let response = raw_anonymous_get(&gateway).await;
+        if response.starts_with(b"HTTP/1.1 404") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "cancelled connection did not release its permit"
+        );
+        tokio::task::yield_now().await;
+    }
+    gateway.shutdown().await;
 }
 
 #[tokio::test]
