@@ -518,6 +518,16 @@ test('target and final report phases require their mode-aware completion milesto
     ).milestones.plugins_ready,
     60,
   );
+
+  const emptyWorkspaceMilestones = { ...finalMilestones };
+  delete emptyWorkspaceMilestones.target_file_opened;
+  assert.equal(
+    parseStartupReport(
+      JSON.stringify(startupReport(emptyWorkspaceMilestones)),
+      { phase: 'final' },
+    ).milestones.plugins_ready,
+    60,
+  );
 });
 
 test('report waiter tolerates causal partial snapshots until target_file_opened is present', async () => {
@@ -535,6 +545,25 @@ test('report waiter tolerates causal partial snapshots until target_file_opened 
     assert.equal(report.milestones.target_file_opened, 42);
   } finally {
     clearTimeout(update);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('final report waiter accepts plugins-ready without an optional target file', async () => {
+  const root = temporaryDirectory('empty-workspace-final-report');
+  const reportPath = path.join(root, 'startup.json');
+  const emptyWorkspaceMilestones = { ...finalMilestones };
+  delete emptyWorkspaceMilestones.target_file_opened;
+  try {
+    fs.writeFileSync(reportPath, JSON.stringify(startupReport(emptyWorkspaceMilestones)));
+    const report = await waitForStartupReport(reportPath, {
+      timeoutMs: 100,
+      pollMs: 1,
+      phase: 'final',
+    });
+    assert.equal(report.milestones.plugins_ready, 60);
+    assert.equal(Object.hasOwn(report.milestones, 'target_file_opened'), false);
+  } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
 });

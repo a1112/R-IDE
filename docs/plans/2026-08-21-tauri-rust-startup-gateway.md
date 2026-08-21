@@ -138,7 +138,7 @@ impl StartupMilestone {
             Self::RpcConnected => &[Self::BackendListening, Self::FrontendRequestStarted],
             Self::FrontendShellAttached => &[Self::RpcConnected, Self::FrontendBundleLoaded],
             Self::TargetFileOpened => &[Self::FrontendShellAttached],
-            Self::PluginsStarted => &[Self::TargetFileOpened],
+            Self::PluginsStarted => &[Self::FrontendShellAttached],
             Self::PluginsReady => &[Self::PluginsStarted],
         }
     }
@@ -152,7 +152,7 @@ impl StartupMilestone {
                 &[Self::BackendListening, Self::NativeWindowVisible]
             }
             Self::TargetFileOpened => &[Self::FrontendShellAttached],
-            Self::PluginsStarted => &[Self::TargetFileOpened],
+            Self::PluginsStarted => &[Self::FrontendShellAttached],
             Self::PluginsReady => &[Self::PluginsStarted],
             Self::GatewayListening
             | Self::FrontendRequestStarted
@@ -165,7 +165,7 @@ impl StartupMilestone {
 
 Set STARTUP_REPORT_VERSION to 2, serialize startupMode, add gateway_listening, frontend_request_started, frontend_bundle_loaded, and rpc_connected fields, and replace ORDERED/latest/index validation with predecessor presence and timestamp checks. Duplicate events remain idempotent. Delete v2 use of backend_spawned_before_window and backend_listening_before_window; do not synthesize timestamps.
 
-Keep legacy v1 parsing in Node only. New Rust output is always v2 and carries the effective startup mode. Rust-gateway requires the full gateway graph; fresh legacy v2 reports use the reduced mode-specific graph and omit gateway-only fields. Add an is_applicable check so attempts to record gateway-only milestones in legacy mode return NotApplicable instead of silently accepting a root event.
+Keep legacy v1 parsing in Node only. New Rust output is always v2 and carries the effective startup mode. Rust-gateway requires its full mode-specific graph except for the optional `target_file_opened` branch used only when startup has a target; final empty-workspace reports complete at `plugins_ready` without synthesizing a target timestamp. Fresh legacy v2 reports use the reduced mode-specific graph and omit gateway-only fields. Add an is_applicable check so attempts to record gateway-only milestones in legacy mode return NotApplicable instead of silently accepting a root event.
 Change StartupMetrics::from_env to receive the requested StartupMode and add select_effective_mode. The only permitted mutation is RustGateway -> LegacyFallback before any event other than ProcessStarted; publish the corrected snapshot immediately.
 
 **Step 4: Write and run failing Node parser/comparator tests**

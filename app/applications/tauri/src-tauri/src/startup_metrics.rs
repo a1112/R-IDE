@@ -111,7 +111,7 @@ impl StartupMilestone {
             Self::RpcConnected => &[Self::BackendListening, Self::FrontendRequestStarted],
             Self::FrontendShellAttached => &[Self::RpcConnected, Self::FrontendBundleLoaded],
             Self::TargetFileOpened => &[Self::FrontendShellAttached],
-            Self::PluginsStarted => &[Self::TargetFileOpened],
+            Self::PluginsStarted => &[Self::FrontendShellAttached],
             Self::PluginsReady => &[Self::PluginsStarted],
         }
     }
@@ -123,7 +123,7 @@ impl StartupMilestone {
             Self::BackendListening => &[Self::BackendSpawned],
             Self::FrontendShellAttached => &[Self::BackendListening, Self::NativeWindowVisible],
             Self::TargetFileOpened => &[Self::FrontendShellAttached],
-            Self::PluginsStarted => &[Self::TargetFileOpened],
+            Self::PluginsStarted => &[Self::FrontendShellAttached],
             Self::PluginsReady => &[Self::PluginsStarted],
             Self::GatewayListening
             | Self::FrontendRequestStarted

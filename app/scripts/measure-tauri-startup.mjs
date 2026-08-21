@@ -78,7 +78,7 @@ const MILESTONE_PREDECESSORS = Object.freeze({
     rpc_connected: ['backend_listening', 'frontend_request_started'],
     frontend_shell_attached: ['rpc_connected', 'frontend_bundle_loaded'],
     target_file_opened: ['frontend_shell_attached'],
-    plugins_started: ['target_file_opened'],
+    plugins_started: ['frontend_shell_attached'],
     plugins_ready: ['plugins_started'],
   }),
   'legacy-explicit': Object.freeze({
@@ -88,7 +88,7 @@ const MILESTONE_PREDECESSORS = Object.freeze({
     backend_listening: ['backend_spawned'],
     frontend_shell_attached: ['backend_listening', 'native_window_visible'],
     target_file_opened: ['frontend_shell_attached'],
-    plugins_started: ['target_file_opened'],
+    plugins_started: ['frontend_shell_attached'],
     plugins_ready: ['plugins_started'],
   }),
   'legacy-fallback': Object.freeze({
@@ -98,11 +98,12 @@ const MILESTONE_PREDECESSORS = Object.freeze({
     backend_listening: ['backend_spawned'],
     frontend_shell_attached: ['backend_listening', 'native_window_visible'],
     target_file_opened: ['frontend_shell_attached'],
-    plugins_started: ['target_file_opened'],
+    plugins_started: ['frontend_shell_attached'],
     plugins_ready: ['plugins_started'],
   }),
 });
 const STARTUP_MODES = new Set(Object.keys(MILESTONE_PREDECESSORS));
+const OPTIONAL_FINAL_MILESTONES = new Set(['target_file_opened']);
 const RUST_PLATFORMS = new Set(['windows', 'linux', 'macos']);
 const RUST_ARCHITECTURES = new Set(['x86_64', 'aarch64']);
 const NODE_TO_RUST_PLATFORM = {
@@ -500,10 +501,15 @@ export function parseStartupReport(
   if (!Object.hasOwn(report.milestones, 'process_started')) {
     throw new Error('startup report must contain process_started');
   }
-  if (phase !== 'incremental' && !Object.hasOwn(report.milestones, 'target_file_opened')) {
+  if (phase === 'target' && !Object.hasOwn(report.milestones, 'target_file_opened')) {
     throw new Error('startup report must contain target_file_opened');
   }
-  if (phase === 'final' && milestoneKeys.length !== applicableMilestones.length) {
+  const requiredFinalMilestones = applicableMilestones.filter(
+    milestone => !OPTIONAL_FINAL_MILESTONES.has(milestone),
+  );
+  if (phase === 'final' && !requiredFinalMilestones.every(
+    milestone => Object.hasOwn(report.milestones, milestone),
+  )) {
     throw new Error(`startup report must contain all ${report.startupMode} final milestones`);
   }
 
@@ -2098,7 +2104,8 @@ export async function waitForStartupReport(
       if (phase !== 'final') {
         throw new Error(`unsupported startup report phase ${phase}`);
       }
-      const finalMilestones = Object.keys(MILESTONE_PREDECESSORS[report.startupMode]);
+      const finalMilestones = Object.keys(MILESTONE_PREDECESSORS[report.startupMode])
+        .filter(milestone => !OPTIONAL_FINAL_MILESTONES.has(milestone));
       if (finalMilestones.every(milestone => Object.hasOwn(report.milestones, milestone))) {
         return parseStartupReport(serialized, {
           expectedPlatform,

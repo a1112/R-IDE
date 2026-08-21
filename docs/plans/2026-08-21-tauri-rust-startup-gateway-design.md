@@ -215,10 +215,10 @@ Schema v2 validates milestone causality as a dependency graph instead of forcing
 - `rpc_connected` depends on `backend_listening` and `frontend_request_started`.
 - `frontend_shell_attached` depends on `rpc_connected` and `frontend_bundle_loaded`.
 - `target_file_opened` depends on `frontend_shell_attached`.
-- `plugins_started` depends on `target_file_opened`.
+- `plugins_started` depends on `frontend_shell_attached`.
 - `plugins_ready` depends on `plugins_started`.
 
-Each one-shot event is accepted only after its declared predecessors and must have a timestamp greater than or equal to every predecessor. Independent events, such as `frontend_bundle_loaded` and `backend_listening`, have no ordering constraint. Fresh `legacy-explicit` and `legacy-fallback` v2 reports use a reduced dependency graph rooted at `process_started` and omit gateway-only milestones; they also preserve actual timestamps. Gateway-mode reports must never publish a delayed surrogate timestamp to make concurrent events appear sequential. The v1 canonicalization remains readable only for historical evidence.
+Each one-shot event is accepted only after its declared predecessors and must have a timestamp greater than or equal to every predecessor. Independent events, such as `frontend_bundle_loaded` and `backend_listening`, have no ordering constraint. `target_file_opened` is an optional branch for empty-workspace startup: target measurements still require it, while a final report may complete at `plugins_ready` without inventing a file-open timestamp. Fresh `legacy-explicit` and `legacy-fallback` v2 reports use a reduced dependency graph rooted at `process_started` and omit gateway-only milestones; they also preserve actual timestamps. Gateway-mode reports must never publish a delayed surrogate timestamp to make concurrent events appear sequential. The v1 canonicalization remains readable only for historical evidence.
 
 The optimized comparator accepts only `rust-gateway`, exact build/profile identity, five complete runs, and all required milestones. It preserves current same-host/platform/architecture compatibility checks.
 

@@ -1242,6 +1242,12 @@ test('critical-empty launches no file or forwarding instance and proves shell pl
         ...NATIVE_OBSERVATIONS,
       };
     },
+    waitForStartupFinalReport: async () => {
+      events.push('wait-startup-final');
+      const complete = startupReport();
+      delete complete.milestones.target_file_opened;
+      return complete;
+    },
   });
 
   const result = await runPackagedSmoke({ scenario: 'critical-empty', timeoutMs: 30_000 }, dependencies);

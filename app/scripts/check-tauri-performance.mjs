@@ -50,7 +50,7 @@ const MILESTONE_PREDECESSORS = Object.freeze({
     rpc_connected: ['backend_listening', 'frontend_request_started'],
     frontend_shell_attached: ['rpc_connected', 'frontend_bundle_loaded'],
     target_file_opened: ['frontend_shell_attached'],
-    plugins_started: ['target_file_opened'],
+    plugins_started: ['frontend_shell_attached'],
     plugins_ready: ['plugins_started'],
   }),
   'legacy-explicit': Object.freeze({
@@ -60,7 +60,7 @@ const MILESTONE_PREDECESSORS = Object.freeze({
     backend_listening: ['backend_spawned'],
     frontend_shell_attached: ['backend_listening', 'native_window_visible'],
     target_file_opened: ['frontend_shell_attached'],
-    plugins_started: ['target_file_opened'],
+    plugins_started: ['frontend_shell_attached'],
     plugins_ready: ['plugins_started'],
   }),
   'legacy-fallback': Object.freeze({
@@ -70,7 +70,7 @@ const MILESTONE_PREDECESSORS = Object.freeze({
     backend_listening: ['backend_spawned'],
     frontend_shell_attached: ['backend_listening', 'native_window_visible'],
     target_file_opened: ['frontend_shell_attached'],
-    plugins_started: ['target_file_opened'],
+    plugins_started: ['frontend_shell_attached'],
     plugins_ready: ['plugins_started'],
   }),
 });

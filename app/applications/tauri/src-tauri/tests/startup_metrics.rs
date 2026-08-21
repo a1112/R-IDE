@@ -506,13 +506,35 @@ fn legacy_report_requires_each_declared_predecessor() {
         report.record(StartupMilestone::PluginsStarted, 30),
         Err(StartupMetricError::MissingPredecessor {
             attempted: StartupMilestone::PluginsStarted,
-            required: StartupMilestone::TargetFileOpened,
+            required: StartupMilestone::FrontendShellAttached,
         })
     );
     assert_eq!(
         serde_json::to_value(&report).expect("serialize after rejection"),
         before
     );
+}
+
+#[test]
+fn plugin_lifecycle_can_complete_without_the_optional_target_file_branch() {
+    let mut report = StartupReport::new("test", "test", 1, StartupMode::LegacyExplicit);
+    for (milestone, duration_ms) in [
+        (StartupMilestone::ProcessStarted, 0),
+        (StartupMilestone::NativeWindowVisible, 2),
+        (StartupMilestone::BackendSpawned, 1),
+        (StartupMilestone::BackendListening, 3),
+        (StartupMilestone::FrontendShellAttached, 4),
+        (StartupMilestone::PluginsStarted, 5),
+        (StartupMilestone::PluginsReady, 6),
+    ] {
+        report
+            .record(milestone, duration_ms)
+            .expect("record empty-workspace startup milestone");
+    }
+
+    let value = serde_json::to_value(&report).expect("serialize empty-workspace report");
+    assert!(value["milestones"].get("target_file_opened").is_none());
+    assert_eq!(value["milestones"]["plugins_ready"], 6);
 }
 
 #[test]
