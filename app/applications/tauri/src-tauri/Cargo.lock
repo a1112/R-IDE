@@ -3216,6 +3216,7 @@ dependencies = [
 name = "ride-tauri"
 version = "1.72.100"
 dependencies = [
+ "base64 0.22.1",
  "bytes",
  "dirs 5.0.1",
  "dunce",
@@ -3232,6 +3233,7 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha1",
  "sha2",
  "signal-hook",
  "sysinfo",

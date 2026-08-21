@@ -459,6 +459,17 @@ async fn websocket_failure_status(request: WebSocketRequest) -> StatusCode {
     }
 }
 
+async fn websocket_failure_details(request: WebSocketRequest) -> (StatusCode, Option<Vec<u8>>) {
+    match connect_async(request).await {
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            let status = response.status();
+            (status, response.into_body())
+        }
+        Ok(_) => panic!("invalid WebSocket request unexpectedly upgraded"),
+        Err(error) => panic!("invalid WebSocket response was not converted to HTTP 502: {error}"),
+    }
+}
+
 async fn open_partial_request(gateway: &StartupGateway) -> TcpStream {
     let mut stream = TcpStream::connect(gateway_addr(gateway)).await.unwrap();
     stream
@@ -2976,4 +2987,129 @@ async fn websocket_proxy_records_rpc_once_after_backend_101_and_never_on_failure
     assert!(reports.recv_timeout(Duration::from_millis(100)).is_err());
     assert_eq!(backend.finish().await.len(), 2);
     gateway.shutdown().await;
+}
+
+#[tokio::test]
+async fn websocket_proxy_rejects_wrong_missing_and_duplicate_backend_accept_without_rpc() {
+    let (reports_sender, reports) = mpsc::channel();
+    let metrics = StartupMetrics::with_clock_and_writer(
+        "test",
+        "test",
+        9,
+        StartupMode::RustGateway,
+        Arc::new(ZeroClock),
+        Box::new(ChannelWriter(reports_sender)),
+    );
+    metrics.record(StartupMilestone::ProcessStarted).unwrap();
+    let backend = RawResponseBackend::spawn(vec![
+        b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: AAAAAAAAAAAAAAAAAAAAAAAAAAA=\r\n\r\n".to_vec(),
+        b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n".to_vec(),
+        b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n".to_vec(),
+    ])
+    .await;
+    let frontend = TemporaryFrontend::new();
+    let gateway = StartupGateway::bind(
+        frontend.root.clone(),
+        metrics.clone(),
+        GatewayLimits::test_defaults(),
+    )
+    .await
+    .unwrap();
+    let cookie = bootstrap_session(&gateway).await;
+    metrics
+        .record(StartupMilestone::FrontendRequestStarted)
+        .unwrap();
+    metrics.record(StartupMilestone::BackendSpawned).unwrap();
+    let state = gateway.state();
+    let generation = state.begin_backend_start().await.unwrap();
+    state.backend_ready(generation, backend.addr).await.unwrap();
+    metrics.record(StartupMilestone::BackendListening).unwrap();
+    receive_report_with_milestone(&reports, "backend_listening");
+    let public_origin = format!("http://{}", gateway.public_authority());
+
+    for _ in 0..3 {
+        let mut request = websocket_client_request(
+            &gateway,
+            Some(&cookie),
+            "/socket.io/?EIO=4&transport=websocket",
+            Some(&public_origin),
+        );
+        request.headers_mut().insert(
+            "sec-websocket-key",
+            "dGhlIHNhbXBsZSBub25jZQ==".parse().unwrap(),
+        );
+        let (status, body) = websocket_failure_details(request).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            body.as_deref(),
+            Some(b"{\"error\":\"backend_proxy_failed\"}".as_slice())
+        );
+        assert!(body.as_ref().is_some_and(|body| body.len() <= 64));
+        assert!(reports.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    gateway.shutdown().await;
+    backend.finish().await;
+}
+
+#[tokio::test]
+async fn websocket_proxy_rejects_connection_nominated_protected_headers_before_backend_contact() {
+    let deliveries = Arc::new(AtomicUsize::new(0));
+    let backend_deliveries = deliveries.clone();
+    let backend = FakeBackend::spawn(Arc::new(move |_request| {
+        let backend_deliveries = backend_deliveries.clone();
+        async move {
+            backend_deliveries.fetch_add(1, Ordering::SeqCst);
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(full_test_body("unexpected protected-header delivery"))
+                .unwrap()
+        }
+        .boxed()
+    }))
+    .await;
+    let (reports_sender, reports) = mpsc::channel();
+    let metrics = StartupMetrics::with_clock_and_writer(
+        "test",
+        "test",
+        10,
+        StartupMode::RustGateway,
+        Arc::new(ZeroClock),
+        Box::new(ChannelWriter(reports_sender)),
+    );
+    metrics.record(StartupMilestone::ProcessStarted).unwrap();
+    let frontend = TemporaryFrontend::new();
+    let gateway = StartupGateway::bind(
+        frontend.root.clone(),
+        metrics.clone(),
+        GatewayLimits::test_defaults(),
+    )
+    .await
+    .unwrap();
+    let cookie = bootstrap_session(&gateway).await;
+    metrics
+        .record(StartupMilestone::FrontendRequestStarted)
+        .unwrap();
+    metrics.record(StartupMilestone::BackendSpawned).unwrap();
+    let state = gateway.state();
+    let generation = state.begin_backend_start().await.unwrap();
+    state.backend_ready(generation, backend.addr).await.unwrap();
+    metrics.record(StartupMilestone::BackendListening).unwrap();
+    receive_report_with_milestone(&reports, "backend_listening");
+    let public_origin = format!("http://{}", gateway.public_authority());
+
+    for nominated in ["Origin", "Host", "Sec-WebSocket-Key"] {
+        let request = format!(
+            "GET /socket.io/?EIO=4&transport=websocket HTTP/1.1\r\nHost: {}\r\nCookie: {cookie}\r\nOrigin: {public_origin}\r\nConnection: Upgrade, {nominated}\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+            gateway.public_authority()
+        );
+        let response = raw_http_exchange(gateway_addr(&gateway), request.as_bytes()).await;
+        assert!(response.starts_with(b"HTTP/1.1 400"), "{nominated}");
+        assert!(response.len() <= 1024, "{nominated}");
+        assert_eq!(deliveries.load(Ordering::SeqCst), 0, "{nominated}");
+        assert!(reports.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    gateway.shutdown().await;
+    backend.shutdown().await;
 }

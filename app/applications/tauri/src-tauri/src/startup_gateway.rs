@@ -8,6 +8,7 @@
  ********************************************************************************/
 
 use crate::startup_metrics::{StartupMetrics, StartupMilestone};
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use bytes::Bytes;
 use futures_util::{FutureExt, TryStreamExt};
 use http_body_util::combinators::BoxBody;
@@ -23,6 +24,7 @@ use hyper::{HeaderMap, Method, Request, Response, StatusCode, Uri};
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use reqwest::Url;
+use sha1::{Digest, Sha1};
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 #[cfg(unix)]
@@ -57,6 +59,7 @@ const BACKEND_PROXY_FAILED_BODY: &[u8] = b"{\"error\":\"backend_proxy_failed\"}"
 const INVALID_HTTP_MESSAGE_BODY: &[u8] = b"{\"error\":\"invalid_http_message\"}";
 const SOCKET_IO_PATH: &str = "/socket.io/";
 const SOCKET_IO_WEBSOCKET_QUERY: &str = "EIO=4&transport=websocket";
+const WEBSOCKET_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const HOP_BY_HOP_HEADERS: [&str; 9] = [
     "connection",
     "proxy-connection",
@@ -1034,7 +1037,9 @@ impl BackendProxy {
     async fn forward(&self, request: Request<hyper::body::Incoming>) -> Response<GatewayBody> {
         match proxy_request_kind(&request, &self.public_origin) {
             Ok(ProxyRequestKind::Http) => self.forward_http(request).await,
-            Ok(ProxyRequestKind::WebSocket) => self.forward_websocket(request).await,
+            Ok(ProxyRequestKind::WebSocket(handshake)) => {
+                self.forward_websocket(request, handshake).await
+            }
             Err(_) => invalid_http_message(),
         }
     }
@@ -1125,6 +1130,7 @@ impl BackendProxy {
     async fn forward_websocket(
         &self,
         mut request: Request<hyper::body::Incoming>,
+        handshake: ValidatedWebSocketHandshake,
     ) -> Response<GatewayBody> {
         let public_upgrade = hyper::upgrade::on(&mut request);
         strip_gateway_session_cookie(request.headers_mut());
@@ -1186,7 +1192,7 @@ impl BackendProxy {
             Ok(Err(_)) | Err(_) => return backend_proxy_failed(),
         };
         if response.status() != StatusCode::SWITCHING_PROTOCOLS
-            || validate_websocket_upgrade_response(&response).is_err()
+            || validate_websocket_upgrade_response(&response, &handshake.expected_accept).is_err()
             || !self.state.backend_lease_is_current(backend_lease).await
         {
             return backend_proxy_failed();
@@ -1887,10 +1893,15 @@ fn fixed_content_type(path: &Path) -> Option<&'static str> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 enum ProxyRequestKind {
     Http,
-    WebSocket,
+    WebSocket(ValidatedWebSocketHandshake),
+}
+
+#[derive(Clone, Debug)]
+struct ValidatedWebSocketHandshake {
+    expected_accept: hyper::header::HeaderValue,
 }
 
 fn proxy_request_kind(
@@ -1912,6 +1923,13 @@ fn proxy_request_kind(
         }
         return Ok(ProxyRequestKind::Http);
     }
+    if connection_tokens
+        .iter()
+        .any(is_protected_websocket_handshake_header)
+    {
+        return Err(ProxyHeaderError::InvalidUpgrade);
+    }
+    let client_key = validated_websocket_key(request.headers());
     if request.method() != Method::GET
         || request.version() != hyper::Version::HTTP_11
         || request.uri().path() != SOCKET_IO_PATH
@@ -1922,18 +1940,31 @@ fn proxy_request_kind(
         || !single_header_equals(request.headers(), UPGRADE, b"websocket")
         || !single_header_equals(request.headers(), ORIGIN, public_origin.as_bytes())
         || !single_header_equals(request.headers(), "sec-websocket-version", b"13")
-        || !has_valid_websocket_key(request.headers())
+        || client_key.is_none()
     {
         return Err(ProxyHeaderError::InvalidUpgrade);
     }
-    Ok(ProxyRequestKind::WebSocket)
+    Ok(ProxyRequestKind::WebSocket(ValidatedWebSocketHandshake {
+        expected_accept: websocket_accept(client_key.expect("validated above")),
+    }))
 }
 
-fn validate_websocket_upgrade_response<B>(response: &Response<B>) -> Result<(), ProxyHeaderError> {
+fn is_protected_websocket_handshake_header(name: &hyper::header::HeaderName) -> bool {
+    name == HOST || name == ORIGIN || name == COOKIE || name.as_str().starts_with("sec-websocket-")
+}
+
+fn validate_websocket_upgrade_response<B>(
+    response: &Response<B>,
+    expected_accept: &hyper::header::HeaderValue,
+) -> Result<(), ProxyHeaderError> {
     let connection_tokens = connection_header_tokens(response.headers())?;
     if !connection_tokens.iter().any(|name| name == UPGRADE)
         || !single_header_equals(response.headers(), UPGRADE, b"websocket")
-        || !has_single_visible_header(response.headers(), "sec-websocket-accept")
+        || !single_header_exactly_equals(
+            response.headers(),
+            "sec-websocket-accept",
+            expected_accept,
+        )
     {
         return Err(ProxyHeaderError::InvalidUpgrade);
     }
@@ -1952,31 +1983,38 @@ fn single_header_equals(
     values.next().is_none() && trim_ows(value.as_bytes()).eq_ignore_ascii_case(expected)
 }
 
-fn has_single_visible_header(headers: &HeaderMap, name: impl hyper::header::AsHeaderName) -> bool {
+fn single_header_exactly_equals(
+    headers: &HeaderMap,
+    name: impl hyper::header::AsHeaderName,
+    expected: &hyper::header::HeaderValue,
+) -> bool {
     let mut values = headers.get_all(name).iter();
     let Some(value) = values.next() else {
         return false;
     };
-    values.next().is_none()
-        && !value.as_bytes().is_empty()
-        && value
-            .as_bytes()
-            .iter()
-            .all(|byte| (b'!'..=b'~').contains(byte))
+    values.next().is_none() && value.as_bytes() == expected.as_bytes()
 }
 
-fn has_valid_websocket_key(headers: &HeaderMap) -> bool {
+fn validated_websocket_key(headers: &HeaderMap) -> Option<&[u8]> {
     let mut values = headers.get_all("sec-websocket-key").iter();
-    let Some(value) = values.next() else {
-        return false;
-    };
+    let value = values.next()?;
     let value = trim_ows(value.as_bytes());
-    values.next().is_none()
+    (values.next().is_none()
         && value.len() == 24
         && value[..22]
             .iter()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/'))
-        && &value[22..] == b"=="
+        && &value[22..] == b"==")
+        .then_some(value)
+}
+
+fn websocket_accept(client_key: &[u8]) -> hyper::header::HeaderValue {
+    let mut digest = Sha1::new();
+    digest.update(client_key);
+    digest.update(WEBSOCKET_GUID);
+    let encoded = BASE64_STANDARD.encode(digest.finalize());
+    hyper::header::HeaderValue::from_bytes(encoded.as_bytes())
+        .expect("base64 SHA-1 output is always a valid visible ASCII header")
 }
 
 fn restore_websocket_upgrade_headers(headers: &mut HeaderMap) {
