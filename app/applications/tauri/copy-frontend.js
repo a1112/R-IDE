@@ -120,11 +120,11 @@ const frontendBootstrap = `(() => {
     window.document.body.appendChild(overlay);
   };
 
-  const stateOrder = Object.freeze({
-    starting: 0,
-    ready: 1,
-    stopping: 2,
-    failed: 3
+  const allowedTransitions = Object.freeze({
+    starting: Object.freeze(['starting', 'ready', 'failed', 'stopping']),
+    ready: Object.freeze(['ready', 'failed', 'stopping']),
+    failed: Object.freeze(['failed']),
+    stopping: Object.freeze(['stopping'])
   });
   const states = new window.EventSource('/_ride/startup/events', { withCredentials: true });
   states.addEventListener('state', event => {
@@ -137,13 +137,13 @@ const frontendBootstrap = `(() => {
     if (!update
       || !Number.isSafeInteger(update.generation)
       || update.generation <= 0
-      || !Object.prototype.hasOwnProperty.call(stateOrder, update.state)) {
+      || !Object.prototype.hasOwnProperty.call(allowedTransitions, update.state)) {
       return;
     }
     if (currentGeneration !== undefined && update.generation < currentGeneration) {
       return;
     }
-    if (update.generation === currentGeneration && stateOrder[update.state] < stateOrder[currentState]) {
+    if (update.generation === currentGeneration && !allowedTransitions[currentState].includes(update.state)) {
       return;
     }
     if (update.generation !== currentGeneration) {

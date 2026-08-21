@@ -376,17 +376,23 @@ test('failed state renders one bounded alert and retry remains idempotent per ge
   assert.equal(harness.requests.filter(request => request.url === '/_ride/startup/retry').length, 1);
   harness.eventSources[0].emitState({ state: 'stopping', generation: 8 });
   assert.equal(retry.disabled, true);
-  harness.eventSources[0].emitState({ state: 'failed', generation: 8, diagnostic: 'second failure' });
+  harness.eventSources[0].emitState({ state: 'failed', generation: 8, diagnostic: 'stale stopping failure' });
+  assert.equal(retry.disabled, true);
+  retry.click();
+  await Promise.resolve();
+  assert.equal(harness.requests.filter(request => request.url === '/_ride/startup/retry').length, 1);
+
+  harness.eventSources[0].emitState({ state: 'failed', generation: 9, diagnostic: 'new generation failure' });
   assert.equal(retry.disabled, false);
   retry.click();
   await Promise.resolve();
   retries = harness.requests.filter(request => request.url === '/_ride/startup/retry');
   assert.equal(retries.length, 2);
-  assert.deepEqual(JSON.parse(retries[1].options.body), { generation: 8 });
+  assert.deepEqual(JSON.parse(retries[1].options.body), { generation: 9 });
 
-  harness.eventSources[0].emitState({ state: 'ready', generation: 8 });
-  assert.equal(harness.document.findAll(element => element.getAttribute('role') === 'alert').length, 1);
   harness.eventSources[0].emitState({ state: 'ready', generation: 9 });
+  assert.equal(harness.document.findAll(element => element.getAttribute('role') === 'alert').length, 1);
+  harness.eventSources[0].emitState({ state: 'ready', generation: 10 });
   assert.equal(harness.document.findAll(element => element.getAttribute('role') === 'alert').length, 0);
   assert.deepEqual(harness.navigation, { reloads: 0, replacements: [] });
   assert.deepEqual(harness.sessionStorage.entries(), []);
