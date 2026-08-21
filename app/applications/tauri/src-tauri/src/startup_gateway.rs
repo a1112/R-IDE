@@ -24,6 +24,24 @@ pub enum BackendPhase {
     Stopping,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackendAddressError {
+    ZeroPort,
+    NonLoopback,
+}
+
+impl fmt::Display for BackendAddressError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::ZeroPort => "backend address has port zero",
+            Self::NonLoopback => "backend address is not loopback",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for BackendAddressError {}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct BackendGeneration(u64);
 
@@ -75,6 +93,11 @@ pub enum GatewayError {
     },
     TooManyBackendWaiters,
     BackendWaitTimedOut(BackendGeneration),
+    BackendGenerationSuperseded {
+        expected: BackendGeneration,
+        observed: BackendGeneration,
+    },
+    InvalidBackendAddress(BackendAddressError),
     GenerationExhausted,
     ShuttingDown,
 }
@@ -109,6 +132,11 @@ impl fmt::Display for GatewayError {
                     "backend generation {generation:?} readiness timed out"
                 )
             }
+            Self::BackendGenerationSuperseded { expected, observed } => write!(
+                formatter,
+                "backend generation {expected:?} was superseded by {observed:?}"
+            ),
+            Self::InvalidBackendAddress(error) => error.fmt(formatter),
             Self::GenerationExhausted => write!(formatter, "backend generation exhausted"),
             Self::ShuttingDown => write!(formatter, "startup gateway is shutting down"),
         }
@@ -206,6 +234,7 @@ impl GatewayState {
         generation: BackendGeneration,
         backend_addr: SocketAddr,
     ) -> Result<(), GatewayError> {
+        Self::validate_backend_addr(backend_addr)?;
         let mut current = self.inner.current.lock().await;
         Self::require_current_generation(&current, generation)?;
         if current.snapshot.phase == BackendPhase::Stopping {
@@ -269,8 +298,9 @@ impl GatewayState {
     pub async fn wait_for_backend(&self) -> Result<SocketAddr, GatewayError> {
         let mut readiness = self.inner.readiness.subscribe();
         let mut shutdown = self.inner.shutdown.subscribe();
+        let expected_generation = readiness.borrow().snapshot.generation;
 
-        if let Some(result) = Self::published_result(&readiness.borrow()) {
+        if let Some(result) = Self::published_result(&readiness.borrow(), expected_generation) {
             return result;
         }
         if *shutdown.borrow() {
@@ -283,7 +313,6 @@ impl GatewayState {
             .clone()
             .try_acquire_owned()
             .map_err(|_| GatewayError::TooManyBackendWaiters)?;
-        let generation = readiness.borrow().snapshot.generation;
         let wait = async {
             loop {
                 tokio::select! {
@@ -302,7 +331,9 @@ impl GatewayState {
                 if *shutdown.borrow() {
                     return Err(GatewayError::ShuttingDown);
                 }
-                if let Some(result) = Self::published_result(&readiness.borrow()) {
+                if let Some(result) =
+                    Self::published_result(&readiness.borrow(), expected_generation)
+                {
                     return result;
                 }
             }
@@ -310,7 +341,7 @@ impl GatewayState {
 
         tokio::time::timeout(self.inner.limits.backend_wait, wait)
             .await
-            .unwrap_or(Err(GatewayError::BackendWaitTimedOut(generation)))
+            .unwrap_or(Err(GatewayError::BackendWaitTimedOut(expected_generation)))
     }
 
     pub async fn shutdown(&self) {
@@ -333,7 +364,31 @@ impl GatewayState {
         }
     }
 
-    fn published_result(published: &PublishedBackend) -> Option<Result<SocketAddr, GatewayError>> {
+    fn validate_backend_addr(backend_addr: SocketAddr) -> Result<(), GatewayError> {
+        if backend_addr.port() == 0 {
+            Err(GatewayError::InvalidBackendAddress(
+                BackendAddressError::ZeroPort,
+            ))
+        } else if !backend_addr.ip().is_loopback() {
+            Err(GatewayError::InvalidBackendAddress(
+                BackendAddressError::NonLoopback,
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn published_result(
+        published: &PublishedBackend,
+        expected_generation: BackendGeneration,
+    ) -> Option<Result<SocketAddr, GatewayError>> {
+        if published.snapshot.generation != expected_generation {
+            return Some(Err(GatewayError::BackendGenerationSuperseded {
+                expected: expected_generation,
+                observed: published.snapshot.generation,
+            }));
+        }
+
         match published.snapshot.phase {
             BackendPhase::Ready => Some(Ok(published
                 .backend_addr
@@ -362,37 +417,147 @@ pub enum RouteKind {
     Backend,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PathError {
+    NotAbsolute,
+    QueryOrFragment,
+    Backslash,
+    Nul,
+    MalformedPercentEncoding,
+    EncodedSeparator,
+    RepeatedSeparator,
+    DotSegment,
+    DoubleEncoding,
+    InvalidUtf8,
+}
+
+impl fmt::Display for PathError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::NotAbsolute => "route path must be absolute",
+            Self::QueryOrFragment => "route path contains a query or fragment",
+            Self::Backslash => "route path contains a backslash",
+            Self::Nul => "route path contains a NUL byte",
+            Self::MalformedPercentEncoding => "route path has malformed percent encoding",
+            Self::EncodedSeparator => "route path contains an encoded separator",
+            Self::RepeatedSeparator => "route path contains repeated separators",
+            Self::DotSegment => "route path contains a dot segment",
+            Self::DoubleEncoding => "route path contains ambiguous double encoding",
+            Self::InvalidUtf8 => "route path is not valid UTF-8",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for PathError {}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct NormalizedPath(String);
+
+impl NormalizedPath {
+    fn parse(raw_path: &str) -> Result<Self, PathError> {
+        if !raw_path.starts_with('/') {
+            return Err(PathError::NotAbsolute);
+        }
+        if raw_path.contains(['?', '#']) {
+            return Err(PathError::QueryOrFragment);
+        }
+        if raw_path.contains('\\') {
+            return Err(PathError::Backslash);
+        }
+        if raw_path.contains('\0') {
+            return Err(PathError::Nul);
+        }
+
+        let raw = raw_path.as_bytes();
+        let mut decoded = Vec::with_capacity(raw.len());
+        let mut index = 0;
+        while index < raw.len() {
+            if raw[index] != b'%' {
+                decoded.push(raw[index]);
+                index += 1;
+                continue;
+            }
+
+            let Some(high) = raw.get(index + 1).and_then(|value| decode_hex(*value)) else {
+                return Err(PathError::MalformedPercentEncoding);
+            };
+            let Some(low) = raw.get(index + 2).and_then(|value| decode_hex(*value)) else {
+                return Err(PathError::MalformedPercentEncoding);
+            };
+            let value = (high << 4) | low;
+            match value {
+                b'/' | b'\\' => return Err(PathError::EncodedSeparator),
+                0 => return Err(PathError::Nul),
+                _ => decoded.push(value),
+            }
+            index += 3;
+        }
+
+        let decoded = String::from_utf8(decoded).map_err(|_| PathError::InvalidUtf8)?;
+        if decoded.contains(['?', '#']) {
+            return Err(PathError::QueryOrFragment);
+        }
+        if decoded.contains('%') {
+            return Err(PathError::DoubleEncoding);
+        }
+        if decoded.contains("//") {
+            return Err(PathError::RepeatedSeparator);
+        }
+        if decoded
+            .split('/')
+            .any(|segment| segment == "." || segment == "..")
+        {
+            return Err(PathError::DotSegment);
+        }
+
+        Ok(Self(decoded))
+    }
+}
+
+fn decode_hex(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RouteTable {
-    static_paths: HashSet<String>,
+    static_paths: HashSet<NormalizedPath>,
 }
 
 impl RouteTable {
-    pub fn new<I, P>(static_paths: I) -> Self
+    pub fn new<I, P>(static_paths: I) -> Result<Self, PathError>
     where
         I: IntoIterator<Item = P>,
         P: AsRef<str>,
     {
-        Self {
+        Ok(Self {
             static_paths: static_paths
                 .into_iter()
-                .map(|path| path.as_ref().to_string())
-                .collect(),
-        }
+                .map(|path| NormalizedPath::parse(path.as_ref()))
+                .collect::<Result<_, _>>()?,
+        })
     }
 
-    pub fn classify(&self, path: &str) -> RouteKind {
-        if path
+    pub fn classify(&self, path: &str) -> Result<RouteKind, PathError> {
+        let path = NormalizedPath::parse(path)?;
+        let normalized = path.0.as_str();
+        let kind = if normalized
             .strip_prefix("/_ride/bootstrap/")
             .is_some_and(|capability| !capability.is_empty())
         {
             RouteKind::Bootstrap
-        } else if path == "/_ride" || path.starts_with("/_ride/") {
+        } else if normalized == "/_ride" || normalized.starts_with("/_ride/") {
             RouteKind::Control
-        } else if self.static_paths.contains(path) {
+        } else if self.static_paths.contains(&path) {
             RouteKind::Static
         } else {
             RouteKind::Backend
-        }
+        };
+        Ok(kind)
     }
 }
