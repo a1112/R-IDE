@@ -55,6 +55,7 @@ scripts/test/run-tauri-tests.test.js
 scripts/test/tauri-frontend-profile.test.mjs
 scripts/test/tauri-packaged-smoke-contract.test.mjs
 scripts/test/tauri-permissions.test.mjs
+scripts/test/tauri-startup-gateway.test.mjs
 scripts/test/verify-tauri-profile.test.mjs
 scripts/verify-tauri-profile.mjs
 TAURI-BUILD-GUIDE.md
