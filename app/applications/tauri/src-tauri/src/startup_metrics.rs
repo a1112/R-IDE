@@ -598,6 +598,24 @@ struct StartupRecorderState {
     clock: Arc<dyn ElapsedClock>,
 }
 
+impl StartupRecorderState {
+    fn update_report<T>(
+        &mut self,
+        snapshots: &mpsc::Sender<StartupReport>,
+        update: impl FnOnce(&mut StartupReport) -> Result<(T, bool), StartupMetricError>,
+    ) -> Result<T, StartupMetricError> {
+        let mut candidate = self.report.clone();
+        let (result, changed) = update(&mut candidate)?;
+        if changed {
+            snapshots
+                .send(candidate.clone())
+                .map_err(|error| StartupMetricError::Write(error.to_string()))?;
+            self.report = candidate;
+        }
+        Ok(result)
+    }
+}
+
 #[derive(Debug)]
 struct StartupRecorder {
     state: Mutex<StartupRecorderState>,
@@ -681,24 +699,15 @@ impl StartupMetrics {
         let Some(recorder) = &self.recorder else {
             return Ok(RecordOutcome::Disabled);
         };
-        let outcome = {
-            let mut state = recorder
-                .state
-                .lock()
-                .map_err(|_| StartupMetricError::RecorderPoisoned)?;
-            let elapsed_ms = state.clock.elapsed_ms();
-            let outcome = state.report.record(milestone, elapsed_ms)?;
-            if outcome == RecordOutcome::Recorded {
-                // The unbounded send cannot wait for disk I/O. Keeping it in this
-                // critical section preserves mutation order for concurrent callers.
-                recorder
-                    .snapshots
-                    .send(state.report.clone())
-                    .map_err(|error| StartupMetricError::Write(error.to_string()))?;
-            }
-            outcome
-        };
-        Ok(outcome)
+        let mut state = recorder
+            .state
+            .lock()
+            .map_err(|_| StartupMetricError::RecorderPoisoned)?;
+        let elapsed_ms = state.clock.elapsed_ms();
+        state.update_report(&recorder.snapshots, |report| {
+            let outcome = report.record(milestone, elapsed_ms)?;
+            Ok((outcome, outcome == RecordOutcome::Recorded))
+        })
     }
 
     pub fn record_rust_phase(
@@ -708,22 +717,15 @@ impl StartupMetrics {
         let Some(recorder) = &self.recorder else {
             return Ok(RecordOutcome::Disabled);
         };
-        let outcome = {
-            let mut state = recorder
-                .state
-                .lock()
-                .map_err(|_| StartupMetricError::RecorderPoisoned)?;
-            let elapsed_ms = state.clock.elapsed_ms();
-            let outcome = state.report.record_rust_phase(phase, elapsed_ms)?;
-            if outcome == RecordOutcome::Recorded {
-                recorder
-                    .snapshots
-                    .send(state.report.clone())
-                    .map_err(|error| StartupMetricError::Write(error.to_string()))?;
-            }
-            outcome
-        };
-        Ok(outcome)
+        let mut state = recorder
+            .state
+            .lock()
+            .map_err(|_| StartupMetricError::RecorderPoisoned)?;
+        let elapsed_ms = state.clock.elapsed_ms();
+        state.update_report(&recorder.snapshots, |report| {
+            let outcome = report.record_rust_phase(phase, elapsed_ms)?;
+            Ok((outcome, outcome == RecordOutcome::Recorded))
+        })
     }
 
     pub fn select_effective_mode(
@@ -737,13 +739,10 @@ impl StartupMetrics {
             .state
             .lock()
             .map_err(|_| StartupMetricError::RecorderPoisoned)?;
-        if state.report.select_effective_mode(requested_mode)? {
-            recorder
-                .snapshots
-                .send(state.report.clone())
-                .map_err(|error| StartupMetricError::Write(error.to_string()))?;
-        }
-        Ok(())
+        state.update_report(&recorder.snapshots, |report| {
+            let changed = report.select_effective_mode(requested_mode)?;
+            Ok(((), changed))
+        })
     }
 
     pub fn record_backend_spawned_before_window(
@@ -893,4 +892,144 @@ fn sync_parent(parent: &Path) -> io::Result<()> {
 #[cfg(not(unix))]
 fn sync_parent(_parent: &Path) -> io::Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+
+    #[derive(Debug)]
+    struct FixedClock(u64);
+
+    impl ElapsedClock for FixedClock {
+        fn elapsed_ms(&self) -> u64 {
+            self.0
+        }
+    }
+
+    fn metrics_with_sender(
+        report: StartupReport,
+        snapshots: mpsc::Sender<StartupReport>,
+    ) -> StartupMetrics {
+        StartupMetrics {
+            recorder: Some(Arc::new(StartupRecorder {
+                state: Mutex::new(StartupRecorderState {
+                    report,
+                    clock: Arc::new(FixedClock(7)),
+                }),
+                snapshots,
+            })),
+        }
+    }
+
+    fn replace_snapshot_sender(
+        metrics: &mut StartupMetrics,
+        snapshots: mpsc::Sender<StartupReport>,
+    ) {
+        Arc::get_mut(metrics.recorder.as_mut().expect("enabled recorder"))
+            .expect("test owns the only recorder reference")
+            .snapshots = snapshots;
+    }
+
+    fn current_report(metrics: &StartupMetrics) -> Value {
+        let recorder = metrics.recorder.as_ref().expect("enabled recorder");
+        let state = recorder.state.lock().expect("recorder state");
+        serde_json::to_value(&state.report).expect("serialize current report")
+    }
+
+    #[test]
+    fn rust_phase_enqueue_failure_does_not_commit_and_retry_records() {
+        let (failed_sender, failed_receiver) = mpsc::channel();
+        drop(failed_receiver);
+        let mut metrics = metrics_with_sender(
+            StartupReport::new("test", "test", 1, StartupMode::RustGateway),
+            failed_sender,
+        );
+
+        assert!(matches!(
+            metrics.record_rust_phase(StartupRustPhase::RuntimePathsResolved),
+            Err(StartupMetricError::Write(_))
+        ));
+        assert_eq!(
+            current_report(&metrics)["rustPhases"],
+            serde_json::json!({})
+        );
+
+        let (recovered_sender, recovered_receiver) = mpsc::channel();
+        replace_snapshot_sender(&mut metrics, recovered_sender);
+        assert_eq!(
+            metrics.record_rust_phase(StartupRustPhase::RuntimePathsResolved),
+            Ok(RecordOutcome::Recorded)
+        );
+        let snapshot = recovered_receiver.recv().expect("retried phase snapshot");
+        assert_eq!(
+            serde_json::to_value(snapshot).expect("serialize phase snapshot")["rustPhases"]
+                ["runtime_paths_resolved"],
+            7
+        );
+    }
+
+    #[test]
+    fn milestone_enqueue_failure_does_not_commit_and_retry_records() {
+        let (failed_sender, failed_receiver) = mpsc::channel();
+        drop(failed_receiver);
+        let mut metrics = metrics_with_sender(
+            StartupReport::new("test", "test", 1, StartupMode::RustGateway),
+            failed_sender,
+        );
+
+        assert!(matches!(
+            metrics.record(StartupMilestone::ProcessStarted),
+            Err(StartupMetricError::Write(_))
+        ));
+        assert_eq!(
+            current_report(&metrics)["milestones"],
+            serde_json::json!({})
+        );
+
+        let (recovered_sender, recovered_receiver) = mpsc::channel();
+        replace_snapshot_sender(&mut metrics, recovered_sender);
+        assert_eq!(
+            metrics.record(StartupMilestone::ProcessStarted),
+            Ok(RecordOutcome::Recorded)
+        );
+        let snapshot = recovered_receiver
+            .recv()
+            .expect("retried milestone snapshot");
+        assert_eq!(
+            serde_json::to_value(snapshot).expect("serialize milestone snapshot")["milestones"]
+                ["process_started"],
+            7
+        );
+    }
+
+    #[test]
+    fn mode_enqueue_failure_does_not_commit_and_retry_transitions() {
+        let mut report = StartupReport::new("test", "test", 1, StartupMode::RustGateway);
+        report
+            .record(StartupMilestone::ProcessStarted, 0)
+            .expect("process start");
+        let (failed_sender, failed_receiver) = mpsc::channel();
+        drop(failed_receiver);
+        let mut metrics = metrics_with_sender(report, failed_sender);
+
+        assert!(matches!(
+            metrics.select_effective_mode(StartupMode::LegacyFallback),
+            Err(StartupMetricError::Write(_))
+        ));
+        assert_eq!(current_report(&metrics)["startupMode"], "rust-gateway");
+
+        let (recovered_sender, recovered_receiver) = mpsc::channel();
+        replace_snapshot_sender(&mut metrics, recovered_sender);
+        assert_eq!(
+            metrics.select_effective_mode(StartupMode::LegacyFallback),
+            Ok(())
+        );
+        let snapshot = recovered_receiver.recv().expect("retried mode snapshot");
+        assert_eq!(
+            serde_json::to_value(snapshot).expect("serialize mode snapshot")["startupMode"],
+            "legacy-fallback"
+        );
+    }
 }
