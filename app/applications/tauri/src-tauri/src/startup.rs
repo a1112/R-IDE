@@ -16,7 +16,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::startup_gateway::{
-    BackendGeneration, GatewayBindCancellation, GatewayError, GatewayLimits, StartupGateway,
+    BackendGeneration, GatewayBindCancellation, GatewayBindObserver, GatewayBindStage,
+    GatewayError, GatewayLimits, StartupGateway,
 };
 use crate::startup_metrics::{StartupMetricError, StartupMetrics, StartupMode};
 
@@ -225,6 +226,7 @@ impl StartupLaunch {
 pub enum StartupCoordinatorError {
     Gateway(GatewayError),
     Metrics(StartupMetricError),
+    LaunchTaskStopped,
 }
 
 impl fmt::Display for StartupCoordinatorError {
@@ -232,6 +234,9 @@ impl fmt::Display for StartupCoordinatorError {
         match self {
             Self::Gateway(error) => write!(formatter, "startup gateway state failed: {error}"),
             Self::Metrics(error) => write!(formatter, "startup metrics failed: {error}"),
+            Self::LaunchTaskStopped => {
+                formatter.write_str("startup gateway launch task stopped before completion")
+            }
         }
     }
 }
@@ -243,6 +248,52 @@ pub struct StartupCoordinator {
     metrics: StartupMetrics,
     limits: GatewayLimits,
     visibility_deadline: StartupVisibilityDeadline,
+}
+
+pub struct PendingStartupLaunch {
+    state: PendingStartupLaunchState,
+}
+
+enum PendingStartupLaunchState {
+    Running(tauri::async_runtime::JoinHandle<Result<StartupLaunch, StartupCoordinatorError>>),
+    Completed(Box<Result<StartupLaunch, StartupCoordinatorError>>),
+}
+
+impl PendingStartupLaunch {
+    pub async fn complete(self) -> Result<StartupLaunch, StartupCoordinatorError> {
+        match self.state {
+            PendingStartupLaunchState::Running(task) => task
+                .await
+                .map_err(|_| StartupCoordinatorError::LaunchTaskStopped)?,
+            PendingStartupLaunchState::Completed(result) => *result,
+        }
+    }
+}
+
+async fn wait_until_gateway_bind_started(
+    mut task: tauri::async_runtime::JoinHandle<Result<StartupLaunch, StartupCoordinatorError>>,
+    mut bind_started: tokio::sync::oneshot::Receiver<()>,
+) -> PendingStartupLaunch {
+    tokio::select! {
+        result = &mut task => PendingStartupLaunch {
+            state: PendingStartupLaunchState::Completed(Box::new(
+                result.unwrap_or(Err(StartupCoordinatorError::LaunchTaskStopped)),
+            )),
+        },
+        observed = &mut bind_started => {
+            if observed.is_ok() {
+                PendingStartupLaunch {
+                    state: PendingStartupLaunchState::Running(task),
+                }
+            } else {
+                PendingStartupLaunch {
+                    state: PendingStartupLaunchState::Completed(Box::new(
+                        task.await.unwrap_or(Err(StartupCoordinatorError::LaunchTaskStopped)),
+                    )),
+                }
+            }
+        }
+    }
 }
 
 impl StartupCoordinator {
@@ -284,6 +335,66 @@ impl StartupCoordinator {
             StartupGateway::bind_cancellable,
         )
         .await
+    }
+
+    pub async fn begin_launch(
+        self,
+        gateway_frontend_directory: PathBuf,
+        legacy_initial_url: tauri::WebviewUrl,
+    ) -> PendingStartupLaunch {
+        let (bind_started, bind_observed) = tokio::sync::oneshot::channel();
+        let bind_started = Arc::new(Mutex::new(Some(bind_started)));
+        let observer = GatewayBindObserver::new(move |stage| {
+            if stage == GatewayBindStage::InventoryStarted {
+                if let Some(sender) = bind_started
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    let _ = sender.send(());
+                }
+            }
+        });
+        let task = tauri::async_runtime::spawn(self.launch_with_gateway_bind(
+            gateway_frontend_directory,
+            legacy_initial_url,
+            move |frontend, metrics, limits, cancellation| {
+                StartupGateway::bind_cancellable_observed(
+                    frontend,
+                    metrics,
+                    limits,
+                    cancellation,
+                    observer,
+                )
+            },
+        ));
+        wait_until_gateway_bind_started(task, bind_observed).await
+    }
+
+    #[doc(hidden)]
+    pub async fn begin_launch_with_gateway_bind<B, BindFuture>(
+        self,
+        gateway_frontend_directory: PathBuf,
+        legacy_initial_url: tauri::WebviewUrl,
+        bind_gateway: B,
+    ) -> PendingStartupLaunch
+    where
+        B: FnOnce(PathBuf, StartupMetrics, GatewayLimits, GatewayBindCancellation) -> BindFuture
+            + Send
+            + 'static,
+        BindFuture: Future<Output = Result<StartupGateway, GatewayError>> + Send + 'static,
+    {
+        let (bind_started, bind_observed) = tokio::sync::oneshot::channel();
+        let task = tauri::async_runtime::spawn(self.launch_with_gateway_bind(
+            gateway_frontend_directory,
+            legacy_initial_url,
+            move |frontend, metrics, limits, cancellation| {
+                let future = bind_gateway(frontend, metrics, limits, cancellation);
+                let _ = bind_started.send(());
+                future
+            },
+        ));
+        wait_until_gateway_bind_started(task, bind_observed).await
     }
 
     pub async fn launch_with_gateway_bind<B, BindFuture>(
@@ -863,12 +974,71 @@ pub fn parse_backend_process_scope_members(
     Ok((members, process_groups))
 }
 
-pub fn backend_process_session_column_name(macos: bool) -> &'static str {
-    if macos {
-        "sess="
-    } else {
-        "sid="
+pub fn parse_backend_process_scope_members_with_session_query<F>(
+    output: &str,
+    owned_pgids: &[i32],
+    owned_session_id: Option<i32>,
+    mut session_query: F,
+) -> Result<(Vec<u32>, Vec<i32>), String>
+where
+    F: FnMut(u32, i32) -> Result<Option<i32>, String>,
+{
+    if owned_pgids.is_empty()
+        || owned_pgids.iter().any(|pgid| *pgid <= 0)
+        || owned_session_id.is_some_and(|session_id| session_id <= 0)
+    {
+        return Err("Malformed backend process-scope enumeration row".to_string());
     }
+    let mut members = Vec::new();
+    let mut process_groups = Vec::new();
+    for line in output.lines().filter(|line| !line.trim().is_empty()) {
+        let mut columns = line.split_whitespace();
+        let pid = columns
+            .next()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|pid| *pid > 0)
+            .ok_or_else(|| "Malformed backend process-scope enumeration row".to_string())?;
+        let process_pgid = columns
+            .next()
+            .and_then(|value| value.parse::<i32>().ok())
+            .filter(|pgid| *pgid >= 0)
+            .ok_or_else(|| "Malformed backend process-scope enumeration row".to_string())?;
+        if columns.next().is_some() {
+            return Err("Malformed backend process-scope enumeration row".to_string());
+        }
+        let owned = if let Some(owned_session_id) = owned_session_id {
+            session_query(pid, process_pgid)
+                .map_err(|_| "Backend process-scope session attestation failed".to_string())?
+                .is_some_and(|session_id| session_id == owned_session_id)
+        } else {
+            owned_pgids.contains(&process_pgid)
+        };
+        if owned {
+            if process_pgid == 0 {
+                return Err("Malformed backend process-scope enumeration row".to_string());
+            }
+            members.push(pid);
+            process_groups.push(process_pgid);
+        }
+    }
+    members.sort_unstable();
+    members.dedup();
+    process_groups.sort_unstable();
+    process_groups.dedup();
+    Ok((members, process_groups))
+}
+
+pub fn attest_backend_process_session_snapshot(
+    first_session_id: i32,
+    observed_pgid: i32,
+    second_session_id: i32,
+    expected_pgid: i32,
+) -> Option<i32> {
+    (first_session_id > 0
+        && observed_pgid > 0
+        && first_session_id == second_session_id
+        && observed_pgid == expected_pgid)
+        .then_some(first_session_id)
 }
 
 #[cfg(target_os = "macos")]
@@ -1510,6 +1680,45 @@ impl PreparedPlatformBackendProcessTree {
 
 #[cfg(unix)]
 impl PlatformBackendProcessTree {
+    #[cfg(target_os = "macos")]
+    fn attest_process_session(pid: u32, expected_pgid: i32) -> Result<Option<i32>, String> {
+        let pid = i32::try_from(pid)
+            .map_err(|_| "Backend process-scope session attestation failed".to_string())?;
+        let read_session = || {
+            let session_id = unsafe { libc::getsid(pid) };
+            if session_id >= 0 {
+                return Ok(Some(session_id));
+            }
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                Ok(None)
+            } else {
+                Err("Backend process-scope session attestation failed".to_string())
+            }
+        };
+        let Some(first_session_id) = read_session()? else {
+            return Ok(None);
+        };
+        let process_pgid = unsafe { libc::getpgid(pid) };
+        if process_pgid < 0 {
+            let error = std::io::Error::last_os_error();
+            return if error.raw_os_error() == Some(libc::ESRCH) {
+                Ok(None)
+            } else {
+                Err("Backend process-scope session attestation failed".to_string())
+            };
+        }
+        let Some(second_session_id) = read_session()? else {
+            return Ok(None);
+        };
+        Ok(attest_backend_process_session_snapshot(
+            first_session_id,
+            process_pgid,
+            second_session_id,
+            expected_pgid,
+        ))
+    }
+
     fn signal_process_groups(
         process_groups: &[libc::pid_t],
         signal: libc::c_int,
@@ -1538,9 +1747,12 @@ impl PlatformBackendProcessTree {
         owned_pgids: &[libc::pid_t],
         owned_session_id: Option<libc::pid_t>,
     ) -> Result<(Vec<u32>, Vec<i32>), String> {
-        let session_column = backend_process_session_column_name(cfg!(target_os = "macos"));
+        #[cfg(target_os = "macos")]
+        let columns = ["-A", "-o", "pid=", "-o", "pgid="];
+        #[cfg(not(target_os = "macos"))]
+        let columns = ["-A", "-o", "pid=", "-o", "pgid=", "-o", "sid="];
         let output = std::process::Command::new("ps")
-            .args(["-A", "-o", "pid=", "-o", "pgid=", "-o", session_column])
+            .args(columns)
             .env("LC_ALL", "C")
             .output()
             .map_err(|error| format!("Failed to enumerate backend process scope: {error}"))?;
@@ -1550,11 +1762,23 @@ impl PlatformBackendProcessTree {
                 output.status
             ));
         }
-        parse_backend_process_scope_members(
-            &String::from_utf8_lossy(&output.stdout),
-            owned_pgids,
-            owned_session_id,
-        )
+        #[cfg(target_os = "macos")]
+        {
+            parse_backend_process_scope_members_with_session_query(
+                &String::from_utf8_lossy(&output.stdout),
+                owned_pgids,
+                owned_session_id,
+                Self::attest_process_session,
+            )
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            parse_backend_process_scope_members(
+                &String::from_utf8_lossy(&output.stdout),
+                owned_pgids,
+                owned_session_id,
+            )
+        }
     }
 
     fn scope_members_bounded(&self, bound: Duration) -> Result<(Vec<u32>, Vec<i32>), String> {
@@ -1995,6 +2219,15 @@ pub struct RuntimePathsCache {
 }
 
 impl RuntimePathsCache {
+    pub fn initialized(paths: RuntimePaths) -> Self {
+        let cache = Self::default();
+        cache
+            .paths
+            .set(paths)
+            .expect("fresh runtime paths cache must be empty");
+        cache
+    }
+
     pub fn get_or_try_init<E>(
         &self,
         resolve: impl FnOnce() -> Result<RuntimePaths, E>,

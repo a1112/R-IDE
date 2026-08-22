@@ -112,6 +112,37 @@ fn event_index(events: &[&'static str], expected: &'static str) -> usize {
 }
 
 #[tokio::test]
+async fn pending_startup_launch_waits_until_binding_has_started() {
+    let (bind_started, bind_observed) = oneshot::channel();
+    let pending = tokio::time::timeout(
+        Duration::from_secs(1),
+        StartupCoordinator::with_limits(
+            StartupMode::RustGateway,
+            disabled_metrics(StartupMode::RustGateway),
+            GatewayLimits::test_defaults(),
+            test_visibility_deadline(),
+        )
+        .begin_launch_with_gateway_bind(
+            PathBuf::from("unused"),
+            legacy_url(),
+            move |_frontend, _metrics, _limits, _cancellation| async move {
+                let _ = bind_started.send(());
+                Err::<StartupGateway, _>(GatewayError::ListenerUnavailable)
+            },
+        ),
+    )
+    .await
+    .expect("begin launch did not observe gateway bind start");
+
+    tokio::time::timeout(Duration::from_secs(1), bind_observed)
+        .await
+        .expect("gateway bind did not start before begin launch returned")
+        .expect("gateway bind start observer dropped");
+    let launch = pending.complete().await.expect("availability fallback");
+    assert_eq!(launch.mode, StartupMode::LegacyFallback);
+}
+
+#[tokio::test]
 async fn gateway_mode_opens_the_window_before_backend_readiness() {
     let frontend = TemporaryFrontend::new();
     let metrics = disabled_metrics(StartupMode::RustGateway);

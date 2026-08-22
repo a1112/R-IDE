@@ -8,13 +8,13 @@
  ********************************************************************************/
 
 use ride_tauri::startup::{
-    attest_pty_cleanup_session, backend_process_session_column_name, finish_backend_stop,
+    attest_backend_process_session_snapshot, attest_pty_cleanup_session, finish_backend_stop,
     parse_backend_process_group_members, parse_backend_process_scope_members,
-    parse_linux_listener_inodes, resolve_tauri_config_directory,
-    validate_pty_cleanup_process_group, wait_for_loopback, wait_for_owned_loopback,
-    BackendLaunchPlan, BackendOwnershipState, BackendReadinessPolicy, BackendSpawnPlan,
-    BackendSpawnStrategy, BackendStartupAction, BackendStartupEvent, BackendStartupState,
-    BackendTransport, RuntimePathMode, RuntimePaths, RuntimePathsCache,
+    parse_backend_process_scope_members_with_session_query, parse_linux_listener_inodes,
+    resolve_tauri_config_directory, validate_pty_cleanup_process_group, wait_for_loopback,
+    wait_for_owned_loopback, BackendLaunchPlan, BackendOwnershipState, BackendReadinessPolicy,
+    BackendSpawnPlan, BackendSpawnStrategy, BackendStartupAction, BackendStartupEvent,
+    BackendStartupState, BackendTransport, RuntimePathMode, RuntimePaths, RuntimePathsCache,
 };
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -65,9 +65,61 @@ fn session_enumeration_discovers_groups_after_their_leader_exits() {
 }
 
 #[test]
-fn process_scope_uses_each_platforms_supported_session_column() {
-    assert_eq!(backend_process_session_column_name(false), "sid=");
-    assert_eq!(backend_process_session_column_name(true), "sess=");
+fn process_scope_can_resolve_numeric_sessions_without_parsing_macos_sess_pointers() {
+    let (members, process_groups) = parse_backend_process_scope_members_with_session_query(
+        "2 0\n4100 4100\n4102 4101\n4200 4200\n",
+        &[4100],
+        Some(4100),
+        |pid, _pgid| {
+            Ok(match pid {
+                4100 => Some(4100),
+                4102 => None,
+                4200 => Some(4200),
+                _ => None,
+            })
+        },
+    )
+    .unwrap();
+
+    assert_eq!(members, vec![4100]);
+    assert_eq!(process_groups, vec![4100]);
+
+    for malformed in ["4100\n", "4100 4100 extra\n", "nope 4100\n"] {
+        let error = parse_backend_process_scope_members_with_session_query(
+            malformed,
+            &[4100],
+            Some(4100),
+            |_pid, _pgid| Ok(Some(4100)),
+        )
+        .unwrap_err();
+        assert_eq!(error, "Malformed backend process-scope enumeration row");
+    }
+
+    let error = parse_backend_process_scope_members_with_session_query(
+        "4100 4100\n",
+        &[4100],
+        Some(4100),
+        |_pid, _pgid| Err("sensitive syscall detail".to_string()),
+    )
+    .unwrap_err();
+    assert_eq!(error, "Backend process-scope session attestation failed");
+    assert!(!error.contains("sensitive syscall detail"));
+}
+
+#[test]
+fn process_session_snapshot_ignores_identity_changes_during_enumeration() {
+    assert_eq!(
+        attest_backend_process_session_snapshot(4100, 4101, 4100, 4101),
+        Some(4100)
+    );
+    assert_eq!(
+        attest_backend_process_session_snapshot(4100, 4200, 4100, 4101),
+        None
+    );
+    assert_eq!(
+        attest_backend_process_session_snapshot(4100, 4101, 4200, 4101),
+        None
+    );
 }
 
 #[test]

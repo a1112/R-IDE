@@ -274,6 +274,7 @@ impl AppState {
         smoke: smoke::SmokeProtocol,
         startup_metrics: startup_metrics::StartupMetrics,
         startup_mode: startup_metrics::StartupMode,
+        runtime_paths: startup::RuntimePaths,
     ) -> Self {
         Self {
             backend_port: Mutex::new(None),
@@ -294,7 +295,7 @@ impl AppState {
             startup_metrics,
             startup_mode: Mutex::new(startup_mode),
             gateway: Mutex::new(None),
-            runtime_paths: startup::RuntimePathsCache::default(),
+            runtime_paths: startup::RuntimePathsCache::initialized(runtime_paths),
             application_shutdown: ApplicationShutdown::new(),
             application_cleanup_retry_running: AtomicBool::new(false),
             application_cleanup_recovered: AtomicBool::new(false),
@@ -572,6 +573,36 @@ pub fn run() {
     {
         eprintln!("Warning: failed to initialize startup metrics: {error}");
     }
+    let context = tauri::generate_context!();
+    let Some(mut main_window_config) = context
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|config| config.label == "main")
+        .cloned()
+    else {
+        eprintln!("Failed to start R-IDE: missing main window configuration");
+        return;
+    };
+    let runtime_paths = match sidecar::resolve_runtime_paths_before_app(context.package_info()) {
+        Ok(paths) => paths,
+        Err(error) => {
+            eprintln!("Failed to resolve startup paths: {error}");
+            return;
+        }
+    };
+    let pending_startup_launch = tauri::async_runtime::block_on(
+        startup::StartupCoordinator::new(
+            requested_startup_mode,
+            startup_metrics.clone(),
+            visibility_deadline,
+        )
+        .begin_launch(
+            runtime_paths.gateway_frontend_directory(),
+            main_window_config.url.clone(),
+        ),
+    );
     configure_local_proxy_bypass();
     let _ = env_logger::try_init();
 
@@ -595,6 +626,7 @@ pub fn run() {
         smoke,
         startup_metrics,
         requested_startup_mode,
+        runtime_paths,
     );
 
     let builder = configure_activation_builder(
@@ -618,26 +650,8 @@ pub fn run() {
         .setup(move |app| {
             native_chrome::install_menu_event_bridge(app.handle());
 
-            let mut main_window_config = app
-                .config()
-                .app
-                .windows
-                .iter()
-                .find(|config| config.label == "main")
-                .cloned()
-                .ok_or_else(|| std::io::Error::other("missing main window configuration"))?;
-            let runtime_paths = sidecar::resolve_runtime_paths(app.handle())?;
-            let startup_metrics = app.state::<AppState>().startup_metrics.clone();
             let mut launch = tauri::async_runtime::block_on(
-                startup::StartupCoordinator::new(
-                    requested_startup_mode,
-                    startup_metrics,
-                    visibility_deadline,
-                )
-                .launch(
-                    runtime_paths.gateway_frontend_directory(),
-                    main_window_config.url.clone(),
-                ),
+                pending_startup_launch.complete(),
             )
             .map_err(|error| std::io::Error::other(error.to_string()))?;
             let presentation = startup::present_startup_window(
@@ -823,7 +837,7 @@ pub fn run() {
             commands::save_file,
             commands::show_in_folder,
         ])
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("error while building tauri application");
 
     install_shutdown_signal_handlers(app.handle().clone());
@@ -1122,6 +1136,11 @@ mod tests {
                     Arc::new(TestClock),
                 ),
                 startup_metrics::StartupMode::LegacyExplicit,
+                startup::RuntimePaths::resolve(
+                    startup::RuntimePathMode::Development(PathBuf::from("checkout")),
+                    PathBuf::from("config"),
+                )
+                .expect("test runtime paths"),
             ),
             |mut builder, plugin| {
                 builder.assembly_order.push("plugin");

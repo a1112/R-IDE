@@ -236,22 +236,26 @@ pub(crate) fn resolve_runtime_paths(app_handle: &AppHandle) -> Result<RuntimePat
     let state = app_handle.state::<crate::AppState>();
     state
         .runtime_paths
-        .get_or_try_init(|| {
-            let config_directory = resolve_tauri_config_directory(
-                std::env::var_os("RIDE_CONFIG_DIR").map(PathBuf::from),
-                home_dir(),
-            );
-            let mode =
-                if let Some(root) = std::env::var_os("RIDE_DEVELOPMENT_ROOT") {
-                    RuntimePathMode::Development(PathBuf::from(root))
-                } else {
-                    RuntimePathMode::Packaged(app_handle.path().resource_dir().map_err(
-                        |error| format!("Failed to resolve resource directory: {error}"),
-                    )?)
-                };
-            RuntimePaths::resolve(mode, config_directory)
-        })
+        .get_or_try_init(|| resolve_runtime_paths_before_app(app_handle.package_info()))
         .cloned()
+}
+
+pub(crate) fn resolve_runtime_paths_before_app(
+    package_info: &tauri::utils::PackageInfo,
+) -> Result<RuntimePaths, String> {
+    let config_directory = resolve_tauri_config_directory(
+        std::env::var_os("RIDE_CONFIG_DIR").map(PathBuf::from),
+        home_dir(),
+    );
+    let mode = if let Some(root) = std::env::var_os("RIDE_DEVELOPMENT_ROOT") {
+        RuntimePathMode::Development(PathBuf::from(root))
+    } else {
+        RuntimePathMode::Packaged(
+            tauri::utils::platform::resource_dir(package_info, &tauri::utils::Env::default())
+                .map_err(|error| format!("Failed to resolve resource directory: {error}"))?,
+        )
+    };
+    RuntimePaths::resolve(mode, config_directory)
 }
 
 fn current_exe_dir() -> PathBuf {
