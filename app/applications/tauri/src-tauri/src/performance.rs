@@ -503,7 +503,7 @@ mod tests {
     struct IdentityTrackingProcessSource {
         topology: Vec<ProcessTopology>,
         samples: Vec<ProcessSample>,
-        identity_requests: Arc<Mutex<Vec<u32>>>,
+        identity_requests: Arc<Mutex<Vec<Vec<u32>>>>,
     }
 
     impl ProcessSource for IdentityTrackingProcessSource {
@@ -519,7 +519,7 @@ mod tests {
             self.identity_requests
                 .lock()
                 .expect("identity requests mutex")
-                .extend_from_slice(pids);
+                .push(pids.to_vec());
             Ok(())
         }
 
@@ -528,6 +528,69 @@ mod tests {
                 .iter()
                 .find(|sample| sample.pid == pid)
                 .cloned()
+        }
+
+        fn logical_cpu_count(&self) -> usize {
+            1
+        }
+
+        fn sampled_at_ms(&self) -> Result<u64, String> {
+            Ok(1)
+        }
+    }
+
+    struct StagedProcessSource {
+        topology: Vec<ProcessTopology>,
+        samples: HashMap<u32, ProcessSample>,
+        identity_calls: Arc<Mutex<Vec<Vec<u32>>>>,
+        identity_error: Option<String>,
+        removed_on_identity_refresh: HashSet<u32>,
+    }
+
+    impl StagedProcessSource {
+        fn new(
+            topology: Vec<ProcessTopology>,
+            samples: Vec<ProcessSample>,
+            identity_calls: Arc<Mutex<Vec<Vec<u32>>>>,
+        ) -> Self {
+            Self {
+                topology,
+                samples: samples
+                    .into_iter()
+                    .map(|sample| (sample.pid, sample))
+                    .collect(),
+                identity_calls,
+                identity_error: None,
+                removed_on_identity_refresh: HashSet::new(),
+            }
+        }
+    }
+
+    impl ProcessSource for StagedProcessSource {
+        fn refresh_usage(&mut self) -> Result<usize, String> {
+            Ok(self.topology.len())
+        }
+
+        fn collect_topology(&self, output: &mut Vec<ProcessTopology>) {
+            output.extend_from_slice(&self.topology);
+        }
+
+        fn refresh_identities(&mut self, pids: &[u32]) -> Result<(), String> {
+            self.identity_calls
+                .lock()
+                .expect("identity calls mutex")
+                .push(pids.to_vec());
+            if let Some(error) = &self.identity_error {
+                return Err(error.clone());
+            }
+            for pid in &self.removed_on_identity_refresh {
+                self.samples.remove(pid);
+            }
+            Ok(())
+        }
+
+        fn process_sample(&self, pid: u32) -> Option<ProcessSample> {
+            self.samples.get(&pid).cloned()
         }
 
         fn logical_cpu_count(&self) -> usize {
@@ -608,9 +671,263 @@ mod tests {
             .expect("identity requests mutex")
             .clone();
 
-        assert_eq!(identity_requests.len(), 3, "identity request count");
-        assert_eq!(identity_requests, vec![10, 20, 30]);
+        assert_eq!(identity_requests, vec![vec![10, 20, 30]]);
         assert_eq!(snapshot.total.process_count, 3);
+    }
+
+    #[test]
+    fn identity_refresh_receives_one_sorted_batch_for_branching_topology() {
+        let identity_requests = Arc::new(Mutex::new(Vec::new()));
+        let topology = vec![
+            ProcessTopology {
+                pid: 10,
+                parent_pid: None,
+            },
+            ProcessTopology {
+                pid: 30,
+                parent_pid: Some(10),
+            },
+            ProcessTopology {
+                pid: 20,
+                parent_pid: Some(10),
+            },
+            ProcessTopology {
+                pid: 50,
+                parent_pid: Some(30),
+            },
+            ProcessTopology {
+                pid: 40,
+                parent_pid: Some(20),
+            },
+        ];
+        let samples = vec![
+            sample(10, None, 1.0, 10, "ride-tauri"),
+            sample(20, Some(10), 1.0, 20, "node main.js"),
+            sample(30, Some(10), 1.0, 30, "node worker.js"),
+            sample(40, Some(20), 1.0, 40, "powershell"),
+            sample(50, Some(30), 1.0, 50, "node plugin-host"),
+        ];
+        let source = Mutex::new(SamplerState::new(IdentityTrackingProcessSource {
+            topology,
+            samples,
+            identity_requests: Arc::clone(&identity_requests),
+        }));
+
+        snapshot_from_source(&source, 10, Some(20)).expect("snapshot");
+        let identity_requests = identity_requests
+            .lock()
+            .expect("identity requests mutex")
+            .clone();
+
+        assert_eq!(identity_requests, vec![vec![10, 20, 30, 40, 50]]);
+    }
+
+    #[test]
+    fn identity_refresh_failure_is_returned_without_a_stale_snapshot() {
+        let identity_calls = Arc::new(Mutex::new(Vec::new()));
+        let mut staged_source = StagedProcessSource::new(
+            vec![ProcessTopology {
+                pid: 10,
+                parent_pid: None,
+            }],
+            vec![sample(10, None, 1.0, 10, "stale-ride-tauri")],
+            Arc::clone(&identity_calls),
+        );
+        staged_source.identity_error = Some("identity refresh failed".to_string());
+        let source = Mutex::new(SamplerState::new(staged_source));
+
+        let error = snapshot_from_source(&source, 10, None)
+            .expect_err("failed identity refresh must not return a stale snapshot");
+
+        assert_eq!(error, "identity refresh failed");
+        assert_eq!(
+            identity_calls.lock().expect("identity calls mutex").clone(),
+            vec![vec![10]]
+        );
+    }
+
+    #[test]
+    fn root_exit_between_topology_and_identity_returns_root_absent() {
+        let identity_calls = Arc::new(Mutex::new(Vec::new()));
+        let mut staged_source = StagedProcessSource::new(
+            vec![
+                ProcessTopology {
+                    pid: 10,
+                    parent_pid: None,
+                },
+                ProcessTopology {
+                    pid: 20,
+                    parent_pid: Some(10),
+                },
+            ],
+            vec![
+                sample(10, None, 1.0, 10, "ride-tauri"),
+                sample(20, Some(10), 1.0, 20, "node main.js"),
+            ],
+            Arc::clone(&identity_calls),
+        );
+        staged_source.removed_on_identity_refresh = HashSet::from([10]);
+        let source = Mutex::new(SamplerState::new(staged_source));
+
+        let error = snapshot_from_source(&source, 10, Some(20))
+            .expect_err("root exiting after topology collection must fail");
+
+        assert_eq!(error, "root process 10 is absent after process refresh");
+        assert_eq!(
+            identity_calls.lock().expect("identity calls mutex").clone(),
+            vec![vec![10, 20]]
+        );
+    }
+
+    #[test]
+    fn child_exit_between_topology_and_identity_is_omitted() {
+        let identity_calls = Arc::new(Mutex::new(Vec::new()));
+        let mut staged_source = StagedProcessSource::new(
+            vec![
+                ProcessTopology {
+                    pid: 10,
+                    parent_pid: None,
+                },
+                ProcessTopology {
+                    pid: 20,
+                    parent_pid: Some(10),
+                },
+            ],
+            vec![
+                sample(10, None, 1.0, 10, "ride-tauri"),
+                sample(20, Some(10), 1.0, 20, "node main.js"),
+            ],
+            Arc::clone(&identity_calls),
+        );
+        staged_source.removed_on_identity_refresh = HashSet::from([20]);
+        let source = Mutex::new(SamplerState::new(staged_source));
+
+        let snapshot = snapshot_from_source(&source, 10, Some(20)).expect("snapshot");
+
+        assert_eq!(
+            identity_calls.lock().expect("identity calls mutex").clone(),
+            vec![vec![10, 20]]
+        );
+        assert_eq!(snapshot.total.process_count, 1);
+        assert_eq!(snapshot.total.memory_bytes, 10);
+        assert_eq!(snapshot.main.process_count, 1);
+        assert_eq!(snapshot.backend, UsageGroup::default());
+    }
+
+    #[test]
+    fn staged_root_child_cycle_refreshes_each_selected_pid_once() {
+        let identity_calls = Arc::new(Mutex::new(Vec::new()));
+        let staged_source = StagedProcessSource::new(
+            vec![
+                ProcessTopology {
+                    pid: 20,
+                    parent_pid: Some(10),
+                },
+                ProcessTopology {
+                    pid: 10,
+                    parent_pid: Some(20),
+                },
+            ],
+            vec![
+                sample(10, Some(20), 1.0, 10, "ride-tauri"),
+                sample(20, Some(10), 1.0, 20, "node main.js"),
+            ],
+            Arc::clone(&identity_calls),
+        );
+        let source = Mutex::new(SamplerState::new(staged_source));
+
+        let snapshot = snapshot_from_source(&source, 10, Some(20)).expect("snapshot");
+
+        assert_eq!(
+            identity_calls.lock().expect("identity calls mutex").clone(),
+            vec![vec![10, 20]]
+        );
+        assert_eq!(snapshot.total.process_count, 2);
+        assert_eq!(snapshot.total.memory_bytes, 30);
+    }
+
+    #[test]
+    fn staged_conflicting_duplicate_and_descendants_are_not_identity_refreshed() {
+        let identity_calls = Arc::new(Mutex::new(Vec::new()));
+        let staged_source = StagedProcessSource::new(
+            vec![
+                ProcessTopology {
+                    pid: 10,
+                    parent_pid: None,
+                },
+                ProcessTopology {
+                    pid: 20,
+                    parent_pid: Some(10),
+                },
+                ProcessTopology {
+                    pid: 20,
+                    parent_pid: Some(99),
+                },
+                ProcessTopology {
+                    pid: 30,
+                    parent_pid: Some(20),
+                },
+                ProcessTopology {
+                    pid: 40,
+                    parent_pid: Some(10),
+                },
+            ],
+            vec![
+                sample(10, None, 1.0, 10, "ride-tauri"),
+                sample(20, Some(10), 1.0, 20, "conflicting-child"),
+                sample(30, Some(20), 1.0, 30, "conflicting-descendant"),
+                sample(40, Some(10), 1.0, 40, "selected-child"),
+            ],
+            Arc::clone(&identity_calls),
+        );
+        let source = Mutex::new(SamplerState::new(staged_source));
+
+        let snapshot = snapshot_from_source(&source, 10, None).expect("snapshot");
+
+        assert_eq!(
+            identity_calls.lock().expect("identity calls mutex").clone(),
+            vec![vec![10, 40]]
+        );
+        assert_eq!(snapshot.total.process_count, 2);
+        assert_eq!(snapshot.total.memory_bytes, 50);
+    }
+
+    #[test]
+    fn staged_unrelated_backend_is_not_identity_refreshed_or_aggregated() {
+        let identity_calls = Arc::new(Mutex::new(Vec::new()));
+        let staged_source = StagedProcessSource::new(
+            vec![
+                ProcessTopology {
+                    pid: 10,
+                    parent_pid: None,
+                },
+                ProcessTopology {
+                    pid: 20,
+                    parent_pid: Some(10),
+                },
+                ProcessTopology {
+                    pid: 99,
+                    parent_pid: None,
+                },
+            ],
+            vec![
+                sample(10, None, 1.0, 10, "ride-tauri"),
+                sample(20, Some(10), 1.0, 20, "selected-child"),
+                sample(99, None, 1.0, 99, "unrelated-backend"),
+            ],
+            Arc::clone(&identity_calls),
+        );
+        let source = Mutex::new(SamplerState::new(staged_source));
+
+        let snapshot = snapshot_from_source(&source, 10, Some(99)).expect("snapshot");
+
+        assert_eq!(
+            identity_calls.lock().expect("identity calls mutex").clone(),
+            vec![vec![10, 20]]
+        );
+        assert_eq!(snapshot.total.process_count, 2);
+        assert_eq!(snapshot.total.memory_bytes, 30);
+        assert_eq!(snapshot.backend, UsageGroup::default());
     }
 
     #[test]
