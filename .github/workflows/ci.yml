@@ -149,6 +149,8 @@ jobs:
     timeout-minutes: 90
     env:
       RIDE_TAURI_FRONTEND_PROFILE: tauri-critical
+      RIDE_STARTUP_MODE: rust-gateway
+      RUST_LOG: ride_tauri=warn
     strategy:
       fail-fast: false
       matrix:

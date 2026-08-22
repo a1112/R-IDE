@@ -5620,6 +5620,71 @@ test('campaign stops on run 2 mode mismatch and preserves failure diagnostics', 
   }
 });
 
+test('explicit rust-gateway campaign rejects first-run fallback with its diagnostics', async () => {
+  const root = temporaryDirectory('campaign-required-startup-mode');
+  const executable = path.join(root, 'R-IDE');
+  const output = path.join(root, 'startup-metrics.json');
+  touch(executable);
+  let calls = 0;
+  const legacyMilestones = {
+    process_started: 0,
+    native_window_visible: 5,
+    backend_spawned: 3,
+    backend_listening: 20,
+    frontend_shell_attached: 40,
+    target_file_opened: 42,
+    plugins_started: 50,
+    plugins_ready: 60,
+  };
+  try {
+    await assert.rejects(
+      runMeasurementCampaign({
+        executable,
+        output,
+        runs: 3,
+        idleMs: 0,
+        timeoutMs: 100,
+        pollMs: 1,
+      }, campaignDependencies({
+        environment: {
+          PATH: process.env.PATH,
+          RIDE_STARTUP_MODE: 'rust-gateway',
+        },
+        measure: async options => {
+          calls++;
+          const measuredRun = {
+            startupReport: startupReport(legacyMilestones, {
+              startupMode: 'legacy-fallback',
+            }),
+            metrics: campaignMetrics(),
+          };
+          fs.writeFileSync(options.reportPath, JSON.stringify(measuredRun.startupReport));
+          fs.writeFileSync(options.stdoutLogPath, 'fallback stdout\n');
+          fs.writeFileSync(options.stderrLogPath, 'fallback reason\n');
+          return measuredRun;
+        },
+      })),
+      /required rust-gateway.*reported legacy-fallback/i,
+    );
+
+    assert.equal(calls, 1, 'the campaign must reject the first fallback run');
+    assert.equal(fs.existsSync(output), false);
+    const diagnostic = JSON.parse(fs.readFileSync(
+      path.join(root, 'startup-metrics.failure.json'),
+      'utf8',
+    ));
+    assert.equal(diagnostic.runIndex, 1);
+    assert.deepEqual(diagnostic.completedRuns, []);
+    assert.equal(diagnostic.startupReport.startupMode, 'legacy-fallback');
+    assert.equal(
+      fs.readFileSync(path.resolve(root, diagnostic.logs.stderr), 'utf8'),
+      'fallback reason\n',
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('packaged metadata reader uses canonical profile and plugin resources', async () => {
   const root = temporaryDirectory('packaged-metadata');
   const executable = path.join(root, 'R-IDE.exe');

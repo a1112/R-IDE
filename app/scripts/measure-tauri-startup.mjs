@@ -183,6 +183,19 @@ function validateRunId(runId) {
   return runId;
 }
 
+function requiredCampaignStartupMode(environment) {
+  const requested = typeof environment?.RIDE_STARTUP_MODE === 'string'
+    ? environment.RIDE_STARTUP_MODE.trim().toLowerCase()
+    : '';
+  if (requested === 'rust-gateway') {
+    return 'rust-gateway';
+  }
+  if (requested === 'legacy' || requested === 'legacy-explicit') {
+    return 'legacy-explicit';
+  }
+  return undefined;
+}
+
 export function filterSpawnEnvironment(sourceEnvironment, reportPath, runId) {
   const environment = {};
   const sensitiveValues = [];
@@ -3451,6 +3464,7 @@ export async function runMeasurementCampaign(
   const campaignId = randomUUID();
   const { sensitiveValues } = filterSpawnEnvironment(environment, 'diagnostic-redaction');
   const { build, host } = validateCampaignMetadata(await readMetadata({ options, executable }));
+  const requiredStartupMode = requiredCampaignStartupMode(environment);
   const rawRuns = [];
   for (let runIndex = 1; runIndex <= options.runs; runIndex++) {
     let runId;
@@ -3484,6 +3498,13 @@ export async function runMeasurementCampaign(
           runId = verifiedRunId;
         },
       });
+      const effectiveStartupMode = measuredRun?.startupReport?.startupMode;
+      if (requiredStartupMode !== undefined && effectiveStartupMode !== requiredStartupMode) {
+        throw new Error(
+          `measurement required ${requiredStartupMode} startup mode but run ${runIndex} `
+          + `reported ${effectiveStartupMode ?? 'no startup mode'}`,
+        );
+      }
       const firstMode = rawRuns[0]?.startupReport?.startupMode;
       if (firstMode !== undefined && measuredRun?.startupReport?.startupMode !== firstMode) {
         throw new Error('measurement campaign reported mixed effective startup modes');
