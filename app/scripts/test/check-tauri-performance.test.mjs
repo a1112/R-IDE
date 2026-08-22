@@ -29,6 +29,23 @@ const ROLES = [
   'terminal',
   'other',
 ];
+const RUST_GATEWAY_PHASES = {
+  runtime_paths_resolved: 10,
+  gateway_inventory_finished: 20,
+  tauri_setup_entered: 15,
+  backend_spawn_requested: 25,
+  window_build_started: 30,
+  window_built: 40,
+  window_shown: 50,
+};
+const LEGACY_EXPLICIT_PHASES = {
+  runtime_paths_resolved: 10,
+  tauri_setup_entered: 15,
+  backend_spawn_requested: 25,
+  window_build_started: 30,
+  window_built: 40,
+  window_shown: 50,
+};
 const HISTORICAL_BASELINE_PATH = path.resolve(
   import.meta.dirname,
   '..',
@@ -204,6 +221,15 @@ function existingV2Measurement(options = {}) {
       plugins_ready: targetFileOpenedMs + 20,
     };
   }
+  return value;
+}
+
+function withV3RustPhases(value, phases = RUST_GATEWAY_PHASES) {
+  for (const run of value.runs) {
+    run.startupReport.version = 3;
+    run.startupReport.rustPhases = { ...phases };
+  }
+  value.median.rustPhases = { ...phases };
   return value;
 }
 
@@ -404,6 +430,109 @@ test('accepts an existing v2 baseline with a v3 rust-gateway candidate', () => {
     minStartupGain: 30,
     minMemoryGain: 10,
   }).runs, 5);
+});
+
+test('accepts historical v1, exact v2, and complete v3 Rust phase report fixtures', () => {
+  const historical = existingV2Measurement({
+    targetFileOpenedMs: 5_310,
+    rssBytes: 1_154_154_496,
+  });
+  const gateway = withV3RustPhases(measurement({
+    targetFileOpenedMs: 3_717,
+    rssBytes: 1_038_739_046,
+  }));
+  assert.equal(compareTauriPerformance(historical, gateway, {
+    minStartupGain: 30,
+    minMemoryGain: 10,
+  }).runs, 5);
+
+  const explicit = withV3RustPhases(measurement({
+    targetFileOpenedMs: 5_310,
+    rssBytes: 1_154_154_496,
+    startupMode: 'legacy-explicit',
+  }), LEGACY_EXPLICIT_PHASES);
+  assert.equal(compareTauriPerformance(explicit, gateway, {
+    minStartupGain: 30,
+    minMemoryGain: 10,
+  }).runs, 5);
+});
+
+test('checker rejects invalid or incomplete v3 Rust phase reports', () => {
+  const baseline = measurement({ targetFileOpenedMs: 5_310, rssBytes: 1_154_154_496 });
+  const cases = [
+    ['unknown phase', report => { report.rustPhases.invented = 51; }, /unexpected.*invented/i],
+    ['negative phase', report => { report.rustPhases.window_shown = -1; }, /window_shown.*non-negative safe integer/i],
+    ['non-integer phase', report => { report.rustPhases.window_shown = 50.5; }, /window_shown.*non-negative safe integer/i],
+    ['missing predecessor', report => {
+      delete report.rustPhases.gateway_inventory_finished;
+    }, /backend_spawn_requested.*gateway_inventory_finished|missing field gateway_inventory_finished/i],
+    ['timestamp precedes predecessor', report => {
+      report.rustPhases.window_build_started = 24;
+    }, /window_build_started.*timestamp.*backend_spawn_requested/i],
+    ['missing rustPhases', report => { delete report.rustPhases; }, /missing field rustPhases/i],
+    ['incomplete final phases', report => {
+      delete report.rustPhases.window_shown;
+    }, /missing field window_shown|all rust-gateway Rust phases/i],
+  ];
+  for (const [label, mutate, expected] of cases) {
+    const candidate = withV3RustPhases(measurement({
+      targetFileOpenedMs: 3_717,
+      rssBytes: 1_038_739_046,
+    }));
+    mutate(candidate.runs[0].startupReport);
+    assert.throws(
+      () => compareTauriPerformance(baseline, candidate, {
+        minStartupGain: 30,
+        minMemoryGain: 10,
+      }),
+      expected,
+      label,
+    );
+  }
+});
+
+test('checker rejects gateway inventory in v3 legacy-explicit reports', () => {
+  const baseline = withV3RustPhases(measurement({
+    targetFileOpenedMs: 5_310,
+    rssBytes: 1_154_154_496,
+    startupMode: 'legacy-explicit',
+  }), LEGACY_EXPLICIT_PHASES);
+  baseline.runs[0].startupReport.rustPhases.gateway_inventory_finished = 20;
+  const candidate = withV3RustPhases(measurement({
+    targetFileOpenedMs: 3_717,
+    rssBytes: 1_038_739_046,
+  }));
+
+  assert.throws(
+    () => compareTauriPerformance(baseline, candidate, {
+      minStartupGain: 30,
+      minMemoryGain: 10,
+    }),
+    /unexpected.*gateway_inventory_finished/i,
+  );
+});
+
+test('checker requires exact v3 Rust phase medians matching all runs', () => {
+  const baseline = measurement({ targetFileOpenedMs: 5_310, rssBytes: 1_154_154_496 });
+  for (const [label, mutate, expected] of [
+    ['stale median', medianValue => { medianValue.window_shown = 49; }, /reported median.*window_shown/i],
+    ['unknown median', medianValue => { medianValue.invented = 1; }, /unexpected field invented/i],
+    ['missing median', medianValue => { delete medianValue.window_shown; }, /missing field window_shown/i],
+  ]) {
+    const candidate = withV3RustPhases(measurement({
+      targetFileOpenedMs: 3_717,
+      rssBytes: 1_038_739_046,
+    }));
+    mutate(candidate.median.rustPhases);
+    assert.throws(
+      () => compareTauriPerformance(baseline, candidate, {
+        minStartupGain: 30,
+        minMemoryGain: 10,
+      }),
+      expected,
+      label,
+    );
+  }
 });
 
 test('rejects legacy and mixed-mode optimized candidates', () => {
