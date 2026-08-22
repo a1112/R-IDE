@@ -577,13 +577,20 @@ export function parseStartupReport(
       throw new Error('startup report must contain all version 1 final milestones');
     }
     let previous = -1;
+    let missingPredecessor;
     for (const milestone of V1_MILESTONES) {
       if (!Object.hasOwn(report.milestones, milestone)) {
+        missingPredecessor ??= milestone;
         continue;
       }
       const elapsed = report.milestones[milestone];
       if (!Number.isSafeInteger(elapsed) || elapsed < 0) {
         throw new Error(`milestone ${milestone} must be a non-negative safe integer`);
+      }
+      if (missingPredecessor !== undefined) {
+        throw new Error(
+          `version 1 startup milestone ${milestone} requires predecessor ${missingPredecessor}`,
+        );
       }
       if (elapsed < previous) {
         throw new Error('version 1 startup milestones must be monotonic');

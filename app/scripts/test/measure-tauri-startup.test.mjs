@@ -537,6 +537,56 @@ test('startup report parser preserves v1 and v2 roots and accepts complete v3 mo
   assert.deepEqual(explicit.rustPhases, legacyExplicitPhases);
 });
 
+test('v1 incremental reports require a continuous canonical milestone prefix', () => {
+  const report = historicalStartupReportV1();
+  report.milestones = {
+    process_started: 0,
+    plugins_ready: 60,
+  };
+
+  assert.throws(
+    () => parseStartupReport(JSON.stringify(report), { phase: 'incremental' }),
+    /plugins_ready.*requires.*native_window_visible|continuous.*prefix/i,
+  );
+});
+
+test('v1 target reports require the complete canonical prefix through target_file_opened', () => {
+  const incomplete = historicalStartupReportV1();
+  incomplete.milestones = {
+    process_started: 0,
+    target_file_opened: 40,
+  };
+  assert.throws(
+    () => parseStartupReport(JSON.stringify(incomplete), { phase: 'target' }),
+    /target_file_opened.*requires.*native_window_visible|continuous.*prefix/i,
+  );
+
+  const complete = historicalStartupReportV1();
+  complete.milestones = {
+    process_started: 0,
+    native_window_visible: 5,
+    backend_spawned: 10,
+    backend_listening: 20,
+    frontend_shell_attached: 30,
+    target_file_opened: 40,
+  };
+  assert.equal(
+    parseStartupReport(JSON.stringify(complete), { phase: 'target' })
+      .milestones.target_file_opened,
+    40,
+  );
+});
+
+test('v1 final validation ignores JSON milestone insertion order', () => {
+  const report = historicalStartupReportV1();
+  report.milestones = Object.fromEntries(Object.entries(report.milestones).reverse());
+
+  assert.equal(
+    parseStartupReport(JSON.stringify(report), { phase: 'final' }).milestones.plugins_ready,
+    60,
+  );
+});
+
 test('v3 incremental reports accept only predecessor-closed Rust phase subsets', () => {
   const report = startupReportV3({ process_started: 0 }, {
     rustPhases: {
