@@ -97,8 +97,10 @@ impl FakeWebSocketBackend {
                 connections.spawn(async move {
                     let observed = Arc::new(std::sync::Mutex::new(None));
                     let callback_observed = observed.clone();
-                    let mut socket = accept_hdr_async(
-                        stream,
+                    // tungstenite's callback contract fixes the error variant to
+                    // ErrorResponse, so this test cannot shrink it independently.
+                    #[allow(clippy::result_large_err)]
+                    let handshake =
                         move |request: &WebSocketRequest, mut response: WebSocketResponse| {
                             *callback_observed.lock().unwrap() = Some(ObservedWebSocketHandshake {
                                 target: request.uri().to_string(),
@@ -129,10 +131,8 @@ impl FakeWebSocketBackend {
                                 "ride_session=backend-value; Path=/".parse().unwrap(),
                             );
                             Ok(response)
-                        },
-                    )
-                    .await
-                    .unwrap();
+                        };
+                    let mut socket = accept_hdr_async(stream, handshake).await.unwrap();
 
                     socket
                         .send(Message::Text("backend-text".into()))
@@ -3740,12 +3740,11 @@ async fn websocket_proxy_propagates_backend_close_to_the_public_side() {
     let backend_task = tokio::spawn(async move {
         for _ in 0..2 {
             let (stream, _) = listener.accept().await.unwrap();
-            let mut socket = accept_hdr_async(
-                stream,
-                |_request: &WebSocketRequest, response: WebSocketResponse| Ok(response),
-            )
-            .await
-            .unwrap();
+            // tungstenite requires this callback to return its concrete, large
+            // ErrorResponse even though this fixture never rejects a handshake.
+            #[allow(clippy::result_large_err)]
+            let handshake = |_request: &WebSocketRequest, response: WebSocketResponse| Ok(response);
+            let mut socket = accept_hdr_async(stream, handshake).await.unwrap();
             socket.close(None).await.unwrap();
         }
     });
