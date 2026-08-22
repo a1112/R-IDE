@@ -43,30 +43,51 @@ struct ProcessSample {
     command_line: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProcessTopology {
+    pid: u32,
+    parent_pid: Option<u32>,
+}
+
 trait ProcessSource {
-    fn refresh(&mut self) -> Result<usize, String>;
-    fn process_ids(&self) -> Vec<u32>;
+    fn refresh_usage(&mut self) -> Result<usize, String>;
+    fn collect_topology(&self, output: &mut Vec<ProcessTopology>);
+    fn refresh_identities(&mut self, pids: &[u32]) -> Result<(), String>;
     fn process_sample(&self, pid: u32) -> Option<ProcessSample>;
     fn logical_cpu_count(&self) -> usize;
     fn sampled_at_ms(&self) -> Result<u64, String>;
 }
 
 impl ProcessSource for System {
-    fn refresh(&mut self) -> Result<usize, String> {
+    fn refresh_usage(&mut self) -> Result<usize, String> {
         Ok(self.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
             ProcessRefreshKind::nothing()
                 .with_cpu()
                 .with_memory()
-                .with_cmd(UpdateKind::OnlyIfNotSet)
-                .with_exe(UpdateKind::OnlyIfNotSet)
                 .without_tasks(),
         ))
     }
 
-    fn process_ids(&self) -> Vec<u32> {
-        self.processes().keys().map(|pid| pid.as_u32()).collect()
+    fn collect_topology(&self, output: &mut Vec<ProcessTopology>) {
+        output.extend(self.processes().values().map(|process| ProcessTopology {
+            pid: process.pid().as_u32(),
+            parent_pid: process.parent().map(Pid::as_u32),
+        }));
+    }
+
+    fn refresh_identities(&mut self, pids: &[u32]) -> Result<(), String> {
+        let pids = pids.iter().copied().map(Pid::from_u32).collect::<Vec<_>>();
+        self.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&pids),
+            false,
+            ProcessRefreshKind::nothing()
+                .with_cmd(UpdateKind::OnlyIfNotSet)
+                .with_exe(UpdateKind::OnlyIfNotSet)
+                .without_tasks(),
+        );
+        Ok(())
     }
 
     fn process_sample(&self, pid: u32) -> Option<ProcessSample> {
@@ -102,8 +123,47 @@ impl ProcessSource for System {
     }
 }
 
+#[derive(Default)]
+struct SnapshotScratch {
+    topology: Vec<ProcessTopology>,
+    selected_pids: Vec<u32>,
+    samples: Vec<ProcessSample>,
+    topology_by_pid: HashMap<u32, Option<u32>>,
+    conflicting_pids: HashSet<u32>,
+    children_by_parent: HashMap<u32, Vec<u32>>,
+    pending: VecDeque<u32>,
+    visited: HashSet<u32>,
+}
+
+impl SnapshotScratch {
+    fn clear(&mut self) {
+        self.topology.clear();
+        self.selected_pids.clear();
+        self.samples.clear();
+        self.topology_by_pid.clear();
+        self.conflicting_pids.clear();
+        self.children_by_parent.clear();
+        self.pending.clear();
+        self.visited.clear();
+    }
+}
+
+struct SamplerState<S> {
+    source: S,
+    scratch: SnapshotScratch,
+}
+
+impl<S> SamplerState<S> {
+    fn new(source: S) -> Self {
+        Self {
+            source,
+            scratch: SnapshotScratch::default(),
+        }
+    }
+}
+
 pub struct PerformanceSampler {
-    system: Mutex<System>,
+    state: Mutex<SamplerState<System>>,
 }
 
 impl Default for PerformanceSampler {
@@ -111,7 +171,7 @@ impl Default for PerformanceSampler {
         let mut system = System::new();
         system.refresh_cpu_list(CpuRefreshKind::nothing());
         Self {
-            system: Mutex::new(system),
+            state: Mutex::new(SamplerState::new(system)),
         }
     }
 }
@@ -122,7 +182,7 @@ impl PerformanceSampler {
         root_pid: u32,
         backend_pid: Option<u32>,
     ) -> Result<PerformanceSnapshot, String> {
-        snapshot_from_source(&self.system, root_pid, backend_pid)
+        snapshot_from_source(&self.state, root_pid, backend_pid)
     }
 }
 
@@ -137,23 +197,33 @@ pub fn ride_performance_snapshot(
 }
 
 fn snapshot_from_source<S: ProcessSource>(
-    source: &Mutex<S>,
+    state: &Mutex<SamplerState<S>>,
     root_pid: u32,
     backend_pid: Option<u32>,
 ) -> Result<PerformanceSnapshot, String> {
-    let mut source = source
+    let mut state = state
         .lock()
         .map_err(|_| "performance sampler mutex is poisoned".to_string())?;
-    let refreshed_processes = source.refresh()?;
+    let SamplerState { source, scratch } = &mut *state;
+    scratch.clear();
+
+    let refreshed_processes = source.refresh_usage()?;
     if refreshed_processes == 0 {
         return Err("process refresh returned no processes".to_string());
     }
-    let samples = source
-        .process_ids()
-        .into_iter()
-        .filter_map(|pid| source.process_sample(pid))
-        .collect::<Vec<_>>();
-    if !samples.iter().any(|sample| sample.pid == root_pid) {
+    source.collect_topology(&mut scratch.topology);
+    if !select_ride_tree(root_pid, scratch) {
+        return Err(format!(
+            "root process {root_pid} is absent after process refresh"
+        ));
+    }
+    source.refresh_identities(&scratch.selected_pids)?;
+    for &pid in &scratch.selected_pids {
+        if let Some(sample) = source.process_sample(pid) {
+            scratch.samples.push(sample);
+        }
+    }
+    if !scratch.samples.iter().any(|sample| sample.pid == root_pid) {
         return Err(format!(
             "root process {root_pid} is absent after process refresh"
         ));
@@ -161,12 +231,64 @@ fn snapshot_from_source<S: ProcessSource>(
     let logical_cpu_count = source.logical_cpu_count().max(1);
     let sampled_at_ms = source.sampled_at_ms()?;
     Ok(aggregate_snapshot(
-        &samples,
+        &scratch.samples,
         root_pid,
         backend_pid,
         logical_cpu_count,
         sampled_at_ms,
     ))
+}
+
+fn select_ride_tree(root_pid: u32, scratch: &mut SnapshotScratch) -> bool {
+    let SnapshotScratch {
+        topology,
+        selected_pids,
+        topology_by_pid,
+        conflicting_pids,
+        children_by_parent,
+        pending,
+        visited,
+        ..
+    } = scratch;
+
+    for process in topology.iter() {
+        if conflicting_pids.contains(&process.pid) {
+            continue;
+        }
+        match topology_by_pid.get(&process.pid).copied() {
+            None => {
+                topology_by_pid.insert(process.pid, process.parent_pid);
+            }
+            Some(parent_pid) if parent_pid == process.parent_pid => {}
+            Some(_) => {
+                topology_by_pid.remove(&process.pid);
+                conflicting_pids.insert(process.pid);
+            }
+        }
+    }
+
+    for (&pid, &parent_pid) in topology_by_pid.iter() {
+        if let Some(parent_pid) = parent_pid {
+            children_by_parent.entry(parent_pid).or_default().push(pid);
+        }
+    }
+
+    if !topology_by_pid.contains_key(&root_pid) {
+        return false;
+    }
+
+    pending.push_back(root_pid);
+    while let Some(pid) = pending.pop_front() {
+        if !visited.insert(pid) || !topology_by_pid.contains_key(&pid) {
+            continue;
+        }
+        selected_pids.push(pid);
+        if let Some(children) = children_by_parent.get(&pid) {
+            pending.extend(children.iter().copied());
+        }
+    }
+    selected_pids.sort_unstable();
+    true
 }
 
 fn aggregate_snapshot(
@@ -304,13 +426,26 @@ mod tests {
     }
 
     impl ProcessSource for StatefulProcessSource {
-        fn refresh(&mut self) -> Result<usize, String> {
+        fn refresh_usage(&mut self) -> Result<usize, String> {
             self.refresh_count.fetch_add(1, Ordering::SeqCst);
             Ok(self.refreshed_processes)
         }
 
-        fn process_ids(&self) -> Vec<u32> {
-            vec![10, 99]
+        fn collect_topology(&self, output: &mut Vec<ProcessTopology>) {
+            output.extend([
+                ProcessTopology {
+                    pid: 10,
+                    parent_pid: None,
+                },
+                ProcessTopology {
+                    pid: 99,
+                    parent_pid: Some(10),
+                },
+            ]);
+        }
+
+        fn refresh_identities(&mut self, _pids: &[u32]) -> Result<(), String> {
+            Ok(())
         }
 
         fn process_sample(&self, pid: u32) -> Option<ProcessSample> {
@@ -337,12 +472,19 @@ mod tests {
     struct MissingRootProcessSource;
 
     impl ProcessSource for MissingRootProcessSource {
-        fn refresh(&mut self) -> Result<usize, String> {
+        fn refresh_usage(&mut self) -> Result<usize, String> {
             Ok(1)
         }
 
-        fn process_ids(&self) -> Vec<u32> {
-            vec![99]
+        fn collect_topology(&self, output: &mut Vec<ProcessTopology>) {
+            output.push(ProcessTopology {
+                pid: 99,
+                parent_pid: None,
+            });
+        }
+
+        fn refresh_identities(&mut self, _pids: &[u32]) -> Result<(), String> {
+            Ok(())
         }
 
         fn process_sample(&self, pid: u32) -> Option<ProcessSample> {
@@ -358,13 +500,52 @@ mod tests {
         }
     }
 
+    struct IdentityTrackingProcessSource {
+        topology: Vec<ProcessTopology>,
+        samples: Vec<ProcessSample>,
+        identity_requests: Arc<Mutex<Vec<u32>>>,
+    }
+
+    impl ProcessSource for IdentityTrackingProcessSource {
+        fn refresh_usage(&mut self) -> Result<usize, String> {
+            Ok(self.topology.len())
+        }
+
+        fn collect_topology(&self, output: &mut Vec<ProcessTopology>) {
+            output.extend_from_slice(&self.topology);
+        }
+
+        fn refresh_identities(&mut self, pids: &[u32]) -> Result<(), String> {
+            self.identity_requests
+                .lock()
+                .expect("identity requests mutex")
+                .extend_from_slice(pids);
+            Ok(())
+        }
+
+        fn process_sample(&self, pid: u32) -> Option<ProcessSample> {
+            self.samples
+                .iter()
+                .find(|sample| sample.pid == pid)
+                .cloned()
+        }
+
+        fn logical_cpu_count(&self) -> usize {
+            1
+        }
+
+        fn sampled_at_ms(&self) -> Result<u64, String> {
+            Ok(1)
+        }
+    }
+
     #[test]
     fn repeated_samples_reuse_the_same_process_source_state() {
         let refresh_count = Arc::new(AtomicUsize::new(0));
-        let source = Mutex::new(StatefulProcessSource {
+        let source = Mutex::new(SamplerState::new(StatefulProcessSource {
             refresh_count: Arc::clone(&refresh_count),
             refreshed_processes: 1,
-        });
+        }));
 
         let first = snapshot_from_source(&source, 10, None).expect("first snapshot");
         let second = snapshot_from_source(&source, 10, None).expect("second snapshot");
@@ -376,10 +557,10 @@ mod tests {
 
     #[test]
     fn ignores_processes_that_terminate_between_refresh_and_collection() {
-        let source = Mutex::new(StatefulProcessSource {
+        let source = Mutex::new(SamplerState::new(StatefulProcessSource {
             refresh_count: Arc::new(AtomicUsize::new(0)),
             refreshed_processes: 1,
-        });
+        }));
 
         let snapshot = snapshot_from_source(&source, 10, None).expect("snapshot");
 
@@ -388,11 +569,56 @@ mod tests {
     }
 
     #[test]
+    fn expensive_identity_is_requested_only_for_the_ride_tree() {
+        let identity_requests = Arc::new(Mutex::new(Vec::new()));
+        let mut topology = (1_000..5_000)
+            .map(|pid| ProcessTopology {
+                pid,
+                parent_pid: None,
+            })
+            .collect::<Vec<_>>();
+        topology.extend([
+            ProcessTopology {
+                pid: 10,
+                parent_pid: None,
+            },
+            ProcessTopology {
+                pid: 20,
+                parent_pid: Some(10),
+            },
+            ProcessTopology {
+                pid: 30,
+                parent_pid: Some(20),
+            },
+        ]);
+        let samples = vec![
+            sample(10, None, 1.0, 10, "ride-tauri"),
+            sample(20, Some(10), 1.0, 20, "node main.js"),
+            sample(30, Some(20), 1.0, 30, "node plugin-host"),
+        ];
+        let source = Mutex::new(SamplerState::new(IdentityTrackingProcessSource {
+            topology,
+            samples,
+            identity_requests: Arc::clone(&identity_requests),
+        }));
+
+        let snapshot = snapshot_from_source(&source, 10, Some(20)).expect("snapshot");
+        let identity_requests = identity_requests
+            .lock()
+            .expect("identity requests mutex")
+            .clone();
+
+        assert_eq!(identity_requests.len(), 3, "identity request count");
+        assert_eq!(identity_requests, vec![10, 20, 30]);
+        assert_eq!(snapshot.total.process_count, 3);
+    }
+
+    #[test]
     fn zero_refreshed_processes_returns_an_error() {
-        let source = Mutex::new(StatefulProcessSource {
+        let source = Mutex::new(SamplerState::new(StatefulProcessSource {
             refresh_count: Arc::new(AtomicUsize::new(0)),
             refreshed_processes: 0,
-        });
+        }));
 
         let error = snapshot_from_source(&source, 10, None)
             .expect_err("zero refreshed processes must fail");
@@ -402,7 +628,7 @@ mod tests {
 
     #[test]
     fn missing_root_after_a_nonzero_refresh_returns_an_error() {
-        let source = Mutex::new(MissingRootProcessSource);
+        let source = Mutex::new(SamplerState::new(MissingRootProcessSource));
 
         let error =
             snapshot_from_source(&source, 10, None).expect_err("missing root process must fail");
@@ -435,7 +661,7 @@ mod tests {
     fn poisoned_sampler_mutex_returns_a_clear_error() {
         let sampler = PerformanceSampler::default();
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = sampler.system.lock().expect("sampler mutex");
+            let _guard = sampler.state.lock().expect("sampler mutex");
             panic!("poison sampler mutex");
         }));
 
