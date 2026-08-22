@@ -454,7 +454,7 @@ export class RidePackagedSmokeActionService implements RidePackagedSmokeActions,
             if (!startupDocument) {
                 throw this.error('Smoke action unavailable.');
             }
-            let retry: StartupElementLike | null = null;
+            let retry: StartupElementLike | null | undefined;
             while (!retry || retry.disabled === true || typeof retry.click !== 'function') {
                 run.assertActive();
                 retry = startupDocument.querySelector('[data-ride-startup-retry="true"]');
@@ -464,7 +464,7 @@ export class RidePackagedSmokeActionService implements RidePackagedSmokeActions,
             }
             run.assertActive();
             retry.click();
-            while (startupDocument.querySelector('[role="alert"]') !== null) {
+            while (startupDocument.querySelector('[role="alert"]')) {
                 await run.delay(this.pollIntervalMs);
             }
         }, plan.actionTimeoutMs);
