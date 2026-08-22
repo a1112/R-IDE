@@ -43,6 +43,11 @@ struct ProcessSample {
     command_line: String,
 }
 
+enum ProcessSampleState {
+    Live(ProcessSample),
+    Nonexistent,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ProcessTopology {
     pid: u32,
@@ -53,7 +58,7 @@ trait ProcessSource {
     fn refresh_usage(&mut self) -> Result<usize, String>;
     fn collect_topology(&self, output: &mut Vec<ProcessTopology>);
     fn refresh_identities(&mut self, pids: &[u32]) -> Result<(), String>;
-    fn process_sample(&self, pid: u32) -> Option<ProcessSample>;
+    fn process_sample(&self, pid: u32) -> Option<ProcessSampleState>;
     fn logical_cpu_count(&self) -> usize;
     fn sampled_at_ms(&self) -> Result<u64, String>;
 }
@@ -90,9 +95,12 @@ impl ProcessSource for System {
         Ok(())
     }
 
-    fn process_sample(&self, pid: u32) -> Option<ProcessSample> {
+    fn process_sample(&self, pid: u32) -> Option<ProcessSampleState> {
         let process = self.process(Pid::from_u32(pid))?;
-        Some(ProcessSample {
+        if !process.exists() {
+            return Some(ProcessSampleState::Nonexistent);
+        }
+        Some(ProcessSampleState::Live(ProcessSample {
             pid: process.pid().as_u32(),
             parent_pid: process.parent().map(Pid::as_u32),
             cpu_percent: process.cpu_usage(),
@@ -108,7 +116,7 @@ impl ProcessSource for System {
                 .map(|part| part.to_string_lossy())
                 .collect::<Vec<_>>()
                 .join(" "),
-        })
+        }))
     }
 
     fn logical_cpu_count(&self) -> usize {
@@ -219,7 +227,7 @@ fn snapshot_from_source<S: ProcessSource>(
     }
     source.refresh_identities(&scratch.selected_pids)?;
     for &pid in &scratch.selected_pids {
-        if let Some(sample) = source.process_sample(pid) {
+        if let Some(ProcessSampleState::Live(sample)) = source.process_sample(pid) {
             scratch.samples.push(sample);
         }
     }
@@ -432,32 +440,25 @@ mod tests {
         }
 
         fn collect_topology(&self, output: &mut Vec<ProcessTopology>) {
-            output.extend([
-                ProcessTopology {
-                    pid: 10,
-                    parent_pid: None,
-                },
-                ProcessTopology {
-                    pid: 99,
-                    parent_pid: Some(10),
-                },
-            ]);
+            output.extend([topology(10, None), topology(99, Some(10))]);
         }
 
         fn refresh_identities(&mut self, _pids: &[u32]) -> Result<(), String> {
             Ok(())
         }
 
-        fn process_sample(&self, pid: u32) -> Option<ProcessSample> {
-            (pid == 10).then(|| {
-                sample(
-                    10,
-                    None,
-                    self.refresh_count.load(Ordering::SeqCst) as f32 * 10.0,
-                    10,
-                    "ride-tauri",
-                )
-            })
+        fn process_sample(&self, pid: u32) -> Option<ProcessSampleState> {
+            (pid == 10)
+                .then(|| {
+                    sample(
+                        10,
+                        None,
+                        self.refresh_count.load(Ordering::SeqCst) as f32 * 10.0,
+                        10,
+                        "ride-tauri",
+                    )
+                })
+                .map(ProcessSampleState::Live)
         }
 
         fn logical_cpu_count(&self) -> usize {
@@ -477,18 +478,17 @@ mod tests {
         }
 
         fn collect_topology(&self, output: &mut Vec<ProcessTopology>) {
-            output.push(ProcessTopology {
-                pid: 99,
-                parent_pid: None,
-            });
+            output.push(topology(99, None));
         }
 
         fn refresh_identities(&mut self, _pids: &[u32]) -> Result<(), String> {
             Ok(())
         }
 
-        fn process_sample(&self, pid: u32) -> Option<ProcessSample> {
-            (pid == 99).then(|| sample(99, None, 1.0, 99, "unrelated"))
+        fn process_sample(&self, pid: u32) -> Option<ProcessSampleState> {
+            (pid == 99)
+                .then(|| sample(99, None, 1.0, 99, "unrelated"))
+                .map(ProcessSampleState::Live)
         }
 
         fn logical_cpu_count(&self) -> usize {
@@ -500,51 +500,17 @@ mod tests {
         }
     }
 
-    struct IdentityTrackingProcessSource {
-        topology: Vec<ProcessTopology>,
-        samples: Vec<ProcessSample>,
-        identity_requests: Arc<Mutex<Vec<Vec<u32>>>>,
-    }
-
-    impl ProcessSource for IdentityTrackingProcessSource {
-        fn refresh_usage(&mut self) -> Result<usize, String> {
-            Ok(self.topology.len())
-        }
-
-        fn collect_topology(&self, output: &mut Vec<ProcessTopology>) {
-            output.extend_from_slice(&self.topology);
-        }
-
-        fn refresh_identities(&mut self, pids: &[u32]) -> Result<(), String> {
-            self.identity_requests
-                .lock()
-                .expect("identity requests mutex")
-                .push(pids.to_vec());
-            Ok(())
-        }
-
-        fn process_sample(&self, pid: u32) -> Option<ProcessSample> {
-            self.samples
-                .iter()
-                .find(|sample| sample.pid == pid)
-                .cloned()
-        }
-
-        fn logical_cpu_count(&self) -> usize {
-            1
-        }
-
-        fn sampled_at_ms(&self) -> Result<u64, String> {
-            Ok(1)
-        }
+    fn topology(pid: u32, parent_pid: Option<u32>) -> ProcessTopology {
+        ProcessTopology { pid, parent_pid }
     }
 
     struct StagedProcessSource {
         topology: Vec<ProcessTopology>,
         samples: HashMap<u32, ProcessSample>,
         identity_calls: Arc<Mutex<Vec<Vec<u32>>>>,
+        sample_calls: Arc<Mutex<Vec<u32>>>,
         identity_error: Option<String>,
-        removed_on_identity_refresh: HashSet<u32>,
+        nonexistent_pids: HashSet<u32>,
     }
 
     impl StagedProcessSource {
@@ -560,8 +526,9 @@ mod tests {
                     .map(|sample| (sample.pid, sample))
                     .collect(),
                 identity_calls,
+                sample_calls: Arc::new(Mutex::new(Vec::new())),
                 identity_error: None,
-                removed_on_identity_refresh: HashSet::new(),
+                nonexistent_pids: HashSet::new(),
             }
         }
     }
@@ -583,14 +550,19 @@ mod tests {
             if let Some(error) = &self.identity_error {
                 return Err(error.clone());
             }
-            for pid in &self.removed_on_identity_refresh {
-                self.samples.remove(pid);
-            }
             Ok(())
         }
 
-        fn process_sample(&self, pid: u32) -> Option<ProcessSample> {
-            self.samples.get(&pid).cloned()
+        fn process_sample(&self, pid: u32) -> Option<ProcessSampleState> {
+            self.sample_calls
+                .lock()
+                .expect("sample calls mutex")
+                .push(pid);
+            let sample = self.samples.get(&pid)?;
+            if self.nonexistent_pids.contains(&pid) {
+                return Some(ProcessSampleState::Nonexistent);
+            }
+            Some(ProcessSampleState::Live(sample.clone()))
         }
 
         fn logical_cpu_count(&self) -> usize {
@@ -633,72 +605,42 @@ mod tests {
 
     #[test]
     fn expensive_identity_is_requested_only_for_the_ride_tree() {
-        let identity_requests = Arc::new(Mutex::new(Vec::new()));
-        let mut topology = (1_000..5_000)
-            .map(|pid| ProcessTopology {
-                pid,
-                parent_pid: None,
-            })
+        let identity_calls = Arc::new(Mutex::new(Vec::new()));
+        let mut process_topology = (1_000..5_000)
+            .map(|pid| topology(pid, None))
             .collect::<Vec<_>>();
-        topology.extend([
-            ProcessTopology {
-                pid: 10,
-                parent_pid: None,
-            },
-            ProcessTopology {
-                pid: 20,
-                parent_pid: Some(10),
-            },
-            ProcessTopology {
-                pid: 30,
-                parent_pid: Some(20),
-            },
+        process_topology.extend([
+            topology(10, None),
+            topology(20, Some(10)),
+            topology(30, Some(20)),
         ]);
         let samples = vec![
             sample(10, None, 1.0, 10, "ride-tauri"),
             sample(20, Some(10), 1.0, 20, "node main.js"),
             sample(30, Some(20), 1.0, 30, "node plugin-host"),
         ];
-        let source = Mutex::new(SamplerState::new(IdentityTrackingProcessSource {
-            topology,
+        let source = Mutex::new(SamplerState::new(StagedProcessSource::new(
+            process_topology,
             samples,
-            identity_requests: Arc::clone(&identity_requests),
-        }));
+            Arc::clone(&identity_calls),
+        )));
 
         let snapshot = snapshot_from_source(&source, 10, Some(20)).expect("snapshot");
-        let identity_requests = identity_requests
-            .lock()
-            .expect("identity requests mutex")
-            .clone();
+        let identity_calls = identity_calls.lock().expect("identity calls mutex").clone();
 
-        assert_eq!(identity_requests, vec![vec![10, 20, 30]]);
+        assert_eq!(identity_calls, vec![vec![10, 20, 30]]);
         assert_eq!(snapshot.total.process_count, 3);
     }
 
     #[test]
     fn identity_refresh_receives_one_sorted_batch_for_branching_topology() {
-        let identity_requests = Arc::new(Mutex::new(Vec::new()));
+        let identity_calls = Arc::new(Mutex::new(Vec::new()));
         let topology = vec![
-            ProcessTopology {
-                pid: 10,
-                parent_pid: None,
-            },
-            ProcessTopology {
-                pid: 30,
-                parent_pid: Some(10),
-            },
-            ProcessTopology {
-                pid: 20,
-                parent_pid: Some(10),
-            },
-            ProcessTopology {
-                pid: 50,
-                parent_pid: Some(30),
-            },
-            ProcessTopology {
-                pid: 40,
-                parent_pid: Some(20),
-            },
+            topology(10, None),
+            topology(30, Some(10)),
+            topology(20, Some(10)),
+            topology(50, Some(30)),
+            topology(40, Some(20)),
         ];
         let samples = vec![
             sample(10, None, 1.0, 10, "ride-tauri"),
@@ -707,33 +649,28 @@ mod tests {
             sample(40, Some(20), 1.0, 40, "powershell"),
             sample(50, Some(30), 1.0, 50, "node plugin-host"),
         ];
-        let source = Mutex::new(SamplerState::new(IdentityTrackingProcessSource {
+        let source = Mutex::new(SamplerState::new(StagedProcessSource::new(
             topology,
             samples,
-            identity_requests: Arc::clone(&identity_requests),
-        }));
+            Arc::clone(&identity_calls),
+        )));
 
         snapshot_from_source(&source, 10, Some(20)).expect("snapshot");
-        let identity_requests = identity_requests
-            .lock()
-            .expect("identity requests mutex")
-            .clone();
+        let identity_calls = identity_calls.lock().expect("identity calls mutex").clone();
 
-        assert_eq!(identity_requests, vec![vec![10, 20, 30, 40, 50]]);
+        assert_eq!(identity_calls, vec![vec![10, 20, 30, 40, 50]]);
     }
 
     #[test]
     fn identity_refresh_failure_is_returned_without_a_stale_snapshot() {
         let identity_calls = Arc::new(Mutex::new(Vec::new()));
         let mut staged_source = StagedProcessSource::new(
-            vec![ProcessTopology {
-                pid: 10,
-                parent_pid: None,
-            }],
+            vec![topology(10, None)],
             vec![sample(10, None, 1.0, 10, "stale-ride-tauri")],
             Arc::clone(&identity_calls),
         );
         staged_source.identity_error = Some("identity refresh failed".to_string());
+        let sample_calls = Arc::clone(&staged_source.sample_calls);
         let source = Mutex::new(SamplerState::new(staged_source));
 
         let error = snapshot_from_source(&source, 10, None)
@@ -744,29 +681,21 @@ mod tests {
             identity_calls.lock().expect("identity calls mutex").clone(),
             vec![vec![10]]
         );
+        assert!(sample_calls.lock().expect("sample calls mutex").is_empty());
     }
 
     #[test]
-    fn root_exit_between_topology_and_identity_returns_root_absent() {
+    fn retained_nonexistent_root_returns_root_absent() {
         let identity_calls = Arc::new(Mutex::new(Vec::new()));
         let mut staged_source = StagedProcessSource::new(
-            vec![
-                ProcessTopology {
-                    pid: 10,
-                    parent_pid: None,
-                },
-                ProcessTopology {
-                    pid: 20,
-                    parent_pid: Some(10),
-                },
-            ],
+            vec![topology(10, None), topology(20, Some(10))],
             vec![
                 sample(10, None, 1.0, 10, "ride-tauri"),
                 sample(20, Some(10), 1.0, 20, "node main.js"),
             ],
             Arc::clone(&identity_calls),
         );
-        staged_source.removed_on_identity_refresh = HashSet::from([10]);
+        staged_source.nonexistent_pids = HashSet::from([10]);
         let source = Mutex::new(SamplerState::new(staged_source));
 
         let error = snapshot_from_source(&source, 10, Some(20))
@@ -780,26 +709,17 @@ mod tests {
     }
 
     #[test]
-    fn child_exit_between_topology_and_identity_is_omitted() {
+    fn retained_nonexistent_child_is_omitted() {
         let identity_calls = Arc::new(Mutex::new(Vec::new()));
         let mut staged_source = StagedProcessSource::new(
-            vec![
-                ProcessTopology {
-                    pid: 10,
-                    parent_pid: None,
-                },
-                ProcessTopology {
-                    pid: 20,
-                    parent_pid: Some(10),
-                },
-            ],
+            vec![topology(10, None), topology(20, Some(10))],
             vec![
                 sample(10, None, 1.0, 10, "ride-tauri"),
                 sample(20, Some(10), 1.0, 20, "node main.js"),
             ],
             Arc::clone(&identity_calls),
         );
-        staged_source.removed_on_identity_refresh = HashSet::from([20]);
+        staged_source.nonexistent_pids = HashSet::from([20]);
         let source = Mutex::new(SamplerState::new(staged_source));
 
         let snapshot = snapshot_from_source(&source, 10, Some(20)).expect("snapshot");
@@ -815,19 +735,10 @@ mod tests {
     }
 
     #[test]
-    fn staged_root_child_cycle_refreshes_each_selected_pid_once() {
+    fn root_child_cycle_refreshes_each_selected_pid_once() {
         let identity_calls = Arc::new(Mutex::new(Vec::new()));
         let staged_source = StagedProcessSource::new(
-            vec![
-                ProcessTopology {
-                    pid: 20,
-                    parent_pid: Some(10),
-                },
-                ProcessTopology {
-                    pid: 10,
-                    parent_pid: Some(20),
-                },
-            ],
+            vec![topology(20, Some(10)), topology(10, Some(20))],
             vec![
                 sample(10, Some(20), 1.0, 10, "ride-tauri"),
                 sample(20, Some(10), 1.0, 20, "node main.js"),
@@ -847,30 +758,15 @@ mod tests {
     }
 
     #[test]
-    fn staged_conflicting_duplicate_and_descendants_are_not_identity_refreshed() {
+    fn conflicting_duplicate_and_descendants_are_not_identity_refreshed() {
         let identity_calls = Arc::new(Mutex::new(Vec::new()));
         let staged_source = StagedProcessSource::new(
             vec![
-                ProcessTopology {
-                    pid: 10,
-                    parent_pid: None,
-                },
-                ProcessTopology {
-                    pid: 20,
-                    parent_pid: Some(10),
-                },
-                ProcessTopology {
-                    pid: 20,
-                    parent_pid: Some(99),
-                },
-                ProcessTopology {
-                    pid: 30,
-                    parent_pid: Some(20),
-                },
-                ProcessTopology {
-                    pid: 40,
-                    parent_pid: Some(10),
-                },
+                topology(10, None),
+                topology(20, Some(10)),
+                topology(20, Some(99)),
+                topology(30, Some(20)),
+                topology(40, Some(10)),
             ],
             vec![
                 sample(10, None, 1.0, 10, "ride-tauri"),
@@ -893,22 +789,13 @@ mod tests {
     }
 
     #[test]
-    fn staged_unrelated_backend_is_not_identity_refreshed_or_aggregated() {
+    fn unrelated_backend_is_not_identity_refreshed_or_aggregated() {
         let identity_calls = Arc::new(Mutex::new(Vec::new()));
         let staged_source = StagedProcessSource::new(
             vec![
-                ProcessTopology {
-                    pid: 10,
-                    parent_pid: None,
-                },
-                ProcessTopology {
-                    pid: 20,
-                    parent_pid: Some(10),
-                },
-                ProcessTopology {
-                    pid: 99,
-                    parent_pid: None,
-                },
+                topology(10, None),
+                topology(20, Some(10)),
+                topology(99, None),
             ],
             vec![
                 sample(10, None, 1.0, 10, "ride-tauri"),
@@ -917,6 +804,7 @@ mod tests {
             ],
             Arc::clone(&identity_calls),
         );
+        let sample_calls = Arc::clone(&staged_source.sample_calls);
         let source = Mutex::new(SamplerState::new(staged_source));
 
         let snapshot = snapshot_from_source(&source, 10, Some(99)).expect("snapshot");
@@ -924,6 +812,10 @@ mod tests {
         assert_eq!(
             identity_calls.lock().expect("identity calls mutex").clone(),
             vec![vec![10, 20]]
+        );
+        assert_eq!(
+            sample_calls.lock().expect("sample calls mutex").as_slice(),
+            &[10, 20]
         );
         assert_eq!(snapshot.total.process_count, 2);
         assert_eq!(snapshot.total.memory_bytes, 30);
