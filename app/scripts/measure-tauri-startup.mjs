@@ -3661,6 +3661,11 @@ export async function runMeasurementCampaign(
   if (effectiveModes.size !== 1) {
     throw new Error('measurement campaign reported mixed effective startup modes');
   }
+  const startupReportVersions = new Set(rawRuns.map(run => run.startupReport.version));
+  if (startupReportVersions.size !== 1) {
+    throw new Error('measurement campaign reported mixed startup report versions');
+  }
+  const [startupReportVersion] = startupReportVersions;
   const [startupMode] = effectiveModes;
   if (!STARTUP_MODES.has(startupMode)) {
     throw new Error(`measurement campaign reported unsupported startup mode ${startupMode}`);
@@ -3668,7 +3673,7 @@ export async function runMeasurementCampaign(
   const overlapRuns = startupMode === 'rust-gateway'
     ? rawRuns.map(run => frontendBackendOverlapMs(run.startupReport.milestones))
     : null;
-  const rustPhaseNames = rawRuns[0].startupReport.version === 3
+  const rustPhaseNames = startupReportVersion === 3
     ? Object.keys(RUST_PHASE_PREDECESSORS[startupMode])
     : null;
 

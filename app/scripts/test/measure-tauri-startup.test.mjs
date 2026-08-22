@@ -5762,6 +5762,39 @@ test('campaign summary includes a median for every v3 Rust startup phase', async
   }
 });
 
+test('campaign rejects mixed startup report versions regardless of run order', async () => {
+  for (const versions of [[2, 3], [3, 2]]) {
+    const root = temporaryDirectory(`campaign-mixed-report-versions-${versions.join('-')}`);
+    const executable = path.join(root, 'R-IDE');
+    const output = path.join(root, 'startup-metrics.json');
+    touch(executable);
+    let run = 0;
+    try {
+      await assert.rejects(
+        runMeasurementCampaign({
+          executable,
+          output,
+          runs: versions.length,
+          idleMs: 0,
+          timeoutMs: 100,
+          pollMs: 1,
+        }, campaignDependencies({
+          measure: async () => ({
+            startupReport: versions[run++] === 3
+              ? startupReportV3(finalMilestones)
+              : startupReport(finalMilestones),
+            metrics: campaignMetrics(),
+          }),
+        })),
+        /measurement campaign reported mixed startup report versions/i,
+      );
+      assert.equal(fs.existsSync(output), false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
 test('campaign stops on run 2 mode mismatch and preserves failure diagnostics', async () => {
   const root = temporaryDirectory('campaign-mixed-startup-modes');
   const executable = path.join(root, 'R-IDE');
