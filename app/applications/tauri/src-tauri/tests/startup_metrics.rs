@@ -10,7 +10,7 @@
 use ride_tauri::initialize_current_startup_metrics;
 use ride_tauri::startup_metrics::{
     RecordOutcome, StartupMetricError, StartupMetrics, StartupMilestone, StartupMode,
-    StartupReport, StartupReportWriter,
+    StartupReport, StartupReportWriter, StartupRustPhase,
 };
 use serde_json::Value;
 use std::fs;
@@ -148,6 +148,270 @@ impl StartupReportWriter for FailFinalOnceWriter {
 }
 
 #[test]
+fn v3_report_serializes_rust_phases_with_snake_case_keys() {
+    let mut report = StartupReport::new("windows", "x86_64", 42, StartupMode::RustGateway);
+    let initial = serde_json::to_value(&report).expect("serialize initial report");
+
+    assert_eq!(initial["version"], 3);
+    assert_eq!(initial["rustPhases"], serde_json::json!({}));
+
+    for (phase, duration_ms) in [
+        (StartupRustPhase::RuntimePathsResolved, 1),
+        (StartupRustPhase::GatewayInventoryFinished, 4),
+        (StartupRustPhase::TauriSetupEntered, 2),
+        (StartupRustPhase::BackendSpawnRequested, 5),
+        (StartupRustPhase::WindowBuildStarted, 6),
+        (StartupRustPhase::WindowBuilt, 7),
+        (StartupRustPhase::WindowShown, 8),
+    ] {
+        assert_eq!(
+            report.record_rust_phase(phase, duration_ms),
+            Ok(RecordOutcome::Recorded)
+        );
+    }
+
+    let value = serde_json::to_value(report).expect("serialize completed report");
+    assert_eq!(value["version"], 3);
+    assert_eq!(value["rustPhases"]["runtime_paths_resolved"], 1);
+    assert_eq!(value["rustPhases"]["gateway_inventory_finished"], 4);
+    assert_eq!(value["rustPhases"]["tauri_setup_entered"], 2);
+    assert_eq!(value["rustPhases"]["backend_spawn_requested"], 5);
+    assert_eq!(value["rustPhases"]["window_build_started"], 6);
+    assert_eq!(value["rustPhases"]["window_built"], 7);
+    assert_eq!(value["rustPhases"]["window_shown"], 8);
+    for camel_case_key in [
+        "runtimePathsResolved",
+        "gatewayInventoryFinished",
+        "tauriSetupEntered",
+        "backendSpawnRequested",
+        "windowBuildStarted",
+        "windowBuilt",
+        "windowShown",
+    ] {
+        assert!(value["rustPhases"].get(camel_case_key).is_none());
+    }
+}
+
+#[test]
+fn duplicate_rust_phase_preserves_the_first_timestamp() {
+    let mut report = StartupReport::new("test", "test", 1, StartupMode::RustGateway);
+
+    assert_eq!(
+        report.record_rust_phase(StartupRustPhase::RuntimePathsResolved, 3),
+        Ok(RecordOutcome::Recorded)
+    );
+    assert_eq!(
+        report.record_rust_phase(StartupRustPhase::RuntimePathsResolved, 99),
+        Ok(RecordOutcome::Duplicate)
+    );
+
+    let value = serde_json::to_value(report).expect("serialize report");
+    assert_eq!(value["rustPhases"]["runtime_paths_resolved"], 3);
+}
+
+#[test]
+fn rust_phase_rejects_window_built_without_window_build_started() {
+    let mut report = StartupReport::new("test", "test", 1, StartupMode::RustGateway);
+
+    assert_eq!(
+        report.record_rust_phase(StartupRustPhase::WindowBuilt, 10),
+        Err(StartupMetricError::MissingRustPhasePredecessor {
+            attempted: StartupRustPhase::WindowBuilt,
+            required: StartupRustPhase::WindowBuildStarted,
+        })
+    );
+}
+
+#[test]
+fn rust_phase_rejects_a_timestamp_before_its_predecessor() {
+    let mut report = StartupReport::new("test", "test", 1, StartupMode::RustGateway);
+    report
+        .record_rust_phase(StartupRustPhase::RuntimePathsResolved, 10)
+        .expect("runtime paths");
+
+    assert_eq!(
+        report.record_rust_phase(StartupRustPhase::GatewayInventoryFinished, 9),
+        Err(StartupMetricError::RustPhasePredecessorTimestamp {
+            attempted: StartupRustPhase::GatewayInventoryFinished,
+            predecessor: StartupRustPhase::RuntimePathsResolved,
+            attempted_ms: 9,
+            predecessor_ms: 10,
+        })
+    );
+}
+
+#[test]
+fn rust_phase_backend_request_in_gateway_mode_requires_both_parallel_predecessors() {
+    let mut missing_setup = StartupReport::new("test", "test", 1, StartupMode::RustGateway);
+    missing_setup
+        .record_rust_phase(StartupRustPhase::RuntimePathsResolved, 1)
+        .expect("runtime paths");
+    missing_setup
+        .record_rust_phase(StartupRustPhase::GatewayInventoryFinished, 2)
+        .expect("gateway inventory");
+    assert_eq!(
+        missing_setup.record_rust_phase(StartupRustPhase::BackendSpawnRequested, 3),
+        Err(StartupMetricError::MissingRustPhasePredecessor {
+            attempted: StartupRustPhase::BackendSpawnRequested,
+            required: StartupRustPhase::TauriSetupEntered,
+        })
+    );
+
+    let mut missing_inventory = StartupReport::new("test", "test", 1, StartupMode::RustGateway);
+    missing_inventory
+        .record_rust_phase(StartupRustPhase::RuntimePathsResolved, 1)
+        .expect("runtime paths");
+    missing_inventory
+        .record_rust_phase(StartupRustPhase::TauriSetupEntered, 2)
+        .expect("tauri setup");
+    assert_eq!(
+        missing_inventory.record_rust_phase(StartupRustPhase::BackendSpawnRequested, 3),
+        Err(StartupMetricError::MissingRustPhasePredecessor {
+            attempted: StartupRustPhase::BackendSpawnRequested,
+            required: StartupRustPhase::GatewayInventoryFinished,
+        })
+    );
+}
+
+#[test]
+fn rust_phase_explicit_legacy_rejects_inventory_and_requires_only_setup_for_backend() {
+    let mut report = StartupReport::new("test", "test", 1, StartupMode::LegacyExplicit);
+
+    assert_eq!(
+        report.record_rust_phase(StartupRustPhase::GatewayInventoryFinished, 1),
+        Err(StartupMetricError::RustPhaseNotApplicable {
+            phase: StartupRustPhase::GatewayInventoryFinished,
+            mode: StartupMode::LegacyExplicit,
+        })
+    );
+    assert_eq!(
+        report.record_rust_phase(StartupRustPhase::TauriSetupEntered, 2),
+        Ok(RecordOutcome::Recorded)
+    );
+    assert_eq!(
+        report.record_rust_phase(StartupRustPhase::BackendSpawnRequested, 3),
+        Ok(RecordOutcome::Recorded)
+    );
+}
+
+#[test]
+fn rust_phase_fallback_retains_gateway_inventory_and_continues_the_chain() {
+    let (writes_tx, writes_rx) = mpsc::channel();
+    let metrics = StartupMetrics::with_clock_and_writer(
+        "windows",
+        "x86_64",
+        42,
+        StartupMode::RustGateway,
+        Arc::new(SequenceClock::new(vec![0, 1, 2, 1, 3, 4, 5, 6])),
+        Box::new(CountingWriter { writes: writes_tx }),
+    );
+    metrics
+        .record(StartupMilestone::ProcessStarted)
+        .expect("process start");
+    metrics
+        .record_rust_phase(StartupRustPhase::RuntimePathsResolved)
+        .expect("runtime paths");
+    metrics
+        .record_rust_phase(StartupRustPhase::GatewayInventoryFinished)
+        .expect("gateway inventory");
+    metrics
+        .record_rust_phase(StartupRustPhase::TauriSetupEntered)
+        .expect("tauri setup");
+
+    metrics
+        .select_effective_mode(StartupMode::LegacyFallback)
+        .expect("select fallback");
+    for phase in [
+        StartupRustPhase::BackendSpawnRequested,
+        StartupRustPhase::WindowBuildStarted,
+        StartupRustPhase::WindowBuilt,
+        StartupRustPhase::WindowShown,
+    ] {
+        metrics
+            .record_rust_phase(phase)
+            .expect("continue fallback phase chain");
+    }
+
+    let mut final_snapshot = None;
+    for _ in 0..9 {
+        let snapshot = writes_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("startup snapshot");
+        if snapshot["rustPhases"].get("window_shown").is_some() {
+            final_snapshot = Some(snapshot);
+            break;
+        }
+    }
+    let report = final_snapshot.expect("window shown snapshot");
+    assert_eq!(report["startupMode"], "legacy-fallback");
+    assert_eq!(report["rustPhases"]["gateway_inventory_finished"], 2);
+    assert_eq!(report["rustPhases"]["window_shown"], 6);
+}
+
+#[test]
+fn rust_phase_recording_is_disabled_with_the_rest_of_startup_metrics() {
+    let metrics = StartupMetrics::with_clock(
+        None,
+        "test-platform",
+        "test-arch",
+        77,
+        StartupMode::RustGateway,
+        Arc::new(SequenceClock::new(vec![])),
+    );
+
+    assert_eq!(
+        metrics.record_rust_phase(StartupRustPhase::RuntimePathsResolved),
+        Ok(RecordOutcome::Disabled)
+    );
+}
+
+#[test]
+fn rust_phase_or_warn_is_a_noop_when_startup_metrics_are_disabled() {
+    let metrics = StartupMetrics::with_clock(
+        None,
+        "test-platform",
+        "test-arch",
+        77,
+        StartupMode::RustGateway,
+        Arc::new(SequenceClock::new(vec![])),
+    );
+
+    metrics.record_rust_phase_or_warn(StartupRustPhase::RuntimePathsResolved);
+}
+
+#[test]
+fn rust_phase_writer_receives_one_snapshot_and_none_for_a_duplicate() {
+    let (writes_tx, writes_rx) = mpsc::channel();
+    let metrics = StartupMetrics::with_clock_and_writer(
+        "test-platform",
+        "test-arch",
+        77,
+        StartupMode::RustGateway,
+        Arc::new(SequenceClock::new(vec![12, 99])),
+        Box::new(CountingWriter { writes: writes_tx }),
+    );
+
+    assert_eq!(
+        metrics.record_rust_phase(StartupRustPhase::RuntimePathsResolved),
+        Ok(RecordOutcome::Recorded)
+    );
+    let snapshot = writes_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("phase snapshot");
+    assert_eq!(snapshot["rustPhases"]["runtime_paths_resolved"], 12);
+
+    assert_eq!(
+        metrics.record_rust_phase(StartupRustPhase::RuntimePathsResolved),
+        Ok(RecordOutcome::Duplicate)
+    );
+    assert_eq!(
+        writes_rx.recv_timeout(Duration::from_millis(100)),
+        Err(mpsc::RecvTimeoutError::Timeout),
+        "a duplicate phase must not enqueue another snapshot"
+    );
+}
+
+#[test]
 fn gateway_report_accepts_parallel_branches_without_rewriting_timestamps() {
     let mut report = StartupReport::new("windows", "x86_64", 42, StartupMode::RustGateway);
     assert_eq!(
@@ -180,7 +444,7 @@ fn gateway_report_accepts_parallel_branches_without_rewriting_timestamps() {
     );
 
     let value = serde_json::to_value(report).expect("serialize report");
-    assert_eq!(value["version"], 2);
+    assert_eq!(value["version"], 3);
     assert_eq!(value["startupMode"], "rust-gateway");
     assert_eq!(value["milestones"]["backend_spawned"], 3);
     assert_eq!(value["milestones"]["frontend_bundle_loaded"], 40);
@@ -468,7 +732,7 @@ fn legacy_report_records_milestones_in_its_dependency_order() {
 
     let value = serde_json::to_value(&report).expect("serialize report");
     assert_eq!(value["schema"], "ride.startup-report");
-    assert_eq!(value["version"], 2);
+    assert_eq!(value["version"], 3);
     assert_eq!(value["startupMode"], "legacy-explicit");
     assert_eq!(value["platform"], "test-platform");
     assert_eq!(value["arch"], "test-arch");
