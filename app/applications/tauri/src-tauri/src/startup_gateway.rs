@@ -1808,7 +1808,7 @@ impl StaticGatewayService {
     ) -> Response<GatewayBody> {
         let body = match self.read_mutating_control_json(request).await {
             Ok(body) => body,
-            Err(response) => return response,
+            Err(response) => return *response,
         };
         if body != serde_json::json!({ "milestone": "frontend_bundle_loaded" }) {
             return control_error(StatusCode::BAD_REQUEST, b"invalid_milestone");
@@ -1824,7 +1824,7 @@ impl StaticGatewayService {
     ) -> Response<GatewayBody> {
         let body = match self.read_mutating_control_json(request).await {
             Ok(body) => body,
-            Err(response) => return response,
+            Err(response) => return *response,
         };
         let Some(generation) = body
             .as_object()
@@ -1853,64 +1853,76 @@ impl StaticGatewayService {
     async fn read_mutating_control_json(
         &self,
         request: Request<hyper::body::Incoming>,
-    ) -> Result<serde_json::Value, Response<GatewayBody>> {
+    ) -> Result<serde_json::Value, Box<Response<GatewayBody>>> {
         if request.uri().query().is_some() {
-            return Err(not_found());
+            return Err(Box::new(not_found()));
         }
         if request.method() != Method::POST {
-            return Err(control_error(
+            return Err(Box::new(control_error(
                 StatusCode::METHOD_NOT_ALLOWED,
                 b"method_not_allowed",
-            ));
+            )));
         }
         if !single_header_equals(request.headers(), ORIGIN, self.public_origin.as_bytes()) {
-            return Err(not_found());
+            return Err(Box::new(not_found()));
         }
         if !single_header_equals(request.headers(), CONTENT_TYPE, b"application/json") {
-            return Err(control_error(
+            return Err(Box::new(control_error(
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
                 b"unsupported_media_type",
-            ));
+            )));
         }
         if request.headers().contains_key(TRANSFER_ENCODING) {
-            return Err(control_error(
+            return Err(Box::new(control_error(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 b"body_too_large",
-            ));
+            )));
         }
         let mut lengths = request.headers().get_all(CONTENT_LENGTH).iter();
         let Some(length) = lengths.next() else {
-            return Err(control_error(
+            return Err(Box::new(control_error(
                 StatusCode::LENGTH_REQUIRED,
                 b"length_required",
-            ));
+            )));
         };
         if lengths.next().is_some() {
-            return Err(control_error(StatusCode::BAD_REQUEST, b"invalid_length"));
+            return Err(Box::new(control_error(
+                StatusCode::BAD_REQUEST,
+                b"invalid_length",
+            )));
         }
         let Some(length) = length
             .to_str()
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
         else {
-            return Err(control_error(StatusCode::BAD_REQUEST, b"invalid_length"));
+            return Err(Box::new(control_error(
+                StatusCode::BAD_REQUEST,
+                b"invalid_length",
+            )));
         };
         if length > CONTROL_BODY_LIMIT {
-            return Err(control_error(
+            return Err(Box::new(control_error(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 b"body_too_large",
-            ));
+            )));
         }
         let collected = request.into_body().collect().await;
         let Ok(collected) = collected else {
-            return Err(control_error(StatusCode::BAD_REQUEST, b"invalid_body"));
+            return Err(Box::new(control_error(
+                StatusCode::BAD_REQUEST,
+                b"invalid_body",
+            )));
         };
         let body = collected.to_bytes();
         if body.len() != length || body.len() > CONTROL_BODY_LIMIT {
-            return Err(control_error(StatusCode::BAD_REQUEST, b"invalid_length"));
+            return Err(Box::new(control_error(
+                StatusCode::BAD_REQUEST,
+                b"invalid_length",
+            )));
         }
         serde_json::from_slice(&body)
-            .map_err(|_| control_error(StatusCode::BAD_REQUEST, b"invalid_json"))
+            .map_err(|_| Box::new(control_error(StatusCode::BAD_REQUEST, b"invalid_json")))
     }
 
     fn has_valid_request_envelope(&self, request: &Request<hyper::body::Incoming>) -> bool {

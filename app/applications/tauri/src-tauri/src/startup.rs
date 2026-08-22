@@ -1067,12 +1067,6 @@ impl BackendProcessTree {
         self.platform.active_process_count()
     }
 
-    #[cfg(unix)]
-    pub(crate) fn confirm_only_root_remains(&self, bound: Duration) -> Result<(), String> {
-        self.platform
-            .confirm_only_root_remains(self.root_pid, bound)
-    }
-
     #[allow(dead_code)]
     pub(crate) fn kill_root(&self) -> Result<(), String> {
         self.platform.kill_root(self.root_pid)
@@ -1656,33 +1650,6 @@ impl PlatformBackendProcessTree {
                 {
                     return Ok(());
                 }
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
-
-    fn confirm_only_root_remains(&self, root_pid: u32, bound: Duration) -> Result<(), String> {
-        if bound.is_zero() {
-            return Err("Backend process-group confirmation bound must be nonzero".to_string());
-        }
-        let deadline = std::time::Instant::now() + bound;
-        loop {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                return Err(format!(
-                    "Backend process scope retained descendants after {}ms",
-                    bound.as_millis()
-                ));
-            }
-            let members = self.group_members(remaining)?;
-            if members.iter().all(|pid| *pid == root_pid) {
-                return Ok(());
-            }
-            if std::time::Instant::now() >= deadline {
-                return Err(format!(
-                    "Backend process scope retained descendants after {}ms",
-                    bound.as_millis()
-                ));
             }
             std::thread::sleep(Duration::from_millis(20));
         }

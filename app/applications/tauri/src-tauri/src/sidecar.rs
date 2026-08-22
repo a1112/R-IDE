@@ -694,6 +694,7 @@ fn clear_backend_tree(app_handle: &AppHandle, tree: &BackendProcessTree) -> bool
     stopping
 }
 
+#[cfg(windows)]
 fn mark_backend_root_exited(app_handle: &AppHandle, pid: u32) -> bool {
     let Some(state) = app_handle.try_state::<crate::AppState>() else {
         return false;
@@ -901,6 +902,7 @@ fn initialize_windows_backend_pty_input(writer: &mut dyn std::io::Write) -> Resu
         .map_err(|error| format!("Failed to initialize backend PTY input: {error}"))
 }
 
+#[cfg(any(windows, test))]
 fn wait_with_backend_pty_lifetime<G, T>(guard: G, wait: impl FnOnce() -> T) -> T {
     let result = wait();
     drop(guard);
@@ -950,6 +952,7 @@ fn reap_portable_child_bounded_ref(
     Err("PTY backend did not exit after force-kill".to_string())
 }
 
+#[cfg(windows)]
 async fn kill_portable_child_async(
     mut killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
 ) -> Result<(), String> {
@@ -959,8 +962,10 @@ async fn kill_portable_child_async(
         .map_err(|error| format!("Failed to kill PTY backend: {error}"))
 }
 
+#[cfg(windows)]
 type SharedPtyExitReceiver = Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<String>>>;
 
+#[cfg(windows)]
 async fn run_pty_cleanup_action_bounded(
     action: impl Future<Output = Result<(), String>>,
     timeout_error: &'static str,
@@ -970,6 +975,7 @@ async fn run_pty_cleanup_action_bounded(
         .unwrap_or_else(|_| Err(timeout_error.to_string()))
 }
 
+#[cfg(windows)]
 async fn wait_for_pty_exit_bounded(exit_rx: SharedPtyExitReceiver) -> Result<(), String> {
     let mut exit_rx = exit_rx.lock().await;
     match tokio::time::timeout(Duration::from_secs(5), exit_rx.recv()).await {
@@ -979,6 +985,7 @@ async fn wait_for_pty_exit_bounded(exit_rx: SharedPtyExitReceiver) -> Result<(),
     }
 }
 
+#[cfg(any(windows, test))]
 async fn clear_retained_pty_ownership_after_exit<Exit, Clear>(exit: Exit, clear: Clear) -> bool
 where
     Exit: Future<Output = Option<String>>,
@@ -992,6 +999,7 @@ where
     }
 }
 
+#[cfg(any(windows, test))]
 fn pty_cleanup_status(result: &Result<(), String>) -> String {
     const MAX_CHARS: usize = 192;
     result
@@ -1031,6 +1039,7 @@ where
     finish_owned_tree_cleanup(Ok(()), root_reap().await, release)
 }
 
+#[cfg(any(windows, test))]
 async fn finish_pty_readiness_publication<
     Kill,
     KillFuture,
