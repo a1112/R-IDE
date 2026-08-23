@@ -1,0 +1,14 @@
+{
+    "extends": "./tsconfig.json",
+    "compilerOptions": {
+        "composite": false,
+        "rootDir": ".",
+        "outDir": "test/dist",
+        "declaration": false,
+        "declarationMap": false
+    },
+    "include": [
+        "src/common/ride-codex-protocol.ts",
+        "test/**/*.ts"
+    ]
+}
