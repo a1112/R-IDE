@@ -74,6 +74,34 @@ const MILESTONE_PREDECESSORS = Object.freeze({
     plugins_ready: ['plugins_started'],
   }),
 });
+const RUST_PHASE_PREDECESSORS = Object.freeze({
+  'rust-gateway': Object.freeze({
+    runtime_paths_resolved: [],
+    gateway_inventory_finished: ['runtime_paths_resolved'],
+    tauri_setup_entered: [],
+    backend_spawn_requested: ['tauri_setup_entered', 'gateway_inventory_finished'],
+    window_build_started: ['backend_spawn_requested'],
+    window_built: ['window_build_started'],
+    window_shown: ['window_built'],
+  }),
+  'legacy-explicit': Object.freeze({
+    runtime_paths_resolved: [],
+    tauri_setup_entered: [],
+    backend_spawn_requested: ['tauri_setup_entered'],
+    window_build_started: ['backend_spawn_requested'],
+    window_built: ['window_build_started'],
+    window_shown: ['window_built'],
+  }),
+  'legacy-fallback': Object.freeze({
+    runtime_paths_resolved: [],
+    gateway_inventory_finished: ['runtime_paths_resolved'],
+    tauri_setup_entered: [],
+    backend_spawn_requested: ['tauri_setup_entered', 'gateway_inventory_finished'],
+    window_build_started: ['backend_spawn_requested'],
+    window_built: ['window_build_started'],
+    window_shown: ['window_built'],
+  }),
+});
 const STARTUP_MODES = new Set(Object.keys(MILESTONE_PREDECESSORS));
 const NODE_TO_REPORT_PLATFORM = { win32: 'windows', darwin: 'macos', linux: 'linux' };
 const NODE_TO_REPORT_ARCH = { x64: 'x86_64', arm64: 'aarch64' };
@@ -223,13 +251,23 @@ function validateRoles(roles, label, expectedCount, expectedRss) {
 }
 
 function validateStartupReport(report, measurement, label) {
-  const reportKeys = report?.version === 2
-    ? ['schema', 'version', 'platform', 'arch', 'pid', 'startupMode', 'milestones']
-    : ['schema', 'version', 'platform', 'arch', 'pid', 'milestones'];
-  exactKeys(report, reportKeys, `${label} startup report`);
-  if (report.schema !== 'ride.startup-report' || ![1, 2].includes(report.version)) {
-    fail(`${label} startup report must use ride.startup-report@1 or @2`);
+  plainObject(report, `${label} startup report`);
+  if (report.schema !== 'ride.startup-report' || ![1, 2, 3].includes(report.version)) {
+    fail(`${label} startup report must use ride.startup-report@1, @2, or @3`);
   }
+  const reportKeys = report.version === 1
+    ? ['schema', 'version', 'platform', 'arch', 'pid', 'milestones']
+    : [
+      'schema',
+      'version',
+      'platform',
+      'arch',
+      'pid',
+      'startupMode',
+      'milestones',
+      ...(report.version === 3 ? ['rustPhases'] : []),
+    ];
+  exactKeys(report, reportKeys, `${label} startup report`);
   if (report.platform !== NODE_TO_REPORT_PLATFORM[measurement.platform]
       || report.arch !== NODE_TO_REPORT_ARCH[measurement.arch]) {
     fail(`${label} startup report platform or architecture is incompatible`);
@@ -265,6 +303,29 @@ function validateStartupReport(report, measurement, label) {
         fail(
           `${label} startup milestone ${milestone} timestamp precedes predecessor ${predecessor}`,
         );
+      }
+    }
+  }
+  if (report.version === 3) {
+    const rustPhasePredecessors = RUST_PHASE_PREDECESSORS[report.startupMode];
+    exactKeys(
+      report.rustPhases,
+      Object.keys(rustPhasePredecessors),
+      `${label} Rust phases`,
+    );
+    for (const rustPhase of Object.keys(rustPhasePredecessors)) {
+      nonNegativeInteger(report.rustPhases[rustPhase], `${label} Rust phase ${rustPhase}`);
+    }
+    for (const [rustPhase, required] of Object.entries(rustPhasePredecessors)) {
+      for (const predecessor of required) {
+        if (!Object.hasOwn(report.rustPhases, predecessor)) {
+          fail(`${label} Rust phase ${rustPhase} requires predecessor ${predecessor}`);
+        }
+        if (report.rustPhases[rustPhase] < report.rustPhases[predecessor]) {
+          fail(
+            `${label} Rust phase ${rustPhase} timestamp precedes predecessor ${predecessor}`,
+          );
+        }
       }
     }
   }
@@ -348,11 +409,19 @@ function validateMeasurementRun(run, measurement, measurementLabel, index) {
 
 function validateReportedMedians(measurement, label) {
   const isV4 = measurement.version === 4;
+  const rustPhaseReportCount = measurement.runs.filter(
+    run => run.startupReport.version === 3,
+  ).length;
+  if (rustPhaseReportCount !== 0 && rustPhaseReportCount !== measurement.runs.length) {
+    fail(`${label} must not mix startup report versions with and without Rust phases`);
+  }
+  const hasRustPhases = rustPhaseReportCount === measurement.runs.length;
   exactKeys(measurement.median, [
     'targetFileOpenedMs',
     ...(isV4 ? ['nativeWindowVisibleMs'] : []),
     'rssBytes',
     'processCount',
+    ...(hasRustPhases ? ['rustPhases'] : []),
     'roles',
   ], `${label} median`);
   const expected = {
@@ -371,6 +440,20 @@ function validateReportedMedians(measurement, label) {
     safeNumber(measurement.median[field], `${label} median ${field}`);
     if (measurement.median[field] !== value) {
       fail(`${label} reported median ${field} does not match its runs`);
+    }
+  }
+  if (hasRustPhases) {
+    const rustPhaseNames = Object.keys(RUST_PHASE_PREDECESSORS[measurement.startupMode]);
+    exactKeys(measurement.median.rustPhases, rustPhaseNames, `${label} median Rust phases`);
+    expected.rustPhases = Object.fromEntries(rustPhaseNames.map(rustPhase => [
+      rustPhase,
+      median(measurement.runs.map(run => run.startupReport.rustPhases[rustPhase])),
+    ]));
+    for (const [rustPhase, value] of Object.entries(expected.rustPhases)) {
+      safeNumber(measurement.median.rustPhases[rustPhase], `${label} median ${rustPhase}`);
+      if (measurement.median.rustPhases[rustPhase] !== value) {
+        fail(`${label} reported median Rust phase ${rustPhase} does not match its runs`);
+      }
     }
   }
   exactKeys(measurement.median.roles, ROLES, `${label} median roles`);

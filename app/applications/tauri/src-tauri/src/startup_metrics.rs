@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 pub const STARTUP_REPORT_ENV: &str = "RIDE_STARTUP_REPORT";
 pub const STARTUP_REPORT_SCHEMA: &str = "ride.startup-report";
-pub const STARTUP_REPORT_VERSION: u32 = 2;
+pub const STARTUP_REPORT_VERSION: u32 = 3;
 pub const STARTUP_MODE_ENV: &str = "RIDE_STARTUP_MODE";
 const UNKNOWN_STARTUP_MODE_WARNING: &str =
     "Unsupported RIDE_STARTUP_MODE; using explicit legacy startup mode";
@@ -69,6 +69,16 @@ impl StartupMode {
         }
     }
 
+    pub const fn rust_phase_predecessors(
+        self,
+        phase: StartupRustPhase,
+    ) -> &'static [StartupRustPhase] {
+        match self {
+            Self::RustGateway | Self::LegacyFallback => phase.gateway_predecessors(),
+            Self::LegacyExplicit => phase.explicit_legacy_predecessors(),
+        }
+    }
+
     const fn is_applicable(self, milestone: StartupMilestone) -> bool {
         match self {
             Self::RustGateway => true,
@@ -79,6 +89,55 @@ impl StartupMode {
                     | StartupMilestone::FrontendBundleLoaded
                     | StartupMilestone::RpcConnected
             ),
+        }
+    }
+
+    const fn is_rust_phase_applicable(self, phase: StartupRustPhase) -> bool {
+        !matches!(
+            (self, phase),
+            (
+                Self::LegacyExplicit,
+                StartupRustPhase::GatewayInventoryFinished
+            )
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupRustPhase {
+    RuntimePathsResolved,
+    GatewayInventoryFinished,
+    TauriSetupEntered,
+    BackendSpawnRequested,
+    WindowBuildStarted,
+    WindowBuilt,
+    WindowShown,
+}
+
+impl StartupRustPhase {
+    const fn gateway_predecessors(self) -> &'static [Self] {
+        match self {
+            Self::RuntimePathsResolved | Self::TauriSetupEntered => &[],
+            Self::GatewayInventoryFinished => &[Self::RuntimePathsResolved],
+            Self::BackendSpawnRequested => {
+                &[Self::TauriSetupEntered, Self::GatewayInventoryFinished]
+            }
+            Self::WindowBuildStarted => &[Self::BackendSpawnRequested],
+            Self::WindowBuilt => &[Self::WindowBuildStarted],
+            Self::WindowShown => &[Self::WindowBuilt],
+        }
+    }
+
+    const fn explicit_legacy_predecessors(self) -> &'static [Self] {
+        match self {
+            Self::RuntimePathsResolved
+            | Self::GatewayInventoryFinished
+            | Self::TauriSetupEntered => &[],
+            Self::BackendSpawnRequested => &[Self::TauriSetupEntered],
+            Self::WindowBuildStarted => &[Self::BackendSpawnRequested],
+            Self::WindowBuilt => &[Self::WindowBuildStarted],
+            Self::WindowShown => &[Self::WindowBuilt],
         }
     }
 }
@@ -223,6 +282,51 @@ impl StartupMilestoneDurations {
     }
 }
 
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct StartupRustPhaseDurations {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runtime_paths_resolved: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gateway_inventory_finished: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tauri_setup_entered: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backend_spawn_requested: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    window_build_started: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    window_built: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    window_shown: Option<u64>,
+}
+
+impl StartupRustPhaseDurations {
+    fn get(&self, phase: StartupRustPhase) -> Option<u64> {
+        match phase {
+            StartupRustPhase::RuntimePathsResolved => self.runtime_paths_resolved,
+            StartupRustPhase::GatewayInventoryFinished => self.gateway_inventory_finished,
+            StartupRustPhase::TauriSetupEntered => self.tauri_setup_entered,
+            StartupRustPhase::BackendSpawnRequested => self.backend_spawn_requested,
+            StartupRustPhase::WindowBuildStarted => self.window_build_started,
+            StartupRustPhase::WindowBuilt => self.window_built,
+            StartupRustPhase::WindowShown => self.window_shown,
+        }
+    }
+
+    fn set(&mut self, phase: StartupRustPhase, duration_ms: u64) {
+        let slot = match phase {
+            StartupRustPhase::RuntimePathsResolved => &mut self.runtime_paths_resolved,
+            StartupRustPhase::GatewayInventoryFinished => &mut self.gateway_inventory_finished,
+            StartupRustPhase::TauriSetupEntered => &mut self.tauri_setup_entered,
+            StartupRustPhase::BackendSpawnRequested => &mut self.backend_spawn_requested,
+            StartupRustPhase::WindowBuildStarted => &mut self.window_build_started,
+            StartupRustPhase::WindowBuilt => &mut self.window_built,
+            StartupRustPhase::WindowShown => &mut self.window_shown,
+        };
+        *slot = Some(duration_ms);
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct StartupReport {
     schema: &'static str,
@@ -233,6 +337,8 @@ pub struct StartupReport {
     #[serde(rename = "startupMode")]
     startup_mode: StartupMode,
     milestones: StartupMilestoneDurations,
+    #[serde(rename = "rustPhases")]
+    rust_phases: StartupRustPhaseDurations,
 }
 
 impl StartupReport {
@@ -250,6 +356,7 @@ impl StartupReport {
             pid,
             startup_mode,
             milestones: StartupMilestoneDurations::default(),
+            rust_phases: StartupRustPhaseDurations::default(),
         }
     }
 
@@ -287,6 +394,43 @@ impl StartupReport {
         }
 
         self.milestones.set(milestone, duration_ms);
+        Ok(RecordOutcome::Recorded)
+    }
+
+    pub fn record_rust_phase(
+        &mut self,
+        phase: StartupRustPhase,
+        duration_ms: u64,
+    ) -> Result<RecordOutcome, StartupMetricError> {
+        if self.rust_phases.get(phase).is_some() {
+            return Ok(RecordOutcome::Duplicate);
+        }
+
+        if !self.startup_mode.is_rust_phase_applicable(phase) {
+            return Err(StartupMetricError::RustPhaseNotApplicable {
+                phase,
+                mode: self.startup_mode,
+            });
+        }
+
+        for predecessor in self.startup_mode.rust_phase_predecessors(phase) {
+            let Some(predecessor_ms) = self.rust_phases.get(*predecessor) else {
+                return Err(StartupMetricError::MissingRustPhasePredecessor {
+                    attempted: phase,
+                    required: *predecessor,
+                });
+            };
+            if duration_ms < predecessor_ms {
+                return Err(StartupMetricError::RustPhasePredecessorTimestamp {
+                    attempted: phase,
+                    predecessor: *predecessor,
+                    attempted_ms: duration_ms,
+                    predecessor_ms,
+                });
+            }
+        }
+
+        self.rust_phases.set(phase, duration_ms);
         Ok(RecordOutcome::Recorded)
     }
 
@@ -338,6 +482,20 @@ pub enum StartupMetricError {
         milestone: StartupMilestone,
         mode: StartupMode,
     },
+    MissingRustPhasePredecessor {
+        attempted: StartupRustPhase,
+        required: StartupRustPhase,
+    },
+    RustPhasePredecessorTimestamp {
+        attempted: StartupRustPhase,
+        predecessor: StartupRustPhase,
+        attempted_ms: u64,
+        predecessor_ms: u64,
+    },
+    RustPhaseNotApplicable {
+        phase: StartupRustPhase,
+        mode: StartupMode,
+    },
     InvalidModeTransition {
         current: StartupMode,
         requested: StartupMode,
@@ -373,6 +531,26 @@ impl fmt::Display for StartupMetricError {
             Self::NotApplicable { milestone, mode } => write!(
                 formatter,
                 "startup milestone {milestone:?} is not applicable in {mode:?} mode"
+            ),
+            Self::MissingRustPhasePredecessor {
+                attempted,
+                required,
+            } => write!(
+                formatter,
+                "startup Rust phase {attempted:?} requires {required:?}"
+            ),
+            Self::RustPhasePredecessorTimestamp {
+                attempted,
+                predecessor,
+                attempted_ms,
+                predecessor_ms,
+            } => write!(
+                formatter,
+                "startup Rust phase {attempted:?} at {attempted_ms}ms precedes predecessor {predecessor:?} at {predecessor_ms}ms"
+            ),
+            Self::RustPhaseNotApplicable { phase, mode } => write!(
+                formatter,
+                "startup Rust phase {phase:?} is not applicable in {mode:?} mode"
             ),
             Self::InvalidModeTransition { current, requested } => write!(
                 formatter,
@@ -418,6 +596,24 @@ impl ElapsedClock for MonotonicClock {
 struct StartupRecorderState {
     report: StartupReport,
     clock: Arc<dyn ElapsedClock>,
+}
+
+impl StartupRecorderState {
+    fn update_report<T>(
+        &mut self,
+        snapshots: &mpsc::Sender<StartupReport>,
+        update: impl FnOnce(&mut StartupReport) -> Result<(T, bool), StartupMetricError>,
+    ) -> Result<T, StartupMetricError> {
+        let mut candidate = self.report.clone();
+        let (result, changed) = update(&mut candidate)?;
+        if changed {
+            snapshots
+                .send(candidate.clone())
+                .map_err(|error| StartupMetricError::Write(error.to_string()))?;
+            self.report = candidate;
+        }
+        Ok(result)
+    }
 }
 
 #[derive(Debug)]
@@ -503,24 +699,33 @@ impl StartupMetrics {
         let Some(recorder) = &self.recorder else {
             return Ok(RecordOutcome::Disabled);
         };
-        let outcome = {
-            let mut state = recorder
-                .state
-                .lock()
-                .map_err(|_| StartupMetricError::RecorderPoisoned)?;
-            let elapsed_ms = state.clock.elapsed_ms();
-            let outcome = state.report.record(milestone, elapsed_ms)?;
-            if outcome == RecordOutcome::Recorded {
-                // The unbounded send cannot wait for disk I/O. Keeping it in this
-                // critical section preserves mutation order for concurrent callers.
-                recorder
-                    .snapshots
-                    .send(state.report.clone())
-                    .map_err(|error| StartupMetricError::Write(error.to_string()))?;
-            }
-            outcome
+        let mut state = recorder
+            .state
+            .lock()
+            .map_err(|_| StartupMetricError::RecorderPoisoned)?;
+        let elapsed_ms = state.clock.elapsed_ms();
+        state.update_report(&recorder.snapshots, |report| {
+            let outcome = report.record(milestone, elapsed_ms)?;
+            Ok((outcome, outcome == RecordOutcome::Recorded))
+        })
+    }
+
+    pub fn record_rust_phase(
+        &self,
+        phase: StartupRustPhase,
+    ) -> Result<RecordOutcome, StartupMetricError> {
+        let Some(recorder) = &self.recorder else {
+            return Ok(RecordOutcome::Disabled);
         };
-        Ok(outcome)
+        let mut state = recorder
+            .state
+            .lock()
+            .map_err(|_| StartupMetricError::RecorderPoisoned)?;
+        let elapsed_ms = state.clock.elapsed_ms();
+        state.update_report(&recorder.snapshots, |report| {
+            let outcome = report.record_rust_phase(phase, elapsed_ms)?;
+            Ok((outcome, outcome == RecordOutcome::Recorded))
+        })
     }
 
     pub fn select_effective_mode(
@@ -534,13 +739,10 @@ impl StartupMetrics {
             .state
             .lock()
             .map_err(|_| StartupMetricError::RecorderPoisoned)?;
-        if state.report.select_effective_mode(requested_mode)? {
-            recorder
-                .snapshots
-                .send(state.report.clone())
-                .map_err(|error| StartupMetricError::Write(error.to_string()))?;
-        }
-        Ok(())
+        state.update_report(&recorder.snapshots, |report| {
+            let changed = report.select_effective_mode(requested_mode)?;
+            Ok(((), changed))
+        })
     }
 
     pub fn record_backend_spawned_before_window(
@@ -558,6 +760,12 @@ impl StartupMetrics {
     pub fn record_or_warn(&self, milestone: StartupMilestone) {
         if let Err(error) = self.record(milestone) {
             log::warn!("Failed to record startup milestone {milestone:?}: {error}");
+        }
+    }
+
+    pub fn record_rust_phase_or_warn(&self, phase: StartupRustPhase) {
+        if let Err(error) = self.record_rust_phase(phase) {
+            log::warn!("Failed to record startup Rust phase {phase:?}: {error}");
         }
     }
 }
@@ -684,4 +892,144 @@ fn sync_parent(parent: &Path) -> io::Result<()> {
 #[cfg(not(unix))]
 fn sync_parent(_parent: &Path) -> io::Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+
+    #[derive(Debug)]
+    struct FixedClock(u64);
+
+    impl ElapsedClock for FixedClock {
+        fn elapsed_ms(&self) -> u64 {
+            self.0
+        }
+    }
+
+    fn metrics_with_sender(
+        report: StartupReport,
+        snapshots: mpsc::Sender<StartupReport>,
+    ) -> StartupMetrics {
+        StartupMetrics {
+            recorder: Some(Arc::new(StartupRecorder {
+                state: Mutex::new(StartupRecorderState {
+                    report,
+                    clock: Arc::new(FixedClock(7)),
+                }),
+                snapshots,
+            })),
+        }
+    }
+
+    fn replace_snapshot_sender(
+        metrics: &mut StartupMetrics,
+        snapshots: mpsc::Sender<StartupReport>,
+    ) {
+        Arc::get_mut(metrics.recorder.as_mut().expect("enabled recorder"))
+            .expect("test owns the only recorder reference")
+            .snapshots = snapshots;
+    }
+
+    fn current_report(metrics: &StartupMetrics) -> Value {
+        let recorder = metrics.recorder.as_ref().expect("enabled recorder");
+        let state = recorder.state.lock().expect("recorder state");
+        serde_json::to_value(&state.report).expect("serialize current report")
+    }
+
+    #[test]
+    fn rust_phase_enqueue_failure_does_not_commit_and_retry_records() {
+        let (failed_sender, failed_receiver) = mpsc::channel();
+        drop(failed_receiver);
+        let mut metrics = metrics_with_sender(
+            StartupReport::new("test", "test", 1, StartupMode::RustGateway),
+            failed_sender,
+        );
+
+        assert!(matches!(
+            metrics.record_rust_phase(StartupRustPhase::RuntimePathsResolved),
+            Err(StartupMetricError::Write(_))
+        ));
+        assert_eq!(
+            current_report(&metrics)["rustPhases"],
+            serde_json::json!({})
+        );
+
+        let (recovered_sender, recovered_receiver) = mpsc::channel();
+        replace_snapshot_sender(&mut metrics, recovered_sender);
+        assert_eq!(
+            metrics.record_rust_phase(StartupRustPhase::RuntimePathsResolved),
+            Ok(RecordOutcome::Recorded)
+        );
+        let snapshot = recovered_receiver.recv().expect("retried phase snapshot");
+        assert_eq!(
+            serde_json::to_value(snapshot).expect("serialize phase snapshot")["rustPhases"]
+                ["runtime_paths_resolved"],
+            7
+        );
+    }
+
+    #[test]
+    fn milestone_enqueue_failure_does_not_commit_and_retry_records() {
+        let (failed_sender, failed_receiver) = mpsc::channel();
+        drop(failed_receiver);
+        let mut metrics = metrics_with_sender(
+            StartupReport::new("test", "test", 1, StartupMode::RustGateway),
+            failed_sender,
+        );
+
+        assert!(matches!(
+            metrics.record(StartupMilestone::ProcessStarted),
+            Err(StartupMetricError::Write(_))
+        ));
+        assert_eq!(
+            current_report(&metrics)["milestones"],
+            serde_json::json!({})
+        );
+
+        let (recovered_sender, recovered_receiver) = mpsc::channel();
+        replace_snapshot_sender(&mut metrics, recovered_sender);
+        assert_eq!(
+            metrics.record(StartupMilestone::ProcessStarted),
+            Ok(RecordOutcome::Recorded)
+        );
+        let snapshot = recovered_receiver
+            .recv()
+            .expect("retried milestone snapshot");
+        assert_eq!(
+            serde_json::to_value(snapshot).expect("serialize milestone snapshot")["milestones"]
+                ["process_started"],
+            7
+        );
+    }
+
+    #[test]
+    fn mode_enqueue_failure_does_not_commit_and_retry_transitions() {
+        let mut report = StartupReport::new("test", "test", 1, StartupMode::RustGateway);
+        report
+            .record(StartupMilestone::ProcessStarted, 0)
+            .expect("process start");
+        let (failed_sender, failed_receiver) = mpsc::channel();
+        drop(failed_receiver);
+        let mut metrics = metrics_with_sender(report, failed_sender);
+
+        assert!(matches!(
+            metrics.select_effective_mode(StartupMode::LegacyFallback),
+            Err(StartupMetricError::Write(_))
+        ));
+        assert_eq!(current_report(&metrics)["startupMode"], "rust-gateway");
+
+        let (recovered_sender, recovered_receiver) = mpsc::channel();
+        replace_snapshot_sender(&mut metrics, recovered_sender);
+        assert_eq!(
+            metrics.select_effective_mode(StartupMode::LegacyFallback),
+            Ok(())
+        );
+        let snapshot = recovered_receiver.recv().expect("retried mode snapshot");
+        assert_eq!(
+            serde_json::to_value(snapshot).expect("serialize mode snapshot")["startupMode"],
+            "legacy-fallback"
+        );
+    }
 }

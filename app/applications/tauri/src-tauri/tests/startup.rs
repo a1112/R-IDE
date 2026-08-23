@@ -107,6 +107,36 @@ fn process_scope_can_resolve_numeric_sessions_without_parsing_macos_sess_pointer
 }
 
 #[test]
+fn unix_cleanup_enumerators_do_not_join_the_application_process_group() {
+    let startup_source = include_str!("../src/startup.rs");
+    let enumerator = startup_source
+        .split_once("fn enumerate_scope_members(")
+        .expect("backend scope enumerator")
+        .1
+        .split_once("fn scope_members_bounded(")
+        .expect("bounded backend scope wrapper")
+        .0;
+
+    assert!(
+        enumerator.contains("process_group(0)"),
+        "the ps helper must run in a separate process group"
+    );
+
+    let sidecar_source = include_str!("../src/sidecar.rs");
+    let descendant_enumerator = sidecar_source
+        .split_once("fn child_pids(")
+        .expect("fallback descendant enumerator")
+        .1
+        .split_once("fn collect_descendant_pids(")
+        .expect("fallback descendant traversal")
+        .0;
+    assert!(
+        descendant_enumerator.contains("process_group(0)"),
+        "the pgrep helper must run in a separate process group"
+    );
+}
+
+#[test]
 fn process_session_snapshot_ignores_identity_changes_during_enumeration() {
     assert_eq!(
         attest_backend_process_session_snapshot(4100, 4101, 4100, 4101),

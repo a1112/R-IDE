@@ -257,6 +257,48 @@ const finalMilestones = {
   plugins_ready: 60,
 };
 
+const rustGatewayPhases = {
+  runtime_paths_resolved: 1,
+  gateway_inventory_finished: 2,
+  tauri_setup_entered: 1,
+  backend_spawn_requested: 3,
+  window_build_started: 4,
+  window_built: 5,
+  window_shown: 6,
+};
+
+const legacyExplicitPhases = {
+  runtime_paths_resolved: 1,
+  tauri_setup_entered: 1,
+  backend_spawn_requested: 2,
+  window_build_started: 3,
+  window_built: 4,
+  window_shown: 5,
+};
+
+function startupReportV3(milestones, overrides = {}) {
+  return startupReport(milestones, {
+    version: 3,
+    rustPhases: rustGatewayPhases,
+    ...overrides,
+  });
+}
+
+function historicalStartupReportV1() {
+  const report = startupReport({
+    process_started: 0,
+    native_window_visible: 5,
+    backend_spawned: 10,
+    backend_listening: 20,
+    frontend_shell_attached: 30,
+    target_file_opened: 40,
+    plugins_started: 50,
+    plugins_ready: 60,
+  }, { version: 1 });
+  delete report.startupMode;
+  return report;
+}
+
 const fixtureCampaignMetadata = {
   build: {
     commit: '0123456789abcdef0123456789abcdef01234567',
@@ -444,6 +486,188 @@ test('startup report parser accepts v2 parallel branches without using key order
     /backend_listening.*backend_spawned.*timestamp/i,
   );
   assert.throws(() => parseStartupReport('{'), /valid JSON/);
+});
+
+test('startup report parser preserves v1 and v2 roots and accepts complete v3 mode phases', () => {
+  const target = currentRustTarget();
+  const v1 = parseStartupReport(JSON.stringify(historicalStartupReportV1()), {
+    expectedPlatform: target.platform,
+    expectedArch: target.arch,
+    phase: 'final',
+  });
+  assert.deepEqual(Object.keys(v1).sort(), [
+    'arch',
+    'milestones',
+    'pid',
+    'platform',
+    'schema',
+    'version',
+  ]);
+
+  const v2 = parseStartupReport(JSON.stringify(startupReport(targetMilestones)));
+  assert.deepEqual(Object.keys(v2).sort(), [
+    'arch',
+    'milestones',
+    'pid',
+    'platform',
+    'schema',
+    'startupMode',
+    'version',
+  ]);
+
+  const gateway = parseStartupReport(
+    JSON.stringify(startupReportV3(finalMilestones)),
+    { phase: 'final' },
+  );
+  assert.deepEqual(gateway.rustPhases, rustGatewayPhases);
+
+  const explicit = parseStartupReport(JSON.stringify(startupReportV3({
+    process_started: 0,
+    native_window_visible: 5,
+    backend_spawned: 10,
+    backend_listening: 20,
+    frontend_shell_attached: 30,
+    target_file_opened: 40,
+    plugins_started: 50,
+    plugins_ready: 60,
+  }, {
+    startupMode: 'legacy-explicit',
+    rustPhases: legacyExplicitPhases,
+  })), { phase: 'final' });
+  assert.deepEqual(explicit.rustPhases, legacyExplicitPhases);
+});
+
+test('v1 incremental reports require a continuous canonical milestone prefix', () => {
+  const report = historicalStartupReportV1();
+  report.milestones = {
+    process_started: 0,
+    plugins_ready: 60,
+  };
+
+  assert.throws(
+    () => parseStartupReport(JSON.stringify(report), { phase: 'incremental' }),
+    /plugins_ready.*requires.*native_window_visible|continuous.*prefix/i,
+  );
+});
+
+test('v1 target reports require the complete canonical prefix through target_file_opened', () => {
+  const incomplete = historicalStartupReportV1();
+  incomplete.milestones = {
+    process_started: 0,
+    target_file_opened: 40,
+  };
+  assert.throws(
+    () => parseStartupReport(JSON.stringify(incomplete), { phase: 'target' }),
+    /target_file_opened.*requires.*native_window_visible|continuous.*prefix/i,
+  );
+
+  const complete = historicalStartupReportV1();
+  complete.milestones = {
+    process_started: 0,
+    native_window_visible: 5,
+    backend_spawned: 10,
+    backend_listening: 20,
+    frontend_shell_attached: 30,
+    target_file_opened: 40,
+  };
+  assert.equal(
+    parseStartupReport(JSON.stringify(complete), { phase: 'target' })
+      .milestones.target_file_opened,
+    40,
+  );
+});
+
+test('v1 final validation ignores JSON milestone insertion order', () => {
+  const report = historicalStartupReportV1();
+  report.milestones = Object.fromEntries(Object.entries(report.milestones).reverse());
+
+  assert.equal(
+    parseStartupReport(JSON.stringify(report), { phase: 'final' }).milestones.plugins_ready,
+    60,
+  );
+});
+
+test('v3 incremental reports accept only predecessor-closed Rust phase subsets', () => {
+  const report = startupReportV3({ process_started: 0 }, {
+    rustPhases: {
+      runtime_paths_resolved: 1,
+      gateway_inventory_finished: 2,
+      tauri_setup_entered: 1,
+      backend_spawn_requested: 3,
+    },
+  });
+
+  assert.deepEqual(
+    parseStartupReport(JSON.stringify(report), { phase: 'incremental' }).rustPhases,
+    report.rustPhases,
+  );
+});
+
+test('v3 Rust phase validation rejects invalid keys, values, ordering, and applicability', () => {
+  const cases = [
+    ['unknown phase', {
+      ...rustGatewayPhases,
+      invented: 7,
+    }, {}, /unexpected Rust phase invented/i],
+    ['negative timestamp', {
+      ...rustGatewayPhases,
+      window_shown: -1,
+    }, {}, /window_shown.*non-negative safe integer/i],
+    ['non-integer timestamp', {
+      ...rustGatewayPhases,
+      window_shown: 6.5,
+    }, {}, /window_shown.*non-negative safe integer/i],
+    ['missing predecessor', {
+      runtime_paths_resolved: 1,
+      tauri_setup_entered: 1,
+      backend_spawn_requested: 3,
+    }, {}, /backend_spawn_requested.*gateway_inventory_finished/i],
+    ['timestamp precedes predecessor', {
+      ...rustGatewayPhases,
+      window_build_started: 2,
+    }, {}, /window_build_started.*backend_spawn_requested.*timestamp/i],
+    ['legacy explicit gateway inventory', {
+      ...legacyExplicitPhases,
+      gateway_inventory_finished: 2,
+    }, { startupMode: 'legacy-explicit' }, /unexpected Rust phase gateway_inventory_finished/i],
+  ];
+  for (const [label, rustPhases, overrides, expected] of cases) {
+    assert.throws(
+      () => parseStartupReport(JSON.stringify(startupReportV3(
+        { process_started: 0 },
+        { rustPhases, ...overrides },
+      )), { phase: 'incremental' }),
+      expected,
+      label,
+    );
+  }
+});
+
+test('v3 target and final reports require rustPhases and every applicable phase', () => {
+  const missingObject = startupReportV3(finalMilestones);
+  delete missingObject.rustPhases;
+  assert.throws(
+    () => parseStartupReport(JSON.stringify(missingObject), { phase: 'final' }),
+    /missing.*rustPhases|must contain rustPhases/i,
+  );
+
+  const incomplete = startupReportV3(finalMilestones, {
+    rustPhases: {
+      runtime_paths_resolved: 1,
+      gateway_inventory_finished: 2,
+      tauri_setup_entered: 1,
+      backend_spawn_requested: 3,
+      window_build_started: 4,
+      window_built: 5,
+    },
+  });
+  for (const phase of ['target', 'final']) {
+    assert.throws(
+      () => parseStartupReport(JSON.stringify(incomplete), { phase }),
+      /all rust-gateway Rust phases|window_shown/i,
+      phase,
+    );
+  }
 });
 
 test('startup report parser rejects missing graph predecessors and unknown modes', () => {
@@ -5539,6 +5763,7 @@ test('campaign v4 records window and frontend/backend overlap diagnostics', asyn
       rssBytes: 90,
     });
     assert.equal(measurement.median.nativeWindowVisibleMs, 5);
+    assert.equal(Object.hasOwn(measurement.median, 'rustPhases'), false);
     assert.deepEqual(measurement.diagnostics.frontendBackendOverlapMs, {
       runs: [16, 16],
       median: 16,
@@ -5546,6 +5771,77 @@ test('campaign v4 records window and frontend/backend overlap diagnostics', asyn
     assert.deepEqual(JSON.parse(fs.readFileSync(output, 'utf8')), measurement);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('campaign summary includes a median for every v3 Rust startup phase', async () => {
+  const root = temporaryDirectory('campaign-rust-phases');
+  const executable = path.join(root, 'R-IDE');
+  const output = path.join(root, 'startup-metrics.json');
+  const offsets = [0, 4, 2];
+  touch(executable);
+  let run = 0;
+  try {
+    const measurement = await runMeasurementCampaign({
+      executable,
+      output,
+      runs: offsets.length,
+      idleMs: 0,
+      timeoutMs: 100,
+      pollMs: 1,
+    }, campaignDependencies({
+      measure: async () => {
+        const offset = offsets[run++];
+        return {
+          startupReport: startupReportV3(finalMilestones, {
+            rustPhases: Object.fromEntries(Object.entries(rustGatewayPhases).map(
+              ([phase, elapsed]) => [phase, elapsed + offset],
+            )),
+          }),
+          metrics: campaignMetrics(),
+        };
+      },
+    }));
+
+    assert.deepEqual(measurement.median.rustPhases, Object.fromEntries(
+      Object.entries(rustGatewayPhases).map(([phase, elapsed]) => [phase, elapsed + 2]),
+    ));
+    assert.deepEqual(JSON.parse(fs.readFileSync(output, 'utf8')), measurement);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('campaign rejects mixed startup report versions regardless of run order', async () => {
+  for (const versions of [[2, 3], [3, 2]]) {
+    const root = temporaryDirectory(`campaign-mixed-report-versions-${versions.join('-')}`);
+    const executable = path.join(root, 'R-IDE');
+    const output = path.join(root, 'startup-metrics.json');
+    touch(executable);
+    let run = 0;
+    try {
+      await assert.rejects(
+        runMeasurementCampaign({
+          executable,
+          output,
+          runs: versions.length,
+          idleMs: 0,
+          timeoutMs: 100,
+          pollMs: 1,
+        }, campaignDependencies({
+          measure: async () => ({
+            startupReport: versions[run++] === 3
+              ? startupReportV3(finalMilestones)
+              : startupReport(finalMilestones),
+            metrics: campaignMetrics(),
+          }),
+        })),
+        /measurement campaign reported mixed startup report versions/i,
+      );
+      assert.equal(fs.existsSync(output), false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   }
 });
 

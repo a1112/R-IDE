@@ -19,7 +19,7 @@ use crate::startup_gateway::{
     BackendGeneration, GatewayBindCancellation, GatewayBindObserver, GatewayBindStage,
     GatewayError, GatewayLimits, StartupGateway,
 };
-use crate::startup_metrics::{StartupMetricError, StartupMetrics, StartupMode};
+use crate::startup_metrics::{StartupMetricError, StartupMetrics, StartupMode, StartupRustPhase};
 
 pub const GATEWAY_CAPABILITY_PERMISSIONS: [&str; 12] = [
     "core:event:allow-listen",
@@ -344,6 +344,7 @@ impl StartupCoordinator {
     ) -> PendingStartupLaunch {
         let (bind_started, bind_observed) = tokio::sync::oneshot::channel();
         let bind_started = Arc::new(Mutex::new(Some(bind_started)));
+        let observer_metrics = self.metrics.clone();
         let observer = GatewayBindObserver::new(move |stage| {
             if stage == GatewayBindStage::InventoryStarted {
                 if let Some(sender) = bind_started
@@ -353,6 +354,10 @@ impl StartupCoordinator {
                 {
                     let _ = sender.send(());
                 }
+            }
+            if stage == GatewayBindStage::InventoryFinished {
+                observer_metrics
+                    .record_rust_phase_or_warn(StartupRustPhase::GatewayInventoryFinished);
             }
         });
         let task = tauri::async_runtime::spawn(self.launch_with_gateway_bind(
@@ -505,6 +510,9 @@ impl StartupCoordinator {
         window_created: StartupWindowCreatedGate,
         reason: &str,
     ) -> Result<StartupLaunch, StartupCoordinatorError> {
+        // Close skipped or interrupted inventory diagnostics at the shared fallback join point.
+        self.metrics
+            .record_rust_phase_or_warn(StartupRustPhase::GatewayInventoryFinished);
         self.metrics
             .select_effective_mode(StartupMode::LegacyFallback)
             .map_err(StartupCoordinatorError::Metrics)?;
@@ -1747,13 +1755,15 @@ impl PlatformBackendProcessTree {
         owned_pgids: &[libc::pid_t],
         owned_session_id: Option<libc::pid_t>,
     ) -> Result<(Vec<u32>, Vec<i32>), String> {
+        use std::os::unix::process::CommandExt;
+
         #[cfg(target_os = "macos")]
         let columns = ["-A", "-o", "pid=", "-o", "pgid="];
         #[cfg(not(target_os = "macos"))]
         let columns = ["-A", "-o", "pid=", "-o", "pgid=", "-o", "sid="];
-        let output = std::process::Command::new("ps")
-            .args(columns)
-            .env("LC_ALL", "C")
+        let mut command = std::process::Command::new("ps");
+        command.args(columns).env("LC_ALL", "C").process_group(0);
+        let output = command
             .output()
             .map_err(|error| format!("Failed to enumerate backend process scope: {error}"))?;
         if !output.status.success() {
