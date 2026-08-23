@@ -17,6 +17,8 @@ export class RideCodexActivation {
     protected error: unknown;
     protected feature: RideCodexFeature | undefined;
     protected disposed = false;
+    protected readonly disposedFeatures = new WeakSet<RideCodexFeature>();
+    protected readonly disposedError = new Error('Codex activation has been disposed.');
 
     constructor(protected readonly loadFeature: () => Promise<RideCodexFeature>) { }
 
@@ -38,20 +40,31 @@ export class RideCodexActivation {
             return this.activation;
         }
         this.stateValue = 'activating';
-        this.activation = this.loadFeature()
-            .then(feature => {
-                this.feature = feature;
-                return feature.activate();
-            })
-            .then(() => {
-                this.stateValue = 'ready';
-            })
-            .catch(error => {
-                this.error = error;
-                this.stateValue = 'error';
-                throw error;
-            });
+        this.activation = this.doActivate();
         return this.activation;
+    }
+
+    protected async doActivate(): Promise<void> {
+        try {
+            const feature = await this.loadFeature();
+            this.feature = feature;
+            this.throwIfDisposed(feature);
+            await feature.activate();
+            this.throwIfDisposed(feature);
+            this.stateValue = 'ready';
+        } catch (error) {
+            const failure = this.disposed ? this.disposedError : error;
+            this.error = failure;
+            this.stateValue = 'error';
+            throw failure;
+        }
+    }
+
+    protected throwIfDisposed(feature: RideCodexFeature): void {
+        if (this.disposed) {
+            this.disposeFeature(feature);
+            throw this.disposedError;
+        }
     }
 
     retry(): Promise<void> {
@@ -72,6 +85,16 @@ export class RideCodexActivation {
             return;
         }
         this.disposed = true;
-        this.feature?.dispose?.();
+        if (this.feature) {
+            this.disposeFeature(this.feature);
+        }
+    }
+
+    protected disposeFeature(feature: RideCodexFeature): void {
+        if (this.disposedFeatures.has(feature)) {
+            return;
+        }
+        this.disposedFeatures.add(feature);
+        feature.dispose?.();
     }
 }

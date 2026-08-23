@@ -76,10 +76,6 @@ export function createTauriBrowserBuildPlans(browserOptions, profileManifest, ba
             createModuleScriptPlugin(baseDirectory, browserOptions.outdir),
         ],
     };
-    if (Object.keys(aliases).length > 0 || browserOptions.alias) {
-        main.alias = { ...(browserOptions.alias ?? {}), ...aliases };
-    }
-
     const classic = CLASSIC_ENTRY_NAMES.map(name => ({
         ...browserOptions,
         entryPoints: { [name]: entryPoints[name] },

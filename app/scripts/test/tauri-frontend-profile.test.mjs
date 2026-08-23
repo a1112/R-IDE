@@ -472,17 +472,22 @@ test('deferred aliases intercept only exact escaped module requests', () => {
     };
     const plans = createTauriBrowserBuildPlans({
         entryPoints: { bundle: 'bundle.js', 'secondary-window': 'secondary-window.js', 'editor.worker': 'worker.js', 'plugin-worker': 'plugin.js' },
-        outdir: 'lib/frontend', plugins: [],
+        outdir: 'lib/frontend', plugins: [], alias: { existing: 'preserved' },
     }, {
         profile: 'tauri-critical',
         featureGroups: { ai: { deferredFrontendModules: Object.entries(aliases).map(([module, proxy]) => ({ module, proxy })) }, },
     }, path.resolve('generated-target'));
+    assert.deepEqual(plans.main.alias, { existing: 'preserved' });
     let resolver;
     plans.main.plugins[0].setup({ onResolve(filter, callback) { resolver = { filter, callback }; } });
     assert.equal(resolver.filter.filter.test('theia-ide-codex-ext/lib/browser/ride-codex-frontend-module'), true);
     assert.equal(resolver.filter.filter.test('@scope/feature.with+symbols'), true);
     assert.equal(resolver.filter.filter.test('theia-ide-codex-ext/lib/browser/ride-codex-frontend-module/extra'), false);
     assert.equal(resolver.filter.filter.test('@scope/featureXwithsymbols'), false);
+    assert.deepEqual(resolver.callback({ path: 'theia-ide-codex-ext/lib/browser/ride-codex-frontend-module' }), {
+        path: path.resolve('generated-target', 'tauri-src/codex-proxy-frontend-module.ts'),
+    });
+    assert.equal(resolver.callback({ path: 'theia-ide-codex-ext/lib/browser/ride-codex-frontend-module/extra' }), undefined);
     assert.equal(resolver.callback({ path: 'unlisted/module' }), undefined);
 });
 
@@ -518,10 +523,7 @@ test('Tauri browser build splits only the ESM main entry and keeps classic worke
     assert.equal(plans.main.splitting, true);
     assert.equal(plans.main.chunkNames, 'chunks/[name]-[hash]');
     assert.equal(plans.main.plugins[0].name, 'ride-tauri-deferred-frontend-alias');
-    assert.equal(
-        plans.main.alias['@theia/secondary-window/lib/browser/secondary-window-frontend-module'],
-        path.resolve('generated-target', 'tauri-src/secondary-window-proxy-frontend-module.ts')
-    );
+    assert.equal(plans.main.alias, undefined);
     assert.deepEqual(plans.classic.map(plan => ({
         entries: Object.keys(plan.entryPoints),
         format: plan.format,
