@@ -431,6 +431,9 @@ impl StartupCoordinator {
             .visibility_deadline
             .bind_deadline(tokio::time::Instant::now())
         else {
+            // The budget gate skipped the inventory stage, so close its diagnostic phase here.
+            self.metrics
+                .record_rust_phase_or_warn(StartupRustPhase::GatewayInventoryFinished);
             return self.legacy_fallback(
                 legacy_initial_url,
                 window_created,
