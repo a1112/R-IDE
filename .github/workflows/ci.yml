@@ -57,6 +57,7 @@ jobs:
           scripts/test/workflow-policy.test.mjs
           scripts/test/desktop-integration-policy.test.mjs
           scripts/test/appimage-integration.test.mjs
+          app/scripts/test/codex-package-wiring.test.mjs
           app/scripts/test/tauri-permissions.test.mjs
           app/scripts/test/generate-packaged-smoke-plugin.test.mjs
           app/scripts/test/measure-tauri-startup.test.mjs

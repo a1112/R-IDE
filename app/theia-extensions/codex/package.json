@@ -37,6 +37,8 @@
     "build": "tsc -b",
     "test": "rimraf test/dist && tsc -p tsconfig.test.json && node --test test/dist/test/*.test.js",
     "lint": "eslint --ext js,jsx,ts,tsx src",
-    "lint:fix": "eslint --ext js,jsx,ts,tsx src --fix"
+    "lint:fix": "eslint --ext js,jsx,ts,tsx src --fix",
+    "update:theia": "ts-node ../../scripts/update-theia-version.ts",
+    "update:next": "ts-node ../../scripts/update-theia-version.ts next"
   }
 }
