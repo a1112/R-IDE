@@ -4,6 +4,8 @@
  * SPDX-License-Identifier: MIT
  ********************************************************************************/
 
+import type { FrontendApplicationContribution } from '@theia/core/lib/browser/frontend-application-contribution';
+
 export type RideCodexActivationState = 'inactive' | 'activating' | 'ready' | 'error';
 
 export interface RideCodexFeature {
@@ -11,7 +13,7 @@ export interface RideCodexFeature {
     dispose?(): void;
 }
 
-export class RideCodexActivation {
+export class RideCodexActivation implements FrontendApplicationContribution {
     protected stateValue: RideCodexActivationState = 'inactive';
     protected activation: Promise<void> | undefined;
     protected error: unknown;
@@ -28,7 +30,7 @@ export class RideCodexActivation {
 
     activate(): Promise<void> {
         if (this.disposed) {
-            return Promise.reject(new Error('Codex activation has been disposed.'));
+            return Promise.reject(this.disposedError);
         }
         if (this.stateValue === 'ready') {
             return Promise.resolve();
@@ -45,14 +47,18 @@ export class RideCodexActivation {
     }
 
     protected async doActivate(): Promise<void> {
+        let feature: RideCodexFeature | undefined;
         try {
-            const feature = await this.loadFeature();
+            feature = await this.loadFeature();
             this.feature = feature;
             this.throwIfDisposed(feature);
             await feature.activate();
             this.throwIfDisposed(feature);
             this.stateValue = 'ready';
         } catch (error) {
+            if (feature) {
+                this.disposeFeature(feature);
+            }
             const failure = this.disposed ? this.disposedError : error;
             this.error = failure;
             this.stateValue = 'error';
@@ -69,7 +75,7 @@ export class RideCodexActivation {
 
     retry(): Promise<void> {
         if (this.disposed) {
-            return Promise.reject(new Error('Codex activation has been disposed.'));
+            return Promise.reject(this.disposedError);
         }
         if (this.stateValue !== 'error') {
             return this.activate();
@@ -90,11 +96,22 @@ export class RideCodexActivation {
         }
     }
 
+    onStop(): void {
+        this.dispose();
+    }
+
     protected disposeFeature(feature: RideCodexFeature): void {
+        if (this.feature === feature) {
+            this.feature = undefined;
+        }
         if (this.disposedFeatures.has(feature)) {
             return;
         }
         this.disposedFeatures.add(feature);
-        feature.dispose?.();
+        try {
+            feature.dispose?.();
+        } catch (error) {
+            console.error('[R-IDE] Failed to dispose Codex feature.', error);
+        }
     }
 }

@@ -26,22 +26,24 @@ test('Codex profile declares the deferred proxy and delayed feature entry', asyn
 test('Codex startup sources contain only inert activation and command proxies', async () => {
     const sourceDirectory = path.join(browserDirectory, 'tauri-src');
     const extensionDirectory = path.join(appDirectory, 'theia-extensions', 'codex', 'src', 'browser');
-    const [proxy, feature, frontend] = await Promise.all([
+    const [proxy, feature, frontend, bindings] = await Promise.all([
         fs.readFile(path.join(sourceDirectory, 'codex-proxy-frontend-module.ts'), 'utf8'),
         fs.readFile(path.join(sourceDirectory, 'codex-feature.ts'), 'utf8'),
         fs.readFile(path.join(extensionDirectory, 'ride-codex-frontend-module.ts'), 'utf8'),
+        fs.readFile(path.join(extensionDirectory, 'ride-codex-chat-agent-proxy.ts'), 'utf8'),
     ]);
     assert.match(proxy, /import\(['"]\.\/codex-feature['"]\)\.then\(module => module\.createCodexFeature\(\)\)/);
     assert.match(feature, /createCodexFeature/);
-    for (const source of [proxy, feature, frontend]) {
+    for (const source of [proxy, feature, frontend, bindings]) {
         assert.doesNotMatch(
             source,
             /@openai\/codex-sdk|codex[- ]installer|app[- ]server|CodexAppServerClient|codex[- ]process|child_process|node:process|process\./i,
         );
     }
-    for (const source of [proxy, frontend]) {
-        assert.match(source, /bind\(CommandContribution\)\.toService\(RideCodexChatAgentProxy\)/);
-    }
+    assert.match(proxy, /bindRideCodexFrontend\(bind,/);
+    assert.match(frontend, /bindRideCodexFrontend\(bind,/);
+    assert.match(bindings, /bind\(CommandContribution\)\.toService\(RideCodexChatAgentProxy\)/);
+    assert.match(bindings, /bind\(FrontendApplicationContribution\)\.toService\(RideCodexActivation\)/);
 });
 
 test('minimal critical build keeps Codex feature code out of the initial bundle inputs', async t => {
