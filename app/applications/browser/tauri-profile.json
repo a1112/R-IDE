@@ -8,7 +8,7 @@
         "@theia/ai-chat-ui",
         "@theia/ai-claude-code",
         "@theia/ai-code-completion",
-        "@theia/ai-codex",
+        "theia-ide-codex-ext",
         "@theia/ai-copilot",
         "@theia/ai-core-ui",
         "@theia/ai-editor",
@@ -69,7 +69,6 @@
         { "name": "@theia/ai-chat-ui", "reason": "The frontend registers view, widget-factory, toolbar, and lifecycle contribution types without deferred adapters." },
         { "name": "@theia/ai-claude-code", "reason": "The frontend registers preferences and lifecycle services and the package requires backend services." },
         { "name": "@theia/ai-code-completion", "reason": "The frontend registers preferences and lifecycle services and the package requires backend services." },
-        { "name": "@theia/ai-codex", "reason": "The frontend registers preference contributions without a deferred adapter and the package requires backend services." },
         { "name": "@theia/ai-copilot", "reason": "The frontend registers preferences and lifecycle services and the package requires backend services." },
         { "name": "@theia/ai-core", "reason": "The hosted-plugin AI MCP dependency requires the AI core services during initial generation." },
         { "name": "@theia/ai-core-ui", "reason": "The frontend registers preference contributions without a deferred adapter." },
@@ -88,6 +87,15 @@
         { "name": "@theia/ai-scanoss", "reason": "The frontend registers preference contributions without a deferred adapter and the package requires backend services." },
         { "name": "@theia/ai-terminal", "reason": "The frontend registers preference contributions without a deferred adapter and the package requires backend services." },
         { "name": "@theia/ai-vercel-ai", "reason": "The frontend registers preferences and lifecycle services and the package requires backend services." }
+      ],
+      "deferredFrontendModules": [
+        {
+          "package": "theia-ide-codex-ext",
+          "module": "theia-ide-codex-ext/lib/browser/ride-codex-frontend-module",
+          "proxy": "tauri-src/codex-proxy-frontend-module.ts",
+          "entry": "tauri-src/codex-feature.ts",
+          "action": "codex-activate"
+        }
       ],
       "deferBlockedReason": "The group fails the explicit-adapter and isolated-backend gates; no complete real-action smoke and initial-entry inventory exists."
     },

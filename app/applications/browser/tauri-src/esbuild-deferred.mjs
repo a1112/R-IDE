@@ -17,10 +17,12 @@ function deferredFrontendAliases(profileManifest, baseDirectory) {
 }
 
 function createDeferredFrontendAliasPlugin(aliases) {
+    const escapeRegex = value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const filter = new RegExp(`^(?:${Object.keys(aliases).map(escapeRegex).join('|')})$`);
     return {
         name: 'ride-tauri-deferred-frontend-alias',
         setup(build) {
-            build.onResolve({ filter: /^@theia\/[^/]+(?:\/|$)/ }, args => {
+            build.onResolve({ filter }, args => {
                 const replacement = aliases[args.path];
                 return replacement ? { path: replacement } : undefined;
             });

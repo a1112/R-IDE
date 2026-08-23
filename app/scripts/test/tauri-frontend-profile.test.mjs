@@ -442,7 +442,14 @@ test('tracked profile defers only secondary-window and records every other group
     const deferredGroups = Object.entries(profile.featureGroups)
         .filter(([, group]) => (group.deferredFrontendModules?.length ?? 0) > 0);
 
-    assert.deepEqual(deferredGroups.map(([name]) => name), ['secondary-window']);
+    assert.deepEqual(deferredGroups.map(([name]) => name), ['ai', 'secondary-window']);
+    assert.deepEqual(profile.featureGroups.ai.deferredFrontendModules, [{
+        package: 'theia-ide-codex-ext',
+        module: 'theia-ide-codex-ext/lib/browser/ride-codex-frontend-module',
+        proxy: 'tauri-src/codex-proxy-frontend-module.ts',
+        entry: 'tauri-src/codex-feature.ts',
+        action: 'codex-activate',
+    }]);
     assert.deepEqual(profile.featureGroups['secondary-window'].deferredFrontendModules, [{
         package: '@theia/secondary-window',
         module: '@theia/secondary-window/lib/browser/secondary-window-frontend-module',
@@ -452,10 +459,31 @@ test('tracked profile defers only secondary-window and records every other group
     }]);
     for (const [name, group] of Object.entries(profile.featureGroups)) {
         assert.deepEqual(group.deferredRoots, [], `${name} must not silently omit package roots`);
-        if (name !== 'secondary-window') {
+        if (name !== 'secondary-window' && name !== 'ai') {
             assert.match(group.deferBlockedReason, /adapter|backend|smoke|inventory|startup|provider|rebind|widget/i);
         }
     }
+});
+
+test('deferred aliases intercept only exact escaped module requests', () => {
+    const aliases = {
+        'theia-ide-codex-ext/lib/browser/ride-codex-frontend-module': 'tauri-src/codex-proxy-frontend-module.ts',
+        '@scope/feature.with+symbols': 'tauri-src/symbol-proxy.ts',
+    };
+    const plans = createTauriBrowserBuildPlans({
+        entryPoints: { bundle: 'bundle.js', 'secondary-window': 'secondary-window.js', 'editor.worker': 'worker.js', 'plugin-worker': 'plugin.js' },
+        outdir: 'lib/frontend', plugins: [],
+    }, {
+        profile: 'tauri-critical',
+        featureGroups: { ai: { deferredFrontendModules: Object.entries(aliases).map(([module, proxy]) => ({ module, proxy })) }, },
+    }, path.resolve('generated-target'));
+    let resolver;
+    plans.main.plugins[0].setup({ onResolve(filter, callback) { resolver = { filter, callback }; } });
+    assert.equal(resolver.filter.filter.test('theia-ide-codex-ext/lib/browser/ride-codex-frontend-module'), true);
+    assert.equal(resolver.filter.filter.test('@scope/feature.with+symbols'), true);
+    assert.equal(resolver.filter.filter.test('theia-ide-codex-ext/lib/browser/ride-codex-frontend-module/extra'), false);
+    assert.equal(resolver.filter.filter.test('@scope/featureXwithsymbols'), false);
+    assert.equal(resolver.callback({ path: 'unlisted/module' }), undefined);
 });
 
 test('Tauri browser build splits only the ESM main entry and keeps classic worker names intact', () => {
