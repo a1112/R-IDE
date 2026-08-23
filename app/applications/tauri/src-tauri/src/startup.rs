@@ -1755,13 +1755,15 @@ impl PlatformBackendProcessTree {
         owned_pgids: &[libc::pid_t],
         owned_session_id: Option<libc::pid_t>,
     ) -> Result<(Vec<u32>, Vec<i32>), String> {
+        use std::os::unix::process::CommandExt;
+
         #[cfg(target_os = "macos")]
         let columns = ["-A", "-o", "pid=", "-o", "pgid="];
         #[cfg(not(target_os = "macos"))]
         let columns = ["-A", "-o", "pid=", "-o", "pgid=", "-o", "sid="];
-        let output = std::process::Command::new("ps")
-            .args(columns)
-            .env("LC_ALL", "C")
+        let mut command = std::process::Command::new("ps");
+        command.args(columns).env("LC_ALL", "C").process_group(0);
+        let output = command
             .output()
             .map_err(|error| format!("Failed to enumerate backend process scope: {error}"))?;
         if !output.status.success() {

@@ -2743,9 +2743,11 @@ fn record_backend_listening(app_handle: &AppHandle) {
 
 #[cfg(unix)]
 fn child_pids(pid: u32) -> Vec<u32> {
-    let output = StdCommand::new("pgrep")
-        .args(["-P", &pid.to_string()])
-        .output();
+    use std::os::unix::process::CommandExt;
+
+    let mut command = StdCommand::new("pgrep");
+    command.args(["-P", &pid.to_string()]).process_group(0);
+    let output = command.output();
 
     output
         .ok()
