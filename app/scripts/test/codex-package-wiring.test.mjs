@@ -11,3 +11,9 @@ test('browser uses the R-IDE Codex extension without the patched upstream packag
     assert.match(root.scripts['build:extensions'], /theia-extensions\/codex/);
     await assert.rejects(access('patches/@theia+ai-codex+1.73.0-next.2.patch'));
 });
+
+test('lockfile omits the obsolete browser Codex package selector', async () => {
+    const lockfile = await readFile('yarn.lock', 'utf8');
+
+    assert.equal(lockfile.includes('"@theia/ai-codex@1.73.0-next.2":'), false);
+});
