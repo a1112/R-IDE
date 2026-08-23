@@ -36,6 +36,39 @@ pub const GATEWAY_BIND_CLEANUP_GRACE: std::time::Duration = std::time::Duration:
 pub const WINDOW_PRESENTATION_BUDGET: std::time::Duration = std::time::Duration::from_millis(200);
 static NEXT_SECONDARY_WINDOW_ID: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Clone, Copy)]
+enum RustStartupCheckpoint {
+    RuntimePathsResolved,
+    TauriSetupEntered,
+    BackendSpawnRequested,
+    WindowBuildStarted,
+    WindowBuilt,
+    WindowShown,
+}
+
+fn record_rust_startup_checkpoint(
+    metrics: &startup_metrics::StartupMetrics,
+    checkpoint: RustStartupCheckpoint,
+) {
+    let phase = match checkpoint {
+        RustStartupCheckpoint::RuntimePathsResolved => {
+            startup_metrics::StartupRustPhase::RuntimePathsResolved
+        }
+        RustStartupCheckpoint::TauriSetupEntered => {
+            startup_metrics::StartupRustPhase::TauriSetupEntered
+        }
+        RustStartupCheckpoint::BackendSpawnRequested => {
+            startup_metrics::StartupRustPhase::BackendSpawnRequested
+        }
+        RustStartupCheckpoint::WindowBuildStarted => {
+            startup_metrics::StartupRustPhase::WindowBuildStarted
+        }
+        RustStartupCheckpoint::WindowBuilt => startup_metrics::StartupRustPhase::WindowBuilt,
+        RustStartupCheckpoint::WindowShown => startup_metrics::StartupRustPhase::WindowShown,
+    };
+    metrics.record_rust_phase_or_warn(phase);
+}
+
 pub fn is_trusted_secondary_window_url(url: &tauri::Url, public_authority: &str) -> bool {
     let Ok(expected) = public_authority.parse::<SocketAddr>() else {
         return false;
@@ -592,6 +625,10 @@ pub fn run() {
             return;
         }
     };
+    record_rust_startup_checkpoint(
+        &startup_metrics,
+        RustStartupCheckpoint::RuntimePathsResolved,
+    );
     let pending_startup_launch = tauri::async_runtime::block_on(
         startup::StartupCoordinator::new(
             requested_startup_mode,
@@ -648,6 +685,10 @@ pub fn run() {
 
     let app = builder
         .setup(move |app| {
+            record_rust_startup_checkpoint(
+                &app.state::<AppState>().startup_metrics,
+                RustStartupCheckpoint::TauriSetupEntered,
+            );
             native_chrome::install_menu_event_bridge(app.handle());
 
             let mut launch = tauri::async_runtime::block_on(
@@ -704,6 +745,10 @@ pub fn run() {
                         .lock()
                         .unwrap()
                         .reserve_start();
+                    record_rust_startup_checkpoint(
+                        &app.state::<AppState>().startup_metrics,
+                        RustStartupCheckpoint::BackendSpawnRequested,
+                    );
                     tauri::async_runtime::spawn(async move {
                         if let Err(e) = sidecar::start_backend(
                             &app_handle,
@@ -731,6 +776,10 @@ pub fn run() {
                     }
 
                     let secondary_window_app = app.handle().clone();
+                    record_rust_startup_checkpoint(
+                        &app.state::<AppState>().startup_metrics,
+                        RustStartupCheckpoint::WindowBuildStarted,
+                    );
                     let window =
                         tauri::WebviewWindowBuilder::from_config(app.handle(), &main_window_config)?
                             .on_page_load(|window, payload| {
@@ -794,6 +843,10 @@ pub fn run() {
                                 }
                             })
                             .build()?;
+                    record_rust_startup_checkpoint(
+                        &app.state::<AppState>().startup_metrics,
+                        RustStartupCheckpoint::WindowBuilt,
+                    );
                     launch.mark_window_created();
                     Ok(window)
                 },
@@ -803,6 +856,10 @@ pub fn run() {
                 },
                 tokio::time::Instant::now,
             )?;
+            record_rust_startup_checkpoint(
+                &app.state::<AppState>().startup_metrics,
+                RustStartupCheckpoint::WindowShown,
+            );
             app.state::<AppState>()
                 .startup_metrics
                 .record_or_warn(startup_metrics::StartupMilestone::NativeWindowVisible);
@@ -1226,6 +1283,72 @@ mod tests {
         fn elapsed_ms(&self) -> u64 {
             0
         }
+    }
+
+    #[derive(Debug, Default)]
+    struct IncrementingClock {
+        next_ms: AtomicU64,
+    }
+
+    impl startup_metrics::ElapsedClock for IncrementingClock {
+        fn elapsed_ms(&self) -> u64 {
+            self.next_ms.fetch_add(1, AtomicOrdering::SeqCst)
+        }
+    }
+
+    #[test]
+    fn rust_startup_phases_follow_real_checkpoint_order_before_native_visibility() {
+        let (reports_tx, reports_rx) = mpsc::channel();
+        let metrics = startup_metrics::StartupMetrics::with_clock_and_writer(
+            "windows",
+            "x86_64",
+            42,
+            startup_metrics::StartupMode::LegacyExplicit,
+            Arc::new(IncrementingClock::default()),
+            Box::new(CapturingStartupReportWriter {
+                reports: reports_tx,
+            }),
+        );
+        initialize_current_startup_metrics(&metrics, startup_metrics::StartupMode::LegacyExplicit)
+            .expect("initialize startup metrics");
+
+        for checkpoint in [
+            RustStartupCheckpoint::RuntimePathsResolved,
+            RustStartupCheckpoint::TauriSetupEntered,
+            RustStartupCheckpoint::BackendSpawnRequested,
+            RustStartupCheckpoint::WindowBuildStarted,
+            RustStartupCheckpoint::WindowBuilt,
+            RustStartupCheckpoint::WindowShown,
+        ] {
+            record_rust_startup_checkpoint(&metrics, checkpoint);
+        }
+        metrics.record_or_warn(startup_metrics::StartupMilestone::NativeWindowVisible);
+
+        let mut final_report = None;
+        for _ in 0..8 {
+            final_report = Some(
+                reports_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("published startup report"),
+            );
+        }
+        let final_report = final_report.expect("final startup report");
+        let phases = &final_report["rustPhases"];
+        let ordered = [
+            phases["runtime_paths_resolved"].as_u64().unwrap(),
+            phases["tauri_setup_entered"].as_u64().unwrap(),
+            phases["backend_spawn_requested"].as_u64().unwrap(),
+            phases["window_build_started"].as_u64().unwrap(),
+            phases["window_built"].as_u64().unwrap(),
+            phases["window_shown"].as_u64().unwrap(),
+        ];
+        assert!(ordered.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert!(
+            phases["window_shown"].as_u64().unwrap()
+                <= final_report["milestones"]["native_window_visible"]
+                    .as_u64()
+                    .unwrap()
+        );
     }
 
     #[test]

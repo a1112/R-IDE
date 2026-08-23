@@ -19,7 +19,7 @@ use crate::startup_gateway::{
     BackendGeneration, GatewayBindCancellation, GatewayBindObserver, GatewayBindStage,
     GatewayError, GatewayLimits, StartupGateway,
 };
-use crate::startup_metrics::{StartupMetricError, StartupMetrics, StartupMode};
+use crate::startup_metrics::{StartupMetricError, StartupMetrics, StartupMode, StartupRustPhase};
 
 pub const GATEWAY_CAPABILITY_PERMISSIONS: [&str; 12] = [
     "core:event:allow-listen",
@@ -344,6 +344,7 @@ impl StartupCoordinator {
     ) -> PendingStartupLaunch {
         let (bind_started, bind_observed) = tokio::sync::oneshot::channel();
         let bind_started = Arc::new(Mutex::new(Some(bind_started)));
+        let observer_metrics = self.metrics.clone();
         let observer = GatewayBindObserver::new(move |stage| {
             if stage == GatewayBindStage::InventoryStarted {
                 if let Some(sender) = bind_started
@@ -353,6 +354,10 @@ impl StartupCoordinator {
                 {
                     let _ = sender.send(());
                 }
+            }
+            if stage == GatewayBindStage::InventoryFinished {
+                observer_metrics
+                    .record_rust_phase_or_warn(StartupRustPhase::GatewayInventoryFinished);
             }
         });
         let task = tauri::async_runtime::spawn(self.launch_with_gateway_bind(
