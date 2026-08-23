@@ -660,12 +660,27 @@ async fn permanently_pending_binder_is_aborted_within_cleanup_grace() {
     .unwrap();
     let bind_dropped = Arc::new(AtomicBool::new(false));
     let observed_drop = Arc::clone(&bind_dropped);
+    let (reports_tx, reports_rx) = mpsc::channel();
+    let metrics = StartupMetrics::with_clock_and_writer(
+        "test",
+        "test",
+        1,
+        StartupMode::RustGateway,
+        Arc::new(ZeroClock),
+        Box::new(ChannelWriter(reports_tx)),
+    );
+    metrics
+        .record(StartupMilestone::ProcessStarted)
+        .expect("record process start");
+    metrics
+        .record_rust_phase(ride_tauri::startup_metrics::StartupRustPhase::RuntimePathsResolved)
+        .expect("record resolved runtime paths");
 
     let launch = tokio::time::timeout(
         Duration::from_secs(1),
         StartupCoordinator::with_limits(
             StartupMode::RustGateway,
-            disabled_metrics(StartupMode::RustGateway),
+            metrics,
             GatewayLimits::test_defaults(),
             visibility,
         )
@@ -689,6 +704,19 @@ async fn permanently_pending_binder_is_aborted_within_cleanup_grace() {
         .fallback_reason
         .as_deref()
         .is_some_and(|reason| reason.contains("cleanup grace") && reason.len() <= 256));
+
+    let final_report = loop {
+        let report = reports_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("published startup report");
+        if report["startupMode"] == "legacy-fallback" {
+            break report;
+        }
+    };
+    assert!(
+        final_report["rustPhases"]["gateway_inventory_finished"].is_number(),
+        "timed-out binder fallback must close the inventory phase: {final_report}"
+    );
 }
 
 #[tokio::test]

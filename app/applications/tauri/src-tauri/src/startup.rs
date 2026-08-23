@@ -431,9 +431,6 @@ impl StartupCoordinator {
             .visibility_deadline
             .bind_deadline(tokio::time::Instant::now())
         else {
-            // The budget gate skipped the inventory stage, so close its diagnostic phase here.
-            self.metrics
-                .record_rust_phase_or_warn(StartupRustPhase::GatewayInventoryFinished);
             return self.legacy_fallback(
                 legacy_initial_url,
                 window_created,
@@ -513,6 +510,9 @@ impl StartupCoordinator {
         window_created: StartupWindowCreatedGate,
         reason: &str,
     ) -> Result<StartupLaunch, StartupCoordinatorError> {
+        // Close skipped or interrupted inventory diagnostics at the shared fallback join point.
+        self.metrics
+            .record_rust_phase_or_warn(StartupRustPhase::GatewayInventoryFinished);
         self.metrics
             .select_effective_mode(StartupMode::LegacyFallback)
             .map_err(StartupCoordinatorError::Metrics)?;
