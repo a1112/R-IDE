@@ -99,16 +99,35 @@ class ResolutionDeadlineError extends Error {
 
 class ResolutionDeadline {
     private readonly expiresAt: number;
+    private readonly controller = new AbortController();
+    private readonly timer: ReturnType<typeof setTimeout>;
+    private readonly onExternalAbort = (): void => this.abort('aborted');
+    private failureReason: 'deadline' | 'aborted' | undefined;
 
     constructor(timeoutMs: number, private readonly signal: AbortSignal | undefined) {
         this.expiresAt = Date.now() + timeoutMs;
+        this.timer = setTimeout(() => this.abort('deadline'), timeoutMs);
+        this.signal?.addEventListener('abort', this.onExternalAbort, { once: true });
+        if (this.signal?.aborted) {
+            this.abort('aborted');
+        }
+    }
+
+    get cancellationSignal(): AbortSignal {
+        return this.controller.signal;
+    }
+
+    remainingMs(): number {
+        this.check();
+        return Math.max(1, this.expiresAt - Date.now());
     }
 
     check(): void {
-        if (this.signal?.aborted) {
-            throw new ResolutionDeadlineError('aborted');
+        if (this.failureReason) {
+            throw new ResolutionDeadlineError(this.failureReason);
         }
         if (Date.now() >= this.expiresAt) {
+            this.abort('deadline');
             throw new ResolutionDeadlineError('deadline');
         }
     }
@@ -119,12 +138,10 @@ class ResolutionDeadline {
         } catch (error) {
             return Promise.reject(error);
         }
-        const remainingMs = Math.max(1, this.expiresAt - Date.now());
         return new Promise<T>((resolve, reject) => {
             let settled = false;
             const cleanup = (): void => {
-                clearTimeout(timer);
-                this.signal?.removeEventListener('abort', onAbort);
+                this.cancellationSignal.removeEventListener('abort', onAbort);
             };
             const settle = (callback: () => void): void => {
                 if (settled) {
@@ -134,17 +151,30 @@ class ResolutionDeadline {
                 cleanup();
                 callback();
             };
-            const onAbort = (): void => settle(() => reject(new ResolutionDeadlineError('aborted')));
-            const timer = setTimeout(
-                () => settle(() => reject(new ResolutionDeadlineError('deadline'))),
-                remainingMs
-            );
-            this.signal?.addEventListener('abort', onAbort, { once: true });
+            const onAbort = (): void => settle(() => reject(new ResolutionDeadlineError(this.failureReason ?? 'aborted')));
+            this.cancellationSignal.addEventListener('abort', onAbort, { once: true });
+            if (this.cancellationSignal.aborted) {
+                onAbort();
+                return;
+            }
             Promise.resolve().then(operation).then(
                 value => settle(() => resolve(value)),
                 error => settle(() => reject(error))
             );
         });
+    }
+
+    dispose(): void {
+        clearTimeout(this.timer);
+        this.signal?.removeEventListener('abort', this.onExternalAbort);
+    }
+
+    private abort(reason: 'deadline' | 'aborted'): void {
+        if (this.failureReason) {
+            return;
+        }
+        this.failureReason = reason;
+        this.controller.abort();
     }
 }
 
@@ -182,10 +212,17 @@ const MAX_MANIFEST_BYTES = 16 * 1024;
 const MAX_PACKAGE_JSON_BYTES = 16 * 1024;
 const MAX_NATIVE_HEADER_BYTES = 64 * 1024;
 const MAX_POSIX_SYMLINK_HOPS = 8;
+const MAX_PROVIDER_ENVIRONMENT_BYTES = 128 * 1024;
+const MAX_PROVIDER_ENVIRONMENT_ENTRIES = 1_024;
+const MAX_PROVIDER_KEY_BYTES = 1_024;
+const MAX_PROVIDER_VALUE_BYTES = 64 * 1024;
+const MAX_PROVIDER_PATH_BYTES = 32 * 1024;
 const DEFAULT_DISCOVERY_TIMEOUT_MS = 10_000;
 const DEFAULT_MAX_SYSTEM_PROBES = 8;
 const SYSTEM_DISCOVERY_LIMIT_DIAGNOSTIC = 'System runtime discovery: PATH scan was truncated at safe limits.';
 const SYSTEM_PROBE_LIMIT_DIAGNOSTIC = 'System runtime discovery: executable probe limit was reached.';
+const SYSTEM_PROVIDER_UNAVAILABLE_DIAGNOSTIC = 'System runtime discovery provider is unavailable or returned invalid data.';
+const MANAGED_PROVIDER_UNAVAILABLE_DIAGNOSTIC = 'Managed runtime provider is unavailable or returned invalid data.';
 
 const PLATFORM_PACKAGE_BY_TARGET: Readonly<Record<string, string>> = Object.freeze({
     'x86_64-unknown-linux-musl': 'codex-linux-x64',
@@ -234,9 +271,12 @@ export class RideCodexRuntimeResolver {
     private readonly discoveryTimeoutMs: number;
     private readonly maxSystemProbes: number;
     private readonly signal: AbortSignal | undefined;
+    private generation = 0;
     private successfulResolution: RideCodexLaunchSpec | undefined;
+    private successfulGeneration: number | undefined;
     private inFlightResolution: Promise<RideCodexLaunchSpec> | undefined;
-    private invalidateAfterInFlight = false;
+    private inFlightGeneration: number | undefined;
+    private queuedResolution: Promise<RideCodexLaunchSpec> | undefined;
 
     constructor(options: RideCodexRuntimeResolverOptions = {}) {
         this.platform = options.platform ?? process.platform;
@@ -255,59 +295,110 @@ export class RideCodexRuntimeResolver {
     }
 
     resolve(): Promise<RideCodexLaunchSpec> {
-        if (this.successfulResolution) {
+        if (this.successfulResolution && this.successfulGeneration === this.generation) {
             return Promise.resolve(this.successfulResolution);
         }
-        if (this.inFlightResolution) {
+        if (this.inFlightResolution && this.inFlightGeneration === this.generation) {
             return this.inFlightResolution;
         }
+        if (this.queuedResolution) {
+            return this.queuedResolution;
+        }
+        if (this.inFlightResolution) {
+            const previous = this.inFlightResolution;
+            let queued!: Promise<RideCodexLaunchSpec>;
+            queued = previous.then(
+                () => undefined,
+                () => undefined
+            ).then(() => {
+                if (this.queuedResolution === queued) {
+                    this.queuedResolution = undefined;
+                }
+                return this.startResolution(this.generation);
+            }).finally(() => {
+                if (this.queuedResolution === queued) {
+                    this.queuedResolution = undefined;
+                }
+            });
+            this.queuedResolution = queued;
+            return queued;
+        }
+        return this.startResolution(this.generation);
+    }
+
+    invalidate(): void {
+        this.generation += 1;
+        this.successfulResolution = undefined;
+        this.successfulGeneration = undefined;
+    }
+
+    private startResolution(generation: number): Promise<RideCodexLaunchSpec> {
         const context: ResolutionContext = {
             deadline: new ResolutionDeadline(this.discoveryTimeoutMs, this.signal),
             maxSystemProbes: this.maxSystemProbes,
             systemProbes: 0
         };
         const resolution = this.resolveOnce(context).then(spec => {
-            if (!this.invalidateAfterInFlight) {
+            if (this.generation === generation) {
                 this.successfulResolution = spec;
+                this.successfulGeneration = generation;
             }
             return spec;
         }).finally(() => {
+            context.deadline.dispose();
             if (this.inFlightResolution === resolution) {
                 this.inFlightResolution = undefined;
-            }
-            if (this.invalidateAfterInFlight) {
-                this.successfulResolution = undefined;
-                this.invalidateAfterInFlight = false;
+                this.inFlightGeneration = undefined;
             }
         });
         this.inFlightResolution = resolution;
+        this.inFlightGeneration = generation;
         return resolution;
-    }
-
-    invalidate(): void {
-        this.successfulResolution = undefined;
-        if (this.inFlightResolution) {
-            this.invalidateAfterInFlight = true;
-        }
     }
 
     private async resolveOnce(context: ResolutionContext): Promise<RideCodexLaunchSpec> {
         context.deadline.check();
         const target = targetForPlatform(this.platform, this.arch);
-        const environment = this.readEnvironment();
+        let environment: Readonly<Record<string, string | undefined>>;
+        try {
+            environment = validateProviderEnvironment(this.readEnvironment());
+        } catch {
+            throw new RideCodexRuntimeConfigurationError(
+                'Codex environment provider is unavailable or returned invalid data.'
+            );
+        }
         context.deadline.check();
         const environmentOverride = readEnvironmentValue(environment, 'RIDE_CODEX_PATH', this.platform);
         if (environmentOverride !== undefined) {
             return this.resolveExplicit(environmentOverride, target, context);
         }
 
-        const userOverride = await context.deadline.run(() => this.readUserOverride());
+        let userOverride: string | undefined;
+        try {
+            userOverride = validateOptionalProviderPath(
+                await context.deadline.run(() => this.readUserOverride())
+            );
+        } catch {
+            context.deadline.check();
+            throw new RideCodexRuntimeConfigurationError(
+                'Codex runtime setting provider is unavailable or returned invalid data.'
+            );
+        }
         if (userOverride !== undefined) {
             return this.resolveExplicit(userOverride, target, context);
         }
 
-        const discovery = await context.deadline.run(() => this.discoverSystemCandidates(environment));
         const diagnostics: string[] = [];
+        let discovery: RideCodexSystemCandidateDiscovery;
+        try {
+            discovery = validateSystemCandidateDiscovery(
+                await context.deadline.run(() => this.discoverSystemCandidates(environment))
+            );
+        } catch {
+            context.deadline.check();
+            addDiagnostic(diagnostics, SYSTEM_PROVIDER_UNAVAILABLE_DIAGNOSTIC);
+            discovery = createSystemCandidateDiscovery([], 0, 0, false);
+        }
         for (const diagnostic of discovery.diagnostics) {
             addDiagnostic(diagnostics, diagnostic);
         }
@@ -330,7 +421,15 @@ export class RideCodexRuntimeResolver {
         }
 
         context.deadline.check();
-        const managed = normalizeOptionalCandidate(await context.deadline.run(() => this.readManagedActiveRuntime()));
+        let managed: string | undefined;
+        try {
+            managed = normalizeOptionalCandidate(validateOptionalProviderPath(
+                await context.deadline.run(() => this.readManagedActiveRuntime())
+            ));
+        } catch {
+            context.deadline.check();
+            addDiagnostic(diagnostics, MANAGED_PROVIDER_UNAVAILABLE_DIAGNOSTIC);
+        }
         if (managed) {
             try {
                 return await this.resolveCandidate(managed, 'managed', target, diagnostics, context);
@@ -377,7 +476,10 @@ export class RideCodexRuntimeResolver {
         }
         let probeResult: Awaited<ReturnType<RideCodexRuntimeProbeLike['probe']>>;
         try {
-            probeResult = await context.deadline.run(() => this.probe.probe(resolved.executable));
+            probeResult = await this.probe.probe(resolved.executable, {
+                signal: context.deadline.cancellationSignal,
+                timeoutMs: context.deadline.remainingMs()
+            });
         } catch (error) {
             context.deadline.check();
             throw new CandidateError(reasonFromError(error));
@@ -852,6 +954,7 @@ export function discoverDefaultCodexSystemCandidates(
 }
 
 function boundProvidedSystemCandidates(candidates: readonly string[]): RideCodexSystemCandidateDiscovery {
+    validateProviderCandidateArray(candidates);
     const truncated = candidates.length > MAX_SYSTEM_CANDIDATES;
     return createSystemCandidateDiscovery(
         candidates.slice(0, MAX_SYSTEM_CANDIDATES),
@@ -907,6 +1010,78 @@ function readEnvironmentValue(
 function normalizeOptionalCandidate(candidate: string | undefined): string | undefined {
     const trimmed = candidate?.trim();
     return trimmed || undefined;
+}
+
+function validateProviderEnvironment(value: unknown): Readonly<Record<string, string | undefined>> {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+        throw new Error('invalid provider environment');
+    }
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+        throw new Error('invalid provider environment');
+    }
+    const keys = Object.keys(value);
+    if (keys.length > MAX_PROVIDER_ENVIRONMENT_ENTRIES) {
+        throw new Error('provider environment is too large');
+    }
+    const bounded: Record<string, string | undefined> = Object.create(null) as Record<string, string | undefined>;
+    let totalBytes = 0;
+    for (const key of keys) {
+        const entry = (value as Record<string, unknown>)[key];
+        if ((entry !== undefined && typeof entry !== 'string') || key.includes('\0') || entry?.includes('\0')) {
+            throw new Error('invalid provider environment entry');
+        }
+        const keyBytes = Buffer.byteLength(key);
+        const valueBytes = typeof entry === 'string' ? Buffer.byteLength(entry) : 0;
+        if (keyBytes > MAX_PROVIDER_KEY_BYTES || valueBytes > MAX_PROVIDER_VALUE_BYTES
+            || totalBytes + keyBytes + valueBytes > MAX_PROVIDER_ENVIRONMENT_BYTES) {
+            throw new Error('provider environment is too large');
+        }
+        bounded[key] = entry;
+        totalBytes += keyBytes + valueBytes;
+    }
+    return Object.freeze(bounded);
+}
+
+function validateOptionalProviderPath(value: unknown): string | undefined {
+    if (value === undefined) {
+        return undefined;
+    }
+    if (typeof value !== 'string' || value.includes('\0') || Buffer.byteLength(value) > MAX_PROVIDER_PATH_BYTES) {
+        throw new Error('invalid provider path');
+    }
+    return value;
+}
+
+function validateProviderCandidateArray(value: unknown): asserts value is readonly string[] {
+    if (!Array.isArray(value)) {
+        throw new Error('invalid system candidate provider result');
+    }
+    const inspected = value.slice(0, MAX_SYSTEM_CANDIDATES + 1);
+    for (const candidate of inspected) {
+        validateOptionalProviderPath(candidate);
+    }
+}
+
+function validateSystemCandidateDiscovery(value: unknown): RideCodexSystemCandidateDiscovery {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+        throw new Error('invalid system discovery result');
+    }
+    const discovery = value as Partial<RideCodexSystemCandidateDiscovery>;
+    validateProviderCandidateArray(discovery.candidates);
+    if (!Array.isArray(discovery.diagnostics)
+        || discovery.diagnostics.some(diagnostic => typeof diagnostic !== 'string')
+        || !Number.isSafeInteger(discovery.scannedPathBytes) || discovery.scannedPathBytes! < 0
+        || !Number.isSafeInteger(discovery.scannedDirectories) || discovery.scannedDirectories! < 0
+        || typeof discovery.truncated !== 'boolean') {
+        throw new Error('invalid system discovery result');
+    }
+    return createSystemCandidateDiscovery(
+        discovery.candidates,
+        discovery.scannedPathBytes!,
+        discovery.scannedDirectories!,
+        discovery.truncated
+    );
 }
 
 function isCompatibleVersion(version: string): boolean {
@@ -1052,7 +1227,10 @@ function reasonFromError(error: unknown): string {
 }
 
 function sanitizeReason(reason: string): string {
-    const safe = reason
+    const bounded = typeof reason === 'string' ? reason.slice(0, MAX_DIAGNOSTIC_LENGTH * 4) : '';
+    const safe = bounded
+        .replace(/\b(?:https?|wss?):\/\/[^\s/@:]+:[^\s/@]+@/gi, match => `${match.slice(0, match.indexOf('://') + 3)}[redacted]@`)
+        .replace(/\b(?:[A-Z0-9_]*(?:API.?KEY|TOKEN|AUTHORIZATION|SECRET|PASSWORD|CREDENTIAL)[A-Z0-9_]*)\s*[:=]\s*\S+/gi, '[redacted]')
         .replace(/(?:OPENAI|CODEX|RIDE)_[A-Z0-9_]+\s*=\s*\S+/gi, '[redacted]')
         .slice(0, MAX_DIAGNOSTIC_LENGTH);
     return safe || 'Codex runtime could not be verified safely.';

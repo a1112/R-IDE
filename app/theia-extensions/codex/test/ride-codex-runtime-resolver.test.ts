@@ -86,6 +86,7 @@ type ManifestOverrides = Partial<{
 interface ProbeLimits {
     readonly timeoutMs: number;
     readonly maxOutputBytes: number;
+    readonly signal?: AbortSignal;
 }
 
 class VirtualFileSystem implements RideCodexRuntimeFileSystem {
@@ -189,9 +190,34 @@ class FakeProbe implements RideCodexRuntimeProbeLike {
         this.versions.set(this.key(path), version);
     }
 
-    async probe(executable: string): Promise<{ readonly version: string }> {
+    async probe(
+        executable: string,
+        request: { readonly signal?: AbortSignal } = {}
+    ): Promise<{ readonly version: string }> {
         this.calls.push({ executable });
-        await this.delay;
+        if (this.delay) {
+            await new Promise<void>((resolve, reject) => {
+                let settled = false;
+                const finish = (callback: () => void): void => {
+                    if (settled) {
+                        return;
+                    }
+                    settled = true;
+                    request.signal?.removeEventListener('abort', onAbort);
+                    callback();
+                };
+                const onAbort = (): void => finish(() => reject(new Error('Codex probe was aborted.')));
+                request.signal?.addEventListener('abort', onAbort, { once: true });
+                if (request.signal?.aborted) {
+                    onAbort();
+                    return;
+                }
+                this.delay!.then(
+                    () => finish(resolve),
+                    error => finish(() => reject(error))
+                );
+            });
+        }
         const failure = this.failures.get(this.key(executable));
         if (failure) {
             throw failure;
@@ -609,6 +635,118 @@ test('all implicit failures produce a bounded explicit no-runtime error', async 
     });
 });
 
+test('runtime providers enforce bounded typed outputs and never disclose provider failures', async t => {
+    const unsafeProviderError = (): Error => new Error(
+        `OPENAI_API_KEY=provider-secret Authorization=Bearer-token https://user:password@example.invalid/${'x'.repeat(10_000)}`
+    );
+    const assertSafe = (error: unknown): boolean => {
+        const runtimeError = error as Error & { readonly diagnostics?: readonly string[] };
+        const visible = `${runtimeError.message}\n${runtimeError.stack ?? ''}\n${runtimeError.diagnostics?.join('\n') ?? ''}`;
+        assert.doesNotMatch(visible, /provider-secret|Bearer-token|user:password|x{32}/i);
+        assert.ok(runtimeError.message.length <= 240);
+        assert.ok((runtimeError.diagnostics ?? []).every(diagnostic => diagnostic.length <= 160));
+        return true;
+    };
+
+    await t.test('environment provider exceptions fail closed with a generic actionable error', async () => {
+        let userReads = 0;
+        const resolver = new RideCodexRuntimeResolver({
+            platform: 'win32', arch: 'x64', filesystem: new VirtualFileSystem(), probe: new FakeProbe(),
+            readEnvironment: () => { throw unsafeProviderError(); },
+            readUserOverride: () => { userReads += 1; return WINDOWS_NATIVE; }
+        });
+        await assert.rejects(resolver.resolve(), error => {
+            assert.ok(error instanceof RideCodexRuntimeConfigurationError);
+            assert.match((error as Error).message, /environment|configure|setting/i);
+            return assertSafe(error);
+        });
+        assert.equal(userReads, 0);
+    });
+
+    await t.test('environment provider rejects invalid and oversized records safely', async () => {
+        for (const environment of [
+            null,
+            [] as unknown[],
+            Promise.resolve({ PATH: 'C:\\bin' }),
+            { PATH: 42 },
+            { PATH: 'x'.repeat(200_000) }
+        ]) {
+            const resolver = new RideCodexRuntimeResolver({
+                platform: 'win32', arch: 'x64', filesystem: new VirtualFileSystem(), probe: new FakeProbe(),
+                readEnvironment: () => environment as unknown as Readonly<Record<string, string | undefined>>
+            });
+            await assert.rejects(resolver.resolve(), error => {
+                assert.ok(error instanceof RideCodexRuntimeConfigurationError);
+                return assertSafe(error);
+            });
+        }
+    });
+
+    await t.test('user override exceptions and invalid values fail closed without fallback', async () => {
+        for (const readUserOverride of [
+            () => { throw unsafeProviderError(); },
+            () => 42 as unknown as string,
+            () => 'C:\\'.concat('x'.repeat(100_000))
+        ]) {
+            let systemReads = 0;
+            const resolver = new RideCodexRuntimeResolver({
+                platform: 'win32', arch: 'x64', filesystem: new VirtualFileSystem(), probe: new FakeProbe(),
+                readEnvironment: () => ({}),
+                readUserOverride,
+                findSystemCandidates: () => { systemReads += 1; return [WINDOWS_NATIVE]; }
+            });
+            await assert.rejects(resolver.resolve(), error => {
+                assert.ok(error instanceof RideCodexRuntimeConfigurationError);
+                assert.match((error as Error).message, /setting|configure|override/i);
+                return assertSafe(error);
+            });
+            assert.equal(systemReads, 0);
+        }
+    });
+
+    await t.test('system discovery exceptions and invalid values continue to a managed runtime', async () => {
+        for (const findSystemCandidates of [
+            () => { throw unsafeProviderError(); },
+            () => ({ secret: 'provider-secret' }) as unknown as readonly string[],
+            () => [42] as unknown as readonly string[],
+            () => ['C:\\'.concat('x'.repeat(100_000))]
+        ]) {
+            const fs = new VirtualFileSystem();
+            fs.addFile(WINDOWS_NATIVE, peHeader('x64'));
+            const resolver = new RideCodexRuntimeResolver({
+                platform: 'win32', arch: 'x64', filesystem: fs, probe: new FakeProbe(),
+                readEnvironment: () => ({}),
+                findSystemCandidates,
+                readManagedActiveRuntime: () => WINDOWS_NATIVE
+            });
+            const spec = await resolver.resolve();
+            assertLaunchSpec(spec, { executable: WINDOWS_NATIVE, source: 'managed' });
+            assert.match(spec.diagnostics.join(' '), /system.*unavailable|system.*invalid/i);
+            assertSafe({ message: '', diagnostics: spec.diagnostics });
+        }
+    });
+
+    await t.test('managed provider exceptions and invalid values become generic unavailable diagnostics', async () => {
+        for (const readManagedActiveRuntime of [
+            () => { throw unsafeProviderError(); },
+            () => ({ secret: 'provider-secret' }) as unknown as string,
+            () => 'C:\\'.concat('x'.repeat(100_000))
+        ]) {
+            const resolver = new RideCodexRuntimeResolver({
+                platform: 'win32', arch: 'x64', filesystem: new VirtualFileSystem(), probe: new FakeProbe(),
+                readEnvironment: () => ({}),
+                findSystemCandidates: () => [],
+                readManagedActiveRuntime
+            });
+            await assert.rejects(resolver.resolve(), error => {
+                assert.ok(error instanceof RideCodexRuntimeUnavailableError);
+                assert.match((error as RideCodexRuntimeUnavailableError).diagnostics.join(' '), /managed.*unavailable|managed.*invalid/i);
+                return assertSafe(error);
+            });
+        }
+    });
+});
+
 test('resolves cmd and PowerShell npm launchers to native optional-package executables without probing wrappers', async t => {
     const cases = [
         { wrapper: 'C:\\npm\\codex.cmd', nested: false },
@@ -956,7 +1094,7 @@ test('probe subprocess receives only a bounded channel-neutral environment', asy
     assert.ok(Buffer.byteLength(JSON.stringify(environment)) < 4_096);
 });
 
-test('failed resolutions retry, successful resolutions cache, and invalidate never duplicates in-flight work', async () => {
+test('failed resolutions retry, successful resolutions cache, and invalidate queues a fresh generation', async () => {
     let configuredPath = 'C:\\missing\\codex.exe';
     let environmentReads = 0;
     const fs = new VirtualFileSystem();
@@ -981,23 +1119,67 @@ test('failed resolutions retry, successful resolutions cache, and invalidate nev
     assert.strictEqual(await resolver.resolve(), recovered);
     assert.equal(environmentReads, 2);
 
-    let releaseProbe: (() => void) | undefined;
-    probe.delay = new Promise<void>(resolve => {
-        releaseProbe = resolve;
+    const firstPath = 'C:\\first-generation\\codex.exe';
+    const secondPath = 'C:\\second-generation\\codex.exe';
+    const refreshFs = new VirtualFileSystem();
+    refreshFs.addFile(firstPath, peHeader('x64'));
+    refreshFs.addFile(secondPath, peHeader('x64'));
+    let refreshPath = firstPath;
+    let releaseFirstProbe: (() => void) | undefined;
+    let markFirstProbeStarted: (() => void) | undefined;
+    const firstProbeStarted = new Promise<void>(resolve => {
+        markFirstProbeStarted = resolve;
     });
-    resolver.invalidate();
-    const first = resolver.resolve();
-    resolver.invalidate();
-    const concurrent = resolver.resolve();
-    assert.strictEqual(first, concurrent);
-    releaseProbe?.();
-    await first;
-    assert.equal(probe.calls.length, 2);
+    const firstProbeGate = new Promise<void>(resolve => {
+        releaseFirstProbe = resolve;
+    });
+    const calls: string[] = [];
+    let activeProbes = 0;
+    let maximumActiveProbes = 0;
+    const refreshProbe: RideCodexRuntimeProbeLike = {
+        probe: async executable => {
+            calls.push(executable);
+            activeProbes += 1;
+            maximumActiveProbes = Math.max(maximumActiveProbes, activeProbes);
+            try {
+                if (calls.length === 1) {
+                    markFirstProbeStarted?.();
+                    await firstProbeGate;
+                }
+                return { version: '0.144.0' };
+            } finally {
+                activeProbes -= 1;
+            }
+        }
+    };
+    const refreshResolver = new RideCodexRuntimeResolver({
+        platform: 'win32', arch: 'x64', filesystem: refreshFs, probe: refreshProbe,
+        readEnvironment: () => ({ RIDE_CODEX_PATH: refreshPath })
+    });
 
-    probe.delay = undefined;
-    await resolver.resolve();
-    assert.equal(probe.calls.length, 3);
-    assert.equal(environmentReads, 4);
+    const stale = refreshResolver.resolve();
+    await firstProbeStarted;
+    refreshPath = secondPath;
+    refreshResolver.invalidate();
+    const refreshed = refreshResolver.resolve();
+    const concurrentRefresh = refreshResolver.resolve();
+
+    assert.notStrictEqual(refreshed, stale);
+    assert.strictEqual(concurrentRefresh, refreshed);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(calls, [firstPath]);
+    assert.equal(maximumActiveProbes, 1);
+
+    releaseFirstProbe?.();
+    const staleSpec = await stale;
+    const refreshedSpec = await refreshed;
+    assertLaunchSpec(staleSpec, { executable: firstPath, source: 'override' });
+    assertLaunchSpec(refreshedSpec, { executable: secondPath, source: 'override' });
+    assert.deepEqual(calls, [firstPath, secondPath]);
+    assert.equal(maximumActiveProbes, 1);
+    assert.strictEqual(await refreshResolver.resolve(), refreshedSpec);
+
+    assert.equal(environmentReads, 2);
 });
 
 test('runtime discovery bounds real probes, deadlines, blocking filesystem work, and network paths', async t => {
@@ -1182,6 +1364,114 @@ test('probe timeout escalates termination, settles once, and clears grace timers
         const timeoutsAfter = process.getActiveResourcesInfo().filter(resource => resource === 'Timeout').length;
         assert.equal(timeoutsAfter, timeoutsBefore);
         assert.deepEqual(child.signals, ['SIGTERM']);
+    });
+});
+
+test('probe cancellation propagates through both probe stages and process termination', async t => {
+    await t.test('resolver deadline cancels the active child before resolution rejects', async () => {
+        const child = new FakeSpawnedProcess();
+        child.onKill = () => queueMicrotask(() => child.emit('close', null, 'SIGTERM'));
+        const runner = new RideCodexBoundedExecRunner({
+            platform: 'win32',
+            spawn: () => child,
+            terminationGraceMs: 5,
+            terminationHardLimitMs: 50
+        });
+        const fs = new VirtualFileSystem();
+        fs.addFile(WINDOWS_NATIVE, peHeader('x64'));
+        const resolver = new RideCodexRuntimeResolver({
+            platform: 'win32',
+            arch: 'x64',
+            filesystem: fs,
+            probe: new RideCodexRuntimeProbe({ runner, versionTimeoutMs: 1_000, helpTimeoutMs: 1_000 }),
+            readEnvironment: () => ({ RIDE_CODEX_PATH: WINDOWS_NATIVE }),
+            discoveryTimeoutMs: 20
+        });
+
+        await assert.rejects(resolver.resolve(), /deadline|timed out/i);
+
+        assert.deepEqual(child.signals, [undefined]);
+        assert.equal(child.listenerCount('close'), 0);
+        assert.equal(child.listenerCount('error'), 0);
+        assert.equal(child.stdout.listenerCount('data'), 0);
+    });
+
+    for (const stage of ['version', 'help'] as const) {
+        await t.test(`external abort terminates the ${stage} child`, async () => {
+            const controller = new AbortController();
+            const children: FakeSpawnedProcess[] = [];
+            let helpStarted: (() => void) | undefined;
+            const helpGate = new Promise<void>(resolve => {
+                helpStarted = resolve;
+            });
+            const runner = new RideCodexBoundedExecRunner({
+                platform: 'linux',
+                terminationGraceMs: 5,
+                terminationHardLimitMs: 50,
+                spawn: (_executable, args) => {
+                    const child = new FakeSpawnedProcess();
+                    children.push(child);
+                    child.onKill = () => queueMicrotask(() => child.emit('close', null, 'SIGTERM'));
+                    if (args[0] === '--version' && stage === 'help') {
+                        queueMicrotask(() => {
+                            child.stdout.end('codex-cli 0.144.0\n');
+                            child.emit('close', 0, null);
+                        });
+                    } else if (args[0] === 'app-server') {
+                        helpStarted?.();
+                    }
+                    return child;
+                }
+            });
+            const probe = new RideCodexRuntimeProbe({ runner, versionTimeoutMs: 1_000, helpTimeoutMs: 1_000 });
+            const pending = probe.probe('/opt/codex', { signal: controller.signal, timeoutMs: 500 });
+            if (stage === 'help') {
+                await helpGate;
+            } else {
+                await new Promise(resolve => setImmediate(resolve));
+            }
+
+            controller.abort();
+            await assert.rejects(pending, /abort/i);
+
+            const activeChild = children[children.length - 1];
+            assert.deepEqual(activeChild.signals, ['SIGTERM']);
+            assert.equal(activeChild.listenerCount('close'), 0);
+            assert.equal(activeChild.listenerCount('error'), 0);
+        });
+    }
+
+    await t.test('abort, error, exit, and close races settle once without listeners or timers', async () => {
+        const controller = new AbortController();
+        const child = new FakeSpawnedProcess();
+        child.onKill = () => queueMicrotask(() => {
+            child.emit('error', new Error('OPENAI_API_KEY=race-secret'));
+            child.emit('exit', null, 'SIGTERM');
+            child.emit('close', null, 'SIGTERM');
+        });
+        const runner = new RideCodexBoundedExecRunner({
+            platform: 'linux', spawn: () => child, terminationGraceMs: 10, terminationHardLimitMs: 40
+        });
+        let settlements = 0;
+        const pending = runner.run('/opt/codex', ['--version'], {
+            timeoutMs: 1_000,
+            maxOutputBytes: 1_024,
+            signal: controller.signal
+        }).then(
+            () => { settlements += 1; },
+            () => { settlements += 1; }
+        );
+
+        controller.abort();
+        await pending;
+        await new Promise(resolve => setImmediate(resolve));
+
+        assert.equal(settlements, 1);
+        assert.deepEqual(child.signals, ['SIGTERM']);
+        assert.equal(child.listenerCount('error'), 0);
+        assert.equal(child.listenerCount('exit'), 0);
+        assert.equal(child.listenerCount('close'), 0);
+        assert.equal(child.stdout.listenerCount('data'), 0);
     });
 });
 

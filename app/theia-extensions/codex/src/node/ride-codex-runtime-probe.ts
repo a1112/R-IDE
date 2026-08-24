@@ -7,7 +7,7 @@
 import { spawn as nodeSpawn } from 'node:child_process';
 import compatibility from '../common/codex-app-server-compatibility.json';
 
-export type RideCodexProbeFailureReason = 'timeout' | 'max-output' | 'not-found' | 'spawn' | 'exit' | 'signal';
+export type RideCodexProbeFailureReason = 'timeout' | 'aborted' | 'max-output' | 'not-found' | 'spawn' | 'exit' | 'signal';
 
 export class RideCodexProbeCommandError extends Error {
     constructor(readonly reason: RideCodexProbeFailureReason, _unsafeDetail?: string) {
@@ -19,6 +19,7 @@ export class RideCodexProbeCommandError extends Error {
 export interface RideCodexProbeCommandLimits {
     readonly timeoutMs: number;
     readonly maxOutputBytes: number;
+    readonly signal?: AbortSignal;
 }
 
 export interface RideCodexProbeCommandResult {
@@ -101,6 +102,9 @@ export class RideCodexBoundedExecRunner implements RideCodexProbeCommandRunner {
             || !Number.isSafeInteger(limits.maxOutputBytes) || limits.maxOutputBytes <= 0) {
             return Promise.reject(new RideCodexProbeCommandError('spawn'));
         }
+        if (limits.signal?.aborted) {
+            return Promise.reject(new RideCodexProbeCommandError('aborted'));
+        }
 
         return new Promise<RideCodexProbeCommandResult>((resolve, reject) => {
             let child: RideCodexSpawnedProcess;
@@ -143,6 +147,7 @@ export class RideCodexBoundedExecRunner implements RideCodexProbeCommandRunner {
                 child.removeListener('error', onError);
                 child.removeListener('close', onClose);
                 child.removeListener('exit', onExit);
+                limits.signal?.removeEventListener('abort', onAbort);
             };
             const rejectOnce = (reason: RideCodexProbeFailureReason): void => {
                 if (settled) {
@@ -198,6 +203,7 @@ export class RideCodexBoundedExecRunner implements RideCodexProbeCommandRunner {
                 killChild(true);
                 rejectOnce('spawn');
             };
+            const onAbort = (): void => terminate('aborted');
             const onError = (error: NodeJS.ErrnoException): void => {
                 if (!terminalReason) {
                     rejectOnce(error.code === 'ENOENT' ? 'not-found' : 'spawn');
@@ -248,6 +254,10 @@ export class RideCodexBoundedExecRunner implements RideCodexProbeCommandRunner {
             child.once('close', onClose);
             child.once('exit', onExit);
             operationTimer = setTimeout(() => terminate('timeout'), limits.timeoutMs);
+            limits.signal?.addEventListener('abort', onAbort, { once: true });
+            if (limits.signal?.aborted) {
+                onAbort();
+            }
         });
     }
 }
@@ -295,8 +305,13 @@ export interface RideCodexRuntimeProbeResult {
     readonly version: string;
 }
 
+export interface RideCodexRuntimeProbeRequest {
+    readonly signal?: AbortSignal;
+    readonly timeoutMs?: number;
+}
+
 export interface RideCodexRuntimeProbeLike {
-    probe(executable: string): Promise<RideCodexRuntimeProbeResult>;
+    probe(executable: string, request?: RideCodexRuntimeProbeRequest): Promise<RideCodexRuntimeProbeResult>;
 }
 
 export interface RideCodexRuntimeProbeOptions {
@@ -323,11 +338,15 @@ export class RideCodexRuntimeProbe implements RideCodexRuntimeProbeLike {
         this.maxOutputBytes = options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
     }
 
-    async probe(executable: string): Promise<RideCodexRuntimeProbeResult> {
+    async probe(executable: string, request: RideCodexRuntimeProbeRequest = {}): Promise<RideCodexRuntimeProbeResult> {
+        const expiresAt = Number.isFinite(request.timeoutMs) && request.timeoutMs! > 0
+            ? Date.now() + request.timeoutMs!
+            : Number.POSITIVE_INFINITY;
         const versionOutput = await this.runProbe(
             executable,
             ['--version'],
-            this.versionTimeoutMs,
+            boundedStageTimeout(this.versionTimeoutMs, expiresAt),
+            request.signal,
             'Codex CLI version probe failed'
         );
         const version = parseCodexVersion(`${versionOutput.stdout}\n${versionOutput.stderr}`);
@@ -343,7 +362,8 @@ export class RideCodexRuntimeProbe implements RideCodexRuntimeProbeLike {
         const helpOutput = await this.runProbe(
             executable,
             ['app-server', '--help'],
-            this.helpTimeoutMs,
+            boundedStageTimeout(this.helpTimeoutMs, expiresAt),
+            request.signal,
             'Codex App Server probe failed'
         );
         const help = `${helpOutput.stdout}\n${helpOutput.stderr}`;
@@ -357,18 +377,28 @@ export class RideCodexRuntimeProbe implements RideCodexRuntimeProbeLike {
         executable: string,
         args: readonly string[],
         timeoutMs: number,
+        signal: AbortSignal | undefined,
         label: string
     ): Promise<RideCodexProbeCommandResult> {
         try {
-            return await this.runner.run(executable, args, {
+            const limits: RideCodexProbeCommandLimits = {
                 timeoutMs,
-                maxOutputBytes: this.maxOutputBytes
-            });
+                maxOutputBytes: this.maxOutputBytes,
+                ...(signal ? { signal } : {})
+            };
+            return await this.runner.run(executable, args, limits);
         } catch (error) {
             const reason = error instanceof RideCodexProbeCommandError ? ` (${error.reason})` : '';
             throw new Error(`${label}${reason}.`);
         }
     }
+}
+
+function boundedStageTimeout(stageTimeoutMs: number, expiresAt: number): number {
+    if (!Number.isFinite(expiresAt)) {
+        return stageTimeoutMs;
+    }
+    return Math.max(1, Math.min(stageTimeoutMs, expiresAt - Date.now()));
 }
 
 function parseCodexVersion(output: string): string | undefined {
@@ -396,6 +426,7 @@ function compareVersions(left: string, right: string): number {
 function commandFailureMessage(reason: RideCodexProbeFailureReason): string {
     switch (reason) {
         case 'timeout': return 'Codex probe timed out.';
+        case 'aborted': return 'Codex probe was aborted.';
         case 'max-output': return 'Codex probe exceeded the output limit.';
         case 'not-found': return 'Codex executable was not found.';
         case 'exit': return 'Codex probe exited unsuccessfully.';
