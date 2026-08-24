@@ -5,7 +5,8 @@
  ********************************************************************************/
 
 export class RideCodexJsonlFramer {
-    protected buffered: Buffer = Buffer.alloc(0);
+    protected readonly buffered: Buffer[] = [];
+    protected bufferedBytes = 0;
     protected failed = false;
 
     constructor(protected readonly maxLineBytes: number) {
@@ -27,33 +28,25 @@ export class RideCodexJsonlFramer {
         try {
             while (newline !== -1) {
                 const segment = bytes.subarray(offset, newline);
-                const rawLength = this.buffered.length + segment.length;
-                const endsWithCarriageReturn = segment.length > 0
-                    ? segment[segment.length - 1] === 0x0d
-                    : this.buffered.length > 0 && this.buffered[this.buffered.length - 1] === 0x0d;
-                const lineLength = rawLength - (endsWithCarriageReturn ? 1 : 0);
-                this.assertWithinLimit(lineLength);
+                this.appendBuffered(segment);
+                const endsWithCarriageReturn = this.endsWithCarriageReturn();
 
-                const rawLine = this.joinBuffered(segment, rawLength);
+                const rawLine = this.joinBuffered();
                 const line = endsWithCarriageReturn ? rawLine.subarray(0, rawLine.length - 1) : rawLine;
                 lines.push(Buffer.from(line));
-                this.buffered = Buffer.alloc(0);
+                this.clearBuffered();
                 offset = newline + 1;
                 newline = bytes.indexOf(0x0a, offset);
             }
 
             const remainder = bytes.subarray(offset);
             if (remainder.length > 0) {
-                const rawLength = this.buffered.length + remainder.length;
-                const endsWithCarriageReturn = remainder[remainder.length - 1] === 0x0d;
-                const bufferedLength = rawLength - (endsWithCarriageReturn ? 1 : 0);
-                this.assertWithinLimit(bufferedLength);
-                this.buffered = this.joinBuffered(remainder, rawLength);
+                this.appendBuffered(remainder);
             }
             return lines;
         } catch (error) {
             this.failed = true;
-            this.buffered = Buffer.alloc(0);
+            this.clearBuffered();
             throw error;
         }
     }
@@ -64,13 +57,34 @@ export class RideCodexJsonlFramer {
         }
     }
 
-    protected joinBuffered(segment: Uint8Array, length: number): Buffer {
-        if (this.buffered.length === 0) {
-            return Buffer.from(segment);
+    protected appendBuffered(segment: Uint8Array): void {
+        if (segment.length === 0) {
+            return;
         }
-        const joined = Buffer.allocUnsafe(length);
-        this.buffered.copy(joined, 0);
-        joined.set(segment, this.buffered.length);
-        return joined;
+        const nextLength = this.bufferedBytes + segment.length;
+        const endsWithCarriageReturn = segment[segment.length - 1] === 0x0d;
+        this.assertWithinLimit(nextLength - (endsWithCarriageReturn ? 1 : 0));
+        this.buffered.push(Buffer.from(segment));
+        this.bufferedBytes = nextLength;
+    }
+
+    protected endsWithCarriageReturn(): boolean {
+        const last = this.buffered[this.buffered.length - 1];
+        return last !== undefined && last[last.length - 1] === 0x0d;
+    }
+
+    protected joinBuffered(): Buffer {
+        if (this.buffered.length === 0) {
+            return Buffer.alloc(0);
+        }
+        if (this.buffered.length === 1) {
+            return this.buffered[0];
+        }
+        return Buffer.concat(this.buffered, this.bufferedBytes);
+    }
+
+    protected clearBuffered(): void {
+        this.buffered.length = 0;
+        this.bufferedBytes = 0;
     }
 }

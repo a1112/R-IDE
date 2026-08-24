@@ -60,6 +60,8 @@ const DEFAULT_MAX_PENDING = 128;
 const DEFAULT_MAX_DIAGNOSTICS = 32;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const MAX_TIMER_MS = 0x7fffffff;
+const MAX_REQUEST_ID_LENGTH = 1_024;
+const MAX_ERROR_MESSAGE_LENGTH = 16 * 1_024;
 
 export class RideCodexRemoteError extends Error {
     constructor(readonly code: number, message: string, readonly data?: unknown) {
@@ -75,11 +77,11 @@ export class RideCodexJsonlClient implements RideCodexDisposable {
     protected readonly notificationListeners = new Set<(notification: RideCodexNotification) => void>();
     protected readonly serverRequestListeners = new Set<(request: RideCodexIncomingRequest) => void>();
     protected readonly diagnosticListeners = new Set<(diagnostic: RideCodexDiagnostic) => void>();
-    protected readonly diagnosedUnknownNotifications = new Set<string>();
     protected readonly transportListeners: RideCodexDisposable[] = [];
     protected readonly maxPending: number;
     protected readonly maxDiagnostics: number;
     protected nextRequestId: number | undefined;
+    protected unknownNotificationDiagnosticCount = 0;
     protected closed = false;
     protected closeReason: Error | undefined;
     protected transportCloseRequested = false;
@@ -94,10 +96,7 @@ export class RideCodexJsonlClient implements RideCodexDisposable {
         }
         this.nextRequestId = initialRequestId;
         this.framer = new RideCodexJsonlFramer(maxLineBytes);
-        this.transportListeners.push(
-            transport.onData(chunk => this.handleData(chunk)),
-            transport.onExit(reason => this.handleExit(reason))
-        );
+        this.registerTransportListeners();
     }
 
     get pendingCount(): number {
@@ -126,8 +125,8 @@ export class RideCodexJsonlClient implements RideCodexDisposable {
         let payload: string;
         try {
             payload = serializeEnvelope({ id, method, params });
-        } catch (error) {
-            return Promise.reject(asError(error, 'Unable to serialize Codex request'));
+        } catch {
+            return Promise.reject(new Error('Unable to serialize Codex request'));
         }
         this.nextRequestId = id === Number.MAX_SAFE_INTEGER ? undefined : id + 1;
 
@@ -153,12 +152,20 @@ export class RideCodexJsonlClient implements RideCodexDisposable {
         if (this.closed) {
             return;
         }
-        this.writePayload(serializeEnvelope({ id, result }));
+        validateOutboundRequestId(id);
+        this.writePayload(serializeEnvelope({ id, result: result === undefined ? null : result }));
     }
 
     respondError(id: RideCodexRequestId, code: number, message: string): void {
         if (this.closed) {
             return;
+        }
+        validateOutboundRequestId(id);
+        if (!Number.isSafeInteger(code)) {
+            throw new RangeError('Codex response error code must be a safe integer');
+        }
+        if (typeof message !== 'string' || message.length > MAX_ERROR_MESSAGE_LENGTH) {
+            throw new RangeError(`Codex response error message must be a string of at most ${MAX_ERROR_MESSAGE_LENGTH} characters`);
         }
         this.writePayload(serializeEnvelope({ id, error: { code, message } }));
     }
@@ -237,7 +244,7 @@ export class RideCodexJsonlClient implements RideCodexDisposable {
 
     protected handleNotification(notification: RideCodexServerNotification): void {
         if (!notification.reviewed) {
-            this.diagnoseUnknownNotification(notification.method);
+            this.diagnoseUnknownNotification();
             return;
         }
         this.emitSafely(this.notificationListeners, {
@@ -258,12 +265,11 @@ export class RideCodexJsonlClient implements RideCodexDisposable {
         }, 'server-request-listener-error', 'A Codex server request listener failed.');
     }
 
-    protected diagnoseUnknownNotification(method: string): void {
-        if (this.diagnosedUnknownNotifications.has(method)
-            || this.diagnosedUnknownNotifications.size >= this.maxDiagnostics) {
+    protected diagnoseUnknownNotification(): void {
+        if (this.unknownNotificationDiagnosticCount >= this.maxDiagnostics) {
             return;
         }
-        this.diagnosedUnknownNotifications.add(method);
+        this.unknownNotificationDiagnosticCount += 1;
         this.emitDiagnostic({
             code: 'unknown-server-notification',
             message: 'Ignored an unsupported Codex App Server notification.'
@@ -299,14 +305,36 @@ export class RideCodexJsonlClient implements RideCodexDisposable {
         this.shutdown(reason ?? new Error('Codex App Server transport exited'), false);
     }
 
+    protected registerTransportListeners(): void {
+        try {
+            if (!this.registerTransportListener(() => this.transport.onData(chunk => this.handleData(chunk)))) {
+                return;
+            }
+            this.registerTransportListener(() => this.transport.onExit(reason => this.handleExit(reason)));
+        } catch (error) {
+            this.disposeTransportListeners();
+            throw error;
+        }
+    }
+
+    protected registerTransportListener(factory: () => RideCodexDisposable): boolean {
+        const listener = factory();
+        if (this.closed) {
+            disposeSafely(listener);
+            return false;
+        }
+        this.transportListeners.push(listener);
+        return true;
+    }
+
     protected writePayload(payload: string): void {
         if (this.closed) {
             return;
         }
         try {
             this.transport.write(`${payload}\n`);
-        } catch (error) {
-            this.shutdown(asError(error, 'Codex App Server transport write failed'), true);
+        } catch {
+            this.shutdown(new Error('Codex App Server transport write failed'), true);
         }
     }
 
@@ -317,13 +345,7 @@ export class RideCodexJsonlClient implements RideCodexDisposable {
         this.closed = true;
         this.closeReason = reason;
 
-        for (const listener of this.transportListeners.splice(0)) {
-            try {
-                listener.dispose();
-            } catch {
-                // Listener cleanup is best effort; pending requests still need deterministic rejection.
-            }
-        }
+        this.disposeTransportListeners();
 
         const pending = [...this.pending.values()];
         this.pending.clear();
@@ -335,7 +357,7 @@ export class RideCodexJsonlClient implements RideCodexDisposable {
         this.notificationListeners.clear();
         this.serverRequestListeners.clear();
         this.diagnosticListeners.clear();
-        this.diagnosedUnknownNotifications.clear();
+        this.unknownNotificationDiagnosticCount = 0;
 
         if (closeTransport && !this.transportCloseRequested) {
             this.transportCloseRequested = true;
@@ -350,6 +372,12 @@ export class RideCodexJsonlClient implements RideCodexDisposable {
     protected closedRequestError(): Error {
         const suffix = this.closeReason?.message ? `: ${this.closeReason.message}` : '';
         return new Error(`Codex JSONL client is closed${suffix}`);
+    }
+
+    protected disposeTransportListeners(): void {
+        for (const listener of this.transportListeners.splice(0)) {
+            disposeSafely(listener);
+        }
     }
 }
 
@@ -374,11 +402,35 @@ function validateLimit(value: number, label: string, minimum: number): number {
 }
 
 function serializeEnvelope(value: unknown): string {
-    const serialized = JSON.stringify(value);
-    if (serialized === undefined) {
-        throw new TypeError('Unable to serialize Codex JSONL envelope');
+    try {
+        const serialized = JSON.stringify(value);
+        if (serialized !== undefined) {
+            return serialized;
+        }
+    } catch {
+        // Payload details must not be exposed through serialization diagnostics.
     }
-    return serialized;
+    throw new TypeError('Unable to serialize Codex JSONL envelope');
+}
+
+function validateOutboundRequestId(id: RideCodexRequestId): void {
+    if (typeof id === 'number' && Number.isSafeInteger(id)) {
+        return;
+    }
+    if (typeof id === 'string' && id.length > 0 && id.length <= MAX_REQUEST_ID_LENGTH) {
+        return;
+    }
+    throw new RangeError(
+        `Codex response request ID must be a safe integer or a non-empty string of at most ${MAX_REQUEST_ID_LENGTH} characters`
+    );
+}
+
+function disposeSafely(disposable: RideCodexDisposable): void {
+    try {
+        disposable.dispose();
+    } catch {
+        // Listener cleanup is best effort; pending requests still need deterministic rejection.
+    }
 }
 
 function asError(value: unknown, fallbackMessage: string): Error {

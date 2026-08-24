@@ -19,12 +19,15 @@ export interface RideCodexRpcError {
     data?: unknown;
 }
 
-export interface RideCodexResponse {
+interface RideCodexResponseBase {
     kind: 'response';
     id: RideCodexRequestId;
-    result?: unknown;
-    error?: RideCodexRpcError;
 }
+
+export type RideCodexResponse = RideCodexResponseBase & (
+    | { result: unknown; error?: never }
+    | { result?: never; error: RideCodexRpcError }
+);
 
 export interface RideCodexServerNotification {
     kind: 'notification';
@@ -103,9 +106,9 @@ export function validateRideCodexIncomingMessage(value: unknown): RideCodexIncom
     }
     if (hasError) {
         if (!isRecord(value.error)
-            || !Number.isInteger(value.error.code)
+            || !Number.isSafeInteger(value.error.code)
             || typeof value.error.message !== 'string') {
-            throw envelopeError('response error must contain an integer code and string message');
+            throw envelopeError('response error must contain a safe integer code and string message');
         }
         return {
             kind: 'response',
