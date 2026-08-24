@@ -1,0 +1,67 @@
+{
+  "codexCliVersion": "0.144.0",
+  "minimumCompatibleCliVersion": "0.144.0",
+  "maximumCompatibleCliVersion": "0.144.0",
+  "minimumCompatibleProtocolVersion": "0.144.0",
+  "maximumCompatibleProtocolVersion": "0.144.0",
+  "schemaDirectory": "generated/app-server/0.144.0",
+  "targets": {
+    "jsonSchema": "schema.json",
+    "typescript": "types"
+  },
+  "clientNotificationMethods": [
+    "initialized"
+  ],
+  "clientMethods": [
+    "initialize",
+    "account/read",
+    "account/login/start",
+    "account/login/cancel",
+    "account/logout",
+    "account/rateLimits/read",
+    "config/read",
+    "config/value/write",
+    "model/list",
+    "modelProvider/capabilities/read",
+    "thread/list",
+    "thread/read",
+    "thread/start",
+    "thread/resume",
+    "thread/archive",
+    "turn/start",
+    "turn/steer",
+    "turn/interrupt"
+  ],
+  "serverNotificationMethods": [
+    "error",
+    "account/updated",
+    "account/login/completed",
+    "account/rateLimits/updated",
+    "model/rerouted",
+    "model/verification",
+    "thread/started",
+    "thread/status/changed",
+    "thread/archived",
+    "turn/started",
+    "turn/completed",
+    "turn/diff/updated",
+    "turn/plan/updated",
+    "item/started",
+    "item/completed",
+    "item/agentMessage/delta",
+    "item/plan/delta",
+    "item/commandExecution/outputDelta",
+    "item/fileChange/outputDelta",
+    "item/fileChange/patchUpdated",
+    "serverRequest/resolved",
+    "warning",
+    "deprecationNotice"
+  ],
+  "serverRequestMethods": [
+    "item/commandExecution/requestApproval",
+    "item/fileChange/requestApproval"
+  ],
+  "schemaSha256": "b25fa4eb28c82b0bf82bd74ae6dbc9bd89355275a5422433217cf2e5cdfeeaf3",
+  "typeFileCount": 598,
+  "typesSha256": "66eb3a017f965e1775bb0cb288c7eea42300a71e75d653cd0030b84d94be7fc0"
+}
