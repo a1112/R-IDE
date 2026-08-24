@@ -9,6 +9,7 @@ import { randomUUID } from 'node:crypto';
 import { chmod, link, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { Readable } from 'node:stream';
 import { test } from 'node:test';
 import {
     createRideCodexInstallPresentation,
@@ -29,7 +30,10 @@ import {
     RideCodexRuntimeFetcher
 } from '../src/node/ride-codex-runtime-fetcher';
 import { RuntimeTarget, runtimeManifestEntryForTarget } from '../src/node/ride-codex-runtime-manifest';
-import { RideCodexRuntimeStore } from '../src/node/ride-codex-runtime-store';
+import {
+    RideCodexRuntimeStore,
+    RideCodexRuntimeStoreTestHooks
+} from '../src/node/ride-codex-runtime-store';
 import { RideCodexRuntimeResolver } from '../src/node/ride-codex-runtime-resolver';
 import {
     attestPublishedRuntime,
@@ -324,6 +328,98 @@ test('fetch capability rejects delegated lease clock rollback before network', a
             /authorization|expired/i
         );
         assert.equal(networkCalls, 0);
+    } finally {
+        await rm(runtimeRoot, { recursive: true, force: true });
+    }
+});
+
+test('lease expiring while the destination opens is rejected at the exact network boundary', async () => {
+    const runtimeRoot = await mkdtemp(join(tmpdir(), 'ride-codex-fetch-boundary-'));
+    const stagingDirectory = join(runtimeRoot, '.staging-boundary');
+    await mkdir(stagingDirectory);
+    const runtime = runtimeManifestEntryForTarget(TARGET);
+    const destination = join(stagingDirectory, 'runtime.tgz');
+    const readings = [1, 1, 2];
+    let clockReads = 0;
+    let networkCalls = 0;
+    const fetcher = new RideCodexRuntimeFetcher({
+        authorizationValidator: async () => Object.freeze({
+            issuedAt: 1,
+            expiresAt: 2,
+            now: () => readings[Math.min(clockReads++, readings.length - 1)]
+        }),
+        requester: {
+            open: async () => {
+                networkCalls += 1;
+                throw new Error('expired lease reached the network');
+            }
+        }
+    });
+    const authorization = Object.freeze({ approved: true });
+
+    try {
+        const capability = await fetcher.authorize(
+            authorization,
+            createInstallAuthorizationContext(runtime, await realpath(runtimeRoot), destination)
+        );
+        await assert.rejects(
+            fetcher.fetchAuthorized(capability, runtime, Object.freeze({
+                path: destination,
+                canonicalRoot: await realpath(runtimeRoot)
+            })),
+            /authorization|expired/i
+        );
+        assert.equal(networkCalls, 0);
+        await assert.rejects(stat(destination), /ENOENT/);
+        await assert.rejects(
+            fetcher.fetchAuthorized(capability, runtime, destination),
+            /invalid|already used/i
+        );
+    } finally {
+        await rm(runtimeRoot, { recursive: true, force: true });
+    }
+});
+
+test('each redirect hop rechecks the delegated lease before opening the next request', async () => {
+    const runtimeRoot = await mkdtemp(join(tmpdir(), 'ride-codex-fetch-redirect-lease-'));
+    const stagingDirectory = join(runtimeRoot, '.staging-redirect-lease');
+    await mkdir(stagingDirectory);
+    const runtime = runtimeManifestEntryForTarget(TARGET);
+    const destination = join(stagingDirectory, 'runtime.tgz');
+    let now = 1;
+    let networkCalls = 0;
+    const fetcher = new RideCodexRuntimeFetcher({
+        authorizationValidator: async () => Object.freeze({ issuedAt: 1, expiresAt: 2, now: () => now }),
+        requester: {
+            open: async () => {
+                networkCalls += 1;
+                if (networkCalls === 1) {
+                    now = 2;
+                    return Object.freeze({
+                        statusCode: 302,
+                        headers: Object.freeze({ location: '/second-hop.tgz' }),
+                        body: Readable.from([])
+                    });
+                }
+                throw new Error('expired redirect lease reached another network hop');
+            }
+        }
+    });
+
+    try {
+        const capability = await fetcher.authorize(
+            Object.freeze({ approved: true }),
+            createInstallAuthorizationContext(runtime, await realpath(runtimeRoot), destination)
+        );
+        await assert.rejects(
+            fetcher.fetchAuthorized(capability, runtime, Object.freeze({
+                path: destination,
+                canonicalRoot: await realpath(runtimeRoot)
+            })),
+            /authorization|expired/i
+        );
+        assert.equal(networkCalls, 1);
+        await assert.rejects(stat(destination), /ENOENT/);
     } finally {
         await rm(runtimeRoot, { recursive: true, force: true });
     }
@@ -1421,6 +1517,111 @@ test('pending activation exposes only the committed runtime to store and resolve
     }
 });
 
+test('recovery quarantines a version renamed before its publishing journal phase update and permits retry', async () => {
+    const trustedRuntimeBase = await mkdtemp(join(tmpdir(), 'ride-codex-publish-phase-crash-'));
+    const runtimeRoot = join(trustedRuntimeBase, 'managed');
+    let crashAfterRename = false;
+    const hooks = {
+        afterPublishRename: () => {
+            if (crashAfterRename) {
+                crashAfterRename = false;
+                throw new Error('simulated crash after publish rename');
+            }
+        }
+    } as RideCodexRuntimeStoreTestHooks;
+    const store = new RideCodexRuntimeStore({ trustedRuntimeBase, runtimeRoot, testHooks: hooks });
+    const consent = new RideCodexInstallConsent();
+    try {
+        await createInstaller(runtimeRoot, consent, store).install(
+            consent.issue(presentationFor('0.143.0', runtimeRoot))
+        );
+        const candidatePresentation = presentationFor('0.144.0', runtimeRoot);
+        crashAfterRename = true;
+        await assert.rejects(
+            store.publish(await createStagedRuntime(runtimeRoot, candidatePresentation), candidatePresentation),
+            /simulated crash/i
+        );
+        assert.equal(await stat(join(runtimeRoot, 'pending-activation.json')).then(() => true, () => false), true);
+
+        const restarted = new RideCodexRuntimeStore({ trustedRuntimeBase, runtimeRoot });
+        await restarted.recover();
+        assert.equal(await restarted.activeVersion(), '0.143.0');
+        assert.deepEqual(await restarted.versions(), ['0.143.0']);
+
+        const retryConsent = new RideCodexInstallConsent();
+        await createInstaller(runtimeRoot, retryConsent, restarted).install(
+            retryConsent.issue(candidatePresentation)
+        );
+        assert.equal(await restarted.activeVersion(), '0.144.0');
+    } finally {
+        await rm(trustedRuntimeBase, { recursive: true, force: true });
+    }
+});
+
+test('publish does not adopt an active runtime when the caller explicitly expected no previous runtime', async () => {
+    const trustedRuntimeBase = await mkdtemp(join(tmpdir(), 'ride-codex-publish-previous-race-'));
+    const runtimeRoot = join(trustedRuntimeBase, 'managed');
+    const store = new RideCodexRuntimeStore({ trustedRuntimeBase, runtimeRoot });
+    const consent = new RideCodexInstallConsent();
+    try {
+        await createInstaller(runtimeRoot, consent, store).install(
+            consent.issue(presentationFor('0.143.0', runtimeRoot))
+        );
+        const presentation = presentationFor('0.144.0', runtimeRoot);
+        await assert.rejects(
+            store.publish(await createStagedRuntime(runtimeRoot, presentation), presentation, undefined),
+            /active runtime changed|previous/i
+        );
+        assert.equal(await store.activeVersion(), '0.143.0');
+        assert.deepEqual(await store.versions(), ['0.143.0']);
+        assert.equal(await stat(join(runtimeRoot, 'pending-activation.json')).then(() => true, () => false), false);
+    } finally {
+        await rm(trustedRuntimeBase, { recursive: true, force: true });
+    }
+});
+
+test('recovery quarantines staging after a publishing journal commit before the version rename', async () => {
+    const trustedRuntimeBase = await mkdtemp(join(tmpdir(), 'ride-codex-publish-intent-crash-'));
+    const runtimeRoot = join(trustedRuntimeBase, 'managed');
+    let crashBeforeRename = false;
+    const hooks = {
+        afterPublishingJournalWrite: () => {
+            if (crashBeforeRename) {
+                crashBeforeRename = false;
+                throw new Error('simulated crash before publish rename');
+            }
+        }
+    } as RideCodexRuntimeStoreTestHooks;
+    const store = new RideCodexRuntimeStore({ trustedRuntimeBase, runtimeRoot, testHooks: hooks });
+    const consent = new RideCodexInstallConsent();
+    try {
+        await createInstaller(runtimeRoot, consent, store).install(
+            consent.issue(presentationFor('0.143.0', runtimeRoot))
+        );
+        const candidatePresentation = presentationFor('0.144.0', runtimeRoot);
+        crashBeforeRename = true;
+        await assert.rejects(
+            store.publish(await createStagedRuntime(runtimeRoot, candidatePresentation), candidatePresentation),
+            /simulated crash/i
+        );
+        assert.equal(await stat(join(runtimeRoot, 'pending-activation.json')).then(() => true, () => false), true);
+
+        const restarted = new RideCodexRuntimeStore({ trustedRuntimeBase, runtimeRoot });
+        await restarted.recover();
+        assert.equal(await restarted.activeVersion(), '0.143.0');
+        assert.deepEqual(await restarted.versions(), ['0.143.0']);
+        assert.equal((await readdir(runtimeRoot)).some(entry => entry.startsWith('.staging-')), false);
+
+        const retryConsent = new RideCodexInstallConsent();
+        await createInstaller(runtimeRoot, retryConsent, restarted).install(
+            retryConsent.issue(candidatePresentation)
+        );
+        assert.equal(await restarted.activeVersion(), '0.144.0');
+    } finally {
+        await rm(trustedRuntimeBase, { recursive: true, force: true });
+    }
+});
+
 test('crash recovery removes an unhandshaken candidate and permits the same version to retry', async () => {
     const trustedRuntimeBase = await mkdtemp(join(tmpdir(), 'ride-codex-retry-after-recovery-'));
     const runtimeRoot = join(trustedRuntimeBase, 'managed');
@@ -1501,6 +1702,92 @@ test('finalization reattests after its last hook and rolls back a changed candid
         assert.deepEqual(await store.versions(), ['0.143.0']);
     } finally {
         await rm(trustedRuntimeBase, { recursive: true, force: true });
+    }
+});
+
+test('recovery completes a finalizing activation and reconciles exactly candidate plus previous', async () => {
+    const trustedRuntimeBase = await mkdtemp(join(tmpdir(), 'ride-codex-finalizing-crash-'));
+    const runtimeRoot = join(trustedRuntimeBase, 'managed');
+    let crashAfterFinalizing = false;
+    const hooks = {
+        afterFinalizingJournalWrite: () => {
+            if (crashAfterFinalizing) {
+                crashAfterFinalizing = false;
+                throw new Error('simulated crash after finalizing journal');
+            }
+        }
+    } as RideCodexRuntimeStoreTestHooks;
+    const store = new RideCodexRuntimeStore({ trustedRuntimeBase, runtimeRoot, testHooks: hooks });
+    const consent = new RideCodexInstallConsent();
+    try {
+        await createInstaller(runtimeRoot, consent, store).install(
+            consent.issue(presentationFor('0.142.0', runtimeRoot))
+        );
+        await createInstaller(runtimeRoot, consent, store).install(
+            consent.issue(presentationFor('0.143.0', runtimeRoot))
+        );
+        crashAfterFinalizing = true;
+        await assert.rejects(
+            createInstaller(runtimeRoot, consent, store).install(
+                consent.issue(presentationFor('0.144.0', runtimeRoot))
+            ),
+            /finalize|activation|rollback/i
+        );
+        assert.equal((await store.readActiveRuntime())?.version, '0.143.0');
+        assert.equal(await stat(join(runtimeRoot, 'pending-activation.json')).then(() => true, () => false), true);
+
+        const restarted = new RideCodexRuntimeStore({ trustedRuntimeBase, runtimeRoot });
+        await restarted.recover();
+        assert.equal(await restarted.activeVersion(), '0.144.0');
+        assert.deepEqual(await restarted.versions(), ['0.143.0', '0.144.0']);
+        assert.equal(await stat(join(runtimeRoot, 'pending-activation.json')).then(() => true, () => false), false);
+    } finally {
+        await rm(trustedRuntimeBase, { recursive: true, force: true });
+    }
+});
+
+test('recovery resumes finalizing after obsolete quarantine interruption without deleting retained runtimes', async () => {
+    const trustedRuntimeBase = await mkdtemp(join(tmpdir(), 'ride-codex-finalizing-cleanup-'));
+    const runtimeRoot = join(trustedRuntimeBase, 'managed');
+    const outside = await mkdtemp(join(tmpdir(), 'ride-codex-finalizing-outside-'));
+    const sentinel = join(outside, 'sentinel.txt');
+    await writeFile(sentinel, 'preserve');
+    let interruptCleanup = false;
+    const hooks = {
+        afterObsoleteQuarantine: () => {
+            if (interruptCleanup) {
+                interruptCleanup = false;
+                throw new Error('simulated crash during obsolete reconciliation');
+            }
+        }
+    } as RideCodexRuntimeStoreTestHooks;
+    const store = new RideCodexRuntimeStore({ trustedRuntimeBase, runtimeRoot, testHooks: hooks });
+    const consent = new RideCodexInstallConsent();
+    try {
+        await createInstaller(runtimeRoot, consent, store).install(
+            consent.issue(presentationFor('0.142.0', runtimeRoot))
+        );
+        await createInstaller(runtimeRoot, consent, store).install(
+            consent.issue(presentationFor('0.143.0', runtimeRoot))
+        );
+        interruptCleanup = true;
+        await assert.rejects(
+            createInstaller(runtimeRoot, consent, store).install(
+                consent.issue(presentationFor('0.144.0', runtimeRoot))
+            ),
+            /finalize|activation|rollback/i
+        );
+
+        const restarted = new RideCodexRuntimeStore({ trustedRuntimeBase, runtimeRoot });
+        await restarted.recover();
+        assert.equal(await restarted.activeVersion(), '0.144.0');
+        assert.deepEqual(await restarted.versions(), ['0.143.0', '0.144.0']);
+        assert.equal(await readFile(sentinel, 'utf8'), 'preserve');
+    } finally {
+        await Promise.all([
+            rm(trustedRuntimeBase, { recursive: true, force: true }),
+            rm(outside, { recursive: true, force: true })
+        ]);
     }
 });
 
@@ -1594,7 +1881,7 @@ test('journal delete failure after rollback rename preserves the previous commit
     }
 });
 
-test('pending journal rename failure leaves recovery authority intact', async () => {
+test('pending journal rename failure leaves finalizing recovery authority intact', async () => {
     const trustedRuntimeBase = await mkdtemp(join(tmpdir(), 'ride-codex-pending-rename-'));
     const runtimeRoot = join(trustedRuntimeBase, 'managed');
     let failRename = false;
@@ -1624,8 +1911,8 @@ test('pending journal rename failure leaves recovery authority intact', async ()
         await assert.rejects(store.finalizeActivation(activated), /pending|final|rename|activation/i);
         assert.equal(await stat(join(runtimeRoot, 'pending-activation.json')).then(() => true, () => false), true);
         await new RideCodexRuntimeStore({ trustedRuntimeBase, runtimeRoot }).recover();
-        assert.equal(await store.activeVersion(), '0.143.0');
-        assert.deepEqual(await store.versions(), ['0.143.0']);
+        assert.equal(await store.activeVersion(), '0.144.0');
+        assert.deepEqual(await store.versions(), ['0.143.0', '0.144.0']);
     } finally {
         await rm(trustedRuntimeBase, { recursive: true, force: true });
     }

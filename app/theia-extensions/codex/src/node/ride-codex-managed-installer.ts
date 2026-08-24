@@ -145,7 +145,7 @@ export class RideCodexManagedInstaller {
                 progress('verifying');
                 await staged.revalidate();
                 previous = await this.store.readActiveRuntime();
-                published = await this.store.publish(staged, presentation);
+                published = await this.store.publish(staged, presentation, previous);
                 progress('activating');
                 activatedRuntime = await this.store.activate(published, previous);
                 this.safeInvalidateResolver();
@@ -199,16 +199,6 @@ export class RideCodexManagedInstaller {
             const retainedPrevious = previous
                 ? await this.store.revalidate(previous).catch(() => undefined)
                 : undefined;
-            const readyDiagnostics: InstallDiagnostic[] = [];
-            await this.store.cleanupObsolete(new Set([
-                activatedRuntime!.relativePath,
-                ...(retainedPrevious ? [retainedPrevious.relativePath] : [])
-            ])).catch(() => {
-                readyDiagnostics.push(createRideCodexInstallDiagnostic(
-                    'cleanup-deferred',
-                    'Codex runtime is ready, but obsolete runtime cleanup was deferred safely.'
-                ));
-            });
             progress('ready');
             return Object.freeze({
                 state: 'ready' as const,
@@ -216,7 +206,7 @@ export class RideCodexManagedInstaller {
                 target: presentation.target,
                 executable: activatedRuntime!.executable,
                 ...(retainedPrevious ? { previousVersion: retainedPrevious.version } : {}),
-                diagnostics: Object.freeze(readyDiagnostics)
+                diagnostics: Object.freeze([])
             });
         });
     }

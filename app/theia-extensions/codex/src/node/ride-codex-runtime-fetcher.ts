@@ -187,12 +187,13 @@ export class RideCodexRuntimeFetcher implements RideCodexRuntimeFetcherLike {
         this.capabilities.delete(capability);
         const authorizedDestination = validateAuthorizedFetchContext(authorization.context, runtime, destination);
         validateAuthorizationLease(authorization.lease);
-        return this.fetchTrusted(runtime, authorizedDestination, signal);
+        return this.fetchTrusted(runtime, authorizedDestination, authorization.lease, signal);
     }
 
     private async fetchTrusted(
         runtime: RideCodexRuntimeManifestEntry,
         destination: RideCodexRuntimeFetchDestination,
+        lease: ValidatedInstallAuthorizationLease | undefined,
         signal?: AbortSignal
     ): Promise<RideCodexRuntimeFetchResult> {
         const initialUrl = requireAllowedRuntimeUrl(runtime.url, true);
@@ -218,7 +219,8 @@ export class RideCodexRuntimeFetcher implements RideCodexRuntimeFetcherLike {
         let completed = false;
         try {
             openedDestination = await openAuthorizedDestination(destination);
-            response = await this.followRedirects(initialUrl, controller.signal);
+            validateAuthorizationLease(lease);
+            response = await this.followRedirects(initialUrl, controller.signal, lease);
             validateContentLength(response.headers, runtime.compressedBytes);
             const result = await this.streamAndVerify(
                 response.body,
@@ -256,7 +258,11 @@ export class RideCodexRuntimeFetcher implements RideCodexRuntimeFetcherLike {
         }
     }
 
-    private async followRedirects(initialUrl: URL, signal: AbortSignal): Promise<RideCodexHttpsResponse> {
+    private async followRedirects(
+        initialUrl: URL,
+        signal: AbortSignal,
+        lease: ValidatedInstallAuthorizationLease | undefined
+    ): Promise<RideCodexHttpsResponse> {
         const visited = new Set<string>();
         let current = initialUrl;
         let redirects = 0;
@@ -265,6 +271,7 @@ export class RideCodexRuntimeFetcher implements RideCodexRuntimeFetcherLike {
                 throw new RideCodexRuntimeFetchError('Codex runtime download redirect loop was rejected.');
             }
             visited.add(current.href);
+            validateAuthorizationLease(lease);
             const response = await raceWithAbort(
                 this.requester.open(current, { connectTimeoutMs: this.connectTimeoutMs, signal }),
                 signal
