@@ -12,8 +12,17 @@ import {
     RideCodexLaunchSpec,
     RideCodexRuntimeSource
 } from './ride-codex-launch-spec';
+import {
+    RuntimeTarget,
+    runtimeManifestEntryDigest,
+    runtimeManifestEntryForTarget
+} from './ride-codex-runtime-manifest';
 import { RideCodexRuntimeProbe, RideCodexRuntimeProbeLike } from './ride-codex-runtime-probe';
-import type { RideCodexRuntimeStore } from './ride-codex-runtime-store';
+import type {
+    ActiveRuntimePointer,
+    RideCodexRuntimeStore,
+    ValidatedManagedRuntime
+} from './ride-codex-runtime-store';
 
 export interface RideCodexRuntimeFileStat {
     readonly size: number;
@@ -41,7 +50,7 @@ export interface RideCodexRuntimeResolverOptions {
     readonly findSystemCandidates?: (
         environment: Readonly<Record<string, string | undefined>>
     ) => MaybePromise<readonly string[]>;
-    readonly readManagedActiveRuntime?: () => MaybePromise<string | undefined>;
+    readonly readManagedActiveRuntime?: () => MaybePromise<ValidatedManagedRuntime | undefined>;
     readonly managedRuntimeStore?: Pick<RideCodexRuntimeStore, 'readActiveRuntime'>;
     readonly discoveryTimeoutMs?: number;
     readonly maxSystemProbes?: number;
@@ -198,6 +207,7 @@ interface CandidateResolution {
     readonly executable: string;
     readonly manifestVersion?: string;
     readonly binaryTarget: string;
+    readonly managedRuntime?: ValidatedManagedRuntime;
 }
 
 interface ResolutionContext {
@@ -219,12 +229,22 @@ const MAX_PROVIDER_ENVIRONMENT_ENTRIES = 1_024;
 const MAX_PROVIDER_KEY_BYTES = 1_024;
 const MAX_PROVIDER_VALUE_BYTES = 64 * 1024;
 const MAX_PROVIDER_PATH_BYTES = 32 * 1024;
+const MAX_PROVIDER_METADATA_BYTES = 4 * 1024;
 const DEFAULT_DISCOVERY_TIMEOUT_MS = 10_000;
 const DEFAULT_MAX_SYSTEM_PROBES = 8;
 const SYSTEM_DISCOVERY_LIMIT_DIAGNOSTIC = 'System runtime discovery: PATH scan was truncated at safe limits.';
 const SYSTEM_PROBE_LIMIT_DIAGNOSTIC = 'System runtime discovery: executable probe limit was reached.';
 const SYSTEM_PROVIDER_UNAVAILABLE_DIAGNOSTIC = 'System runtime discovery provider is unavailable or returned invalid data.';
 const MANAGED_PROVIDER_UNAVAILABLE_DIAGNOSTIC = 'Managed runtime provider is unavailable or returned invalid data.';
+const MANAGED_RUNTIME_KEYS = Object.freeze([
+    'directory', 'executable', 'manifestDigest', 'pointer', 'relativePath', 'target', 'version'
+].sort());
+const ACTIVE_POINTER_KEYS = Object.freeze([
+    'executableRelativePath', 'manifestDigest', 'relativePath', 'rootIdentity',
+    'schemaVersion', 'target', 'treeDigest', 'treeEntries', 'treePathBytes',
+    'treeReadBytes', 'version'
+].sort());
+const POINTER_IDENTITY_KEYS = Object.freeze(['birthtimeNs', 'ctimeNs', 'dev', 'ino', 'size'].sort());
 
 const PLATFORM_PACKAGE_BY_TARGET: Readonly<Record<string, string>> = Object.freeze({
     'x86_64-unknown-linux-musl': 'codex-linux-x64',
@@ -269,7 +289,7 @@ export class RideCodexRuntimeResolver {
     private readonly discoverSystemCandidates: (
         environment: Readonly<Record<string, string | undefined>>
     ) => MaybePromise<RideCodexSystemCandidateDiscovery>;
-    private readonly readManagedActiveRuntime: () => MaybePromise<string | undefined>;
+    private readonly readManagedActiveRuntime: () => MaybePromise<ValidatedManagedRuntime | undefined>;
     private readonly discoveryTimeoutMs: number;
     private readonly maxSystemProbes: number;
     private readonly signal: AbortSignal | undefined;
@@ -292,7 +312,7 @@ export class RideCodexRuntimeResolver {
             : environment => discoverDefaultCodexSystemCandidates(environment, this.platform);
         this.readManagedActiveRuntime = options.readManagedActiveRuntime
             ?? (options.managedRuntimeStore
-                ? async () => (await options.managedRuntimeStore!.readActiveRuntime())?.executable
+                ? async () => options.managedRuntimeStore!.readActiveRuntime()
                 : () => undefined);
         this.discoveryTimeoutMs = positiveSafeInteger(options.discoveryTimeoutMs, DEFAULT_DISCOVERY_TIMEOUT_MS);
         this.maxSystemProbes = positiveSafeInteger(options.maxSystemProbes, DEFAULT_MAX_SYSTEM_PROBES);
@@ -426,18 +446,26 @@ export class RideCodexRuntimeResolver {
         }
 
         context.deadline.check();
-        let managed: string | undefined;
+        let managed: ValidatedManagedRuntime | undefined;
         try {
-            managed = normalizeOptionalCandidate(validateOptionalProviderPath(
+            managed = validateManagedProviderRuntime(
                 await context.deadline.run(() => this.readManagedActiveRuntime())
-            ));
+            );
         } catch {
             context.deadline.check();
             addDiagnostic(diagnostics, MANAGED_PROVIDER_UNAVAILABLE_DIAGNOSTIC);
         }
         if (managed) {
             try {
-                return await this.resolveCandidate(managed, 'managed', target, diagnostics, context);
+                this.requireReviewedManagedRuntime(managed, target);
+                return await this.resolveCandidate(
+                    managed.executable,
+                    'managed',
+                    target,
+                    diagnostics,
+                    context,
+                    managed
+                );
             } catch (error) {
                 addDiagnostic(diagnostics, `Managed runtime: ${reasonFromError(error)}`);
             }
@@ -467,9 +495,18 @@ export class RideCodexRuntimeResolver {
         source: RideCodexRuntimeSource,
         target: string,
         diagnostics: readonly string[],
-        context: ResolutionContext
+        context: ResolutionContext,
+        managedRuntime?: ValidatedManagedRuntime
     ): Promise<RideCodexLaunchSpec> {
-        const resolved = await this.resolveNativeExecutable(candidate, target, context);
+        const nativeResolution = await this.resolveNativeExecutable(candidate, target, context);
+        const resolved: CandidateResolution = managedRuntime
+            ? Object.freeze({
+                executable: nativeResolution.executable,
+                manifestVersion: managedRuntime.version,
+                binaryTarget: nativeResolution.binaryTarget,
+                managedRuntime
+            })
+            : nativeResolution;
         if (resolved.binaryTarget !== target) {
             throw new CandidateError('Codex runtime target does not match this platform architecture.');
         }
@@ -496,10 +533,28 @@ export class RideCodexRuntimeResolver {
         return createRideCodexLaunchSpec({
             executable: resolved.executable,
             version: probeResult.version,
-            target,
+            target: resolved.managedRuntime?.target ?? target,
             source,
             diagnostics
         });
+    }
+
+    private requireReviewedManagedRuntime(runtime: ValidatedManagedRuntime, currentTarget: string): void {
+        if (runtime.target !== currentTarget) {
+            throw new CandidateError('Codex managed runtime target does not match this platform architecture.');
+        }
+        let reviewed;
+        try {
+            reviewed = runtimeManifestEntryForTarget(runtime.target as RuntimeTarget);
+        } catch {
+            throw new CandidateError('Codex managed runtime target is not present in the reviewed manifest.');
+        }
+        if (runtime.version !== reviewed.version) {
+            throw new CandidateError('Codex managed runtime version does not match the reviewed manifest.');
+        }
+        if (runtime.manifestDigest !== runtimeManifestEntryDigest(reviewed)) {
+            throw new CandidateError('Codex managed runtime digest does not match the reviewed manifest.');
+        }
     }
 
     private async resolveNativeExecutable(
@@ -1069,6 +1124,128 @@ function validateProviderCandidateArray(value: unknown): asserts value is readon
     for (const candidate of inspected) {
         validateOptionalProviderPath(candidate);
     }
+}
+
+function validateManagedProviderRuntime(value: unknown): ValidatedManagedRuntime | undefined {
+    if (value === undefined) {
+        return undefined;
+    }
+    const runtime = requireProviderDataRecord(value, MANAGED_RUNTIME_KEYS);
+    const pointerRecord = requireProviderDataRecord(runtime.pointer, ACTIVE_POINTER_KEYS);
+    const identityRecord = requireProviderDataRecord(pointerRecord.rootIdentity, POINTER_IDENTITY_KEYS);
+    const version = requireBoundedProviderString(runtime.version, MAX_PROVIDER_METADATA_BYTES);
+    const target = requireBoundedProviderString(runtime.target, MAX_PROVIDER_METADATA_BYTES);
+    const manifestDigest = requireBoundedProviderString(runtime.manifestDigest, MAX_PROVIDER_METADATA_BYTES);
+    const relativePath = requireBoundedProviderString(runtime.relativePath, MAX_PROVIDER_PATH_BYTES);
+    const directory = requireBoundedProviderString(runtime.directory, MAX_PROVIDER_PATH_BYTES);
+    const executable = requireBoundedProviderString(runtime.executable, MAX_PROVIDER_PATH_BYTES);
+    if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version)
+        || !/^[a-z0-9_-]+$/.test(target)
+        || !/^sha256-[a-f0-9]{64}$/.test(manifestDigest)
+        || !isPortableProviderRelativePath(relativePath)
+        || (!win32.isAbsolute(directory) && !posix.isAbsolute(directory))
+        || (!win32.isAbsolute(executable) && !posix.isAbsolute(executable))) {
+        throw new Error('invalid managed runtime provider result');
+    }
+    const pointerVersion = requireBoundedProviderString(pointerRecord.version, MAX_PROVIDER_METADATA_BYTES);
+    const pointerTarget = requireBoundedProviderString(pointerRecord.target, MAX_PROVIDER_METADATA_BYTES);
+    const pointerManifestDigest = requireBoundedProviderString(pointerRecord.manifestDigest, MAX_PROVIDER_METADATA_BYTES);
+    const pointerRelativePath = requireBoundedProviderString(pointerRecord.relativePath, MAX_PROVIDER_PATH_BYTES);
+    const executableRelativePath = requireBoundedProviderString(
+        pointerRecord.executableRelativePath,
+        MAX_PROVIDER_PATH_BYTES
+    );
+    const treeDigest = requireBoundedProviderString(pointerRecord.treeDigest, MAX_PROVIDER_METADATA_BYTES);
+    const treeReadBytes = requireBoundedProviderString(pointerRecord.treeReadBytes, MAX_PROVIDER_METADATA_BYTES);
+    if (pointerRecord.schemaVersion !== 1
+        || pointerVersion !== version
+        || pointerTarget !== target
+        || pointerManifestDigest !== manifestDigest
+        || pointerRelativePath !== relativePath
+        || !isPortableProviderRelativePath(pointerRelativePath)
+        || !isPortableProviderRelativePath(executableRelativePath)
+        || !/^sha256-[a-f0-9]{64}$/.test(treeDigest)
+        || !isCanonicalProviderInteger(treeReadBytes)
+        || !Number.isSafeInteger(pointerRecord.treeEntries) || (pointerRecord.treeEntries as number) <= 0
+        || !Number.isSafeInteger(pointerRecord.treePathBytes) || (pointerRecord.treePathBytes as number) <= 0) {
+        throw new Error('invalid managed runtime provider result');
+    }
+    const rootIdentity = Object.freeze({
+        dev: requireCanonicalProviderInteger(identityRecord.dev),
+        ino: requireCanonicalProviderInteger(identityRecord.ino),
+        size: requireCanonicalProviderInteger(identityRecord.size),
+        birthtimeNs: requireCanonicalProviderInteger(identityRecord.birthtimeNs),
+        ctimeNs: requireCanonicalProviderInteger(identityRecord.ctimeNs)
+    });
+    const pointer: ActiveRuntimePointer = Object.freeze({
+        schemaVersion: 1,
+        version,
+        target,
+        manifestDigest,
+        relativePath,
+        executableRelativePath,
+        treeDigest,
+        treeEntries: pointerRecord.treeEntries as number,
+        treeReadBytes,
+        treePathBytes: pointerRecord.treePathBytes as number,
+        rootIdentity
+    });
+    return Object.freeze({
+        version,
+        target,
+        manifestDigest,
+        relativePath,
+        directory,
+        executable,
+        pointer
+    });
+}
+
+function requireProviderDataRecord(value: unknown, expectedKeys: readonly string[]): Record<string, unknown> {
+    if (typeof value !== 'object' || !value || Array.isArray(value) || value instanceof Promise) {
+        throw new Error('invalid provider record');
+    }
+    const keys = Object.keys(value).sort();
+    if (keys.length !== expectedKeys.length || keys.some((key, index) => key !== expectedKeys[index])) {
+        throw new Error('invalid provider record');
+    }
+    const record: Record<string, unknown> = {};
+    for (const key of keys) {
+        const descriptor = Object.getOwnPropertyDescriptor(value, key);
+        if (!descriptor || descriptor.enumerable !== true
+            || !Object.prototype.hasOwnProperty.call(descriptor, 'value')
+            || Object.prototype.hasOwnProperty.call(descriptor, 'get')
+            || Object.prototype.hasOwnProperty.call(descriptor, 'set')) {
+            throw new Error('invalid provider record');
+        }
+        record[key] = descriptor.value;
+    }
+    return record;
+}
+
+function requireBoundedProviderString(value: unknown, maxBytes: number): string {
+    if (typeof value !== 'string' || value.includes('\0') || Buffer.byteLength(value) > maxBytes) {
+        throw new Error('invalid managed runtime provider string');
+    }
+    return value;
+}
+
+function requireCanonicalProviderInteger(value: unknown): string {
+    const text = requireBoundedProviderString(value, 40);
+    if (!isCanonicalProviderInteger(text)) {
+        throw new Error('invalid managed runtime provider integer');
+    }
+    return text;
+}
+
+function isCanonicalProviderInteger(value: string): boolean {
+    return /^(?:0|[1-9]\d*)$/.test(value) && value.length <= 40;
+}
+
+function isPortableProviderRelativePath(value: string): boolean {
+    return value.length > 0 && !value.includes('\\') && !value.startsWith('/')
+        && posix.normalize(value) === value
+        && value.split('/').every(segment => segment.length > 0 && segment !== '.' && segment !== '..');
 }
 
 function validateSystemCandidateDiscovery(value: unknown): RideCodexSystemCandidateDiscovery {

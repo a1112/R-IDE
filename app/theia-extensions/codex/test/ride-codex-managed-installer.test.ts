@@ -809,10 +809,24 @@ test('managed resolver remains lazy, performs no writes without a pointer, and c
     const runtimeRoot = join(trustedRuntimeBase, 'managed');
     const store = new RideCodexRuntimeStore({ trustedRuntimeBase, runtimeRoot });
     const consent = new RideCodexInstallConsent();
-    const presentation = presentationFor('0.144.0', runtimeRoot, host.target);
-    const installer = createInstaller(runtimeRoot, consent, store);
+    const runtime = runtimeManifestEntryForTarget(host.target);
+    const presentation = createRideCodexRuntimeInstallPresentation(runtime, runtimeRoot);
+    const installer = new RideCodexManagedInstaller({
+        consent,
+        store,
+        stager: { stage: async (_authorization, _target, installPresentation) => createStagedRuntime(runtimeRoot, installPresentation) },
+        handshake: async () => undefined
+    });
     try {
         await installer.install(consent.issue(presentation));
+        const active = await store.readActiveRuntime();
+        assert.ok(active);
+        assert.equal(active.version, runtime.version);
+        assert.equal(active.target, runtime.target);
+        assert.equal(active.manifestDigest, presentation.manifestDigest);
+        assert.equal(Object.isFrozen(active), true);
+        assert.equal(Object.isFrozen(active.pointer), true);
+        assert.equal(Object.isFrozen(active.pointer.rootIdentity), true);
         const resolver = new RideCodexRuntimeResolver({
             platform: host.platform,
             arch: host.arch,
@@ -824,7 +838,9 @@ test('managed resolver remains lazy, performs no writes without a pointer, and c
         });
         const launch = await resolver.resolve();
         assert.equal(launch.source, 'managed');
-        assert.equal(launch.executable, (await store.readActiveRuntime())?.executable);
+        assert.equal(launch.executable, active.executable);
+        assert.equal(launch.version, active.version);
+        assert.equal(launch.target, active.target);
     } finally {
         await rm(trustedRuntimeBase, { recursive: true, force: true });
     }

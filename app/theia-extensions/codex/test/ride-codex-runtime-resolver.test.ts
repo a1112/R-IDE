@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { constants as fsConstants, promises as realFs } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname as nativeDirname, join as nativeJoin, relative as nativeRelative, sep as nativeSeparator } from 'node:path';
+import { dirname as nativeDirname, join as nativeJoin, relative as nativeRelative, sep as nativeSeparator, win32 } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { test } from 'node:test';
 import {
@@ -32,9 +32,51 @@ import {
     RideCodexRuntimeUnavailableError,
     targetForPlatform
 } from '../src/node/ride-codex-runtime-resolver';
+import {
+    RuntimeTarget,
+    runtimeManifestEntryDigest,
+    runtimeManifestEntryForTarget
+} from '../src/node/ride-codex-runtime-manifest';
+import { ValidatedManagedRuntime } from '../src/node/ride-codex-runtime-store';
 
 const WINDOWS_TARGET = 'x86_64-pc-windows-msvc';
 const WINDOWS_NATIVE = 'C:\\tools\\codex.exe';
+const WINDOWS_RUNTIME = runtimeManifestEntryForTarget(WINDOWS_TARGET);
+const WINDOWS_MANIFEST_DIGEST = runtimeManifestEntryDigest(WINDOWS_RUNTIME);
+
+function validatedManagedRuntime(
+    executable: string,
+    overrides: Partial<Pick<ValidatedManagedRuntime, 'version' | 'target' | 'manifestDigest'>> = {}
+): ValidatedManagedRuntime {
+    const version = overrides.version ?? WINDOWS_RUNTIME.version;
+    const target = overrides.target ?? WINDOWS_RUNTIME.target;
+    const manifestDigest = overrides.manifestDigest ?? WINDOWS_MANIFEST_DIGEST;
+    const relativePath = `versions/v-${version}--${target}--${manifestDigest.slice('sha256-'.length, 'sha256-'.length + 16)}`;
+    const directory = win32.dirname(executable);
+    const rootIdentity = Object.freeze({ dev: '1', ino: '2', size: '0', birthtimeNs: '3', ctimeNs: '4' });
+    const pointer = Object.freeze({
+        schemaVersion: 1 as const,
+        version,
+        target,
+        manifestDigest,
+        relativePath,
+        executableRelativePath: `package/vendor/${target}/bin/${target.includes('windows') ? 'codex.exe' : 'codex'}`,
+        treeDigest: `sha256-${'1'.repeat(64)}`,
+        treeEntries: 1,
+        treeReadBytes: '1',
+        treePathBytes: 1,
+        rootIdentity
+    });
+    return Object.freeze({
+        version,
+        target,
+        manifestDigest,
+        relativePath,
+        directory,
+        executable,
+        pointer
+    });
+}
 
 function peHeader(arch: 'x64' | 'arm64'): Uint8Array {
     const header = Buffer.alloc(512);
@@ -269,7 +311,7 @@ function createResolver(options: {
         },
         readManagedActiveRuntime: async () => {
             counters.managed += 1;
-            return options.managed;
+            return options.managed ? validatedManagedRuntime(options.managed) : undefined;
         }
     });
     return { fs, probe, counters, resolver };
@@ -454,6 +496,89 @@ test('system candidates precede managed runtime and incompatible implicit candid
     assert.deepEqual(fixture.probe.calls.map(call => call.executable), [incompatible, managed]);
     assert.ok(spec.diagnostics.length >= 2);
     assert.ok(spec.diagnostics.every((diagnostic: string) => !diagnostic.includes(missing)));
+});
+
+test('managed runtimes require exact reviewed metadata before probing and exact pointer version after probing', async t => {
+    const createManagedResolver = (
+        runtime: ValidatedManagedRuntime,
+        header: Uint8Array = peHeader('x64')
+    ): { readonly resolver: RideCodexRuntimeResolver; readonly probe: FakeProbe } => {
+        const filesystem = new VirtualFileSystem();
+        const probe = new FakeProbe();
+        filesystem.addFile(runtime.executable, header);
+        return {
+            probe,
+            resolver: new RideCodexRuntimeResolver({
+                platform: 'win32',
+                arch: 'x64',
+                filesystem,
+                probe,
+                readEnvironment: () => ({}),
+                readUserOverride: () => undefined,
+                findSystemCandidates: () => [],
+                managedRuntimeStore: { readActiveRuntime: async () => runtime }
+            })
+        };
+    };
+
+    await t.test('rejects a pointer digest that differs from the current reviewed target entry without probing', async () => {
+        const runtime = validatedManagedRuntime(WINDOWS_NATIVE, {
+            manifestDigest: `sha256-${'f'.repeat(64)}`
+        });
+        const fixture = createManagedResolver(runtime);
+
+        await assert.rejects(fixture.resolver.resolve(), /No compatible native Codex runtime/i);
+        assert.deepEqual(fixture.probe.calls, []);
+    });
+
+    await t.test('rejects a pointer version that differs from the current reviewed version without probing', async () => {
+        const runtime = validatedManagedRuntime(WINDOWS_NATIVE, { version: '0.143.0' });
+        const fixture = createManagedResolver(runtime);
+
+        await assert.rejects(fixture.resolver.resolve(), /No compatible native Codex runtime/i);
+        assert.deepEqual(fixture.probe.calls, []);
+    });
+
+    await t.test('rejects a pointer target that differs from the current platform without probing', async () => {
+        const target: RuntimeTarget = 'aarch64-pc-windows-msvc';
+        const runtime = validatedManagedRuntime(WINDOWS_NATIVE, {
+            target,
+            manifestDigest: runtimeManifestEntryDigest(runtimeManifestEntryForTarget(target))
+        });
+        const fixture = createManagedResolver(runtime);
+
+        await assert.rejects(fixture.resolver.resolve(), /No compatible native Codex runtime/i);
+        assert.deepEqual(fixture.probe.calls, []);
+    });
+
+    await t.test('rejects a native executable whose header differs from the exact pointer target before probing', async () => {
+        const runtime = validatedManagedRuntime(WINDOWS_NATIVE);
+        const fixture = createManagedResolver(runtime, peHeader('arm64'));
+
+        await assert.rejects(fixture.resolver.resolve(), /No compatible native Codex runtime/i);
+        assert.deepEqual(fixture.probe.calls, []);
+    });
+
+    await t.test('rejects probe output that is semantically compatible but not exactly equal to the pointer version', async () => {
+        const runtime = validatedManagedRuntime(WINDOWS_NATIVE);
+        const fixture = createManagedResolver(runtime);
+        fixture.probe.version(runtime.executable, '0.144.00');
+
+        await assert.rejects(fixture.resolver.resolve(), /No compatible native Codex runtime/i);
+        assert.deepEqual(fixture.probe.calls.map(call => call.executable), [runtime.executable]);
+    });
+
+    await t.test('accepts an exact frozen pointer and returns its precise managed version and target', async () => {
+        const runtime = validatedManagedRuntime(WINDOWS_NATIVE);
+        const fixture = createManagedResolver(runtime);
+
+        const spec = await fixture.resolver.resolve();
+
+        assertLaunchSpec(spec, { executable: runtime.executable, source: 'managed', target: runtime.target });
+        assert.equal(spec.version, runtime.version);
+        assert.equal(Object.isFrozen(runtime), true);
+        assert.equal(Object.isFrozen(runtime.pointer), true);
+    });
 });
 
 test('a valid system runtime prevents reading the managed active pointer', async () => {
@@ -832,7 +957,7 @@ test('runtime providers enforce bounded typed outputs and never disclose provide
                 platform: 'win32', arch: 'x64', filesystem: fs, probe: new FakeProbe(),
                 readEnvironment: () => ({}),
                 findSystemCandidates,
-                readManagedActiveRuntime: () => WINDOWS_NATIVE
+                readManagedActiveRuntime: () => validatedManagedRuntime(WINDOWS_NATIVE)
             });
             const spec = await resolver.resolve();
             assertLaunchSpec(spec, { executable: WINDOWS_NATIVE, source: 'managed' });
@@ -844,8 +969,8 @@ test('runtime providers enforce bounded typed outputs and never disclose provide
     await t.test('managed provider exceptions and invalid values become generic unavailable diagnostics', async () => {
         for (const readManagedActiveRuntime of [
             () => { throw unsafeProviderError(); },
-            () => ({ secret: 'provider-secret' }) as unknown as string,
-            () => 'C:\\'.concat('x'.repeat(100_000))
+            () => ({ secret: 'provider-secret' }) as unknown as ValidatedManagedRuntime,
+            () => 'C:\\'.concat('x'.repeat(100_000)) as unknown as ValidatedManagedRuntime
         ]) {
             const resolver = new RideCodexRuntimeResolver({
                 platform: 'win32', arch: 'x64', filesystem: new VirtualFileSystem(), probe: new FakeProbe(),
