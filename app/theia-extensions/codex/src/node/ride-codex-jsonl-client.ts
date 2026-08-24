@@ -124,7 +124,7 @@ export class RideCodexJsonlClient implements RideCodexDisposable {
 
         let payload: string;
         try {
-            payload = serializeEnvelope({ id, method, params });
+            payload = serializeEnvelope({ id, method, params }, ['id', 'method', 'params']);
         } catch {
             return Promise.reject(new Error('Unable to serialize Codex request'));
         }
@@ -153,7 +153,10 @@ export class RideCodexJsonlClient implements RideCodexDisposable {
             return;
         }
         validateOutboundRequestId(id);
-        this.writePayload(serializeEnvelope({ id, result: result === undefined ? null : result }));
+        this.writePayload(serializeEnvelope(
+            { id, result: result === undefined ? null : result },
+            ['id', 'result']
+        ));
     }
 
     respondError(id: RideCodexRequestId, code: number, message: string): void {
@@ -167,7 +170,7 @@ export class RideCodexJsonlClient implements RideCodexDisposable {
         if (typeof message !== 'string' || message.length > MAX_ERROR_MESSAGE_LENGTH) {
             throw new RangeError(`Codex response error message must be a string of at most ${MAX_ERROR_MESSAGE_LENGTH} characters`);
         }
-        this.writePayload(serializeEnvelope({ id, error: { code, message } }));
+        this.writePayload(serializeEnvelope({ id, error: { code, message } }, ['id', 'error']));
     }
 
     onNotification(listener: (notification: RideCodexNotification) => void): RideCodexDisposable {
@@ -401,10 +404,19 @@ function validateLimit(value: number, label: string, minimum: number): number {
     return value;
 }
 
-function serializeEnvelope(value: unknown): string {
+function serializeEnvelope(value: unknown, requiredProperties: readonly string[]): string {
     try {
         const serialized = JSON.stringify(value);
-        if (serialized !== undefined) {
+        if (serialized === undefined) {
+            throw new TypeError();
+        }
+        const envelope: unknown = JSON.parse(serialized);
+        if (
+            typeof envelope === 'object'
+            && envelope !== null
+            && !Array.isArray(envelope)
+            && requiredProperties.every(property => Object.prototype.hasOwnProperty.call(envelope, property))
+        ) {
             return serialized;
         }
     } catch {

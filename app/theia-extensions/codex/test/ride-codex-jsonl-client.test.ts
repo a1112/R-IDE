@@ -295,6 +295,77 @@ test('validates outbound response IDs and errors before writing complete envelop
     client.dispose();
 });
 
+test('rejects lossy request params without closing the connection', async t => {
+    const cases: ReadonlyArray<readonly [string, unknown]> = [
+        ['symbol', Symbol('must-not-leak')],
+        ['function', function mustNotLeak(): void { /* no-op */ }],
+        ['toJSON returning undefined', { toJSON: () => undefined, secret: 'must-not-leak' }]
+    ];
+
+    for (const [label, params] of cases) {
+        await t.test(label, async () => {
+            const transport = new FakeTransport();
+            const client = new RideCodexJsonlClient(transport);
+            let rejectionCount = 0;
+            const invalid = client.request('initialize', params, 10).catch(error => {
+                rejectionCount += 1;
+                throw error;
+            });
+
+            await assert.rejects(invalid, error => {
+                assert.match((error as Error).message, /serialize/i);
+                assert.doesNotMatch((error as Error).message, /must-not-leak/i);
+                return true;
+            });
+            await wait(20);
+            assert.equal(rejectionCount, 1);
+            assert.equal(client.pendingCount, 0);
+            assert.equal(transport.writes.length, 0);
+
+            const valid = client.request('initialize', { clientInfo: { name: 'R-IDE' } });
+            const request = parseWrite(transport, 0);
+            assert.deepEqual(request.params, { clientInfo: { name: 'R-IDE' } });
+            transport.emitData(`${JSON.stringify({ id: request.id, result: { ready: true } })}\n`);
+            assert.deepEqual(await valid, { ready: true });
+            client.dispose();
+        });
+    }
+});
+
+test('rejects lossy response results without closing the connection', async t => {
+    const cases: ReadonlyArray<readonly [string, unknown]> = [
+        ['symbol', Symbol('must-not-leak')],
+        ['function', function mustNotLeak(): void { /* no-op */ }],
+        ['toJSON returning undefined', { toJSON: () => undefined, secret: 'must-not-leak' }]
+    ];
+
+    for (const [label, result] of cases) {
+        await t.test(label, () => {
+            const transport = new FakeTransport();
+            const client = new RideCodexJsonlClient(transport);
+
+            assert.throws(() => client.respond('approval-lossy', result), error => {
+                assert.match((error as Error).message, /serialize/i);
+                assert.doesNotMatch((error as Error).message, /must-not-leak/i);
+                return true;
+            });
+            assert.equal(transport.writes.length, 0);
+
+            client.respond('approval-safe', { decision: 'accept' });
+            client.respond('approval-empty', undefined);
+            assert.deepEqual(parseWrite(transport, 0), {
+                id: 'approval-safe',
+                result: { decision: 'accept' }
+            });
+            assert.deepEqual(parseWrite(transport, 1), {
+                id: 'approval-empty',
+                result: null
+            });
+            client.dispose();
+        });
+    }
+});
+
 test('serialization and synchronous write failures clean pending requests and reject once', async t => {
     await t.test('circular and BigInt parameters', async () => {
         const transport = new FakeTransport();
