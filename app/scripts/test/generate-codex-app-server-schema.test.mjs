@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import test from 'node:test';
+import ts from 'typescript';
 
 const appRoot = resolve(import.meta.dirname, '..', '..');
 const generator = join(appRoot, 'scripts', 'generate-codex-app-server-schema.mjs');
@@ -13,7 +14,6 @@ const generatedRoot = join(appRoot, 'theia-extensions', 'codex', 'src', 'common'
 const schemaPath = join(generatedRoot, 'schema.json');
 const compatibilityPath = join(appRoot, 'theia-extensions', 'codex', 'src', 'common', 'codex-app-server-compatibility.json');
 const methodsPath = join(appRoot, 'theia-extensions', 'codex', 'src', 'common', 'ride-codex-methods.ts');
-const compiledMethodsPath = join(appRoot, 'theia-extensions', 'codex', 'lib', 'common', 'ride-codex-methods.js');
 
 const EXPECTED_CLIENT_METHODS = [
     'initialize', 'account/read', 'account/login/start', 'account/login/cancel', 'account/logout',
@@ -50,6 +50,31 @@ function readJson(path) {
 
 function readMethods() {
     return readFileSync(methodsPath, 'utf8');
+}
+
+async function importCompiledMethods() {
+    const temporary = mkdtempSync(join(tmpdir(), 'ride-codex-methods-'));
+    const compiledMethodsPath = join(temporary, 'ride-codex-methods.cjs');
+    try {
+        const compiled = ts.transpileModule(readMethods(), {
+            compilerOptions: {
+                module: ts.ModuleKind.CommonJS,
+                target: ts.ScriptTarget.ES2022
+            },
+            fileName: methodsPath,
+            reportDiagnostics: true
+        });
+        const errors = (compiled.diagnostics ?? []).filter(diagnostic => diagnostic.category === ts.DiagnosticCategory.Error);
+        assert.deepEqual(errors, [], 'ride-codex-methods.ts must compile without errors');
+        writeFileSync(compiledMethodsPath, compiled.outputText);
+        return await import(`${pathToFileURL(compiledMethodsPath).href}?test=${Date.now()}`);
+    } finally {
+        rmSync(temporary, { recursive: true, force: true });
+    }
+}
+
+function makeExecutable(path) {
+    if (process.platform !== 'win32') chmodSync(path, 0o755);
 }
 
 function readQuotedArray(source, name) {
@@ -177,6 +202,7 @@ test('ordinary fixture validation does not discover or execute Codex', () => {
     const poisonCodex = join(poisonDirectory, process.platform === 'win32' ? 'codex.cmd' : 'codex');
     const marker = join(poisonDirectory, 'executed');
     writeFileSync(poisonCodex, process.platform === 'win32' ? `@echo off\r\n> "${marker}" echo executed\r\nexit /b 1\r\n` : `#!/bin/sh\ntouch '${marker}'\nexit 1\n`);
+    makeExecutable(poisonCodex);
     const env = { ...process.env, PATH: `${poisonDirectory}${process.platform === 'win32' ? ';' : ':'}${process.env.PATH}` };
     const result = spawnSync(process.execPath, [generator, '--check', '--version', '0.144.0'], { cwd: appRoot, encoding: 'utf8', env });
     const wasExecuted = existsSync(marker);
@@ -192,6 +218,7 @@ test('a fake Codex version mismatch reaches executable verification', () => {
     writeFileSync(executable, process.platform === 'win32'
         ? `@echo off\r\n> "${marker}" echo verified\r\necho codex-cli 0.143.0\r\n`
         : `#!/bin/sh\ntouch '${marker}'\necho 'codex-cli 0.143.0'\n`);
+    makeExecutable(executable);
     try {
         const result = spawnSync(process.execPath, [generator, '--check', '--codex', executable, '--version', '0.144.0'], { cwd: appRoot, encoding: 'utf8' });
         assert.notEqual(result.status, 0);
@@ -203,7 +230,7 @@ test('a fake Codex version mismatch reaches executable verification', () => {
 });
 
 test('compiled allowlists expose exact immutable reviewed classifiers', async () => {
-    const imported = await import(`${pathToFileURL(compiledMethodsPath).href}?red=${Date.now()}`);
+    const imported = await importCompiledMethods();
     const methods = imported.default ?? imported;
     assert.ok(Object.isFrozen(methods.INITIALIZE_CAPABILITIES));
     assert.ok(Object.isFrozen(methods.CLIENT_METHODS));
