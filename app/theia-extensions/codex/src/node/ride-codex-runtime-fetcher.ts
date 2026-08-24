@@ -5,8 +5,8 @@
  ********************************************************************************/
 
 import { createHash, timingSafeEqual } from 'node:crypto';
-import { BigIntStats, createWriteStream } from 'node:fs';
-import { FileHandle, lstat, realpath, rm } from 'node:fs/promises';
+import { BigIntStats, constants as fsConstants } from 'node:fs';
+import { FileHandle, lstat, open, realpath, rm } from 'node:fs/promises';
 import { request as httpsRequest } from 'node:https';
 import { dirname, isAbsolute, relative, resolve as resolvePath } from 'node:path';
 import { Readable, Transform, Writable } from 'node:stream';
@@ -60,7 +60,6 @@ export interface RideCodexRuntimeFetchResult {
 export interface RideCodexRuntimeFetchDestination {
     readonly path: string;
     readonly canonicalRoot: string;
-    readonly handle: FileHandle;
 }
 
 export type RuntimeFetchDestination = string | RideCodexRuntimeFetchDestination;
@@ -168,13 +167,13 @@ export class RideCodexRuntimeFetcher implements RideCodexRuntimeFetcherLike {
             throw new RideCodexRuntimeFetchError('Codex runtime fetch authorization capability is invalid or already used.');
         }
         this.capabilities.delete(capability);
-        await validateAuthorizedFetchContext(context, runtime, destination);
-        return this.fetchTrusted(runtime, destination, signal);
+        const authorizedDestination = validateAuthorizedFetchContext(context, runtime, destination);
+        return this.fetchTrusted(runtime, authorizedDestination, signal);
     }
 
     private async fetchTrusted(
         runtime: RideCodexRuntimeManifestEntry,
-        destination: RuntimeFetchDestination,
+        destination: RideCodexRuntimeFetchDestination,
         signal?: AbortSignal
     ): Promise<RideCodexRuntimeFetchResult> {
         const initialUrl = requireAllowedRuntimeUrl(runtime.url, true);
@@ -196,22 +195,25 @@ export class RideCodexRuntimeFetcher implements RideCodexRuntimeFetcherLike {
         }
 
         let response: RideCodexHttpsResponse | undefined;
+        let openedDestination: OpenedRuntimeFetchDestination | undefined;
+        let completed = false;
         try {
+            openedDestination = await openAuthorizedDestination(destination);
             response = await this.followRedirects(initialUrl, controller.signal);
             validateContentLength(response.headers, runtime.compressedBytes);
             const result = await this.streamAndVerify(
                 response.body,
-                destination,
+                openedDestination.handle,
                 runtime,
                 controller.signal,
                 () => timedOut
             );
+            await openedDestination.handle.sync();
+            await validateOpenedDestination(openedDestination);
+            completed = true;
             return Object.freeze(result);
         } catch (error) {
             response?.body.destroy();
-            if (typeof destination === 'string') {
-                await rm(destination, { force: true }).catch(() => undefined);
-            }
             if (error instanceof RideCodexRuntimeFetchError) {
                 throw error;
             }
@@ -223,6 +225,10 @@ export class RideCodexRuntimeFetcher implements RideCodexRuntimeFetcherLike {
             }
             throw new RideCodexRuntimeFetchError('Codex runtime download failed.');
         } finally {
+            await openedDestination?.handle.close().catch(() => undefined);
+            if (openedDestination && !completed) {
+                await removeOpenedDestination(openedDestination);
+            }
             clearTimeout(overallTimer);
             signal?.removeEventListener('abort', onExternalAbort);
         }
@@ -266,7 +272,7 @@ export class RideCodexRuntimeFetcher implements RideCodexRuntimeFetcherLike {
 
     private async streamAndVerify(
         body: Readable,
-        destination: RuntimeFetchDestination,
+        destination: FileHandle,
         runtime: RideCodexRuntimeManifestEntry,
         signal: AbortSignal,
         didOverallTimeout: () => boolean
@@ -302,9 +308,7 @@ export class RideCodexRuntimeFetcher implements RideCodexRuntimeFetcherLike {
             await pipeline(
                 body,
                 verifier,
-                typeof destination === 'string'
-                    ? createWriteStream(destination, { flags: 'wx', mode: 0o600 })
-                    : fileHandleWritable(destination.handle),
+                fileHandleWritable(destination),
                 { signal }
             );
         } catch (error) {
@@ -426,47 +430,114 @@ function normalizeInstallAuthorizationContext(context: InstallAuthorizationConte
     });
 }
 
-async function validateAuthorizedFetchContext(
+function validateAuthorizedFetchContext(
     context: InstallAuthorizationContext,
     runtime: RideCodexRuntimeManifestEntry,
     destination: RuntimeFetchDestination
-): Promise<void> {
-    const destinationPath = resolvePath(typeof destination === 'string' ? destination : destination.path);
-    const destinationRoot = resolvePath(
-        typeof destination === 'string' ? context.canonicalRoot : destination.canonicalRoot
-    );
+): RideCodexRuntimeFetchDestination {
+    const normalizedDestination = normalizeFetchDestination(context, destination);
+    const destinationPath = normalizedDestination.path;
+    const destinationRoot = normalizedDestination.canonicalRoot;
     if (!safeStringEqual(context.target, runtime.target)
         || !safeStringEqual(context.manifestDigest, runtimeManifestEntryDigest(runtime))
         || !safeStringEqual(normalizePathForComparison(context.canonicalRoot), normalizePathForComparison(destinationRoot))
         || !safeStringEqual(normalizePathForComparison(context.destination), normalizePathForComparison(destinationPath))
-        || !isStrictChild(destinationRoot, destinationPath)
-        || (typeof destination !== 'string'
-            && (!destination.handle || !Number.isSafeInteger(destination.handle.fd)))) {
+        || !isStrictChild(destinationRoot, destinationPath)) {
         throw new RideCodexRuntimeFetchError('Codex runtime fetch does not match its authorized install context.');
     }
-    if (typeof destination !== 'string') {
-        await validateAuthorizedDestinationHandle(destinationPath, destinationRoot, destination.handle);
+    return normalizedDestination;
+}
+
+function normalizeFetchDestination(
+    context: InstallAuthorizationContext,
+    destination: RuntimeFetchDestination
+): RideCodexRuntimeFetchDestination {
+    if (typeof destination === 'string') {
+        return Object.freeze({
+            path: resolvePath(destination),
+            canonicalRoot: resolvePath(context.canonicalRoot)
+        });
+    }
+    try {
+        const keys = Reflect.ownKeys(destination);
+        if (keys.length !== 2 || !keys.includes('path') || !keys.includes('canonicalRoot')) {
+            throw new Error('unexpected destination shape');
+        }
+        const pathDescriptor = Object.getOwnPropertyDescriptor(destination, 'path');
+        const rootDescriptor = Object.getOwnPropertyDescriptor(destination, 'canonicalRoot');
+        if (!pathDescriptor || !('value' in pathDescriptor) || typeof pathDescriptor.value !== 'string'
+            || !rootDescriptor || !('value' in rootDescriptor) || typeof rootDescriptor.value !== 'string') {
+            throw new Error('unsafe destination properties');
+        }
+        return Object.freeze({
+            path: resolvePath(pathDescriptor.value),
+            canonicalRoot: resolvePath(rootDescriptor.value)
+        });
+    } catch {
+        throw new RideCodexRuntimeFetchError(
+            'Codex runtime fetch destination is invalid or contains an external file handle.'
+        );
     }
 }
 
-async function validateAuthorizedDestinationHandle(
-    destinationPath: string,
-    destinationRoot: string,
-    handle: FileHandle
-): Promise<void> {
+interface FetchFileObjectIdentity {
+    readonly dev: bigint;
+    readonly ino: bigint;
+    readonly birthtimeNs: bigint;
+}
+
+interface OpenedRuntimeFetchDestination extends RideCodexRuntimeFetchDestination {
+    readonly handle: FileHandle;
+    readonly identity: FetchFileObjectIdentity;
+}
+
+async function openAuthorizedDestination(
+    destination: RideCodexRuntimeFetchDestination
+): Promise<OpenedRuntimeFetchDestination> {
+    let handle: FileHandle | undefined;
     try {
-        const handleBefore = await handle.stat({ bigint: true });
-        const pathBefore = await lstat(destinationPath, { bigint: true });
-        const canonicalDestination = await realpath(destinationPath);
-        const handleAfter = await handle.stat({ bigint: true });
-        const pathAfter = await lstat(destinationPath, { bigint: true });
+        await validateDestinationParent(destination);
+        const flags = fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL
+            | (fsConstants.O_NOFOLLOW ?? 0);
+        handle = await open(destination.path, flags, 0o600);
+        const identity = fetchFileObjectIdentity(await handle.stat({ bigint: true }));
+        const opened = Object.freeze({ ...destination, handle, identity });
+        await validateOpenedDestination(opened);
+        return opened;
+    } catch {
+        await handle?.close().catch(() => undefined);
+        throw new RideCodexRuntimeFetchError(
+            'Codex runtime fetch destination could not be opened as its authorized new regular file.'
+        );
+    }
+}
+
+async function validateDestinationParent(destination: RideCodexRuntimeFetchDestination): Promise<void> {
+    const canonicalRoot = await realpath(destination.canonicalRoot);
+    const canonicalParent = await realpath(dirname(destination.path));
+    if (!samePath(canonicalRoot, destination.canonicalRoot)
+        || (!samePath(canonicalRoot, canonicalParent) && !isStrictChild(canonicalRoot, canonicalParent))) {
+        throw new RideCodexRuntimeFetchError('Codex runtime fetch destination parent escaped its authorized root.');
+    }
+}
+
+async function validateOpenedDestination(destination: OpenedRuntimeFetchDestination): Promise<void> {
+    try {
+        const handleBefore = await destination.handle.stat({ bigint: true });
+        const pathBefore = await lstat(destination.path, { bigint: true });
+        const canonicalDestination = await realpath(destination.path);
+        await validateDestinationParent(destination);
+        const handleAfter = await destination.handle.stat({ bigint: true });
+        const pathAfter = await lstat(destination.path, { bigint: true });
         if (!handleBefore.isFile() || !handleAfter.isFile()
             || !pathBefore.isFile() || pathBefore.isSymbolicLink()
             || !pathAfter.isFile() || pathAfter.isSymbolicLink()
             || handleBefore.nlink !== BigInt(1) || handleAfter.nlink !== BigInt(1)
             || pathBefore.nlink !== BigInt(1) || pathAfter.nlink !== BigInt(1)
-            || !samePath(canonicalDestination, destinationPath)
-            || !isStrictChild(destinationRoot, canonicalDestination)
+            || !samePath(canonicalDestination, destination.path)
+            || !isStrictChild(destination.canonicalRoot, canonicalDestination)
+            || !fetchFileObjectIdentitiesEqual(destination.identity, fetchFileObjectIdentity(handleBefore))
+            || !fetchFileObjectIdentitiesEqual(destination.identity, fetchFileObjectIdentity(handleAfter))
             || !fetchFileIdentitiesEqual(handleBefore, handleAfter)
             || !fetchFileIdentitiesEqual(handleBefore, pathBefore)
             || !fetchFileIdentitiesEqual(handleBefore, pathAfter)) {
@@ -474,9 +545,39 @@ async function validateAuthorizedDestinationHandle(
         }
     } catch {
         throw new RideCodexRuntimeFetchError(
-            'Codex runtime fetch destination handle does not match its authorized regular file.'
+            'Codex runtime fetch destination identity changed outside its authorized path.'
         );
     }
+}
+
+async function removeOpenedDestination(destination: OpenedRuntimeFetchDestination): Promise<void> {
+    try {
+        const pathStat = await lstat(destination.path, { bigint: true });
+        const canonicalDestination = await realpath(destination.path);
+        if (pathStat.isFile() && !pathStat.isSymbolicLink()
+            && pathStat.nlink === BigInt(1)
+            && samePath(canonicalDestination, destination.path)
+            && isStrictChild(destination.canonicalRoot, canonicalDestination)
+            && fetchFileObjectIdentitiesEqual(destination.identity, fetchFileObjectIdentity(pathStat))) {
+            await rm(destination.path, { force: true });
+        }
+    } catch {
+        // Preserve an unknown or replaced path; the staging boundary owns final cleanup.
+    }
+}
+
+function fetchFileObjectIdentity(stat: BigIntStats): FetchFileObjectIdentity {
+    return Object.freeze({
+        dev: stat.dev,
+        ino: stat.ino,
+        birthtimeNs: stat.birthtimeNs
+    });
+}
+
+function fetchFileObjectIdentitiesEqual(left: FetchFileObjectIdentity, right: FetchFileObjectIdentity): boolean {
+    return left.dev === right.dev
+        && left.ino === right.ino
+        && left.birthtimeNs === right.birthtimeNs;
 }
 
 function fetchFileIdentitiesEqual(left: BigIntStats, right: BigIntStats): boolean {

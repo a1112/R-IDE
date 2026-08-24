@@ -240,11 +240,7 @@ function sha512Integrity(bytes: Uint8Array): string {
 }
 
 async function writeFetchDestination(destination: RuntimeFetchDestination, bytes: Uint8Array): Promise<void> {
-    if (typeof destination === 'string') {
-        await writeFile(destination, bytes, { flag: 'wx', mode: 0o600 });
-        return;
-    }
-    await destination.handle.writeFile(bytes);
+    await writeFile(typeof destination === 'string' ? destination : destination.path, bytes, { flag: 'wx', mode: 0o600 });
 }
 
 function fetchEntry(bytes: Uint8Array, overrides: Partial<RideCodexRuntimeManifestEntry> = {}): RideCodexRuntimeManifestEntry {
@@ -319,11 +315,9 @@ test('fetch authorization capability is context-bound, instance-bound, unforgeab
     const context = createInstallAuthorizationContext(runtime, await realpath(root), destinationPath);
     const capability = await first.authorize(AUTHORIZATION, context);
     const forged = Object.freeze(Object.create(null)) as RideCodexRuntimeFetchCapability;
-    const destinationHandle = await open(destinationPath, 'wx+', 0o600);
     const destination: RideCodexRuntimeFetchDestination = Object.freeze({
         path: destinationPath,
-        canonicalRoot: await realpath(root),
-        handle: destinationHandle
+        canonicalRoot: await realpath(root)
     });
     try {
         await assert.rejects(
@@ -336,6 +330,10 @@ test('fetch authorization capability is context-bound, instance-bound, unforgeab
         );
         const result = await first.fetchAuthorized(capability, runtime, destination);
         assert.equal(result.bytes, bytes.length);
+        assert.deepEqual(await readFile(destinationPath), bytes);
+        const renamedPath = join(root, 'closed-owned-handle.tgz');
+        await rename(destinationPath, renamedPath);
+        assert.deepEqual(await readFile(renamedPath), bytes);
         await assert.rejects(
             first.fetchAuthorized(capability, runtime, destination),
             /authorization|capability/i
@@ -348,7 +346,6 @@ test('fetch authorization capability is context-bound, instance-bound, unforgeab
         assert.equal(context.canonicalRoot, await realpath(root));
         assert.equal(requester.calls.length, 1);
     } finally {
-        await destinationHandle.close().catch(() => undefined);
         await rm(root, { recursive: true, force: true });
         await rm(otherRoot, { recursive: true, force: true });
     }
@@ -495,7 +492,184 @@ test('fetch authorization rejects a handle for a file outside the authorized des
     }
 });
 
-test('pre-opened fetch destination rejects path replacement before network access', async () => {
+test('fetch authorization rejects a structural fake file handle before network access and consumes capability', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ride-codex-fetch-fake-handle-'));
+    const outsideRoot = await mkdtemp(join(tmpdir(), 'ride-codex-fetch-fake-handle-outside-'));
+    const bytes = Buffer.from('must remain inside the authorized destination');
+    const sentinel = 'outside sentinel must remain unchanged';
+    const requester = new ScriptedRequester([response(Readable.from([bytes]))]);
+    const fetcher = new RideCodexRuntimeFetcher({ authorizationValidator: () => true, requester });
+    const runtime = fetchEntry(bytes);
+    const canonicalRoot = await realpath(root);
+    const authorizedPath = join(canonicalRoot, 'runtime.tgz');
+    const outsidePath = join(outsideRoot, 'outside.tgz');
+    await writeFile(authorizedPath, '');
+    await writeFile(outsidePath, sentinel);
+    const authorizedHandle = await open(authorizedPath, 'r+');
+    const outsideHandle = await open(outsidePath, 'r+');
+    const fakeHandle = Object.freeze({
+        fd: authorizedHandle.fd,
+        stat: authorizedHandle.stat.bind(authorizedHandle),
+        write: outsideHandle.write.bind(outsideHandle),
+        sync: outsideHandle.sync.bind(outsideHandle),
+        close: outsideHandle.close.bind(outsideHandle)
+    }) as unknown as typeof authorizedHandle;
+    try {
+        const capability = await fetcher.authorize(
+            AUTHORIZATION,
+            createInstallAuthorizationContext(runtime, canonicalRoot, authorizedPath)
+        );
+        await assert.rejects(
+            fetcher.fetchAuthorized(capability, runtime, Object.freeze({
+                path: authorizedPath,
+                canonicalRoot,
+                handle: fakeHandle
+            })),
+            /authorization|destination|handle/i
+        );
+        assert.equal(requester.calls.length, 0);
+        assert.equal(await readFile(outsidePath, 'utf8'), sentinel);
+        await assert.rejects(
+            fetcher.fetchAuthorized(capability, runtime, Object.freeze({
+                path: authorizedPath,
+                canonicalRoot,
+                handle: authorizedHandle
+            })),
+            /authorization|capability|already used/i
+        );
+    } finally {
+        await authorizedHandle.close().catch(() => undefined);
+        await outsideHandle.close().catch(() => undefined);
+        await rm(root, { recursive: true, force: true });
+        await rm(outsideRoot, { recursive: true, force: true });
+    }
+});
+
+test('fetch authorization rejects a closed legacy file handle before network access', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ride-codex-fetch-closed-handle-'));
+    const bytes = Buffer.from('closed caller handles are never trusted');
+    const requester = new ScriptedRequester([response(Readable.from([bytes]))]);
+    const fetcher = new RideCodexRuntimeFetcher({ authorizationValidator: () => true, requester });
+    const runtime = fetchEntry(bytes);
+    const canonicalRoot = await realpath(root);
+    const destinationPath = join(canonicalRoot, 'runtime.tgz');
+    const closedHandle = await open(destinationPath, 'wx+', 0o600);
+    await closedHandle.close();
+    const capability = await fetcher.authorize(
+        AUTHORIZATION,
+        createInstallAuthorizationContext(runtime, canonicalRoot, destinationPath)
+    );
+    try {
+        await assert.rejects(
+            fetcher.fetchAuthorized(capability, runtime, Object.freeze({
+                path: destinationPath,
+                canonicalRoot,
+                handle: closedHandle
+            })),
+            /authorization|destination|handle/i
+        );
+        assert.equal(requester.calls.length, 0);
+    } finally {
+        await rm(root, { recursive: true, force: true });
+    }
+});
+
+test('internally owned fetch destination rejects a pre-existing symbolic link before network access', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ride-codex-fetch-link-'));
+    const outsideRoot = await mkdtemp(join(tmpdir(), 'ride-codex-fetch-link-outside-'));
+    const bytes = Buffer.from('links must not be followed');
+    const sentinel = 'linked sentinel must remain unchanged';
+    const requester = new ScriptedRequester([response(Readable.from([bytes]))]);
+    const fetcher = new RideCodexRuntimeFetcher({ authorizationValidator: () => true, requester });
+    const runtime = fetchEntry(bytes);
+    const canonicalRoot = await realpath(root);
+    const destinationPath = join(canonicalRoot, 'runtime.tgz');
+    const outsidePath = join(outsideRoot, 'outside.tgz');
+    await writeFile(outsidePath, sentinel);
+    await symlink(outsidePath, destinationPath, 'file');
+    const capability = await fetcher.authorize(
+        AUTHORIZATION,
+        createInstallAuthorizationContext(runtime, canonicalRoot, destinationPath)
+    );
+    try {
+        await assert.rejects(
+            fetcher.fetchAuthorized(capability, runtime, Object.freeze({
+                path: destinationPath,
+                canonicalRoot
+            })),
+            /authorization|destination|regular file|opened/i
+        );
+        assert.equal(requester.calls.length, 0);
+        assert.equal(await readFile(outsidePath, 'utf8'), sentinel);
+    } finally {
+        await rm(root, { recursive: true, force: true });
+        await rm(outsideRoot, { recursive: true, force: true });
+    }
+});
+
+test('fetcher owns and closes its native destination handle after a successful authorized fetch', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ride-codex-fetch-owned-handle-'));
+    const bytes = Buffer.from('the fetcher owns this native handle');
+    const requester = new ScriptedRequester([response(Readable.from([bytes]))]);
+    const fetcher = new RideCodexRuntimeFetcher({ authorizationValidator: () => true, requester });
+    const runtime = fetchEntry(bytes);
+    const canonicalRoot = await realpath(root);
+    const destinationPath = join(canonicalRoot, 'runtime.tgz');
+    const renamedPath = join(canonicalRoot, 'renamed-after-close.tgz');
+    try {
+        const capability = await fetcher.authorize(
+            AUTHORIZATION,
+            createInstallAuthorizationContext(runtime, canonicalRoot, destinationPath)
+        );
+        await fetcher.fetchAuthorized(capability, runtime, Object.freeze({
+            path: destinationPath,
+            canonicalRoot
+        }));
+        await rename(destinationPath, renamedPath);
+        assert.deepEqual(await readFile(renamedPath), bytes);
+        assert.equal(requester.calls.length, 1);
+    } finally {
+        await rm(root, { recursive: true, force: true });
+    }
+});
+
+test('internally owned fetch destination detects path replacement during download and preserves the replacement', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ride-codex-fetch-midstream-replacement-'));
+    const bytes = Buffer.from('bytes stay on the originally opened inode');
+    const sentinel = 'replacement sentinel must remain unchanged';
+    const runtime = fetchEntry(bytes);
+    const canonicalRoot = await realpath(root);
+    const destinationPath = join(canonicalRoot, 'runtime.tgz');
+    const retainedPath = join(canonicalRoot, 'retained-open-inode.tgz');
+    const requester = new ScriptedRequester([
+        async () => {
+            await rename(destinationPath, retainedPath);
+            await writeFile(destinationPath, sentinel, { flag: 'wx' });
+            return response(Readable.from([bytes]));
+        }
+    ]);
+    const fetcher = new RideCodexRuntimeFetcher({ authorizationValidator: () => true, requester });
+    try {
+        const capability = await fetcher.authorize(
+            AUTHORIZATION,
+            createInstallAuthorizationContext(runtime, canonicalRoot, destinationPath)
+        );
+        await assert.rejects(
+            fetcher.fetchAuthorized(capability, runtime, Object.freeze({
+                path: destinationPath,
+                canonicalRoot
+            })),
+            /destination|identity|authorized path/i
+        );
+        assert.equal(requester.calls.length, 1);
+        assert.equal(await readFile(destinationPath, 'utf8'), sentinel);
+        assert.deepEqual(await readFile(retainedPath), bytes);
+    } finally {
+        await rm(root, { recursive: true, force: true });
+    }
+});
+
+test('internally owned fetch destination rejects path replacement before network access', async () => {
     const root = await mkdtemp(join(tmpdir(), 'ride-codex-fetch-open-handle-'));
     const bytes = Buffer.from('write only to the authorized open inode');
     const requester = new ScriptedRequester([response(Readable.from([bytes]))]);
@@ -503,28 +677,22 @@ test('pre-opened fetch destination rejects path replacement before network acces
     const runtime = fetchEntry(bytes);
     const canonicalRoot = await realpath(root);
     const destinationPath = join(root, 'runtime.tgz');
-    const retainedPath = join(root, 'retained-original.tgz');
-    const handle = await open(destinationPath, 'wx+', 0o600);
     try {
         const capability = await fetcher.authorize(
             AUTHORIZATION,
             createInstallAuthorizationContext(runtime, canonicalRoot, destinationPath)
         );
-        await rename(destinationPath, retainedPath);
         await writeFile(destinationPath, 'external sentinel', { flag: 'wx' });
         await assert.rejects(
             fetcher.fetchAuthorized(capability, runtime, Object.freeze({
                 path: destinationPath,
-                canonicalRoot,
-                handle
+                canonicalRoot
             })),
-            /authorization|destination|handle|identity/i
+            /authorization|destination|regular file|opened/i
         );
         assert.equal(requester.calls.length, 0);
-        assert.deepEqual(await readFile(retainedPath), Buffer.alloc(0));
         assert.equal(await readFile(destinationPath, 'utf8'), 'external sentinel');
     } finally {
-        await handle.close().catch(() => undefined);
         await rm(root, { recursive: true, force: true });
     }
 });

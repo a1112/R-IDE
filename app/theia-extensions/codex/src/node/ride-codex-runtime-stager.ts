@@ -136,7 +136,6 @@ export class RideCodexRuntimeStager {
         );
         const capability = await this.fetcher.authorize(authorization, authorizationContext);
         let stagingBoundary: RuntimeStagingBoundary | undefined;
-        let archiveHandle: FileHandle | undefined;
         try {
             const capacity = await this.statfs(rootBoundary.canonicalRoot);
             if (availableBytes(capacity) < BigInt(requiredRuntimeStageBytes(runtime))) {
@@ -147,18 +146,17 @@ export class RideCodexRuntimeStager {
             stagingBoundary = await rootBoundary.captureStaging(stagingDirectory);
             await stagingBoundary.verify();
             await stagingBoundary.verify();
-            archiveHandle = await openNewOwnedFile(archive, stagingBoundary);
             const destination: RideCodexRuntimeFetchDestination = Object.freeze({
                 path: archive,
-                canonicalRoot: rootBoundary.canonicalRoot,
-                handle: archiveHandle
+                canonicalRoot: rootBoundary.canonicalRoot
             });
             await this.fetcher.fetchAuthorized(capability, runtime, destination, this.signal);
-            await archiveHandle.sync();
-            const archiveIdentity = filesystemIdentity(await archiveHandle.stat({ bigint: true }));
-            await archiveHandle.close();
-            archiveHandle = undefined;
             await stagingBoundary.verify();
+            const archiveStat = await safeLstat(archive, 'Codex runtime archive is missing after download.');
+            if (!archiveStat.isFile() || archiveStat.isSymbolicLink()) {
+                throw new RideCodexRuntimeStageError('Codex runtime archive must remain a regular file after download.');
+            }
+            const archiveIdentity = filesystemIdentity(archiveStat);
             const archiveReader = await openVerifiedFile(archive, stagingBoundary, archiveIdentity);
             try {
                 await this.extractor.extract(
@@ -177,7 +175,6 @@ export class RideCodexRuntimeStager {
             await stagingBoundary.verify();
             return staged;
         } catch (error) {
-            await archiveHandle?.close().catch(() => undefined);
             await stagingBoundary?.cleanup();
             if (error instanceof RideCodexRuntimeStageError) {
                 throw error;
@@ -662,28 +659,6 @@ function runtimeTreeAttestationsEqual(left: RuntimeTreeAttestation, right: Runti
             && entry.digest === candidate.digest
             && runtimeFilesystemIdentitiesEqual(entry.identity, candidate.identity);
     });
-}
-
-async function openNewOwnedFile(path: string, boundary: RuntimeStagingBoundary): Promise<FileHandle> {
-    await boundary.verify();
-    const flags = fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL
-        | (fsConstants.O_NOFOLLOW ?? 0);
-    const handle = await fs.open(path, flags, 0o600);
-    try {
-        const stat = await handle.stat({ bigint: true });
-        if (!stat.isFile()) {
-            throw new RideCodexRuntimeStageError('Codex runtime archive destination is not a regular file.');
-        }
-        const canonical = await safeRealpath(path, 'Codex runtime archive destination could not be resolved safely.');
-        if (!samePath(canonical, path) || !isStrictChild(boundary.canonicalStaging, canonical)) {
-            throw new RideCodexRuntimeStageError('Codex runtime archive destination escaped its staging boundary.');
-        }
-        await boundary.verify();
-        return handle;
-    } catch (error) {
-        await handle.close().catch(() => undefined);
-        throw error;
-    }
 }
 
 async function openVerifiedFile(
