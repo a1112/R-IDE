@@ -1,0 +1,77 @@
+{
+  "schemaVersion": 1,
+  "runtimes": [
+    {
+      "package": "@openai/codex",
+      "version": "0.144.0",
+      "npmVersion": "0.144.0-win32-x64",
+      "target": "x86_64-pc-windows-msvc",
+      "url": "https://registry.npmjs.org/@openai/codex/-/codex-0.144.0-win32-x64.tgz",
+      "integrity": "sha512-QiholLCYqNeYvNM77HOmPtrOFrY0rQc/N9nXt+sQGXO3rEGmcWjpLzujY4Oegl3CLRHoieWqlep3EqEvFBjoIA==",
+      "compressedBytes": 145137410,
+      "unpackedBytes": 409204884,
+      "layoutVersion": 1,
+      "entrypoint": "bin/codex.exe"
+    },
+    {
+      "package": "@openai/codex",
+      "version": "0.144.0",
+      "npmVersion": "0.144.0-win32-arm64",
+      "target": "aarch64-pc-windows-msvc",
+      "url": "https://registry.npmjs.org/@openai/codex/-/codex-0.144.0-win32-arm64.tgz",
+      "integrity": "sha512-e2yGSgwdzrT1SoJMoOzWD58WBEsIaAMZpEchuV2VGkE2T955SG7dn7EyVQTQcy7/rdpE8aEDktZ/1eQQfjkdtQ==",
+      "compressedBytes": 136015165,
+      "unpackedBytes": 356429977,
+      "layoutVersion": 1,
+      "entrypoint": "bin/codex.exe"
+    },
+    {
+      "package": "@openai/codex",
+      "version": "0.144.0",
+      "npmVersion": "0.144.0-darwin-x64",
+      "target": "x86_64-apple-darwin",
+      "url": "https://registry.npmjs.org/@openai/codex/-/codex-0.144.0-darwin-x64.tgz",
+      "integrity": "sha512-4p2jxRbN+Khg5UQzpkzT9upFj+qkEF/abmdvrtflkkWmVKP6Nt+yi8ospdqv9PDqvQ9SotPvX7iXaFaeUTrtmA==",
+      "compressedBytes": 128742068,
+      "unpackedBytes": 337146266,
+      "layoutVersion": 1,
+      "entrypoint": "bin/codex"
+    },
+    {
+      "package": "@openai/codex",
+      "version": "0.144.0",
+      "npmVersion": "0.144.0-darwin-arm64",
+      "target": "aarch64-apple-darwin",
+      "url": "https://registry.npmjs.org/@openai/codex/-/codex-0.144.0-darwin-arm64.tgz",
+      "integrity": "sha512-rqFAJdOa2I0VRgepVsSZeLxs96+Y+LXTjccOOvH6894FyaFAYPZ/o+6hgpB1iGHxxdoY/DsGa8jrJC8Leqn9Kg==",
+      "compressedBytes": 120229260,
+      "unpackedBytes": 311534939,
+      "layoutVersion": 1,
+      "entrypoint": "bin/codex"
+    },
+    {
+      "package": "@openai/codex",
+      "version": "0.144.0",
+      "npmVersion": "0.144.0-linux-x64",
+      "target": "x86_64-unknown-linux-musl",
+      "url": "https://registry.npmjs.org/@openai/codex/-/codex-0.144.0-linux-x64.tgz",
+      "integrity": "sha512-GmKtQeX+cO9lN7mQD1FEVcXYEMLMgMByHwZdvlluH0bj/+c2ind3hwbRtE3eECFDekNhEiB80Ez0FfbkyFQqoA==",
+      "compressedBytes": 131150753,
+      "unpackedBytes": 351492154,
+      "layoutVersion": 1,
+      "entrypoint": "bin/codex"
+    },
+    {
+      "package": "@openai/codex",
+      "version": "0.144.0",
+      "npmVersion": "0.144.0-linux-arm64",
+      "target": "aarch64-unknown-linux-musl",
+      "url": "https://registry.npmjs.org/@openai/codex/-/codex-0.144.0-linux-arm64.tgz",
+      "integrity": "sha512-k++xhZrn9P3laO00Q92APG6mdOFDD66nUBo+8ExCa1NXi2pjLEMLC4+UNJTUUtUT1PEflOZ5pDKxPXgzaiFFFg==",
+      "compressedBytes": 123658222,
+      "unpackedBytes": 308463407,
+      "layoutVersion": 1,
+      "entrypoint": "bin/codex"
+    }
+  ]
+}

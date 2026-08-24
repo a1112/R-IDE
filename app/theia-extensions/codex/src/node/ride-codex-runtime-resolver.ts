@@ -1112,7 +1112,7 @@ function isPathWithin(paths: typeof win32, parent: string, child: string): boole
     return relative !== '' && !relative.startsWith('..') && !paths.isAbsolute(relative);
 }
 
-function readNativeBinaryTargets(platform: NodeJS.Platform, header: Uint8Array): readonly string[] {
+export function readNativeBinaryTargets(platform: NodeJS.Platform, header: Uint8Array): readonly string[] {
     const buffer = Buffer.from(header.buffer, header.byteOffset, header.byteLength);
     if (platform === 'win32') {
         if (buffer.length < 0x40 || buffer[0] !== 0x4d || buffer[1] !== 0x5a) {

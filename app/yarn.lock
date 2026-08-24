@@ -6047,7 +6047,7 @@
     "@types/node" "*"
     "@types/tar-stream" "*"
 
-"@types/tar-stream@*", "@types/tar-stream@^3.1.4":
+"@types/tar-stream@*", "@types/tar-stream@3.1.4", "@types/tar-stream@^3.1.4":
   version "3.1.4"
   resolved "https://registry.yarnpkg.com/@types/tar-stream/-/tar-stream-3.1.4.tgz#7eca21004291f8d4803437fe20cc01b0744782a8"
   integrity sha512-921gW0+g29mCJX0fRvqeHzBlE/XclDaAG0Ousy1LCghsOhvaKacDeRGEVzQP9IPfKn8Vysy7FEXAIxycpc/CMg==
@@ -17706,7 +17706,7 @@ tar-stream@^1.5.2:
     to-buffer "^1.1.1"
     xtend "^4.0.0"
 
-tar-stream@^3.1.5, tar-stream@^3.2.0:
+tar-stream@3.2.0, tar-stream@^3.1.5, tar-stream@^3.2.0:
   version "3.2.0"
   resolved "https://registry.yarnpkg.com/tar-stream/-/tar-stream-3.2.0.tgz#0d0064d9b67ea3c9f5abde155e35faab0df37591"
   integrity sha512-ojzvCvVaNp6aOTFmG7jaRD0meowIAuPc3cMMhSgKiVWws1GyHbGd/xvnyuRKcKlMpt3qvxx6r0hreCNITP9hIg==
