@@ -11,6 +11,8 @@
         "src/common/ride-codex-methods.ts",
         "src/common/ride-codex-protocol.ts",
         "src/node/ride-codex-jsonl-*.ts",
+        "src/node/ride-codex-launch-spec.ts",
+        "src/node/ride-codex-runtime-*.ts",
         "test/**/*.ts"
     ]
 }
