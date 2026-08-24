@@ -30,6 +30,8 @@ import {
     RideCodexRuntimeFetchCapability,
     RideCodexRuntimeFetchDestination,
     RideCodexRuntimeFetcher,
+    RideCodexRuntimeFetchResult,
+    RideCodexRuntimeFileIdentity,
     RuntimeFetchDestination,
     validateInstallAuthorization
 } from '../src/node/ride-codex-runtime-fetcher';
@@ -239,8 +241,37 @@ function sha512Integrity(bytes: Uint8Array): string {
     return `sha512-${createHash('sha512').update(bytes).digest('base64')}`;
 }
 
-async function writeFetchDestination(destination: RuntimeFetchDestination, bytes: Uint8Array): Promise<void> {
-    await writeFile(typeof destination === 'string' ? destination : destination.path, bytes, { flag: 'wx', mode: 0o600 });
+async function downloadedFileIdentity(path: string): Promise<RideCodexRuntimeFileIdentity> {
+    const identity = await lstat(path, { bigint: true });
+    assert.equal(identity.isFile(), true);
+    assert.equal(identity.isSymbolicLink(), false);
+    return Object.freeze({
+        type: 'file',
+        dev: identity.dev,
+        ino: identity.ino,
+        size: identity.size,
+        birthtimeNs: identity.birthtimeNs,
+        ctimeNs: identity.ctimeNs,
+        nlink: identity.nlink,
+        mode: identity.mode
+    });
+}
+
+async function writeFetchDestination(
+    destination: RuntimeFetchDestination,
+    bytes: Uint8Array
+): Promise<RideCodexRuntimeFileIdentity> {
+    const path = typeof destination === 'string' ? destination : destination.path;
+    await writeFile(path, bytes, { flag: 'wx', mode: 0o600 });
+    return downloadedFileIdentity(path);
+}
+
+function downloadedFetchResult(
+    bytes: Uint8Array,
+    identity: RideCodexRuntimeFileIdentity,
+    integrity = sha512Integrity(bytes)
+): RideCodexRuntimeFetchResult {
+    return Object.freeze({ bytes: bytes.byteLength, integrity, identity });
 }
 
 function fetchEntry(bytes: Uint8Array, overrides: Partial<RideCodexRuntimeManifestEntry> = {}): RideCodexRuntimeManifestEntry {
@@ -281,6 +312,34 @@ test('fetcher streams an exact response to disk and verifies byte count and SHA-
         assert.equal(requester.calls[0].url, RIDE_CODEX_RUNTIME_MANIFEST.runtimes[4].url);
         assert.ok(requester.calls[0].request.connectTimeoutMs > 0);
         assert.equal(Object.isFrozen(result), true);
+    } finally {
+        await rm(root, { recursive: true, force: true });
+    }
+});
+
+test('fetcher returns a deeply frozen final identity for the downloaded regular file', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ride-codex-fetch-final-identity-'));
+    const bytes = Buffer.from('final identity fixture');
+    const requester = new ScriptedRequester([response(Readable.from([bytes]))]);
+    try {
+        const destination = join(root, 'runtime.tgz');
+        const fetcher = new RideCodexRuntimeFetcher({
+            authorizationValidator: authorization => authorization === AUTHORIZATION,
+            requester
+        });
+        const result = await fetcher.fetch(AUTHORIZATION, fetchEntry(bytes), destination);
+        const candidate = result as typeof result & {
+            readonly identity?: Awaited<ReturnType<typeof downloadedFileIdentity>>;
+        };
+        const expected = await downloadedFileIdentity(destination);
+
+        assert.ok(candidate.identity);
+        assert.equal(Object.isFrozen(result), true);
+        assert.equal(Object.isFrozen(candidate.identity), true);
+        assert.deepEqual(candidate.identity, expected);
+        assert.throws(() => {
+            (candidate.identity as { size: bigint }).size = BigInt(0);
+        }, TypeError);
     } finally {
         await rm(root, { recursive: true, force: true });
     }
@@ -893,7 +952,7 @@ test('fetcher aborts connect, idle, overall, and stream failures and removes par
 test('staging consumes a single-use external authorization once before statfs and download', async () => {
     const root = await mkdtemp(join(tmpdir(), 'ride-codex-stage-capability-'));
     const archive = await tarGz(validArchiveEntries());
-    const entry = RIDE_CODEX_RUNTIME_MANIFEST.runtimes[4];
+    const entry = fetchEntry(archive);
     const capabilities = new WeakSet<object>();
     let validations = 0;
     let authorizationConsumed = false;
@@ -927,11 +986,12 @@ test('staging consumes a single-use external authorization once before statfs an
                     throw new Error('authorization capability is invalid');
                 }
                 fetchCalls += 1;
-                await writeFetchDestination(destination, archive);
-                return Object.freeze({ bytes: archive.length, integrity: sha512Integrity(archive) });
+                const identity = await writeFetchDestination(destination, archive);
+                return downloadedFetchResult(archive, identity);
             }
         },
-        probe: new RecordingProbe()
+        probe: new RecordingProbe(),
+        runtimeEntryForTarget: () => entry
     });
     try {
         const staged = await stager.stage(AUTHORIZATION, entry.target);
@@ -1001,7 +1061,20 @@ test('staging detects replacement with an external symlink and cleanup preserves
                     replacedStaging = dirname(typeof destination === 'string' ? destination : destination.path);
                     await rm(replacedStaging, { recursive: true, force: true });
                     await symlink(external, replacedStaging, process.platform === 'win32' ? 'junction' : 'dir');
-                    return Object.freeze({ bytes: entry.compressedBytes, integrity: entry.integrity });
+                    return Object.freeze({
+                        bytes: entry.compressedBytes,
+                        integrity: entry.integrity,
+                        identity: Object.freeze({
+                            type: 'file' as const,
+                            dev: BigInt(0),
+                            ino: BigInt(0),
+                            size: BigInt(entry.compressedBytes),
+                            birthtimeNs: BigInt(0),
+                            ctimeNs: BigInt(0),
+                            nlink: BigInt(1),
+                            mode: BigInt(0)
+                        })
+                    });
                 }
             }
         });
@@ -1211,7 +1284,7 @@ async function createArchiveStager(
         readonly trustedRuntimeBase?: string;
     } = {}
 ): Promise<RideCodexRuntimeStager> {
-    const entry = RIDE_CODEX_RUNTIME_MANIFEST.runtimes[4];
+    const entry = fetchEntry(archive);
     return new RideCodexRuntimeStager({
         trustedRuntimeBase: options.trustedRuntimeBase ?? root,
         runtimeRoot: root,
@@ -1220,20 +1293,138 @@ async function createArchiveStager(
         fetcher: {
             authorize: async authorization => authorization as RideCodexRuntimeFetchCapability,
             fetchAuthorized: async (_authorization, _runtime, destination) => {
-                await writeFetchDestination(destination, archive);
-                return Object.freeze({ bytes: archive.length, integrity: sha512Integrity(archive) });
+                const identity = await writeFetchDestination(destination, archive);
+                return downloadedFetchResult(archive, identity);
             }
         },
         probe: options.probe ?? new RecordingProbe(),
-        maxArchiveEntries: options.maxArchiveEntries
+        maxArchiveEntries: options.maxArchiveEntries,
+        runtimeEntryForTarget: () => entry
     });
 }
+
+test('staging rejects an archive path replaced after fetch identity attestation', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ride-codex-handoff-replacement-'));
+    const retainedRoot = await mkdtemp(join(tmpdir(), 'ride-codex-handoff-retained-'));
+    const trustedArchive = await tarGz(validArchiveEntries());
+    const replacementArchive = await tarGz(validArchiveEntries({
+        extras: [{
+            header: { name: 'package/vendor/x86_64-unknown-linux-musl/codex-resources/replacement.txt', type: 'file' },
+            body: 'replacement archive must never be extracted'
+        }]
+    }));
+    const runtime = fetchEntry(trustedArchive);
+    const retainedArchive = join(retainedRoot, 'trusted-runtime.tgz');
+    let probeCalls = 0;
+    try {
+        const options = {
+            trustedRuntimeBase: root,
+            runtimeRoot: root,
+            authorizationValidator: (authorization: InstallAuthorization) => authorization === AUTHORIZATION,
+            statfs: async () => ({ bsize: 1, bavail: Number.MAX_SAFE_INTEGER }),
+            fetcher: {
+                authorize: async (authorization: InstallAuthorization) => authorization as RideCodexRuntimeFetchCapability,
+                fetchAuthorized: async (
+                    _authorization: RideCodexRuntimeFetchCapability,
+                    _runtime: RideCodexRuntimeManifestEntry,
+                    destination: RuntimeFetchDestination
+                ) => {
+                    const archivePath = typeof destination === 'string' ? destination : destination.path;
+                    await writeFetchDestination(destination, trustedArchive);
+                    const identity = await downloadedFileIdentity(archivePath);
+                    await rename(archivePath, retainedArchive);
+                    await writeFile(archivePath, replacementArchive, { flag: 'wx', mode: 0o600 });
+                    return Object.freeze({
+                        bytes: trustedArchive.length,
+                        integrity: sha512Integrity(trustedArchive),
+                        identity
+                    });
+                }
+            },
+            probe: {
+                probe: async () => {
+                    probeCalls += 1;
+                    return Object.freeze({ version: '0.144.0' });
+                }
+            },
+            runtimeEntryForTarget: () => runtime
+        };
+        const stager = new RideCodexRuntimeStager(options);
+
+        await assert.rejects(
+            stager.stage(AUTHORIZATION, runtime.target),
+            /archive|download|handoff|identity|replace|stage|safe/i
+        );
+        assert.equal(probeCalls, 0);
+        assert.deepEqual(await readFile(retainedArchive), trustedArchive);
+    } finally {
+        await rm(root, { recursive: true, force: true });
+        await rm(retainedRoot, { recursive: true, force: true });
+    }
+});
+
+test('staging rejects a fetch result whose integrity disagrees with the handle rehash', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ride-codex-handoff-rehash-'));
+    const trustedFixture = await tarGz(validArchiveEntries({
+        extras: [{
+            header: { name: 'package/vendor/x86_64-unknown-linux-musl/codex-resources/source.txt', type: 'file' },
+            body: 'trusted archive'
+        }]
+    }));
+    const tamperedFixture = await tarGz(validArchiveEntries({
+        extras: [{
+            header: { name: 'package/vendor/x86_64-unknown-linux-musl/codex-resources/source.txt', type: 'file' },
+            body: 'tampered archive'
+        }]
+    }));
+    const exactBytes = Math.max(trustedFixture.length, tamperedFixture.length);
+    const archive = Buffer.concat([trustedFixture, Buffer.alloc(exactBytes - trustedFixture.length)]);
+    const tamperedArchive = Buffer.concat([tamperedFixture, Buffer.alloc(exactBytes - tamperedFixture.length)]);
+    const runtime = fetchEntry(archive);
+    let probeCalls = 0;
+    try {
+        const options = {
+            trustedRuntimeBase: root,
+            runtimeRoot: root,
+            authorizationValidator: (authorization: InstallAuthorization) => authorization === AUTHORIZATION,
+            statfs: async () => ({ bsize: 1, bavail: Number.MAX_SAFE_INTEGER }),
+            fetcher: {
+                authorize: async (authorization: InstallAuthorization) => authorization as RideCodexRuntimeFetchCapability,
+                fetchAuthorized: async (
+                    _authorization: RideCodexRuntimeFetchCapability,
+                    _runtime: RideCodexRuntimeManifestEntry,
+                    destination: RuntimeFetchDestination
+                ) => {
+                    const archivePath = typeof destination === 'string' ? destination : destination.path;
+                    await writeFetchDestination(destination, tamperedArchive);
+                    return downloadedFetchResult(archive, await downloadedFileIdentity(archivePath));
+                }
+            },
+            probe: {
+                probe: async () => {
+                    probeCalls += 1;
+                    return Object.freeze({ version: '0.144.0' });
+                }
+            },
+            runtimeEntryForTarget: () => runtime
+        };
+        const stager = new RideCodexRuntimeStager(options);
+
+        await assert.rejects(
+            stager.stage(AUTHORIZATION, runtime.target),
+            /archive|download|integrity|hash|rehash|stage|safe/i
+        );
+        assert.equal(probeCalls, 0);
+    } finally {
+        await rm(root, { recursive: true, force: true });
+    }
+});
 
 test('valid archive is streamed into a frozen staged runtime without activating it', async () => {
     const root = await mkdtemp(join(tmpdir(), 'ride-codex-valid-stage-'));
     const archive = await tarGz(validArchiveEntries());
     const probe = new RecordingProbe();
-    const entry = RIDE_CODEX_RUNTIME_MANIFEST.runtimes[4];
+    const entry = fetchEntry(archive);
     try {
         const stager = await createArchiveStager(root, archive, { probe });
         const staged = await stager.stage(AUTHORIZATION, 'x86_64-unknown-linux-musl');
@@ -1243,7 +1434,8 @@ test('valid archive is streamed into a frozen staged runtime without activating 
         assert.equal(staged.target, 'x86_64-unknown-linux-musl');
         assert.equal(staged.entrypoint, 'bin/codex');
         assert.equal(staged.npmVersion, '0.144.0-linux-x64');
-        assert.equal(staged.integrity, RIDE_CODEX_RUNTIME_MANIFEST.runtimes[4].integrity);
+        assert.equal(staged.integrity, sha512Integrity(archive));
+        assert.equal(staged.compressedBytes, archive.length);
         assert.equal(staged.layoutVersion, 1);
         assert.equal(Object.isFrozen(staged.authorizationContext), true);
         assert.equal(Object.isFrozen(staged.stagingIdentity), true);

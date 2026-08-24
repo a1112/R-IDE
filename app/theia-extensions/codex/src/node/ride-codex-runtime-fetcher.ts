@@ -55,6 +55,18 @@ export interface RideCodexHttpsRequester {
 export interface RideCodexRuntimeFetchResult {
     readonly bytes: number;
     readonly integrity: string;
+    readonly identity: RideCodexRuntimeFileIdentity;
+}
+
+export interface RideCodexRuntimeFileIdentity {
+    readonly type: 'file';
+    readonly dev: bigint;
+    readonly ino: bigint;
+    readonly size: bigint;
+    readonly birthtimeNs: bigint;
+    readonly ctimeNs: bigint;
+    readonly nlink: bigint;
+    readonly mode: bigint;
 }
 
 export interface RideCodexRuntimeFetchDestination {
@@ -209,9 +221,12 @@ export class RideCodexRuntimeFetcher implements RideCodexRuntimeFetcherLike {
                 () => timedOut
             );
             await openedDestination.handle.sync();
-            await validateOpenedDestination(openedDestination);
+            const identity = await validateOpenedDestination(openedDestination);
+            if (identity.size !== BigInt(result.bytes)) {
+                throw new RideCodexRuntimeFetchError('Codex runtime download final file size changed unexpectedly.');
+            }
             completed = true;
-            return Object.freeze(result);
+            return Object.freeze({ ...result, identity });
         } catch (error) {
             response?.body.destroy();
             if (error instanceof RideCodexRuntimeFetchError) {
@@ -276,7 +291,7 @@ export class RideCodexRuntimeFetcher implements RideCodexRuntimeFetcherLike {
         runtime: RideCodexRuntimeManifestEntry,
         signal: AbortSignal,
         didOverallTimeout: () => boolean
-    ): Promise<RideCodexRuntimeFetchResult> {
+    ): Promise<Omit<RideCodexRuntimeFetchResult, 'identity'>> {
         const hash = createHash('sha512');
         let bytes = 0;
         let idleTimer: ReturnType<typeof setTimeout> | undefined;
@@ -521,7 +536,7 @@ async function validateDestinationParent(destination: RideCodexRuntimeFetchDesti
     }
 }
 
-async function validateOpenedDestination(destination: OpenedRuntimeFetchDestination): Promise<void> {
+async function validateOpenedDestination(destination: OpenedRuntimeFetchDestination): Promise<RideCodexRuntimeFileIdentity> {
     try {
         const handleBefore = await destination.handle.stat({ bigint: true });
         const pathBefore = await lstat(destination.path, { bigint: true });
@@ -543,11 +558,28 @@ async function validateOpenedDestination(destination: OpenedRuntimeFetchDestinat
             || !fetchFileIdentitiesEqual(handleBefore, pathAfter)) {
             throw new Error('identity mismatch');
         }
+        return runtimeFetchFileIdentity(handleAfter);
     } catch {
         throw new RideCodexRuntimeFetchError(
             'Codex runtime fetch destination identity changed outside its authorized path.'
         );
     }
+}
+
+function runtimeFetchFileIdentity(stat: BigIntStats): RideCodexRuntimeFileIdentity {
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== BigInt(1)) {
+        throw new RideCodexRuntimeFetchError('Codex runtime download is not a safe regular file.');
+    }
+    return Object.freeze({
+        type: 'file',
+        dev: stat.dev,
+        ino: stat.ino,
+        size: stat.size,
+        birthtimeNs: stat.birthtimeNs,
+        ctimeNs: stat.ctimeNs,
+        nlink: stat.nlink,
+        mode: stat.mode
+    });
 }
 
 async function removeOpenedDestination(destination: OpenedRuntimeFetchDestination): Promise<void> {

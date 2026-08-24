@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: MIT
  ********************************************************************************/
 
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { BigIntStats, constants as fsConstants, promises as fs } from 'node:fs';
 import { FileHandle } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve } from 'node:path';
@@ -19,6 +19,8 @@ import {
     InstallAuthorizationValidator,
     RideCodexRuntimeFetcher,
     RideCodexRuntimeFetchDestination,
+    RideCodexRuntimeFetchResult,
+    RideCodexRuntimeFileIdentity,
     RideCodexRuntimeStagingFetcherLike
 } from './ride-codex-runtime-fetcher';
 import {
@@ -85,6 +87,7 @@ export interface RideCodexRuntimeStagerOptions {
     readonly probe?: RideCodexRuntimeProbeLike;
     readonly maxArchiveEntries?: number;
     readonly signal?: AbortSignal;
+    readonly runtimeEntryForTarget?: (target: RuntimeTarget) => RideCodexRuntimeManifestEntry;
 }
 
 export class RideCodexRuntimeStageError extends Error {
@@ -103,6 +106,7 @@ export class RideCodexRuntimeStager {
     private readonly extractor: RideCodexRuntimeArchiveExtractor;
     private readonly maxTreeEntries: number;
     private readonly signal?: AbortSignal;
+    private readonly runtimeEntryForTarget: (target: RuntimeTarget) => RideCodexRuntimeManifestEntry;
 
     constructor(options: RideCodexRuntimeStagerOptions) {
         if (!isAbsolute(options.trustedRuntimeBase) || !isAbsolute(options.runtimeRoot)) {
@@ -120,10 +124,14 @@ export class RideCodexRuntimeStager {
         this.extractor = new RideCodexRuntimeArchiveExtractor({ maxEntries: maxArchiveEntries });
         this.maxTreeEntries = boundedTreeEntryLimit(maxArchiveEntries);
         this.signal = options.signal;
+        this.runtimeEntryForTarget = options.runtimeEntryForTarget ?? runtimeManifestEntryForTarget;
     }
 
     async stage(authorization: InstallAuthorization, target: RuntimeTarget): Promise<StagedRuntime> {
-        const runtime = runtimeManifestEntryForTarget(target);
+        const runtime = this.runtimeEntryForTarget(target);
+        if (runtime.target !== target) {
+            throw new RideCodexRuntimeStageError('Codex runtime manifest target does not match the staging request.');
+        }
         const rootBoundary = await RuntimeRootBoundary.create(this.trustedRuntimeBase, this.runtimeRoot);
         const stagingDirectory = join(rootBoundary.canonicalRoot, `.staging-${randomUUID()}`);
         requireStrictChild(rootBoundary.canonicalRoot, stagingDirectory);
@@ -150,20 +158,30 @@ export class RideCodexRuntimeStager {
                 path: archive,
                 canonicalRoot: rootBoundary.canonicalRoot
             });
-            await this.fetcher.fetchAuthorized(capability, runtime, destination, this.signal);
+            const fetchResult = normalizeRuntimeFetchResult(
+                await this.fetcher.fetchAuthorized(capability, runtime, destination, this.signal),
+                runtime
+            );
             await stagingBoundary.verify();
-            const archiveStat = await safeLstat(archive, 'Codex runtime archive is missing after download.');
-            if (!archiveStat.isFile() || archiveStat.isSymbolicLink()) {
-                throw new RideCodexRuntimeStageError('Codex runtime archive must remain a regular file after download.');
-            }
-            const archiveIdentity = filesystemIdentity(archiveStat);
-            const archiveReader = await openVerifiedFile(archive, stagingBoundary, archiveIdentity);
+            const archiveReader = await openVerifiedDownloadedArchive(
+                archive,
+                stagingBoundary,
+                runtime,
+                fetchResult,
+                this.signal
+            );
             try {
                 await this.extractor.extract(
                     Object.freeze({ path: archive, handle: archiveReader }),
                     stagingDirectory,
                     runtime,
                     () => stagingBoundary!.verify()
+                );
+                await verifyOpenedDownloadedArchive(
+                    archive,
+                    archiveReader,
+                    stagingBoundary,
+                    fetchResult.identity
                 );
             } finally {
                 await archiveReader.close().catch(() => undefined);
@@ -661,30 +679,178 @@ function runtimeTreeAttestationsEqual(left: RuntimeTreeAttestation, right: Runti
     });
 }
 
-async function openVerifiedFile(
+function normalizeRuntimeFetchResult(
+    candidate: RideCodexRuntimeFetchResult,
+    runtime: RideCodexRuntimeManifestEntry
+): RideCodexRuntimeFetchResult {
+    try {
+        if (typeof candidate !== 'object' || candidate === null) {
+            throw new Error('missing result');
+        }
+        const descriptors = Object.getOwnPropertyDescriptors(candidate);
+        if (Reflect.ownKeys(descriptors).length !== 3
+            || !Object.prototype.hasOwnProperty.call(descriptors, 'bytes')
+            || !Object.prototype.hasOwnProperty.call(descriptors, 'integrity')
+            || !Object.prototype.hasOwnProperty.call(descriptors, 'identity')) {
+            throw new Error('unexpected result shape');
+        }
+        const bytes = ownDataValue<number>(descriptors.bytes);
+        const integrity = ownDataValue<string>(descriptors.integrity);
+        const identity = normalizeRuntimeFetchFileIdentity(
+            ownDataValue<RideCodexRuntimeFileIdentity>(descriptors.identity)
+        );
+        if (!Number.isSafeInteger(bytes) || bytes <= 0
+            || bytes !== runtime.compressedBytes
+            || typeof integrity !== 'string'
+            || integrity !== runtime.integrity
+            || identity.size !== BigInt(bytes)) {
+            throw new Error('result does not match manifest');
+        }
+        return Object.freeze({ bytes, integrity, identity });
+    } catch {
+        throw new RideCodexRuntimeStageError(
+            'Codex runtime download result did not match the reviewed manifest and file identity.'
+        );
+    }
+}
+
+function normalizeRuntimeFetchFileIdentity(candidate: RideCodexRuntimeFileIdentity): RideCodexRuntimeFileIdentity {
+    if (typeof candidate !== 'object' || candidate === null) {
+        throw new Error('missing identity');
+    }
+    const descriptors = Object.getOwnPropertyDescriptors(candidate);
+    const keys = ['type', 'dev', 'ino', 'size', 'birthtimeNs', 'ctimeNs', 'nlink', 'mode'] as const;
+    if (Reflect.ownKeys(descriptors).length !== keys.length
+        || keys.some(key => !Object.prototype.hasOwnProperty.call(descriptors, key))) {
+        throw new Error('unexpected identity shape');
+    }
+    const type = ownDataValue<'file'>(descriptors.type);
+    const dev = ownDataValue<bigint>(descriptors.dev);
+    const ino = ownDataValue<bigint>(descriptors.ino);
+    const size = ownDataValue<bigint>(descriptors.size);
+    const birthtimeNs = ownDataValue<bigint>(descriptors.birthtimeNs);
+    const ctimeNs = ownDataValue<bigint>(descriptors.ctimeNs);
+    const nlink = ownDataValue<bigint>(descriptors.nlink);
+    const mode = ownDataValue<bigint>(descriptors.mode);
+    if (type !== 'file'
+        || [dev, ino, size, birthtimeNs, ctimeNs, nlink, mode].some(value => typeof value !== 'bigint')
+        || size < BigInt(0) || nlink !== BigInt(1)) {
+        throw new Error('invalid identity');
+    }
+    return Object.freeze({ type, dev, ino, size, birthtimeNs, ctimeNs, nlink, mode });
+}
+
+function ownDataValue<T>(descriptor: PropertyDescriptor | undefined): T {
+    if (!descriptor || !('value' in descriptor)) {
+        throw new Error('unsafe accessor');
+    }
+    return descriptor.value as T;
+}
+
+async function openVerifiedDownloadedArchive(
     path: string,
     boundary: RuntimeStagingBoundary,
-    expectedIdentity: RuntimeFilesystemIdentity
+    runtime: RideCodexRuntimeManifestEntry,
+    fetchResult: RideCodexRuntimeFetchResult,
+    signal?: AbortSignal
 ): Promise<FileHandle> {
     await boundary.verify();
     const handle = await fs.open(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
     try {
-        const openedStat = await handle.stat({ bigint: true });
-        const pathStat = await safeLstat(path, 'Codex runtime archive is missing.');
-        const canonical = await safeRealpath(path, 'Codex runtime archive could not be resolved safely.');
-        if (!openedStat.isFile() || !pathStat.isFile() || pathStat.isSymbolicLink()
-            || !runtimeFilesystemIdentitiesEqual(filesystemIdentity(openedStat), expectedIdentity)
-            || !runtimeFilesystemIdentitiesEqual(filesystemIdentity(pathStat), expectedIdentity)
-            || !samePath(canonical, path)
-            || !isStrictChild(boundary.canonicalStaging, canonical)) {
-            throw new RideCodexRuntimeStageError('Codex runtime archive identity changed before extraction.');
-        }
-        await boundary.verify();
+        await verifyOpenedDownloadedArchive(path, handle, boundary, fetchResult.identity);
+        await rehashOpenedDownloadedArchive(handle, runtime, fetchResult, signal);
+        await verifyOpenedDownloadedArchive(path, handle, boundary, fetchResult.identity);
         return handle;
     } catch (error) {
         await handle.close().catch(() => undefined);
         throw error;
     }
+}
+
+async function verifyOpenedDownloadedArchive(
+    path: string,
+    handle: FileHandle,
+    boundary: RuntimeStagingBoundary,
+    expectedIdentity: RideCodexRuntimeFileIdentity
+): Promise<void> {
+    await boundary.verify();
+    const openedStat = await handle.stat({ bigint: true });
+    const pathStat = await safeLstat(path, 'Codex runtime archive is missing.');
+    const canonical = await safeRealpath(path, 'Codex runtime archive could not be resolved safely.');
+    if (!openedStat.isFile() || openedStat.isSymbolicLink() || openedStat.nlink !== BigInt(1)
+        || !pathStat.isFile() || pathStat.isSymbolicLink() || pathStat.nlink !== BigInt(1)
+        || !runtimeFetchFileIdentityMatchesStat(expectedIdentity, openedStat)
+        || !runtimeFetchFileIdentityMatchesStat(expectedIdentity, pathStat)
+        || !samePath(canonical, path)
+        || !isStrictChild(boundary.canonicalStaging, canonical)) {
+        throw new RideCodexRuntimeStageError('Codex runtime archive identity changed during download handoff.');
+    }
+    await boundary.verify();
+}
+
+function runtimeFetchFileIdentityMatchesStat(
+    expected: RideCodexRuntimeFileIdentity,
+    actual: BigIntStats
+): boolean {
+    return expected.type === 'file'
+        && expected.dev === actual.dev
+        && expected.ino === actual.ino
+        && expected.size === actual.size
+        && expected.birthtimeNs === actual.birthtimeNs
+        && expected.ctimeNs === actual.ctimeNs
+        && expected.nlink === actual.nlink
+        && expected.mode === actual.mode;
+}
+
+async function rehashOpenedDownloadedArchive(
+    handle: FileHandle,
+    runtime: RideCodexRuntimeManifestEntry,
+    fetchResult: RideCodexRuntimeFetchResult,
+    signal?: AbortSignal
+): Promise<void> {
+    const expectedBytes = runtime.compressedBytes;
+    if (!Number.isSafeInteger(expectedBytes) || expectedBytes <= 0 || fetchResult.bytes !== expectedBytes) {
+        throw new RideCodexRuntimeStageError('Codex runtime archive byte limit is invalid.');
+    }
+    const hash = createHash('sha512');
+    const buffer = Buffer.allocUnsafe(Math.min(RUNTIME_TREE_READ_BUFFER_BYTES, expectedBytes));
+    let position = 0;
+    while (position < expectedBytes) {
+        if (signal?.aborted) {
+            throw new RideCodexRuntimeStageError('Codex runtime archive verification was aborted.');
+        }
+        const length = Math.min(buffer.length, expectedBytes - position);
+        const { bytesRead } = await handle.read(buffer, 0, length, position);
+        if (bytesRead <= 0) {
+            throw new RideCodexRuntimeStageError('Codex runtime archive was truncated during handoff verification.');
+        }
+        hash.update(buffer.subarray(0, bytesRead));
+        position += bytesRead;
+    }
+    const extra = Buffer.allocUnsafe(1);
+    if ((await handle.read(extra, 0, 1, position)).bytesRead !== 0) {
+        throw new RideCodexRuntimeStageError('Codex runtime archive exceeded its exact compressed byte limit.');
+    }
+    const actualDigest = hash.digest();
+    const manifestDigest = decodeSha512Integrity(runtime.integrity);
+    const fetchDigest = decodeSha512Integrity(fetchResult.integrity);
+    if (actualDigest.length !== manifestDigest.length
+        || actualDigest.length !== fetchDigest.length
+        || !timingSafeEqual(actualDigest, manifestDigest)
+        || !timingSafeEqual(actualDigest, fetchDigest)) {
+        throw new RideCodexRuntimeStageError('Codex runtime archive SHA-512 verification failed during handoff.');
+    }
+}
+
+function decodeSha512Integrity(integrity: string): Buffer {
+    if (typeof integrity !== 'string' || !/^sha512-[A-Za-z0-9+/]{86}==$/.test(integrity)) {
+        throw new RideCodexRuntimeStageError('Codex runtime archive SHA-512 metadata is invalid.');
+    }
+    const digest = Buffer.from(integrity.slice('sha512-'.length), 'base64');
+    if (digest.length !== 64) {
+        throw new RideCodexRuntimeStageError('Codex runtime archive SHA-512 metadata is invalid.');
+    }
+    return digest;
 }
 
 function samePath(left: string, right: string): boolean {
