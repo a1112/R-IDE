@@ -182,34 +182,15 @@ export class RideCodexManagedInstaller {
             }
             if (primaryDiagnostic) {
                 const diagnostics: InstallDiagnostic[] = [primaryDiagnostic];
-                let restored = false;
                 try {
                     await this.store.restore(previous, published!);
-                    restored = true;
                     this.safeInvalidateResolver();
                     progress('rolled-back');
                 } catch {
-                    const current = await this.store.readActiveRuntime().catch(() => undefined);
-                    restored = previous
-                        ? current?.relativePath === previous.relativePath
-                        : current === undefined;
-                    if (restored) {
-                        this.safeInvalidateResolver();
-                        progress('rolled-back');
-                    } else {
-                        diagnostics.push(createRideCodexInstallDiagnostic(
-                            'rollback-failed',
-                            'Codex runtime rollback also failed; the active pointer requires safe recovery.'
-                        ));
-                    }
-                }
-                if (restored) {
-                    await this.store.discard(published!).catch(() => {
-                        diagnostics.push(createRideCodexInstallDiagnostic(
-                            'cleanup-failed',
-                            'The failed Codex runtime was isolated but could not be removed.'
-                        ));
-                    });
+                    diagnostics.push(createRideCodexInstallDiagnostic(
+                        'rollback-failed',
+                        'Codex runtime rollback also failed; the active pointer requires safe recovery.'
+                    ));
                 }
                 progress('failed');
                 throw new RideCodexManagedInstallError(diagnostics);

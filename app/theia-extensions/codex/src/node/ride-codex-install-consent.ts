@@ -13,6 +13,7 @@ import {
 import {
     InstallAuthorization,
     InstallAuthorizationContext,
+    InstallAuthorizationLease,
     InstallAuthorizationValidator
 } from './ride-codex-runtime-fetcher';
 import {
@@ -22,6 +23,7 @@ import {
 import { requiredRuntimeStageBytes } from './ride-codex-runtime-stager';
 
 const INSTALL_CONSENT_TOKEN_BRAND: unique symbol = Symbol('ride-codex-install-consent-token');
+const INSTALL_AUTHORIZATION_MARKER: unique symbol = Symbol('ride-codex-install-authorization');
 export type InstallConsentToken = Readonly<{ readonly [INSTALL_CONSENT_TOKEN_BRAND]: true }>;
 
 export interface ConsumedInstallConsent {
@@ -106,7 +108,7 @@ export class RideCodexInstallConsent {
                 throw new RideCodexInstallConsentError('Codex install consent does not match the displayed installation.');
             }
         }
-        const authorization = Object.freeze({}) as InstallAuthorization;
+        const authorization = Object.freeze({ [INSTALL_AUTHORIZATION_MARKER]: true }) as InstallAuthorization;
         this.authorizations.set(authorization, Object.freeze({
             target: record.presentation.target,
             manifestDigest: record.presentation.manifestDigest,
@@ -120,7 +122,7 @@ export class RideCodexInstallConsent {
     private consumeAuthorization(
         authorization: InstallAuthorization,
         context: InstallAuthorizationContext
-    ): boolean {
+    ): false | InstallAuthorizationLease {
         if (typeof authorization !== 'object' || !authorization) {
             return false;
         }
@@ -135,11 +137,18 @@ export class RideCodexInstallConsent {
         } catch {
             return false;
         }
-        return now >= record.issuedAt
-            && now < record.expiresAt
-            && record.target === context.target
-            && record.manifestDigest === context.manifestDigest
-            && samePath(record.canonicalRoot, resolve(context.canonicalRoot));
+        if (now < record.issuedAt
+            || now >= record.expiresAt
+            || record.target !== context.target
+            || record.manifestDigest !== context.manifestDigest
+            || !samePath(record.canonicalRoot, resolve(context.canonicalRoot))) {
+            return false;
+        }
+        return Object.freeze({
+            issuedAt: record.issuedAt,
+            expiresAt: record.expiresAt,
+            now: () => this.readClock()
+        });
     }
 
     private readClock(): number {

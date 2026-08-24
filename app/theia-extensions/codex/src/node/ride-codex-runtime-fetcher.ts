@@ -26,10 +26,16 @@ export interface InstallAuthorizationContext {
     readonly destination: string;
 }
 
+export interface InstallAuthorizationLease {
+    readonly issuedAt: number;
+    readonly expiresAt: number;
+    readonly now: () => number;
+}
+
 export type InstallAuthorizationValidator = (
     authorization: InstallAuthorization,
     context: InstallAuthorizationContext
-) => boolean | Promise<boolean>;
+) => boolean | InstallAuthorizationLease | Promise<boolean | InstallAuthorizationLease>;
 
 const RUNTIME_FETCH_CAPABILITY_BRAND: unique symbol = Symbol('ride-codex-runtime-fetch-capability');
 
@@ -127,7 +133,7 @@ export class RideCodexRuntimeFetcher implements RideCodexRuntimeFetcherLike {
     private readonly idleTimeoutMs: number;
     private readonly overallTimeoutMs: number;
     private readonly maxRedirects: number;
-    private readonly capabilities = new WeakMap<object, InstallAuthorizationContext>();
+    private readonly capabilities = new WeakMap<object, RuntimeFetchAuthorizationRecord>();
 
     constructor(options: RideCodexRuntimeFetcherOptions) {
         this.authorizationValidator = options.authorizationValidator;
@@ -159,9 +165,9 @@ export class RideCodexRuntimeFetcher implements RideCodexRuntimeFetcherLike {
         context: InstallAuthorizationContext
     ): Promise<RideCodexRuntimeFetchCapability> {
         const normalizedContext = normalizeInstallAuthorizationContext(context);
-        await validateInstallAuthorization(authorization, this.authorizationValidator, normalizedContext);
+        const lease = await validateInstallAuthorization(authorization, this.authorizationValidator, normalizedContext);
         const capability = Object.freeze(Object.create(null)) as RideCodexRuntimeFetchCapability;
-        this.capabilities.set(capability, normalizedContext);
+        this.capabilities.set(capability, Object.freeze({ context: normalizedContext, lease }));
         return capability;
     }
 
@@ -174,12 +180,13 @@ export class RideCodexRuntimeFetcher implements RideCodexRuntimeFetcherLike {
         if (typeof capability !== 'object' || capability === null) {
             throw new RideCodexRuntimeFetchError('Codex runtime fetch authorization capability is invalid or already used.');
         }
-        const context = this.capabilities.get(capability);
-        if (!context) {
+        const authorization = this.capabilities.get(capability);
+        if (!authorization) {
             throw new RideCodexRuntimeFetchError('Codex runtime fetch authorization capability is invalid or already used.');
         }
         this.capabilities.delete(capability);
-        const authorizedDestination = validateAuthorizedFetchContext(context, runtime, destination);
+        const authorizedDestination = validateAuthorizedFetchContext(authorization.context, runtime, destination);
+        validateAuthorizationLease(authorization.lease);
         return this.fetchTrusted(runtime, authorizedDestination, signal);
     }
 
@@ -382,7 +389,7 @@ export async function validateInstallAuthorization(
     authorization: InstallAuthorization,
     validator: InstallAuthorizationValidator | undefined,
     context: InstallAuthorizationContext
-): Promise<void> {
+): Promise<ValidatedInstallAuthorizationLease | undefined> {
     let keys: readonly PropertyKey[];
     try {
         if (typeof authorization !== 'object' || authorization === null || !validator) {
@@ -395,15 +402,91 @@ export async function validateInstallAuthorization(
     if (keys.length === 0) {
         throw new RideCodexRuntimeFetchError('Codex runtime install authorization is required.');
     }
-    let valid = false;
+    let validation: boolean | InstallAuthorizationLease = false;
     try {
-        valid = await validator(authorization, context);
+        validation = await validator(authorization, context);
     } catch {
-        valid = false;
+        validation = false;
     }
-    if (valid !== true) {
+    if (validation === true) {
+        return undefined;
+    }
+    if (validation === false) {
         throw new RideCodexRuntimeFetchError('Codex runtime install authorization is invalid.');
     }
+    return normalizeAuthorizationLease(validation);
+}
+
+interface RuntimeFetchAuthorizationRecord {
+    readonly context: InstallAuthorizationContext;
+    readonly lease: ValidatedInstallAuthorizationLease | undefined;
+}
+
+interface ValidatedInstallAuthorizationLease {
+    readonly issuedAt: number;
+    readonly expiresAt: number;
+    readonly checkedAt: number;
+    readonly now: () => number;
+}
+
+function normalizeAuthorizationLease(lease: InstallAuthorizationLease): ValidatedInstallAuthorizationLease {
+    try {
+        if (typeof lease !== 'object' || !lease) {
+            throw new Error('missing lease');
+        }
+        const keys = Reflect.ownKeys(lease);
+        if (keys.length !== 3 || !keys.includes('issuedAt') || !keys.includes('expiresAt') || !keys.includes('now')) {
+            throw new Error('invalid lease shape');
+        }
+        const issuedAt = dataProperty(lease, 'issuedAt');
+        const expiresAt = dataProperty(lease, 'expiresAt');
+        const now = dataProperty(lease, 'now');
+        if (!Number.isSafeInteger(issuedAt) || (issuedAt as number) < 0
+            || !Number.isSafeInteger(expiresAt) || (expiresAt as number) <= (issuedAt as number)
+            || typeof now !== 'function') {
+            throw new Error('invalid lease values');
+        }
+        const checkedAt = now();
+        if (!Number.isSafeInteger(checkedAt)
+            || checkedAt < (issuedAt as number)
+            || checkedAt >= (expiresAt as number)) {
+            throw new Error('expired lease');
+        }
+        return Object.freeze({
+            issuedAt: issuedAt as number,
+            expiresAt: expiresAt as number,
+            checkedAt,
+            now: now as () => number
+        });
+    } catch {
+        throw new RideCodexRuntimeFetchError('Codex runtime install authorization is invalid or expired.');
+    }
+}
+
+function validateAuthorizationLease(lease: ValidatedInstallAuthorizationLease | undefined): void {
+    if (!lease) {
+        return;
+    }
+    let now: number;
+    try {
+        now = lease.now();
+    } catch {
+        throw new RideCodexRuntimeFetchError('Codex runtime install authorization is invalid or expired.');
+    }
+    if (!Number.isSafeInteger(now)
+        || now < lease.issuedAt
+        || now < lease.checkedAt
+        || now >= lease.expiresAt) {
+        throw new RideCodexRuntimeFetchError('Codex runtime install authorization is invalid or expired.');
+    }
+}
+
+function dataProperty(object: object, key: PropertyKey): unknown {
+    const descriptor = Object.getOwnPropertyDescriptor(object, key);
+    if (!descriptor || !Object.prototype.hasOwnProperty.call(descriptor, 'value')) {
+        throw new Error('unsafe property');
+    }
+    return descriptor.value;
 }
 
 export function createInstallAuthorizationContext(
