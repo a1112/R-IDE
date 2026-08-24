@@ -364,7 +364,7 @@ export class RideCodexRuntimeResolver {
             systemProbes: 0
         };
         const resolution = this.resolveOnce(context).then(spec => {
-            if (this.generation === generation) {
+            if (this.generation === generation && spec.source !== 'managed') {
                 this.successfulResolution = spec;
                 this.successfulGeneration = generation;
             }

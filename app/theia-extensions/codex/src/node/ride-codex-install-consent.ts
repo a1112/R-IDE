@@ -5,6 +5,7 @@
  ********************************************************************************/
 
 import { resolve } from 'node:path';
+import { types as utilTypes } from 'node:util';
 import {
     createRideCodexInstallPresentation,
     InstallPresentation
@@ -43,6 +44,8 @@ interface AuthorizationRecord {
     readonly target: string;
     readonly manifestDigest: string;
     readonly canonicalRoot: string;
+    readonly issuedAt: number;
+    readonly expiresAt: number;
 }
 
 const DEFAULT_TTL_MS = 60_000;
@@ -73,7 +76,7 @@ export class RideCodexInstallConsent {
     }
 
     issue(presentation: InstallPresentation): InstallConsentToken {
-        const snapshot = createRideCodexInstallPresentation({ ...presentation });
+        const snapshot = snapshotPresentation(presentation);
         const issuedAt = this.readClock();
         const token = Object.freeze({}) as InstallConsentToken;
         this.tokens.set(token, Object.freeze({
@@ -98,7 +101,7 @@ export class RideCodexInstallConsent {
             throw new RideCodexInstallConsentError('Codex install consent expired.');
         }
         if (expected) {
-            const normalizedExpected = createRideCodexInstallPresentation({ ...expected });
+            const normalizedExpected = snapshotPresentation(expected);
             if (!presentationsEqual(record.presentation, normalizedExpected)) {
                 throw new RideCodexInstallConsentError('Codex install consent does not match the displayed installation.');
             }
@@ -107,7 +110,9 @@ export class RideCodexInstallConsent {
         this.authorizations.set(authorization, Object.freeze({
             target: record.presentation.target,
             manifestDigest: record.presentation.manifestDigest,
-            canonicalRoot: resolve(record.presentation.installRoot)
+            canonicalRoot: resolve(record.presentation.installRoot),
+            issuedAt: record.issuedAt,
+            expiresAt: record.expiresAt
         }));
         return Object.freeze({ presentation: record.presentation, authorization });
     }
@@ -124,7 +129,15 @@ export class RideCodexInstallConsent {
             return false;
         }
         this.authorizations.delete(authorization);
-        return record.target === context.target
+        let now: number;
+        try {
+            now = this.readClock();
+        } catch {
+            return false;
+        }
+        return now >= record.issuedAt
+            && now < record.expiresAt
+            && record.target === context.target
             && record.manifestDigest === context.manifestDigest
             && samePath(record.canonicalRoot, resolve(context.canonicalRoot));
     }
@@ -135,6 +148,17 @@ export class RideCodexInstallConsent {
             throw new RideCodexInstallConsentError('Codex install consent clock is invalid.');
         }
         return now;
+    }
+}
+
+function snapshotPresentation(presentation: InstallPresentation): InstallPresentation {
+    if (typeof presentation !== 'object' || !presentation || utilTypes.isProxy(presentation)) {
+        throw new RideCodexInstallConsentError('Codex install presentation contains an unsafe object.');
+    }
+    try {
+        return createRideCodexInstallPresentation(presentation);
+    } catch {
+        throw new RideCodexInstallConsentError('Codex install presentation is invalid or unsafe.');
     }
 }
 

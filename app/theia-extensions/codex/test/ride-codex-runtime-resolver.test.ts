@@ -581,6 +581,65 @@ test('managed runtimes require exact reviewed metadata before probing and exact 
     });
 });
 
+test('managed resolutions coalesce only while in flight and re-read the active pointer for every later delivery', async () => {
+    const firstExecutable = 'C:\\managed-first\\codex.exe';
+    const secondExecutable = 'C:\\managed-second\\codex.exe';
+    const filesystem = new VirtualFileSystem();
+    filesystem.addFile(firstExecutable, peHeader('x64'));
+    filesystem.addFile(secondExecutable, peHeader('x64'));
+    const probe = new FakeProbe();
+    let active = validatedManagedRuntime(firstExecutable);
+    let managedReads = 0;
+    let releaseRead!: () => void;
+    let markReadStarted!: () => void;
+    const readStarted = new Promise<void>(resolveStarted => { markReadStarted = resolveStarted; });
+    const readGate = new Promise<void>(resolveRead => { releaseRead = resolveRead; });
+    const resolver = new RideCodexRuntimeResolver({
+        platform: 'win32',
+        arch: 'x64',
+        filesystem,
+        probe,
+        readEnvironment: () => ({}),
+        readUserOverride: () => undefined,
+        findSystemCandidates: () => [],
+        readManagedActiveRuntime: async () => {
+            managedReads += 1;
+            if (managedReads === 1) {
+                markReadStarted();
+                await readGate;
+            }
+            return active;
+        }
+    });
+
+    const first = resolver.resolve();
+    await readStarted;
+    const concurrent = resolver.resolve();
+    assert.strictEqual(concurrent, first);
+    assert.equal(managedReads, 1);
+    releaseRead();
+    const firstSpec = await first;
+    assert.equal(firstSpec.executable, firstExecutable);
+
+    active = validatedManagedRuntime(secondExecutable);
+    const switched = await resolver.resolve();
+    assert.equal(managedReads, 2);
+    assert.equal(switched.executable, secondExecutable);
+    assert.notStrictEqual(switched, firstSpec);
+
+    await assert.rejects(
+        new Promise<void>(resolveMutation => {
+            active = Object.freeze({
+                ...active,
+                manifestDigest: `sha256-${'f'.repeat(64)}`
+            });
+            resolveMutation();
+        }).then(() => resolver.resolve()),
+        /No compatible native Codex runtime/i
+    );
+    assert.equal(managedReads, 3);
+});
+
 test('a valid system runtime prevents reading the managed active pointer', async () => {
     const system = 'C:\\system\\codex.exe';
     const fixture = createResolver({ system: [system], managed: 'C:\\managed\\codex.exe' });

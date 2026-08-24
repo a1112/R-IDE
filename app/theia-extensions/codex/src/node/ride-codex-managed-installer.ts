@@ -45,7 +45,7 @@ export interface RideCodexManagedHandshakeOptions {
 }
 
 export type RideCodexManagedHandshake = (
-    runtime: PublishedManagedRuntime,
+    runtime: ValidatedManagedRuntime,
     options: RideCodexManagedHandshakeOptions
 ) => Promise<void>;
 
@@ -123,8 +123,8 @@ export class RideCodexManagedInstaller {
             let sequence = 0;
             let staged: StagedRuntime | undefined;
             let published: PublishedManagedRuntime | undefined;
+            let activatedRuntime: ValidatedManagedRuntime | undefined;
             let previous: ValidatedManagedRuntime | undefined;
-            let activated = false;
             const progress = (state: InstallProgress['state']): void => {
                 const update = createRideCodexInstallProgress(state, presentation, sequence++);
                 try {
@@ -147,19 +147,10 @@ export class RideCodexManagedInstaller {
                 previous = await this.store.readActiveRuntime();
                 published = await this.store.publish(staged, presentation);
                 progress('activating');
-                try {
-                    await this.store.activate(published, previous);
-                    activated = true;
-                } catch (error) {
-                    const committed = await this.store.readActiveRuntime().catch(() => undefined);
-                    if (committed?.relativePath !== published.relativePath) {
-                        throw error;
-                    }
-                    activated = true;
-                }
+                activatedRuntime = await this.store.activate(published, previous);
                 this.safeInvalidateResolver();
             } catch {
-                if (published && !activated) {
+                if (published && !activatedRuntime) {
                     await this.store.discard(published).catch(() => undefined);
                 } else if (staged && !published) {
                     await this.store.recover().catch(() => undefined);
@@ -170,12 +161,27 @@ export class RideCodexManagedInstaller {
                 ]);
             }
 
+            let primaryDiagnostic: InstallDiagnostic | undefined;
             try {
-                await this.handshake(published!, Object.freeze({ failHandshake: options.failHandshake === true }));
+                await this.handshake(activatedRuntime!, Object.freeze({ failHandshake: options.failHandshake === true }));
             } catch {
-                const diagnostics: InstallDiagnostic[] = [
-                    createRideCodexInstallDiagnostic('handshake-failed', 'Codex App Server handshake failed.')
-                ];
+                primaryDiagnostic = createRideCodexInstallDiagnostic(
+                    'handshake-failed',
+                    'Codex App Server handshake failed.'
+                );
+            }
+            if (!primaryDiagnostic) {
+                try {
+                    activatedRuntime = await this.store.finalizeActivation(activatedRuntime!);
+                } catch {
+                    primaryDiagnostic = createRideCodexInstallDiagnostic(
+                        'finalize-failed',
+                        'Codex runtime activation could not be finalized safely.'
+                    );
+                }
+            }
+            if (primaryDiagnostic) {
+                const diagnostics: InstallDiagnostic[] = [primaryDiagnostic];
                 let restored = false;
                 try {
                     await this.store.restore(previous, published!);
@@ -214,7 +220,7 @@ export class RideCodexManagedInstaller {
                 : undefined;
             const readyDiagnostics: InstallDiagnostic[] = [];
             await this.store.cleanupObsolete(new Set([
-                published!.relativePath,
+                activatedRuntime!.relativePath,
                 ...(retainedPrevious ? [retainedPrevious.relativePath] : [])
             ])).catch(() => {
                 readyDiagnostics.push(createRideCodexInstallDiagnostic(
@@ -225,9 +231,9 @@ export class RideCodexManagedInstaller {
             progress('ready');
             return Object.freeze({
                 state: 'ready' as const,
-                version: published!.version,
+                version: activatedRuntime!.version,
                 target: presentation.target,
-                executable: published!.executable,
+                executable: activatedRuntime!.executable,
                 ...(retainedPrevious ? { previousVersion: retainedPrevious.version } : {}),
                 diagnostics: Object.freeze(readyDiagnostics)
             });

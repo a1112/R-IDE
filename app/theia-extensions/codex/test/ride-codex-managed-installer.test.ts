@@ -125,6 +125,129 @@ test('consent is short-lived, single-use, instance-bound, immutable, and bound t
     assert.equal(results.filter(result => result.status === 'rejected').length, 1);
 });
 
+test('consent snapshots descriptors without invoking accessors or proxy traps', () => {
+    const root = join(tmpdir(), 'ride-codex-consent-descriptors');
+    const original = presentationFor('0.144.0', root);
+    const consent = new RideCodexInstallConsent();
+    let getterCalls = 0;
+    const accessor = { ...original } as InstallPresentation;
+    Object.defineProperty(accessor, 'version', {
+        enumerable: true,
+        get: () => {
+            getterCalls += 1;
+            return '0.144.0';
+        }
+    });
+    assert.throws(() => consent.issue(accessor), /presentation|unsafe/i);
+    assert.equal(getterCalls, 0);
+
+    let proxyTraps = 0;
+    const proxy = new Proxy({ ...original }, {
+        ownKeys: target => {
+            proxyTraps += 1;
+            return Reflect.ownKeys(target);
+        },
+        getOwnPropertyDescriptor: (target, property) => {
+            proxyTraps += 1;
+            return Reflect.getOwnPropertyDescriptor(target, property);
+        }
+    });
+    assert.throws(() => consent.issue(proxy), /presentation|unsafe/i);
+    assert.equal(proxyTraps, 0);
+
+    assert.throws(() => consent.issue({ ...original, extra: true } as InstallPresentation), /presentation|shape/i);
+});
+
+test('delegated authorization retains TTL, rejects clock rollback, and is concurrently one-shot', async () => {
+    let now = 10;
+    const root = join(tmpdir(), 'ride-codex-authorization-ttl');
+    const presentation = presentationFor('0.144.0', root);
+    const consent = new RideCodexInstallConsent({ clock: () => now, ttlMs: 25 });
+    const context = Object.freeze({
+        target: presentation.target,
+        manifestDigest: presentation.manifestDigest,
+        canonicalRoot: root,
+        destination: join(root, '.staging-test', 'runtime.tgz')
+    });
+
+    const expired = consent.consume(consent.issue(presentation), presentation).authorization;
+    now = 36;
+    assert.equal(await consent.authorizationValidator(expired, context), false);
+    assert.equal(await consent.authorizationValidator(expired, context), false);
+
+    now = 20;
+    const rolledBack = consent.consume(consent.issue(presentation), presentation).authorization;
+    now = 19;
+    assert.equal(await consent.authorizationValidator(rolledBack, context), false);
+    assert.equal(await consent.authorizationValidator(rolledBack, context), false);
+
+    now = 30;
+    const concurrent = consent.consume(consent.issue(presentation), presentation).authorization;
+    const results = await Promise.all([
+        Promise.resolve().then(() => consent.authorizationValidator(concurrent, context)),
+        Promise.resolve().then(() => consent.authorizationValidator(concurrent, context))
+    ]);
+    assert.deepEqual(results.sort(), [false, true]);
+});
+
+test('queued installs recheck delegated consent TTL before staging side effects', async () => {
+    const trustedRuntimeBase = await mkdtemp(join(tmpdir(), 'ride-codex-queued-consent-'));
+    const runtimeRoot = join(trustedRuntimeBase, 'managed');
+    let now = 10;
+    const consent = new RideCodexInstallConsent({ clock: () => now, ttlMs: 25 });
+    const store = new RideCodexRuntimeStore({ trustedRuntimeBase, runtimeRoot });
+    let releaseLock!: () => void;
+    let markLocked!: () => void;
+    const locked = new Promise<void>(resolveLocked => { markLocked = resolveLocked; });
+    const release = new Promise<void>(resolveRelease => { releaseLock = resolveRelease; });
+    const holder = store.withTransaction(async () => {
+        markLocked();
+        await release;
+    });
+    await locked;
+
+    let stagingEffects = 0;
+    let delegatedAuthorization: Parameters<typeof consent.authorizationValidator>[0] | undefined;
+    let delegatedContext: Parameters<typeof consent.authorizationValidator>[1] | undefined;
+    const installer = new RideCodexManagedInstaller({
+        consent,
+        store,
+        validatePresentation: () => true,
+        stager: {
+            stage: async (authorization, _target, presentation) => {
+                delegatedAuthorization = authorization;
+                delegatedContext = Object.freeze({
+                    target: presentation.target,
+                    manifestDigest: presentation.manifestDigest,
+                    canonicalRoot: runtimeRoot,
+                    destination: join(runtimeRoot, '.staging-test', 'runtime.tgz')
+                });
+                if (!await consent.authorizationValidator(authorization, delegatedContext)) {
+                    throw new Error('delegated consent expired before staging');
+                }
+                stagingEffects += 1;
+                return createStagedRuntime(runtimeRoot, presentation);
+            }
+        },
+        handshake: async () => undefined
+    });
+    try {
+        const pending = installer.install(consent.issue(presentationFor('0.144.0', runtimeRoot)));
+        now = 36;
+        releaseLock();
+        await holder;
+        await assert.rejects(pending, /activation|consent/i);
+        assert.equal(stagingEffects, 0);
+        assert.ok(delegatedAuthorization);
+        assert.ok(delegatedContext);
+        assert.equal(await consent.authorizationValidator(delegatedAuthorization!, delegatedContext!), false);
+    } finally {
+        releaseLock();
+        await holder.catch(() => undefined);
+        await rm(trustedRuntimeBase, { recursive: true, force: true });
+    }
+});
+
 test('official presentation derives every consent field from the reviewed manifest and delegated authorization is one-shot', async () => {
     const root = join(tmpdir(), 'ride-codex-official-presentation');
     const runtime = runtimeManifestEntryForTarget(TARGET);
@@ -307,6 +430,238 @@ test('a pointer rename that committed before a later durability error is recogni
         await installer.install(consent.issue(presentationFor('0.144.0', runtimeRoot)));
         assert.equal(await store.activeVersion(), '0.144.0');
         assert.equal(handshakes, 2);
+    } finally {
+        await rm(trustedRuntimeBase, { recursive: true, force: true });
+    }
+});
+
+test('activation reattests the committed candidate before handshake and restores the previous runtime on mutation', async () => {
+    const trustedRuntimeBase = await mkdtemp(join(tmpdir(), 'ride-codex-activation-postcondition-'));
+    const runtimeRoot = join(trustedRuntimeBase, 'managed');
+    let mutateCandidate = false;
+    let handshakes = 0;
+    const store = new RideCodexRuntimeStore({
+        trustedRuntimeBase,
+        runtimeRoot,
+        testHooks: {
+            beforePointerRename: async kind => {
+                if (kind !== 'activate' || !mutateCandidate) {
+                    return;
+                }
+                mutateCandidate = false;
+                const versions = await readdir(join(runtimeRoot, 'versions'));
+                const candidate = versions.find(name => name.startsWith('v-0.144.0--'));
+                assert.ok(candidate);
+                await writeFile(
+                    join(runtimeRoot, 'versions', candidate, 'package', 'vendor', TARGET, 'bin', 'codex.exe'),
+                    'MUTATED-BEFORE-HANDSHAKE'
+                );
+            }
+        }
+    });
+    const consent = new RideCodexInstallConsent();
+    const installer = new RideCodexManagedInstaller({
+        consent,
+        store,
+        validatePresentation: () => true,
+        stager: { stage: async (_authorization, _target, presentation) => createStagedRuntime(runtimeRoot, presentation) },
+        handshake: async () => { handshakes += 1; }
+    });
+    try {
+        await installer.install(consent.issue(presentationFor('0.143.0', runtimeRoot)));
+        handshakes = 0;
+        mutateCandidate = true;
+        await assert.rejects(
+            installer.install(consent.issue(presentationFor('0.144.0', runtimeRoot))),
+            /activation|attestation|rollback/i
+        );
+        assert.equal(handshakes, 0);
+        assert.equal(await store.activeVersion(), '0.143.0');
+    } finally {
+        await rm(trustedRuntimeBase, { recursive: true, force: true });
+    }
+});
+
+test('rollback reattests the committed previous runtime and never reports a mutated pointer as valid', async () => {
+    const trustedRuntimeBase = await mkdtemp(join(tmpdir(), 'ride-codex-rollback-postcondition-'));
+    const runtimeRoot = join(trustedRuntimeBase, 'managed');
+    let mutatePrevious = false;
+    let previousExecutable = '';
+    const store = new RideCodexRuntimeStore({
+        trustedRuntimeBase,
+        runtimeRoot,
+        testHooks: {
+            beforePointerRename: async kind => {
+                if (kind === 'rollback' && mutatePrevious) {
+                    mutatePrevious = false;
+                    await writeFile(previousExecutable, 'MUTATED-PREVIOUS-RUNTIME');
+                }
+            }
+        }
+    });
+    const consent = new RideCodexInstallConsent();
+    try {
+        await createInstaller(runtimeRoot, consent, store).install(
+            consent.issue(presentationFor('0.143.0', runtimeRoot))
+        );
+        previousExecutable = (await store.readActiveRuntime())!.executable;
+        mutatePrevious = true;
+        await assert.rejects(
+            createInstaller(runtimeRoot, consent, store).install(
+                consent.issue(presentationFor('0.144.0', runtimeRoot)),
+                { failHandshake: true }
+            ),
+            error => {
+                assert.ok(error instanceof RideCodexManagedInstallError);
+                assert.deepEqual(error.diagnostics.map(diagnostic => diagnostic.code), [
+                    'handshake-failed', 'rollback-failed'
+                ]);
+                return true;
+            }
+        );
+        await assert.rejects(store.readActiveRuntime(), /attestation|runtime/i);
+    } finally {
+        await rm(trustedRuntimeBase, { recursive: true, force: true });
+    }
+});
+
+test('recovery rolls back a committed pending activation, including a first install with no previous runtime', async () => {
+    const trustedRuntimeBase = await mkdtemp(join(tmpdir(), 'ride-codex-pending-recovery-'));
+    const outside = await mkdtemp(join(tmpdir(), 'ride-codex-pending-outside-'));
+    const sentinel = join(outside, 'sentinel.txt');
+    await writeFile(sentinel, 'preserve');
+    try {
+        const runtimeRoot = join(trustedRuntimeBase, 'managed');
+        const consent = new RideCodexInstallConsent();
+        const store = new RideCodexRuntimeStore({ trustedRuntimeBase, runtimeRoot });
+        await createInstaller(runtimeRoot, consent, store).install(
+            consent.issue(presentationFor('0.143.0', runtimeRoot))
+        );
+        const previous = await store.readActiveRuntime();
+        assert.ok(previous);
+        const presentation = presentationFor('0.144.0', runtimeRoot);
+        const published = await store.publish(await createStagedRuntime(runtimeRoot, presentation), presentation);
+        await store.activate(published, previous);
+        assert.equal(await store.activeVersion(), '0.144.0');
+        assert.equal(await stat(join(runtimeRoot, 'pending-activation.json')).then(() => true, () => false), true);
+
+        const restarted = new RideCodexRuntimeStore({ trustedRuntimeBase, runtimeRoot });
+        await restarted.recover();
+        assert.equal(await restarted.activeVersion(), '0.143.0');
+        assert.equal(await stat(join(runtimeRoot, 'pending-activation.json')).then(() => true, () => false), false);
+
+        const firstBase = await mkdtemp(join(tmpdir(), 'ride-codex-pending-first-'));
+        try {
+            const firstRoot = join(firstBase, 'managed');
+            const firstStore = new RideCodexRuntimeStore({ trustedRuntimeBase: firstBase, runtimeRoot: firstRoot });
+            const firstPresentation = presentationFor('0.144.0', firstRoot);
+            const firstPublished = await firstStore.publish(
+                await createStagedRuntime(firstRoot, firstPresentation),
+                firstPresentation
+            );
+            await firstStore.activate(firstPublished, undefined);
+            await new RideCodexRuntimeStore({ trustedRuntimeBase: firstBase, runtimeRoot: firstRoot }).recover();
+            assert.equal(await firstStore.activeVersion(), undefined);
+        } finally {
+            await rm(firstBase, { recursive: true, force: true });
+        }
+        assert.equal(await readFile(sentinel, 'utf8'), 'preserve');
+    } finally {
+        await Promise.all([
+            rm(trustedRuntimeBase, { recursive: true, force: true }),
+            rm(outside, { recursive: true, force: true })
+        ]);
+    }
+});
+
+test('recovery rejects malformed pending journals without deleting runtime or external data', async () => {
+    const trustedRuntimeBase = await mkdtemp(join(tmpdir(), 'ride-codex-pending-invalid-'));
+    const runtimeRoot = join(trustedRuntimeBase, 'managed');
+    const outside = await mkdtemp(join(tmpdir(), 'ride-codex-pending-invalid-outside-'));
+    const sentinel = join(outside, 'sentinel.txt');
+    await writeFile(sentinel, 'preserve');
+    const consent = new RideCodexInstallConsent();
+    const store = new RideCodexRuntimeStore({ trustedRuntimeBase, runtimeRoot });
+    try {
+        await createInstaller(runtimeRoot, consent, store).install(
+            consent.issue(presentationFor('0.143.0', runtimeRoot))
+        );
+        const previous = await store.readActiveRuntime();
+        assert.ok(previous);
+        const presentation = presentationFor('0.144.0', runtimeRoot);
+        const published = await store.publish(await createStagedRuntime(runtimeRoot, presentation), presentation);
+        await store.activate(published, previous);
+        const pendingPath = join(runtimeRoot, 'pending-activation.json');
+        const validPending = await readFile(pendingPath, 'utf8');
+        const parsed = JSON.parse(validPending) as Record<string, unknown>;
+        const candidate = parsed.candidate as Record<string, unknown>;
+        const malformed = [
+            '{not-json',
+            Buffer.alloc(64 * 1024 + 1, 0x61),
+            validPending.replace('"schemaVersion":1', '"schemaVersion":1,"schemaVersion":1'),
+            `${JSON.stringify({
+                ...parsed,
+                candidate: { ...candidate, relativePath: 'versions/v-9.9.9--x86_64-pc-windows-msvc--aaaaaaaaaaaaaaaa' }
+            })}\n`
+        ];
+        const stale = join(runtimeRoot, '.staging-must-not-delete');
+        await mkdir(stale);
+        await writeFile(join(stale, 'local-sentinel.txt'), 'preserve');
+        for (const bytes of malformed) {
+            await writeFile(pendingPath, bytes);
+            await assert.rejects(store.recover(), /pending|journal|transaction|invalid|oversized/i);
+            assert.equal(await readFile(join(stale, 'local-sentinel.txt'), 'utf8'), 'preserve');
+            assert.equal(await readFile(sentinel, 'utf8'), 'preserve');
+        }
+        await writeFile(pendingPath, validPending);
+        await store.recover();
+        assert.equal(await store.activeVersion(), '0.143.0');
+    } finally {
+        await Promise.all([
+            rm(trustedRuntimeBase, { recursive: true, force: true }),
+            rm(outside, { recursive: true, force: true })
+        ]);
+    }
+});
+
+test('successful handshake finalizes its journal and finalize failure rolls back without reporting ready', async () => {
+    const trustedRuntimeBase = await mkdtemp(join(tmpdir(), 'ride-codex-finalize-'));
+    const runtimeRoot = join(trustedRuntimeBase, 'managed');
+    let failFinalize = false;
+    const progress: InstallProgress[] = [];
+    const store = new RideCodexRuntimeStore({
+        trustedRuntimeBase,
+        runtimeRoot,
+        testHooks: {
+            beforePendingFinalize: () => {
+                if (failFinalize) {
+                    failFinalize = false;
+                    throw new Error('simulated pending journal finalize failure');
+                }
+            }
+        } as never
+    });
+    const consent = new RideCodexInstallConsent();
+    const installer = new RideCodexManagedInstaller({
+        consent,
+        store,
+        validatePresentation: () => true,
+        stager: { stage: async (_authorization, _target, presentation) => createStagedRuntime(runtimeRoot, presentation) },
+        handshake: async () => undefined,
+        onProgress: update => progress.push(update)
+    });
+    try {
+        await installer.install(consent.issue(presentationFor('0.143.0', runtimeRoot)));
+        assert.equal(await stat(join(runtimeRoot, 'pending-activation.json')).then(() => true, () => false), false);
+        progress.length = 0;
+        failFinalize = true;
+        await assert.rejects(
+            installer.install(consent.issue(presentationFor('0.144.0', runtimeRoot))),
+            /finalize|activation|rollback/i
+        );
+        assert.equal(await store.activeVersion(), '0.143.0');
+        assert.equal(progress.some(update => update.state === 'ready'), false);
+        assert.equal(await stat(join(runtimeRoot, 'pending-activation.json')).then(() => true, () => false), false);
     } finally {
         await rm(trustedRuntimeBase, { recursive: true, force: true });
     }
@@ -827,13 +1182,19 @@ test('managed resolver remains lazy, performs no writes without a pointer, and c
         assert.equal(Object.isFrozen(active), true);
         assert.equal(Object.isFrozen(active.pointer), true);
         assert.equal(Object.isFrozen(active.pointer.rootIdentity), true);
+        let validatedActiveReads = 0;
         const resolver = new RideCodexRuntimeResolver({
             platform: host.platform,
             arch: host.arch,
             readEnvironment: () => ({}),
             readUserOverride: () => undefined,
             findSystemCandidates: () => [],
-            managedRuntimeStore: store,
+            managedRuntimeStore: {
+                readActiveRuntime: async () => {
+                    validatedActiveReads += 1;
+                    return store.readActiveRuntime();
+                }
+            },
             probe: { probe: async () => ({ version: '0.144.0' }) }
         });
         const launch = await resolver.resolve();
@@ -841,6 +1202,10 @@ test('managed resolver remains lazy, performs no writes without a pointer, and c
         assert.equal(launch.executable, active.executable);
         assert.equal(launch.version, active.version);
         assert.equal(launch.target, active.target);
+        assert.equal(validatedActiveReads, 1);
+        await writeFile(active.executable, 'MUTATED-AFTER-FIRST-MANAGED-RESOLVE');
+        await assert.rejects(resolver.resolve(), /No compatible native Codex runtime/i);
+        assert.equal(validatedActiveReads, 2);
     } finally {
         await rm(trustedRuntimeBase, { recursive: true, force: true });
     }

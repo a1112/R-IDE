@@ -22,6 +22,7 @@ export interface RideCodexRuntimeStoreTestHooks {
     beforePointerSync?(kind: PointerWriteKind, temporaryPath: string): void | Promise<void>;
     beforePointerRename?(kind: PointerWriteKind, temporaryPath: string): void | Promise<void>;
     afterPointerRename?(kind: PointerWriteKind, activePath: string): void | Promise<void>;
+    beforePendingFinalize?(pendingPath: string): void | Promise<void>;
 }
 
 export interface RideCodexRuntimeStoreOptions {
@@ -66,9 +67,19 @@ export interface ActiveRuntimePointer {
     readonly rootIdentity: SerializedRuntimeIdentity;
 }
 
+interface PendingActivationTransaction {
+    readonly schemaVersion: 1;
+    readonly transactionId: string;
+    readonly phase: 'awaiting-handshake';
+    readonly candidate: ActiveRuntimePointer;
+    readonly previous: ActiveRuntimePointer | 'none';
+}
+
 const ACTIVE_POINTER = 'active.json';
+const PENDING_ACTIVATION = 'pending-activation.json';
 const VERSIONS_DIRECTORY = 'versions';
 const MAX_POINTER_BYTES = 16 * 1024;
+const MAX_PENDING_BYTES = 32 * 1024;
 const MAX_DIRECTORY_ENTRIES = 4096;
 const MAX_DELETE_TREE_ENTRIES = 262_144;
 const MAX_RUNTIME_BYTES = 2 * 1024 * 1024 * 1024;
@@ -78,6 +89,7 @@ const POINTER_KEYS = Object.freeze([
     'treeReadBytes', 'version'
 ].sort());
 const IDENTITY_KEYS = Object.freeze(['birthtimeNs', 'ctimeNs', 'dev', 'ino', 'size'].sort());
+const PENDING_KEYS = Object.freeze(['candidate', 'phase', 'previous', 'schemaVersion', 'transactionId'].sort());
 const ROOT_LOCKS = new Map<string, RootLock>();
 
 export class RideCodexRuntimeStoreError extends Error {
@@ -115,10 +127,15 @@ export class RideCodexRuntimeStore {
 
     async recover(): Promise<void> {
         const boundary = await this.ensureWritableBoundary();
+        const pending = await this.readPendingActivation(boundary);
+        if (pending) {
+            await this.rollbackPendingActivation(pending, boundary, 'recover');
+        }
         const entries = await boundedDirectoryEntries(boundary.root);
         for (const entry of entries) {
             if (!entry.startsWith('.staging-')
                 && !entry.startsWith('active.json.tmp-')
+                && !entry.startsWith('pending-activation.json.tmp-')
                 && !entry.startsWith('.install-quarantine-')) {
                 continue;
             }
@@ -166,12 +183,10 @@ export class RideCodexRuntimeStore {
         if (!boundary) {
             return undefined;
         }
-        const activePath = join(boundary.root, ACTIVE_POINTER);
-        const bytes = await readBoundedRegularFile(activePath, MAX_POINTER_BYTES, true);
-        if (!bytes) {
+        const pointer = await this.readActivePointer(boundary);
+        if (!pointer) {
             return undefined;
         }
-        const pointer = parseActivePointer(bytes);
         return this.validatePointer(pointer, boundary);
     }
 
@@ -309,33 +324,77 @@ export class RideCodexRuntimeStore {
     async activate(
         published: PublishedManagedRuntime,
         expectedPrevious?: ValidatedManagedRuntime
-    ): Promise<ValidatedManagedRuntime | undefined> {
+    ): Promise<ValidatedManagedRuntime> {
         const previous = await this.readActiveRuntime();
-        if ((previous?.relativePath ?? undefined) !== (expectedPrevious?.relativePath ?? undefined)
-            || (previous?.manifestDigest ?? undefined) !== (expectedPrevious?.manifestDigest ?? undefined)) {
+        if (!optionalPointersEqual(previous?.pointer, expectedPrevious?.pointer)) {
             throw new RideCodexRuntimeStoreError('Codex active runtime changed before activation.');
         }
-        await this.writeActivePointer(published.pointer, 'activate');
-        return previous;
+        const boundary = await this.ensureWritableBoundary();
+        const candidate = await this.validatePointer(published.pointer, boundary);
+        if (!activePointersEqual(candidate.pointer, published.pointer)) {
+            throw new RideCodexRuntimeStoreError('Codex published runtime changed before activation.');
+        }
+        const pending = createPendingActivation(published.pointer, previous?.pointer);
+        await this.writePendingActivation(pending, boundary);
+        let primaryFailure: unknown;
+        try {
+            await this.writeActivePointer(published.pointer, 'activate');
+        } catch (error) {
+            primaryFailure = error;
+        }
+        try {
+            const activated = await this.readActiveRuntime();
+            if (!activated || !activePointersEqual(activated.pointer, published.pointer)) {
+                throw new RideCodexRuntimeStoreError('Codex activation pointer post-condition did not match the candidate.');
+            }
+            return activated;
+        } catch (postConditionError) {
+            const primary = primaryFailure ?? postConditionError;
+            try {
+                await this.rollbackPendingActivation(pending, boundary, 'activation-failure');
+            } catch {
+                throw new RideCodexRuntimeStoreError(
+                    'Codex runtime activation failed and rollback also failed; safe recovery is required.'
+                );
+            }
+            throw new RideCodexRuntimeStoreError(
+                primary
+                    ? 'Codex runtime activation post-condition failed and was rolled back safely.'
+                    : 'Codex runtime activation failed and was rolled back safely.'
+            );
+        }
     }
 
     async restore(
         previous: ValidatedManagedRuntime | undefined,
         failed: PublishedManagedRuntime
     ): Promise<void> {
-        const current = await this.readActiveRuntime();
-        if (!current || current.relativePath !== failed.relativePath) {
-            throw new RideCodexRuntimeStoreError('Codex active runtime changed before rollback.');
-        }
-        if (previous) {
-            await this.revalidate(previous);
-            await this.writeActivePointer(previous.pointer, 'rollback');
-            return;
-        }
         const boundary = await this.ensureWritableBoundary();
-        const activePath = join(boundary.root, ACTIVE_POINTER);
-        await quarantineAndDelete(activePath, boundary.root, boundary);
-        await syncDirectory(boundary.root);
+        const pending = await this.readPendingActivation(boundary);
+        if (!pending
+            || !activePointersEqual(pending.candidate, failed.pointer)
+            || !optionalPointersEqual(
+                pending.previous === 'none' ? undefined : pending.previous,
+                previous?.pointer
+            )) {
+            throw new RideCodexRuntimeStoreError('Codex pending activation changed before rollback.');
+        }
+        await this.rollbackPendingActivation(pending, boundary, 'rollback');
+    }
+
+    async finalizeActivation(runtime: ValidatedManagedRuntime): Promise<ValidatedManagedRuntime> {
+        const boundary = await this.ensureWritableBoundary();
+        const pending = await this.readPendingActivation(boundary);
+        if (!pending || !activePointersEqual(pending.candidate, runtime.pointer)) {
+            throw new RideCodexRuntimeStoreError('Codex pending activation is unavailable for finalization.');
+        }
+        const active = await this.readActiveRuntime();
+        if (!active || !activePointersEqual(active.pointer, pending.candidate)) {
+            throw new RideCodexRuntimeStoreError('Codex active runtime changed before finalization.');
+        }
+        await this.testHooks.beforePendingFinalize?.(join(boundary.root, PENDING_ACTIVATION));
+        await this.clearPendingActivation(boundary);
+        return active;
     }
 
     async discard(published: PublishedManagedRuntime): Promise<void> {
@@ -371,6 +430,126 @@ export class RideCodexRuntimeStore {
             }
             await quarantineAndDelete(candidate, boundary.root, boundary);
         }
+    }
+
+    private async readActivePointer(boundary: StoreBoundary): Promise<ActiveRuntimePointer | undefined> {
+        const bytes = await readBoundedRegularFile(join(boundary.root, ACTIVE_POINTER), MAX_POINTER_BYTES, true);
+        if (!bytes) {
+            return undefined;
+        }
+        const pointer = parseActivePointer(bytes);
+        await boundary.verify();
+        return pointer;
+    }
+
+    private async readPendingActivation(
+        boundary: StoreBoundary
+    ): Promise<PendingActivationTransaction | undefined> {
+        const bytes = await readBoundedRegularFile(join(boundary.root, PENDING_ACTIVATION), MAX_PENDING_BYTES, true);
+        if (!bytes) {
+            return undefined;
+        }
+        const pending = parsePendingActivation(bytes);
+        await boundary.verify();
+        return pending;
+    }
+
+    private async writePendingActivation(
+        pending: PendingActivationTransaction,
+        boundary: StoreBoundary
+    ): Promise<void> {
+        const pendingPath = join(boundary.root, PENDING_ACTIVATION);
+        if (await pathExists(pendingPath)) {
+            throw new RideCodexRuntimeStoreError('Codex pending activation already exists and requires recovery.');
+        }
+        const temporaryPath = join(boundary.root, `pending-activation.json.tmp-${randomUUID()}`);
+        requireStrictChild(boundary.root, temporaryPath);
+        const bytes = Buffer.from(`${JSON.stringify(pending)}\n`, 'utf8');
+        if (bytes.length > MAX_PENDING_BYTES) {
+            throw new RideCodexRuntimeStoreError('Codex pending activation journal exceeded its size limit.');
+        }
+        let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
+        try {
+            handle = await fs.open(
+                temporaryPath,
+                fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | (fsConstants.O_NOFOLLOW ?? 0),
+                0o600
+            );
+            await handle.writeFile(bytes);
+            await handle.sync();
+        } finally {
+            await handle?.close().catch(() => undefined);
+        }
+        const tempStat = await safeLstat(temporaryPath, 'Codex pending activation temporary journal is missing.');
+        if (!tempStat.isFile() || tempStat.isSymbolicLink() || tempStat.nlink !== BigInt(1)) {
+            throw new RideCodexRuntimeStoreError('Codex pending activation temporary journal is unsafe.');
+        }
+        await syncDirectory(boundary.root);
+        await boundary.verify();
+        await fs.rename(temporaryPath, pendingPath);
+        await syncDirectory(boundary.root);
+        await boundary.verify();
+    }
+
+    private async clearPendingActivation(boundary: StoreBoundary): Promise<void> {
+        await quarantineAndDelete(join(boundary.root, PENDING_ACTIVATION), boundary.root, boundary);
+        await syncDirectory(boundary.root);
+    }
+
+    private async rollbackPendingActivation(
+        pending: PendingActivationTransaction,
+        boundary: StoreBoundary,
+        reason: 'recover' | 'rollback' | 'activation-failure'
+    ): Promise<void> {
+        const activePointer = await this.readActivePointer(boundary);
+        const previousPointer = pending.previous === 'none' ? undefined : pending.previous;
+        const activeIsCandidate = activePointer !== undefined
+            && activePointersEqual(activePointer, pending.candidate);
+        const activeIsPrevious = previousPointer !== undefined
+            && activePointer !== undefined
+            && activePointersEqual(activePointer, previousPointer);
+        const activeIsOriginalEmpty = previousPointer === undefined && activePointer === undefined;
+
+        if (activeIsCandidate) {
+            if (previousPointer) {
+                await this.validatePointer(previousPointer, boundary);
+                try {
+                    await this.writeActivePointer(previousPointer, 'rollback');
+                } catch {
+                    // A rename can commit before a later durability signal fails. The
+                    // post-condition below decides whether rollback actually completed.
+                }
+                const restored = await this.readActiveRuntime();
+                if (!restored || !activePointersEqual(restored.pointer, previousPointer)) {
+                    throw new RideCodexRuntimeStoreError('Codex rollback pointer post-condition failed.');
+                }
+            } else {
+                const activePath = join(boundary.root, ACTIVE_POINTER);
+                await quarantineAndDelete(activePath, boundary.root, boundary);
+                await syncDirectory(boundary.root);
+                if (await this.readActivePointer(boundary)) {
+                    throw new RideCodexRuntimeStoreError('Codex first-install rollback post-condition failed.');
+                }
+            }
+            await this.clearPendingActivation(boundary);
+            return;
+        }
+
+        if (activeIsPrevious) {
+            const restored = await this.readActiveRuntime();
+            if (!restored || !previousPointer || !activePointersEqual(restored.pointer, previousPointer)) {
+                throw new RideCodexRuntimeStoreError('Codex previous runtime is invalid during pending recovery.');
+            }
+            await this.clearPendingActivation(boundary);
+            return;
+        }
+        if (activeIsOriginalEmpty) {
+            await this.clearPendingActivation(boundary);
+            return;
+        }
+        throw new RideCodexRuntimeStoreError(
+            `Codex pending activation state is inconsistent during ${reason}; recovery stopped safely.`
+        );
     }
 
     private async writeActivePointer(pointer: ActiveRuntimePointer, kind: PointerWriteKind): Promise<void> {
@@ -521,6 +700,65 @@ function createActivePointer(
         treePathBytes: attestation.totalPathBytes,
         rootIdentity: serializeIdentity(attestation.rootIdentity)
     });
+}
+
+function createPendingActivation(
+    candidate: ActiveRuntimePointer,
+    previous: ActiveRuntimePointer | undefined
+): PendingActivationTransaction {
+    return Object.freeze({
+        schemaVersion: 1,
+        transactionId: randomUUID(),
+        phase: 'awaiting-handshake',
+        candidate,
+        previous: previous ?? 'none'
+    });
+}
+
+function parsePendingActivation(bytes: Buffer): PendingActivationTransaction {
+    const source = bytes.toString('utf8');
+    let candidate: unknown;
+    try {
+        candidate = JSON.parse(source) as unknown;
+    } catch {
+        throw new RideCodexRuntimeStoreError('Codex pending activation journal is invalid JSON.');
+    }
+    const record = requireExactRecord(
+        candidate,
+        PENDING_KEYS,
+        'Codex pending activation journal has an invalid shape.'
+    );
+    if (record.schemaVersion !== 1
+        || record.phase !== 'awaiting-handshake'
+        || typeof record.transactionId !== 'string'
+        || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(record.transactionId)
+        || (record.previous !== 'none' && (typeof record.previous !== 'object' || !record.previous))) {
+        throw new RideCodexRuntimeStoreError('Codex pending activation journal values are invalid.');
+    }
+    const pending: PendingActivationTransaction = Object.freeze({
+        schemaVersion: 1,
+        transactionId: record.transactionId,
+        phase: 'awaiting-handshake',
+        candidate: parsePointerValue(record.candidate),
+        previous: record.previous === 'none' ? 'none' : parsePointerValue(record.previous)
+    });
+    if (pending.previous !== 'none' && activePointersEqual(pending.candidate, pending.previous)) {
+        throw new RideCodexRuntimeStoreError('Codex pending activation journal does not change the active runtime.');
+    }
+    if (source !== `${JSON.stringify(pending)}\n`) {
+        throw new RideCodexRuntimeStoreError('Codex pending activation journal is not canonical JSON.');
+    }
+    return pending;
+}
+
+function parsePointerValue(value: unknown): ActiveRuntimePointer {
+    const bytes = Buffer.from(`${JSON.stringify(value)}\n`, 'utf8');
+    const pointer = parseActivePointer(bytes);
+    if (pointer.relativePath !== versionRelativePath(pointer.version, pointer.target, pointer.manifestDigest)
+        || pointer.executableRelativePath !== expectedExecutableRelativePath(pointer.target)) {
+        throw new RideCodexRuntimeStoreError('Codex pending activation pointer metadata is inconsistent.');
+    }
+    return pointer;
 }
 
 function parseActivePointer(bytes: Buffer): ActiveRuntimePointer {
@@ -804,6 +1042,33 @@ function attestationsMatchPointer(attestation: PublishedRuntimeAttestation, poin
         && attestation.totalReadBytes.toString() === pointer.treeReadBytes
         && attestation.totalPathBytes === pointer.treePathBytes
         && runtimeFilesystemIdentitiesEqual(attestation.rootIdentity, deserializeIdentity(pointer.rootIdentity));
+}
+
+function optionalPointersEqual(
+    left: ActiveRuntimePointer | undefined,
+    right: ActiveRuntimePointer | undefined
+): boolean {
+    return left === undefined || right === undefined
+        ? left === right
+        : activePointersEqual(left, right);
+}
+
+function activePointersEqual(left: ActiveRuntimePointer, right: ActiveRuntimePointer): boolean {
+    return left.schemaVersion === right.schemaVersion
+        && left.version === right.version
+        && left.target === right.target
+        && left.manifestDigest === right.manifestDigest
+        && left.relativePath === right.relativePath
+        && left.executableRelativePath === right.executableRelativePath
+        && left.treeDigest === right.treeDigest
+        && left.treeEntries === right.treeEntries
+        && left.treeReadBytes === right.treeReadBytes
+        && left.treePathBytes === right.treePathBytes
+        && left.rootIdentity.dev === right.rootIdentity.dev
+        && left.rootIdentity.ino === right.rootIdentity.ino
+        && left.rootIdentity.size === right.rootIdentity.size
+        && left.rootIdentity.birthtimeNs === right.rootIdentity.birthtimeNs
+        && left.rootIdentity.ctimeNs === right.rootIdentity.ctimeNs;
 }
 
 function filesystemIdentity(stat: BigIntStats): RuntimeFilesystemIdentity {
