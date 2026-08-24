@@ -33,6 +33,8 @@ const MAX_ARCHIVE_PATH_BYTES = 1024;
 const MAX_PACKAGE_MANIFEST_BYTES = 16 * 1024;
 const MAX_NATIVE_HEADER_BYTES = 4096;
 const RUNTIME_PROBE_TIMEOUT_MS = 10_000;
+const TAR_BLOCK_BYTES = 512;
+const MAX_TAR_OVERHEAD_BYTES = 64 * 1024;
 
 export interface RideCodexStatFs {
     readonly bsize: number | bigint;
@@ -237,7 +239,12 @@ export class RideCodexRuntimeArchiveExtractor {
             ).then(() => next(), error => next(error));
         });
         try {
-            await pipeline(createReadStream(archive), createGunzip(), new TarHeaderGuard(), tarExtractor);
+            await pipeline(
+                createReadStream(archive),
+                createGunzip(),
+                new TarHeaderGuard(this.maxEntries, maxRawTarBytes(runtime.unpackedBytes)),
+                tarExtractor
+            );
         } catch (error) {
             if (error instanceof RideCodexRuntimeStageError) {
                 throw error;
@@ -348,28 +355,32 @@ export class RideCodexRuntimeArchiveExtractor {
 class TarHeaderGuard extends Transform {
     private pending = Buffer.alloc(0);
     private contentBlocksRemaining = 0;
+    private rawBytes = 0;
+    private entryCount = 0;
+    private zeroBlocks = 0;
+
+    constructor(
+        private readonly maxEntries: number,
+        private readonly maxRawBytes: number
+    ) {
+        super();
+    }
 
     override _transform(chunk: Buffer | string, _encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
         const buffer = Buffer.from(chunk);
-        this.pending = this.pending.length ? Buffer.concat([this.pending, buffer]) : buffer;
         try {
-            while (this.pending.length >= 512) {
-                const block = this.pending.subarray(0, 512);
-                this.pending = this.pending.subarray(512);
+            if (buffer.length > this.maxRawBytes - this.rawBytes) {
+                throw new RideCodexRuntimeStageError('Codex runtime archive exceeded the raw tar byte limit.');
+            }
+            this.rawBytes += buffer.length;
+            this.pending = this.pending.length ? Buffer.concat([this.pending, buffer]) : buffer;
+            while (this.pending.length >= TAR_BLOCK_BYTES) {
+                const block = this.pending.subarray(0, TAR_BLOCK_BYTES);
+                this.pending = this.pending.subarray(TAR_BLOCK_BYTES);
                 if (this.contentBlocksRemaining > 0) {
                     this.contentBlocksRemaining -= 1;
-                } else if (!block.every(byte => byte === 0)) {
-                    validateTarTextField(block.subarray(0, 100));
-                    validateTarTextField(block.subarray(345, 500));
-                    const sizeText = block.subarray(124, 136).toString('ascii').replace(/[\0 ]+$/g, '');
-                    if (!/^[0-7]+$/.test(sizeText)) {
-                        throw new RideCodexRuntimeStageError('Codex runtime archive has an invalid size header.');
-                    }
-                    const size = Number.parseInt(sizeText, 8);
-                    if (!Number.isSafeInteger(size) || size < 0) {
-                        throw new RideCodexRuntimeStageError('Codex runtime archive has an unsafe size header.');
-                    }
-                    this.contentBlocksRemaining = Math.ceil(size / 512);
+                } else {
+                    this.validateHeaderBlock(block);
                 }
                 this.push(block);
             }
@@ -386,6 +397,66 @@ class TarHeaderGuard extends Transform {
         }
         callback();
     }
+
+    private validateHeaderBlock(block: Buffer): void {
+        if (block.every(byte => byte === 0)) {
+            this.zeroBlocks += 1;
+            return;
+        }
+        if (this.zeroBlocks > 0) {
+            throw new RideCodexRuntimeStageError('Codex runtime archive contains data after its end marker.');
+        }
+        this.entryCount += 1;
+        if (this.entryCount > this.maxEntries) {
+            throw new RideCodexRuntimeStageError('Codex runtime archive exceeded the raw entry limit.');
+        }
+        validateTarTextField(block.subarray(0, 100));
+        validateTarTextField(block.subarray(345, 500));
+        const typeFlag = block[156];
+        if (typeFlag !== 0 && typeFlag !== 0x30 && typeFlag !== 0x35) {
+            throw new RideCodexRuntimeStageError('Codex runtime archive contains a forbidden raw tar entry type.');
+        }
+        const size = parseCanonicalTarSize(block.subarray(124, 136));
+        if (size > this.maxRawBytes) {
+            throw new RideCodexRuntimeStageError('Codex runtime archive has an unsafe size header.');
+        }
+        if (typeFlag === 0x35 && size !== 0) {
+            throw new RideCodexRuntimeStageError('Codex runtime archive directory has unexpected raw content.');
+        }
+        this.contentBlocksRemaining = Math.ceil(size / TAR_BLOCK_BYTES);
+    }
+}
+
+function maxRawTarBytes(unpackedBytes: number): number {
+    if (!Number.isSafeInteger(unpackedBytes) || unpackedBytes < 0
+        || unpackedBytes > Number.MAX_SAFE_INTEGER - MAX_TAR_OVERHEAD_BYTES) {
+        throw new RideCodexRuntimeStageError('Codex runtime manifest unpacked size exceeds the raw tar range.');
+    }
+    return unpackedBytes + MAX_TAR_OVERHEAD_BYTES;
+}
+
+function parseCanonicalTarSize(field: Buffer): number {
+    if (field.length !== 12 || (field[0] & 0x80) !== 0) {
+        throw new RideCodexRuntimeStageError('Codex runtime archive has an unsupported size header.');
+    }
+    let value = BigInt(0);
+    let digits = 0;
+    let padding = false;
+    for (const byte of field) {
+        if (byte === 0 || byte === 0x20) {
+            padding = true;
+            continue;
+        }
+        if (padding || byte < 0x30 || byte > 0x37) {
+            throw new RideCodexRuntimeStageError('Codex runtime archive has a malformed octal size header.');
+        }
+        value = (value * BigInt(8)) + BigInt(byte - 0x30);
+        digits += 1;
+    }
+    if (digits === 0 || value > BigInt(Number.MAX_SAFE_INTEGER)) {
+        throw new RideCodexRuntimeStageError('Codex runtime archive has an unsafe size header.');
+    }
+    return Number(value);
 }
 
 function validateTarTextField(field: Buffer): void {

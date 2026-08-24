@@ -732,6 +732,20 @@ function replaceTarType(archive: Buffer, path: string, typeFlag: string): Buffer
     const raw = gunzipSync(archive);
     const headerOffset = findTarHeader(raw, path);
     raw[headerOffset + 156] = typeFlag.charCodeAt(0);
+    updateTarChecksum(raw, headerOffset);
+    return gzipSync(raw);
+}
+
+function replaceTarSize(archive: Buffer, path: string, sizeField: Buffer): Buffer {
+    assert.equal(sizeField.length, 12);
+    const raw = gunzipSync(archive);
+    const headerOffset = findTarHeader(raw, path);
+    sizeField.copy(raw, headerOffset + 124);
+    updateTarChecksum(raw, headerOffset);
+    return gzipSync(raw);
+}
+
+function updateTarChecksum(raw: Buffer, headerOffset: number): void {
     raw.fill(0x20, headerOffset + 148, headerOffset + 156);
     let checksum = 0;
     for (let index = headerOffset; index < headerOffset + 512; index += 1) {
@@ -740,7 +754,6 @@ function replaceTarType(archive: Buffer, path: string, typeFlag: string): Buffer
     raw.write(checksum.toString(8).padStart(6, '0'), headerOffset + 148, 6, 'ascii');
     raw[headerOffset + 154] = 0;
     raw[headerOffset + 155] = 0x20;
-    return gzipSync(raw);
 }
 
 function findTarHeader(raw: Buffer, name: string): number {
@@ -753,12 +766,105 @@ function findTarHeader(raw: Buffer, name: string): number {
     throw new Error('fixture tar header was not found');
 }
 
+function paxCommentPayload(byteLength: number): Buffer {
+    const prefix = `${byteLength} comment=`;
+    const valueBytes = byteLength - Buffer.byteLength(prefix) - 1;
+    assert.ok(valueBytes > 0);
+    const payload = Buffer.from(`${prefix}${'a'.repeat(valueBytes)}\n`);
+    assert.equal(payload.length, byteLength);
+    return payload;
+}
+
+async function hiddenTarExtensionArchive(typeFlag: 'x' | 'g' | 'L' | 'K'): Promise<Buffer> {
+    const name = `hidden-${typeFlag}`;
+    const payload = typeFlag === 'x' || typeFlag === 'g'
+        ? paxCommentPayload(1024 * 1024)
+        : Buffer.concat([Buffer.alloc((1024 * 1024) - 1, 0x61), Buffer.from([0])]);
+    const archive = await tarGz([
+        { header: { name, type: 'file' }, body: payload },
+        ...validArchiveEntries()
+    ]);
+    return replaceTarType(archive, name, typeFlag);
+}
+
+test('archive rejects hidden PAX and GNU extension records before output or probe', async t => {
+    const cases = [
+        { name: 'PAX local header', typeFlag: 'x' },
+        { name: 'PAX global header', typeFlag: 'g' },
+        { name: 'GNU long path', typeFlag: 'L' },
+        { name: 'GNU long link path', typeFlag: 'K' }
+    ] as const;
+    for (const entry of cases) {
+        await t.test(entry.name, async () => {
+            const root = await mkdtemp(join(tmpdir(), 'ride-codex-hidden-tar-'));
+            const probe = new RecordingProbe();
+            try {
+                const archive = await hiddenTarExtensionArchive(entry.typeFlag);
+                assert.ok(gunzipSync(archive).length > 1024 * 1024);
+                const stager = await createArchiveStager(root, archive, { probe });
+                await assert.rejects(
+                    stager.stage(AUTHORIZATION, 'x86_64-unknown-linux-musl'),
+                    /forbidden raw tar entry type/i
+                );
+                assert.equal(probe.calls.length, 0);
+                assert.deepEqual(await import('node:fs/promises').then(fs => fs.readdir(root)), []);
+            } finally {
+                await rm(root, { recursive: true, force: true });
+            }
+        });
+    }
+});
+
+test('raw tar scanner counts all decompressed records and rejects unsafe size encodings', async t => {
+    await t.test('raw byte budget includes headers, padding, end markers, and trailing records', async () => {
+        const root = await mkdtemp(join(tmpdir(), 'ride-codex-raw-budget-'));
+        const archivePath = join(root, 'fixture.tgz');
+        const ordinary = await tarGz([
+            { header: { name: 'package/', type: 'directory' } },
+            { header: { name: 'package/one', type: 'file' }, body: 'x' }
+        ]);
+        const oversizedRaw = Buffer.concat([gunzipSync(ordinary), Buffer.alloc(64 * 1024)]);
+        await writeFile(archivePath, gzipSync(oversizedRaw));
+        try {
+            const extractor = new RideCodexRuntimeArchiveExtractor({ maxEntries: 1024 });
+            await assert.rejects(
+                extractor.extract(archivePath, root, fetchEntry(Buffer.from('x'), { unpackedBytes: 1 })),
+                /raw tar byte limit/i
+            );
+        } finally {
+            await rm(root, { recursive: true, force: true });
+        }
+    });
+
+    const sizeCases = [
+        { name: 'malformed octal', field: Buffer.from('00000000008 ') },
+        { name: 'base-256', field: Buffer.from([0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]) },
+        { name: 'declared size exceeds bounded archive range', field: Buffer.from('777777777777') }
+    ] as const;
+    for (const entry of sizeCases) {
+        await t.test(entry.name, async () => {
+            const root = await mkdtemp(join(tmpdir(), 'ride-codex-raw-size-'));
+            const probe = new RecordingProbe();
+            const target = 'package/vendor/x86_64-unknown-linux-musl/codex-package.json';
+            try {
+                const archive = replaceTarSize(await tarGz(validArchiveEntries()), target, entry.field);
+                const stager = await createArchiveStager(root, archive, { probe });
+                await assert.rejects(stager.stage(AUTHORIZATION, 'x86_64-unknown-linux-musl'), /size header/i);
+                assert.equal(probe.calls.length, 0);
+                assert.deepEqual(await import('node:fs/promises').then(fs => fs.readdir(root)), []);
+            } finally {
+                await rm(root, { recursive: true, force: true });
+            }
+        });
+    }
+});
+
 test('archive enforces entry and unpacked byte budgets before retaining output', async t => {
     await t.test('entry count', async () => {
         const root = await mkdtemp(join(tmpdir(), 'ride-codex-entry-limit-'));
         try {
             const stager = await createArchiveStager(root, await tarGz(validArchiveEntries()), { maxArchiveEntries: 2 });
-            await assert.rejects(stager.stage(AUTHORIZATION, 'x86_64-unknown-linux-musl'), /entries|limit|archive/i);
+            await assert.rejects(stager.stage(AUTHORIZATION, 'x86_64-unknown-linux-musl'), /raw entry limit/i);
             assert.deepEqual(await import('node:fs/promises').then(fs => fs.readdir(root)), []);
         } finally {
             await rm(root, { recursive: true, force: true });
