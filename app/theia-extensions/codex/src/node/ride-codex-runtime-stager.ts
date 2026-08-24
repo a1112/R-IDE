@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: MIT
  ********************************************************************************/
 
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { BigIntStats, constants as fsConstants, promises as fs } from 'node:fs';
 import { FileHandle } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve } from 'node:path';
@@ -39,6 +39,9 @@ const MAX_NATIVE_HEADER_BYTES = 4096;
 const RUNTIME_PROBE_TIMEOUT_MS = 10_000;
 const TAR_BLOCK_BYTES = 512;
 const MAX_TAR_OVERHEAD_BYTES = 64 * 1024;
+const MAX_RUNTIME_TREE_ENTRIES = 262_144;
+const MAX_RUNTIME_TREE_TOTAL_PATH_BYTES = 16 * 1024 * 1024;
+const RUNTIME_TREE_READ_BUFFER_BYTES = 64 * 1024;
 
 export interface RideCodexStatFs {
     readonly bsize: number | bigint;
@@ -98,6 +101,7 @@ export class RideCodexRuntimeStager {
     private readonly fetcher: RideCodexRuntimeStagingFetcherLike;
     private readonly probe: RideCodexRuntimeProbeLike;
     private readonly extractor: RideCodexRuntimeArchiveExtractor;
+    private readonly maxTreeEntries: number;
     private readonly signal?: AbortSignal;
 
     constructor(options: RideCodexRuntimeStagerOptions) {
@@ -112,14 +116,24 @@ export class RideCodexRuntimeStager {
             authorizationValidator: options.authorizationValidator
         });
         this.probe = options.probe ?? new RideCodexRuntimeProbe();
-        this.extractor = new RideCodexRuntimeArchiveExtractor({ maxEntries: options.maxArchiveEntries });
+        const maxArchiveEntries = positiveSafeInteger(options.maxArchiveEntries, DEFAULT_MAX_ARCHIVE_ENTRIES);
+        this.extractor = new RideCodexRuntimeArchiveExtractor({ maxEntries: maxArchiveEntries });
+        this.maxTreeEntries = boundedTreeEntryLimit(maxArchiveEntries);
         this.signal = options.signal;
     }
 
     async stage(authorization: InstallAuthorization, target: RuntimeTarget): Promise<StagedRuntime> {
         const runtime = runtimeManifestEntryForTarget(target);
         const rootBoundary = await RuntimeRootBoundary.create(this.trustedRuntimeBase, this.runtimeRoot);
-        const authorizationContext = createInstallAuthorizationContext(runtime, rootBoundary.canonicalRoot);
+        const stagingDirectory = join(rootBoundary.canonicalRoot, `.staging-${randomUUID()}`);
+        requireStrictChild(rootBoundary.canonicalRoot, stagingDirectory);
+        const archive = join(stagingDirectory, 'runtime.tgz');
+        requireStrictChild(stagingDirectory, archive);
+        const authorizationContext = createInstallAuthorizationContext(
+            runtime,
+            rootBoundary.canonicalRoot,
+            archive
+        );
         const capability = await this.fetcher.authorize(authorization, authorizationContext);
         let stagingBoundary: RuntimeStagingBoundary | undefined;
         let archiveHandle: FileHandle | undefined;
@@ -129,11 +143,9 @@ export class RideCodexRuntimeStager {
                 throw new RideCodexRuntimeStageError('Insufficient disk space to stage the managed Codex runtime.');
             }
             await rootBoundary.verify();
-            const stagingDirectory = await fs.mkdtemp(join(rootBoundary.canonicalRoot, '.staging-'));
+            await fs.mkdir(stagingDirectory, { mode: 0o700 });
             stagingBoundary = await rootBoundary.captureStaging(stagingDirectory);
             await stagingBoundary.verify();
-            const archive = join(stagingDirectory, 'runtime.tgz');
-            requireStrictChild(stagingDirectory, archive);
             await stagingBoundary.verify();
             archiveHandle = await openNewOwnedFile(archive, stagingBoundary);
             const destination: RideCodexRuntimeFetchDestination = Object.freeze({
@@ -159,9 +171,9 @@ export class RideCodexRuntimeStager {
                 await archiveReader.close().catch(() => undefined);
             }
             await stagingBoundary.verify();
-            const staged = await this.verifyStagedRuntime(stagingBoundary, runtime, authorizationContext);
-            await stagingBoundary.verify();
             await fs.rm(archive, { force: true });
+            await stagingBoundary.verify();
+            const staged = await this.verifyStagedRuntime(stagingBoundary, runtime, authorizationContext);
             await stagingBoundary.verify();
             return staged;
         } catch (error) {
@@ -221,34 +233,30 @@ export class RideCodexRuntimeStager {
         if (probeResult.version !== runtime.version) {
             throw new RideCodexRuntimeStageError('Codex staged runtime probe returned an incompatible version.');
         }
-        const packageIdentity = filesystemIdentity(await safeLstat(packageRoot, 'Codex package root is missing.'));
-        const resourcesIdentity = filesystemIdentity(await safeLstat(resourcesDirectory, 'Codex resources directory is missing.'));
-        const pathIdentity = filesystemIdentity(await safeLstat(pathDirectory, 'Codex path directory is missing.'));
-        const manifestIdentity = filesystemIdentity(await safeLstat(manifestPath, 'Codex package manifest is missing.'));
-        const executableIdentity = filesystemIdentity(await safeLstat(executable, 'Codex native executable is missing.'));
+        await stagingBoundary.verify();
+        const treeAttestation = await attestRuntimeTree(
+            stagingDirectory,
+            this.maxTreeEntries,
+            MAX_ARCHIVE_PATH_BYTES,
+            runtime.unpackedBytes
+        );
+        await stagingBoundary.verify();
         const revalidate = async (): Promise<void> => {
-            await stagingBoundary.verify();
-            await verifyDirectoryIdentity(
-                packageRoot, packageRoot, packageIdentity,
-                'Codex staged package root identity changed.'
-            );
-            await verifyDirectoryIdentity(
-                resourcesDirectory, resourcesDirectory, resourcesIdentity,
-                'Codex staged resources identity changed.'
-            );
-            await verifyDirectoryIdentity(
-                pathDirectory, pathDirectory, pathIdentity,
-                'Codex staged path directory identity changed.'
-            );
-            await verifyFileIdentity(
-                manifestPath, manifestIdentity, stagingDirectory,
-                'Codex staged package manifest identity changed.'
-            );
-            await verifyFileIdentity(
-                executable, executableIdentity, stagingDirectory,
-                'Codex staged executable identity changed.'
-            );
-            await stagingBoundary.verify();
+            try {
+                await stagingBoundary.verify();
+                const currentTree = await attestRuntimeTree(
+                    stagingDirectory,
+                    this.maxTreeEntries,
+                    MAX_ARCHIVE_PATH_BYTES,
+                    runtime.unpackedBytes
+                );
+                if (!runtimeTreeAttestationsEqual(treeAttestation, currentTree)) {
+                    throw new RideCodexRuntimeStageError('Codex staged runtime tree attestation changed.');
+                }
+                await stagingBoundary.verify();
+            } catch {
+                throw new RideCodexRuntimeStageError('Codex staged runtime tree attestation changed or is unsafe.');
+            }
         };
         return Object.freeze({
             stagingDirectory,
@@ -462,20 +470,188 @@ async function verifyDirectoryIdentity(
     }
 }
 
-async function verifyFileIdentity(
-    path: string,
-    expectedIdentity: RuntimeFilesystemIdentity,
-    expectedParent: string,
-    message: string
-): Promise<void> {
-    const stat = await safeLstat(path, message);
-    const canonical = await safeRealpath(path, message);
-    if (!stat.isFile() || stat.isSymbolicLink()
-        || !samePath(canonical, path)
-        || !isStrictChild(expectedParent, canonical)
-        || !runtimeFilesystemIdentitiesEqual(filesystemIdentity(stat), expectedIdentity)) {
-        throw new RideCodexRuntimeStageError(message);
+type RuntimeTreeEntryType = 'directory' | 'file';
+
+interface RuntimeTreeAttestationEntry {
+    readonly path: string;
+    readonly type: RuntimeTreeEntryType;
+    readonly identity: RuntimeFilesystemIdentity;
+    readonly size: bigint;
+    readonly digest: string;
+}
+
+interface RuntimeTreeAttestation {
+    readonly entries: readonly RuntimeTreeAttestationEntry[];
+    readonly totalReadBytes: bigint;
+    readonly totalPathBytes: number;
+}
+
+function boundedTreeEntryLimit(maxArchiveEntries: number): number {
+    return Math.min(MAX_RUNTIME_TREE_ENTRIES, Math.max(16, (maxArchiveEntries * 2) + 16));
+}
+
+async function attestRuntimeTree(
+    root: string,
+    maxEntries: number,
+    maxPathBytes: number,
+    maxReadBytes: number
+): Promise<RuntimeTreeAttestation> {
+    if (!Number.isSafeInteger(maxEntries) || maxEntries <= 0
+        || !Number.isSafeInteger(maxPathBytes) || maxPathBytes <= 0
+        || !Number.isSafeInteger(maxReadBytes) || maxReadBytes <= 0) {
+        throw new RideCodexRuntimeStageError('Codex staged runtime tree attestation limits are invalid.');
     }
+    const canonicalRoot = resolve(root);
+    const entries: RuntimeTreeAttestationEntry[] = [];
+    let totalReadBytes = BigInt(0);
+    let totalPathBytes = 0;
+    const maxReadBytesBigInt = BigInt(maxReadBytes);
+
+    const addEntry = (entry: RuntimeTreeAttestationEntry): void => {
+        const pathBytes = Buffer.byteLength(entry.path);
+        if (pathBytes <= 0 || pathBytes > maxPathBytes) {
+            throw new RideCodexRuntimeStageError('Codex staged runtime tree path exceeded its attestation limit.');
+        }
+        if (entries.length >= maxEntries) {
+            throw new RideCodexRuntimeStageError('Codex staged runtime tree exceeded its attestation entry limit.');
+        }
+        if (totalPathBytes > MAX_RUNTIME_TREE_TOTAL_PATH_BYTES - pathBytes) {
+            throw new RideCodexRuntimeStageError('Codex staged runtime tree exceeded its attestation path budget.');
+        }
+        totalPathBytes += pathBytes;
+        entries.push(Object.freeze(entry));
+    };
+
+    const visit = async (absolutePath: string, relativePath: string): Promise<void> => {
+        const stat = await safeLstat(absolutePath, 'Codex staged runtime tree entry is missing.');
+        const canonical = await safeRealpath(absolutePath, 'Codex staged runtime tree entry could not be resolved safely.');
+        if (!samePath(canonical, absolutePath)
+            || (!samePath(absolutePath, canonicalRoot) && !isStrictChild(canonicalRoot, absolutePath))) {
+            throw new RideCodexRuntimeStageError('Codex staged runtime tree entry escaped its canonical boundary.');
+        }
+        if (stat.isSymbolicLink()) {
+            throw new RideCodexRuntimeStageError('Codex staged runtime tree contains a forbidden link.');
+        }
+        if (stat.isDirectory()) {
+            if (entries.length >= maxEntries) {
+                throw new RideCodexRuntimeStageError('Codex staged runtime tree exceeded its attestation entry limit.');
+            }
+            const children: Array<{ readonly name: string }> = [];
+            const directory = await fs.opendir(absolutePath);
+            try {
+                while (true) {
+                    const child = await directory.read();
+                    if (!child) {
+                        break;
+                    }
+                    if (children.length >= maxEntries - entries.length - 1) {
+                        throw new RideCodexRuntimeStageError('Codex staged runtime tree exceeded its attestation entry limit.');
+                    }
+                    children.push(Object.freeze({ name: child.name }));
+                }
+            } finally {
+                await directory.close().catch(() => undefined);
+            }
+            children.sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0);
+            const namesDigest = createHash('sha256');
+            for (const child of children) {
+                if (!isPortablePathSegment(child.name)) {
+                    throw new RideCodexRuntimeStageError('Codex staged runtime tree contains an unsafe path segment.');
+                }
+                namesDigest.update(child.name, 'utf8').update('\0');
+            }
+            addEntry(Object.freeze({
+                path: relativePath,
+                type: 'directory',
+                identity: filesystemIdentity(stat),
+                size: stat.size,
+                digest: `sha256-${namesDigest.digest('hex')}`
+            }));
+            for (const child of children) {
+                const childRelativePath = relativePath === '.' ? child.name : `${relativePath}/${child.name}`;
+                await visit(join(absolutePath, child.name), childRelativePath);
+            }
+            const after = await safeLstat(absolutePath, 'Codex staged runtime tree directory changed during attestation.');
+            if (!after.isDirectory() || after.isSymbolicLink()
+                || !runtimeFilesystemIdentitiesEqual(filesystemIdentity(stat), filesystemIdentity(after))) {
+                throw new RideCodexRuntimeStageError('Codex staged runtime tree directory changed during attestation.');
+            }
+            return;
+        }
+        if (!stat.isFile() || stat.nlink !== BigInt(1)) {
+            throw new RideCodexRuntimeStageError('Codex staged runtime tree contains a non-regular or linked file.');
+        }
+        const remainingBytes = maxReadBytesBigInt - totalReadBytes;
+        if (stat.size < BigInt(0) || stat.size > remainingBytes || stat.size > BigInt(Number.MAX_SAFE_INTEGER)) {
+            throw new RideCodexRuntimeStageError('Codex staged runtime tree exceeded its attestation byte limit.');
+        }
+        const handle = await fs.open(absolutePath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+        try {
+            const openedStat = await handle.stat({ bigint: true });
+            if (!openedStat.isFile() || openedStat.nlink !== BigInt(1)
+                || !runtimeFilesystemIdentitiesEqual(filesystemIdentity(stat), filesystemIdentity(openedStat))) {
+                throw new RideCodexRuntimeStageError('Codex staged runtime tree file identity changed during attestation.');
+            }
+            const digest = createHash('sha256');
+            const buffer = Buffer.allocUnsafe(RUNTIME_TREE_READ_BUFFER_BYTES);
+            const expectedBytes = Number(openedStat.size);
+            let position = 0;
+            while (position < expectedBytes) {
+                const length = Math.min(buffer.length, expectedBytes - position);
+                const { bytesRead } = await handle.read(buffer, 0, length, position);
+                if (bytesRead <= 0) {
+                    throw new RideCodexRuntimeStageError('Codex staged runtime tree file was truncated during attestation.');
+                }
+                digest.update(buffer.subarray(0, bytesRead));
+                position += bytesRead;
+            }
+            const extra = Buffer.allocUnsafe(1);
+            if ((await handle.read(extra, 0, 1, position)).bytesRead !== 0) {
+                throw new RideCodexRuntimeStageError('Codex staged runtime tree file grew during attestation.');
+            }
+            const afterOpened = await handle.stat({ bigint: true });
+            const afterPath = await safeLstat(absolutePath, 'Codex staged runtime tree file changed during attestation.');
+            if (!afterPath.isFile() || afterPath.isSymbolicLink() || afterPath.nlink !== BigInt(1)
+                || !runtimeFilesystemIdentitiesEqual(filesystemIdentity(openedStat), filesystemIdentity(afterOpened))
+                || !runtimeFilesystemIdentitiesEqual(filesystemIdentity(openedStat), filesystemIdentity(afterPath))) {
+                throw new RideCodexRuntimeStageError('Codex staged runtime tree file changed during attestation.');
+            }
+            totalReadBytes += openedStat.size;
+            addEntry(Object.freeze({
+                path: relativePath,
+                type: 'file',
+                identity: filesystemIdentity(openedStat),
+                size: openedStat.size,
+                digest: `sha256-${digest.digest('hex')}`
+            }));
+        } finally {
+            await handle.close().catch(() => undefined);
+        }
+    };
+
+    await visit(canonicalRoot, '.');
+    return Object.freeze({
+        entries: Object.freeze(entries),
+        totalReadBytes,
+        totalPathBytes
+    });
+}
+
+function runtimeTreeAttestationsEqual(left: RuntimeTreeAttestation, right: RuntimeTreeAttestation): boolean {
+    if (left.totalReadBytes !== right.totalReadBytes
+        || left.totalPathBytes !== right.totalPathBytes
+        || left.entries.length !== right.entries.length) {
+        return false;
+    }
+    return left.entries.every((entry, index) => {
+        const candidate = right.entries[index];
+        return candidate !== undefined
+            && entry.path === candidate.path
+            && entry.type === candidate.type
+            && entry.size === candidate.size
+            && entry.digest === candidate.digest
+            && runtimeFilesystemIdentitiesEqual(entry.identity, candidate.identity);
+    });
 }
 
 async function openNewOwnedFile(path: string, boundary: RuntimeStagingBoundary): Promise<FileHandle> {

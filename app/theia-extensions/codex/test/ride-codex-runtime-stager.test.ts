@@ -8,7 +8,7 @@ import { strict as assert } from 'node:assert';
 import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { promises as fsPromises } from 'node:fs';
-import { lstat, mkdir, mkdtemp, open, readFile, realpath, rename, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { link, lstat, mkdir, mkdtemp, open, readFile, realpath, rename, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve } from 'node:path';
 import { Readable } from 'node:stream';
@@ -315,10 +315,10 @@ test('fetch authorization capability is context-bound, instance-bound, unforgeab
         requester: new ScriptedRequester([])
     });
     const runtime = fetchEntry(bytes);
-    const context = createInstallAuthorizationContext(runtime, await realpath(root));
+    const destinationPath = join(root, 'runtime.tgz');
+    const context = createInstallAuthorizationContext(runtime, await realpath(root), destinationPath);
     const capability = await first.authorize(AUTHORIZATION, context);
     const forged = Object.freeze(Object.create(null)) as RideCodexRuntimeFetchCapability;
-    const destinationPath = join(root, 'runtime.tgz');
     const destinationHandle = await open(destinationPath, 'wx+', 0o600);
     const destination: RideCodexRuntimeFetchDestination = Object.freeze({
         path: destinationPath,
@@ -363,15 +363,16 @@ test('fetch authorization context rejects target, manifest digest, root, and des
     const runtime = fetchEntry(bytes);
     const canonicalRoot = await realpath(root);
     const otherCanonicalRoot = await realpath(otherRoot);
-    const context = createInstallAuthorizationContext(runtime, canonicalRoot);
 
     const attempt = async (
         name: string,
         candidateRuntime: RideCodexRuntimeManifestEntry,
         destinationRoot: string,
-        destinationPath: string
+        destinationPath: string,
+        authorizedDestination: string = destinationPath
     ): Promise<void> => {
         await t.test(name, async () => {
+            const context = createInstallAuthorizationContext(runtime, canonicalRoot, authorizedDestination);
             const capability = await fetcher.authorize(AUTHORIZATION, context);
             const handle = await open(destinationPath, 'wx+', 0o600);
             try {
@@ -403,12 +404,44 @@ test('fetch authorization context rejects target, manifest digest, root, and des
             canonicalRoot,
             join(root, 'digest-b.tgz')
         );
-        await attempt('canonical root B', runtime, otherCanonicalRoot, join(otherRoot, 'root-b.tgz'));
-        await attempt('destination escape', runtime, canonicalRoot, join(otherRoot, 'escape.tgz'));
+        await attempt(
+            'canonical root B', runtime, otherCanonicalRoot, join(otherRoot, 'root-b.tgz'), join(root, 'authorized-root-a.tgz')
+        );
+        await attempt(
+            'destination escape', runtime, canonicalRoot, join(otherRoot, 'escape.tgz'), join(root, 'authorized-escape-a.tgz')
+        );
         assert.equal(requester.calls.length, 0);
     } finally {
         await rm(root, { recursive: true, force: true });
         await rm(otherRoot, { recursive: true, force: true });
+    }
+});
+
+test('fetch authorization capability rejects a sibling destination before network access', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ride-codex-fetch-sibling-destination-'));
+    const bytes = Buffer.from('exact destination capability');
+    const requester = new ScriptedRequester([response(Readable.from([bytes]))]);
+    const fetcher = new RideCodexRuntimeFetcher({ authorizationValidator: () => true, requester });
+    const runtime = fetchEntry(bytes);
+    const canonicalRoot = await realpath(root);
+    const authorizedPath = join(canonicalRoot, 'authorized-runtime.tgz');
+    const siblingPath = join(canonicalRoot, 'sibling-runtime.tgz');
+    const context = createInstallAuthorizationContext(runtime, canonicalRoot, authorizedPath);
+    const capability = await fetcher.authorize(AUTHORIZATION, context);
+    const siblingHandle = await open(siblingPath, 'wx+', 0o600);
+    try {
+        await assert.rejects(
+            fetcher.fetchAuthorized(capability, runtime, Object.freeze({
+                path: siblingPath,
+                canonicalRoot,
+                handle: siblingHandle
+            })),
+            /authorization|context|destination/i
+        );
+        assert.equal(requester.calls.length, 0);
+    } finally {
+        await siblingHandle.close().catch(() => undefined);
+        await rm(root, { recursive: true, force: true });
     }
 });
 
@@ -425,7 +458,7 @@ test('pre-opened fetch destination keeps payload on the original inode after its
     try {
         const capability = await fetcher.authorize(
             AUTHORIZATION,
-            createInstallAuthorizationContext(runtime, canonicalRoot)
+            createInstallAuthorizationContext(runtime, canonicalRoot, destinationPath)
         );
         await rename(destinationPath, retainedPath);
         await writeFile(destinationPath, 'external sentinel', { flag: 'wx' });
@@ -1037,6 +1070,53 @@ test('staged runtime revalidation rejects directory identity drift before Task 7
             await rm(movedDirectory, { recursive: true, force: true });
         }
     }
+});
+
+test('staged runtime revalidation attests the complete resource tree before Task 7 activation', async t => {
+    const vendor = 'package/vendor/x86_64-unknown-linux-musl';
+    const archive = await tarGz(validArchiveEntries({
+        extras: [
+            { header: { name: `${vendor}/codex-resources/model.json`, type: 'file' }, body: 'trusted resource' },
+            { header: { name: `${vendor}/codex-path/helper`, type: 'file' }, body: 'trusted helper' }
+        ]
+    }));
+
+    const mutateAndReject = async (
+        name: string,
+        mutate: (staged: Awaited<ReturnType<RideCodexRuntimeStager['stage']>>, root: string) => Promise<void>
+    ): Promise<void> => {
+        await t.test(name, async () => {
+            const root = await mkdtemp(join(tmpdir(), 'ride-codex-tree-attestation-'));
+            try {
+                const staged = await (await createArchiveStager(root, archive)).stage(
+                    AUTHORIZATION,
+                    'x86_64-unknown-linux-musl'
+                );
+                await staged.revalidate();
+                await mutate(staged, root);
+                await assert.rejects(staged.revalidate(), /attest|tree|identity|content|resource|changed|safe/i);
+            } finally {
+                await rm(root, { recursive: true, force: true });
+            }
+        });
+    };
+
+    await mutateAndReject('resource content changed', async staged => {
+        await writeFile(join(staged.resourcesDirectory, 'model.json'), 'tampered resource');
+    });
+    await mutateAndReject('resource deleted', async staged => {
+        await rm(join(staged.resourcesDirectory, 'model.json'));
+    });
+    await mutateAndReject('resource added', async staged => {
+        await writeFile(join(staged.resourcesDirectory, 'injected.json'), 'injected');
+    });
+    await mutateAndReject('resource replaced by a hard link', async (staged, root) => {
+        const replacement = join(root, 'replacement-resource');
+        await writeFile(replacement, 'replacement');
+        const resource = join(staged.resourcesDirectory, 'model.json');
+        await rm(resource);
+        await link(replacement, resource);
+    });
 });
 
 test('valid npm-style archive does not require explicit directory headers', async () => {

@@ -23,6 +23,7 @@ export interface InstallAuthorizationContext {
     readonly target: RuntimeTarget;
     readonly manifestDigest: string;
     readonly canonicalRoot: string;
+    readonly destination: string;
 }
 
 export type InstallAuthorizationValidator = (
@@ -137,7 +138,7 @@ export class RideCodexRuntimeFetcher implements RideCodexRuntimeFetcherLike {
         });
         const capability = await this.authorize(
             authorization,
-            createInstallAuthorizationContext(runtime, canonicalRoot)
+            createInstallAuthorizationContext(runtime, canonicalRoot, destination)
         );
         return this.fetchAuthorized(capability, runtime, destination, signal);
     }
@@ -388,12 +389,14 @@ export async function validateInstallAuthorization(
 
 export function createInstallAuthorizationContext(
     runtime: RideCodexRuntimeManifestEntry,
-    canonicalRoot: string
+    canonicalRoot: string,
+    destination: string
 ): InstallAuthorizationContext {
     return normalizeInstallAuthorizationContext(Object.freeze({
         target: runtime.target,
         manifestDigest: runtimeManifestEntryDigest(runtime),
-        canonicalRoot
+        canonicalRoot,
+        destination
     }));
 }
 
@@ -403,17 +406,23 @@ function normalizeInstallAuthorizationContext(context: InstallAuthorizationConte
         || typeof context.manifestDigest !== 'string'
         || !/^sha256-[a-f0-9]{64}$/.test(context.manifestDigest)
         || typeof context.canonicalRoot !== 'string'
-        || !isAbsolute(context.canonicalRoot)) {
+        || !isAbsolute(context.canonicalRoot)
+        || typeof context.destination !== 'string'
+        || !isAbsolute(context.destination)) {
         throw new RideCodexRuntimeFetchError('Codex runtime install authorization context is invalid.');
     }
     const canonicalRoot = resolvePath(context.canonicalRoot);
-    if (!samePath(canonicalRoot, context.canonicalRoot)) {
-        throw new RideCodexRuntimeFetchError('Codex runtime install authorization root is not canonical.');
+    const destination = resolvePath(context.destination);
+    if (!samePath(canonicalRoot, context.canonicalRoot)
+        || !samePath(destination, context.destination)
+        || !isStrictChild(canonicalRoot, destination)) {
+        throw new RideCodexRuntimeFetchError('Codex runtime install authorization root or destination is not canonical.');
     }
     return Object.freeze({
         target: context.target,
         manifestDigest: context.manifestDigest,
-        canonicalRoot
+        canonicalRoot,
+        destination
     });
 }
 
@@ -429,6 +438,7 @@ function validateAuthorizedFetchContext(
     if (!safeStringEqual(context.target, runtime.target)
         || !safeStringEqual(context.manifestDigest, runtimeManifestEntryDigest(runtime))
         || !safeStringEqual(normalizePathForComparison(context.canonicalRoot), normalizePathForComparison(destinationRoot))
+        || !safeStringEqual(normalizePathForComparison(context.destination), normalizePathForComparison(destinationPath))
         || !isStrictChild(destinationRoot, destinationPath)
         || (typeof destination !== 'string'
             && (!destination.handle || !Number.isSafeInteger(destination.handle.fd)))) {
