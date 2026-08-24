@@ -8,7 +8,9 @@
         "declarationMap": false
     },
     "include": [
+        "src/common/ride-codex-methods.ts",
         "src/common/ride-codex-protocol.ts",
+        "src/node/ride-codex-jsonl-*.ts",
         "test/**/*.ts"
     ]
 }
