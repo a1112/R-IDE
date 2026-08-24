@@ -6,9 +6,9 @@
 
 import { strict as assert } from 'node:assert';
 import { createHash } from 'node:crypto';
-import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { lstat, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, relative, resolve } from 'node:path';
+import { dirname, join, relative, resolve } from 'node:path';
 import { Readable } from 'node:stream';
 import { createGzip, gzipSync, gunzipSync } from 'node:zlib';
 import { test } from 'node:test';
@@ -22,7 +22,9 @@ import {
     RideCodexHttpsRequest,
     RideCodexHttpsRequester,
     RideCodexHttpsResponse,
-    RideCodexRuntimeFetcher
+    RideCodexRuntimeFetchCapability,
+    RideCodexRuntimeFetcher,
+    validateInstallAuthorization
 } from '../src/node/ride-codex-runtime-fetcher';
 import {
     InstallAuthorization,
@@ -128,6 +130,7 @@ test('staging rejects missing or invalid authorization before statfs or network 
     let statfsCalls = 0;
     let fetchCalls = 0;
     const stager = new RideCodexRuntimeStager({
+        trustedRuntimeBase: process.cwd(),
         runtimeRoot: resolve('runtime-root-must-not-be-touched'),
         authorizationValidator: async authorization => {
             validations += 1;
@@ -138,7 +141,14 @@ test('staging rejects missing or invalid authorization before statfs or network 
             return { bsize: 4096, bavail: 1_000_000 };
         },
         fetcher: {
-            fetch: async () => {
+            authorize: async authorization => {
+                await validateInstallAuthorization(authorization, async candidate => {
+                    validations += 1;
+                    return candidate === AUTHORIZATION;
+                });
+                return authorization as RideCodexRuntimeFetchCapability;
+            },
+            fetchAuthorized: async () => {
                 fetchCalls += 1;
                 throw new Error('network must not be reached');
             }
@@ -166,6 +176,7 @@ test('staging checks Node statfs capacity before creating a staging directory or
             entry.compressedBytes + entry.unpackedBytes + RIDE_CODEX_RUNTIME_STAGE_SAFETY_MARGIN_BYTES
         );
         const stager = new RideCodexRuntimeStager({
+            trustedRuntimeBase: root,
             runtimeRoot: root,
             authorizationValidator: authorization => authorization === AUTHORIZATION,
             statfs: async () => ({
@@ -173,7 +184,11 @@ test('staging checks Node statfs capacity before creating a staging directory or
                 bavail: requiredRuntimeStageBytes(entry) - 1
             }),
             fetcher: {
-                fetch: async () => {
+                authorize: async authorization => {
+                    await validateInstallAuthorization(authorization, candidate => candidate === AUTHORIZATION);
+                    return authorization as RideCodexRuntimeFetchCapability;
+                },
+                fetchAuthorized: async () => {
                     fetchCalls += 1;
                     throw new Error('network must not be reached');
                 }
@@ -248,6 +263,52 @@ test('fetcher streams an exact response to disk and verifies byte count and SHA-
         assert.equal(requester.calls[0].url, RIDE_CODEX_RUNTIME_MANIFEST.runtimes[4].url);
         assert.ok(requester.calls[0].request.connectTimeoutMs > 0);
         assert.equal(Object.isFrozen(result), true);
+    } finally {
+        await rm(root, { recursive: true, force: true });
+    }
+});
+
+test('fetch authorization capability is instance-bound, unforgeable, and consumed exactly once', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ride-codex-fetch-capability-'));
+    const bytes = Buffer.from('one-shot capability');
+    const requester = new ScriptedRequester([response(Readable.from([bytes]))]);
+    let validations = 0;
+    let externalAuthorizationConsumed = false;
+    const first = new RideCodexRuntimeFetcher({
+        authorizationValidator: authorization => {
+            validations += 1;
+            if (externalAuthorizationConsumed || authorization !== AUTHORIZATION) {
+                return false;
+            }
+            externalAuthorizationConsumed = true;
+            return true;
+        },
+        requester
+    });
+    const second = new RideCodexRuntimeFetcher({
+        authorizationValidator: () => true,
+        requester: new ScriptedRequester([])
+    });
+    const runtime = fetchEntry(bytes);
+    const capability = await first.authorize(AUTHORIZATION);
+    const forged = Object.freeze(Object.create(null)) as RideCodexRuntimeFetchCapability;
+    try {
+        await assert.rejects(
+            first.fetchAuthorized(forged, runtime, join(root, 'forged.tgz')),
+            /authorization|capability/i
+        );
+        await assert.rejects(
+            second.fetchAuthorized(capability, runtime, join(root, 'cross-instance.tgz')),
+            /authorization|capability/i
+        );
+        const result = await first.fetchAuthorized(capability, runtime, join(root, 'runtime.tgz'));
+        assert.equal(result.bytes, bytes.length);
+        await assert.rejects(
+            first.fetchAuthorized(capability, runtime, join(root, 'replay.tgz')),
+            /authorization|capability/i
+        );
+        assert.equal(validations, 1);
+        assert.equal(requester.calls.length, 1);
     } finally {
         await rm(root, { recursive: true, force: true });
     }
@@ -431,17 +492,166 @@ test('fetcher aborts connect, idle, overall, and stream failures and removes par
     }
 });
 
+test('staging consumes a single-use external authorization once before statfs and download', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ride-codex-stage-capability-'));
+    const archive = await tarGz(validArchiveEntries());
+    const entry = RIDE_CODEX_RUNTIME_MANIFEST.runtimes[4];
+    const capabilities = new WeakSet<object>();
+    let validations = 0;
+    let authorizationConsumed = false;
+    let statfsCalls = 0;
+    let fetchCalls = 0;
+    const validator = async (authorization: InstallAuthorization): Promise<boolean> => {
+        validations += 1;
+        if (authorizationConsumed || authorization !== AUTHORIZATION) {
+            return false;
+        }
+        authorizationConsumed = true;
+        return true;
+    };
+    const stager = new RideCodexRuntimeStager({
+        trustedRuntimeBase: root,
+        runtimeRoot: root,
+        authorizationValidator: validator,
+        statfs: async () => {
+            statfsCalls += 1;
+            return { bsize: 1, bavail: requiredRuntimeStageBytes(entry) };
+        },
+        fetcher: {
+            authorize: async authorization => {
+                await validateInstallAuthorization(authorization, validator);
+                const capability = Object.freeze(Object.create(null)) as RideCodexRuntimeFetchCapability;
+                capabilities.add(capability);
+                return capability;
+            },
+            fetchAuthorized: async (capability, _runtime, destination) => {
+                if (!capabilities.delete(capability)) {
+                    throw new Error('authorization capability is invalid');
+                }
+                fetchCalls += 1;
+                await writeFile(destination, archive, { flag: 'wx', mode: 0o600 });
+                return Object.freeze({ bytes: archive.length, integrity: sha512Integrity(archive) });
+            }
+        },
+        probe: new RecordingProbe()
+    });
+    try {
+        const staged = await stager.stage(AUTHORIZATION, entry.target);
+        assert.equal((await stat(staged.executable)).isFile(), true);
+        assert.equal(validations, 1);
+        assert.equal(statfsCalls, 1);
+        assert.equal(fetchCalls, 1);
+        await assert.rejects(stager.stage(AUTHORIZATION, entry.target), /authorization/i);
+        assert.equal(validations, 2);
+        assert.equal(statfsCalls, 1);
+        assert.equal(fetchCalls, 1);
+    } finally {
+        await rm(root, { recursive: true, force: true });
+    }
+});
+
+test('staging rejects symlink or junction ancestors below its trusted runtime base before statfs or download', async () => {
+    const base = await mkdtemp(join(tmpdir(), 'ride-codex-trusted-base-'));
+    const external = await mkdtemp(join(tmpdir(), 'ride-codex-external-root-'));
+    const linkedAncestor = join(base, 'linked');
+    let statfsCalls = 0;
+    let fetchCalls = 0;
+    try {
+        await symlink(external, linkedAncestor, process.platform === 'win32' ? 'junction' : 'dir');
+        const stager = new RideCodexRuntimeStager({
+            trustedRuntimeBase: base,
+            runtimeRoot: join(linkedAncestor, 'runtime'),
+            authorizationValidator: authorization => authorization === AUTHORIZATION,
+            statfs: async () => {
+                statfsCalls += 1;
+                return { bsize: 1, bavail: Number.MAX_SAFE_INTEGER };
+            },
+            fetcher: {
+                authorize: async authorization => authorization as RideCodexRuntimeFetchCapability,
+                fetchAuthorized: async () => {
+                    fetchCalls += 1;
+                    throw new Error('network must not be reached');
+                }
+            }
+        });
+        await assert.rejects(stager.stage(AUTHORIZATION, 'x86_64-pc-windows-msvc'), /root|symlink|junction|reparse|safe/i);
+        assert.equal(statfsCalls, 0);
+        assert.equal(fetchCalls, 0);
+    } finally {
+        await rm(base, { recursive: true, force: true });
+        await rm(external, { recursive: true, force: true });
+    }
+});
+
+test('staging detects replacement with an external symlink and cleanup preserves the external sentinel', async () => {
+    const base = await mkdtemp(join(tmpdir(), 'ride-codex-root-swap-'));
+    const root = join(base, 'runtime');
+    const external = await mkdtemp(join(tmpdir(), 'ride-codex-root-swap-external-'));
+    const sentinel = join(external, 'sentinel.txt');
+    const entry = RIDE_CODEX_RUNTIME_MANIFEST.runtimes[4];
+    let replacedStaging: string | undefined;
+    await writeFile(sentinel, 'must survive');
+    try {
+        const stager = new RideCodexRuntimeStager({
+            trustedRuntimeBase: base,
+            runtimeRoot: root,
+            authorizationValidator: authorization => authorization === AUTHORIZATION,
+            statfs: async () => ({ bsize: 1, bavail: requiredRuntimeStageBytes(entry) }),
+            fetcher: {
+                authorize: async authorization => authorization as RideCodexRuntimeFetchCapability,
+                fetchAuthorized: async (_capability, _runtime, destination) => {
+                    replacedStaging = dirname(destination);
+                    await rm(replacedStaging, { recursive: true, force: true });
+                    await symlink(external, replacedStaging, process.platform === 'win32' ? 'junction' : 'dir');
+                    return Object.freeze({ bytes: entry.compressedBytes, integrity: entry.integrity });
+                }
+            }
+        });
+        await assert.rejects(stager.stage(AUTHORIZATION, entry.target), /root|staging|replace|symlink|junction|safe/i);
+        assert.equal(await readFile(sentinel, 'utf8'), 'must survive');
+        assert.ok(replacedStaging);
+        assert.equal((await lstat(replacedStaging!)).isSymbolicLink(), true);
+    } finally {
+        await rm(base, { recursive: true, force: true });
+        await rm(external, { recursive: true, force: true });
+    }
+});
+
+test('staging returns paths rooted in the canonical extension-owned runtime directory', async () => {
+    const base = await mkdtemp(join(tmpdir(), 'ride-codex-canonical-base-'));
+    const root = join(base, 'nested', '..', 'runtime');
+    try {
+        const stager = await createArchiveStager(root, await tarGz(validArchiveEntries()), {
+            trustedRuntimeBase: base
+        });
+        const staged = await stager.stage(AUTHORIZATION, 'x86_64-unknown-linux-musl');
+        const canonicalRoot = await realpath(resolve(base, 'runtime'));
+        assert.ok(isPathChild(canonicalRoot, staged.stagingDirectory));
+        assert.equal(await realpath(staged.stagingDirectory), staged.stagingDirectory);
+        assert.ok(isPathChild(staged.stagingDirectory, staged.executable));
+    } finally {
+        await rm(base, { recursive: true, force: true });
+    }
+});
+
+function isPathChild(parent: string, child: string): boolean {
+    const childRelative = relative(parent, child);
+    return childRelative !== '' && !childRelative.startsWith('..') && !resolve(childRelative).startsWith('..');
+}
+
 test('staging paths are unique children of the extension-owned runtime root', async () => {
     const root = await mkdtemp(join(tmpdir(), 'ride-codex-stage-root-'));
     const observed: string[] = [];
     try {
         const entry = RIDE_CODEX_RUNTIME_MANIFEST.runtimes[0];
         const stager = new RideCodexRuntimeStager({
+            trustedRuntimeBase: root,
             runtimeRoot: root,
             authorizationValidator: authorization => authorization === AUTHORIZATION,
             statfs: async () => ({ bsize: 1, bavail: requiredRuntimeStageBytes(entry) }),
             fetcher: {
-                fetch: async (_authorization, _runtime, destination) => {
+                authorize: async authorization => authorization as RideCodexRuntimeFetchCapability,
+                fetchAuthorized: async (_authorization, _runtime, destination) => {
                     observed.push(destination);
                     throw new Error('stop after path observation');
                 }
@@ -542,15 +752,18 @@ async function createArchiveStager(
     options: {
         readonly probe?: RideCodexRuntimeProbeLike;
         readonly maxArchiveEntries?: number;
+        readonly trustedRuntimeBase?: string;
     } = {}
 ): Promise<RideCodexRuntimeStager> {
     const entry = RIDE_CODEX_RUNTIME_MANIFEST.runtimes[4];
     return new RideCodexRuntimeStager({
+        trustedRuntimeBase: options.trustedRuntimeBase ?? root,
         runtimeRoot: root,
         authorizationValidator: authorization => authorization === AUTHORIZATION,
         statfs: async () => ({ bsize: 1, bavail: requiredRuntimeStageBytes(entry) }),
         fetcher: {
-            fetch: async (_authorization, _runtime, destination) => {
+            authorize: async authorization => authorization as RideCodexRuntimeFetchCapability,
+            fetchAuthorized: async (_authorization, _runtime, destination) => {
                 await writeFile(destination, archive, { flag: 'wx', mode: 0o600 });
                 return Object.freeze({ bytes: archive.length, integrity: sha512Integrity(archive) });
             }
@@ -656,6 +869,44 @@ test('archive path validation rejects traversal, platform tricks, invalid names,
     }
 });
 
+test('archive path validation rejects Windows aliases, controls, and non-NFC segments in real tar fixtures', async t => {
+    const cases = [
+        { name: 'CON device', path: 'package/CON' },
+        { name: 'PRN device with extension', path: 'package/prn.txt' },
+        { name: 'AUX device case-insensitive', path: 'package/AuX.log' },
+        { name: 'NUL device with extension', path: 'package/NUL.bin' },
+        { name: 'COM1 device', path: 'package/COM1.txt' },
+        { name: 'COM9 device', path: 'package/com9' },
+        { name: 'LPT1 device', path: 'package/LPT1.data' },
+        { name: 'LPT9 device', path: 'package/lpt9' },
+        { name: 'trailing dot', path: 'package/trailing.' },
+        { name: 'trailing space', path: 'package/trailing ' },
+        { name: 'ASCII control', path: 'package/control\u0001name' },
+        { name: 'DEL control', path: 'package/control\u007fname' },
+        { name: 'non-NFC Unicode', path: 'package/Cafe\u0301' }
+    ] as const;
+    for (const entry of cases) {
+        await t.test(entry.name, async () => {
+            const extractor = new RideCodexRuntimeArchiveExtractor();
+            assert.throws(
+                () => extractor.validateEntryPath(entry.path, 'x86_64-unknown-linux-musl'),
+                /archive|path|entry|alias|Unicode|name/i
+            );
+            const root = await mkdtemp(join(tmpdir(), 'ride-codex-alias-path-'));
+            try {
+                const archive = await tarGz(validArchiveEntries({
+                    extras: [{ header: { name: entry.path, type: 'file' }, body: 'unsafe alias' }]
+                }));
+                const stager = await createArchiveStager(root, archive);
+                await assert.rejects(stager.stage(AUTHORIZATION, 'x86_64-unknown-linux-musl'), /archive|path|entry|alias|Unicode|name/i);
+                assert.deepEqual(await import('node:fs/promises').then(fs => fs.readdir(root)), []);
+            } finally {
+                await rm(root, { recursive: true, force: true });
+            }
+        });
+    }
+});
+
 test('archive rejects duplicate and case-colliding entries', async t => {
     const cases: readonly TarFixtureEntry[][] = [
         [{ header: { name: 'package/README', type: 'file' }, body: 'one' }, { header: { name: 'package/README', type: 'file' }, body: 'two' }],
@@ -672,6 +923,23 @@ test('archive rejects duplicate and case-colliding entries', async t => {
                 await rm(root, { recursive: true, force: true });
             }
         });
+    }
+});
+
+test('archive collision keys use NFC plus Unicode case folding', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ride-codex-unicode-collision-'));
+    try {
+        const archive = await tarGz(validArchiveEntries({
+            extras: [
+                { header: { name: 'package/Straße', type: 'file' }, body: 'one' },
+                { header: { name: 'package/STRASSE', type: 'file' }, body: 'two' }
+            ]
+        }));
+        const stager = await createArchiveStager(root, archive);
+        await assert.rejects(stager.stage(AUTHORIZATION, 'x86_64-unknown-linux-musl'), /collision|archive|Unicode/i);
+        assert.deepEqual(await import('node:fs/promises').then(fs => fs.readdir(root)), []);
+    } finally {
+        await rm(root, { recursive: true, force: true });
     }
 });
 
@@ -787,6 +1055,19 @@ async function hiddenTarExtensionArchive(typeFlag: 'x' | 'g' | 'L' | 'K'): Promi
     return replaceTarType(archive, name, typeFlag);
 }
 
+function firstTarEndBlock(raw: Buffer): number {
+    for (let offset = 0; offset + 512 <= raw.length; offset += 512) {
+        if (raw.subarray(offset, offset + 512).every(byte => byte === 0)) {
+            return offset;
+        }
+    }
+    throw new Error('fixture tar end marker was not found');
+}
+
+function rewriteRawTar(archive: Buffer, rewrite: (raw: Buffer) => Buffer): Buffer {
+    return gzipSync(rewrite(gunzipSync(archive)));
+}
+
 test('archive rejects hidden PAX and GNU extension records before output or probe', async t => {
     const cases = [
         { name: 'PAX local header', typeFlag: 'x' },
@@ -859,6 +1140,71 @@ test('raw tar scanner counts all decompressed records and rejects unsafe size en
     }
 });
 
+test('raw tar scanner requires a canonical two-block terminator and rejects truncation or concatenation', async t => {
+    const ordinary = await tarGz(validArchiveEntries());
+    const ordinaryRaw = gunzipSync(ordinary);
+    const endOffset = firstTarEndBlock(ordinaryRaw);
+    const executableOffset = findTarHeader(
+        ordinaryRaw,
+        'package/vendor/x86_64-unknown-linux-musl/bin/codex'
+    );
+    const invalidCases = [
+        {
+            name: 'missing end blocks',
+            archive: rewriteRawTar(ordinary, raw => raw.subarray(0, endOffset))
+        },
+        {
+            name: 'single end block',
+            archive: rewriteRawTar(ordinary, raw => raw.subarray(0, endOffset + 512))
+        },
+        {
+            name: 'truncated header',
+            archive: rewriteRawTar(ordinary, raw => raw.subarray(0, executableOffset + 128))
+        },
+        {
+            name: 'truncated file data',
+            archive: rewriteRawTar(ordinary, raw => raw.subarray(0, executableOffset + 512 + 16))
+        },
+        {
+            name: 'truncated file padding',
+            archive: rewriteRawTar(ordinary, raw => raw.subarray(0, executableOffset + 512 + 128))
+        },
+        {
+            name: 'archive concatenated after two end blocks',
+            archive: gzipSync(Buffer.concat([ordinaryRaw, ordinaryRaw]))
+        }
+    ] as const;
+    for (const entry of invalidCases) {
+        await t.test(entry.name, async () => {
+            const root = await mkdtemp(join(tmpdir(), 'ride-codex-tar-end-'));
+            const probe = new RecordingProbe();
+            try {
+                const stager = await createArchiveStager(root, entry.archive, { probe });
+                await assert.rejects(
+                    stager.stage(AUTHORIZATION, 'x86_64-unknown-linux-musl'),
+                    /tar|archive|end|incomplete|marker/i
+                );
+                assert.equal(probe.calls.length, 0);
+                assert.deepEqual(await import('node:fs/promises').then(fs => fs.readdir(root)), []);
+            } finally {
+                await rm(root, { recursive: true, force: true });
+            }
+        });
+    }
+
+    await t.test('extra zero padding remains valid', async () => {
+        const root = await mkdtemp(join(tmpdir(), 'ride-codex-tar-padding-'));
+        try {
+            const archive = gzipSync(Buffer.concat([ordinaryRaw, Buffer.alloc(4 * 512)]));
+            const stager = await createArchiveStager(root, archive);
+            const staged = await stager.stage(AUTHORIZATION, 'x86_64-unknown-linux-musl');
+            assert.equal((await stat(staged.executable)).isFile(), true);
+        } finally {
+            await rm(root, { recursive: true, force: true });
+        }
+    });
+});
+
 test('archive enforces entry and unpacked byte budgets before retaining output', async t => {
     await t.test('entry count', async () => {
         const root = await mkdtemp(join(tmpdir(), 'ride-codex-entry-limit-'));
@@ -904,6 +1250,13 @@ test('package manifest and native runtime are bounded and strictly verified befo
         { name: 'entrypoint traversal', archive: () => tarGz(validArchiveEntries({ manifest: packageManifest({ entrypoint: '../codex' }) })), expected: /entrypoint|manifest|escape/i },
         { name: 'resources traversal', archive: () => tarGz(validArchiveEntries({ manifest: packageManifest({ resourcesDir: '../resources' }) })), expected: /resource|manifest|path/i },
         { name: 'path directory absolute', archive: () => tarGz(validArchiveEntries({ manifest: packageManifest({ pathDir: '/tmp/path' }) })), expected: /path|manifest/i },
+        {
+            name: 'non-NFC resource directory',
+            archive: () => tarGz(validArchiveEntries({
+                manifest: packageManifest({ resourcesDir: 'code\u0065\u0301x-resources' })
+            })),
+            expected: /manifest resource or path directory is invalid/i
+        },
         { name: 'wrong binary architecture', archive: () => tarGz(validArchiveEntries({ binary: elfHeader('arm64') })), expected: /architecture|target|binary/i },
         { name: 'incompatible probe version', archive: () => tarGz(validArchiveEntries()), probeVersion: '0.143.0', expected: /probe|version|runtime/i }
     ];

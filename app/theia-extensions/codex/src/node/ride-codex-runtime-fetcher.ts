@@ -18,6 +18,12 @@ export type InstallAuthorizationValidator = (
     authorization: InstallAuthorization
 ) => boolean | Promise<boolean>;
 
+const RUNTIME_FETCH_CAPABILITY_BRAND: unique symbol = Symbol('ride-codex-runtime-fetch-capability');
+
+export type RideCodexRuntimeFetchCapability = Readonly<{
+    readonly [RUNTIME_FETCH_CAPABILITY_BRAND]: true;
+}>;
+
 export interface RideCodexHttpsRequest {
     readonly connectTimeoutMs: number;
     readonly signal: AbortSignal;
@@ -38,7 +44,17 @@ export interface RideCodexRuntimeFetchResult {
     readonly integrity: string;
 }
 
-export interface RideCodexRuntimeFetcherLike {
+export interface RideCodexRuntimeStagingFetcherLike {
+    authorize(authorization: InstallAuthorization): Promise<RideCodexRuntimeFetchCapability>;
+    fetchAuthorized(
+        capability: RideCodexRuntimeFetchCapability,
+        runtime: RideCodexRuntimeManifestEntry,
+        destination: string,
+        signal?: AbortSignal
+    ): Promise<RideCodexRuntimeFetchResult>;
+}
+
+export interface RideCodexRuntimeFetcherLike extends RideCodexRuntimeStagingFetcherLike {
     fetch(
         authorization: InstallAuthorization,
         runtime: RideCodexRuntimeManifestEntry,
@@ -76,6 +92,7 @@ export class RideCodexRuntimeFetcher implements RideCodexRuntimeFetcherLike {
     private readonly idleTimeoutMs: number;
     private readonly overallTimeoutMs: number;
     private readonly maxRedirects: number;
+    private readonly capabilities = new WeakSet<object>();
 
     constructor(options: RideCodexRuntimeFetcherOptions) {
         this.authorizationValidator = options.authorizationValidator;
@@ -92,7 +109,34 @@ export class RideCodexRuntimeFetcher implements RideCodexRuntimeFetcherLike {
         destination: string,
         signal?: AbortSignal
     ): Promise<RideCodexRuntimeFetchResult> {
+        const capability = await this.authorize(authorization);
+        return this.fetchAuthorized(capability, runtime, destination, signal);
+    }
+
+    async authorize(authorization: InstallAuthorization): Promise<RideCodexRuntimeFetchCapability> {
         await validateInstallAuthorization(authorization, this.authorizationValidator);
+        const capability = Object.freeze(Object.create(null)) as RideCodexRuntimeFetchCapability;
+        this.capabilities.add(capability);
+        return capability;
+    }
+
+    async fetchAuthorized(
+        capability: RideCodexRuntimeFetchCapability,
+        runtime: RideCodexRuntimeManifestEntry,
+        destination: string,
+        signal?: AbortSignal
+    ): Promise<RideCodexRuntimeFetchResult> {
+        if (typeof capability !== 'object' || capability === null || !this.capabilities.delete(capability)) {
+            throw new RideCodexRuntimeFetchError('Codex runtime fetch authorization capability is invalid or already used.');
+        }
+        return this.fetchTrusted(runtime, destination, signal);
+    }
+
+    private async fetchTrusted(
+        runtime: RideCodexRuntimeManifestEntry,
+        destination: string,
+        signal?: AbortSignal
+    ): Promise<RideCodexRuntimeFetchResult> {
         const initialUrl = requireAllowedRuntimeUrl(runtime.url, true);
         const expectedUrl = `${ALLOWED_ORIGIN}/@openai/codex/-/codex-${runtime.npmVersion}.tgz`;
         if (runtime.package !== '@openai/codex' || runtime.version !== '0.144.0'
