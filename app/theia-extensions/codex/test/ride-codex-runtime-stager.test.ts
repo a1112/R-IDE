@@ -445,7 +445,57 @@ test('fetch authorization capability rejects a sibling destination before networ
     }
 });
 
-test('pre-opened fetch destination keeps payload on the original inode after its path is replaced', async () => {
+test('fetch authorization rejects a handle for a file outside the authorized destination before network access', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ride-codex-fetch-handle-binding-'));
+    const outsideRoot = await mkdtemp(join(tmpdir(), 'ride-codex-fetch-handle-binding-outside-'));
+    const bytes = Buffer.from('must not be written outside the authorized root');
+    const sentinel = 'outside sentinel must remain unchanged';
+    const requester = new ScriptedRequester([response(Readable.from([bytes]))]);
+    const fetcher = new RideCodexRuntimeFetcher({ authorizationValidator: () => true, requester });
+    const runtime = fetchEntry(bytes);
+    const canonicalRoot = await realpath(root);
+    const authorizedPath = join(canonicalRoot, 'runtime.tgz');
+    const outsidePath = join(outsideRoot, 'outside.tgz');
+    await writeFile(authorizedPath, '');
+    await writeFile(outsidePath, sentinel);
+    const outsideHandle = await open(outsidePath, 'r+');
+    try {
+        const capability = await fetcher.authorize(
+            AUTHORIZATION,
+            createInstallAuthorizationContext(runtime, canonicalRoot, authorizedPath)
+        );
+        await assert.rejects(
+            fetcher.fetchAuthorized(capability, runtime, Object.freeze({
+                path: authorizedPath,
+                canonicalRoot,
+                handle: outsideHandle
+            })),
+            /authorization|destination|handle|identity/i
+        );
+        assert.equal(requester.calls.length, 0);
+        assert.equal(await readFile(outsidePath, 'utf8'), sentinel);
+
+        const authorizedHandle = await open(authorizedPath, 'r+');
+        try {
+            await assert.rejects(
+                fetcher.fetchAuthorized(capability, runtime, Object.freeze({
+                    path: authorizedPath,
+                    canonicalRoot,
+                    handle: authorizedHandle
+                })),
+                /authorization|capability|already used/i
+            );
+        } finally {
+            await authorizedHandle.close();
+        }
+    } finally {
+        await outsideHandle.close().catch(() => undefined);
+        await rm(root, { recursive: true, force: true });
+        await rm(outsideRoot, { recursive: true, force: true });
+    }
+});
+
+test('pre-opened fetch destination rejects path replacement before network access', async () => {
     const root = await mkdtemp(join(tmpdir(), 'ride-codex-fetch-open-handle-'));
     const bytes = Buffer.from('write only to the authorized open inode');
     const requester = new ScriptedRequester([response(Readable.from([bytes]))]);
@@ -462,13 +512,16 @@ test('pre-opened fetch destination keeps payload on the original inode after its
         );
         await rename(destinationPath, retainedPath);
         await writeFile(destinationPath, 'external sentinel', { flag: 'wx' });
-        await fetcher.fetchAuthorized(capability, runtime, Object.freeze({
-            path: destinationPath,
-            canonicalRoot,
-            handle
-        }));
-        await handle.sync();
-        assert.deepEqual(await readFile(retainedPath), bytes);
+        await assert.rejects(
+            fetcher.fetchAuthorized(capability, runtime, Object.freeze({
+                path: destinationPath,
+                canonicalRoot,
+                handle
+            })),
+            /authorization|destination|handle|identity/i
+        );
+        assert.equal(requester.calls.length, 0);
+        assert.deepEqual(await readFile(retainedPath), Buffer.alloc(0));
         assert.equal(await readFile(destinationPath, 'utf8'), 'external sentinel');
     } finally {
         await handle.close().catch(() => undefined);
@@ -1047,6 +1100,32 @@ test('valid archive is streamed into a frozen staged runtime without activating 
         ]);
         await assert.rejects(readFile(join(root, 'active')), /ENOENT/);
         await assert.rejects(readFile(join(staged.stagingDirectory, 'runtime.tgz')), /ENOENT/);
+    } finally {
+        await rm(root, { recursive: true, force: true });
+    }
+});
+
+test('staging rejects a runtime tree changed by the probe before returning a staged runtime', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ride-codex-probe-attestation-'));
+    const archive = await tarGz(validArchiveEntries());
+    let changedDuringProbe = false;
+    const probe: RideCodexRuntimeProbeLike = {
+        probe: async executable => {
+            const original = join(root, 'original-codex');
+            await rename(executable, original);
+            await writeFile(executable, Buffer.concat([elfHeader(), Buffer.from('REPLACED-DURING-PROBE')]));
+            changedDuringProbe = true;
+            return Object.freeze({ version: '0.144.0' });
+        }
+    };
+    try {
+        const stager = await createArchiveStager(root, archive, { probe });
+        await assert.rejects(
+            stager.stage(AUTHORIZATION, 'x86_64-unknown-linux-musl'),
+            /attest|tree|identity|changed|safe/i
+        );
+        assert.equal(changedDuringProbe, true);
+        assert.deepEqual(await fsPromises.readdir(root), ['original-codex']);
     } finally {
         await rm(root, { recursive: true, force: true });
     }

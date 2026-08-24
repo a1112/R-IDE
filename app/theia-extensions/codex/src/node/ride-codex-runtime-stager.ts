@@ -221,6 +221,13 @@ export class RideCodexRuntimeStager {
         if (platform !== 'win32') {
             await fs.chmod(executable, 0o700);
         }
+        const treeAttestation = await attestRuntimeTree(
+            stagingDirectory,
+            this.maxTreeEntries,
+            MAX_ARCHIVE_PATH_BYTES,
+            runtime.unpackedBytes
+        );
+        await stagingBoundary.verify();
         let probeResult: { readonly version: string };
         try {
             probeResult = await this.probe.probe(executable, {
@@ -234,12 +241,15 @@ export class RideCodexRuntimeStager {
             throw new RideCodexRuntimeStageError('Codex staged runtime probe returned an incompatible version.');
         }
         await stagingBoundary.verify();
-        const treeAttestation = await attestRuntimeTree(
+        const postProbeTreeAttestation = await attestRuntimeTree(
             stagingDirectory,
             this.maxTreeEntries,
             MAX_ARCHIVE_PATH_BYTES,
             runtime.unpackedBytes
         );
+        if (!runtimeTreeAttestationsEqual(treeAttestation, postProbeTreeAttestation)) {
+            throw new RideCodexRuntimeStageError('Codex staged runtime tree changed during its probe.');
+        }
         await stagingBoundary.verify();
         const revalidate = async (): Promise<void> => {
             try {

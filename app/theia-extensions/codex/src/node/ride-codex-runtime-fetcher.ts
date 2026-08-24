@@ -5,8 +5,8 @@
  ********************************************************************************/
 
 import { createHash, timingSafeEqual } from 'node:crypto';
-import { createWriteStream } from 'node:fs';
-import { FileHandle, realpath, rm } from 'node:fs/promises';
+import { BigIntStats, createWriteStream } from 'node:fs';
+import { FileHandle, lstat, realpath, rm } from 'node:fs/promises';
 import { request as httpsRequest } from 'node:https';
 import { dirname, isAbsolute, relative, resolve as resolvePath } from 'node:path';
 import { Readable, Transform, Writable } from 'node:stream';
@@ -168,7 +168,7 @@ export class RideCodexRuntimeFetcher implements RideCodexRuntimeFetcherLike {
             throw new RideCodexRuntimeFetchError('Codex runtime fetch authorization capability is invalid or already used.');
         }
         this.capabilities.delete(capability);
-        validateAuthorizedFetchContext(context, runtime, destination);
+        await validateAuthorizedFetchContext(context, runtime, destination);
         return this.fetchTrusted(runtime, destination, signal);
     }
 
@@ -426,11 +426,11 @@ function normalizeInstallAuthorizationContext(context: InstallAuthorizationConte
     });
 }
 
-function validateAuthorizedFetchContext(
+async function validateAuthorizedFetchContext(
     context: InstallAuthorizationContext,
     runtime: RideCodexRuntimeManifestEntry,
     destination: RuntimeFetchDestination
-): void {
+): Promise<void> {
     const destinationPath = resolvePath(typeof destination === 'string' ? destination : destination.path);
     const destinationRoot = resolvePath(
         typeof destination === 'string' ? context.canonicalRoot : destination.canonicalRoot
@@ -444,6 +444,47 @@ function validateAuthorizedFetchContext(
             && (!destination.handle || !Number.isSafeInteger(destination.handle.fd)))) {
         throw new RideCodexRuntimeFetchError('Codex runtime fetch does not match its authorized install context.');
     }
+    if (typeof destination !== 'string') {
+        await validateAuthorizedDestinationHandle(destinationPath, destinationRoot, destination.handle);
+    }
+}
+
+async function validateAuthorizedDestinationHandle(
+    destinationPath: string,
+    destinationRoot: string,
+    handle: FileHandle
+): Promise<void> {
+    try {
+        const handleBefore = await handle.stat({ bigint: true });
+        const pathBefore = await lstat(destinationPath, { bigint: true });
+        const canonicalDestination = await realpath(destinationPath);
+        const handleAfter = await handle.stat({ bigint: true });
+        const pathAfter = await lstat(destinationPath, { bigint: true });
+        if (!handleBefore.isFile() || !handleAfter.isFile()
+            || !pathBefore.isFile() || pathBefore.isSymbolicLink()
+            || !pathAfter.isFile() || pathAfter.isSymbolicLink()
+            || handleBefore.nlink !== BigInt(1) || handleAfter.nlink !== BigInt(1)
+            || pathBefore.nlink !== BigInt(1) || pathAfter.nlink !== BigInt(1)
+            || !samePath(canonicalDestination, destinationPath)
+            || !isStrictChild(destinationRoot, canonicalDestination)
+            || !fetchFileIdentitiesEqual(handleBefore, handleAfter)
+            || !fetchFileIdentitiesEqual(handleBefore, pathBefore)
+            || !fetchFileIdentitiesEqual(handleBefore, pathAfter)) {
+            throw new Error('identity mismatch');
+        }
+    } catch {
+        throw new RideCodexRuntimeFetchError(
+            'Codex runtime fetch destination handle does not match its authorized regular file.'
+        );
+    }
+}
+
+function fetchFileIdentitiesEqual(left: BigIntStats, right: BigIntStats): boolean {
+    return left.dev === right.dev
+        && left.ino === right.ino
+        && left.size === right.size
+        && left.birthtimeNs === right.birthtimeNs
+        && left.ctimeNs === right.ctimeNs;
 }
 
 function isRuntimeTarget(value: unknown): value is RuntimeTarget {
