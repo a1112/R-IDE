@@ -1,8 +1,9 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const appRoot = resolve(import.meta.dirname, '..');
 const reviewedVersion = '0.144.0';
@@ -83,7 +84,7 @@ function normalizeText(text) {
     return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/\n*$/, '\n');
 }
 
-function normalizeGenerated(source, destination) {
+export function normalizeGenerated(source, destination) {
     const sourceTypes = join(source, 'types');
     const sourceSchema = join(source, 'schema', schemaSourceName);
     if (!existsSync(sourceTypes) || !existsSync(sourceSchema)) fail('generator output is partial or malformed');
@@ -148,24 +149,24 @@ function sameTree(left, right) {
     return JSON.stringify(leftFiles) === JSON.stringify(rightFiles) && leftFiles.every(file => readFileSync(join(left, file)).equals(readFileSync(join(right, file))));
 }
 
-function publish(source) {
-    const staged = `${generatedRoot}.staged-${process.pid}`;
-    const backup = `${generatedRoot}.backup-${process.pid}`;
-    rmSync(staged, { recursive: true, force: true });
-    cpSync(source, staged, { recursive: true });
+export function publishImmutableFixture(source, target) {
+    const staged = `${target}.stage-${process.pid}-${randomUUID()}`;
     try {
-        if (existsSync(generatedRoot)) renameSync(generatedRoot, backup);
-        renameSync(staged, generatedRoot);
-        rmSync(backup, { recursive: true, force: true });
-    } catch (error) {
+        cpSync(source, staged, { recursive: true });
+        if (!existsSync(target)) {
+            renameSync(staged, target);
+            return 'published';
+        }
+        if (sameTree(staged, target)) return 'unchanged';
+        fail('existing reviewed fixture differs; a separate protocol-review change/version is required');
+    } finally {
         rmSync(staged, { recursive: true, force: true });
-        if (!existsSync(generatedRoot) && existsSync(backup)) renameSync(backup, generatedRoot);
-        throw error;
     }
 }
 
 function main() {
     const args = parseArgs(process.argv.slice(2));
+    if (args.mode === 'write' && !args.codex) fail('--write requires explicit --codex');
     if (!args.codex) {
         validateFixture();
         return;
@@ -175,7 +176,7 @@ function main() {
     try {
         if (args.mode === 'write') {
             validateMetadata(generated.normalized);
-            publish(generated.normalized);
+            publishImmutableFixture(generated.normalized, generatedRoot);
             validateFixture();
         } else {
             validateFixture();
@@ -186,9 +187,11 @@ function main() {
     }
 }
 
-try {
-    main();
-} catch (error) {
-    process.stderr.write(`${error.message}\n`);
-    process.exitCode = 1;
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+    try {
+        main();
+    } catch (error) {
+        process.stderr.write(`${error.message}\n`);
+        process.exitCode = 1;
+    }
 }
