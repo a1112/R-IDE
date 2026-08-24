@@ -4,6 +4,8 @@
  * SPDX-License-Identifier: MIT
  ********************************************************************************/
 
+import { createHash } from 'node:crypto';
+
 export const RIDE_CODEX_RUNTIME_VERSION = '0.144.0' as const;
 
 export type RuntimeTarget =
@@ -165,6 +167,22 @@ export function runtimeManifestEntryForTarget(target: RuntimeTarget): RideCodexR
         throw new Error('Codex runtime target is not present in the reviewed manifest.');
     }
     return runtime;
+}
+
+export function runtimeManifestEntryDigest(runtime: RideCodexRuntimeManifestEntry): string {
+    const canonical = JSON.stringify({
+        compressedBytes: runtime.compressedBytes,
+        entrypoint: runtime.entrypoint,
+        integrity: runtime.integrity,
+        layoutVersion: runtime.layoutVersion,
+        npmVersion: runtime.npmVersion,
+        package: runtime.package,
+        target: runtime.target,
+        unpackedBytes: runtime.unpackedBytes,
+        url: runtime.url,
+        version: runtime.version
+    });
+    return `sha256-${createHash('sha256').update(canonical, 'utf8').digest('hex')}`;
 }
 
 function requireDataRecord(value: unknown, expectedKeys: readonly string[]): Record<string, unknown> {

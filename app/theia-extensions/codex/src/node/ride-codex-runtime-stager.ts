@@ -4,16 +4,21 @@
  * SPDX-License-Identifier: MIT
  ********************************************************************************/
 
-import { constants as fsConstants, createReadStream, promises as fs } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { BigIntStats, constants as fsConstants, promises as fs } from 'node:fs';
+import { FileHandle } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve } from 'node:path';
-import { PassThrough, Transform } from 'node:stream';
+import { PassThrough, Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { createGunzip } from 'node:zlib';
 import { extract, Headers } from 'tar-stream';
 import {
+    createInstallAuthorizationContext,
     InstallAuthorization,
+    InstallAuthorizationContext,
     InstallAuthorizationValidator,
     RideCodexRuntimeFetcher,
+    RideCodexRuntimeFetchDestination,
     RideCodexRuntimeStagingFetcherLike
 } from './ride-codex-runtime-fetcher';
 import {
@@ -55,6 +60,17 @@ export interface StagedRuntime {
     readonly unpackedBytes: number;
     readonly layoutVersion: 1;
     readonly entrypoint: string;
+    readonly authorizationContext: InstallAuthorizationContext;
+    readonly stagingIdentity: RuntimeFilesystemIdentity;
+    revalidate(): Promise<void>;
+}
+
+export interface RuntimeFilesystemIdentity {
+    readonly dev: bigint;
+    readonly ino: bigint;
+    readonly size: bigint;
+    readonly birthtimeNs: bigint;
+    readonly ctimeNs: bigint;
 }
 
 export interface RideCodexRuntimeStagerOptions {
@@ -101,11 +117,13 @@ export class RideCodexRuntimeStager {
     }
 
     async stage(authorization: InstallAuthorization, target: RuntimeTarget): Promise<StagedRuntime> {
-        const capability = await this.fetcher.authorize(authorization);
         const runtime = runtimeManifestEntryForTarget(target);
+        const rootBoundary = await RuntimeRootBoundary.create(this.trustedRuntimeBase, this.runtimeRoot);
+        const authorizationContext = createInstallAuthorizationContext(runtime, rootBoundary.canonicalRoot);
+        const capability = await this.fetcher.authorize(authorization, authorizationContext);
         let stagingBoundary: RuntimeStagingBoundary | undefined;
+        let archiveHandle: FileHandle | undefined;
         try {
-            const rootBoundary = await RuntimeRootBoundary.create(this.trustedRuntimeBase, this.runtimeRoot);
             const capacity = await this.statfs(rootBoundary.canonicalRoot);
             if (availableBytes(capacity) < BigInt(requiredRuntimeStageBytes(runtime))) {
                 throw new RideCodexRuntimeStageError('Insufficient disk space to stage the managed Codex runtime.');
@@ -117,16 +135,37 @@ export class RideCodexRuntimeStager {
             const archive = join(stagingDirectory, 'runtime.tgz');
             requireStrictChild(stagingDirectory, archive);
             await stagingBoundary.verify();
-            await this.fetcher.fetchAuthorized(capability, runtime, archive, this.signal);
+            archiveHandle = await openNewOwnedFile(archive, stagingBoundary);
+            const destination: RideCodexRuntimeFetchDestination = Object.freeze({
+                path: archive,
+                canonicalRoot: rootBoundary.canonicalRoot,
+                handle: archiveHandle
+            });
+            await this.fetcher.fetchAuthorized(capability, runtime, destination, this.signal);
+            await archiveHandle.sync();
+            const archiveIdentity = filesystemIdentity(await archiveHandle.stat({ bigint: true }));
+            await archiveHandle.close();
+            archiveHandle = undefined;
             await stagingBoundary.verify();
-            await this.extractor.extract(archive, stagingDirectory, runtime);
+            const archiveReader = await openVerifiedFile(archive, stagingBoundary, archiveIdentity);
+            try {
+                await this.extractor.extract(
+                    Object.freeze({ path: archive, handle: archiveReader }),
+                    stagingDirectory,
+                    runtime,
+                    () => stagingBoundary!.verify()
+                );
+            } finally {
+                await archiveReader.close().catch(() => undefined);
+            }
             await stagingBoundary.verify();
-            const staged = await this.verifyStagedRuntime(stagingDirectory, runtime);
+            const staged = await this.verifyStagedRuntime(stagingBoundary, runtime, authorizationContext);
             await stagingBoundary.verify();
             await fs.rm(archive, { force: true });
             await stagingBoundary.verify();
             return staged;
         } catch (error) {
+            await archiveHandle?.close().catch(() => undefined);
             await stagingBoundary?.cleanup();
             if (error instanceof RideCodexRuntimeStageError) {
                 throw error;
@@ -136,18 +175,23 @@ export class RideCodexRuntimeStager {
     }
 
     private async verifyStagedRuntime(
-        stagingDirectory: string,
-        runtime: RideCodexRuntimeManifestEntry
+        stagingBoundary: RuntimeStagingBoundary,
+        runtime: RideCodexRuntimeManifestEntry,
+        authorizationContext: InstallAuthorizationContext
     ): Promise<StagedRuntime> {
+        const stagingDirectory = stagingBoundary.canonicalStaging;
+        await stagingBoundary.verify();
         const packageRoot = join(stagingDirectory, 'package');
         const vendorRoot = join(packageRoot, 'vendor', runtime.target);
         const manifestPath = join(vendorRoot, 'codex-package.json');
         const manifest = await readPackageManifest(manifestPath);
+        await stagingBoundary.verify();
         validatePackageManifest(manifest, runtime);
         const resourcesDirectory = join(vendorRoot, manifest.resourcesDir);
         const pathDirectory = join(vendorRoot, manifest.pathDir);
         await requireSafeDirectory(resourcesDirectory, vendorRoot);
         await requireSafeDirectory(pathDirectory, vendorRoot);
+        await stagingBoundary.verify();
 
         const executable = resolve(vendorRoot, runtime.entrypoint);
         requireStrictChild(vendorRoot, executable);
@@ -156,6 +200,7 @@ export class RideCodexRuntimeStager {
             throw new RideCodexRuntimeStageError('Codex native executable must be a regular file.');
         }
         const header = await readPrefix(executable, MAX_NATIVE_HEADER_BYTES);
+        await stagingBoundary.verify();
         const platform = platformForTarget(runtime.target);
         const binaryTargets = readNativeBinaryTargets(platform, header);
         if (!binaryTargets.includes(runtime.target)) {
@@ -176,6 +221,35 @@ export class RideCodexRuntimeStager {
         if (probeResult.version !== runtime.version) {
             throw new RideCodexRuntimeStageError('Codex staged runtime probe returned an incompatible version.');
         }
+        const packageIdentity = filesystemIdentity(await safeLstat(packageRoot, 'Codex package root is missing.'));
+        const resourcesIdentity = filesystemIdentity(await safeLstat(resourcesDirectory, 'Codex resources directory is missing.'));
+        const pathIdentity = filesystemIdentity(await safeLstat(pathDirectory, 'Codex path directory is missing.'));
+        const manifestIdentity = filesystemIdentity(await safeLstat(manifestPath, 'Codex package manifest is missing.'));
+        const executableIdentity = filesystemIdentity(await safeLstat(executable, 'Codex native executable is missing.'));
+        const revalidate = async (): Promise<void> => {
+            await stagingBoundary.verify();
+            await verifyDirectoryIdentity(
+                packageRoot, packageRoot, packageIdentity,
+                'Codex staged package root identity changed.'
+            );
+            await verifyDirectoryIdentity(
+                resourcesDirectory, resourcesDirectory, resourcesIdentity,
+                'Codex staged resources identity changed.'
+            );
+            await verifyDirectoryIdentity(
+                pathDirectory, pathDirectory, pathIdentity,
+                'Codex staged path directory identity changed.'
+            );
+            await verifyFileIdentity(
+                manifestPath, manifestIdentity, stagingDirectory,
+                'Codex staged package manifest identity changed.'
+            );
+            await verifyFileIdentity(
+                executable, executableIdentity, stagingDirectory,
+                'Codex staged executable identity changed.'
+            );
+            await stagingBoundary.verify();
+        };
         return Object.freeze({
             stagingDirectory,
             packageRoot,
@@ -190,23 +264,20 @@ export class RideCodexRuntimeStager {
             compressedBytes: runtime.compressedBytes,
             unpackedBytes: runtime.unpackedBytes,
             layoutVersion: runtime.layoutVersion,
-            entrypoint: runtime.entrypoint
+            entrypoint: runtime.entrypoint,
+            authorizationContext,
+            stagingIdentity: stagingBoundary.identity,
+            revalidate
         });
     }
 }
 
-type DirectoryStat = Awaited<ReturnType<typeof fs.lstat>>;
-
-interface DirectoryIdentity {
-    readonly dev: number | bigint;
-    readonly ino: number | bigint;
-    readonly birthtimeMs: number | bigint;
-}
+type DirectoryStat = BigIntStats;
 
 class RuntimeRootBoundary {
     private constructor(
         readonly canonicalRoot: string,
-        private readonly rootIdentity: DirectoryIdentity
+        private readonly rootIdentity: RuntimeFilesystemIdentity
     ) { }
 
     static async create(trustedRuntimeBase: string, runtimeRoot: string): Promise<RuntimeRootBoundary> {
@@ -241,7 +312,7 @@ class RuntimeRootBoundary {
         const canonicalRoot = current;
         const rootStat = await safeLstat(canonicalRoot, 'Codex runtime root is missing.');
         requireRegularDirectory(rootStat, 'Codex runtime root is not a safe extension-owned directory.');
-        return new RuntimeRootBoundary(canonicalRoot, directoryIdentity(rootStat));
+        return new RuntimeRootBoundary(canonicalRoot, filesystemIdentity(rootStat));
     }
 
     async verify(): Promise<void> {
@@ -263,7 +334,7 @@ class RuntimeRootBoundary {
         if (!samePath(canonicalStaging, realStaging) || !isStrictChild(this.canonicalRoot, realStaging)) {
             throw new RideCodexRuntimeStageError('Codex runtime staging directory escaped its canonical root.');
         }
-        return new RuntimeStagingBoundary(this, canonicalStaging, directoryIdentity(stagingStat));
+        return new RuntimeStagingBoundary(this, canonicalStaging, filesystemIdentity(stagingStat));
     }
 }
 
@@ -271,8 +342,12 @@ class RuntimeStagingBoundary {
     constructor(
         private readonly root: RuntimeRootBoundary,
         readonly canonicalStaging: string,
-        private readonly stagingIdentity: DirectoryIdentity
+        private readonly stagingIdentity: RuntimeFilesystemIdentity
     ) { }
+
+    get identity(): RuntimeFilesystemIdentity {
+        return this.stagingIdentity;
+    }
 
     async verify(): Promise<void> {
         await this.root.verify();
@@ -286,12 +361,44 @@ class RuntimeStagingBoundary {
     }
 
     async cleanup(): Promise<void> {
-        try {
-            await this.verify();
-        } catch {
-            return;
+        await this.root.verify();
+        let quarantine: string | undefined;
+        for (let attempt = 0; attempt < 16; attempt += 1) {
+            const candidate = join(this.root.canonicalRoot, `.quarantine-${randomUUID()}`);
+            requireStrictChild(this.root.canonicalRoot, candidate);
+            try {
+                await fs.rename(this.canonicalStaging, candidate);
+                quarantine = candidate;
+                break;
+            } catch (error) {
+                const code = (error as NodeJS.ErrnoException).code;
+                if (code === 'ENOENT') {
+                    return;
+                }
+                if ((code === 'EPERM' || code === 'EBUSY' || code === 'EACCES') && attempt < 15) {
+                    await new Promise<void>(resolveImmediate => setTimeout(resolveImmediate, 5));
+                    continue;
+                }
+                if (code !== 'EEXIST') {
+                    throw new RideCodexRuntimeStageError('Codex runtime staging cleanup could not be quarantined safely.');
+                }
+            }
         }
-        await fs.rm(this.canonicalStaging, { recursive: true, force: true }).catch(() => undefined);
+        if (!quarantine) {
+            throw new RideCodexRuntimeStageError('Codex runtime staging cleanup quarantine names were exhausted.');
+        }
+        const movedStat = await safeLstat(quarantine, 'Codex runtime cleanup quarantine is missing.');
+        const movedCanonical = await safeRealpath(quarantine, 'Codex runtime cleanup quarantine could not be resolved safely.');
+        if (!movedStat.isDirectory() || movedStat.isSymbolicLink()
+            || !samePath(movedCanonical, quarantine)
+            || !runtimeDirectoryIdentitiesEqual(filesystemIdentity(movedStat), this.stagingIdentity)) {
+            throw new RideCodexRuntimeStageError(
+                'Codex runtime cleanup quarantined a replaced object and left it isolated for safe diagnosis.'
+            );
+        }
+        await this.root.verify();
+        await fs.rm(quarantine, { recursive: true, force: true });
+        await this.root.verify();
     }
 }
 
@@ -301,8 +408,34 @@ function requireRegularDirectory(stat: DirectoryStat, message: string): void {
     }
 }
 
-function directoryIdentity(stat: DirectoryStat): DirectoryIdentity {
-    return Object.freeze({ dev: stat.dev, ino: stat.ino, birthtimeMs: stat.birthtimeMs });
+function filesystemIdentity(stat: BigIntStats): RuntimeFilesystemIdentity {
+    return Object.freeze({
+        dev: stat.dev,
+        ino: stat.ino,
+        size: stat.size,
+        birthtimeNs: stat.birthtimeNs,
+        ctimeNs: stat.ctimeNs
+    });
+}
+
+export function runtimeFilesystemIdentitiesEqual(
+    left: RuntimeFilesystemIdentity,
+    right: RuntimeFilesystemIdentity
+): boolean {
+    return left.dev === right.dev
+        && left.ino === right.ino
+        && left.size === right.size
+        && left.birthtimeNs === right.birthtimeNs
+        && left.ctimeNs === right.ctimeNs;
+}
+
+function runtimeDirectoryIdentitiesEqual(
+    left: RuntimeFilesystemIdentity,
+    right: RuntimeFilesystemIdentity
+): boolean {
+    return left.dev === right.dev
+        && left.ino === right.ino
+        && left.birthtimeNs === right.birthtimeNs;
 }
 
 async function safeRealpath(path: string, message: string): Promise<string> {
@@ -316,18 +449,80 @@ async function safeRealpath(path: string, message: string): Promise<string> {
 async function verifyDirectoryIdentity(
     path: string,
     expectedCanonicalPath: string,
-    expectedIdentity: DirectoryIdentity,
+    expectedIdentity: RuntimeFilesystemIdentity,
     message: string
 ): Promise<void> {
     const stat = await safeLstat(path, message);
     requireRegularDirectory(stat, message);
     const canonical = await safeRealpath(path, message);
-    const actualIdentity = directoryIdentity(stat);
+    const actualIdentity = filesystemIdentity(stat);
     if (!samePath(canonical, expectedCanonicalPath)
-        || actualIdentity.dev !== expectedIdentity.dev
-        || actualIdentity.ino !== expectedIdentity.ino
-        || actualIdentity.birthtimeMs !== expectedIdentity.birthtimeMs) {
+        || !runtimeDirectoryIdentitiesEqual(actualIdentity, expectedIdentity)) {
         throw new RideCodexRuntimeStageError(message);
+    }
+}
+
+async function verifyFileIdentity(
+    path: string,
+    expectedIdentity: RuntimeFilesystemIdentity,
+    expectedParent: string,
+    message: string
+): Promise<void> {
+    const stat = await safeLstat(path, message);
+    const canonical = await safeRealpath(path, message);
+    if (!stat.isFile() || stat.isSymbolicLink()
+        || !samePath(canonical, path)
+        || !isStrictChild(expectedParent, canonical)
+        || !runtimeFilesystemIdentitiesEqual(filesystemIdentity(stat), expectedIdentity)) {
+        throw new RideCodexRuntimeStageError(message);
+    }
+}
+
+async function openNewOwnedFile(path: string, boundary: RuntimeStagingBoundary): Promise<FileHandle> {
+    await boundary.verify();
+    const flags = fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL
+        | (fsConstants.O_NOFOLLOW ?? 0);
+    const handle = await fs.open(path, flags, 0o600);
+    try {
+        const stat = await handle.stat({ bigint: true });
+        if (!stat.isFile()) {
+            throw new RideCodexRuntimeStageError('Codex runtime archive destination is not a regular file.');
+        }
+        const canonical = await safeRealpath(path, 'Codex runtime archive destination could not be resolved safely.');
+        if (!samePath(canonical, path) || !isStrictChild(boundary.canonicalStaging, canonical)) {
+            throw new RideCodexRuntimeStageError('Codex runtime archive destination escaped its staging boundary.');
+        }
+        await boundary.verify();
+        return handle;
+    } catch (error) {
+        await handle.close().catch(() => undefined);
+        throw error;
+    }
+}
+
+async function openVerifiedFile(
+    path: string,
+    boundary: RuntimeStagingBoundary,
+    expectedIdentity: RuntimeFilesystemIdentity
+): Promise<FileHandle> {
+    await boundary.verify();
+    const handle = await fs.open(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+    try {
+        const openedStat = await handle.stat({ bigint: true });
+        const pathStat = await safeLstat(path, 'Codex runtime archive is missing.');
+        const canonical = await safeRealpath(path, 'Codex runtime archive could not be resolved safely.');
+        if (!openedStat.isFile() || !pathStat.isFile() || pathStat.isSymbolicLink()
+            || !runtimeFilesystemIdentitiesEqual(filesystemIdentity(openedStat), expectedIdentity)
+            || !runtimeFilesystemIdentitiesEqual(filesystemIdentity(pathStat), expectedIdentity)
+            || !samePath(canonical, path)
+            || !isStrictChild(boundary.canonicalStaging, canonical)) {
+            throw new RideCodexRuntimeStageError('Codex runtime archive identity changed before extraction.');
+        }
+        await boundary.verify();
+        return handle;
+    } catch (error) {
+        await handle.close().catch(() => undefined);
+        throw error;
     }
 }
 
@@ -343,6 +538,11 @@ export interface RideCodexRuntimeArchiveExtractorOptions {
     readonly maxEntries?: number;
 }
 
+interface RuntimeArchiveSource {
+    readonly path: string;
+    readonly handle: FileHandle;
+}
+
 export class RideCodexRuntimeArchiveExtractor {
     private readonly maxEntries: number;
 
@@ -351,9 +551,10 @@ export class RideCodexRuntimeArchiveExtractor {
     }
 
     async extract(
-        archive: string,
+        archive: string | RuntimeArchiveSource,
         stagingDirectory: string,
-        runtime: RideCodexRuntimeManifestEntry
+        runtime: RideCodexRuntimeManifestEntry,
+        verifyStaging: () => Promise<void> = async () => undefined
     ): Promise<void> {
         const stagingRoot = resolve(stagingDirectory);
         const seenEntries = new Set<string>();
@@ -362,9 +563,11 @@ export class RideCodexRuntimeArchiveExtractor {
         let unpackedBytes = 0;
         const tarExtractor = extract({ allowUnknownFormat: false });
         tarExtractor.on('entry', (header, entry, next) => {
-            const absorbParentDestroyError = (): void => undefined;
-            entry.on('error', absorbParentDestroyError);
-            entry.once('close', () => entry.removeListener('error', absorbParentDestroyError));
+            let firstEntryError: Error | undefined;
+            const recordEntryError = (error: Error): void => {
+                firstEntryError ??= error;
+            };
+            entry.on('error', recordEntryError);
             void this.processEntry(
                 header,
                 entry,
@@ -384,12 +587,24 @@ export class RideCodexRuntimeArchiveExtractor {
                         throw new RideCodexRuntimeStageError('Codex runtime archive exceeded the unpacked byte limit.');
                     }
                     unpackedBytes += declaredSize;
+                },
+                verifyStaging
+            ).then(async () => {
+                await new Promise<void>(resolveEntryTurn => {
+                    setImmediate(() => setImmediate(resolveEntryTurn));
+                });
+                if (firstEntryError) {
+                    throw new RideCodexRuntimeStageError('Codex runtime archive entry stream failed safely.');
                 }
-            ).then(() => next(), error => next(error));
+            }).finally(() => {
+                entry.removeListener('error', recordEntryError);
+            }).then(() => next(), error => next(error));
         });
         try {
             await pipeline(
-                createReadStream(archive),
+                typeof archive === 'string'
+                    ? (await import('node:fs')).createReadStream(archive)
+                    : Readable.from(readFileHandleChunks(archive.handle)),
                 createGunzip(),
                 new TarHeaderGuard(this.maxEntries, maxRawTarBytes(runtime.unpackedBytes)),
                 tarExtractor
@@ -438,7 +653,8 @@ export class RideCodexRuntimeArchiveExtractor {
         seenEntries: Set<string>,
         canonicalNames: Map<string, string>,
         countEntry: () => void,
-        countDeclaredBytes: (size: number) => void
+        countDeclaredBytes: (size: number) => void,
+        verifyStaging: () => Promise<void>
     ): Promise<void> {
         countEntry();
         const normalized = this.validateEntryPath(header.name, runtime.target);
@@ -457,20 +673,38 @@ export class RideCodexRuntimeArchiveExtractor {
                 entry.resume();
                 throw new RideCodexRuntimeStageError('Codex runtime archive directory has unexpected content.');
             }
-            await ensureSafeDirectory(stagingRoot, normalized.split('/'));
+            await ensureSafeDirectory(stagingRoot, normalized.split('/'), verifyStaging);
             await consumeEntry(entry, 0);
+            await verifyStaging();
             return;
         }
-        await ensureSafeDirectory(stagingRoot, normalized.split('/').slice(0, -1));
+        await ensureSafeDirectory(stagingRoot, normalized.split('/').slice(0, -1), verifyStaging);
+        await verifyStaging();
         const flags = fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL
             | (fsConstants.O_NOFOLLOW ?? 0);
         let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
         try {
             handle = await fs.open(output, flags, 0o600);
-            const openedStat = await handle.stat();
+            const openedStat = await handle.stat({ bigint: true });
             if (!openedStat.isFile()) {
                 throw new RideCodexRuntimeStageError('Codex runtime archive output is not a regular file.');
             }
+            const outputCanonical = await safeRealpath(
+                output,
+                'Codex runtime archive output could not be resolved safely.'
+            );
+            const outputPathStat = await safeLstat(output, 'Codex runtime archive output is missing.');
+            if (!samePath(outputCanonical, output)
+                || !isStrictChild(stagingRoot, outputCanonical)
+                || !outputPathStat.isFile()
+                || outputPathStat.isSymbolicLink()
+                || !runtimeFilesystemIdentitiesEqual(
+                    filesystemIdentity(openedStat),
+                    filesystemIdentity(outputPathStat)
+                )) {
+                throw new RideCodexRuntimeStageError('Codex runtime archive output escaped its staging boundary.');
+            }
+            await verifyStaging();
             let actualBytes = 0;
             let position = 0;
             for await (const chunk of entry) {
@@ -498,6 +732,8 @@ export class RideCodexRuntimeArchiveExtractor {
                 throw new RideCodexRuntimeStageError('Codex runtime archive entry size did not match its declaration.');
             }
             await handle.chmod(0o600);
+            await handle.sync();
+            await verifyStaging();
         } finally {
             await handle?.close().catch(() => undefined);
         }
@@ -622,6 +858,19 @@ function validateTarTextField(field: Buffer): void {
     }
 }
 
+async function* readFileHandleChunks(handle: FileHandle): AsyncGenerator<Buffer> {
+    let position = 0;
+    while (true) {
+        const buffer = Buffer.allocUnsafe(64 * 1024);
+        const { bytesRead } = await handle.read(buffer, 0, buffer.length, position);
+        if (bytesRead === 0) {
+            return;
+        }
+        position += bytesRead;
+        yield buffer.subarray(0, bytesRead);
+    }
+}
+
 export function requiredRuntimeStageBytes(runtime: RideCodexRuntimeManifestEntry): number {
     const required = runtime.compressedBytes + runtime.unpackedBytes + RIDE_CODEX_RUNTIME_STAGE_SAFETY_MARGIN_BYTES;
     if (!Number.isSafeInteger(required)) {
@@ -733,9 +982,9 @@ async function readPrefix(path: string, maxBytes: number): Promise<Buffer> {
     }
 }
 
-async function safeLstat(path: string, message: string): Promise<Awaited<ReturnType<typeof fs.lstat>>> {
+async function safeLstat(path: string, message: string): Promise<BigIntStats> {
     try {
-        return await fs.lstat(path);
+        return await fs.lstat(path, { bigint: true });
     } catch {
         throw new RideCodexRuntimeStageError(message);
     }
@@ -770,9 +1019,14 @@ function registerArchiveName(
     }
 }
 
-async function ensureSafeDirectory(root: string, segments: readonly string[]): Promise<void> {
+async function ensureSafeDirectory(
+    root: string,
+    segments: readonly string[],
+    verifyStaging: () => Promise<void> = async () => undefined
+): Promise<void> {
     let current = root;
     for (const segment of segments) {
+        await verifyStaging();
         current = resolve(current, segment);
         requireStrictChild(root, current);
         try {
@@ -782,11 +1036,16 @@ async function ensureSafeDirectory(root: string, segments: readonly string[]): P
                 throw error;
             }
         }
-        const stat = await fs.lstat(current);
+        const stat = await fs.lstat(current, { bigint: true });
         if (!stat.isDirectory() || stat.isSymbolicLink()) {
             throw new RideCodexRuntimeStageError('Codex runtime archive directory encountered a symlink or non-directory.');
         }
         await fs.chmod(current, 0o700);
+        const canonical = await safeRealpath(current, 'Codex runtime archive directory could not be resolved safely.');
+        if (!samePath(canonical, current) || !isStrictChild(root, canonical)) {
+            throw new RideCodexRuntimeStageError('Codex runtime archive directory escaped its staging boundary.');
+        }
+        await verifyStaging();
     }
 }
 

@@ -6,16 +6,28 @@
 
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { createWriteStream } from 'node:fs';
-import { rm } from 'node:fs/promises';
+import { FileHandle, realpath, rm } from 'node:fs/promises';
 import { request as httpsRequest } from 'node:https';
-import { Readable, Transform } from 'node:stream';
+import { dirname, isAbsolute, relative, resolve as resolvePath } from 'node:path';
+import { Readable, Transform, Writable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
-import { RideCodexRuntimeManifestEntry } from './ride-codex-runtime-manifest';
+import {
+    RideCodexRuntimeManifestEntry,
+    RuntimeTarget,
+    runtimeManifestEntryDigest
+} from './ride-codex-runtime-manifest';
 
 export type InstallAuthorization = Readonly<Record<PropertyKey, unknown>>;
 
+export interface InstallAuthorizationContext {
+    readonly target: RuntimeTarget;
+    readonly manifestDigest: string;
+    readonly canonicalRoot: string;
+}
+
 export type InstallAuthorizationValidator = (
-    authorization: InstallAuthorization
+    authorization: InstallAuthorization,
+    context: InstallAuthorizationContext
 ) => boolean | Promise<boolean>;
 
 const RUNTIME_FETCH_CAPABILITY_BRAND: unique symbol = Symbol('ride-codex-runtime-fetch-capability');
@@ -44,12 +56,23 @@ export interface RideCodexRuntimeFetchResult {
     readonly integrity: string;
 }
 
+export interface RideCodexRuntimeFetchDestination {
+    readonly path: string;
+    readonly canonicalRoot: string;
+    readonly handle: FileHandle;
+}
+
+export type RuntimeFetchDestination = string | RideCodexRuntimeFetchDestination;
+
 export interface RideCodexRuntimeStagingFetcherLike {
-    authorize(authorization: InstallAuthorization): Promise<RideCodexRuntimeFetchCapability>;
+    authorize(
+        authorization: InstallAuthorization,
+        context: InstallAuthorizationContext
+    ): Promise<RideCodexRuntimeFetchCapability>;
     fetchAuthorized(
         capability: RideCodexRuntimeFetchCapability,
         runtime: RideCodexRuntimeManifestEntry,
-        destination: string,
+        destination: RuntimeFetchDestination,
         signal?: AbortSignal
     ): Promise<RideCodexRuntimeFetchResult>;
 }
@@ -92,7 +115,7 @@ export class RideCodexRuntimeFetcher implements RideCodexRuntimeFetcherLike {
     private readonly idleTimeoutMs: number;
     private readonly overallTimeoutMs: number;
     private readonly maxRedirects: number;
-    private readonly capabilities = new WeakSet<object>();
+    private readonly capabilities = new WeakMap<object, InstallAuthorizationContext>();
 
     constructor(options: RideCodexRuntimeFetcherOptions) {
         this.authorizationValidator = options.authorizationValidator;
@@ -109,32 +132,48 @@ export class RideCodexRuntimeFetcher implements RideCodexRuntimeFetcherLike {
         destination: string,
         signal?: AbortSignal
     ): Promise<RideCodexRuntimeFetchResult> {
-        const capability = await this.authorize(authorization);
+        const canonicalRoot = await realpath(dirname(resolvePath(destination))).catch(() => {
+            throw new RideCodexRuntimeFetchError('Codex runtime fetch destination root is unavailable.');
+        });
+        const capability = await this.authorize(
+            authorization,
+            createInstallAuthorizationContext(runtime, canonicalRoot)
+        );
         return this.fetchAuthorized(capability, runtime, destination, signal);
     }
 
-    async authorize(authorization: InstallAuthorization): Promise<RideCodexRuntimeFetchCapability> {
-        await validateInstallAuthorization(authorization, this.authorizationValidator);
+    async authorize(
+        authorization: InstallAuthorization,
+        context: InstallAuthorizationContext
+    ): Promise<RideCodexRuntimeFetchCapability> {
+        const normalizedContext = normalizeInstallAuthorizationContext(context);
+        await validateInstallAuthorization(authorization, this.authorizationValidator, normalizedContext);
         const capability = Object.freeze(Object.create(null)) as RideCodexRuntimeFetchCapability;
-        this.capabilities.add(capability);
+        this.capabilities.set(capability, normalizedContext);
         return capability;
     }
 
     async fetchAuthorized(
         capability: RideCodexRuntimeFetchCapability,
         runtime: RideCodexRuntimeManifestEntry,
-        destination: string,
+        destination: RuntimeFetchDestination,
         signal?: AbortSignal
     ): Promise<RideCodexRuntimeFetchResult> {
-        if (typeof capability !== 'object' || capability === null || !this.capabilities.delete(capability)) {
+        if (typeof capability !== 'object' || capability === null) {
             throw new RideCodexRuntimeFetchError('Codex runtime fetch authorization capability is invalid or already used.');
         }
+        const context = this.capabilities.get(capability);
+        if (!context) {
+            throw new RideCodexRuntimeFetchError('Codex runtime fetch authorization capability is invalid or already used.');
+        }
+        this.capabilities.delete(capability);
+        validateAuthorizedFetchContext(context, runtime, destination);
         return this.fetchTrusted(runtime, destination, signal);
     }
 
     private async fetchTrusted(
         runtime: RideCodexRuntimeManifestEntry,
-        destination: string,
+        destination: RuntimeFetchDestination,
         signal?: AbortSignal
     ): Promise<RideCodexRuntimeFetchResult> {
         const initialUrl = requireAllowedRuntimeUrl(runtime.url, true);
@@ -169,7 +208,9 @@ export class RideCodexRuntimeFetcher implements RideCodexRuntimeFetcherLike {
             return Object.freeze(result);
         } catch (error) {
             response?.body.destroy();
-            await rm(destination, { force: true }).catch(() => undefined);
+            if (typeof destination === 'string') {
+                await rm(destination, { force: true }).catch(() => undefined);
+            }
             if (error instanceof RideCodexRuntimeFetchError) {
                 throw error;
             }
@@ -224,7 +265,7 @@ export class RideCodexRuntimeFetcher implements RideCodexRuntimeFetcherLike {
 
     private async streamAndVerify(
         body: Readable,
-        destination: string,
+        destination: RuntimeFetchDestination,
         runtime: RideCodexRuntimeManifestEntry,
         signal: AbortSignal,
         didOverallTimeout: () => boolean
@@ -260,7 +301,9 @@ export class RideCodexRuntimeFetcher implements RideCodexRuntimeFetcherLike {
             await pipeline(
                 body,
                 verifier,
-                createWriteStream(destination, { flags: 'wx', mode: 0o600 }),
+                typeof destination === 'string'
+                    ? createWriteStream(destination, { flags: 'wx', mode: 0o600 })
+                    : fileHandleWritable(destination.handle),
                 { signal }
             );
         } catch (error) {
@@ -288,9 +331,37 @@ export class RideCodexRuntimeFetcher implements RideCodexRuntimeFetcherLike {
     }
 }
 
+function fileHandleWritable(handle: FileHandle): Writable {
+    let position = 0;
+    return new Writable({
+        write(chunk: Buffer | string, encoding, callback): void {
+            const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, encoding);
+            writeAll(handle, buffer, position).then(
+                () => {
+                    position += buffer.length;
+                    callback();
+                },
+                error => callback(error as Error)
+            );
+        }
+    });
+}
+
+async function writeAll(handle: FileHandle, buffer: Buffer, position: number): Promise<void> {
+    let offset = 0;
+    while (offset < buffer.length) {
+        const { bytesWritten } = await handle.write(buffer, offset, buffer.length - offset, position + offset);
+        if (bytesWritten <= 0) {
+            throw new RideCodexRuntimeFetchError('Codex runtime download could not be written safely.');
+        }
+        offset += bytesWritten;
+    }
+}
+
 export async function validateInstallAuthorization(
     authorization: InstallAuthorization,
-    validator: InstallAuthorizationValidator | undefined
+    validator: InstallAuthorizationValidator | undefined,
+    context: InstallAuthorizationContext
 ): Promise<void> {
     let keys: readonly PropertyKey[];
     try {
@@ -306,13 +377,92 @@ export async function validateInstallAuthorization(
     }
     let valid = false;
     try {
-        valid = await validator(authorization);
+        valid = await validator(authorization, context);
     } catch {
         valid = false;
     }
     if (valid !== true) {
         throw new RideCodexRuntimeFetchError('Codex runtime install authorization is invalid.');
     }
+}
+
+export function createInstallAuthorizationContext(
+    runtime: RideCodexRuntimeManifestEntry,
+    canonicalRoot: string
+): InstallAuthorizationContext {
+    return normalizeInstallAuthorizationContext(Object.freeze({
+        target: runtime.target,
+        manifestDigest: runtimeManifestEntryDigest(runtime),
+        canonicalRoot
+    }));
+}
+
+function normalizeInstallAuthorizationContext(context: InstallAuthorizationContext): InstallAuthorizationContext {
+    if (typeof context !== 'object' || context === null
+        || !isRuntimeTarget(context.target)
+        || typeof context.manifestDigest !== 'string'
+        || !/^sha256-[a-f0-9]{64}$/.test(context.manifestDigest)
+        || typeof context.canonicalRoot !== 'string'
+        || !isAbsolute(context.canonicalRoot)) {
+        throw new RideCodexRuntimeFetchError('Codex runtime install authorization context is invalid.');
+    }
+    const canonicalRoot = resolvePath(context.canonicalRoot);
+    if (!samePath(canonicalRoot, context.canonicalRoot)) {
+        throw new RideCodexRuntimeFetchError('Codex runtime install authorization root is not canonical.');
+    }
+    return Object.freeze({
+        target: context.target,
+        manifestDigest: context.manifestDigest,
+        canonicalRoot
+    });
+}
+
+function validateAuthorizedFetchContext(
+    context: InstallAuthorizationContext,
+    runtime: RideCodexRuntimeManifestEntry,
+    destination: RuntimeFetchDestination
+): void {
+    const destinationPath = resolvePath(typeof destination === 'string' ? destination : destination.path);
+    const destinationRoot = resolvePath(
+        typeof destination === 'string' ? context.canonicalRoot : destination.canonicalRoot
+    );
+    if (!safeStringEqual(context.target, runtime.target)
+        || !safeStringEqual(context.manifestDigest, runtimeManifestEntryDigest(runtime))
+        || !safeStringEqual(normalizePathForComparison(context.canonicalRoot), normalizePathForComparison(destinationRoot))
+        || !isStrictChild(destinationRoot, destinationPath)
+        || (typeof destination !== 'string'
+            && (!destination.handle || !Number.isSafeInteger(destination.handle.fd)))) {
+        throw new RideCodexRuntimeFetchError('Codex runtime fetch does not match its authorized install context.');
+    }
+}
+
+function isRuntimeTarget(value: unknown): value is RuntimeTarget {
+    return value === 'x86_64-pc-windows-msvc'
+        || value === 'aarch64-pc-windows-msvc'
+        || value === 'x86_64-apple-darwin'
+        || value === 'aarch64-apple-darwin'
+        || value === 'x86_64-unknown-linux-musl'
+        || value === 'aarch64-unknown-linux-musl';
+}
+
+function safeStringEqual(left: string, right: string): boolean {
+    const leftDigest = createHash('sha256').update(left, 'utf8').digest();
+    const rightDigest = createHash('sha256').update(right, 'utf8').digest();
+    return timingSafeEqual(leftDigest, rightDigest);
+}
+
+function normalizePathForComparison(path: string): string {
+    const normalized = resolvePath(path);
+    return process.platform === 'win32' ? normalized.toLocaleLowerCase('en-US') : normalized;
+}
+
+function samePath(left: string, right: string): boolean {
+    return normalizePathForComparison(left) === normalizePathForComparison(right);
+}
+
+function isStrictChild(parent: string, child: string): boolean {
+    const childRelative = relative(parent, child);
+    return childRelative !== '' && !childRelative.startsWith('..') && !isAbsolute(childRelative);
 }
 
 class NodeHttpsRequester implements RideCodexHttpsRequester {

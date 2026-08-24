@@ -6,7 +6,9 @@
 
 import { strict as assert } from 'node:assert';
 import { createHash } from 'node:crypto';
-import { lstat, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { EventEmitter } from 'node:events';
+import { promises as fsPromises } from 'node:fs';
+import { lstat, mkdir, mkdtemp, open, readFile, realpath, rename, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve } from 'node:path';
 import { Readable } from 'node:stream';
@@ -16,14 +18,19 @@ import { Headers, pack } from 'tar-stream';
 import {
     parseRideCodexRuntimeManifest,
     RIDE_CODEX_RUNTIME_MANIFEST,
-    RideCodexRuntimeManifestEntry
+    RideCodexRuntimeManifestEntry,
+    runtimeManifestEntryDigest
 } from '../src/node/ride-codex-runtime-manifest';
 import {
+    createInstallAuthorizationContext,
+    InstallAuthorizationContext,
     RideCodexHttpsRequest,
     RideCodexHttpsRequester,
     RideCodexHttpsResponse,
     RideCodexRuntimeFetchCapability,
+    RideCodexRuntimeFetchDestination,
     RideCodexRuntimeFetcher,
+    RuntimeFetchDestination,
     validateInstallAuthorization
 } from '../src/node/ride-codex-runtime-fetcher';
 import {
@@ -31,7 +38,9 @@ import {
     requiredRuntimeStageBytes,
     RIDE_CODEX_RUNTIME_STAGE_SAFETY_MARGIN_BYTES,
     RideCodexRuntimeArchiveExtractor,
-    RideCodexRuntimeStager
+    RideCodexRuntimeStager,
+    RuntimeFilesystemIdentity,
+    runtimeFilesystemIdentitiesEqual
 } from '../src/node/ride-codex-runtime-stager';
 import { RideCodexRuntimeProbeLike } from '../src/node/ride-codex-runtime-probe';
 
@@ -126,12 +135,13 @@ test('manifest parsing rejects duplicate, mutable, or unsafe runtime metadata', 
 const AUTHORIZATION = Object.freeze({ consent: Symbol('install-consent') }) as InstallAuthorization;
 
 test('staging rejects missing or invalid authorization before statfs or network access', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ride-codex-invalid-authorization-'));
     let validations = 0;
     let statfsCalls = 0;
     let fetchCalls = 0;
     const stager = new RideCodexRuntimeStager({
-        trustedRuntimeBase: process.cwd(),
-        runtimeRoot: resolve('runtime-root-must-not-be-touched'),
+        trustedRuntimeBase: root,
+        runtimeRoot: join(root, 'runtime'),
         authorizationValidator: async authorization => {
             validations += 1;
             return authorization === AUTHORIZATION;
@@ -141,11 +151,11 @@ test('staging rejects missing or invalid authorization before statfs or network 
             return { bsize: 4096, bavail: 1_000_000 };
         },
         fetcher: {
-            authorize: async authorization => {
+            authorize: async (authorization, context) => {
                 await validateInstallAuthorization(authorization, async candidate => {
                     validations += 1;
                     return candidate === AUTHORIZATION;
-                });
+                }, context);
                 return authorization as RideCodexRuntimeFetchCapability;
             },
             fetchAuthorized: async () => {
@@ -155,15 +165,19 @@ test('staging rejects missing or invalid authorization before statfs or network 
         }
     });
 
-    for (const authorization of [undefined, null, {}, Object.freeze({ wrong: true })]) {
-        await assert.rejects(
-            stager.stage(authorization as InstallAuthorization, 'x86_64-pc-windows-msvc'),
-            /authorization/i
-        );
+    try {
+        for (const authorization of [undefined, null, {}, Object.freeze({ wrong: true })]) {
+            await assert.rejects(
+                stager.stage(authorization as InstallAuthorization, 'x86_64-pc-windows-msvc'),
+                /authorization/i
+            );
+        }
+        assert.equal(validations, 1);
+        assert.equal(statfsCalls, 0);
+        assert.equal(fetchCalls, 0);
+    } finally {
+        await rm(root, { recursive: true, force: true });
     }
-    assert.equal(validations, 1);
-    assert.equal(statfsCalls, 0);
-    assert.equal(fetchCalls, 0);
 });
 
 test('staging checks Node statfs capacity before creating a staging directory or fetching', async () => {
@@ -184,8 +198,8 @@ test('staging checks Node statfs capacity before creating a staging directory or
                 bavail: requiredRuntimeStageBytes(entry) - 1
             }),
             fetcher: {
-                authorize: async authorization => {
-                    await validateInstallAuthorization(authorization, candidate => candidate === AUTHORIZATION);
+                authorize: async (authorization, context) => {
+                    await validateInstallAuthorization(authorization, candidate => candidate === AUTHORIZATION, context);
                     return authorization as RideCodexRuntimeFetchCapability;
                 },
                 fetchAuthorized: async () => {
@@ -223,6 +237,14 @@ class ScriptedRequester implements RideCodexHttpsRequester {
 
 function sha512Integrity(bytes: Uint8Array): string {
     return `sha512-${createHash('sha512').update(bytes).digest('base64')}`;
+}
+
+async function writeFetchDestination(destination: RuntimeFetchDestination, bytes: Uint8Array): Promise<void> {
+    if (typeof destination === 'string') {
+        await writeFile(destination, bytes, { flag: 'wx', mode: 0o600 });
+        return;
+    }
+    await destination.handle.writeFile(bytes);
 }
 
 function fetchEntry(bytes: Uint8Array, overrides: Partial<RideCodexRuntimeManifestEntry> = {}): RideCodexRuntimeManifestEntry {
@@ -268,15 +290,18 @@ test('fetcher streams an exact response to disk and verifies byte count and SHA-
     }
 });
 
-test('fetch authorization capability is instance-bound, unforgeable, and consumed exactly once', async () => {
+test('fetch authorization capability is context-bound, instance-bound, unforgeable, and consumed exactly once', async () => {
     const root = await mkdtemp(join(tmpdir(), 'ride-codex-fetch-capability-'));
+    const otherRoot = await mkdtemp(join(tmpdir(), 'ride-codex-fetch-capability-other-'));
     const bytes = Buffer.from('one-shot capability');
     const requester = new ScriptedRequester([response(Readable.from([bytes]))]);
     let validations = 0;
     let externalAuthorizationConsumed = false;
+    const validatedContexts: InstallAuthorizationContext[] = [];
     const first = new RideCodexRuntimeFetcher({
-        authorizationValidator: authorization => {
+        authorizationValidator: (authorization, context) => {
             validations += 1;
+            validatedContexts.push(context);
             if (externalAuthorizationConsumed || authorization !== AUTHORIZATION) {
                 return false;
             }
@@ -290,28 +315,147 @@ test('fetch authorization capability is instance-bound, unforgeable, and consume
         requester: new ScriptedRequester([])
     });
     const runtime = fetchEntry(bytes);
-    const capability = await first.authorize(AUTHORIZATION);
+    const context = createInstallAuthorizationContext(runtime, await realpath(root));
+    const capability = await first.authorize(AUTHORIZATION, context);
     const forged = Object.freeze(Object.create(null)) as RideCodexRuntimeFetchCapability;
+    const destinationPath = join(root, 'runtime.tgz');
+    const destinationHandle = await open(destinationPath, 'wx+', 0o600);
+    const destination: RideCodexRuntimeFetchDestination = Object.freeze({
+        path: destinationPath,
+        canonicalRoot: await realpath(root),
+        handle: destinationHandle
+    });
     try {
         await assert.rejects(
-            first.fetchAuthorized(forged, runtime, join(root, 'forged.tgz')),
+            first.fetchAuthorized(forged, runtime, destination),
             /authorization|capability/i
         );
         await assert.rejects(
-            second.fetchAuthorized(capability, runtime, join(root, 'cross-instance.tgz')),
+            second.fetchAuthorized(capability, runtime, destination),
             /authorization|capability/i
         );
-        const result = await first.fetchAuthorized(capability, runtime, join(root, 'runtime.tgz'));
+        const result = await first.fetchAuthorized(capability, runtime, destination);
         assert.equal(result.bytes, bytes.length);
         await assert.rejects(
-            first.fetchAuthorized(capability, runtime, join(root, 'replay.tgz')),
+            first.fetchAuthorized(capability, runtime, destination),
             /authorization|capability/i
         );
         assert.equal(validations, 1);
+        assert.deepEqual(validatedContexts, [context]);
+        assert.equal(Object.isFrozen(context), true);
+        assert.equal(context.target, runtime.target);
+        assert.equal(context.manifestDigest, runtimeManifestEntryDigest(runtime));
+        assert.equal(context.canonicalRoot, await realpath(root));
         assert.equal(requester.calls.length, 1);
     } finally {
+        await destinationHandle.close().catch(() => undefined);
+        await rm(root, { recursive: true, force: true });
+        await rm(otherRoot, { recursive: true, force: true });
+    }
+});
+
+test('fetch authorization context rejects target, manifest digest, root, and destination substitution before network', async t => {
+    const root = await mkdtemp(join(tmpdir(), 'ride-codex-fetch-context-'));
+    const otherRoot = await mkdtemp(join(tmpdir(), 'ride-codex-fetch-context-other-'));
+    const bytes = Buffer.from('context-bound capability');
+    const requester = new ScriptedRequester([]);
+    const fetcher = new RideCodexRuntimeFetcher({ authorizationValidator: () => true, requester });
+    const runtime = fetchEntry(bytes);
+    const canonicalRoot = await realpath(root);
+    const otherCanonicalRoot = await realpath(otherRoot);
+    const context = createInstallAuthorizationContext(runtime, canonicalRoot);
+
+    const attempt = async (
+        name: string,
+        candidateRuntime: RideCodexRuntimeManifestEntry,
+        destinationRoot: string,
+        destinationPath: string
+    ): Promise<void> => {
+        await t.test(name, async () => {
+            const capability = await fetcher.authorize(AUTHORIZATION, context);
+            const handle = await open(destinationPath, 'wx+', 0o600);
+            try {
+                await assert.rejects(
+                    fetcher.fetchAuthorized(capability, candidateRuntime, Object.freeze({
+                        path: destinationPath,
+                        canonicalRoot: destinationRoot,
+                        handle
+                    })),
+                    /authorization|context|target|manifest|root|destination/i
+                );
+            } finally {
+                await handle.close();
+                await rm(destinationPath, { force: true });
+            }
+        });
+    };
+
+    try {
+        await attempt(
+            'target B',
+            RIDE_CODEX_RUNTIME_MANIFEST.runtimes[5],
+            canonicalRoot,
+            join(root, 'target-b.tgz')
+        );
+        await attempt(
+            'manifest digest B',
+            Object.freeze({ ...runtime, integrity: sha512Integrity(Buffer.from('other digest')) }),
+            canonicalRoot,
+            join(root, 'digest-b.tgz')
+        );
+        await attempt('canonical root B', runtime, otherCanonicalRoot, join(otherRoot, 'root-b.tgz'));
+        await attempt('destination escape', runtime, canonicalRoot, join(otherRoot, 'escape.tgz'));
+        assert.equal(requester.calls.length, 0);
+    } finally {
+        await rm(root, { recursive: true, force: true });
+        await rm(otherRoot, { recursive: true, force: true });
+    }
+});
+
+test('pre-opened fetch destination keeps payload on the original inode after its path is replaced', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ride-codex-fetch-open-handle-'));
+    const bytes = Buffer.from('write only to the authorized open inode');
+    const requester = new ScriptedRequester([response(Readable.from([bytes]))]);
+    const fetcher = new RideCodexRuntimeFetcher({ authorizationValidator: () => true, requester });
+    const runtime = fetchEntry(bytes);
+    const canonicalRoot = await realpath(root);
+    const destinationPath = join(root, 'runtime.tgz');
+    const retainedPath = join(root, 'retained-original.tgz');
+    const handle = await open(destinationPath, 'wx+', 0o600);
+    try {
+        const capability = await fetcher.authorize(
+            AUTHORIZATION,
+            createInstallAuthorizationContext(runtime, canonicalRoot)
+        );
+        await rename(destinationPath, retainedPath);
+        await writeFile(destinationPath, 'external sentinel', { flag: 'wx' });
+        await fetcher.fetchAuthorized(capability, runtime, Object.freeze({
+            path: destinationPath,
+            canonicalRoot,
+            handle
+        }));
+        await handle.sync();
+        assert.deepEqual(await readFile(retainedPath), bytes);
+        assert.equal(await readFile(destinationPath, 'utf8'), 'external sentinel');
+    } finally {
+        await handle.close().catch(() => undefined);
         await rm(root, { recursive: true, force: true });
     }
+});
+
+test('runtime filesystem identity preserves bigint values beyond Number safe precision', () => {
+    const high = BigInt(Number.MAX_SAFE_INTEGER) + BigInt(1);
+    const first: RuntimeFilesystemIdentity = Object.freeze({
+        dev: high,
+        ino: high,
+        size: BigInt(0),
+        birthtimeNs: high,
+        ctimeNs: high
+    });
+    const second: RuntimeFilesystemIdentity = Object.freeze({ ...first, ino: high + BigInt(1) });
+    assert.equal(runtimeFilesystemIdentitiesEqual(first, first), true);
+    assert.equal(runtimeFilesystemIdentitiesEqual(first, second), false);
+    assert.equal(typeof first.ino, 'bigint');
 });
 
 test('fetcher itself rejects missing authorization and same-origin non-manifest paths before network', async () => {
@@ -518,8 +662,8 @@ test('staging consumes a single-use external authorization once before statfs an
             return { bsize: 1, bavail: requiredRuntimeStageBytes(entry) };
         },
         fetcher: {
-            authorize: async authorization => {
-                await validateInstallAuthorization(authorization, validator);
+            authorize: async (authorization, context) => {
+                await validateInstallAuthorization(authorization, validator, context);
                 const capability = Object.freeze(Object.create(null)) as RideCodexRuntimeFetchCapability;
                 capabilities.add(capability);
                 return capability;
@@ -529,7 +673,7 @@ test('staging consumes a single-use external authorization once before statfs an
                     throw new Error('authorization capability is invalid');
                 }
                 fetchCalls += 1;
-                await writeFile(destination, archive, { flag: 'wx', mode: 0o600 });
+                await writeFetchDestination(destination, archive);
                 return Object.freeze({ bytes: archive.length, integrity: sha512Integrity(archive) });
             }
         },
@@ -600,7 +744,7 @@ test('staging detects replacement with an external symlink and cleanup preserves
             fetcher: {
                 authorize: async authorization => authorization as RideCodexRuntimeFetchCapability,
                 fetchAuthorized: async (_capability, _runtime, destination) => {
-                    replacedStaging = dirname(destination);
+                    replacedStaging = dirname(typeof destination === 'string' ? destination : destination.path);
                     await rm(replacedStaging, { recursive: true, force: true });
                     await symlink(external, replacedStaging, process.platform === 'win32' ? 'junction' : 'dir');
                     return Object.freeze({ bytes: entry.compressedBytes, integrity: entry.integrity });
@@ -610,8 +754,66 @@ test('staging detects replacement with an external symlink and cleanup preserves
         await assert.rejects(stager.stage(AUTHORIZATION, entry.target), /root|staging|replace|symlink|junction|safe/i);
         assert.equal(await readFile(sentinel, 'utf8'), 'must survive');
         assert.ok(replacedStaging);
-        assert.equal((await lstat(replacedStaging!)).isSymbolicLink(), true);
+        await assert.rejects(lstat(replacedStaging!), /ENOENT/);
+        const quarantines = (await fsPromises.readdir(root)).filter(name => name.startsWith('.quarantine-'));
+        assert.equal(quarantines.length, 1);
+        assert.equal((await lstat(join(root, quarantines[0]))).isSymbolicLink(), true);
     } finally {
+        await rm(base, { recursive: true, force: true });
+        await rm(external, { recursive: true, force: true });
+    }
+});
+
+test('cleanup atomically quarantines a verify-after replacement and never follows the external target', async t => {
+    const base = await mkdtemp(join(tmpdir(), 'ride-codex-cleanup-race-'));
+    const root = join(base, 'runtime');
+    const external = await mkdtemp(join(tmpdir(), 'ride-codex-cleanup-race-external-'));
+    const sentinel = join(external, 'sentinel.txt');
+    const entry = RIDE_CODEX_RUNTIME_MANIFEST.runtimes[4];
+    const originalRename = fsPromises.rename.bind(fsPromises);
+    let stagingDirectory: string | undefined;
+    let ownedDirectory: string | undefined;
+    let renameRaceTriggered = false;
+    await writeFile(sentinel, 'must survive cleanup race');
+    t.mock.method(fsPromises, 'rename', async (
+        source: Parameters<typeof rename>[0],
+        destination: Parameters<typeof rename>[1]
+    ) => {
+        const sourcePath = String(source);
+        const destinationPath = String(destination);
+        if (!renameRaceTriggered && stagingDirectory && sourcePath === stagingDirectory
+            && destinationPath.includes('.quarantine-')) {
+            renameRaceTriggered = true;
+            ownedDirectory = `${stagingDirectory}-owned`;
+            await originalRename(stagingDirectory, ownedDirectory);
+            await symlink(external, stagingDirectory, process.platform === 'win32' ? 'junction' : 'dir');
+        }
+        return originalRename(source, destination);
+    });
+    try {
+        const stager = new RideCodexRuntimeStager({
+            trustedRuntimeBase: base,
+            runtimeRoot: root,
+            authorizationValidator: authorization => authorization === AUTHORIZATION,
+            statfs: async () => ({ bsize: 1, bavail: requiredRuntimeStageBytes(entry) }),
+            fetcher: {
+                authorize: async authorization => authorization as RideCodexRuntimeFetchCapability,
+                fetchAuthorized: async (_capability, _runtime, destination) => {
+                    stagingDirectory = dirname(typeof destination === 'string' ? destination : destination.path);
+                    throw new Error('force safe cleanup');
+                }
+            }
+        });
+        await assert.rejects(stager.stage(AUTHORIZATION, entry.target), /cleanup|quarantine|stage|runtime|safe/i);
+        assert.equal(renameRaceTriggered, true);
+        assert.equal(await readFile(sentinel, 'utf8'), 'must survive cleanup race');
+        assert.ok(ownedDirectory);
+        assert.equal((await lstat(ownedDirectory!)).isDirectory(), true);
+        const quarantines = (await fsPromises.readdir(root)).filter(name => name.startsWith('.quarantine-'));
+        assert.equal(quarantines.length, 1);
+        assert.equal((await lstat(join(root, quarantines[0]))).isSymbolicLink(), true);
+    } finally {
+        t.mock.restoreAll();
         await rm(base, { recursive: true, force: true });
         await rm(external, { recursive: true, force: true });
     }
@@ -652,7 +854,7 @@ test('staging paths are unique children of the extension-owned runtime root', as
             fetcher: {
                 authorize: async authorization => authorization as RideCodexRuntimeFetchCapability,
                 fetchAuthorized: async (_authorization, _runtime, destination) => {
-                    observed.push(destination);
+                    observed.push(typeof destination === 'string' ? destination : destination.path);
                     throw new Error('stop after path observation');
                 }
             }
@@ -764,7 +966,7 @@ async function createArchiveStager(
         fetcher: {
             authorize: async authorization => authorization as RideCodexRuntimeFetchCapability,
             fetchAuthorized: async (_authorization, _runtime, destination) => {
-                await writeFile(destination, archive, { flag: 'wx', mode: 0o600 });
+                await writeFetchDestination(destination, archive);
                 return Object.freeze({ bytes: archive.length, integrity: sha512Integrity(archive) });
             }
         },
@@ -777,6 +979,7 @@ test('valid archive is streamed into a frozen staged runtime without activating 
     const root = await mkdtemp(join(tmpdir(), 'ride-codex-valid-stage-'));
     const archive = await tarGz(validArchiveEntries());
     const probe = new RecordingProbe();
+    const entry = RIDE_CODEX_RUNTIME_MANIFEST.runtimes[4];
     try {
         const stager = await createArchiveStager(root, archive, { probe });
         const staged = await stager.stage(AUTHORIZATION, 'x86_64-unknown-linux-musl');
@@ -788,6 +991,12 @@ test('valid archive is streamed into a frozen staged runtime without activating 
         assert.equal(staged.npmVersion, '0.144.0-linux-x64');
         assert.equal(staged.integrity, RIDE_CODEX_RUNTIME_MANIFEST.runtimes[4].integrity);
         assert.equal(staged.layoutVersion, 1);
+        assert.equal(Object.isFrozen(staged.authorizationContext), true);
+        assert.equal(Object.isFrozen(staged.stagingIdentity), true);
+        assert.equal(staged.authorizationContext.target, staged.target);
+        assert.equal(staged.authorizationContext.manifestDigest, runtimeManifestEntryDigest(entry));
+        assert.equal(typeof staged.stagingIdentity.ino, 'bigint');
+        await staged.revalidate();
         assert.ok(relative(root, staged.stagingDirectory) && !relative(root, staged.stagingDirectory).startsWith('..'));
         assert.equal(staged.packageRoot, join(staged.stagingDirectory, 'package'));
         assert.equal(staged.executable, join(staged.packageRoot, 'vendor', staged.target, 'bin', 'codex'));
@@ -810,6 +1019,26 @@ test('valid archive is streamed into a frozen staged runtime without activating 
     }
 });
 
+test('staged runtime revalidation rejects directory identity drift before Task 7 activation', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ride-codex-stage-revalidate-'));
+    const archive = await tarGz(validArchiveEntries());
+    let movedDirectory: string | undefined;
+    try {
+        const stager = await createArchiveStager(root, archive);
+        const staged = await stager.stage(AUTHORIZATION, 'x86_64-unknown-linux-musl');
+        await staged.revalidate();
+        movedDirectory = `${staged.stagingDirectory}-moved`;
+        await rename(staged.stagingDirectory, movedDirectory);
+        await mkdir(staged.stagingDirectory, { mode: 0o700 });
+        await assert.rejects(staged.revalidate(), /replaced|identity|staging|safe/i);
+    } finally {
+        await rm(root, { recursive: true, force: true });
+        if (movedDirectory) {
+            await rm(movedDirectory, { recursive: true, force: true });
+        }
+    }
+});
+
 test('valid npm-style archive does not require explicit directory headers', async () => {
     const root = await mkdtemp(join(tmpdir(), 'ride-codex-implicit-dirs-'));
     const vendor = 'package/vendor/x86_64-unknown-linux-musl';
@@ -824,6 +1053,33 @@ test('valid npm-style archive does not require explicit directory headers', asyn
         const staged = await stager.stage(AUTHORIZATION, 'x86_64-unknown-linux-musl');
         assert.equal((await stat(staged.executable)).isFile(), true);
     } finally {
+        await rm(root, { recursive: true, force: true });
+    }
+});
+
+test('archive rejects the first entry-local error emitted after end before reporting extraction success', async t => {
+    const root = await mkdtemp(join(tmpdir(), 'ride-codex-entry-late-error-'));
+    const archive = await tarGz(validArchiveEntries());
+    const originalOn = EventEmitter.prototype.on;
+    let injected = false;
+    t.mock.method(EventEmitter.prototype, 'on', function (
+        this: EventEmitter,
+        event: string | symbol,
+        listener: (...args: unknown[]) => void
+    ): EventEmitter {
+        const result = originalOn.call(this, event, listener as (...args: never[]) => void);
+        if (!injected && event === 'error' && listener.name === 'recordEntryError') {
+            injected = true;
+            this.once('end', () => setImmediate(() => this.emit('error', new Error('late entry failure'))));
+        }
+        return result;
+    });
+    try {
+        const stager = await createArchiveStager(root, archive);
+        await assert.rejects(stager.stage(AUTHORIZATION, 'x86_64-unknown-linux-musl'), /entry|archive|stream|safe/i);
+        assert.equal(injected, true);
+    } finally {
+        t.mock.restoreAll();
         await rm(root, { recursive: true, force: true });
     }
 });
