@@ -635,6 +635,44 @@ test('all implicit failures produce a bounded explicit no-runtime error', async 
     });
 });
 
+test('production default environment provider accepts native process.env without retaining it', async () => {
+    const fs = new VirtualFileSystem();
+    const probe = new FakeProbe();
+    fs.addFile(WINDOWS_NATIVE, peHeader('x64'));
+    let discoveredEnvironment: Readonly<Record<string, string | undefined>> | undefined;
+    const overrideKeys = Object.keys(process.env).filter(key => key.toLowerCase() === 'ride_codex_path');
+    const savedOverrides = overrideKeys.map(key => [key, process.env[key]] as const);
+    for (const key of overrideKeys) {
+        delete process.env[key];
+    }
+
+    try {
+        const resolver = new RideCodexRuntimeResolver({
+            platform: 'win32',
+            arch: 'x64',
+            filesystem: fs,
+            probe,
+            findSystemCandidates: environment => {
+                discoveredEnvironment = environment;
+                return [WINDOWS_NATIVE];
+            }
+        });
+
+        const spec = await resolver.resolve();
+
+        assertLaunchSpec(spec, { executable: WINDOWS_NATIVE, source: 'system' });
+        assert.ok(discoveredEnvironment);
+        assert.notEqual(discoveredEnvironment, process.env);
+        assert.equal(Object.getPrototypeOf(discoveredEnvironment), null);
+    } finally {
+        for (const [key, value] of savedOverrides) {
+            if (value !== undefined) {
+                process.env[key] = value;
+            }
+        }
+    }
+});
+
 test('runtime providers enforce bounded typed outputs and never disclose provider failures', async t => {
     const unsafeProviderError = (): Error => new Error(
         `OPENAI_API_KEY=provider-secret Authorization=Bearer-token https://user:password@example.invalid/${'x'.repeat(10_000)}`
@@ -663,13 +701,90 @@ test('runtime providers enforce bounded typed outputs and never disclose provide
         assert.equal(userReads, 0);
     });
 
+    await t.test('environment provider accepts own data properties from an unusual prototype without inheriting it', async () => {
+        const inheritedOverride = 'C:\\inherited-secret\\codex.exe';
+        const environment = Object.create({ RIDE_CODEX_PATH: inheritedOverride }) as Record<string, string | undefined>;
+        Object.defineProperty(environment, 'PATH', {
+            configurable: true,
+            enumerable: true,
+            value: 'C:\\safe-bin',
+            writable: true
+        });
+        const fs = new VirtualFileSystem();
+        fs.addFile(WINDOWS_NATIVE, peHeader('x64'));
+        let receivedEnvironment: Readonly<Record<string, string | undefined>> | undefined;
+        const resolver = new RideCodexRuntimeResolver({
+            platform: 'win32', arch: 'x64', filesystem: fs, probe: new FakeProbe(),
+            readEnvironment: () => environment,
+            findSystemCandidates: boundedEnvironment => {
+                receivedEnvironment = boundedEnvironment;
+                return [WINDOWS_NATIVE];
+            }
+        });
+
+        const spec = await resolver.resolve();
+
+        assertLaunchSpec(spec, { executable: WINDOWS_NATIVE, source: 'system' });
+        assert.ok(receivedEnvironment);
+        assert.notEqual(receivedEnvironment, environment);
+        assert.equal(Object.getPrototypeOf(receivedEnvironment), null);
+        assert.equal(receivedEnvironment.PATH, 'C:\\safe-bin');
+        assert.equal(Object.prototype.hasOwnProperty.call(receivedEnvironment, 'RIDE_CODEX_PATH'), false);
+    });
+
+    await t.test('environment provider rejects accessors without executing getters', async () => {
+        let getterCalls = 0;
+        let systemReads = 0;
+        const environment = Object.create(null) as Record<string, string | undefined>;
+        Object.defineProperty(environment, 'PATH', {
+            enumerable: true,
+            get: () => {
+                getterCalls += 1;
+                return 'C:\\must-not-run';
+            }
+        });
+        const resolver = new RideCodexRuntimeResolver({
+            platform: 'win32', arch: 'x64', filesystem: new VirtualFileSystem(), probe: new FakeProbe(),
+            readEnvironment: () => environment,
+            findSystemCandidates: () => { systemReads += 1; return []; }
+        });
+
+        await assert.rejects(resolver.resolve(), error => {
+            assert.ok(error instanceof RideCodexRuntimeConfigurationError);
+            return assertSafe(error);
+        });
+        assert.equal(getterCalls, 0);
+        assert.equal(systemReads, 0);
+    });
+
+    await t.test('environment provider converts descriptor proxy failures into a generic safe error', async () => {
+        const environment = new Proxy(Object.create(null) as Record<string, string | undefined>, {
+            ownKeys: () => ['PATH'],
+            getOwnPropertyDescriptor: () => { throw unsafeProviderError(); }
+        });
+        const resolver = new RideCodexRuntimeResolver({
+            platform: 'win32', arch: 'x64', filesystem: new VirtualFileSystem(), probe: new FakeProbe(),
+            readEnvironment: () => environment
+        });
+
+        await assert.rejects(resolver.resolve(), error => {
+            assert.ok(error instanceof RideCodexRuntimeConfigurationError);
+            return assertSafe(error);
+        });
+    });
+
     await t.test('environment provider rejects invalid and oversized records safely', async () => {
+        const tooManyEntries = Object.fromEntries(
+            Array.from({ length: 1_025 }, (_, index) => [`KEY_${index}`, 'value'])
+        );
         for (const environment of [
             null,
             [] as unknown[],
             Promise.resolve({ PATH: 'C:\\bin' }),
             { PATH: 42 },
-            { PATH: 'x'.repeat(200_000) }
+            { PATH: 'x'.repeat(200_000) },
+            { ['K'.repeat(1_025)]: 'value' },
+            tooManyEntries
         ]) {
             const resolver = new RideCodexRuntimeResolver({
                 platform: 'win32', arch: 'x64', filesystem: new VirtualFileSystem(), probe: new FakeProbe(),

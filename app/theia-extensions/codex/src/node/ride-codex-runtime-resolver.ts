@@ -1013,11 +1013,7 @@ function normalizeOptionalCandidate(candidate: string | undefined): string | und
 }
 
 function validateProviderEnvironment(value: unknown): Readonly<Record<string, string | undefined>> {
-    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-        throw new Error('invalid provider environment');
-    }
-    const prototype = Object.getPrototypeOf(value);
-    if (prototype !== Object.prototype && prototype !== null) {
+    if (typeof value !== 'object' || value === null || Array.isArray(value) || value instanceof Promise) {
         throw new Error('invalid provider environment');
     }
     const keys = Object.keys(value);
@@ -1027,7 +1023,14 @@ function validateProviderEnvironment(value: unknown): Readonly<Record<string, st
     const bounded: Record<string, string | undefined> = Object.create(null) as Record<string, string | undefined>;
     let totalBytes = 0;
     for (const key of keys) {
-        const entry = (value as Record<string, unknown>)[key];
+        const descriptor = Object.getOwnPropertyDescriptor(value, key);
+        if (!descriptor || descriptor.enumerable !== true
+            || !Object.prototype.hasOwnProperty.call(descriptor, 'value')
+            || Object.prototype.hasOwnProperty.call(descriptor, 'get')
+            || Object.prototype.hasOwnProperty.call(descriptor, 'set')) {
+            throw new Error('invalid provider environment entry');
+        }
+        const entry = descriptor.value;
         if ((entry !== undefined && typeof entry !== 'string') || key.includes('\0') || entry?.includes('\0')) {
             throw new Error('invalid provider environment entry');
         }
