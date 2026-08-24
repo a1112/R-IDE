@@ -22,8 +22,8 @@ export interface RideCodexRuntimeFileStat {
 
 export interface RideCodexRuntimeFileSystem {
     lstat(path: string): Promise<RideCodexRuntimeFileStat>;
-    readTextFile(path: string): Promise<string>;
     readFilePrefix(path: string, maxBytes: number): Promise<Uint8Array>;
+    readLink(path: string): Promise<string>;
     realpath(path: string): Promise<string>;
     isExecutable(path: string): Promise<boolean>;
 }
@@ -41,6 +41,9 @@ export interface RideCodexRuntimeResolverOptions {
         environment: Readonly<Record<string, string | undefined>>
     ) => MaybePromise<readonly string[]>;
     readonly readManagedActiveRuntime?: () => MaybePromise<string | undefined>;
+    readonly discoveryTimeoutMs?: number;
+    readonly maxSystemProbes?: number;
+    readonly signal?: AbortSignal;
 }
 
 export const RIDE_CODEX_RUNTIME_DISCOVERY_LIMITS = Object.freeze({
@@ -85,6 +88,66 @@ class CandidateError extends Error {
     }
 }
 
+class ResolutionDeadlineError extends Error {
+    constructor(reason: 'deadline' | 'aborted') {
+        super(reason === 'aborted'
+            ? 'Codex runtime discovery was aborted.'
+            : 'Codex runtime discovery timed out at the global deadline.');
+        this.name = 'ResolutionDeadlineError';
+    }
+}
+
+class ResolutionDeadline {
+    private readonly expiresAt: number;
+
+    constructor(timeoutMs: number, private readonly signal: AbortSignal | undefined) {
+        this.expiresAt = Date.now() + timeoutMs;
+    }
+
+    check(): void {
+        if (this.signal?.aborted) {
+            throw new ResolutionDeadlineError('aborted');
+        }
+        if (Date.now() >= this.expiresAt) {
+            throw new ResolutionDeadlineError('deadline');
+        }
+    }
+
+    run<T>(operation: () => MaybePromise<T>): Promise<T> {
+        try {
+            this.check();
+        } catch (error) {
+            return Promise.reject(error);
+        }
+        const remainingMs = Math.max(1, this.expiresAt - Date.now());
+        return new Promise<T>((resolve, reject) => {
+            let settled = false;
+            const cleanup = (): void => {
+                clearTimeout(timer);
+                this.signal?.removeEventListener('abort', onAbort);
+            };
+            const settle = (callback: () => void): void => {
+                if (settled) {
+                    return;
+                }
+                settled = true;
+                cleanup();
+                callback();
+            };
+            const onAbort = (): void => settle(() => reject(new ResolutionDeadlineError('aborted')));
+            const timer = setTimeout(
+                () => settle(() => reject(new ResolutionDeadlineError('deadline'))),
+                remainingMs
+            );
+            this.signal?.addEventListener('abort', onAbort, { once: true });
+            Promise.resolve().then(operation).then(
+                value => settle(() => resolve(value)),
+                error => settle(() => reject(error))
+            );
+        });
+    }
+}
+
 interface CodexPackageManifest {
     readonly layoutVersion: unknown;
     readonly version: unknown;
@@ -93,9 +156,22 @@ interface CodexPackageManifest {
     readonly entrypoint: unknown;
 }
 
+interface CodexRootPackageManifest {
+    readonly name: unknown;
+    readonly version: unknown;
+    readonly bin: unknown;
+}
+
 interface CandidateResolution {
     readonly executable: string;
     readonly manifestVersion?: string;
+    readonly binaryTarget: string;
+}
+
+interface ResolutionContext {
+    readonly deadline: ResolutionDeadline;
+    readonly maxSystemProbes: number;
+    systemProbes: number;
 }
 
 const MAX_DIAGNOSTICS = 8;
@@ -103,7 +179,13 @@ const MAX_DIAGNOSTIC_LENGTH = 160;
 const MAX_SYSTEM_CANDIDATES = RIDE_CODEX_RUNTIME_DISCOVERY_LIMITS.maxCandidates;
 const MAX_WRAPPER_BYTES = 64 * 1024;
 const MAX_MANIFEST_BYTES = 16 * 1024;
+const MAX_PACKAGE_JSON_BYTES = 16 * 1024;
+const MAX_NATIVE_HEADER_BYTES = 64 * 1024;
+const MAX_POSIX_SYMLINK_HOPS = 8;
+const DEFAULT_DISCOVERY_TIMEOUT_MS = 10_000;
+const DEFAULT_MAX_SYSTEM_PROBES = 8;
 const SYSTEM_DISCOVERY_LIMIT_DIAGNOSTIC = 'System runtime discovery: PATH scan was truncated at safe limits.';
+const SYSTEM_PROBE_LIMIT_DIAGNOSTIC = 'System runtime discovery: executable probe limit was reached.';
 
 const PLATFORM_PACKAGE_BY_TARGET: Readonly<Record<string, string>> = Object.freeze({
     'x86_64-unknown-linux-musl': 'codex-linux-x64',
@@ -116,7 +198,6 @@ const PLATFORM_PACKAGE_BY_TARGET: Readonly<Record<string, string>> = Object.free
 
 const defaultFileSystem: RideCodexRuntimeFileSystem = {
     lstat: path => fs.lstat(path),
-    readTextFile: path => fs.readFile(path, 'utf8'),
     readFilePrefix: async (path, maxBytes) => {
         const handle = await fs.open(path, 'r');
         try {
@@ -127,6 +208,7 @@ const defaultFileSystem: RideCodexRuntimeFileSystem = {
             await handle.close();
         }
     },
+    readLink: path => fs.readlink(path),
     realpath: path => fs.realpath(path),
     isExecutable: async path => {
         try {
@@ -149,7 +231,12 @@ export class RideCodexRuntimeResolver {
         environment: Readonly<Record<string, string | undefined>>
     ) => MaybePromise<RideCodexSystemCandidateDiscovery>;
     private readonly readManagedActiveRuntime: () => MaybePromise<string | undefined>;
-    private resolution: Promise<RideCodexLaunchSpec> | undefined;
+    private readonly discoveryTimeoutMs: number;
+    private readonly maxSystemProbes: number;
+    private readonly signal: AbortSignal | undefined;
+    private successfulResolution: RideCodexLaunchSpec | undefined;
+    private inFlightResolution: Promise<RideCodexLaunchSpec> | undefined;
+    private invalidateAfterInFlight = false;
 
     constructor(options: RideCodexRuntimeResolverOptions = {}) {
         this.platform = options.platform ?? process.platform;
@@ -162,50 +249,91 @@ export class RideCodexRuntimeResolver {
             ? async environment => boundProvidedSystemCandidates(await options.findSystemCandidates!(environment))
             : environment => discoverDefaultCodexSystemCandidates(environment, this.platform);
         this.readManagedActiveRuntime = options.readManagedActiveRuntime ?? (() => undefined);
+        this.discoveryTimeoutMs = positiveSafeInteger(options.discoveryTimeoutMs, DEFAULT_DISCOVERY_TIMEOUT_MS);
+        this.maxSystemProbes = positiveSafeInteger(options.maxSystemProbes, DEFAULT_MAX_SYSTEM_PROBES);
+        this.signal = options.signal;
     }
 
     resolve(): Promise<RideCodexLaunchSpec> {
-        if (!this.resolution) {
-            this.resolution = this.resolveOnce();
+        if (this.successfulResolution) {
+            return Promise.resolve(this.successfulResolution);
         }
-        return this.resolution;
+        if (this.inFlightResolution) {
+            return this.inFlightResolution;
+        }
+        const context: ResolutionContext = {
+            deadline: new ResolutionDeadline(this.discoveryTimeoutMs, this.signal),
+            maxSystemProbes: this.maxSystemProbes,
+            systemProbes: 0
+        };
+        const resolution = this.resolveOnce(context).then(spec => {
+            if (!this.invalidateAfterInFlight) {
+                this.successfulResolution = spec;
+            }
+            return spec;
+        }).finally(() => {
+            if (this.inFlightResolution === resolution) {
+                this.inFlightResolution = undefined;
+            }
+            if (this.invalidateAfterInFlight) {
+                this.successfulResolution = undefined;
+                this.invalidateAfterInFlight = false;
+            }
+        });
+        this.inFlightResolution = resolution;
+        return resolution;
     }
 
-    private async resolveOnce(): Promise<RideCodexLaunchSpec> {
+    invalidate(): void {
+        this.successfulResolution = undefined;
+        if (this.inFlightResolution) {
+            this.invalidateAfterInFlight = true;
+        }
+    }
+
+    private async resolveOnce(context: ResolutionContext): Promise<RideCodexLaunchSpec> {
+        context.deadline.check();
         const target = targetForPlatform(this.platform, this.arch);
         const environment = this.readEnvironment();
-        const environmentOverride = readEnvironmentValue(environment, 'RIDE_CODEX_PATH');
+        context.deadline.check();
+        const environmentOverride = readEnvironmentValue(environment, 'RIDE_CODEX_PATH', this.platform);
         if (environmentOverride !== undefined) {
-            return this.resolveExplicit(environmentOverride, target);
+            return this.resolveExplicit(environmentOverride, target, context);
         }
 
-        const userOverride = await this.readUserOverride();
+        const userOverride = await context.deadline.run(() => this.readUserOverride());
         if (userOverride !== undefined) {
-            return this.resolveExplicit(userOverride, target);
+            return this.resolveExplicit(userOverride, target, context);
         }
 
-        const discovery = await this.discoverSystemCandidates(environment);
+        const discovery = await context.deadline.run(() => this.discoverSystemCandidates(environment));
         const diagnostics: string[] = [];
         for (const diagnostic of discovery.diagnostics) {
             addDiagnostic(diagnostics, diagnostic);
         }
         const systemCandidates = discovery.candidates;
         for (let index = 0; index < systemCandidates.length; index += 1) {
+            context.deadline.check();
+            if (context.systemProbes >= context.maxSystemProbes) {
+                addDiagnostic(diagnostics, SYSTEM_PROBE_LIMIT_DIAGNOSTIC);
+                break;
+            }
             const candidate = normalizeOptionalCandidate(systemCandidates[index]);
             if (!candidate) {
                 continue;
             }
             try {
-                return await this.resolveCandidate(candidate, 'system', target, diagnostics);
+                return await this.resolveCandidate(candidate, 'system', target, diagnostics, context);
             } catch (error) {
                 addDiagnostic(diagnostics, `System candidate ${index + 1}: ${reasonFromError(error)}`);
             }
         }
 
-        const managed = normalizeOptionalCandidate(await this.readManagedActiveRuntime());
+        context.deadline.check();
+        const managed = normalizeOptionalCandidate(await context.deadline.run(() => this.readManagedActiveRuntime()));
         if (managed) {
             try {
-                return await this.resolveCandidate(managed, 'managed', target, diagnostics);
+                return await this.resolveCandidate(managed, 'managed', target, diagnostics, context);
             } catch (error) {
                 addDiagnostic(diagnostics, `Managed runtime: ${reasonFromError(error)}`);
             }
@@ -218,13 +346,13 @@ export class RideCodexRuntimeResolver {
         throw new RideCodexRuntimeUnavailableError(diagnostics);
     }
 
-    private async resolveExplicit(candidate: string, target: string): Promise<RideCodexLaunchSpec> {
+    private async resolveExplicit(candidate: string, target: string, context: ResolutionContext): Promise<RideCodexLaunchSpec> {
         const normalized = candidate.trim();
         if (!normalized) {
             throw new RideCodexRuntimeConfigurationError('Codex path is empty.');
         }
         try {
-            return await this.resolveCandidate(normalized, 'override', target, []);
+            return await this.resolveCandidate(normalized, 'override', target, [], context);
         } catch (error) {
             throw new RideCodexRuntimeConfigurationError(reasonFromError(error));
         }
@@ -234,17 +362,25 @@ export class RideCodexRuntimeResolver {
         candidate: string,
         source: RideCodexRuntimeSource,
         target: string,
-        diagnostics: readonly string[]
+        diagnostics: readonly string[],
+        context: ResolutionContext
     ): Promise<RideCodexLaunchSpec> {
-        const resolved = await this.resolveNativeExecutable(candidate, target);
+        const resolved = await this.resolveNativeExecutable(candidate, target, context);
+        if (resolved.binaryTarget !== target) {
+            throw new CandidateError('Codex runtime target does not match this platform architecture.');
+        }
+        if (source === 'system') {
+            if (context.systemProbes >= context.maxSystemProbes) {
+                throw new CandidateError('System Codex executable probe limit was reached.');
+            }
+            context.systemProbes += 1;
+        }
         let probeResult: Awaited<ReturnType<RideCodexRuntimeProbeLike['probe']>>;
         try {
-            probeResult = await this.probe.probe(resolved.executable, target);
+            probeResult = await context.deadline.run(() => this.probe.probe(resolved.executable));
         } catch (error) {
+            context.deadline.check();
             throw new CandidateError(reasonFromError(error));
-        }
-        if (probeResult.target !== target) {
-            throw new CandidateError('Codex runtime target does not match this platform architecture.');
         }
         if (!isCompatibleVersion(probeResult.version)
             || (resolved.manifestVersion && resolved.manifestVersion !== probeResult.version)) {
@@ -259,14 +395,24 @@ export class RideCodexRuntimeResolver {
         });
     }
 
-    private async resolveNativeExecutable(candidate: string, target: string): Promise<CandidateResolution> {
+    private async resolveNativeExecutable(
+        candidate: string,
+        target: string,
+        context: ResolutionContext
+    ): Promise<CandidateResolution> {
         const paths = this.platform === 'win32' ? win32 : posix;
         if (!paths.isAbsolute(candidate)) {
             throw new CandidateError('Codex path must be absolute.');
         }
         const normalized = paths.normalize(candidate);
-        const stat = await this.safeLstat(normalized);
+        if (this.platform === 'win32' && isWindowsNetworkPath(normalized)) {
+            throw new CandidateError('Windows UNC and network Codex paths are not supported; configure a local native executable.');
+        }
+        const stat = await this.safeLstat(normalized, context);
         if (stat.isSymbolicLink()) {
+            if (this.platform !== 'win32') {
+                return this.resolvePosixNpmLauncher(normalized, target, context);
+            }
             throw new CandidateError('Codex path must not be a symlink.');
         }
         if (!stat.isFile()) {
@@ -276,7 +422,7 @@ export class RideCodexRuntimeResolver {
         if (this.platform === 'win32') {
             const extension = win32.extname(normalized).toLowerCase();
             if (extension === '.cmd' || extension === '.ps1') {
-                return this.resolveWindowsNpmWrapper(normalized, stat, target);
+                return this.resolveWindowsNpmWrapper(normalized, stat, target, context);
             }
             if (extension !== '.exe') {
                 throw new CandidateError('Codex path is not a native Windows executable.');
@@ -285,33 +431,26 @@ export class RideCodexRuntimeResolver {
             if (/\.(?:cmd|ps1|js)$/i.test(normalized)) {
                 throw new CandidateError('Codex path is a script wrapper, not a native executable.');
             }
-            let header: Uint8Array;
-            try {
-                header = await this.filesystem.readFilePrefix(normalized, 4);
-            } catch {
-                throw new CandidateError('Codex native executable header cannot be read.');
-            }
-            if (!isNativePosixBinary(this.platform, header)) {
-                throw new CandidateError('Codex path is not a native POSIX executable.');
-            }
-            if (!await this.filesystem.isExecutable(normalized)) {
+            if (!await context.deadline.run(() => this.filesystem.isExecutable(normalized))) {
                 throw new CandidateError('Codex file is not executable.');
             }
         }
-        await this.requireStableRealPath(normalized);
-        return { executable: normalized };
+        await this.requireStableRealPath(normalized, context);
+        const binaryTarget = await this.requireNativeBinaryTarget(normalized, target, context);
+        return { executable: normalized, binaryTarget };
     }
 
     private async resolveWindowsNpmWrapper(
         wrapper: string,
         wrapperStat: RideCodexRuntimeFileStat,
-        target: string
+        target: string,
+        context: ResolutionContext
     ): Promise<CandidateResolution> {
         if (wrapperStat.size > MAX_WRAPPER_BYTES) {
             throw new CandidateError('Codex npm launcher exceeds the safe size limit.');
         }
-        await this.requireStableRealPath(wrapper);
-        const body = await this.filesystem.readTextFile(wrapper);
+        await this.requireStableRealPath(wrapper, context);
+        const body = await this.readBoundedText(wrapper, MAX_WRAPPER_BYTES, 'Codex npm launcher', context);
         if (!/(?:node_modules[\\/])+@openai[\\/]codex[\\/]bin[\\/]codex\.js/i.test(body)) {
             throw new CandidateError('Codex npm launcher cannot be resolved safely.');
         }
@@ -326,13 +465,115 @@ export class RideCodexRuntimeResolver {
             win32.join(wrapperDirectory, 'node_modules', '@openai', 'codex', 'node_modules', '@openai', platformPackage),
             win32.join(wrapperDirectory, 'node_modules', '@openai', 'codex')
         ];
+        return this.resolveNpmNativePackageRoots(packageRoots, target, win32, 'bin/codex.exe', context);
+    }
+
+    private async resolvePosixNpmLauncher(
+        launcher: string,
+        target: string,
+        context: ResolutionContext
+    ): Promise<CandidateResolution> {
+        let current = launcher;
+        let stat: RideCodexRuntimeFileStat;
+        let hops = 0;
+        while (true) {
+            stat = await this.safeLstat(current, context);
+            if (!stat.isSymbolicLink()) {
+                break;
+            }
+            if (hops >= MAX_POSIX_SYMLINK_HOPS) {
+                throw new CandidateError('Codex npm launcher exceeds the safe symlink hop limit.');
+            }
+            let linkTarget: string;
+            try {
+                linkTarget = await context.deadline.run(() => this.filesystem.readLink(current));
+            } catch (error) {
+                context.deadline.check();
+                throw new CandidateError('Codex npm launcher symlink cannot be read.');
+            }
+            if (!linkTarget || linkTarget.includes('\0')) {
+                throw new CandidateError('Codex npm launcher symlink target is invalid.');
+            }
+            current = posix.normalize(posix.isAbsolute(linkTarget)
+                ? linkTarget
+                : posix.resolve(posix.dirname(current), linkTarget));
+            hops += 1;
+        }
+        if (!stat.isFile()) {
+            throw new CandidateError('Codex npm launcher target is not a file.');
+        }
+
+        let canonicalScript: string;
+        try {
+            canonicalScript = posix.normalize(await context.deadline.run(() => this.filesystem.realpath(current)));
+        } catch (error) {
+            context.deadline.check();
+            throw new CandidateError('Codex npm launcher canonical path cannot be resolved.');
+        }
+        const suffix = '/node_modules/@openai/codex/bin/codex.js';
+        if (!canonicalScript.endsWith(suffix)) {
+            throw new CandidateError('Codex npm launcher does not resolve to a validated @openai/codex package.');
+        }
+        const packageRoot = posix.dirname(posix.dirname(canonicalScript));
+        if (!isPathWithin(posix, packageRoot, canonicalScript)) {
+            throw new CandidateError('Codex npm launcher escapes its package root.');
+        }
+
+        const packageJsonPath = posix.join(packageRoot, 'package.json');
+        const packageJsonStat = await this.safeLstat(packageJsonPath, context);
+        if (packageJsonStat.isSymbolicLink() || !packageJsonStat.isFile()) {
+            throw new CandidateError('Codex npm package metadata must be a regular file.');
+        }
+        await this.requireStableRealPath(packageJsonPath, context);
+        const rootManifest = await this.readRootPackageManifest(packageJsonPath, context);
+        const bin = typeof rootManifest.bin === 'string'
+            ? rootManifest.bin
+            : rootManifest.bin && typeof rootManifest.bin === 'object' && !Array.isArray(rootManifest.bin)
+                ? (rootManifest.bin as Record<string, unknown>).codex
+                : undefined;
+        if (rootManifest.name !== '@openai/codex'
+            || typeof rootManifest.version !== 'string'
+            || !isCompatibleVersion(rootManifest.version)
+            || bin !== 'bin/codex.js') {
+            throw new CandidateError('Codex npm package metadata is invalid or incompatible.');
+        }
+
+        const platformPackage = PLATFORM_PACKAGE_BY_TARGET[target];
+        if (!platformPackage) {
+            throw new CandidateError('Codex target has no supported native npm package.');
+        }
+        const packageScope = posix.dirname(packageRoot);
+        const packageRoots = [
+            posix.join(packageScope, platformPackage),
+            posix.join(packageRoot, 'node_modules', '@openai', platformPackage),
+            packageRoot
+        ];
+        return this.resolveNpmNativePackageRoots(
+            packageRoots,
+            target,
+            posix,
+            'bin/codex',
+            context,
+            rootManifest.version
+        );
+    }
+
+    private async resolveNpmNativePackageRoots(
+        packageRoots: readonly string[],
+        target: string,
+        paths: typeof win32,
+        expectedEntrypoint: string,
+        context: ResolutionContext,
+        rootPackageVersion?: string
+    ): Promise<CandidateResolution> {
         for (const packageRoot of packageRoots) {
-            const vendorTarget = win32.join(packageRoot, 'vendor', target);
-            const manifestPath = win32.join(vendorTarget, 'codex-package.json');
+            const normalizedVendorTarget = paths.join(packageRoot, 'vendor', target);
+            const manifestPath = paths.join(normalizedVendorTarget, 'codex-package.json');
             let manifestStat: RideCodexRuntimeFileStat;
             try {
-                manifestStat = await this.filesystem.lstat(manifestPath);
+                manifestStat = await context.deadline.run(() => this.filesystem.lstat(manifestPath));
             } catch (error) {
+                context.deadline.check();
                 if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
                     continue;
                 }
@@ -344,47 +585,81 @@ export class RideCodexRuntimeResolver {
             if (manifestStat.size > MAX_MANIFEST_BYTES) {
                 throw new CandidateError('Codex package manifest exceeds the safe size limit.');
             }
-            await this.requireStableRealPath(manifestPath);
-            const manifest = await this.readManifest(manifestPath);
-            this.validateManifest(manifest, target);
+            await this.requireStableRealPath(manifestPath, context);
+            const manifest = await this.readManifest(manifestPath, context);
+            this.validateManifest(manifest, target, paths, expectedEntrypoint);
+            if (rootPackageVersion && manifest.version !== rootPackageVersion) {
+                throw new CandidateError('Codex native package version does not match @openai/codex.');
+            }
 
-            const expectedEntrypoint = 'bin/codex.exe';
             if (manifest.entrypoint !== expectedEntrypoint) {
                 throw new CandidateError('Codex package entrypoint is invalid.');
             }
-            const entrypoint = win32.resolve(vendorTarget, manifest.entrypoint);
-            if (!isPathWithin(win32, vendorTarget, entrypoint)) {
+            const entrypoint = paths.resolve(normalizedVendorTarget, manifest.entrypoint);
+            if (!isPathWithin(paths, normalizedVendorTarget, entrypoint)) {
                 throw new CandidateError('Codex package entrypoint escapes the vendor directory.');
             }
-            const executableStat = await this.safeLstat(entrypoint);
+            const executableStat = await this.safeLstat(entrypoint, context);
             if (executableStat.isSymbolicLink()) {
                 throw new CandidateError('Codex native executable must not be a symlink.');
             }
             if (!executableStat.isFile()) {
                 throw new CandidateError('Codex native executable is not a file.');
             }
-            if (win32.extname(entrypoint).toLowerCase() !== '.exe') {
+            if (this.platform === 'win32' && win32.extname(entrypoint).toLowerCase() !== '.exe') {
                 throw new CandidateError('Codex package entrypoint is not a native Windows executable.');
             }
-            await this.requireStableRealPath(entrypoint);
-            return { executable: entrypoint, manifestVersion: manifest.version as string };
+            if (this.platform !== 'win32'
+                && !await context.deadline.run(() => this.filesystem.isExecutable(entrypoint))) {
+                throw new CandidateError('Codex native package entrypoint is not executable.');
+            }
+            await this.requireStableRealPath(entrypoint, context);
+            const binaryTarget = await this.requireNativeBinaryTarget(entrypoint, target, context);
+            return { executable: entrypoint, manifestVersion: manifest.version as string, binaryTarget };
         }
         throw new CandidateError('Codex npm launcher has no compatible native optional package.');
     }
 
-    private async readManifest(path: string): Promise<CodexPackageManifest> {
+    private async readManifest(path: string, context: ResolutionContext): Promise<CodexPackageManifest> {
         try {
-            const value = JSON.parse(await this.filesystem.readTextFile(path)) as unknown;
+            const value = JSON.parse(await this.readBoundedText(
+                path, MAX_MANIFEST_BYTES, 'Codex package manifest', context
+            )) as unknown;
             if (!value || typeof value !== 'object' || Array.isArray(value)) {
                 throw new Error('invalid');
             }
             return value as CodexPackageManifest;
-        } catch {
+        } catch (error) {
+            if (error instanceof CandidateError) {
+                throw error;
+            }
             throw new CandidateError('Codex package manifest is invalid JSON.');
         }
     }
 
-    private validateManifest(manifest: CodexPackageManifest, target: string): void {
+    private async readRootPackageManifest(path: string, context: ResolutionContext): Promise<CodexRootPackageManifest> {
+        try {
+            const value = JSON.parse(await this.readBoundedText(
+                path, MAX_PACKAGE_JSON_BYTES, 'Codex npm package metadata', context
+            )) as unknown;
+            if (!value || typeof value !== 'object' || Array.isArray(value)) {
+                throw new Error('invalid');
+            }
+            return value as CodexRootPackageManifest;
+        } catch (error) {
+            if (error instanceof CandidateError) {
+                throw error;
+            }
+            throw new CandidateError('Codex npm package metadata is invalid JSON.');
+        }
+    }
+
+    private validateManifest(
+        manifest: CodexPackageManifest,
+        target: string,
+        paths: typeof win32,
+        expectedEntrypoint: string
+    ): void {
         if (manifest.layoutVersion !== 1) {
             throw new CandidateError('Codex package layout version is unsupported.');
         }
@@ -398,16 +673,62 @@ export class RideCodexRuntimeResolver {
             throw new CandidateError('Codex package variant is invalid.');
         }
         if (typeof manifest.entrypoint !== 'string'
-            || win32.isAbsolute(manifest.entrypoint)
+            || paths.isAbsolute(manifest.entrypoint)
+            || manifest.entrypoint !== expectedEntrypoint
             || manifest.entrypoint.split(/[\\/]+/).some(segment => segment === '..')) {
             throw new CandidateError('Codex package entrypoint is invalid or escapes its vendor directory.');
         }
     }
 
-    private async safeLstat(path: string): Promise<RideCodexRuntimeFileStat> {
+    private async readBoundedText(
+        path: string,
+        maxBytes: number,
+        label: string,
+        context: ResolutionContext
+    ): Promise<string> {
+        let bytes: Uint8Array;
         try {
-            return await this.filesystem.lstat(path);
+            bytes = await context.deadline.run(() => this.filesystem.readFilePrefix(path, maxBytes + 1));
         } catch (error) {
+            context.deadline.check();
+            throw new CandidateError(`${label} cannot be read.`);
+        }
+        if (bytes.byteLength > maxBytes) {
+            throw new CandidateError(`${label} exceeds the safe size limit.`);
+        }
+        try {
+            return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+        } catch {
+            throw new CandidateError(`${label} is not valid UTF-8.`);
+        }
+    }
+
+    private async requireNativeBinaryTarget(
+        path: string,
+        expectedTarget: string,
+        context: ResolutionContext
+    ): Promise<string> {
+        let header: Uint8Array;
+        try {
+            header = await context.deadline.run(() => this.filesystem.readFilePrefix(path, MAX_NATIVE_HEADER_BYTES));
+        } catch (error) {
+            context.deadline.check();
+            throw new CandidateError('Codex native executable header cannot be read.');
+        }
+        const targets = readNativeBinaryTargets(this.platform, header);
+        if (!targets.includes(expectedTarget)) {
+            throw new CandidateError(targets.length === 0
+                ? 'Codex path is not a recognized native executable.'
+                : 'Codex runtime target does not match this platform architecture.');
+        }
+        return expectedTarget;
+    }
+
+    private async safeLstat(path: string, context: ResolutionContext): Promise<RideCodexRuntimeFileStat> {
+        try {
+            return await context.deadline.run(() => this.filesystem.lstat(path));
+        } catch (error) {
+            context.deadline.check();
             if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
                 throw new CandidateError('Codex runtime does not exist or is missing a required file.');
             }
@@ -415,11 +736,12 @@ export class RideCodexRuntimeResolver {
         }
     }
 
-    private async requireStableRealPath(path: string): Promise<void> {
+    private async requireStableRealPath(path: string, context: ResolutionContext): Promise<void> {
         let realPath: string;
         try {
-            realPath = await this.filesystem.realpath(path);
-        } catch {
+            realPath = await context.deadline.run(() => this.filesystem.realpath(path));
+        } catch (error) {
+            context.deadline.check();
             throw new CandidateError('Codex runtime canonical path cannot be resolved.');
         }
         const paths = this.platform === 'win32' ? win32 : posix;
@@ -451,7 +773,7 @@ export function discoverDefaultCodexSystemCandidates(
     environment: Readonly<Record<string, string | undefined>>,
     platform: NodeJS.Platform
 ): RideCodexSystemCandidateDiscovery {
-    const pathValue = readEnvironmentValue(environment, 'PATH');
+    const pathValue = readEnvironmentValue(environment, 'PATH', platform);
     if (!pathValue) {
         return createSystemCandidateDiscovery([], 0, 0, false);
     }
@@ -460,6 +782,7 @@ export function discoverDefaultCodexSystemCandidates(
     const names = platform === 'win32' ? ['codex.exe', 'codex.cmd', 'codex.ps1'] : ['codex'];
     const candidates: string[] = [];
     const seen = new Set<string>();
+    const seenDirectories = new Set<string>();
     let scannedPathBytes = 0;
     let scannedDirectories = 0;
     let tokenStart = 0;
@@ -467,21 +790,27 @@ export function discoverDefaultCodexSystemCandidates(
     let truncated = false;
 
     const addDirectory = (directory: string, hasUnscannedPath: boolean): void => {
+        if (!directory || !paths.isAbsolute(directory)) {
+            return;
+        }
+        const normalizedDirectory = paths.normalize(directory);
+        const directoryKey = platform === 'win32' ? normalizedDirectory.toLowerCase() : normalizedDirectory;
+        if (seenDirectories.has(directoryKey)) {
+            return;
+        }
         if (scannedDirectories >= RIDE_CODEX_RUNTIME_DISCOVERY_LIMITS.maxDirectories) {
             truncated = true;
             return;
         }
+        seenDirectories.add(directoryKey);
         scannedDirectories += 1;
-        if (!directory || !paths.isAbsolute(directory)) {
-            return;
-        }
         for (let nameIndex = 0; nameIndex < names.length; nameIndex += 1) {
             if (candidates.length >= RIDE_CODEX_RUNTIME_DISCOVERY_LIMITS.maxCandidates) {
                 truncated = hasUnscannedPath || nameIndex < names.length;
                 return;
             }
             const name = names[nameIndex];
-            const candidate = paths.normalize(paths.join(directory, name));
+            const candidate = paths.normalize(paths.join(normalizedDirectory, name));
             const key = platform === 'win32' ? candidate.toLowerCase() : candidate;
             if (!seen.has(key)) {
                 seen.add(key);
@@ -562,10 +891,14 @@ function utf8CodePointByteLength(codePoint: number): number {
 
 function readEnvironmentValue(
     environment: Readonly<Record<string, string | undefined>>,
-    key: string
+    key: string,
+    platform: NodeJS.Platform
 ): string | undefined {
     if (key in environment) {
         return environment[key];
+    }
+    if (platform !== 'win32') {
+        return undefined;
     }
     const matchingKey = Object.keys(environment).find(candidate => candidate.toLowerCase() === key.toLowerCase());
     return matchingKey ? environment[matchingKey] : undefined;
@@ -601,30 +934,106 @@ function isPathWithin(paths: typeof win32, parent: string, child: string): boole
     return relative !== '' && !relative.startsWith('..') && !paths.isAbsolute(relative);
 }
 
-function isNativePosixBinary(platform: NodeJS.Platform, header: Uint8Array): boolean {
-    if (header.byteLength < 4) {
-        return false;
+function readNativeBinaryTargets(platform: NodeJS.Platform, header: Uint8Array): readonly string[] {
+    const buffer = Buffer.from(header.buffer, header.byteOffset, header.byteLength);
+    if (platform === 'win32') {
+        if (buffer.length < 0x40 || buffer[0] !== 0x4d || buffer[1] !== 0x5a) {
+            return [];
+        }
+        const peOffset = buffer.readUInt32LE(0x3c);
+        if (peOffset > buffer.length - 6
+            || buffer.toString('binary', peOffset, peOffset + 4) !== 'PE\0\0') {
+            return [];
+        }
+        const target = targetForMachine(platform, buffer.readUInt16LE(peOffset + 4));
+        return target ? [target] : [];
     }
     if (platform === 'linux') {
-        return header[0] === 0x7f && header[1] === 0x45 && header[2] === 0x4c && header[3] === 0x46;
+        if (buffer.length < 20
+            || buffer[0] !== 0x7f || buffer[1] !== 0x45 || buffer[2] !== 0x4c || buffer[3] !== 0x46
+            || buffer[4] !== 2 || (buffer[5] !== 1 && buffer[5] !== 2)) {
+            return [];
+        }
+        const machine = buffer[5] === 1 ? buffer.readUInt16LE(18) : buffer.readUInt16BE(18);
+        const target = targetForMachine(platform, machine);
+        return target ? [target] : [];
     }
-    if (platform !== 'darwin') {
-        return false;
+    if (platform !== 'darwin' || buffer.length < 8) {
+        return [];
     }
-    const magic = Buffer.from(header).readUInt32BE(0);
-    return magic === 0xfeedface
-        || magic === 0xfeedfacf
-        || magic === 0xcefaedfe
-        || magic === 0xcffaedfe
-        || magic === 0xcafebabe
-        || magic === 0xbebafeca
-        || magic === 0xcafebabf
-        || magic === 0xbfbafeca;
+
+    const magicBe = buffer.readUInt32BE(0);
+    const magicLe = buffer.readUInt32LE(0);
+    if (magicLe === 0xfeedfacf) {
+        const target = targetForMachine(platform, buffer.readUInt32LE(4));
+        return target ? [target] : [];
+    }
+    if (magicBe === 0xfeedfacf) {
+        const target = targetForMachine(platform, buffer.readUInt32BE(4));
+        return target ? [target] : [];
+    }
+
+    let littleEndian: boolean;
+    let entrySize: number;
+    if (magicBe === 0xcafebabe || magicBe === 0xcafebabf) {
+        littleEndian = false;
+        entrySize = magicBe === 0xcafebabf ? 32 : 20;
+    } else if (magicLe === 0xcafebabe || magicLe === 0xcafebabf) {
+        littleEndian = true;
+        entrySize = magicLe === 0xcafebabf ? 32 : 20;
+    } else {
+        return [];
+    }
+    const architectureCount = littleEndian ? buffer.readUInt32LE(4) : buffer.readUInt32BE(4);
+    if (architectureCount === 0 || architectureCount > 64 || 8 + (architectureCount * entrySize) > buffer.length) {
+        return [];
+    }
+    const targets = new Set<string>();
+    for (let index = 0; index < architectureCount; index += 1) {
+        const offset = 8 + (index * entrySize);
+        const machine = littleEndian ? buffer.readUInt32LE(offset) : buffer.readUInt32BE(offset);
+        const target = targetForMachine(platform, machine);
+        if (target) {
+            targets.add(target);
+        }
+    }
+    return [...targets];
+}
+
+function targetForMachine(platform: NodeJS.Platform, machine: number): string | undefined {
+    if (platform === 'win32') {
+        return machine === 0x8664
+            ? 'x86_64-pc-windows-msvc'
+            : machine === 0xaa64 ? 'aarch64-pc-windows-msvc' : undefined;
+    }
+    if (platform === 'linux') {
+        return machine === 62
+            ? 'x86_64-unknown-linux-musl'
+            : machine === 183 ? 'aarch64-unknown-linux-musl' : undefined;
+    }
+    if (platform === 'darwin') {
+        return machine === 0x01000007
+            ? 'x86_64-apple-darwin'
+            : machine === 0x0100000c ? 'aarch64-apple-darwin' : undefined;
+    }
+    return undefined;
+}
+
+function isWindowsNetworkPath(path: string): boolean {
+    const normalized = path.replace(/\//g, '\\');
+    return normalized.startsWith('\\\\') || /^\\\\\?\\UNC\\/i.test(normalized);
+}
+
+function positiveSafeInteger(value: number | undefined, fallback: number): number {
+    return Number.isSafeInteger(value) && value! > 0 ? value! : fallback;
 }
 
 function reasonFromError(error: unknown): string {
     if (error instanceof CandidateError) {
         return sanitizeReason(error.safeReason);
+    }
+    if (error instanceof ResolutionDeadlineError) {
+        return sanitizeReason(error.message);
     }
     const message = error instanceof Error ? error.message : '';
     if (/app[ -]?server/i.test(message)) {

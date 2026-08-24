@@ -6,6 +6,9 @@
 
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import { constants as fsConstants, promises as realFs } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname as nativeDirname, join as nativeJoin, relative as nativeRelative, sep as nativeSeparator } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { test } from 'node:test';
 import {
@@ -33,6 +36,38 @@ import {
 const WINDOWS_TARGET = 'x86_64-pc-windows-msvc';
 const WINDOWS_NATIVE = 'C:\\tools\\codex.exe';
 
+function peHeader(arch: 'x64' | 'arm64'): Uint8Array {
+    const header = Buffer.alloc(512);
+    header.write('MZ', 0, 'ascii');
+    header.writeUInt32LE(0x80, 0x3c);
+    header.write('PE\0\0', 0x80, 'binary');
+    header.writeUInt16LE(arch === 'x64' ? 0x8664 : 0xaa64, 0x84);
+    return header;
+}
+
+function elfHeader(arch: 'x64' | 'arm64'): Uint8Array {
+    const header = Buffer.alloc(64);
+    header.set([0x7f, 0x45, 0x4c, 0x46, 2, 1, 1]);
+    header.writeUInt16LE(arch === 'x64' ? 62 : 183, 18);
+    return header;
+}
+
+function machoHeader(arch: 'x64' | 'arm64'): Uint8Array {
+    const header = Buffer.alloc(32);
+    header.writeUInt32LE(0xfeedfacf, 0);
+    header.writeUInt32LE(arch === 'x64' ? 0x01000007 : 0x0100000c, 4);
+    return header;
+}
+
+function machoUniversalHeader(): Uint8Array {
+    const header = Buffer.alloc(8 + (2 * 20));
+    header.writeUInt32BE(0xcafebabe, 0);
+    header.writeUInt32BE(2, 4);
+    header.writeUInt32BE(0x01000007, 8);
+    header.writeUInt32BE(0x0100000c, 28);
+    return header;
+}
+
 interface VirtualFile {
     readonly kind: 'file' | 'directory' | 'symlink';
     readonly content?: string | Uint8Array;
@@ -57,7 +92,7 @@ class VirtualFileSystem implements RideCodexRuntimeFileSystem {
     readonly calls: string[] = [];
     private readonly files = new Map<string, VirtualFile>();
 
-    addFile(path: string, content: string | Uint8Array = '', executable = true): void {
+    addFile(path: string, content: string | Uint8Array = peHeader('x64'), executable = true): void {
         this.files.set(this.key(path), { kind: 'file', content, executable });
     }
 
@@ -97,6 +132,15 @@ class VirtualFileSystem implements RideCodexRuntimeFileSystem {
             : Buffer.from(file.content ?? []).toString('utf8');
     }
 
+    async readLink(path: string): Promise<string> {
+        this.calls.push(`readlink:${path}`);
+        const file = this.files.get(this.key(path));
+        if (!file || file.kind !== 'symlink' || !file.realPath) {
+            throw new Error('not a symlink');
+        }
+        return file.realPath;
+    }
+
     async readFilePrefix(path: string, maxBytes: number): Promise<Uint8Array> {
         this.calls.push(`prefix:${path}:${maxBytes}`);
         const file = this.files.get(this.key(path));
@@ -132,7 +176,7 @@ class VirtualFileSystem implements RideCodexRuntimeFileSystem {
 }
 
 class FakeProbe implements RideCodexRuntimeProbeLike {
-    readonly calls: Array<{ executable: string; target: string }> = [];
+    readonly calls: Array<{ executable: string }> = [];
     private readonly failures = new Map<string, Error>();
     private readonly versions = new Map<string, string>();
     delay: Promise<void> | undefined;
@@ -145,14 +189,14 @@ class FakeProbe implements RideCodexRuntimeProbeLike {
         this.versions.set(this.key(path), version);
     }
 
-    async probe(executable: string, target: string): Promise<{ readonly version: string; readonly target: string }> {
-        this.calls.push({ executable, target });
+    async probe(executable: string): Promise<{ readonly version: string }> {
+        this.calls.push({ executable });
         await this.delay;
         const failure = this.failures.get(this.key(executable));
         if (failure) {
             throw failure;
         }
-        return { version: this.versions.get(this.key(executable)) ?? '0.144.0', target };
+        return { version: this.versions.get(this.key(executable)) ?? '0.144.0' };
     }
 
     private key(path: string): string {
@@ -641,7 +685,7 @@ test('rejects wrapper and executable realpath escapes', async t => {
 test('normalizes POSIX native runtimes and rejects wrappers or non-executable files', async t => {
     await t.test('absolute executable', async () => {
         const fixture = createResolver({ platform: 'linux', arch: 'arm64', environment: { RIDE_CODEX_PATH: '/opt/codex/bin/codex' } });
-        fixture.fs.addFile('/opt/codex/bin/codex', Uint8Array.from([0x7f, 0x45, 0x4c, 0x46]), true);
+        fixture.fs.addFile('/opt/codex/bin/codex', elfHeader('arm64'), true);
         const spec = await fixture.resolver.resolve();
         assertLaunchSpec(spec, {
             executable: '/opt/codex/bin/codex',
@@ -658,7 +702,7 @@ test('normalizes POSIX native runtimes and rejects wrappers or non-executable fi
     ]) {
         await t.test(entry.name, async () => {
             const fixture = createResolver({ platform: 'linux', arch: 'x64', environment: { RIDE_CODEX_PATH: entry.path } });
-            fixture.fs.addFile(entry.path, entry.content ?? Uint8Array.from([0x7f, 0x45, 0x4c, 0x46]), entry.executable);
+            fixture.fs.addFile(entry.path, entry.content ?? elfHeader('x64'), entry.executable);
             await assert.rejects(fixture.resolver.resolve(), /absolute|native|executable/i);
             assert.equal(fixture.probe.calls.length, 0);
         });
@@ -673,7 +717,7 @@ test('accepts native Mach-O magic without executing a wrapper', async () => {
     });
     fixture.fs.addFile(
         '/Applications/Codex.app/Contents/MacOS/codex',
-        Uint8Array.from([0xcf, 0xfa, 0xed, 0xfe]),
+        machoHeader('arm64'),
         true
     );
 
@@ -714,9 +758,9 @@ test('probe accepts only compatible codex-cli output and proven app-server help'
             maxOutputBytes: 4_096
         });
 
-        const result = await probe.probe(WINDOWS_NATIVE, WINDOWS_TARGET);
+        const result = await probe.probe(WINDOWS_NATIVE);
 
-        assert.deepEqual(result, { version: '0.144.0', target: WINDOWS_TARGET });
+        assert.deepEqual(result, { version: '0.144.0' });
         assert.deepEqual(calls, [
             { executable: WINDOWS_NATIVE, args: ['--version'], timeoutMs: 1_000, maxOutputBytes: 4_096 },
             { executable: WINDOWS_NATIVE, args: ['app-server', '--help'], timeoutMs: 2_000, maxOutputBytes: 4_096 }
@@ -738,7 +782,7 @@ test('probe accepts only compatible codex-cli output and proven app-server help'
                         : { stdout: entry.help, stderr: '' }
                 }
             });
-            await assert.rejects(probe.probe(WINDOWS_NATIVE, WINDOWS_TARGET), entry.expected);
+            await assert.rejects(probe.probe(WINDOWS_NATIVE), entry.expected);
         });
     }
 });
@@ -746,10 +790,14 @@ test('probe accepts only compatible codex-cli output and proven app-server help'
 class FakeSpawnedProcess extends EventEmitter {
     readonly stdout = new PassThrough();
     readonly stderr = new PassThrough();
+    readonly signals: Array<NodeJS.Signals | number | undefined> = [];
     killed = false;
+    onKill: ((signal: NodeJS.Signals | number | undefined) => void) | undefined;
 
-    kill(): boolean {
+    kill(signal?: NodeJS.Signals | number): boolean {
         this.killed = true;
+        this.signals.push(signal);
+        this.onKill?.(signal);
         return true;
     }
 }
@@ -861,10 +909,475 @@ test('probe diagnostics stay bounded and never include command output or environ
         }
     });
 
-    await assert.rejects(probe.probe(WINDOWS_NATIVE, WINDOWS_TARGET), error => {
+    await assert.rejects(probe.probe(WINDOWS_NATIVE), error => {
         const message = (error as Error).message;
         assert.ok(message.length <= 200);
         assert.doesNotMatch(message, /must-not-leak|OPENAI_API_KEY|x{20}/);
         return true;
     });
+});
+
+test('probe subprocess receives only a bounded channel-neutral environment', async () => {
+    const child = new FakeSpawnedProcess();
+    let spawnOptions: Record<string, unknown> | undefined;
+    const runner = new RideCodexBoundedExecRunner({
+        platform: 'win32',
+        readEnvironment: () => ({
+            SystemRoot: 'C:\\Windows',
+            TEMP: 'C:\\Temp',
+            LANG: 'zh_CN.UTF-8',
+            PATH: 'C:\\unneeded',
+            OPENAI_API_KEY: 'api-secret',
+            access_token: 'token-secret',
+            Authorization: 'auth-secret',
+            CLIENT_SECRET: 'client-secret',
+            DB_PASSWORD: 'password-secret',
+            AWS_CREDENTIAL_FILE: 'credential-secret',
+            RIDE_CODEX_PATH: 'C:\\channel\\codex.exe',
+            CODEX_HOME: 'C:\\channel\\home',
+            HUGE: 'x'.repeat(100_000)
+        }),
+        spawn: (_executable: string, _args: readonly string[], options: object) => {
+            spawnOptions = options as Record<string, unknown>;
+            queueMicrotask(() => child.emit('close', 0, null));
+            return child;
+        }
+    });
+
+    await runner.run(WINDOWS_NATIVE, ['--version'], { timeoutMs: 100, maxOutputBytes: 1_024 });
+
+    const environment = spawnOptions?.env as Readonly<Record<string, string>> | undefined;
+    assert.deepEqual(environment, {
+        SystemRoot: 'C:\\Windows',
+        TEMP: 'C:\\Temp',
+        LANG: 'zh_CN.UTF-8'
+    });
+    assert.doesNotMatch(JSON.stringify(environment), /api-secret|token-secret|auth-secret|client-secret|password-secret|credential-secret|channel/i);
+    assert.ok(Buffer.byteLength(JSON.stringify(environment)) < 4_096);
+});
+
+test('failed resolutions retry, successful resolutions cache, and invalidate never duplicates in-flight work', async () => {
+    let configuredPath = 'C:\\missing\\codex.exe';
+    let environmentReads = 0;
+    const fs = new VirtualFileSystem();
+    const probe = new FakeProbe();
+    const resolver = new RideCodexRuntimeResolver({
+        platform: 'win32',
+        arch: 'x64',
+        filesystem: fs,
+        probe,
+        readEnvironment: () => {
+            environmentReads += 1;
+            return { RIDE_CODEX_PATH: configuredPath };
+        }
+    });
+
+    await assert.rejects(resolver.resolve(), RideCodexRuntimeConfigurationError);
+    configuredPath = WINDOWS_NATIVE;
+    fs.addFile(WINDOWS_NATIVE, peHeader('x64'));
+    const recovered = await resolver.resolve();
+    assertLaunchSpec(recovered, { executable: WINDOWS_NATIVE, source: 'override' });
+    assert.equal(environmentReads, 2);
+    assert.strictEqual(await resolver.resolve(), recovered);
+    assert.equal(environmentReads, 2);
+
+    let releaseProbe: (() => void) | undefined;
+    probe.delay = new Promise<void>(resolve => {
+        releaseProbe = resolve;
+    });
+    resolver.invalidate();
+    const first = resolver.resolve();
+    resolver.invalidate();
+    const concurrent = resolver.resolve();
+    assert.strictEqual(first, concurrent);
+    releaseProbe?.();
+    await first;
+    assert.equal(probe.calls.length, 2);
+
+    probe.delay = undefined;
+    await resolver.resolve();
+    assert.equal(probe.calls.length, 3);
+    assert.equal(environmentReads, 4);
+});
+
+test('runtime discovery bounds real probes, deadlines, blocking filesystem work, and network paths', async t => {
+    await t.test('hundreds of existing candidates consume only the configured probe budget', async () => {
+        const fs = new VirtualFileSystem();
+        const probe = new FakeProbe();
+        const candidates = Array.from({ length: 200 }, (_, index) => `C:\\candidate-${index}\\codex.exe`);
+        for (const candidate of candidates) {
+            fs.addFile(candidate, peHeader('x64'));
+            probe.fail(candidate, 'Codex App Server command is unavailable');
+        }
+        const resolver = new RideCodexRuntimeResolver({
+            platform: 'win32',
+            arch: 'x64',
+            filesystem: fs,
+            probe,
+            readEnvironment: () => ({}),
+            findSystemCandidates: () => candidates,
+            maxSystemProbes: 3,
+            discoveryTimeoutMs: 500
+        });
+
+        await assert.rejects(resolver.resolve(), RideCodexRuntimeUnavailableError);
+        assert.equal(probe.calls.length, 3);
+    });
+
+    await t.test('deadline stops a hanging probe and prevents later candidates from starting', async () => {
+        const first = 'C:\\first\\codex.exe';
+        const second = 'C:\\second\\codex.exe';
+        const fs = new VirtualFileSystem();
+        fs.addFile(first, peHeader('x64'));
+        fs.addFile(second, peHeader('x64'));
+        const probe = new FakeProbe();
+        probe.delay = new Promise<void>(() => undefined);
+        const resolver = new RideCodexRuntimeResolver({
+            platform: 'win32', arch: 'x64', filesystem: fs, probe,
+            readEnvironment: () => ({}), findSystemCandidates: () => [first, second],
+            discoveryTimeoutMs: 20
+        });
+        const guard = new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error('test guard expired')), 150));
+
+        await assert.rejects(Promise.race([resolver.resolve(), guard]), /deadline|timed out|time limit/i);
+        assert.equal(probe.calls.length, 1);
+    });
+
+    await t.test('deadline also bounds injected filesystem operations', async () => {
+        const fs = new VirtualFileSystem();
+        fs.lstat = async () => new Promise<RideCodexRuntimeFileStat>(() => undefined);
+        const resolver = new RideCodexRuntimeResolver({
+            platform: 'win32', arch: 'x64', filesystem: fs, probe: new FakeProbe(),
+            readEnvironment: () => ({ RIDE_CODEX_PATH: WINDOWS_NATIVE }), discoveryTimeoutMs: 20
+        });
+        const guard = new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error('test guard expired')), 150));
+        await assert.rejects(Promise.race([resolver.resolve(), guard]), /deadline|timed out|time limit/i);
+    });
+
+    await t.test('AbortSignal cancels an in-flight probe without starting another candidate', async () => {
+        const controller = new AbortController();
+        const first = 'C:\\abort-first\\codex.exe';
+        const second = 'C:\\abort-second\\codex.exe';
+        const fs = new VirtualFileSystem();
+        fs.addFile(first, peHeader('x64'));
+        fs.addFile(second, peHeader('x64'));
+        const probe = new FakeProbe();
+        probe.delay = new Promise<void>(() => undefined);
+        const resolver = new RideCodexRuntimeResolver({
+            platform: 'win32', arch: 'x64', filesystem: fs, probe,
+            readEnvironment: () => ({}), findSystemCandidates: () => [first, second],
+            discoveryTimeoutMs: 1_000, signal: controller.signal
+        });
+        const resolution = resolver.resolve();
+        await new Promise(resolve => setImmediate(resolve));
+        controller.abort();
+        await assert.rejects(resolution, /aborted/i);
+        assert.equal(probe.calls.length, 1);
+    });
+
+    await t.test('explicit UNC is actionable while implicit UNC is skipped before filesystem access', async () => {
+        const unc = '\\\\offline-host\\share\\codex.exe';
+        const explicitFs = new VirtualFileSystem();
+        const explicit = new RideCodexRuntimeResolver({
+            platform: 'win32', arch: 'x64', filesystem: explicitFs, probe: new FakeProbe(),
+            readEnvironment: () => ({ RIDE_CODEX_PATH: unc })
+        });
+        await assert.rejects(explicit.resolve(), /UNC|network/i);
+        assert.deepEqual(explicitFs.calls, []);
+
+        const local = 'C:\\local\\codex.exe';
+        const implicit = createResolver({ system: [unc, local] });
+        implicit.fs.addFile(local, peHeader('x64'));
+        const spec = await implicit.resolver.resolve();
+        assertLaunchSpec(spec, { executable: local, source: 'system' });
+        assert.equal(implicit.fs.calls.some(call => call.includes('offline-host')), false);
+    });
+});
+
+test('probe timeout escalates termination, settles once, and clears grace timers', async t => {
+    await t.test('POSIX sends SIGTERM then SIGKILL and waits for close', async () => {
+        const child = new FakeSpawnedProcess();
+        child.onKill = signal => {
+            if (signal === 'SIGKILL') {
+                queueMicrotask(() => child.emit('close', null, 'SIGKILL'));
+            }
+        };
+        const runner = new RideCodexBoundedExecRunner({
+            platform: 'linux', spawn: () => child, terminationGraceMs: 5, terminationHardLimitMs: 50
+        });
+        await assert.rejects(
+            runner.run('/opt/codex', ['--version'], { timeoutMs: 5, maxOutputBytes: 100 }),
+            error => error instanceof RideCodexProbeCommandError && error.reason === 'timeout'
+        );
+        assert.deepEqual(child.signals, ['SIGTERM', 'SIGKILL']);
+        assert.equal(child.listenerCount('close'), 0);
+        assert.equal(child.stdout.listenerCount('data'), 0);
+    });
+
+    await t.test('close during grace prevents force kill and no timer fires later', async () => {
+        const child = new FakeSpawnedProcess();
+        child.onKill = () => queueMicrotask(() => child.emit('close', null, 'SIGTERM'));
+        const runner = new RideCodexBoundedExecRunner({
+            platform: 'linux', spawn: () => child, terminationGraceMs: 10, terminationHardLimitMs: 40
+        });
+        await assert.rejects(runner.run('/opt/codex', [], { timeoutMs: 5, maxOutputBytes: 100 }));
+        await new Promise(resolve => setTimeout(resolve, 25));
+        assert.deepEqual(child.signals, ['SIGTERM']);
+    });
+
+    await t.test('exit during grace settles without waiting for close or force kill', async () => {
+        const child = new FakeSpawnedProcess();
+        child.onKill = () => queueMicrotask(() => child.emit('exit', null, 'SIGTERM'));
+        const runner = new RideCodexBoundedExecRunner({
+            platform: 'linux', spawn: () => child, terminationGraceMs: 10, terminationHardLimitMs: 40
+        });
+        await assert.rejects(runner.run('/opt/codex', [], { timeoutMs: 5, maxOutputBytes: 100 }));
+        await new Promise(resolve => setTimeout(resolve, 20));
+        assert.deepEqual(child.signals, ['SIGTERM']);
+        assert.equal(child.listenerCount('exit'), 0);
+    });
+
+    await t.test('kill failure still waits for the hard termination deadline and settles once', async () => {
+        const child = new FakeSpawnedProcess();
+        child.kill = () => {
+            throw new Error('kill failed with secret detail');
+        };
+        const runner = new RideCodexBoundedExecRunner({
+            platform: 'linux', spawn: () => child, terminationGraceMs: 5, terminationHardLimitMs: 20
+        });
+        let settlements = 0;
+        const started = Date.now();
+        await runner.run('/opt/codex', [], { timeoutMs: 5, maxOutputBytes: 100 }).then(
+            () => { settlements += 1; },
+            () => { settlements += 1; }
+        );
+        assert.equal(settlements, 1);
+        assert.ok(Date.now() - started >= 15);
+        assert.equal(child.listenerCount('close'), 0);
+    });
+
+    await t.test('a misconfigured hard limit cannot preempt the force-kill grace step', async () => {
+        const child = new FakeSpawnedProcess();
+        child.onKill = signal => {
+            if (signal === 'SIGKILL') {
+                queueMicrotask(() => child.emit('exit', null, 'SIGKILL'));
+            }
+        };
+        const runner = new RideCodexBoundedExecRunner({
+            platform: 'linux', spawn: () => child, terminationGraceMs: 15, terminationHardLimitMs: 5
+        });
+        await assert.rejects(runner.run('/opt/codex', [], { timeoutMs: 5, maxOutputBytes: 100 }));
+        assert.deepEqual(child.signals, ['SIGTERM', 'SIGKILL']);
+    });
+
+    await t.test('synchronous exit from kill cannot install late dangling timers', async () => {
+        const child = new FakeSpawnedProcess();
+        child.onKill = () => child.emit('exit', null, 'SIGTERM');
+        const timeoutsBefore = process.getActiveResourcesInfo().filter(resource => resource === 'Timeout').length;
+        const runner = new RideCodexBoundedExecRunner({
+            platform: 'linux', spawn: () => child, terminationGraceMs: 1_000, terminationHardLimitMs: 2_000
+        });
+        await assert.rejects(runner.run('/opt/codex', [], { timeoutMs: 5, maxOutputBytes: 100 }));
+        await new Promise(resolve => setImmediate(resolve));
+        const timeoutsAfter = process.getActiveResourcesInfo().filter(resource => resource === 'Timeout').length;
+        assert.equal(timeoutsAfter, timeoutsBefore);
+        assert.deepEqual(child.signals, ['SIGTERM']);
+    });
+});
+
+test('native executable headers prove PE, ELF, and Mach-O x64/arm64 targets before probing', async t => {
+    const cases: ReadonlyArray<{
+        name: string; platform: NodeJS.Platform; arch: 'x64' | 'arm64'; path: string; header: Uint8Array; target: string;
+    }> = [
+        { name: 'PE x64', platform: 'win32', arch: 'x64', path: 'C:\\bin\\codex.exe', header: peHeader('x64'), target: 'x86_64-pc-windows-msvc' },
+        { name: 'PE arm64', platform: 'win32', arch: 'arm64', path: 'C:\\bin\\codex.exe', header: peHeader('arm64'), target: 'aarch64-pc-windows-msvc' },
+        { name: 'ELF x64', platform: 'linux', arch: 'x64', path: '/opt/codex', header: elfHeader('x64'), target: 'x86_64-unknown-linux-musl' },
+        { name: 'ELF arm64', platform: 'linux', arch: 'arm64', path: '/opt/codex', header: elfHeader('arm64'), target: 'aarch64-unknown-linux-musl' },
+        { name: 'Mach-O x64', platform: 'darwin', arch: 'x64', path: '/opt/codex', header: machoHeader('x64'), target: 'x86_64-apple-darwin' },
+        { name: 'Mach-O arm64', platform: 'darwin', arch: 'arm64', path: '/opt/codex', header: machoHeader('arm64'), target: 'aarch64-apple-darwin' },
+        { name: 'Mach-O universal arm64', platform: 'darwin', arch: 'arm64', path: '/opt/codex', header: machoUniversalHeader(), target: 'aarch64-apple-darwin' }
+    ];
+    for (const entry of cases) {
+        await t.test(entry.name, async () => {
+            const fixture = createResolver({
+                platform: entry.platform, arch: entry.arch, environment: { RIDE_CODEX_PATH: entry.path }
+            });
+            fixture.fs.addFile(entry.path, entry.header, true);
+            const spec = await fixture.resolver.resolve();
+            assertLaunchSpec(spec, { executable: entry.path, source: 'override', target: entry.target });
+            assert.equal(fixture.fs.calls.some(call => /prefix:.*:65536$/i.test(call)), true);
+        });
+    }
+
+    await t.test('runnable wrong-architecture binary is rejected before probe', async () => {
+        const fixture = createResolver({ platform: 'win32', arch: 'x64', environment: { RIDE_CODEX_PATH: WINDOWS_NATIVE } });
+        fixture.fs.addFile(WINDOWS_NATIVE, peHeader('arm64'), true);
+        await assert.rejects(fixture.resolver.resolve(), /target|architecture/i);
+        assert.equal(fixture.probe.calls.length, 0);
+    });
+
+    await t.test('malformed 32-bit Mach-O cannot claim a 64-bit target', async () => {
+        const header = Buffer.from(machoHeader('x64'));
+        header.writeUInt32LE(0xfeedface, 0);
+        const fixture = createResolver({
+            platform: 'darwin', arch: 'x64', environment: { RIDE_CODEX_PATH: '/opt/codex' }
+        });
+        fixture.fs.addFile('/opt/codex', header, true);
+        await assert.rejects(fixture.resolver.resolve(), /native|recognized|architecture/i);
+        assert.equal(fixture.probe.calls.length, 0);
+    });
+});
+
+class RealMappedPosixFileSystem implements RideCodexRuntimeFileSystem {
+    constructor(readonly root: string) { }
+
+    toNative(path: string): string {
+        assert.ok(path === '/fixture' || path.startsWith('/fixture/'));
+        return nativeJoin(this.root, ...path.slice('/fixture'.length).split('/').filter(Boolean));
+    }
+
+    async lstat(path: string): Promise<RideCodexRuntimeFileStat> {
+        return realFs.lstat(this.toNative(path));
+    }
+
+    async readTextFile(path: string): Promise<string> {
+        return realFs.readFile(this.toNative(path), 'utf8');
+    }
+
+    async readFilePrefix(path: string, maxBytes: number): Promise<Uint8Array> {
+        const handle = await realFs.open(this.toNative(path), 'r');
+        try {
+            const buffer = Buffer.alloc(maxBytes);
+            const { bytesRead } = await handle.read(buffer, 0, maxBytes, 0);
+            return buffer.subarray(0, bytesRead);
+        } finally {
+            await handle.close();
+        }
+    }
+
+    async readLink(path: string): Promise<string> {
+        const target = await realFs.readlink(this.toNative(path));
+        if (!target.startsWith(nativeSeparator)) {
+            return target.split(nativeSeparator).join('/');
+        }
+        const relative = nativeRelative(this.root, target);
+        return `/fixture/${relative.split(nativeSeparator).join('/')}`;
+    }
+
+    async realpath(path: string): Promise<string> {
+        const canonical = await realFs.realpath(this.toNative(path));
+        const relative = nativeRelative(this.root, canonical);
+        return relative ? `/fixture/${relative.split(nativeSeparator).join('/')}` : '/fixture';
+    }
+
+    async isExecutable(path: string): Promise<boolean> {
+        try {
+            await realFs.access(this.toNative(path), fsConstants.X_OK);
+            return true;
+        } catch {
+            return false;
+        }
+    }
+}
+
+test('resolves a real POSIX npm bin symlink only through a validated package and native optional package', async () => {
+    const root = await realFs.mkdtemp(nativeJoin(tmpdir(), 'ride-codex-posix-'));
+    const filesystem = new RealMappedPosixFileSystem(root);
+    const link = '/fixture/bin/codex';
+    const packageRoot = '/fixture/lib/node_modules/@openai/codex';
+    const script = `${packageRoot}/bin/codex.js`;
+    const nativeRoot = '/fixture/lib/node_modules/@openai/codex-linux-x64';
+    const target = 'x86_64-unknown-linux-musl';
+    const manifest = `${nativeRoot}/vendor/${target}/codex-package.json`;
+    const executable = `${nativeRoot}/vendor/${target}/bin/codex`;
+    try {
+        for (const directory of [
+            nativeDirname(filesystem.toNative(link)), nativeDirname(filesystem.toNative(script)),
+            nativeDirname(filesystem.toNative(manifest)), nativeDirname(filesystem.toNative(executable))
+        ]) {
+            await realFs.mkdir(directory, { recursive: true });
+        }
+        await realFs.writeFile(filesystem.toNative(script), '#!/usr/bin/env node\n');
+        await realFs.writeFile(filesystem.toNative(`${packageRoot}/package.json`), JSON.stringify({
+            name: '@openai/codex', version: '0.144.0', bin: { codex: 'bin/codex.js' }
+        }));
+        await realFs.writeFile(filesystem.toNative(manifest), JSON.stringify({
+            layoutVersion: 1, version: '0.144.0', target, variant: 'codex', entrypoint: 'bin/codex'
+        }));
+        await realFs.writeFile(filesystem.toNative(executable), elfHeader('x64'));
+        await realFs.chmod(filesystem.toNative(executable), 0o755);
+        const relativeTarget = nativeRelative(nativeDirname(filesystem.toNative(link)), filesystem.toNative(script));
+        await realFs.symlink(relativeTarget, filesystem.toNative(link), 'file');
+
+        const probe = new FakeProbe();
+        const resolver = new RideCodexRuntimeResolver({
+            platform: 'linux', arch: 'x64', filesystem, probe,
+            readEnvironment: () => ({ RIDE_CODEX_PATH: link })
+        });
+        const spec = await resolver.resolve();
+        assertLaunchSpec(spec, { executable, source: 'override', target });
+        assert.deepEqual(probe.calls.map(call => call.executable), [executable]);
+        assert.equal(probe.calls.some(call => /\.js$|\/bin\/codex$/.test(call.executable) && call.executable === link), false);
+    } finally {
+        await realFs.rm(root, { recursive: true, force: true });
+    }
+});
+
+test('POSIX npm resolution rejects excessive symlink hops and arbitrary scripts without probing', async t => {
+    await t.test('hop limit', async () => {
+        const fs = new VirtualFileSystem();
+        const entry = '/usr/local/bin/codex';
+        for (let index = 0; index < 10; index += 1) {
+            fs.addSymlink(index === 0 ? entry : `/links/${index}`, `/links/${index + 1}`);
+        }
+        fs.addFile('/links/10', '#!/usr/bin/env node\n');
+        const probe = new FakeProbe();
+        const resolver = new RideCodexRuntimeResolver({
+            platform: 'linux', arch: 'x64', filesystem: fs, probe,
+            readEnvironment: () => ({ RIDE_CODEX_PATH: entry })
+        });
+        await assert.rejects(resolver.resolve(), /symlink|hop|launcher/i);
+        assert.equal(probe.calls.length, 0);
+    });
+
+    await t.test('symlink to an arbitrary JavaScript file', async () => {
+        const fs = new VirtualFileSystem();
+        fs.addSymlink('/usr/local/bin/codex', '/tmp/codex.js');
+        fs.addFile('/tmp/codex.js', '#!/usr/bin/env node\n');
+        const probe = new FakeProbe();
+        const resolver = new RideCodexRuntimeResolver({
+            platform: 'linux', arch: 'x64', filesystem: fs, probe,
+            readEnvironment: () => ({ RIDE_CODEX_PATH: '/usr/local/bin/codex' })
+        });
+        await assert.rejects(resolver.resolve(), /package|launcher|script/i);
+        assert.equal(probe.calls.length, 0);
+    });
+});
+
+test('wrapper and manifest reads are max-plus-one bounded, environment lookup is platform-correct, and PATH duplicates do not spend budget', async () => {
+    const wrapper = 'C:\\npm\\codex.cmd';
+    const fixture = createResolver({ environment: { RIDE_CODEX_PATH: wrapper } });
+    addWindowsNpmLayout(fixture.fs, wrapper);
+    await fixture.resolver.resolve();
+    assert.equal(fixture.fs.calls.some(call => call.startsWith('read:')), false);
+    assert.equal(fixture.fs.calls.includes(`prefix:${wrapper}:65537`), true);
+    assert.equal(fixture.fs.calls.some(call => /codex-package\.json:16385$/i.test(call)), true);
+
+    assert.equal(discoverDefaultCodexSystemCandidates({ Path: '/wrong' }, 'linux').candidates.length, 0);
+    assert.ok(discoverDefaultCodexSystemCandidates({ Path: 'C:\\tools' }, 'win32').candidates.length > 0);
+
+    const system = '/opt/system/codex';
+    const posix = createResolver({
+        platform: 'linux', arch: 'x64', environment: { ride_codex_path: '/wrong/codex' }, system: [system]
+    });
+    posix.fs.addFile(system, elfHeader('x64'));
+    assertLaunchSpec(await posix.resolver.resolve(), {
+        executable: system, source: 'system', target: 'x86_64-unknown-linux-musl'
+    });
+
+    const duplicated = Array.from({ length: 700 }, () => '/opt/repeated');
+    const discovery = discoverDefaultCodexSystemCandidates({ PATH: [...duplicated, '/opt/late'].join(':') }, 'linux');
+    assert.equal(discovery.scannedDirectories, 2);
+    assert.ok(discovery.candidates.includes('/opt/late/codex'));
+    assert.equal(discovery.truncated, false);
 });

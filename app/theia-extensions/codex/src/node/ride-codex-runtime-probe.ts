@@ -46,15 +46,18 @@ export interface RideCodexSpawnedProcess {
     readonly stderr: RideCodexReadableStream;
     once(event: 'error', listener: (error: NodeJS.ErrnoException) => void): this;
     once(event: 'close', listener: (code: number | null, signal: NodeJS.Signals | null) => void): this;
+    once(event: 'exit', listener: (code: number | null, signal: NodeJS.Signals | null) => void): this;
     removeListener(event: 'error', listener: (error: NodeJS.ErrnoException) => void): this;
     removeListener(event: 'close', listener: (code: number | null, signal: NodeJS.Signals | null) => void): this;
-    kill(): boolean;
+    removeListener(event: 'exit', listener: (code: number | null, signal: NodeJS.Signals | null) => void): this;
+    kill(signal?: NodeJS.Signals | number): boolean;
 }
 
 export interface RideCodexSpawnOptions {
     readonly shell: false;
     readonly windowsHide: true;
     readonly stdio: readonly ['ignore', 'pipe', 'pipe'];
+    readonly env: Readonly<Record<string, string>>;
 }
 
 export type RideCodexSpawn = (
@@ -65,13 +68,28 @@ export type RideCodexSpawn = (
 
 export interface RideCodexBoundedExecRunnerOptions {
     readonly spawn?: RideCodexSpawn;
+    readonly platform?: NodeJS.Platform;
+    readonly readEnvironment?: () => Readonly<Record<string, string | undefined>>;
+    readonly terminationGraceMs?: number;
+    readonly terminationHardLimitMs?: number;
 }
 
 export class RideCodexBoundedExecRunner implements RideCodexProbeCommandRunner {
     private readonly spawn: RideCodexSpawn;
+    private readonly platform: NodeJS.Platform;
+    private readonly readEnvironment: () => Readonly<Record<string, string | undefined>>;
+    private readonly terminationGraceMs: number;
+    private readonly terminationHardLimitMs: number;
 
     constructor(options: RideCodexBoundedExecRunnerOptions = {}) {
         this.spawn = options.spawn ?? (nodeSpawn as unknown as RideCodexSpawn);
+        this.platform = options.platform ?? process.platform;
+        this.readEnvironment = options.readEnvironment ?? (() => process.env);
+        this.terminationGraceMs = positiveDuration(options.terminationGraceMs, 100);
+        this.terminationHardLimitMs = Math.max(
+            positiveDuration(options.terminationHardLimitMs, 500),
+            this.terminationGraceMs + 1
+        );
     }
 
     run(
@@ -90,7 +108,8 @@ export class RideCodexBoundedExecRunner implements RideCodexProbeCommandRunner {
                 child = this.spawn(executable, args, {
                     shell: false,
                     windowsHide: true,
-                    stdio: ['ignore', 'pipe', 'pipe']
+                    stdio: ['ignore', 'pipe', 'pipe'],
+                    env: createProbeEnvironment(this.readEnvironment(), this.platform)
                 });
             } catch (error) {
                 const code = (error as NodeJS.ErrnoException).code;
@@ -102,31 +121,63 @@ export class RideCodexBoundedExecRunner implements RideCodexProbeCommandRunner {
             const stderr: Buffer[] = [];
             let outputBytes = 0;
             let settled = false;
-            let timer: ReturnType<typeof setTimeout>;
+            let terminalReason: RideCodexProbeFailureReason | undefined;
+            let operationTimer: ReturnType<typeof setTimeout> | undefined;
+            let terminationGraceTimer: ReturnType<typeof setTimeout> | undefined;
+            let terminationHardTimer: ReturnType<typeof setTimeout> | undefined;
 
             const cleanup = (): void => {
-                clearTimeout(timer);
+                if (operationTimer) {
+                    clearTimeout(operationTimer);
+                }
+                if (terminationGraceTimer) {
+                    clearTimeout(terminationGraceTimer);
+                }
+                if (terminationHardTimer) {
+                    clearTimeout(terminationHardTimer);
+                }
                 child.stdout.removeListener('data', onStdout);
                 child.stderr.removeListener('data', onStderr);
                 child.stdout.removeListener('error', onStreamError);
                 child.stderr.removeListener('error', onStreamError);
                 child.removeListener('error', onError);
                 child.removeListener('close', onClose);
+                child.removeListener('exit', onExit);
             };
-            const fail = (reason: RideCodexProbeFailureReason, kill = false): void => {
+            const rejectOnce = (reason: RideCodexProbeFailureReason): void => {
                 if (settled) {
                     return;
                 }
                 settled = true;
                 cleanup();
-                if (kill) {
-                    try {
-                        child.kill();
-                    } catch {
-                        // The process may already have exited.
-                    }
-                }
                 reject(new RideCodexProbeCommandError(reason));
+            };
+            const killChild = (force: boolean): void => {
+                try {
+                    if (this.platform === 'win32') {
+                        child.kill();
+                    } else {
+                        child.kill(force ? 'SIGKILL' : 'SIGTERM');
+                    }
+                } catch {
+                    // A failed kill remains bounded by the hard termination timer.
+                }
+            };
+            const terminate = (reason: RideCodexProbeFailureReason): void => {
+                if (settled || terminalReason) {
+                    return;
+                }
+                terminalReason = reason;
+                if (operationTimer) {
+                    clearTimeout(operationTimer);
+                }
+                terminationGraceTimer = setTimeout(() => {
+                    if (!settled) {
+                        killChild(true);
+                    }
+                }, this.terminationGraceMs);
+                terminationHardTimer = setTimeout(() => rejectOnce(reason), this.terminationHardLimitMs);
+                killChild(false);
             };
             const collect = (destination: Buffer[], chunk: Buffer | string): void => {
                 if (settled) {
@@ -135,27 +186,37 @@ export class RideCodexBoundedExecRunner implements RideCodexProbeCommandRunner {
                 const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
                 outputBytes += buffer.length;
                 if (outputBytes > limits.maxOutputBytes) {
-                    fail('max-output', true);
+                    killChild(true);
+                    rejectOnce('max-output');
                     return;
                 }
                 destination.push(buffer);
             };
             const onStdout = (chunk: Buffer | string): void => collect(stdout, chunk);
             const onStderr = (chunk: Buffer | string): void => collect(stderr, chunk);
-            const onStreamError = (): void => fail('spawn', true);
+            const onStreamError = (): void => {
+                killChild(true);
+                rejectOnce('spawn');
+            };
             const onError = (error: NodeJS.ErrnoException): void => {
-                fail(error.code === 'ENOENT' ? 'not-found' : 'spawn');
+                if (!terminalReason) {
+                    rejectOnce(error.code === 'ENOENT' ? 'not-found' : 'spawn');
+                }
             };
             const onClose = (code: number | null, signal: NodeJS.Signals | null): void => {
                 if (settled) {
                     return;
                 }
+                if (terminalReason) {
+                    rejectOnce(terminalReason);
+                    return;
+                }
                 if (signal) {
-                    fail('signal');
+                    rejectOnce('signal');
                     return;
                 }
                 if (code !== 0) {
-                    fail('exit');
+                    rejectOnce('exit');
                     return;
                 }
                 settled = true;
@@ -165,6 +226,19 @@ export class RideCodexBoundedExecRunner implements RideCodexProbeCommandRunner {
                     stderr: Buffer.concat(stderr).toString('utf8')
                 });
             };
+            const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
+                if (terminalReason) {
+                    rejectOnce(terminalReason);
+                    return;
+                }
+                if (signal) {
+                    rejectOnce('signal');
+                    return;
+                }
+                if (code !== 0) {
+                    rejectOnce('exit');
+                }
+            };
 
             child.stdout.on('data', onStdout);
             child.stderr.on('data', onStderr);
@@ -172,18 +246,57 @@ export class RideCodexBoundedExecRunner implements RideCodexProbeCommandRunner {
             child.stderr.once('error', onStreamError);
             child.once('error', onError);
             child.once('close', onClose);
-            timer = setTimeout(() => fail('timeout', true), limits.timeoutMs);
+            child.once('exit', onExit);
+            operationTimer = setTimeout(() => terminate('timeout'), limits.timeoutMs);
         });
     }
 }
 
+const MAX_PROBE_ENVIRONMENT_BYTES = 16 * 1024;
+const MAX_PROBE_ENVIRONMENT_VALUE_BYTES = 4 * 1024;
+const PROBE_ENVIRONMENT_KEYS = Object.freeze([
+    'SystemRoot', 'WINDIR', 'ComSpec', 'PATHEXT', 'TEMP', 'TMP', 'TMPDIR',
+    'HOME', 'USERPROFILE', 'LOCALAPPDATA', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ'
+]);
+const SECRET_ENVIRONMENT_KEY = /(?:API.?KEY|TOKEN|AUTHORIZATION|SECRET|PASSWORD|CREDENTIAL|RIDE_CODEX_PATH|CODEX_HOME)/i;
+
+function createProbeEnvironment(
+    environment: Readonly<Record<string, string | undefined>>,
+    platform: NodeJS.Platform
+): Readonly<Record<string, string>> {
+    const safe: Record<string, string> = {};
+    let bytes = 0;
+    for (const canonicalKey of PROBE_ENVIRONMENT_KEYS) {
+        const actualKey = platform === 'win32'
+            ? Object.keys(environment).find(key => key.toLowerCase() === canonicalKey.toLowerCase())
+            : canonicalKey in environment ? canonicalKey : undefined;
+        if (!actualKey || SECRET_ENVIRONMENT_KEY.test(actualKey)) {
+            continue;
+        }
+        const value = environment[actualKey];
+        if (typeof value !== 'string' || value.includes('\0')) {
+            continue;
+        }
+        const entryBytes = Buffer.byteLength(canonicalKey) + Buffer.byteLength(value);
+        if (entryBytes > MAX_PROBE_ENVIRONMENT_VALUE_BYTES || bytes + entryBytes > MAX_PROBE_ENVIRONMENT_BYTES) {
+            continue;
+        }
+        safe[canonicalKey] = value;
+        bytes += entryBytes;
+    }
+    return Object.freeze(safe);
+}
+
+function positiveDuration(value: number | undefined, fallback: number): number {
+    return Number.isSafeInteger(value) && value! > 0 ? value! : fallback;
+}
+
 export interface RideCodexRuntimeProbeResult {
     readonly version: string;
-    readonly target: string;
 }
 
 export interface RideCodexRuntimeProbeLike {
-    probe(executable: string, target: string): Promise<RideCodexRuntimeProbeResult>;
+    probe(executable: string): Promise<RideCodexRuntimeProbeResult>;
 }
 
 export interface RideCodexRuntimeProbeOptions {
@@ -210,7 +323,7 @@ export class RideCodexRuntimeProbe implements RideCodexRuntimeProbeLike {
         this.maxOutputBytes = options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
     }
 
-    async probe(executable: string, target: string): Promise<RideCodexRuntimeProbeResult> {
+    async probe(executable: string): Promise<RideCodexRuntimeProbeResult> {
         const versionOutput = await this.runProbe(
             executable,
             ['--version'],
@@ -237,7 +350,7 @@ export class RideCodexRuntimeProbe implements RideCodexRuntimeProbeLike {
         if (!/\bUsage:\s+codex\s+app-server(?:\s|\[|$)/i.test(help)) {
             throw new Error('Codex App Server command is unavailable or returned unrecognized help.');
         }
-        return Object.freeze({ version, target });
+        return Object.freeze({ version });
     }
 
     private async runProbe(
