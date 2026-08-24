@@ -511,6 +511,47 @@ interface RuntimeTreeAttestation {
     readonly totalPathBytes: number;
 }
 
+export interface PublishedRuntimeAttestation {
+    readonly treeDigest: string;
+    readonly rootIdentity: RuntimeFilesystemIdentity;
+    readonly entries: number;
+    readonly totalReadBytes: bigint;
+    readonly totalPathBytes: number;
+}
+
+export async function attestPublishedRuntime(
+    root: string,
+    maxReadBytes: number,
+    maxEntries = MAX_RUNTIME_TREE_ENTRIES
+): Promise<PublishedRuntimeAttestation> {
+    const attestation = await attestRuntimeTree(root, maxEntries, MAX_ARCHIVE_PATH_BYTES, maxReadBytes);
+    const rootEntry = attestation.entries[0];
+    if (!rootEntry || rootEntry.path !== '.' || rootEntry.type !== 'directory') {
+        throw new RideCodexRuntimeStageError('Codex published runtime tree has no safe root attestation.');
+    }
+    const digest = createHash('sha256');
+    for (const entry of attestation.entries) {
+        digest.update(entry.path, 'utf8').update('\0');
+        digest.update(entry.type, 'utf8').update('\0');
+        digest.update(entry.identity.dev.toString()).update('\0');
+        digest.update(entry.identity.ino.toString()).update('\0');
+        digest.update(entry.identity.size.toString()).update('\0');
+        digest.update(entry.identity.birthtimeNs.toString()).update('\0');
+        digest.update(entry.identity.ctimeNs.toString()).update('\0');
+        digest.update(entry.size.toString()).update('\0');
+        digest.update(entry.digest, 'utf8').update('\0');
+    }
+    digest.update(attestation.totalReadBytes.toString()).update('\0');
+    digest.update(attestation.totalPathBytes.toString()).update('\0');
+    return Object.freeze({
+        treeDigest: `sha256-${digest.digest('hex')}`,
+        rootIdentity: rootEntry.identity,
+        entries: attestation.entries.length,
+        totalReadBytes: attestation.totalReadBytes,
+        totalPathBytes: attestation.totalPathBytes
+    });
+}
+
 function boundedTreeEntryLimit(maxArchiveEntries: number): number {
     return Math.min(MAX_RUNTIME_TREE_ENTRIES, Math.max(16, (maxArchiveEntries * 2) + 16));
 }

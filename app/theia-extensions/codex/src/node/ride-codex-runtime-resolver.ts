@@ -13,6 +13,7 @@ import {
     RideCodexRuntimeSource
 } from './ride-codex-launch-spec';
 import { RideCodexRuntimeProbe, RideCodexRuntimeProbeLike } from './ride-codex-runtime-probe';
+import type { RideCodexRuntimeStore } from './ride-codex-runtime-store';
 
 export interface RideCodexRuntimeFileStat {
     readonly size: number;
@@ -41,6 +42,7 @@ export interface RideCodexRuntimeResolverOptions {
         environment: Readonly<Record<string, string | undefined>>
     ) => MaybePromise<readonly string[]>;
     readonly readManagedActiveRuntime?: () => MaybePromise<string | undefined>;
+    readonly managedRuntimeStore?: Pick<RideCodexRuntimeStore, 'readActiveRuntime'>;
     readonly discoveryTimeoutMs?: number;
     readonly maxSystemProbes?: number;
     readonly signal?: AbortSignal;
@@ -288,7 +290,10 @@ export class RideCodexRuntimeResolver {
         this.discoverSystemCandidates = options.findSystemCandidates
             ? async environment => boundProvidedSystemCandidates(await options.findSystemCandidates!(environment))
             : environment => discoverDefaultCodexSystemCandidates(environment, this.platform);
-        this.readManagedActiveRuntime = options.readManagedActiveRuntime ?? (() => undefined);
+        this.readManagedActiveRuntime = options.readManagedActiveRuntime
+            ?? (options.managedRuntimeStore
+                ? async () => (await options.managedRuntimeStore!.readActiveRuntime())?.executable
+                : () => undefined);
         this.discoveryTimeoutMs = positiveSafeInteger(options.discoveryTimeoutMs, DEFAULT_DISCOVERY_TIMEOUT_MS);
         this.maxSystemProbes = positiveSafeInteger(options.maxSystemProbes, DEFAULT_MAX_SYSTEM_PROBES);
         this.signal = options.signal;
