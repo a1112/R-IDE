@@ -20,8 +20,11 @@ import {
     RideCodexSpawn
 } from '../src/node/ride-codex-runtime-probe';
 import {
+    discoverDefaultCodexSystemCandidates,
+    RIDE_CODEX_RUNTIME_DISCOVERY_LIMITS,
     RideCodexRuntimeFileStat,
     RideCodexRuntimeFileSystem,
+    RideCodexRuntimeConfigurationError,
     RideCodexRuntimeResolver,
     RideCodexRuntimeUnavailableError,
     targetForPlatform
@@ -326,6 +329,45 @@ test('environment and user overrides are exclusive and take priority over system
     });
 });
 
+test('explicit blank overrides fail without consulting lower-priority runtime providers', async t => {
+    for (const blank of ['', ' ', '\t']) {
+        await t.test(`RIDE_CODEX_PATH ${JSON.stringify(blank)}`, async () => {
+            const fixture = createResolver({
+                environment: { RIDE_CODEX_PATH: blank },
+                userOverride: WINDOWS_NATIVE,
+                system: [WINDOWS_NATIVE],
+                managed: WINDOWS_NATIVE
+            });
+            fixture.fs.addFile(WINDOWS_NATIVE);
+
+            await assert.rejects(
+                fixture.resolver.resolve(),
+                error => error instanceof RideCodexRuntimeConfigurationError && /empty|blank|path/i.test(error.message)
+            );
+            assert.deepEqual(fixture.counters, { environment: 1, user: 0, system: 0, managed: 0 });
+            assert.deepEqual(fixture.fs.calls, []);
+            assert.deepEqual(fixture.probe.calls, []);
+        });
+
+        await t.test(`user override ${JSON.stringify(blank)}`, async () => {
+            const fixture = createResolver({
+                userOverride: blank,
+                system: [WINDOWS_NATIVE],
+                managed: WINDOWS_NATIVE
+            });
+            fixture.fs.addFile(WINDOWS_NATIVE);
+
+            await assert.rejects(
+                fixture.resolver.resolve(),
+                error => error instanceof RideCodexRuntimeConfigurationError && /empty|blank|path/i.test(error.message)
+            );
+            assert.deepEqual(fixture.counters, { environment: 1, user: 1, system: 0, managed: 0 });
+            assert.deepEqual(fixture.fs.calls, []);
+            assert.deepEqual(fixture.probe.calls, []);
+        });
+    }
+});
+
 test('system candidates precede managed runtime and incompatible implicit candidates fall through', async () => {
     const missing = 'C:\\missing\\codex.exe';
     const incompatible = 'C:\\old\\codex.exe';
@@ -366,6 +408,82 @@ test('finds a system runtime after a realistically long PATH candidate list', as
 
     assertLaunchSpec(spec, { executable: system, source: 'system' });
     assert.deepEqual(fixture.probe.calls.map(call => call.executable), [system]);
+});
+
+test('default PATH discovery bounds tokenization, candidate generation, and filesystem checks', async t => {
+    const windowsDirectories = Array.from({ length: 2_000 }, (_, index) => `C:\\path-${index}`);
+    const windows = discoverDefaultCodexSystemCandidates(
+        { PATH: windowsDirectories.join(';') },
+        'win32'
+    );
+
+    assert.equal(windows.candidates.length, RIDE_CODEX_RUNTIME_DISCOVERY_LIMITS.maxCandidates);
+    assert.ok(windows.scannedDirectories <= RIDE_CODEX_RUNTIME_DISCOVERY_LIMITS.maxDirectories);
+    assert.ok(windows.scannedPathBytes <= RIDE_CODEX_RUNTIME_DISCOVERY_LIMITS.maxPathBytes);
+    assert.equal(windows.truncated, true);
+    assert.deepEqual(windows.candidates.slice(0, 3), [
+        'C:\\path-0\\codex.exe',
+        'C:\\path-0\\codex.cmd',
+        'C:\\path-0\\codex.ps1'
+    ]);
+    assert.ok(windows.diagnostics.length > 0);
+    assert.ok(windows.diagnostics.every((diagnostic: string) => diagnostic.length <= 160));
+
+    const posixDirectories = Array.from({ length: 2_000 }, (_, index) => `/opt/path-${index}`);
+    const posixDiscovery = discoverDefaultCodexSystemCandidates(
+        { PATH: posixDirectories.join(':') },
+        'linux'
+    );
+    assert.equal(posixDiscovery.candidates.length, RIDE_CODEX_RUNTIME_DISCOVERY_LIMITS.maxCandidates);
+    assert.equal(posixDiscovery.scannedDirectories, RIDE_CODEX_RUNTIME_DISCOVERY_LIMITS.maxDirectories);
+    assert.deepEqual(posixDiscovery.candidates.slice(0, 2), [
+        '/opt/path-0/codex',
+        '/opt/path-1/codex'
+    ]);
+    assert.equal(posixDiscovery.truncated, true);
+
+    const longDirectories = Array.from(
+        { length: 128 },
+        (_, index) => `/opt/${'a'.repeat(1_024)}-${index}`
+    );
+    const byteBounded = discoverDefaultCodexSystemCandidates(
+        { PATH: longDirectories.join(':') },
+        'linux'
+    );
+    assert.equal(byteBounded.truncated, true);
+    assert.ok(byteBounded.scannedPathBytes <= RIDE_CODEX_RUNTIME_DISCOVERY_LIMITS.maxPathBytes);
+    assert.ok(byteBounded.scannedDirectories < RIDE_CODEX_RUNTIME_DISCOVERY_LIMITS.maxDirectories);
+    assert.ok(byteBounded.candidates.length < RIDE_CODEX_RUNTIME_DISCOVERY_LIMITS.maxCandidates);
+
+    await t.test('resolver checks only the generated bound and reports truncation', async () => {
+        const fs = new VirtualFileSystem();
+        let managedCalls = 0;
+        const resolver = new RideCodexRuntimeResolver({
+            platform: 'win32',
+            arch: 'x64',
+            filesystem: fs,
+            probe: new FakeProbe(),
+            readEnvironment: () => ({ PATH: windowsDirectories.join(';') }),
+            readUserOverride: () => undefined,
+            readManagedActiveRuntime: () => {
+                managedCalls += 1;
+                return undefined;
+            }
+        });
+
+        await assert.rejects(resolver.resolve(), error => {
+            assert.ok(error instanceof RideCodexRuntimeUnavailableError);
+            const runtimeError = error as RideCodexRuntimeUnavailableError;
+            assert.ok(runtimeError.diagnostics.some(diagnostic => /truncat|limit/i.test(diagnostic)));
+            assert.ok(runtimeError.diagnostics.every(diagnostic => diagnostic.length <= 160));
+            return true;
+        });
+        assert.equal(
+            fs.calls.filter(call => call.startsWith('lstat:')).length,
+            RIDE_CODEX_RUNTIME_DISCOVERY_LIMITS.maxCandidates
+        );
+        assert.equal(managedCalls, 1);
+    });
 });
 
 test('invalid explicit overrides fail actionably without fallback or secret disclosure', async t => {

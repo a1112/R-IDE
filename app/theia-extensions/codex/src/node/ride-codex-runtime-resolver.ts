@@ -43,6 +43,20 @@ export interface RideCodexRuntimeResolverOptions {
     readonly readManagedActiveRuntime?: () => MaybePromise<string | undefined>;
 }
 
+export const RIDE_CODEX_RUNTIME_DISCOVERY_LIMITS = Object.freeze({
+    maxPathBytes: 64 * 1024,
+    maxDirectories: 512,
+    maxCandidates: 512
+});
+
+export interface RideCodexSystemCandidateDiscovery {
+    readonly candidates: readonly string[];
+    readonly diagnostics: readonly string[];
+    readonly scannedPathBytes: number;
+    readonly scannedDirectories: number;
+    readonly truncated: boolean;
+}
+
 export class RideCodexRuntimeConfigurationError extends Error {
     readonly diagnostics: readonly string[];
 
@@ -86,9 +100,10 @@ interface CandidateResolution {
 
 const MAX_DIAGNOSTICS = 8;
 const MAX_DIAGNOSTIC_LENGTH = 160;
-const MAX_SYSTEM_CANDIDATES = 512;
+const MAX_SYSTEM_CANDIDATES = RIDE_CODEX_RUNTIME_DISCOVERY_LIMITS.maxCandidates;
 const MAX_WRAPPER_BYTES = 64 * 1024;
 const MAX_MANIFEST_BYTES = 16 * 1024;
+const SYSTEM_DISCOVERY_LIMIT_DIAGNOSTIC = 'System runtime discovery: PATH scan was truncated at safe limits.';
 
 const PLATFORM_PACKAGE_BY_TARGET: Readonly<Record<string, string>> = Object.freeze({
     'x86_64-unknown-linux-musl': 'codex-linux-x64',
@@ -130,9 +145,9 @@ export class RideCodexRuntimeResolver {
     private readonly probe: RideCodexRuntimeProbeLike;
     private readonly readEnvironment: () => Readonly<Record<string, string | undefined>>;
     private readonly readUserOverride: () => MaybePromise<string | undefined>;
-    private readonly findSystemCandidates: (
+    private readonly discoverSystemCandidates: (
         environment: Readonly<Record<string, string | undefined>>
-    ) => MaybePromise<readonly string[]>;
+    ) => MaybePromise<RideCodexSystemCandidateDiscovery>;
     private readonly readManagedActiveRuntime: () => MaybePromise<string | undefined>;
     private resolution: Promise<RideCodexLaunchSpec> | undefined;
 
@@ -143,8 +158,9 @@ export class RideCodexRuntimeResolver {
         this.probe = options.probe ?? new RideCodexRuntimeProbe();
         this.readEnvironment = options.readEnvironment ?? (() => process.env);
         this.readUserOverride = options.readUserOverride ?? (() => undefined);
-        this.findSystemCandidates = options.findSystemCandidates
-            ?? (environment => defaultSystemCandidates(environment, this.platform));
+        this.discoverSystemCandidates = options.findSystemCandidates
+            ? async environment => boundProvidedSystemCandidates(await options.findSystemCandidates!(environment))
+            : environment => discoverDefaultCodexSystemCandidates(environment, this.platform);
         this.readManagedActiveRuntime = options.readManagedActiveRuntime ?? (() => undefined);
     }
 
@@ -158,18 +174,22 @@ export class RideCodexRuntimeResolver {
     private async resolveOnce(): Promise<RideCodexLaunchSpec> {
         const target = targetForPlatform(this.platform, this.arch);
         const environment = this.readEnvironment();
-        const environmentOverride = normalizeOptionalCandidate(readEnvironmentValue(environment, 'RIDE_CODEX_PATH'));
-        if (environmentOverride) {
+        const environmentOverride = readEnvironmentValue(environment, 'RIDE_CODEX_PATH');
+        if (environmentOverride !== undefined) {
             return this.resolveExplicit(environmentOverride, target);
         }
 
-        const userOverride = normalizeOptionalCandidate(await this.readUserOverride());
-        if (userOverride) {
+        const userOverride = await this.readUserOverride();
+        if (userOverride !== undefined) {
             return this.resolveExplicit(userOverride, target);
         }
 
+        const discovery = await this.discoverSystemCandidates(environment);
         const diagnostics: string[] = [];
-        const systemCandidates = (await this.findSystemCandidates(environment)).slice(0, MAX_SYSTEM_CANDIDATES);
+        for (const diagnostic of discovery.diagnostics) {
+            addDiagnostic(diagnostics, diagnostic);
+        }
+        const systemCandidates = discovery.candidates;
         for (let index = 0; index < systemCandidates.length; index += 1) {
             const candidate = normalizeOptionalCandidate(systemCandidates[index]);
             if (!candidate) {
@@ -199,8 +219,12 @@ export class RideCodexRuntimeResolver {
     }
 
     private async resolveExplicit(candidate: string, target: string): Promise<RideCodexLaunchSpec> {
+        const normalized = candidate.trim();
+        if (!normalized) {
+            throw new RideCodexRuntimeConfigurationError('Codex path is empty.');
+        }
         try {
-            return await this.resolveCandidate(candidate, 'override', target, []);
+            return await this.resolveCandidate(normalized, 'override', target, []);
         } catch (error) {
             throw new RideCodexRuntimeConfigurationError(reasonFromError(error));
         }
@@ -423,24 +447,40 @@ export function targetForPlatform(platform: NodeJS.Platform, arch: string): stri
     }
 }
 
-function defaultSystemCandidates(
+export function discoverDefaultCodexSystemCandidates(
     environment: Readonly<Record<string, string | undefined>>,
     platform: NodeJS.Platform
-): readonly string[] {
+): RideCodexSystemCandidateDiscovery {
     const pathValue = readEnvironmentValue(environment, 'PATH');
     if (!pathValue) {
-        return [];
+        return createSystemCandidateDiscovery([], 0, 0, false);
     }
     const paths = platform === 'win32' ? win32 : posix;
     const delimiter = platform === 'win32' ? ';' : ':';
     const names = platform === 'win32' ? ['codex.exe', 'codex.cmd', 'codex.ps1'] : ['codex'];
     const candidates: string[] = [];
     const seen = new Set<string>();
-    for (const directory of pathValue.split(delimiter)) {
-        if (!directory || !paths.isAbsolute(directory)) {
-            continue;
+    let scannedPathBytes = 0;
+    let scannedDirectories = 0;
+    let tokenStart = 0;
+    let index = 0;
+    let truncated = false;
+
+    const addDirectory = (directory: string, hasUnscannedPath: boolean): void => {
+        if (scannedDirectories >= RIDE_CODEX_RUNTIME_DISCOVERY_LIMITS.maxDirectories) {
+            truncated = true;
+            return;
         }
-        for (const name of names) {
+        scannedDirectories += 1;
+        if (!directory || !paths.isAbsolute(directory)) {
+            return;
+        }
+        for (let nameIndex = 0; nameIndex < names.length; nameIndex += 1) {
+            if (candidates.length >= RIDE_CODEX_RUNTIME_DISCOVERY_LIMITS.maxCandidates) {
+                truncated = hasUnscannedPath || nameIndex < names.length;
+                return;
+            }
+            const name = names[nameIndex];
             const candidate = paths.normalize(paths.join(directory, name));
             const key = platform === 'win32' ? candidate.toLowerCase() : candidate;
             if (!seen.has(key)) {
@@ -448,8 +488,76 @@ function defaultSystemCandidates(
                 candidates.push(candidate);
             }
         }
+    };
+
+    while (index < pathValue.length && !truncated) {
+        const codePoint = pathValue.codePointAt(index)!;
+        const codeUnitLength = codePoint > 0xffff ? 2 : 1;
+        const byteLength = utf8CodePointByteLength(codePoint);
+        if (scannedPathBytes + byteLength > RIDE_CODEX_RUNTIME_DISCOVERY_LIMITS.maxPathBytes) {
+            truncated = true;
+            break;
+        }
+        const character = pathValue.slice(index, index + codeUnitLength);
+        scannedPathBytes += byteLength;
+        if (character === delimiter) {
+            addDirectory(pathValue.slice(tokenStart, index), index + codeUnitLength < pathValue.length);
+            tokenStart = index + codeUnitLength;
+            if (scannedDirectories >= RIDE_CODEX_RUNTIME_DISCOVERY_LIMITS.maxDirectories
+                && tokenStart < pathValue.length) {
+                truncated = true;
+            }
+        }
+        index += codeUnitLength;
     }
-    return candidates;
+
+    if (!truncated && index === pathValue.length) {
+        addDirectory(pathValue.slice(tokenStart), false);
+    }
+    return createSystemCandidateDiscovery(
+        candidates,
+        scannedPathBytes,
+        scannedDirectories,
+        truncated
+    );
+}
+
+function boundProvidedSystemCandidates(candidates: readonly string[]): RideCodexSystemCandidateDiscovery {
+    const truncated = candidates.length > MAX_SYSTEM_CANDIDATES;
+    return createSystemCandidateDiscovery(
+        candidates.slice(0, MAX_SYSTEM_CANDIDATES),
+        0,
+        0,
+        truncated
+    );
+}
+
+function createSystemCandidateDiscovery(
+    candidates: readonly string[],
+    scannedPathBytes: number,
+    scannedDirectories: number,
+    truncated: boolean
+): RideCodexSystemCandidateDiscovery {
+    return Object.freeze({
+        candidates: Object.freeze([...candidates]),
+        diagnostics: Object.freeze(truncated ? [SYSTEM_DISCOVERY_LIMIT_DIAGNOSTIC] : []),
+        scannedPathBytes,
+        scannedDirectories,
+        truncated
+    });
+}
+
+function utf8CodePointByteLength(codePoint: number): number {
+    if (codePoint <= 0x7f) {
+        return 1;
+    }
+    if (codePoint <= 0x7ff) {
+        return 2;
+    }
+    if (codePoint <= 0xffff) {
+        return 3;
+    }
+    return 4;
 }
 
 function readEnvironmentValue(
