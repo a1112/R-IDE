@@ -208,6 +208,52 @@ test('dispatches approved server requests and replies method-not-found to unknow
     client.dispose();
 });
 
+test('treats reviewed server messages without params as fatal malformed envelopes', async t => {
+    const cases: ReadonlyArray<{
+        name: string;
+        data: string;
+        subscribe(client: RideCodexJsonlClient): () => number;
+    }> = [
+        {
+            name: 'reviewed notification',
+            data: '{"method":"thread/started"}\n',
+            subscribe: client => {
+                const notifications: unknown[] = [];
+                client.onNotification(notification => notifications.push(notification));
+                return () => notifications.length;
+            }
+        },
+        {
+            name: 'approved server request',
+            data: '{"id":"approval-1","method":"item/commandExecution/requestApproval"}\n',
+            subscribe: client => {
+                const requests: unknown[] = [];
+                client.onServerRequest(request => requests.push(request));
+                return () => requests.length;
+            }
+        }
+    ];
+
+    for (const entry of cases) {
+        await t.test(entry.name, async () => {
+            const transport = new FakeTransport();
+            const client = new RideCodexJsonlClient(transport);
+            const dispatchCount = entry.subscribe(client);
+            const pending = client.request('initialize', {});
+
+            transport.emitData(entry.data);
+
+            await assert.rejects(pending, /protocol|envelope|params/i);
+            assert.equal(dispatchCount(), 0);
+            assert.equal(client.pendingCount, 0);
+            assert.equal(transport.closeCalls, 1);
+            assert.equal(transport.listenerCount, 0);
+            client.dispose();
+            assert.equal(transport.closeCalls, 1);
+        });
+    }
+});
+
 test('rejects remote errors and cleans the pending request', async () => {
     const transport = new FakeTransport();
     const client = new RideCodexJsonlClient(transport);

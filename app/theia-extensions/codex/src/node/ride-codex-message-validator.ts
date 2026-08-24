@@ -63,8 +63,11 @@ export function validateRideCodexIncomingMessage(value: unknown): RideCodexIncom
         if (hasOwn(value, 'result') || hasOwn(value, 'error')) {
             throw envelopeError('request and notification messages cannot contain response payloads');
         }
+        if (!hasOwn(value, 'params')) {
+            throw envelopeError('request and notification messages must contain params');
+        }
 
-        const params = hasOwn(value, 'params') ? value.params : undefined;
+        const params = value.params;
         if (hasId) {
             if (!isRequestId(value.id)) {
                 throw envelopeError('server request ID must be a string or safe integer');
