@@ -24,11 +24,21 @@ import { requiredRuntimeStageBytes } from './ride-codex-runtime-stager';
 
 const INSTALL_CONSENT_TOKEN_BRAND: unique symbol = Symbol('ride-codex-install-consent-token');
 const INSTALL_AUTHORIZATION_MARKER: unique symbol = Symbol('ride-codex-install-authorization');
+const INSTALL_TRANSACTION_AUTHORIZATION_MARKER: unique symbol = Symbol('ride-codex-install-transaction-authorization');
 export type InstallConsentToken = Readonly<{ readonly [INSTALL_CONSENT_TOKEN_BRAND]: true }>;
+export type InstallTransactionAuthorization = Readonly<{
+    readonly [INSTALL_TRANSACTION_AUTHORIZATION_MARKER]: true;
+}>;
+
+export interface ConsumedInstallTransactionAuthorization {
+    readonly presentation: InstallPresentation;
+    readonly canonicalRoot: string;
+}
 
 export interface ConsumedInstallConsent {
     readonly presentation: InstallPresentation;
     readonly authorization: InstallAuthorization;
+    readonly transactionAuthorization: InstallTransactionAuthorization;
 }
 
 export interface RideCodexInstallConsentOptions {
@@ -43,15 +53,18 @@ interface ConsentRecord {
 }
 
 interface AuthorizationRecord {
+    readonly presentation: InstallPresentation;
     readonly target: string;
     readonly manifestDigest: string;
     readonly canonicalRoot: string;
     readonly issuedAt: number;
     readonly expiresAt: number;
+    readonly now: () => number;
 }
 
 const DEFAULT_TTL_MS = 60_000;
 const MAX_TTL_MS = 5 * 60_000;
+const TRANSACTION_AUTHORIZATIONS = new WeakMap<object, AuthorizationRecord>();
 
 export class RideCodexInstallConsentError extends Error {
     constructor(message = 'Matching Codex install consent is required.') {
@@ -109,14 +122,21 @@ export class RideCodexInstallConsent {
             }
         }
         const authorization = Object.freeze({ [INSTALL_AUTHORIZATION_MARKER]: true }) as InstallAuthorization;
-        this.authorizations.set(authorization, Object.freeze({
+        const transactionAuthorization = Object.freeze({
+            [INSTALL_TRANSACTION_AUTHORIZATION_MARKER]: true
+        }) as InstallTransactionAuthorization;
+        const authorizationRecord = Object.freeze({
+            presentation: record.presentation,
             target: record.presentation.target,
             manifestDigest: record.presentation.manifestDigest,
             canonicalRoot: resolve(record.presentation.installRoot),
             issuedAt: record.issuedAt,
-            expiresAt: record.expiresAt
-        }));
-        return Object.freeze({ presentation: record.presentation, authorization });
+            expiresAt: record.expiresAt,
+            now: () => this.readClock()
+        });
+        this.authorizations.set(authorization, authorizationRecord);
+        TRANSACTION_AUTHORIZATIONS.set(transactionAuthorization, authorizationRecord);
+        return Object.freeze({ presentation: record.presentation, authorization, transactionAuthorization });
     }
 
     private consumeAuthorization(
@@ -158,6 +178,38 @@ export class RideCodexInstallConsent {
         }
         return now;
     }
+}
+
+export function consumeInstallTransactionAuthorization(
+    authorization: InstallTransactionAuthorization,
+    presentation: InstallPresentation
+): ConsumedInstallTransactionAuthorization | undefined {
+    if (typeof authorization !== 'object' || !authorization) {
+        return undefined;
+    }
+    const record = TRANSACTION_AUTHORIZATIONS.get(authorization);
+    if (!record) {
+        return undefined;
+    }
+    TRANSACTION_AUTHORIZATIONS.delete(authorization);
+    let now: number;
+    let expected: InstallPresentation;
+    try {
+        now = record.now();
+        expected = snapshotPresentation(presentation);
+    } catch {
+        return undefined;
+    }
+    if (!Number.isFinite(now)
+        || now < record.issuedAt
+        || now >= record.expiresAt
+        || !presentationsEqual(record.presentation, expected)) {
+        return undefined;
+    }
+    return Object.freeze({
+        presentation: record.presentation,
+        canonicalRoot: record.canonicalRoot
+    });
 }
 
 function snapshotPresentation(presentation: InstallPresentation): InstallPresentation {

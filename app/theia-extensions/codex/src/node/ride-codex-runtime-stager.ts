@@ -44,6 +44,21 @@ const MAX_TAR_OVERHEAD_BYTES = 64 * 1024;
 const MAX_RUNTIME_TREE_ENTRIES = 262_144;
 const MAX_RUNTIME_TREE_TOTAL_PATH_BYTES = 16 * 1024 * 1024;
 const RUNTIME_TREE_READ_BUFFER_BYTES = 64 * 1024;
+const STAGED_RUNTIME_PROVENANCE = new WeakMap<object, StagedRuntimeProvenance>();
+
+interface StagedRuntimeProvenance {
+    consumed: boolean;
+    readonly target: RuntimeTarget;
+    readonly manifestDigest: string;
+    readonly canonicalRoot: string;
+    readonly revalidate: () => Promise<void>;
+}
+
+export interface StagedRuntimePublicationContext {
+    readonly target: RuntimeTarget;
+    readonly manifestDigest: string;
+    readonly canonicalRoot: string;
+}
 
 export interface RideCodexStatFs {
     readonly bsize: number | bigint;
@@ -283,7 +298,7 @@ export class RideCodexRuntimeStager {
                 throw new RideCodexRuntimeStageError('Codex staged runtime tree attestation changed or is unsafe.');
             }
         };
-        return Object.freeze({
+        const staged = Object.freeze({
             stagingDirectory,
             packageRoot,
             executable,
@@ -302,7 +317,35 @@ export class RideCodexRuntimeStager {
             stagingIdentity: stagingBoundary.identity,
             revalidate
         });
+        STAGED_RUNTIME_PROVENANCE.set(staged, {
+            consumed: false,
+            target: runtime.target,
+            manifestDigest: authorizationContext.manifestDigest,
+            canonicalRoot: authorizationContext.canonicalRoot,
+            revalidate
+        });
+        return staged;
     }
+}
+
+export async function consumeStagedRuntimeForPublication(
+    staged: StagedRuntime,
+    context: StagedRuntimePublicationContext
+): Promise<void> {
+    if (typeof staged !== 'object' || !staged) {
+        throw new RideCodexRuntimeStageError('Codex staged runtime provenance is invalid.');
+    }
+    const provenance = STAGED_RUNTIME_PROVENANCE.get(staged);
+    if (!provenance || provenance.consumed) {
+        throw new RideCodexRuntimeStageError('Codex staged runtime provenance is invalid or already used.');
+    }
+    provenance.consumed = true;
+    if (provenance.target !== context.target
+        || provenance.manifestDigest !== context.manifestDigest
+        || !samePath(provenance.canonicalRoot, context.canonicalRoot)) {
+        throw new RideCodexRuntimeStageError('Codex staged runtime provenance does not match the installation transaction.');
+    }
+    await provenance.revalidate();
 }
 
 type DirectoryStat = BigIntStats;

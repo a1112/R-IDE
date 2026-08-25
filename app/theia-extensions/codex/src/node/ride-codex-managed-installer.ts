@@ -119,96 +119,107 @@ export class RideCodexManagedInstaller {
                 'Codex install consent does not match the reviewed runtime manifest.'
             );
         }
-        return this.store.withTransaction(async () => {
-            let sequence = 0;
-            let staged: StagedRuntime | undefined;
-            let published: PublishedManagedRuntime | undefined;
-            let activatedRuntime: ValidatedManagedRuntime | undefined;
-            let previous: ValidatedManagedRuntime | undefined;
-            const progress = (state: InstallProgress['state']): void => {
-                const update = createRideCodexInstallProgress(state, presentation, sequence++);
+        return this.store.withAuthorizedTransaction(
+            consumed.transactionAuthorization,
+            presentation,
+            async transaction => {
+                let sequence = 0;
+                let staged: StagedRuntime | undefined;
+                let published: PublishedManagedRuntime | undefined;
+                let activatedRuntime: ValidatedManagedRuntime | undefined;
+                let previous: ValidatedManagedRuntime | undefined;
+                const progress = (state: InstallProgress['state']): void => {
+                    const update = createRideCodexInstallProgress(state, presentation, sequence++);
+                    try {
+                        this.onProgress?.(update);
+                    } catch {
+                        // UI observers cannot influence the installation transaction.
+                    }
+                };
+
                 try {
-                    this.onProgress?.(update);
+                    await this.store.recover(transaction);
+                    progress('downloading');
+                    staged = await this.stager.stage(
+                        consumed.authorization,
+                        presentation.target as RuntimeTarget,
+                        presentation
+                    );
+                    progress('verifying');
+                    previous = await this.store.readActiveRuntime();
+                    published = await this.store.publish(transaction, staged, presentation, previous);
+                    progress('activating');
+                    activatedRuntime = await this.store.activate(transaction, published, previous);
+                    this.safeInvalidateResolver();
                 } catch {
-                    // UI observers cannot influence the installation transaction.
+                    if (published && !activatedRuntime) {
+                        await this.store.discard(transaction, published).catch(() => undefined);
+                    } else if (staged && !published) {
+                        await this.store.recover(transaction).catch(() => undefined);
+                    }
+                    progress('failed');
+                    throw new RideCodexManagedInstallError([
+                        createRideCodexInstallDiagnostic('activation-failed', 'Codex runtime activation failed safely.')
+                    ]);
                 }
-            };
 
-            try {
-                await this.store.recover();
-                progress('downloading');
-                staged = await this.stager.stage(
-                    consumed.authorization,
-                    presentation.target as RuntimeTarget,
-                    presentation
-                );
-                progress('verifying');
-                await staged.revalidate();
-                previous = await this.store.readActiveRuntime();
-                published = await this.store.publish(staged, presentation, previous);
-                progress('activating');
-                activatedRuntime = await this.store.activate(published, previous);
-                this.safeInvalidateResolver();
-            } catch {
-                if (published && !activatedRuntime) {
-                    await this.store.discard(published).catch(() => undefined);
-                } else if (staged && !published) {
-                    await this.store.recover().catch(() => undefined);
-                }
-                progress('failed');
-                throw new RideCodexManagedInstallError([
-                    createRideCodexInstallDiagnostic('activation-failed', 'Codex runtime activation failed safely.')
-                ]);
-            }
-
-            let primaryDiagnostic: InstallDiagnostic | undefined;
-            try {
-                await this.handshake(activatedRuntime!, Object.freeze({ failHandshake: options.failHandshake === true }));
-            } catch {
-                primaryDiagnostic = createRideCodexInstallDiagnostic(
-                    'handshake-failed',
-                    'Codex App Server handshake failed.'
-                );
-            }
-            if (!primaryDiagnostic) {
+                let primaryDiagnostic: InstallDiagnostic | undefined;
+                let handshakeCompletion: Awaited<ReturnType<RideCodexRuntimeStore['completeHandshake']>> | undefined;
                 try {
-                    activatedRuntime = await this.store.finalizeActivation(activatedRuntime!);
+                    handshakeCompletion = await this.store.completeHandshake(
+                        transaction,
+                        activatedRuntime!,
+                        runtime => this.handshake(
+                            runtime,
+                            Object.freeze({ failHandshake: options.failHandshake === true })
+                        )
+                    );
                 } catch {
                     primaryDiagnostic = createRideCodexInstallDiagnostic(
-                        'finalize-failed',
-                        'Codex runtime activation could not be finalized safely.'
+                        'handshake-failed',
+                        'Codex App Server handshake failed.'
                     );
                 }
-            }
-            if (primaryDiagnostic) {
-                const diagnostics: InstallDiagnostic[] = [primaryDiagnostic];
-                try {
-                    await this.store.restore(previous, published!);
-                    this.safeInvalidateResolver();
-                    progress('rolled-back');
-                } catch {
-                    diagnostics.push(createRideCodexInstallDiagnostic(
-                        'rollback-failed',
-                        'Codex runtime rollback also failed; the active pointer requires safe recovery.'
-                    ));
+                if (!primaryDiagnostic) {
+                    try {
+                        activatedRuntime = await this.store.finalizeActivation(transaction, handshakeCompletion!);
+                    } catch {
+                        primaryDiagnostic = createRideCodexInstallDiagnostic(
+                            'finalize-failed',
+                            'Codex runtime activation could not be finalized safely.'
+                        );
+                    }
                 }
-                progress('failed');
-                throw new RideCodexManagedInstallError(diagnostics);
-            }
+                if (primaryDiagnostic) {
+                    const diagnostics: InstallDiagnostic[] = [primaryDiagnostic];
+                    try {
+                        await this.store.restore(transaction, previous, published!);
+                        this.safeInvalidateResolver();
+                        progress('rolled-back');
+                    } catch {
+                        diagnostics.push(createRideCodexInstallDiagnostic(
+                            'rollback-failed',
+                            'Codex runtime rollback also failed; the active pointer requires safe recovery.'
+                        ));
+                    }
+                    progress('failed');
+                    throw new RideCodexManagedInstallError(diagnostics);
+                }
 
-            const retainedPrevious = previous
-                ? await this.store.revalidate(previous).catch(() => undefined)
-                : undefined;
-            progress('ready');
-            return Object.freeze({
-                state: 'ready' as const,
-                version: activatedRuntime!.version,
-                target: presentation.target,
-                executable: activatedRuntime!.executable,
-                ...(retainedPrevious ? { previousVersion: retainedPrevious.version } : {}),
-                diagnostics: Object.freeze([])
-            });
-        });
+                const retainedPrevious = previous
+                    ? await this.store.revalidate(previous).catch(() => undefined)
+                    : undefined;
+                progress('ready');
+                return Object.freeze({
+                    state: 'ready' as const,
+                    version: activatedRuntime!.version,
+                    target: presentation.target,
+                    executable: activatedRuntime!.executable,
+                    ...(retainedPrevious ? { previousVersion: retainedPrevious.version } : {}),
+                    diagnostics: Object.freeze([])
+                });
+            }
+        );
     }
 
     private safeInvalidateResolver(): void {

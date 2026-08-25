@@ -9,7 +9,12 @@ import { BigIntStats, constants as fsConstants, promises as fs } from 'node:fs';
 import { isAbsolute, join, posix, relative, resolve } from 'node:path';
 import { InstallPresentation } from '../common/ride-codex-installation';
 import {
+    consumeInstallTransactionAuthorization,
+    InstallTransactionAuthorization
+} from './ride-codex-install-consent';
+import {
     attestPublishedRuntime,
+    consumeStagedRuntimeForPublication,
     PublishedRuntimeAttestation,
     RuntimeFilesystemIdentity,
     runtimeFilesystemIdentitiesEqual,
@@ -37,6 +42,9 @@ export interface RideCodexRuntimeStoreTestHooks {
     afterPublishRename?(publishedPath: string): void | Promise<void>;
     afterFinalizingJournalWrite?(pendingPath: string): void | Promise<void>;
     afterObsoleteQuarantine?(relativePath: string, quarantinePath: string): void | Promise<void>;
+    afterRollbackCandidateQuarantine?(quarantinePath: string): void | Promise<void>;
+    afterPublishingCandidateQuarantine?(quarantinePath: string): void | Promise<void>;
+    beforePendingCommitSync?(kind: PendingActivationCommitKind, root: string): void | Promise<void>;
 }
 
 export interface RideCodexRuntimeStoreOptions {
@@ -57,6 +65,43 @@ export interface ValidatedManagedRuntime {
 
 export interface PublishedManagedRuntime extends ValidatedManagedRuntime {
     readonly pointer: ActiveRuntimePointer;
+}
+
+const RUNTIME_STORE_TRANSACTION_BRAND: unique symbol = Symbol('ride-codex-runtime-store-transaction');
+const RUNTIME_HANDSHAKE_COMPLETION_BRAND: unique symbol = Symbol('ride-codex-runtime-handshake-completion');
+
+export type RideCodexRuntimeStoreTransaction = Readonly<{
+    readonly [RUNTIME_STORE_TRANSACTION_BRAND]: true;
+}>;
+
+export type RideCodexHandshakeCompletion = Readonly<{
+    readonly [RUNTIME_HANDSHAKE_COMPLETION_BRAND]: true;
+}>;
+
+interface StoreTransactionRecord {
+    active: boolean;
+    accepting: boolean;
+    readonly presentation: InstallPresentation;
+    readonly operations: Set<Promise<unknown>>;
+    published?: PublishedManagedRuntime;
+    activated?: ValidatedManagedRuntime;
+}
+
+interface PublishedRuntimeRecord {
+    readonly transaction: StoreTransactionRecord;
+    activated: boolean;
+}
+
+interface HandshakeCompletionRecord {
+    readonly transaction: StoreTransactionRecord;
+    readonly runtime: ValidatedManagedRuntime;
+    consumed: boolean;
+}
+
+interface CommittedPendingQuarantine {
+    readonly path: string;
+    readonly identity: RuntimeFilesystemIdentity;
+    readonly pending: PendingActivationTransaction;
 }
 
 interface SerializedRuntimeIdentity {
@@ -111,6 +156,7 @@ const PENDING_KEYS = Object.freeze([
     'stagingRelativePath', 'transactionId'
 ].sort());
 const ROOT_LOCKS = new Map<string, RootLock>();
+const MAX_TRANSACTION_OPERATIONS = 16;
 
 export class RideCodexRuntimeStoreError extends Error {
     constructor(message: string) {
@@ -123,6 +169,9 @@ export class RideCodexRuntimeStore {
     readonly installRoot: string;
     private readonly trustedRuntimeBase: string;
     private readonly testHooks: RideCodexRuntimeStoreTestHooks;
+    private readonly transactions = new WeakMap<object, StoreTransactionRecord>();
+    private readonly publishedRuntimes = new WeakMap<object, PublishedRuntimeRecord>();
+    private readonly handshakeCompletions = new WeakMap<object, HandshakeCompletionRecord>();
 
     constructor(options: RideCodexRuntimeStoreOptions) {
         if (!isAbsolute(options.trustedRuntimeBase) || !isAbsolute(options.runtimeRoot)
@@ -135,7 +184,55 @@ export class RideCodexRuntimeStore {
         this.testHooks = options.testHooks ?? Object.freeze({});
     }
 
-    async withTransaction<T>(operation: () => Promise<T>): Promise<T> {
+    async withAuthorizedTransaction<T>(
+        authorization: InstallTransactionAuthorization,
+        presentation: InstallPresentation,
+        operation: (transaction: RideCodexRuntimeStoreTransaction) => Promise<T>
+    ): Promise<T> {
+        if (typeof operation !== 'function') {
+            throw new RideCodexRuntimeStoreError('Codex install transaction operation is invalid.');
+        }
+        return this.withRootLock(async () => {
+            const authorized = consumeInstallTransactionAuthorization(authorization, presentation);
+            if (!authorized || !samePath(authorized.canonicalRoot, this.installRoot)) {
+                throw new RideCodexRuntimeStoreError(
+                    'Codex install consent transaction authorization is invalid, expired, or already used.'
+                );
+            }
+            const transaction = Object.freeze({}) as RideCodexRuntimeStoreTransaction;
+            const record: StoreTransactionRecord = {
+                active: true,
+                accepting: true,
+                presentation: authorized.presentation,
+                operations: new Set()
+            };
+            this.transactions.set(transaction, record);
+            let result: T | undefined;
+            let callbackFailure: unknown;
+            let callbackRejected = false;
+            try {
+                result = await operation(transaction);
+            } catch (error) {
+                callbackRejected = true;
+                callbackFailure = error;
+            }
+            record.accepting = false;
+            const settlements = await Promise.allSettled([...record.operations]);
+            record.active = false;
+            if (callbackRejected) {
+                throw callbackFailure;
+            }
+            const operationFailure = settlements.find(
+                (settlement): settlement is PromiseRejectedResult => settlement.status === 'rejected'
+            );
+            if (operationFailure) {
+                throw operationFailure.reason;
+            }
+            return result as T;
+        });
+    }
+
+    private async withRootLock<T>(operation: () => Promise<T>): Promise<T> {
         const key = pathKey(this.installRoot);
         let lock = ROOT_LOCKS.get(key);
         if (!lock) {
@@ -145,9 +242,26 @@ export class RideCodexRuntimeStore {
         return lock.run(operation);
     }
 
-    async recover(): Promise<void> {
+    async recover(transaction?: RideCodexRuntimeStoreTransaction): Promise<void> {
+        if (transaction) {
+            return this.trackTransactionOperation(transaction, () => this.recoverUnlocked());
+        }
+        return this.withRootLock(() => this.recoverUnlocked());
+    }
+
+    private async recoverUnlocked(): Promise<void> {
         const boundary = await this.ensureWritableBoundary();
-        const pending = await this.readPendingActivation(boundary);
+        let pending = await this.readPendingActivation(boundary);
+        const committedPending = await this.readCommittedPendingQuarantine(boundary);
+        if (pending && committedPending) {
+            throw new RideCodexRuntimeStoreError(
+                'Codex runtime store contains both active and quarantined recovery journals.'
+            );
+        }
+        if (!pending && committedPending) {
+            await this.recoverCommittedPendingQuarantine(committedPending, boundary);
+            pending = await this.readPendingActivation(boundary);
+        }
         if (pending) {
             if (pending.phase === 'publishing') {
                 await this.recoverPublishing(pending, boundary);
@@ -159,6 +273,12 @@ export class RideCodexRuntimeStore {
         }
         const entries = await boundedDirectoryEntries(boundary.root);
         for (const entry of entries) {
+            if (entry.startsWith('.install-quarantine-pending-')) {
+                // Pending journals are recovery authority, not generic cleanup. A
+                // best-effort deletion failure is retried through the validated
+                // committed-journal path on the next recovery pass.
+                continue;
+            }
             if (!entry.startsWith('.staging-')
                 && !entry.startsWith('active.json.tmp-')
                 && !entry.startsWith('pending-activation.json.tmp-')
@@ -311,207 +431,284 @@ export class RideCodexRuntimeStore {
     }
 
     async publish(
+        transaction: RideCodexRuntimeStoreTransaction,
         staged: StagedRuntime,
         presentation: InstallPresentation,
         expectedPrevious?: ValidatedManagedRuntime
     ): Promise<PublishedManagedRuntime> {
-        const expectedPreviousWasSpecified = arguments.length >= 3;
-        const boundary = await this.ensureWritableBoundary();
-        if (await this.readPendingActivation(boundary)) {
-            throw new RideCodexRuntimeStoreError('Codex managed runtime transaction already requires recovery.');
-        }
-        const activePointer = await this.readActivePointer(boundary);
-        const previous = activePointer ? await this.validatePointer(activePointer, boundary) : undefined;
-        if (expectedPreviousWasSpecified
-            && !optionalPointersEqual(previous?.pointer, expectedPrevious?.pointer)) {
-            throw new RideCodexRuntimeStoreError('Codex active runtime changed before publishing.');
-        }
-        if (!samePath(presentation.installRoot, boundary.root)
-            || staged.version !== presentation.version
-            || staged.target !== presentation.target
-            || staged.authorizationContext.target !== presentation.target
-            || staged.authorizationContext.manifestDigest !== presentation.manifestDigest
-            || !samePath(staged.authorizationContext.canonicalRoot, boundary.root)) {
-            throw new RideCodexRuntimeStoreError('Codex staged runtime does not match its consented presentation.');
-        }
-        await staged.revalidate();
-        const staging = resolve(staged.stagingDirectory);
-        requireStrictChild(boundary.root, staging);
-        if (!/^\.staging-[0-9a-f-]+$/i.test(staging.slice(boundary.root.length + 1))) {
-            throw new RideCodexRuntimeStoreError('Codex staged runtime has a non-canonical staging path.');
-        }
-        const stagingStat = await safeLstat(staging, 'Codex staged runtime directory is missing.');
-        requireRegularDirectory(stagingStat, 'Codex staged runtime directory is unsafe.');
-        const stagingCanonical = await safeRealpath(staging, 'Codex staged runtime directory could not be resolved safely.');
-        if (!samePath(stagingCanonical, staging)
-            || !stableDirectoryIdentityEqual(filesystemIdentity(stagingStat), staged.stagingIdentity)) {
-            throw new RideCodexRuntimeStoreError('Codex staged runtime identity is invalid.');
-        }
-        const executableRelativePath = safeRelativeRuntimePath(staging, staged.executable);
-        if (executableRelativePath !== expectedExecutableRelativePath(presentation.target)) {
-            throw new RideCodexRuntimeStoreError('Codex staged runtime executable path is inconsistent.');
-        }
-        const versionsRoot = await boundary.requireVersions(true);
-        const relativePath = versionRelativePath(presentation.version, presentation.target, presentation.manifestDigest);
-        const directory = resolve(boundary.root, ...relativePath.split('/'));
-        requireStrictChild(versionsRoot!, directory);
-        if (await pathExists(directory)) {
-            throw new RideCodexRuntimeStoreError('Codex runtime version directory already exists.');
-        }
-        const stagingAttestation = await attestPublishedRuntime(staging, staged.unpackedBytes);
-        if (!stableDirectoryIdentityEqual(stagingAttestation.rootIdentity, staged.stagingIdentity)) {
-            throw new RideCodexRuntimeStoreError('Codex staged runtime identity changed before publishing.');
-        }
-        const intentPointer = createActivePointer(
-            presentation,
-            relativePath,
-            executableRelativePath,
-            stagingAttestation
-        );
-        const stagingRelativePath = relative(boundary.root, staging).split(/[/\\]/).join('/');
-        if (!/^\.staging-[0-9a-f-]+$/i.test(stagingRelativePath)) {
-            throw new RideCodexRuntimeStoreError('Codex staged runtime has a non-canonical journal path.');
-        }
-        let pending = createPendingActivation(
-            'publishing',
-            intentPointer,
-            previous?.pointer,
-            stagingRelativePath,
-            staged.stagingIdentity
-        );
-        await this.writePendingActivation(pending, boundary);
-        await this.testHooks.afterPublishingJournalWrite?.(join(boundary.root, PENDING_ACTIVATION));
-        await boundary.verify();
-        await fs.rename(staging, directory);
-        await syncDirectory(versionsRoot!);
-        await boundary.verify();
-        await this.testHooks.afterPublishRename?.(directory);
-        const movedStat = await safeLstat(directory, 'Codex published runtime directory is missing.');
-        requireRegularDirectory(movedStat, 'Codex published runtime directory is unsafe.');
-        if (!stableDirectoryIdentityEqual(filesystemIdentity(movedStat), staged.stagingIdentity)
-            || !samePath(await safeRealpath(directory, 'Codex published runtime could not be resolved safely.'), directory)) {
-            throw new RideCodexRuntimeStoreError('Codex published runtime identity changed during activation.');
-        }
-        const attestation = await attestPublishedRuntime(directory, staged.unpackedBytes);
-        const executable = resolve(directory, ...executableRelativePath.split('/'));
-        requireStrictChild(directory, executable);
-        const pointer = createActivePointer(presentation, relativePath, executableRelativePath, attestation);
-        const awaitingHandshake = transitionPendingActivation(pending, 'awaiting-handshake', pointer);
-        await this.replacePendingActivation(pending, awaitingHandshake, boundary);
-        pending = awaitingHandshake;
-        await boundary.verify();
-        return Object.freeze({
-            version: presentation.version,
-            target: presentation.target,
-            manifestDigest: presentation.manifestDigest,
-            relativePath,
-            directory,
-            executable,
-            pointer: pending.candidate
+        return this.trackTransactionOperation(transaction, async transactionRecord => {
+            const expectedPreviousWasSpecified = arguments.length >= 4;
+            if (!installPresentationsEqual(transactionRecord.presentation, presentation)) {
+                throw new RideCodexRuntimeStoreError('Codex install transaction presentation changed before publishing.');
+            }
+            const boundary = await this.ensureWritableBoundary();
+            if (await this.readPendingActivation(boundary)) {
+                throw new RideCodexRuntimeStoreError('Codex managed runtime transaction already requires recovery.');
+            }
+            const activePointer = await this.readActivePointer(boundary);
+            const previous = activePointer ? await this.validatePointer(activePointer, boundary) : undefined;
+            if (expectedPreviousWasSpecified
+                && !optionalPointersEqual(previous?.pointer, expectedPrevious?.pointer)) {
+                throw new RideCodexRuntimeStoreError('Codex active runtime changed before publishing.');
+            }
+            if (!samePath(presentation.installRoot, boundary.root)
+                || staged.version !== presentation.version
+                || staged.target !== presentation.target
+                || staged.authorizationContext.target !== presentation.target
+                || staged.authorizationContext.manifestDigest !== presentation.manifestDigest
+                || !samePath(staged.authorizationContext.canonicalRoot, boundary.root)) {
+                throw new RideCodexRuntimeStoreError('Codex staged runtime does not match its consented presentation.');
+            }
+            await consumeStagedRuntimeForPublication(staged, {
+                target: presentation.target as StagedRuntime['target'],
+                manifestDigest: presentation.manifestDigest,
+                canonicalRoot: boundary.root
+            }).catch(() => {
+                throw new RideCodexRuntimeStoreError('Codex staged runtime provenance is invalid or already used.');
+            });
+            const staging = resolve(staged.stagingDirectory);
+            requireStrictChild(boundary.root, staging);
+            if (!/^\.staging-[0-9a-f-]+$/i.test(staging.slice(boundary.root.length + 1))) {
+                throw new RideCodexRuntimeStoreError('Codex staged runtime has a non-canonical staging path.');
+            }
+            const stagingStat = await safeLstat(staging, 'Codex staged runtime directory is missing.');
+            requireRegularDirectory(stagingStat, 'Codex staged runtime directory is unsafe.');
+            const stagingCanonical = await safeRealpath(staging, 'Codex staged runtime directory could not be resolved safely.');
+            if (!samePath(stagingCanonical, staging)
+                || !stableDirectoryIdentityEqual(filesystemIdentity(stagingStat), staged.stagingIdentity)) {
+                throw new RideCodexRuntimeStoreError('Codex staged runtime identity is invalid.');
+            }
+            const executableRelativePath = safeRelativeRuntimePath(staging, staged.executable);
+            if (executableRelativePath !== expectedExecutableRelativePath(presentation.target)) {
+                throw new RideCodexRuntimeStoreError('Codex staged runtime executable path is inconsistent.');
+            }
+            const versionsRoot = await boundary.requireVersions(true);
+            const relativePath = versionRelativePath(presentation.version, presentation.target, presentation.manifestDigest);
+            const directory = resolve(boundary.root, ...relativePath.split('/'));
+            requireStrictChild(versionsRoot!, directory);
+            if (await pathExists(directory)) {
+                throw new RideCodexRuntimeStoreError('Codex runtime version directory already exists.');
+            }
+            const stagingAttestation = await attestPublishedRuntime(staging, staged.unpackedBytes);
+            if (!stableDirectoryIdentityEqual(stagingAttestation.rootIdentity, staged.stagingIdentity)) {
+                throw new RideCodexRuntimeStoreError('Codex staged runtime identity changed before publishing.');
+            }
+            const intentPointer = createActivePointer(
+                presentation,
+                relativePath,
+                executableRelativePath,
+                stagingAttestation
+            );
+            const stagingRelativePath = relative(boundary.root, staging).split(/[/\\]/).join('/');
+            if (!/^\.staging-[0-9a-f-]+$/i.test(stagingRelativePath)) {
+                throw new RideCodexRuntimeStoreError('Codex staged runtime has a non-canonical journal path.');
+            }
+            let pending = createPendingActivation(
+                'publishing',
+                intentPointer,
+                previous?.pointer,
+                stagingRelativePath,
+                staged.stagingIdentity
+            );
+            await this.writePendingActivation(pending, boundary);
+            await this.testHooks.afterPublishingJournalWrite?.(join(boundary.root, PENDING_ACTIVATION));
+            await boundary.verify();
+            await fs.rename(staging, directory);
+            await syncDirectory(versionsRoot!);
+            await boundary.verify();
+            await this.testHooks.afterPublishRename?.(directory);
+            const movedStat = await safeLstat(directory, 'Codex published runtime directory is missing.');
+            requireRegularDirectory(movedStat, 'Codex published runtime directory is unsafe.');
+            if (!stableDirectoryIdentityEqual(filesystemIdentity(movedStat), staged.stagingIdentity)
+                || !samePath(await safeRealpath(directory, 'Codex published runtime could not be resolved safely.'), directory)) {
+                throw new RideCodexRuntimeStoreError('Codex published runtime identity changed during activation.');
+            }
+            const attestation = await attestPublishedRuntime(directory, staged.unpackedBytes);
+            const executable = resolve(directory, ...executableRelativePath.split('/'));
+            requireStrictChild(directory, executable);
+            const pointer = createActivePointer(presentation, relativePath, executableRelativePath, attestation);
+            const awaitingHandshake = transitionPendingActivation(pending, 'awaiting-handshake', pointer);
+            await this.replacePendingActivation(pending, awaitingHandshake, boundary);
+            pending = awaitingHandshake;
+            await boundary.verify();
+            const published = Object.freeze({
+                version: presentation.version,
+                target: presentation.target,
+                manifestDigest: presentation.manifestDigest,
+                relativePath,
+                directory,
+                executable,
+                pointer: pending.candidate
+            });
+            transactionRecord.published = published;
+            this.publishedRuntimes.set(published, { transaction: transactionRecord, activated: false });
+            return published;
         });
     }
 
     async activate(
+        transaction: RideCodexRuntimeStoreTransaction,
         published: PublishedManagedRuntime,
         expectedPrevious?: ValidatedManagedRuntime
     ): Promise<ValidatedManagedRuntime> {
-        const boundary = await this.ensureWritableBoundary();
-        const pending = await this.readPendingActivation(boundary);
-        if (!pending || pending.phase !== 'awaiting-handshake'
-            || !activePointersEqual(pending.candidate, published.pointer)
-            || !optionalPointersEqual(pending.previous === 'none' ? undefined : pending.previous, expectedPrevious?.pointer)) {
-            throw new RideCodexRuntimeStoreError('Codex publishing journal changed before activation.');
-        }
-        const previousPointer = pending.previous === 'none' ? undefined : pending.previous;
-        const activePointer = await this.readActivePointer(boundary);
-        if (!optionalPointersEqual(activePointer, previousPointer)) {
-            throw new RideCodexRuntimeStoreError('Codex active runtime changed before activation.');
-        }
-        if (previousPointer) {
-            await this.validatePointer(previousPointer, boundary);
-        }
-        let candidate: ValidatedManagedRuntime;
-        try {
-            candidate = await this.validatePointer(published.pointer, boundary);
-            if (!activePointersEqual(candidate.pointer, published.pointer)) {
-                throw new RideCodexRuntimeStoreError('Codex published runtime changed before activation.');
+        return this.trackTransactionOperation(transaction, async transactionRecord => {
+            const publishedRecord = this.requirePublishedRuntime(published, transactionRecord);
+            if (publishedRecord.activated || transactionRecord.published !== published) {
+                throw new RideCodexRuntimeStoreError('Codex published runtime capability is invalid or already used.');
             }
-        } catch {
-            await this.rollbackPendingActivation(pending, boundary, 'activation-failure');
-            throw new RideCodexRuntimeStoreError(
-                'Codex published runtime failed activation validation and was removed safely.'
-            );
-        }
-        let primaryFailure: unknown;
-        try {
-            await this.writeActivePointer(published.pointer, 'activate');
-        } catch (error) {
-            primaryFailure = error;
-        }
-        try {
-            const activated = await this.readHandshakeCandidate(pending, boundary);
-            return activated;
-        } catch (postConditionError) {
-            const primary = primaryFailure ?? postConditionError;
+            const boundary = await this.ensureWritableBoundary();
+            const pending = await this.readPendingActivation(boundary);
+            if (!pending || pending.phase !== 'awaiting-handshake'
+                || !activePointersEqual(pending.candidate, published.pointer)
+                || !optionalPointersEqual(pending.previous === 'none' ? undefined : pending.previous, expectedPrevious?.pointer)) {
+                throw new RideCodexRuntimeStoreError('Codex publishing journal changed before activation.');
+            }
+            const previousPointer = pending.previous === 'none' ? undefined : pending.previous;
+            const activePointer = await this.readActivePointer(boundary);
+            if (!optionalPointersEqual(activePointer, previousPointer)) {
+                throw new RideCodexRuntimeStoreError('Codex active runtime changed before activation.');
+            }
+            if (previousPointer) {
+                await this.validatePointer(previousPointer, boundary);
+            }
+            let candidate: ValidatedManagedRuntime;
             try {
-                await this.rollbackPendingActivation(pending, boundary, 'activation-failure');
+                candidate = await this.validatePointer(published.pointer, boundary);
+                if (!activePointersEqual(candidate.pointer, published.pointer)) {
+                    throw new RideCodexRuntimeStoreError('Codex published runtime changed before activation.');
+                }
             } catch {
+                await this.rollbackPendingActivation(pending, boundary, 'activation-failure');
                 throw new RideCodexRuntimeStoreError(
-                    'Codex runtime activation failed and rollback also failed; safe recovery is required.'
+                    'Codex published runtime failed activation validation and was removed safely.'
                 );
             }
-            throw new RideCodexRuntimeStoreError(
-                primary
-                    ? 'Codex runtime activation post-condition failed and was rolled back safely.'
-                    : 'Codex runtime activation failed and was rolled back safely.'
-            );
-        }
+            let primaryFailure: unknown;
+            try {
+                await this.writeActivePointer(published.pointer, 'activate');
+            } catch (error) {
+                primaryFailure = error;
+            }
+            try {
+                const activated = await this.readHandshakeCandidate(pending, boundary);
+                publishedRecord.activated = true;
+                transactionRecord.activated = activated;
+                return activated;
+            } catch (postConditionError) {
+                const primary = primaryFailure ?? postConditionError;
+                try {
+                    await this.rollbackPendingActivation(pending, boundary, 'activation-failure');
+                } catch {
+                    throw new RideCodexRuntimeStoreError(
+                        'Codex runtime activation failed and rollback also failed; safe recovery is required.'
+                    );
+                }
+                throw new RideCodexRuntimeStoreError(
+                    primary
+                        ? 'Codex runtime activation post-condition failed and was rolled back safely.'
+                        : 'Codex runtime activation failed and was rolled back safely.'
+                );
+            }
+        });
     }
 
     async restore(
+        transaction: RideCodexRuntimeStoreTransaction,
         previous: ValidatedManagedRuntime | undefined,
         failed: PublishedManagedRuntime
     ): Promise<void> {
-        const boundary = await this.ensureWritableBoundary();
-        const pending = await this.readPendingActivation(boundary);
-        if (!pending || pending.phase !== 'awaiting-handshake'
-            || !activePointersEqual(pending.candidate, failed.pointer)
-            || !optionalPointersEqual(
-                pending.previous === 'none' ? undefined : pending.previous,
-                previous?.pointer
-            )) {
-            throw new RideCodexRuntimeStoreError('Codex pending activation changed before rollback.');
-        }
-        await this.rollbackPendingActivation(pending, boundary, 'rollback');
+        return this.trackTransactionOperation(transaction, async transactionRecord => {
+            this.requirePublishedRuntime(failed, transactionRecord);
+            const boundary = await this.ensureWritableBoundary();
+            const pending = await this.readPendingActivation(boundary);
+            if (!pending) {
+                const active = await this.readActivePointer(boundary);
+                const expected = previous?.pointer;
+                if (optionalPointersEqual(active, expected) && !await pathExists(failed.directory)) {
+                    if (expected) {
+                        await this.validatePointer(expected, boundary);
+                    } else {
+                        await boundary.verify();
+                    }
+                    return;
+                }
+            }
+            if (!pending || pending.phase !== 'awaiting-handshake'
+                || !activePointersEqual(pending.candidate, failed.pointer)
+                || !optionalPointersEqual(
+                    pending.previous === 'none' ? undefined : pending.previous,
+                    previous?.pointer
+                )) {
+                throw new RideCodexRuntimeStoreError('Codex pending activation changed before rollback.');
+            }
+            await this.rollbackPendingActivation(pending, boundary, 'rollback');
+        });
     }
 
-    async finalizeActivation(runtime: ValidatedManagedRuntime): Promise<ValidatedManagedRuntime> {
-        const boundary = await this.ensureWritableBoundary();
-        const initialPending = await this.readPendingActivation(boundary);
-        if (!initialPending || initialPending.phase !== 'awaiting-handshake'
-            || !activePointersEqual(initialPending.candidate, runtime.pointer)) {
-            throw new RideCodexRuntimeStoreError('Codex pending activation is unavailable for finalization.');
-        }
-        await this.testHooks.beforePendingFinalize?.(join(boundary.root, PENDING_ACTIVATION));
-        const pending = await this.readPendingActivation(boundary);
-        if (!pending || !pendingActivationsEqual(pending, initialPending)) {
-            throw new RideCodexRuntimeStoreError('Codex pending activation changed before finalization.');
-        }
-        const active = await this.readHandshakeCandidate(pending, boundary);
-        if (!activePointersEqual(active.pointer, runtime.pointer)) {
-            throw new RideCodexRuntimeStoreError('Codex active runtime changed before finalization.');
-        }
-        const retainPrevious = pending.previous !== 'none'
-            && await this.validatePointer(pending.previous, boundary).then(() => true, () => false);
-        const finalizing = transitionPendingActivation(
-            pending,
-            'finalizing',
-            pending.candidate,
-            retainPrevious
-        );
-        await this.replacePendingActivation(pending, finalizing, boundary);
-        await this.testHooks.afterFinalizingJournalWrite?.(join(boundary.root, PENDING_ACTIVATION));
-        return this.finishFinalizing(finalizing, boundary);
+    async completeHandshake(
+        transaction: RideCodexRuntimeStoreTransaction,
+        runtime: ValidatedManagedRuntime,
+        operation: (runtime: ValidatedManagedRuntime) => Promise<void>
+    ): Promise<RideCodexHandshakeCompletion> {
+        return this.trackTransactionOperation(transaction, async transactionRecord => {
+            if (transactionRecord.activated !== runtime || typeof operation !== 'function') {
+                throw new RideCodexRuntimeStoreError('Codex handshake transaction capability is invalid.');
+            }
+            await operation(runtime);
+            this.requireTransaction(transaction, true);
+            if (transactionRecord.activated !== runtime) {
+                throw new RideCodexRuntimeStoreError('Codex activated runtime changed during handshake.');
+            }
+            const completion = Object.freeze({}) as RideCodexHandshakeCompletion;
+            this.handshakeCompletions.set(completion, {
+                transaction: transactionRecord,
+                runtime,
+                consumed: false
+            });
+            return completion;
+        });
+    }
+
+    async finalizeActivation(
+        transaction: RideCodexRuntimeStoreTransaction,
+        completion: RideCodexHandshakeCompletion
+    ): Promise<ValidatedManagedRuntime> {
+        return this.trackTransactionOperation(transaction, async transactionRecord => {
+            const handshake = typeof completion === 'object' && completion
+                ? this.handshakeCompletions.get(completion)
+                : undefined;
+            if (!handshake || handshake.consumed || handshake.transaction !== transactionRecord) {
+                throw new RideCodexRuntimeStoreError('Codex handshake completion capability is invalid or already used.');
+            }
+            handshake.consumed = true;
+            const runtime = handshake.runtime;
+            const boundary = await this.ensureWritableBoundary();
+            const initialPending = await this.readPendingActivation(boundary);
+            if (!initialPending || initialPending.phase !== 'awaiting-handshake'
+                || !activePointersEqual(initialPending.candidate, runtime.pointer)) {
+                throw new RideCodexRuntimeStoreError('Codex pending activation is unavailable for finalization.');
+            }
+            await this.testHooks.beforePendingFinalize?.(join(boundary.root, PENDING_ACTIVATION));
+            const pending = await this.readPendingActivation(boundary);
+            if (!pending || !pendingActivationsEqual(pending, initialPending)) {
+                throw new RideCodexRuntimeStoreError('Codex pending activation changed before finalization.');
+            }
+            const active = await this.readHandshakeCandidate(pending, boundary);
+            if (!activePointersEqual(active.pointer, runtime.pointer)) {
+                throw new RideCodexRuntimeStoreError('Codex active runtime changed before finalization.');
+            }
+            const retainPrevious = pending.previous !== 'none'
+                && await this.validatePointer(pending.previous, boundary).then(() => true, () => false);
+            const finalizing = transitionPendingActivation(
+                pending,
+                'finalizing',
+                pending.candidate,
+                retainPrevious
+            );
+            await this.replacePendingActivation(pending, finalizing, boundary);
+            await this.testHooks.afterFinalizingJournalWrite?.(join(boundary.root, PENDING_ACTIVATION));
+            return this.finishFinalizing(finalizing, boundary);
+        });
     }
 
     private async finishFinalizing(
@@ -521,20 +718,85 @@ export class RideCodexRuntimeStore {
         if (expected.phase !== 'finalizing') {
             throw new RideCodexRuntimeStoreError('Codex activation is not in its finalizing phase.');
         }
-        let active = await this.readHandshakeCandidate(expected, boundary);
+        try {
+            await this.readHandshakeCandidate(expected, boundary);
+        } catch {
+            try {
+                await this.rollbackPendingActivation(expected, boundary, 'rollback');
+            } catch {
+                throw new RideCodexRuntimeStoreError(
+                    'Codex finalization proof failed and rollback also failed; safe recovery is required.'
+                );
+            }
+            throw new RideCodexRuntimeStoreError(
+                'Codex finalization proof failed and the previous runtime was restored safely.'
+            );
+        }
         await this.reconcileRetainedVersions(expected, boundary);
         const pending = await this.readPendingActivation(boundary);
         if (!pending || !pendingActivationsEqual(pending, expected)) {
-            throw new RideCodexRuntimeStoreError('Codex finalizing journal changed during version reconciliation.');
+            throw new RideCodexRuntimeStoreError(
+                'Codex finalizing journal changed during version reconciliation.'
+            );
         }
-        active = await this.readHandshakeCandidate(pending, boundary);
         await this.testHooks.beforePendingCommitRename?.(
             'finalize',
             join(boundary.root, PENDING_ACTIVATION),
             pendingQuarantinePath(boundary.root, pending)
         );
-        const quarantine = await this.commitPendingActivationRemoval(boundary, 'finalize', pending);
-        await this.deleteCommittedQuarantine(quarantine, boundary, 'finalize');
+        try {
+            await this.validateFinalizingCommitState(pending, boundary);
+        } catch {
+            try {
+                await this.rollbackPendingActivation(pending, boundary, 'rollback');
+            } catch {
+                throw new RideCodexRuntimeStoreError(
+                    'Codex finalization proof failed and rollback also failed; safe recovery is required.'
+                );
+            }
+            throw new RideCodexRuntimeStoreError(
+                'Codex finalization proof failed and the previous runtime was restored safely.'
+            );
+        }
+        const committed = await this.commitPendingActivationRemoval(
+            boundary,
+            'finalize',
+            pending,
+            () => this.validateFinalizingCommitState(pending, boundary)
+        );
+        let active: ValidatedManagedRuntime;
+        try {
+            active = await this.validateFinalizingCommitState(pending, boundary);
+        } catch {
+            const pendingPath = join(boundary.root, PENDING_ACTIVATION);
+            try {
+                await this.restorePendingQuarantine(pendingPath, committed.path, committed.identity, boundary);
+                await this.rollbackPendingActivation(pending, boundary, 'rollback');
+            } catch {
+                throw new RideCodexRuntimeStoreError(
+                    'Codex finalization post-condition failed and rollback also failed; safe recovery is required.'
+                );
+            }
+            throw new RideCodexRuntimeStoreError(
+                'Codex finalization post-condition failed and the previous runtime was restored safely.'
+            );
+        }
+        await this.deleteCommittedQuarantine(committed.path, boundary, 'finalize');
+        return active;
+    }
+
+    private async validateFinalizingCommitState(
+        pending: PendingActivationTransaction,
+        boundary: StoreBoundary
+    ): Promise<ValidatedManagedRuntime> {
+        const pointer = await this.readActivePointer(boundary);
+        if (!pointer || !activePointersEqual(pointer, pending.candidate)) {
+            throw new RideCodexRuntimeStoreError('Codex finalizing active pointer changed before commit.');
+        }
+        const active = await this.validatePointer(pending.candidate, boundary);
+        if (pending.previous !== 'none' && pending.retention.includes(pending.previous.relativePath)) {
+            await this.validatePointer(pending.previous, boundary);
+        }
         return active;
     }
 
@@ -636,17 +898,61 @@ export class RideCodexRuntimeStore {
             await syncDirectory(source === candidate ? versionsRoot : boundary.root);
             await syncDirectory(boundary.root);
         }
+        await this.testHooks.afterPublishingCandidateQuarantine?.(quarantine);
         const finalPending = await this.readPendingActivation(boundary);
         if (!finalPending || !pendingActivationsEqual(finalPending, pending)) {
             throw new RideCodexRuntimeStoreError('Codex publishing journal changed before recovery commit.');
         }
-        const journalQuarantine = await this.commitPendingActivationRemoval(
+        await this.testHooks.beforePendingCommitRename?.(
+            'publishing-recovery',
+            join(boundary.root, PENDING_ACTIVATION),
+            pendingQuarantinePath(boundary.root, pending)
+        );
+        const committed = await this.commitPendingActivationRemoval(
             boundary,
             'publishing-recovery',
-            pending
+            pending,
+            () => this.validateCommittedPrevious(pending, boundary)
         );
+        try {
+            await this.validateCommittedPrevious(pending, boundary);
+        } catch {
+            try {
+                await this.restorePendingQuarantine(
+                    join(boundary.root, PENDING_ACTIVATION),
+                    committed.path,
+                    committed.identity,
+                    boundary
+                );
+            } catch {
+                throw new RideCodexRuntimeStoreError(
+                    'Codex publishing recovery post-condition failed and journal restoration also failed.'
+                );
+            }
+            throw new RideCodexRuntimeStoreError(
+                'Codex publishing recovery post-condition failed; recovery authority was preserved.'
+            );
+        }
         await deleteExistingQuarantine(quarantine, boundary.root, boundary).catch(() => undefined);
-        await this.deleteCommittedQuarantine(journalQuarantine, boundary, 'publishing-recovery');
+        await this.deleteCommittedQuarantine(committed.path, boundary, 'publishing-recovery');
+    }
+
+    private async validateCommittedPrevious(
+        pending: PendingActivationTransaction,
+        boundary: StoreBoundary
+    ): Promise<void> {
+        const pointer = await this.readActivePointer(boundary);
+        if (pending.previous === 'none') {
+            if (pointer) {
+                throw new RideCodexRuntimeStoreError('Codex first-install committed state changed before recovery commit.');
+            }
+            await boundary.verify();
+            return;
+        }
+        if (!pointer || !activePointersEqual(pointer, pending.previous)) {
+            throw new RideCodexRuntimeStoreError('Codex previous active pointer changed before recovery commit.');
+        }
+        await this.validatePointer(pending.previous, boundary);
     }
 
     private async validatePublishingRecoveryObject(
@@ -687,47 +993,31 @@ export class RideCodexRuntimeStore {
         return this.validatePointer(pointer, boundary);
     }
 
-    async discard(published: PublishedManagedRuntime): Promise<void> {
-        const boundary = await this.ensureWritableBoundary();
-        const pending = await this.readPendingActivation(boundary);
-        if (pending) {
-            throw new RideCodexRuntimeStoreError(
-                activePointersEqual(pending.candidate, published.pointer)
-                    ? 'Codex pending candidate cannot be discarded before recovery commits.'
-                    : 'Codex runtime cannot be discarded while another activation is pending.'
-            );
-        }
-        const current = await this.readActiveRuntime();
-        if (current?.relativePath === published.relativePath) {
-            throw new RideCodexRuntimeStoreError('Codex active runtime cannot be discarded.');
-        }
-        const stat = await safeLstat(published.directory, 'Codex failed runtime directory is missing.');
-        if (!stableDirectoryIdentityEqual(filesystemIdentity(stat), deserializeIdentity(published.pointer.rootIdentity))) {
-            throw new RideCodexRuntimeStoreError('Codex failed runtime identity changed before cleanup.');
-        }
-        await quarantineAndDelete(published.directory, boundary.root, boundary);
-    }
-
-    async cleanupObsolete(keepRelativePaths: ReadonlySet<string>): Promise<void> {
-        const boundary = await this.ensureWritableBoundary();
-        const versionsRoot = await boundary.requireVersions(true);
-        for (const entry of await boundedDirectoryEntries(versionsRoot!)) {
-            const parsed = parseVersionDirectoryName(entry);
-            if (!parsed) {
-                continue;
+    async discard(
+        transaction: RideCodexRuntimeStoreTransaction,
+        published: PublishedManagedRuntime
+    ): Promise<void> {
+        return this.trackTransactionOperation(transaction, async transactionRecord => {
+            this.requirePublishedRuntime(published, transactionRecord);
+            const boundary = await this.ensureWritableBoundary();
+            const pending = await this.readPendingActivation(boundary);
+            if (pending) {
+                throw new RideCodexRuntimeStoreError(
+                    activePointersEqual(pending.candidate, published.pointer)
+                        ? 'Codex pending candidate cannot be discarded before recovery commits.'
+                        : 'Codex runtime cannot be discarded while another activation is pending.'
+                );
             }
-            const relativePath = `${VERSIONS_DIRECTORY}/${entry}`;
-            if (keepRelativePaths.has(relativePath)) {
-                continue;
+            const current = await this.readActiveRuntime();
+            if (current?.relativePath === published.relativePath) {
+                throw new RideCodexRuntimeStoreError('Codex active runtime cannot be discarded.');
             }
-            const candidate = join(versionsRoot!, entry);
-            const stat = await safeLstat(candidate, 'Codex obsolete runtime entry is missing.');
-            if (!stat.isDirectory() || stat.isSymbolicLink()
-                || !samePath(await safeRealpath(candidate, 'Codex obsolete runtime entry is unsafe.'), candidate)) {
-                throw new RideCodexRuntimeStoreError('Codex obsolete runtime cleanup refused an unsafe entry.');
+            const stat = await safeLstat(published.directory, 'Codex failed runtime directory is missing.');
+            if (!stableDirectoryIdentityEqual(filesystemIdentity(stat), deserializeIdentity(published.pointer.rootIdentity))) {
+                throw new RideCodexRuntimeStoreError('Codex failed runtime identity changed before cleanup.');
             }
-            await quarantineAndDelete(candidate, boundary.root, boundary);
-        }
+            await quarantineAndDelete(published.directory, boundary.root, boundary);
+        });
     }
 
     private async readActivePointer(boundary: StoreBoundary): Promise<ActiveRuntimePointer | undefined> {
@@ -750,6 +1040,144 @@ export class RideCodexRuntimeStore {
         const pending = parsePendingActivation(bytes);
         await boundary.verify();
         return pending;
+    }
+
+    private async readCommittedPendingQuarantine(
+        boundary: StoreBoundary
+    ): Promise<CommittedPendingQuarantine | undefined> {
+        const entries = (await boundedDirectoryEntries(boundary.root)).filter(
+            candidateEntry => /^\.install-quarantine-pending-[0-9a-f-]{36}$/.test(candidateEntry)
+        );
+        if (entries.length > 1) {
+            throw new RideCodexRuntimeStoreError('Codex runtime store contains multiple quarantined recovery journals.');
+        }
+        const entry = entries[0];
+        if (!entry) {
+            return undefined;
+        }
+        const quarantine = join(boundary.root, entry);
+        requireStrictChild(boundary.root, quarantine);
+        const before = await safeLstat(quarantine, 'Codex quarantined recovery journal is missing.');
+        if (!before.isFile() || before.isSymbolicLink() || before.nlink !== BigInt(1)
+            || !samePath(
+                await safeRealpath(quarantine, 'Codex quarantined recovery journal is unsafe.'),
+                quarantine
+            )) {
+            throw new RideCodexRuntimeStoreError('Codex quarantined recovery journal is unsafe.');
+        }
+        const bytes = await readBoundedRegularFile(quarantine, MAX_PENDING_BYTES, false);
+        if (!bytes) {
+            throw new RideCodexRuntimeStoreError('Codex quarantined recovery journal is unavailable.');
+        }
+        const pending = parsePendingActivation(bytes);
+        if (!samePath(quarantine, pendingQuarantinePath(boundary.root, pending))) {
+            throw new RideCodexRuntimeStoreError('Codex quarantined recovery journal name is inconsistent.');
+        }
+        const after = await safeLstat(quarantine, 'Codex quarantined recovery journal changed while reading.');
+        if (!stableObjectIdentityEqual(filesystemIdentity(before), filesystemIdentity(after))) {
+            throw new RideCodexRuntimeStoreError('Codex quarantined recovery journal identity changed while reading.');
+        }
+        await boundary.verify();
+        return Object.freeze({
+            path: quarantine,
+            identity: filesystemIdentity(after),
+            pending
+        });
+    }
+
+    private async recoverCommittedPendingQuarantine(
+        committed: CommittedPendingQuarantine,
+        boundary: StoreBoundary
+    ): Promise<void> {
+        const pendingPath = join(boundary.root, PENDING_ACTIVATION);
+        const restore = async (): Promise<void> => {
+            await this.restorePendingQuarantine(
+                pendingPath,
+                committed.path,
+                committed.identity,
+                boundary
+            );
+            const restored = await this.readPendingActivation(boundary);
+            if (!restored || !pendingActivationsEqual(restored, committed.pending)) {
+                throw new RideCodexRuntimeStoreError('Codex quarantined recovery journal was not restored safely.');
+            }
+        };
+
+        if (committed.pending.phase === 'finalizing') {
+            const active = await this.readActivePointer(boundary);
+            const previous = committed.pending.previous === 'none'
+                ? undefined
+                : committed.pending.previous;
+            if (optionalPointersEqual(active, previous)) {
+                await this.recoverCommittedRollback(committed, boundary, restore);
+                return;
+            }
+            await restore();
+            try {
+                await this.finishFinalizing(committed.pending, boundary);
+            } catch (error) {
+                const pending = await this.readPendingActivation(boundary);
+                const quarantined = await this.readCommittedPendingQuarantine(boundary);
+                if (pending || quarantined) {
+                    throw error;
+                }
+                await this.validateCommittedPrevious(committed.pending, boundary);
+            }
+            return;
+        }
+
+        if (committed.pending.phase === 'awaiting-handshake') {
+            await this.recoverCommittedRollback(committed, boundary, restore);
+            return;
+        }
+
+        const staging = resolve(boundary.root, ...committed.pending.stagingRelativePath.split('/'));
+        requireStrictChild(boundary.root, staging);
+        const versionsRoot = join(boundary.root, VERSIONS_DIRECTORY);
+        const candidate = resolve(boundary.root, ...committed.pending.candidate.relativePath.split('/'));
+        requireStrictChild(versionsRoot, candidate);
+        const publishingQuarantine = join(
+            boundary.root,
+            `.install-quarantine-publishing-${committed.pending.transactionId}`
+        );
+        requireStrictChild(boundary.root, publishingQuarantine);
+        const states = await Promise.all([staging, candidate, publishingQuarantine].map(pathExists));
+        if (states.filter(Boolean).length > 1) {
+            throw new RideCodexRuntimeStoreError('Codex committed publishing recovery state is inconsistent.');
+        }
+        if (!states.some(Boolean)) {
+            await this.validateCommittedPrevious(committed.pending, boundary);
+            await this.deleteCommittedQuarantine(committed.path, boundary, 'publishing-recovery');
+            return;
+        }
+        await restore();
+        await this.recoverPublishing(committed.pending, boundary);
+    }
+
+    private async recoverCommittedRollback(
+        committed: CommittedPendingQuarantine,
+        boundary: StoreBoundary,
+        restore: () => Promise<void>
+    ): Promise<void> {
+        const versionsRoot = join(boundary.root, VERSIONS_DIRECTORY);
+        const candidate = resolve(boundary.root, ...committed.pending.candidate.relativePath.split('/'));
+        requireStrictChild(versionsRoot, candidate);
+        const candidateQuarantine = join(
+            boundary.root,
+            `.install-quarantine-candidate-${committed.pending.transactionId}`
+        );
+        requireStrictChild(boundary.root, candidateQuarantine);
+        const states = await Promise.all([candidate, candidateQuarantine].map(pathExists));
+        if (states.filter(Boolean).length > 1) {
+            throw new RideCodexRuntimeStoreError('Codex committed rollback candidate state is inconsistent.');
+        }
+        if (!states.some(Boolean)) {
+            await this.validateCommittedPrevious(committed.pending, boundary);
+            await this.deleteCommittedQuarantine(committed.path, boundary, 'rollback');
+            return;
+        }
+        await restore();
+        await this.rollbackPendingActivation(committed.pending, boundary, 'recover');
     }
 
     private async writePendingActivation(
@@ -848,8 +1276,9 @@ export class RideCodexRuntimeStore {
     private async commitPendingActivationRemoval(
         boundary: StoreBoundary,
         kind: PendingActivationCommitKind,
-        expected: PendingActivationTransaction
-    ): Promise<string> {
+        expected: PendingActivationTransaction,
+        finalStateProof: () => Promise<unknown>
+    ): Promise<CommittedPendingQuarantine> {
         const pendingPath = join(boundary.root, PENDING_ACTIVATION);
         const before = await safeLstat(pendingPath, 'Codex pending activation journal is missing.');
         if (!before.isFile() || before.isSymbolicLink() || before.nlink !== BigInt(1)
@@ -872,6 +1301,7 @@ export class RideCodexRuntimeStore {
             || !runtimeFilesystemIdentitiesEqual(filesystemIdentity(before), filesystemIdentity(finalStat))) {
             throw new RideCodexRuntimeStoreError('Codex pending activation journal changed before commit.');
         }
+        await finalStateProof();
         await fs.rename(pendingPath, quarantine);
         try {
             const moved = await safeLstat(quarantine, 'Codex pending activation quarantine is missing.');
@@ -880,9 +1310,14 @@ export class RideCodexRuntimeStore {
                 || !samePath(await safeRealpath(quarantine, 'Codex pending activation quarantine is unsafe.'), quarantine)) {
                 throw new RideCodexRuntimeStoreError('Codex pending activation quarantine identity changed.');
             }
-            await syncDirectory(boundary.root).catch(() => undefined);
+            await this.testHooks.beforePendingCommitSync?.(kind, boundary.root);
+            await syncDirectory(boundary.root);
             await boundary.verify();
-            return quarantine;
+            return Object.freeze({
+                path: quarantine,
+                identity: filesystemIdentity(before),
+                pending: expected
+            });
         } catch (error) {
             await this.restorePendingQuarantine(pendingPath, quarantine, filesystemIdentity(before), boundary)
                 .catch(() => undefined);
@@ -909,7 +1344,7 @@ export class RideCodexRuntimeStore {
         if (!stableObjectIdentityEqual(filesystemIdentity(restored), expectedIdentity)) {
             throw new RideCodexRuntimeStoreError('Codex pending activation journal identity changed during recovery.');
         }
-        await syncDirectory(boundary.root).catch(() => undefined);
+        await syncDirectory(boundary.root);
         await boundary.verify();
     }
 
@@ -931,7 +1366,7 @@ export class RideCodexRuntimeStore {
         boundary: StoreBoundary,
         reason: 'recover' | 'rollback' | 'activation-failure'
     ): Promise<void> {
-        if (pending.phase !== 'awaiting-handshake') {
+        if (pending.phase !== 'awaiting-handshake' && pending.phase !== 'finalizing') {
             throw new RideCodexRuntimeStoreError('Codex activation cannot roll back after entering another phase.');
         }
         const activePointer = await this.readActivePointer(boundary);
@@ -978,6 +1413,8 @@ export class RideCodexRuntimeStore {
             );
         }
 
+        const candidateQuarantine = await this.quarantineRollbackCandidate(pending, boundary);
+        await this.testHooks.afterRollbackCandidateQuarantine?.(candidateQuarantine);
         await this.testHooks.beforePendingCommitRename?.(
             'rollback',
             join(boundary.root, PENDING_ACTIVATION),
@@ -987,20 +1424,33 @@ export class RideCodexRuntimeStore {
         if (!finalPending || !pendingActivationsEqual(finalPending, pending)) {
             throw new RideCodexRuntimeStoreError('Codex pending activation changed before rollback commit.');
         }
-        if (previousPointer) {
-            await this.validatePointer(previousPointer, boundary);
-        }
-
-        const candidateQuarantine = await this.quarantineRollbackCandidate(pending, boundary);
-        let journalQuarantine: string;
+        const committed = await this.commitPendingActivationRemoval(
+            boundary,
+            'rollback',
+            pending,
+            () => this.validateCommittedPrevious(pending, boundary)
+        );
         try {
-            journalQuarantine = await this.commitPendingActivationRemoval(boundary, 'rollback', pending);
-        } catch (error) {
-            await this.restoreRollbackCandidate(pending, candidateQuarantine, boundary).catch(() => undefined);
-            throw error;
+            await this.validateCommittedPrevious(pending, boundary);
+        } catch {
+            try {
+                await this.restorePendingQuarantine(
+                    join(boundary.root, PENDING_ACTIVATION),
+                    committed.path,
+                    committed.identity,
+                    boundary
+                );
+            } catch {
+                throw new RideCodexRuntimeStoreError(
+                    'Codex rollback post-condition failed and journal restoration also failed.'
+                );
+            }
+            throw new RideCodexRuntimeStoreError(
+                'Codex rollback post-condition failed; recovery authority was preserved.'
+            );
         }
         await deleteExistingQuarantine(candidateQuarantine, boundary.root, boundary).catch(() => undefined);
-        await this.deleteCommittedQuarantine(journalQuarantine, boundary, 'rollback');
+        await this.deleteCommittedQuarantine(committed.path, boundary, 'rollback');
     }
 
     private async quarantineRollbackCandidate(
@@ -1032,28 +1482,9 @@ export class RideCodexRuntimeStore {
         if (!stableDirectoryIdentityEqual(filesystemIdentity(before), filesystemIdentity(moved))) {
             throw new RideCodexRuntimeStoreError('Codex pending candidate changed while entering quarantine.');
         }
-        await syncDirectory(boundary.root).catch(() => undefined);
+        await syncDirectory(boundary.root);
         await boundary.verify();
         return quarantine;
-    }
-
-    private async restoreRollbackCandidate(
-        pending: PendingActivationTransaction,
-        quarantine: string,
-        boundary: StoreBoundary
-    ): Promise<void> {
-        const candidate = resolve(boundary.root, ...pending.candidate.relativePath.split('/'));
-        if (await pathExists(candidate)) {
-            throw new RideCodexRuntimeStoreError('Codex pending candidate was replaced before recovery.');
-        }
-        const before = await validateRollbackQuarantine(quarantine, pending.candidate, boundary);
-        await fs.rename(quarantine, candidate);
-        const restored = await validateRollbackCandidate(candidate, pending.candidate, boundary);
-        if (!stableDirectoryIdentityEqual(filesystemIdentity(before), filesystemIdentity(restored))) {
-            throw new RideCodexRuntimeStoreError('Codex pending candidate identity changed during recovery.');
-        }
-        await syncDirectory(boundary.root).catch(() => undefined);
-        await boundary.verify();
     }
 
     private async writeActivePointer(pointer: ActiveRuntimePointer, kind: PointerWriteKind): Promise<void> {
@@ -1088,6 +1519,51 @@ export class RideCodexRuntimeStore {
         await this.testHooks.afterPointerRename?.(kind, activePath);
         await syncDirectory(boundary.root);
         await boundary.verify();
+    }
+
+    private requireTransaction(
+        transaction: RideCodexRuntimeStoreTransaction,
+        allowSettling = false
+    ): StoreTransactionRecord {
+        if (typeof transaction !== 'object' || !transaction) {
+            throw new RideCodexRuntimeStoreError('Codex install transaction capability is invalid.');
+        }
+        const record = this.transactions.get(transaction);
+        if (!record || !record.active || (!allowSettling && !record.accepting)) {
+            throw new RideCodexRuntimeStoreError('Codex install transaction capability is invalid, ended, or belongs to another store.');
+        }
+        return record;
+    }
+
+    private trackTransactionOperation<T>(
+        transaction: RideCodexRuntimeStoreTransaction,
+        operation: (record: StoreTransactionRecord) => Promise<T>
+    ): Promise<T> {
+        const record = this.requireTransaction(transaction);
+        if (record.operations.size >= MAX_TRANSACTION_OPERATIONS) {
+            throw new RideCodexRuntimeStoreError('Codex install transaction exceeded its operation limit.');
+        }
+        const pending = Promise.resolve().then(() => operation(record));
+        record.operations.add(pending);
+        pending.then(
+            () => { record.operations.delete(pending); },
+            () => { record.operations.delete(pending); }
+        );
+        return pending;
+    }
+
+    private requirePublishedRuntime(
+        published: PublishedManagedRuntime,
+        transaction: StoreTransactionRecord
+    ): PublishedRuntimeRecord {
+        if (typeof published !== 'object' || !published) {
+            throw new RideCodexRuntimeStoreError('Codex published runtime capability is invalid.');
+        }
+        const record = this.publishedRuntimes.get(published);
+        if (!record || record.transaction !== transaction) {
+            throw new RideCodexRuntimeStoreError('Codex published runtime capability is invalid or belongs to another transaction.');
+        }
+        return record;
     }
 
     private async ensureWritableBoundary(): Promise<StoreBoundary> {
@@ -1569,7 +2045,7 @@ async function readBoundedRegularFile(path: string, maxBytes: number, optional: 
     }
 }
 
-async function validateExistingDirectory(path: string, message: string): Promise<{ path: string; identity: RuntimeFilesystemIdentity }> {
+async function validateExistingDirectory(path: string, message: string): Promise<{ path: string; identity: RuntimeFilesystemIdentity; }> {
     let stat: BigIntStats;
     try {
         stat = await fs.lstat(path, { bigint: true });
@@ -1626,7 +2102,7 @@ function expectedExecutableRelativePath(target: string): string {
     return `package/vendor/${target}/bin/${target.includes('windows') ? 'codex.exe' : 'codex'}`;
 }
 
-function parseVersionDirectoryName(name: string): { version: string } | undefined {
+function parseVersionDirectoryName(name: string): { version: string; } | undefined {
     const match = /^v-(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)--([a-z0-9_-]+)--([a-f0-9]{16})$/.exec(name);
     return match && isVersion(match[1]) && isTarget(match[2]) ? Object.freeze({ version: match[1] }) : undefined;
 }
@@ -1822,12 +2298,17 @@ async function syncDirectory(path: string): Promise<void> {
         await handle.sync();
     } catch (error) {
         const code = (error as NodeJS.ErrnoException).code;
-        if (!['EACCES', 'EBADF', 'EINVAL', 'EISDIR', 'ENOTSUP', 'EPERM'].includes(code ?? '')) {
+        if (!isUnsupportedDirectorySyncError(code)) {
             throw error;
         }
     } finally {
         await handle?.close().catch(() => undefined);
     }
+}
+
+function isUnsupportedDirectorySyncError(code: string | undefined): boolean {
+    return ['EINVAL', 'EISDIR', 'ENOTSUP', 'EOPNOTSUPP'].includes(code ?? '')
+        || (process.platform === 'win32' && code === 'EPERM');
 }
 
 async function pathExists(path: string): Promise<boolean> {
@@ -1879,6 +2360,17 @@ function requireStrictChild(parent: string, candidate: string): void {
 
 function samePath(left: string, right: string): boolean {
     return pathKey(resolve(left)) === pathKey(resolve(right));
+}
+
+function installPresentationsEqual(left: InstallPresentation, right: InstallPresentation): boolean {
+    return left.source === right.source
+        && left.version === right.version
+        && left.target === right.target
+        && left.urlOrigin === right.urlOrigin
+        && samePath(left.installRoot, right.installRoot)
+        && left.requiredSpaceBytes === right.requiredSpaceBytes
+        && left.rollbackPolicy === right.rollbackPolicy
+        && left.manifestDigest === right.manifestDigest;
 }
 
 function pathKey(path: string): string {
