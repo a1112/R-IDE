@@ -45,13 +45,14 @@ class FakeTurnHost implements RideCodexTurnHost {
     steerTurnId = 'turn-1';
     rejectMethod: string | undefined;
     restartPromise: Promise<number> | undefined;
+    resumeResponse: unknown = { thread: { id: 'thread-1' } };
     readonly #notifications = new Set<(notification: RideCodexNotification, generation: number) => void>();
     readonly #states = new Set<(event: Readonly<{ state: 'ready'; generation: number }>) => void>();
 
     async acquire(kind: 'active-turn' | 'foreground-panel'): Promise<RideCodexTurnHostLease> {
         return {
             generation: this.generation,
-            request: async (method, params) => {
+            request: (method, params) => {
                 this.calls.push(Object.freeze({ method, params }));
                 if (method === this.rejectMethod) {
                     throw new Error('C:\\secret\\workspace apiKey=plain-secret');
@@ -72,7 +73,7 @@ class FakeTurnHost implements RideCodexTurnHost {
                     return this.interruptPromise;
                 }
                 if (method === 'thread/resume') {
-                    return { thread: { id: 'thread-1' } };
+                    return this.resumeResponse;
                 }
                 return {};
             },
@@ -235,6 +236,7 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         });
         host.emit('item/reasoning/summaryTextDelta', { ...base, summaryIndex: 0, delta: 'why' });
         host.emit('item/reasoning/summaryPartAdded', { ...base, summaryIndex: 1 });
+        host.emit('item/reasoning/textDelta', { ...base, contentIndex: 0, delta: 'details' });
         host.emit('item/plan/delta', { ...base, delta: 'plan delta' });
         host.emit('item/commandExecution/outputDelta', { ...base, delta: 'stdout' });
         host.emit('item/fileChange/outputDelta', { ...base, delta: 'patch output' });
@@ -264,7 +266,7 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         await Promise.resolve();
 
         for (const expected of [
-            'turn-started', 'item-started', 'reasoning-summary-delta', 'reasoning-summary-part',
+            'turn-started', 'item-started', 'reasoning-summary-delta', 'reasoning-summary-part', 'reasoning-delta',
             'plan-delta', 'command-output', 'file-output', 'file-patch', 'turn-plan', 'turn-diff',
             'token-usage', 'warning', 'error', 'item-completed'
         ]) {
@@ -274,6 +276,35 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
             (event): event is Extract<RideCodexUiEvent, { type: 'file-patch' }> => event.type === 'file-patch'
         );
         assert.equal(patchEvent?.changes[0].diff, '@@ -1 +1 @@');
+        assert.deepEqual(normalizedEvents.find(event => event.type === 'reasoning-delta'), {
+            type: 'reasoning-delta', itemId: 'item-1', contentIndex: 0, delta: 'details'
+        });
+    });
+
+    it('keeps reasoning summary, part, and text streams distinct at UTF-8 boundaries', async () => {
+        const host = new FakeTurnHost();
+        const scheduler = new FakeScheduler();
+        const events: RideCodexUiEvent[] = [];
+        const coordinator = new RideCodexTurnCoordinator({ host, scheduler, maxItemBytes: 8 });
+        const service = coordinator.connectClient({ turnEvents: batch => { events.push(...batch.events); } });
+        await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'one' }] });
+        const base = { threadId: 'thread-1', turnId: 'turn-1', itemId: 'reasoning-1' };
+        host.emit('item/started', {
+            ...base, startedAtMs: 1,
+            item: { type: 'reasoning', id: 'reasoning-1', summary: [], content: [] }
+        });
+        host.emit('item/reasoning/summaryTextDelta', { ...base, summaryIndex: 0, delta: '你你你' });
+        host.emit('item/reasoning/summaryPartAdded', { ...base, summaryIndex: 1 });
+        host.emit('item/reasoning/textDelta', { ...base, contentIndex: 0, delta: '界界界' });
+        scheduler.flushOne();
+        await Promise.resolve();
+
+        const summary = events.find(event => event.type === 'reasoning-summary-delta');
+        const part = events.find(event => event.type === 'reasoning-summary-part');
+        const reasoning = events.find(event => event.type === 'reasoning-delta');
+        assert.equal(summary?.type === 'reasoning-summary-delta' ? Buffer.byteLength(summary.delta, 'utf8') : -1, 6);
+        assert.deepEqual(part, { type: 'reasoning-summary-part', itemId: 'reasoning-1', summaryIndex: 1 });
+        assert.equal(reasoning?.type === 'reasoning-delta' ? Buffer.byteLength(reasoning.delta, 'utf8') : -1, 6);
     });
 
     it('ignores cross-thread, cross-turn, old-generation, duplicate terminal, and late notifications', async () => {
@@ -351,8 +382,53 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         assert.equal(host.releases, 2);
         assert.deepEqual(host.calls[host.calls.length - 1], {
             method: 'thread/resume',
-            params: { threadId: 'thread-1', includeTurns: false }
+            params: { threadId: 'thread-1' }
         });
+    });
+
+    it('fails recovery closed for malformed resume responses without invoking Proxy or accessor traps', async () => {
+        let traps = 0;
+        const proxied = new Proxy({}, {
+            get: () => { traps += 1; return undefined; },
+            ownKeys: () => { traps += 1; return []; },
+            getOwnPropertyDescriptor: () => { traps += 1; return undefined; },
+            getPrototypeOf: () => { traps += 1; return Object.prototype; }
+        });
+        const accessor = Object.defineProperty({}, 'thread', {
+            enumerable: true,
+            get: () => { traps += 1; return { id: 'thread-1' }; }
+        });
+        for (const response of [{}, { thread: { id: 'wrong-thread' } }, proxied, accessor]) {
+            const host = new FakeTurnHost();
+            const scheduler = new FakeScheduler();
+            const timeoutCallbacks: Array<() => void> = [];
+            const events: RideCodexUiEvent[] = [];
+            host.interruptPromise = new Promise(() => undefined);
+            host.resumeResponse = response;
+            const coordinator = new RideCodexTurnCoordinator({
+                host,
+                scheduler,
+                interruptTimeoutMs: 10,
+                timers: {
+                    setTimeout: callback => { timeoutCallbacks.push(callback); return callback; },
+                    clearTimeout: () => undefined
+                }
+            });
+            const service = coordinator.connectClient({
+                turnEvents: batch => { events.push(...batch.events); }
+            });
+            await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'one' }] });
+            const interrupting = service.interruptTurn({ threadId: 'thread-1', turnId: 'turn-1' });
+            timeoutCallbacks.shift()?.();
+            assert.equal((await interrupting).status, 'interrupt-uncertain');
+            while (scheduler.callbacks.length > 0) {
+                scheduler.flushOne();
+                await Promise.resolve();
+            }
+            assert.ok(events.some(event => event.type === 'error' && event.code === 'recovery-failed'));
+            await coordinator.dispose();
+        }
+        assert.equal(traps, 0);
     });
 
     it('releases the active lease on owner disconnect and host restart, and rejects hung acquire on dispose', async () => {
@@ -549,6 +625,101 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         ]);
     });
 
+    it('compacts seven slow-client turns as coherent bounded identities and keeps the latest terminal visible', async () => {
+        const host = new FakeTurnHost();
+        const scheduler = new FakeScheduler();
+        let unblock!: () => void;
+        const blocked = new Promise<void>(resolve => { unblock = resolve; });
+        const delivered: RideCodexEventBatch[] = [];
+        let calls = 0;
+        const coordinator = new RideCodexTurnCoordinator({
+            host, scheduler, maxQueuedBytes: 512, maxBatchEvents: 8
+        });
+        const service = coordinator.connectClient({
+            turnEvents: batch => {
+                delivered.push(batch);
+                calls += 1;
+                return calls === 1 ? blocked : undefined;
+            }
+        });
+
+        for (let index = 1; index <= 7; index += 1) {
+            const turnId = `turn-${index}`;
+            host.nextTurnId = turnId;
+            await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: turnId }] });
+            scheduler.flushOne();
+            host.emit('turn/completed', {
+                threadId: 'thread-1', turn: { id: turnId, status: 'completed', items: [] }
+            });
+            scheduler.flushOne();
+        }
+        assert.equal(delivered.length, 1);
+
+        unblock();
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+
+        assert.ok(delivered.length <= 5);
+        const byTurn = new Map<string, string[]>();
+        for (const batch of delivered) {
+            const types = byTurn.get(batch.turnId) ?? [];
+            types.push(...batch.events.map(event => event.type));
+            byTurn.set(batch.turnId, types);
+            assert.ok(Buffer.byteLength(JSON.stringify(batch), 'utf8') <= 512);
+        }
+        for (const [turnId, types] of byTurn) {
+            assert.ok(types.includes('turn-started'), `missing start for ${turnId}`);
+            assert.ok(types.includes('turn-terminal'), `missing terminal for ${turnId}`);
+            assert.ok(types.indexOf('turn-started') < types.indexOf('turn-terminal'), `invalid order for ${turnId}`);
+        }
+        assert.ok(byTurn.get('turn-7')?.includes('turn-terminal'));
+        assert.ok(delivered.flatMap(batch => batch.events).some(event =>
+            event.type === 'warning' && event.code === 'events-dropped'
+        ));
+    });
+
+    it('preserves the unique terminal for one slow-client turn across a delta storm', async () => {
+        const host = new FakeTurnHost();
+        const scheduler = new FakeScheduler();
+        let unblock!: () => void;
+        const blocked = new Promise<void>(resolve => { unblock = resolve; });
+        const delivered: RideCodexEventBatch[] = [];
+        let calls = 0;
+        const coordinator = new RideCodexTurnCoordinator({
+            host, scheduler, maxQueuedBytes: 512, maxBatchEvents: 8, maxItemBytes: 128
+        });
+        const service = coordinator.connectClient({
+            turnEvents: batch => {
+                delivered.push(batch);
+                calls += 1;
+                return calls === 1 ? blocked : undefined;
+            }
+        });
+        await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'one' }] });
+        scheduler.flushOne();
+        host.emit('item/started', {
+            threadId: 'thread-1', turnId: 'turn-1', startedAtMs: 1,
+            item: { type: 'agentMessage', id: 'item-1', text: '', phase: null, memoryCitation: null }
+        });
+        for (let index = 0; index < 100; index += 1) {
+            host.emit('item/agentMessage/delta', {
+                threadId: 'thread-1', turnId: 'turn-1', itemId: 'item-1', delta: '你'
+            });
+            scheduler.flushOne();
+        }
+        host.emit('turn/completed', {
+            threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', items: [] }
+        });
+        scheduler.flushOne();
+        unblock();
+        await Promise.resolve();
+        await Promise.resolve();
+
+        assert.ok(delivered.flatMap(batch => batch.events).some(event => event.type === 'turn-terminal'));
+        assert.ok(delivered.length <= 2);
+    });
+
     it('releases the active lease and exposes only a stable error when steer or interrupt RPC fails', async () => {
         for (const method of ['turn/steer', 'turn/interrupt'] as const) {
             const host = new FakeTurnHost();
@@ -588,6 +759,105 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
             threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', items: [] }
         });
         assert.equal(host.releases, 1);
+    });
+
+    it('linearizes an exact terminal that arrives before the start response', async () => {
+        for (const status of ['completed', 'failed', 'interrupted'] as const) {
+            const host = new FakeTurnHost();
+            let rejectStart!: (error: unknown) => void;
+            host.startPromise = new Promise((_resolve, reject) => { rejectStart = reject; });
+            const coordinator = new RideCodexTurnCoordinator({ host });
+            const service = coordinator.connectClient({ turnEvents: () => undefined });
+            const starting = service.startTurn({
+                threadId: 'thread-1', input: [{ type: 'text', text: status }]
+            });
+            await Promise.resolve();
+            await Promise.resolve();
+            host.emit('turn/started', {
+                threadId: 'thread-1', turn: { id: 'turn-1', status: 'inProgress', items: [] }
+            });
+            host.emit('turn/completed', {
+                threadId: 'thread-1', turn: { id: 'turn-1', status, items: [] }
+            });
+
+            const result = await starting;
+            assert.deepEqual(result, { threadId: 'thread-1', turnId: 'turn-1', status });
+            assert.ok(Object.isFrozen(result));
+            assert.equal(host.releases, 1);
+            rejectStart(new Error('late start response'));
+            await Promise.resolve();
+            await Promise.resolve();
+            assert.equal(host.releases, 1);
+            await coordinator.dispose();
+        }
+    });
+
+    it('linearizes an exact interrupted terminal before the interrupt response and absorbs its late rejection', async () => {
+        const host = new FakeTurnHost();
+        let rejectInterrupt!: (error: unknown) => void;
+        host.interruptPromise = new Promise((_resolve, reject) => { rejectInterrupt = reject; });
+        const coordinator = new RideCodexTurnCoordinator({ host });
+        const service = coordinator.connectClient({ turnEvents: () => undefined });
+        await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'one' }] });
+        const interrupting = service.interruptTurn({ threadId: 'thread-1', turnId: 'turn-1' });
+        host.emit('turn/completed', {
+            threadId: 'thread-1', turn: { id: 'turn-1', status: 'interrupted', items: [] }
+        });
+
+        const result = await interrupting;
+        assert.deepEqual(result, { threadId: 'thread-1', turnId: 'turn-1', status: 'interrupted' });
+        assert.equal(host.releases, 1);
+        rejectInterrupt(new Error('late interrupt response'));
+        await Promise.resolve();
+        await Promise.resolve();
+        assert.equal(host.releases, 1);
+    });
+
+    it('linearizes an exact terminal before the steer response without accepting a cross-turn result', async () => {
+        const host = new FakeTurnHost();
+        let resolveSteer!: (value: unknown) => void;
+        host.steerPromise = new Promise(resolve => { resolveSteer = resolve; });
+        const coordinator = new RideCodexTurnCoordinator({ host });
+        const service = coordinator.connectClient({ turnEvents: () => undefined });
+        await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'one' }] });
+        const steering = service.steerTurn({
+            threadId: 'thread-1', expectedTurnId: 'turn-1', input: [{ type: 'text', text: 'more' }]
+        });
+        host.emit('turn/completed', {
+            threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', items: [] }
+        });
+
+        assert.deepEqual(await steering, {
+            threadId: 'thread-1', turnId: 'turn-1', status: 'completed'
+        });
+        assert.equal(host.releases, 1);
+        resolveSteer({ turnId: 'different-turn' });
+        await Promise.resolve();
+        assert.equal(host.releases, 1);
+    });
+
+    it('keeps interrupt timeout uncertain when a completed notification arrives after the timeout boundary', async () => {
+        const host = new FakeTurnHost();
+        const timeoutCallbacks: Array<() => void> = [];
+        host.interruptPromise = new Promise(() => undefined);
+        const coordinator = new RideCodexTurnCoordinator({
+            host,
+            interruptTimeoutMs: 10,
+            timers: {
+                setTimeout: callback => { timeoutCallbacks.push(callback); return callback; },
+                clearTimeout: () => undefined
+            }
+        });
+        const service = coordinator.connectClient({ turnEvents: () => undefined });
+        await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'one' }] });
+        const interrupting = service.interruptTurn({ threadId: 'thread-1', turnId: 'turn-1' });
+        timeoutCallbacks.shift()?.();
+        host.emit('turn/completed', {
+            threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', items: [] }
+        });
+
+        assert.equal((await interrupting).status, 'interrupt-uncertain');
+        assert.equal(host.releases, 2);
     });
 
     it('dispose terminates interrupt recovery even when the host restart is hung', async () => {

@@ -69,6 +69,7 @@ export type RideCodexUiEvent =
     | Readonly<{ type: 'agent-delta' | 'plan-delta' | 'command-output' | 'file-output'; itemId: string; delta: string }>
     | Readonly<{ type: 'reasoning-summary-delta'; itemId: string; summaryIndex: number; delta: string }>
     | Readonly<{ type: 'reasoning-summary-part'; itemId: string; summaryIndex: number }>
+    | Readonly<{ type: 'reasoning-delta'; itemId: string; contentIndex: number; delta: string }>
     | Readonly<{ type: 'file-patch'; itemId: string; changes: readonly RideCodexFileChange[] }>
     | Readonly<{ type: 'turn-plan'; explanation?: string; steps: readonly RideCodexPlanStep[] }>
     | Readonly<{ type: 'turn-diff'; diff: string }>
@@ -104,6 +105,7 @@ export interface RideCodexRenderedItem {
     readonly state: 'started' | 'completed';
     readonly text: string;
     readonly summaries: readonly string[];
+    readonly reasoning: readonly string[];
     readonly changes: readonly RideCodexFileChange[];
 }
 

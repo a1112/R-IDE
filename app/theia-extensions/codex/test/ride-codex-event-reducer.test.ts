@@ -66,6 +66,7 @@ describe('RideCodexEventReducer minimal frame contract', () => {
             { type: 'item-started', itemId: 'item-1', itemKind: 'reasoning' },
             { type: 'reasoning-summary-part', itemId: 'item-1', summaryIndex: 0 },
             { type: 'reasoning-summary-delta', itemId: 'item-1', summaryIndex: 0, delta: 'thinking' },
+            { type: 'reasoning-delta', itemId: 'item-1', contentIndex: 0, delta: 'private reasoning' },
             { type: 'plan-delta', itemId: 'item-1', delta: 'step' },
             { type: 'command-output', itemId: 'command-1', delta: 'stdout' },
             { type: 'file-output', itemId: 'file-1', delta: 'patch' },
@@ -86,6 +87,8 @@ describe('RideCodexEventReducer minimal frame contract', () => {
         const snapshot = reducer.snapshot();
         assert.equal(snapshot.status, 'failed');
         assert.equal(snapshot.items.find(item => item.id === 'item-1')?.text.includes('late'), false);
+        assert.deepEqual(snapshot.items.find(item => item.id === 'item-1')?.summaries, ['thinking']);
+        assert.deepEqual(snapshot.items.find(item => item.id === 'item-1')?.reasoning, ['private reasoning']);
         assert.equal(snapshot.plan?.steps[0].step, 'build');
         assert.equal(snapshot.diff, '+line');
         assert.equal(snapshot.usage?.totalTokens, 10);
@@ -94,6 +97,36 @@ describe('RideCodexEventReducer minimal frame contract', () => {
         assert.ok(Object.isFrozen(snapshot));
         assert.ok(Object.isFrozen(snapshot.items));
         assert.ok(Object.isFrozen(snapshot.items[0]));
+    });
+
+    it('renders reasoning summary parts and reasoning text into separate UTF-8 bounded fields', () => {
+        const frames: Array<() => void> = [];
+        const reducer = new RideCodexEventReducer({
+            scheduleFrame: callback => {
+                frames.push(callback);
+                return { dispose: () => undefined };
+            },
+            maxItemBytes: 8,
+            maxRetainedBytes: 64
+        });
+        reducer.notifyMany({
+            generation: 1,
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            events: [
+                { type: 'turn-started' },
+                { type: 'item-started', itemId: 'reasoning-1', itemKind: 'reasoning' },
+                { type: 'reasoning-summary-delta', itemId: 'reasoning-1', summaryIndex: 0, delta: '你你你' },
+                { type: 'reasoning-summary-part', itemId: 'reasoning-1', summaryIndex: 1 },
+                { type: 'reasoning-delta', itemId: 'reasoning-1', contentIndex: 0, delta: '界界界' }
+            ]
+        });
+        frames.shift()?.();
+
+        const item = reducer.snapshot().items[0];
+        assert.deepEqual(item.summaries, ['你你', '']);
+        assert.deepEqual(item.reasoning, ['界界']);
+        assert.equal(item.text, '');
     });
 
     it('enforces UTF-8 item, total, retained item, warning, and error bounds during storms', () => {
@@ -215,7 +248,7 @@ describe('RideCodexEventReducer minimal frame contract', () => {
         assert.equal(reducer.snapshot().items[0].text, 'new');
     });
 
-    it('rejects accessor-backed event data without invoking getters or changing state', () => {
+    it('rejects accessor-backed event data after native clone without changing state', () => {
         const frames: Array<() => void> = [];
         const reducer = new RideCodexEventReducer({
             scheduleFrame: callback => {
@@ -238,9 +271,99 @@ describe('RideCodexEventReducer minimal frame contract', () => {
             events: [event as never]
         });
 
-        assert.equal(getterCalls, 0);
+        assert.equal(getterCalls, 1);
         assert.equal(frames.length, 0);
         assert.equal(reducer.snapshot().status, 'idle');
+    });
+
+    it('rejects Proxy batches, event arrays, events, and nested payloads before any reflective trap', () => {
+        const frames: Array<() => void> = [];
+        const reducer = new RideCodexEventReducer({
+            scheduleFrame: callback => {
+                frames.push(callback);
+                return { dispose: () => undefined };
+            }
+        });
+        let traps = 0;
+        const proxied = <T extends object>(target: T): T => new Proxy(target, {
+            get: () => { traps += 1; return undefined; },
+            ownKeys: () => { traps += 1; return []; },
+            getOwnPropertyDescriptor: () => { traps += 1; return undefined; },
+            getPrototypeOf: () => { traps += 1; return Object.prototype; }
+        });
+        const valid = {
+            generation: 1, threadId: 'thread-1', turnId: 'turn-1',
+            events: [{ type: 'turn-started' as const }]
+        };
+        const batches: unknown[] = [
+            proxied(valid),
+            { ...valid, events: proxied([{ type: 'turn-started' as const }]) },
+            { ...valid, events: [proxied({ type: 'turn-started' as const })] },
+            {
+                ...valid,
+                events: [
+                    { type: 'turn-started' as const },
+                    { type: 'turn-terminal' as const, status: 'failed' as const, error: proxied({ code: 'turn-error', message: 'x' }) }
+                ]
+            }
+        ];
+        for (const batch of batches) {
+            reducer.notifyMany(batch as RideCodexEventBatch);
+        }
+
+        assert.equal(traps, 0);
+        assert.equal(frames.length, 0);
+        assert.equal(reducer.snapshot().status, 'idle');
+    });
+
+    it('preserves a unique terminal when ordinary pending events consume the frame byte budget', () => {
+        const frames: Array<() => void> = [];
+        const reducer = new RideCodexEventReducer({
+            scheduleFrame: callback => {
+                frames.push(callback);
+                return { dispose: () => undefined };
+            },
+            maxQueuedBytes: 256,
+            maxBatchEvents: 16
+        });
+        reducer.notifyMany({
+            generation: 1, threadId: 'thread-1', turnId: 'turn-1',
+            events: [
+                { type: 'turn-started' },
+                { type: 'item-started', itemId: 'item-1', itemKind: 'agent-message' },
+                { type: 'agent-delta', itemId: 'item-1', delta: 'x'.repeat(96) }
+            ]
+        });
+        reducer.notifyMany({
+            generation: 1, threadId: 'thread-1', turnId: 'turn-1',
+            events: [{ type: 'turn-terminal', status: 'completed' }]
+        });
+        frames.shift()?.();
+
+        assert.equal(reducer.snapshot().status, 'completed');
+        assert.ok(reducer.snapshot().warnings.some(warning => warning.code === 'events-dropped'));
+    });
+
+    it('uses an exact terminal batch as an identity boundary when its start was compacted upstream', () => {
+        const frames: Array<() => void> = [];
+        const reducer = new RideCodexEventReducer({
+            scheduleFrame: callback => {
+                frames.push(callback);
+                return { dispose: () => undefined };
+            }
+        });
+        reducer.notifyMany({
+            generation: 1, threadId: 'thread-1', turnId: 'turn-1',
+            events: [{ type: 'turn-started' }]
+        });
+        reducer.notifyMany({
+            generation: 1, threadId: 'thread-1', turnId: 'turn-2',
+            events: [{ type: 'turn-terminal', status: 'completed' }]
+        });
+        frames.shift()?.();
+
+        assert.equal(reducer.snapshot().turnId, 'turn-2');
+        assert.equal(reducer.snapshot().status, 'completed');
     });
 
     it('rejects malformed typed events and bounds an oversized frontend batch with drop metadata', () => {

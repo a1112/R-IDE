@@ -53,6 +53,7 @@ export const SERVER_NOTIFICATION_METHODS = Object.freeze([
     'item/plan/delta',
     'item/reasoning/summaryTextDelta',
     'item/reasoning/summaryPartAdded',
+    'item/reasoning/textDelta',
     'item/commandExecution/outputDelta',
     'item/fileChange/outputDelta',
     'item/fileChange/patchUpdated',

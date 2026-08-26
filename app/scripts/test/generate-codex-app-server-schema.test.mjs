@@ -25,6 +25,7 @@ const EXPECTED_CLIENT_METHODS = [
 const REQUIRED_STABLE_STREAMS = [
     'item/reasoning/summaryTextDelta',
     'item/reasoning/summaryPartAdded',
+    'item/reasoning/textDelta',
     'thread/tokenUsage/updated'
 ];
 
@@ -35,7 +36,7 @@ const EXPECTED_SERVER_NOTIFICATIONS = [
     'thread/archived', 'thread/tokenUsage/updated', 'turn/started', 'turn/completed',
     'turn/diff/updated', 'turn/plan/updated', 'item/started', 'item/completed',
     'item/agentMessage/delta', 'item/plan/delta', 'item/reasoning/summaryTextDelta',
-    'item/reasoning/summaryPartAdded', 'item/commandExecution/outputDelta',
+    'item/reasoning/summaryPartAdded', 'item/reasoning/textDelta', 'item/commandExecution/outputDelta',
     'item/fileChange/outputDelta', 'item/fileChange/patchUpdated',
     'serverRequest/resolved', 'warning', 'deprecationNotice'
 ];
@@ -165,7 +166,7 @@ test('generated protocol discriminators independently contain only the reviewed 
     assertReviewedSubset(EXPECTED_SERVER_NOTIFICATIONS, generated.serverNotification, 'ServerNotification');
     assertReviewedSubset(EXPECTED_SERVER_REQUESTS, generated.serverRequest, 'ServerRequest');
     assert.deepEqual(EXPECTED_SERVER_REQUESTS, ['item/commandExecution/requestApproval', 'item/fileChange/requestApproval']);
-    for (const unsafe of ['config/read', 'config/value/write', 'item/reasoning/textDelta', 'process/outputDelta', 'thread/realtime/started', 'item/mcpToolCall/progress']) {
+    for (const unsafe of ['config/read', 'config/value/write', 'process/outputDelta', 'thread/realtime/started', 'item/mcpToolCall/progress']) {
         assert.ok(!EXPECTED_CLIENT_METHODS.includes(unsafe));
         assert.ok(!EXPECTED_SERVER_NOTIFICATIONS.includes(unsafe));
         assert.ok(!EXPECTED_SERVER_REQUESTS.includes(unsafe));
@@ -174,7 +175,7 @@ test('generated protocol discriminators independently contain only the reviewed 
     for (const method of [...EXPECTED_CLIENT_METHODS, ...EXPECTED_CLIENT_NOTIFICATIONS, ...EXPECTED_SERVER_NOTIFICATIONS, ...EXPECTED_SERVER_REQUESTS]) {
         assert.ok(methods.has(method), `schema discriminator must contain ${method}`);
     }
-    for (const unsafe of ['item/reasoning/textDelta', 'process/outputDelta', 'thread/realtime/started', 'item/mcpToolCall/progress']) {
+    for (const unsafe of ['process/outputDelta', 'thread/realtime/started', 'item/mcpToolCall/progress']) {
         assert.ok(!EXPECTED_SERVER_NOTIFICATIONS.includes(unsafe), `${unsafe} must remain excluded from review`);
     }
 });
@@ -243,7 +244,7 @@ test('compiled allowlists expose exact immutable reviewed classifiers', async ()
     assert.deepEqual(methods.SERVER_NOTIFICATION_METHODS, EXPECTED_SERVER_NOTIFICATIONS);
     assert.deepEqual(methods.SERVER_REQUEST_METHODS, EXPECTED_SERVER_REQUESTS);
     for (const method of EXPECTED_SERVER_NOTIFICATIONS) assert.deepEqual(methods.classifyServerNotification(method), { kind: 'reviewed', fatal: false });
-    assert.deepEqual(methods.classifyServerNotification('item/reasoning/textDelta'), { kind: 'unknown', fatal: false });
+    assert.deepEqual(methods.classifyServerNotification('process/outputDelta'), { kind: 'unknown', fatal: false });
     for (const method of EXPECTED_SERVER_REQUESTS) assert.deepEqual(methods.classifyServerRequest(method), { kind: 'approved' });
     assert.deepEqual(methods.classifyServerRequest('item/tool/requestUserInput'), { kind: 'unsupported' });
 });

@@ -97,9 +97,12 @@ interface ClientRecord {
     readonly client: RideCodexTurnClient;
     connected: boolean;
     inFlight: boolean;
+    inFlightIdentity: QueueIdentity | undefined;
     deliveryVersion: number;
     pending: RideCodexEventBatch[];
     pendingBytes: number;
+    droppedEvents: number;
+    droppedBytes: number;
 }
 
 interface ActiveTurn {
@@ -111,6 +114,7 @@ interface ActiveTurn {
     lease: RideCodexTurnHostLease | undefined;
     generation: number | undefined;
     turnId: string | undefined;
+    terminalResult: RideCodexTurnResult | undefined;
     released: boolean;
     terminal: boolean;
     controlPending: boolean;
@@ -245,7 +249,8 @@ export class RideCodexTurnCoordinator {
         }
         const record: ClientRecord = {
             id: this.#nextClientId++, client, connected: true, inFlight: false,
-            deliveryVersion: 0, pending: [], pendingBytes: 0
+            inFlightIdentity: undefined, deliveryVersion: 0, pending: [], pendingBytes: 0,
+            droppedEvents: 0, droppedBytes: 0
         };
         this.#clients.add(record);
         let disposed = false;
@@ -322,10 +327,13 @@ export class RideCodexTurnCoordinator {
             const status = normalizeServerTurnStatus(ownValue(turn, 'status'));
             this.#establishTurn(active, turnId);
             if (status !== 'in-progress') {
-                this.#finishActive(status, status === 'failed' ? SAFE_FAILURE : undefined);
+                this.#finishActive(status, status === 'failed' ? SAFE_FAILURE : undefined, undefined, true, true);
             }
             return Object.freeze({ threadId: request.threadId, turnId, status });
         } catch (error) {
+            if (active.terminalResult) {
+                return active.terminalResult;
+            }
             if (this.#active === active) {
                 this.#finishActive('failed', SAFE_FAILURE, undefined, active.turnId !== undefined);
             }
@@ -360,6 +368,9 @@ export class RideCodexTurnCoordinator {
             }
             return Object.freeze({ threadId: active.threadId, turnId: responseTurnId, status: 'in-progress' });
         } catch (error) {
+            if (active.terminalResult) {
+                return active.terminalResult;
+            }
             if (this.#active === active) {
                 this.#finishActive('failed', SAFE_FAILURE);
             }
@@ -388,7 +399,12 @@ export class RideCodexTurnCoordinator {
         let timedOut = false;
         const timeout = new Promise<never>((_resolve, reject) => {
             timer = this.#timers.setTimeout(() => {
-                timedOut = true;
+                if (this.#active === active && !active.terminal) {
+                    timedOut = true;
+                    this.#finishActive('interrupt-uncertain', Object.freeze({
+                        code: 'interrupt-timeout', message: 'Codex turn interrupt could not be confirmed.'
+                    }), undefined, true, true);
+                }
                 reject(new RideCodexInterruptTimeout());
             }, this.#interruptTimeoutMs);
         });
@@ -408,16 +424,16 @@ export class RideCodexTurnCoordinator {
                 status: 'in-progress'
             });
         } catch (error) {
-            if (timedOut && this.#active === active) {
-                this.#finishActive('interrupt-uncertain', Object.freeze({
-                    code: 'interrupt-timeout', message: 'Codex turn interrupt could not be confirmed.'
-                }));
+            if (timedOut) {
                 await this.#recoverPersistentThread(request.threadId, expectedGeneration);
-                return Object.freeze({
+                return active.terminalResult ?? Object.freeze({
                     threadId: request.threadId,
                     turnId: request.turnId,
                     status: 'interrupt-uncertain'
                 });
+            }
+            if (active.terminalResult) {
+                return active.terminalResult;
             }
             if (this.#disposed) {
                 throw new RideCodexTurnError('disposed');
@@ -456,13 +472,17 @@ export class RideCodexTurnCoordinator {
                 if (lease.generation !== generation || this.#disposed || lifecycle !== this.#lifecycle) {
                     throw new RideCodexTurnError('operation-superseded');
                 }
-                await Promise.race([
+                const raw = await Promise.race([
                     safePromise(lease.request('thread/resume', Object.freeze({
-                        threadId,
-                        includeTurns: false
+                        threadId
                     }), this.#recoveryTimeoutMs)),
                     this.#disposedSignal
                 ]);
+                const response = requireRecord(raw);
+                const resumedThread = requireRecord(ownValue(response, 'thread'));
+                if (requireIdentifier(ownValue(resumedThread, 'id')) !== threadId) {
+                    throw new RideCodexTurnError('invalid-data');
+                }
             } finally {
                 this.#releaseLease(lease);
             }
@@ -495,6 +515,7 @@ export class RideCodexTurnCoordinator {
                 }
             },
             lease: undefined, generation: undefined, turnId: undefined,
+            terminalResult: undefined,
             released: false, terminal: false, controlPending: false
         };
     }
@@ -553,13 +574,21 @@ export class RideCodexTurnCoordinator {
         status: RideCodexTurnTerminalStatus,
         error?: RideCodexSafeError,
         invalidation = new RideCodexTurnError('operation-superseded'),
-        emit = true
+        emit = true,
+        linearize = false
     ): void {
         const active = this.#active;
         if (!active || active.terminal) {
             return;
         }
         active.terminal = true;
+        if (linearize && active.turnId !== undefined) {
+            active.terminalResult = Object.freeze({
+                threadId: active.threadId,
+                turnId: active.turnId,
+                status
+            });
+        }
         if (emit && active.turnId !== undefined) {
             this.#queueIdentity = Object.freeze({
                 generation: active.generation ?? this.#generation,
@@ -642,7 +671,7 @@ export class RideCodexTurnCoordinator {
         }
         this.#finishActive(status, status === 'failed' ? Object.freeze({
             code: 'turn-error', message: 'Codex turn failed.'
-        }) : undefined);
+        }) : undefined, undefined, true, true);
     }
 
     #onWarning(active: ActiveTurn, raw: unknown): void {
@@ -739,6 +768,18 @@ export class RideCodexTurnCoordinator {
                     summaryIndex: requireIndex(ownValue(params, 'summaryIndex'))
                 }));
                 return;
+            case 'item/reasoning/textDelta': {
+                const itemId = requireIdentifier(ownValue(params, 'itemId'));
+                if (this.#retainedItems.get(itemId)?.state !== 'started') {
+                    return;
+                }
+                const contentIndex = requireIndex(ownValue(params, 'contentIndex'));
+                const delta = this.#boundedStreamText(ownValue(params, 'delta'));
+                this.#enqueueCoalesced(Object.freeze({
+                    type: 'reasoning-delta', itemId, contentIndex, delta
+                }));
+                return;
+            }
             case 'item/fileChange/patchUpdated':
                 if (!this.#isItemOpen(params)) {
                     return;
@@ -808,7 +849,9 @@ export class RideCodexTurnCoordinator {
             && 'delta' in previous.event && previous.event.type === event.type
             && previous.event.itemId === event.itemId
             && (event.type !== 'reasoning-summary-delta'
-                || ('summaryIndex' in previous.event && previous.event.summaryIndex === event.summaryIndex))) {
+                || ('summaryIndex' in previous.event && previous.event.summaryIndex === event.summaryIndex))
+            && (event.type !== 'reasoning-delta'
+                || ('contentIndex' in previous.event && previous.event.contentIndex === event.contentIndex))) {
             const combined = previous.event.delta + event.delta;
             const merged = truncateUtf8(combined, this.#maxItemBytes);
             const replacement = Object.freeze({ ...previous.event, delta: merged }) as RideCodexUiEvent;
@@ -968,6 +1011,9 @@ export class RideCodexTurnCoordinator {
             return;
         }
         let delivery: void | Promise<void>;
+        client.inFlightIdentity = Object.freeze({
+            generation: batch.generation, threadId: batch.threadId, turnId: batch.turnId
+        });
         try {
             delivery = client.client.turnEvents(batch);
         } catch {
@@ -975,6 +1021,7 @@ export class RideCodexTurnCoordinator {
             return;
         }
         if (!delivery) {
+            client.inFlightIdentity = undefined;
             this.#drainClient(client);
             return;
         }
@@ -986,6 +1033,7 @@ export class RideCodexTurnCoordinator {
             }
             const candidate = (delivery as Promise<void>).then;
             if (typeof candidate !== 'function') {
+                client.inFlightIdentity = undefined;
                 this.#drainClient(client);
                 return;
             }
@@ -1014,6 +1062,7 @@ export class RideCodexTurnCoordinator {
             return;
         }
         client.inFlight = false;
+        client.inFlightIdentity = undefined;
         this.#drainClient(client);
     }
 
@@ -1032,20 +1081,77 @@ export class RideCodexTurnCoordinator {
         while (client.pending.length > MAX_CLIENT_PENDING_BATCHES
             || client.pendingBytes > this.#maxQueuedBytes) {
             const removable = client.pending.findIndex(candidate =>
-                !candidate.events.some(event => event.type === 'turn-terminal')
+                !client.inFlightIdentity || !sameBatchIdentity(candidate, client.inFlightIdentity)
             );
-            const index = removable >= 0 ? removable : 0;
-            const [removed] = client.pending.splice(index, 1);
-            client.pendingBytes -= batchBytes(removed);
+            if (removable < 0) {
+                break;
+            }
+            const identity = client.pending[removable];
+            for (let index = client.pending.length - 1; index >= 0; index -= 1) {
+                const candidate = client.pending[index];
+                if (candidate.generation !== identity.generation
+                    || candidate.threadId !== identity.threadId || candidate.turnId !== identity.turnId) {
+                    continue;
+                }
+                const [removed] = client.pending.splice(index, 1);
+                const removedBytes = batchBytes(removed);
+                client.pendingBytes -= removedBytes;
+                client.droppedEvents = Math.min(
+                    Number.MAX_SAFE_INTEGER,
+                    client.droppedEvents + removed.events.reduce((sum, event) =>
+                        sum + (event.type === 'warning' && event.code === 'events-dropped'
+                            ? event.droppedEvents ?? 1 : 1), 0)
+                );
+                client.droppedBytes = Math.min(
+                    Number.MAX_SAFE_INTEGER,
+                    client.droppedBytes + Math.min(removedBytes, this.#maxQueuedBytes)
+                );
+            }
         }
     }
 
     #drainClient(client: ClientRecord): void {
         while (client.connected && !client.inFlight && client.pending.length > 0) {
-            const batch = client.pending.shift() as RideCodexEventBatch;
-            client.pendingBytes -= batchBytes(batch);
+            const pending = client.pending.shift() as RideCodexEventBatch;
+            client.pendingBytes -= batchBytes(pending);
+            const batch = this.#withClientDropWarning(client, pending);
             this.#deliver(client, batch);
         }
+    }
+
+    #withClientDropWarning(client: ClientRecord, batch: RideCodexEventBatch): RideCodexEventBatch {
+        if (client.droppedEvents === 0) {
+            return batch;
+        }
+        const events = [...batch.events];
+        const warningFor = (): Extract<RideCodexUiEvent, { type: 'warning' }> => Object.freeze({
+            type: 'warning', code: 'events-dropped',
+            message: 'Some Codex frontend deliveries were dropped to preserve responsiveness.',
+            droppedEvents: client.droppedEvents,
+            droppedBytes: client.droppedBytes
+        });
+        let warning = warningFor();
+        while (events.length >= this.#maxBatchEvents
+            || batchBytes({ ...batch, events: [...events, warning] }) > this.#maxQueuedBytes) {
+            const removable = findLastIndex(events, event =>
+                event.type !== 'turn-started' && event.type !== 'turn-terminal'
+            );
+            if (removable < 0) {
+                return batch;
+            }
+            const [removed] = events.splice(removable, 1);
+            client.droppedEvents = Math.min(Number.MAX_SAFE_INTEGER, client.droppedEvents + 1);
+            client.droppedBytes = Math.min(
+                Number.MAX_SAFE_INTEGER,
+                client.droppedBytes + Math.min(eventBytes(removed), this.#maxQueuedBytes)
+            );
+            warning = warningFor();
+        }
+        const terminalIndex = events.findIndex(event => event.type === 'turn-terminal');
+        events.splice(terminalIndex < 0 ? events.length : terminalIndex, 0, warning);
+        client.droppedEvents = 0;
+        client.droppedBytes = 0;
+        return freezeRideCodexEventBatch({ ...batch, events });
     }
 
     #disconnect(client: ClientRecord, terminateOwnedTurn = true): void {
@@ -1056,7 +1162,10 @@ export class RideCodexTurnCoordinator {
         client.deliveryVersion += 1;
         client.pending.length = 0;
         client.pendingBytes = 0;
+        client.droppedEvents = 0;
+        client.droppedBytes = 0;
         client.inFlight = false;
+        client.inFlightIdentity = undefined;
         this.#clients.delete(client);
         if (terminateOwnedTurn && this.#active?.owner === client) {
             this.#finishActive('interrupted', undefined, new RideCodexTurnError('client-disconnected'));
@@ -1369,6 +1478,7 @@ function boundEvent(event: RideCodexUiEvent, maxBytes: number, maxItems: number)
         case 'command-output':
         case 'file-output':
         case 'reasoning-summary-delta':
+        case 'reasoning-delta':
             return Object.freeze({ ...event, delta: truncateUtf8(event.delta, maxBytes) });
         case 'turn-diff':
             return Object.freeze({ ...event, diff: truncateUtf8(event.diff, maxBytes) });
@@ -1506,6 +1616,11 @@ function findLastIndex<T>(values: readonly T[], predicate: (value: T) => boolean
 function sameIdentity(left: QueueIdentity, right: QueueIdentity): boolean {
     return left.generation === right.generation
         && left.threadId === right.threadId && left.turnId === right.turnId;
+}
+
+function sameBatchIdentity(batch: RideCodexEventBatch, identity: QueueIdentity): boolean {
+    return batch.generation === identity.generation
+        && batch.threadId === identity.threadId && batch.turnId === identity.turnId;
 }
 
 function queueIdentityKey(identity: QueueIdentity): string {

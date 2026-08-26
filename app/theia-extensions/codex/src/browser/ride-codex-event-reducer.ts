@@ -36,6 +36,7 @@ interface MutableItem {
     state: 'started' | 'completed';
     text: string;
     summaries: string[];
+    reasoning: string[];
     changes: RideCodexFileChange[];
 }
 
@@ -123,52 +124,71 @@ export class RideCodexEventReducer {
             return;
         }
         const sourceEvents = safeBatch.events;
-        const reserveDrop = sourceEvents.length > this.#maxBatchEvents;
-        const events = sourceEvents.slice(0, reserveDrop ? this.#maxBatchEvents - 1 : this.#maxBatchEvents);
-        let bytes = utf8ByteLength(safeBatch.threadId) + utf8ByteLength(safeBatch.turnId);
+        const selected = selectPriorityEvents(sourceEvents, this.#maxBatchEvents);
+        let dropped = sourceEvents.length - selected.length;
+        const identityBytes = utf8ByteLength(safeBatch.threadId) + utf8ByteLength(safeBatch.turnId);
+        let bytes = identityBytes;
         const accepted: RideCodexUiEvent[] = [];
-        for (const event of events) {
+        for (const event of selected) {
             const eventBytes = estimateEventBytes(event);
+            if (isTurnBoundary(event)) {
+                while (this.#queuedBytes + bytes + eventBytes > this.#maxQueuedBytes) {
+                    const removable = findLastOrdinaryEvent(accepted);
+                    if (removable < 0) {
+                        break;
+                    }
+                    bytes -= estimateEventBytes(accepted[removable]);
+                    accepted.splice(removable, 1);
+                    dropped += 1;
+                }
+                dropped += this.#makePendingRoom(bytes + eventBytes, safeBatch);
+            }
             if (bytes + eventBytes > this.#maxQueuedBytes || this.#queuedBytes + bytes + eventBytes > this.#maxQueuedBytes) {
-                break;
+                dropped += 1;
+                continue;
             }
             accepted.push(event);
             bytes += eventBytes;
         }
-        const dropped = sourceEvents.length - accepted.length;
         if (dropped > 0) {
             const warning: RideCodexUiEvent = {
                 type: 'warning',
                 code: 'events-dropped',
-                message: 'Some Codex UI events were dropped to preserve responsiveness.',
+                message: 'Codex UI events were dropped.',
                 droppedEvents: dropped
             };
             const warningBytes = estimateEventBytes(warning);
             while (accepted.length >= this.#maxBatchEvents || bytes + warningBytes > this.#maxQueuedBytes) {
-                const removed = accepted.pop();
-                if (!removed || removed.type === 'turn-started') {
-                    if (removed) {
-                        accepted.push(removed);
-                    }
+                const removable = findLastOrdinaryEvent(accepted);
+                if (removable < 0) {
                     break;
                 }
+                const [removed] = accepted.splice(removable, 1);
                 bytes -= estimateEventBytes(removed);
+                dropped += 1;
             }
-            if (accepted.length < this.#maxBatchEvents && bytes + warningBytes <= this.#maxQueuedBytes) {
-                accepted.push(warning);
+            dropped += this.#makePendingRoom(bytes + warningBytes, safeBatch);
+            if (accepted.length < this.#maxBatchEvents && bytes + warningBytes <= this.#maxQueuedBytes
+                && this.#queuedBytes + bytes + warningBytes <= this.#maxQueuedBytes) {
+                const terminalIndex = accepted.findIndex(event => event.type === 'turn-terminal');
+                accepted.splice(terminalIndex < 0 ? accepted.length : terminalIndex, 0, {
+                    ...warning,
+                    droppedEvents: dropped
+                });
                 bytes += warningBytes;
             }
         }
         if (accepted.length === 0) {
             return;
         }
-        this.#pending.push({
+        const pending = deepFreezeRideCodex({
             generation: safeBatch.generation,
             threadId: safeBatch.threadId,
             turnId: safeBatch.turnId,
             events: accepted
-        });
-        this.#queuedBytes += bytes;
+        }) as RideCodexEventBatch;
+        this.#pending.push(pending);
+        this.#queuedBytes += pendingBatchBytes(pending);
         if (!this.#frame) {
             this.#frame = this.#scheduleFrame(() => this.#flushFrame());
         }
@@ -219,21 +239,22 @@ export class RideCodexEventReducer {
             return false;
         }
         const startsTurn = batch.events.some(event => event.type === 'turn-started');
+        const terminatesTurn = batch.events.some(event => event.type === 'turn-terminal');
         if (batch.generation > this.#generation) {
-            if (!startsTurn) {
+            if (!startsTurn && !terminatesTurn) {
                 return false;
             }
             this.#resetFor(batch);
         } else if (this.#turnId !== undefined
             && (batch.threadId !== this.#threadId || batch.turnId !== this.#turnId)) {
-            if (startsTurn && this.#isTerminal()) {
+            if ((startsTurn && this.#isTerminal()) || terminatesTurn) {
                 this.#resetFor(batch);
             } else {
                 return false;
             }
         }
         if (this.#turnId === undefined) {
-            if (!startsTurn) {
+            if (!startsTurn && !terminatesTurn) {
                 return false;
             }
             this.#resetFor(batch);
@@ -243,6 +264,47 @@ export class RideCodexEventReducer {
             changed = this.#applyEvent(event) || changed;
         }
         return changed;
+    }
+
+    #makePendingRoom(requiredBytes: number, incoming: RideCodexEventBatch): number {
+        let dropped = 0;
+        while (this.#queuedBytes + requiredBytes > this.#maxQueuedBytes) {
+            let removed = false;
+            for (let batchIndex = 0; batchIndex < this.#pending.length; batchIndex += 1) {
+                const pendingBatch = this.#pending[batchIndex];
+                const eventIndex = pendingBatch.events.findIndex(event => !isTurnBoundary(event));
+                if (eventIndex < 0) {
+                    continue;
+                }
+                const events = pendingBatch.events.filter((_event, index) => index !== eventIndex);
+                const previousBytes = pendingBatchBytes(pendingBatch);
+                if (events.length === 0) {
+                    this.#pending.splice(batchIndex, 1);
+                    this.#queuedBytes -= previousBytes;
+                } else {
+                    const replacement = deepFreezeRideCodex({ ...pendingBatch, events }) as RideCodexEventBatch;
+                    this.#pending[batchIndex] = replacement;
+                    this.#queuedBytes -= previousBytes - pendingBatchBytes(replacement);
+                }
+                dropped += 1;
+                removed = true;
+                break;
+            }
+            if (removed) {
+                continue;
+            }
+            const identityIndex = this.#pending.findIndex(pendingBatch =>
+                pendingBatch.generation !== incoming.generation
+                || pendingBatch.threadId !== incoming.threadId || pendingBatch.turnId !== incoming.turnId
+            );
+            if (identityIndex < 0) {
+                break;
+            }
+            const [removedBatch] = this.#pending.splice(identityIndex, 1);
+            this.#queuedBytes -= pendingBatchBytes(removedBatch);
+            dropped += removedBatch.events.length;
+        }
+        return dropped;
     }
 
     #resetFor(batch: RideCodexEventBatch): void {
@@ -294,6 +356,8 @@ export class RideCodexEventReducer {
                 return this.#ensureSummary(event.itemId, event.summaryIndex);
             case 'reasoning-summary-delta':
                 return this.#appendSummary(event.itemId, event.summaryIndex, event.delta);
+            case 'reasoning-delta':
+                return this.#appendReasoning(event.itemId, event.contentIndex, event.delta);
             case 'file-patch': {
                 const item = this.#item(event.itemId, 'file-change');
                 item.changes = event.changes.map(change => ({ ...change }));
@@ -328,7 +392,7 @@ export class RideCodexEventReducer {
         if (this.#items.has(id)) {
             return false;
         }
-        this.#items.set(id, { id, kind, state: 'started', text: '', summaries: [], changes: [] });
+        this.#items.set(id, { id, kind, state: 'started', text: '', summaries: [], reasoning: [], changes: [] });
         this.#trimItemsByCount();
         return true;
     }
@@ -345,7 +409,7 @@ export class RideCodexEventReducer {
     #item(id: string, kind: RideCodexItemKind): MutableItem {
         let item = this.#items.get(id);
         if (!item) {
-            item = { id, kind, state: 'started', text: '', summaries: [], changes: [] };
+            item = { id, kind, state: 'started', text: '', summaries: [], reasoning: [], changes: [] };
             this.#items.set(id, item);
             this.#trimItemsByCount();
         }
@@ -397,6 +461,23 @@ export class RideCodexEventReducer {
         return true;
     }
 
+    #appendReasoning(id: string, index: number, delta: string): boolean {
+        const item = this.#item(id, 'reasoning');
+        while (item.reasoning.length <= index) {
+            item.reasoning.push('');
+        }
+        const current = item.reasoning[index] ?? '';
+        const otherBytes = item.reasoning.reduce(
+            (sum, value, position) => position === index ? sum : sum + utf8ByteLength(value), 0
+        );
+        const next = truncateUtf8(current + delta, Math.max(0, this.#maxItemBytes - otherBytes));
+        if (next === current) {
+            return false;
+        }
+        item.reasoning[index] = next;
+        return true;
+    }
+
     #pushWarning(event: Extract<RideCodexUiEvent, { type: 'warning' }>): void {
         this.#warnings.push(deepFreezeRideCodex({ ...event }) as typeof event);
         this.#warnings.splice(0, Math.max(0, this.#warnings.length - this.#maxDiagnosticHistory));
@@ -440,6 +521,7 @@ export class RideCodexEventReducer {
         for (const item of this.#items.values()) {
             bytes += utf8ByteLength(item.id) + utf8ByteLength(item.text);
             bytes += item.summaries.reduce((sum, summary) => sum + utf8ByteLength(summary), 0);
+            bytes += item.reasoning.reduce((sum, reasoning) => sum + utf8ByteLength(reasoning), 0);
             bytes += item.changes.reduce((sum, change) =>
                 sum + utf8ByteLength(change.path) + utf8ByteLength(change.kind)
                 + (change.diff === undefined ? 0 : utf8ByteLength(change.diff)), 0);
@@ -454,6 +536,7 @@ export class RideCodexEventReducer {
             state: item.state,
             text: item.text,
             summaries: [...item.summaries],
+            reasoning: [...item.reasoning],
             changes: item.changes.map(change => ({ ...change }))
         }));
         return deepFreezeRideCodex({
@@ -491,7 +574,19 @@ function positiveLimit(value: number | undefined, fallback: number): number {
 }
 
 function copySafeBatch(value: RideCodexEventBatch, maxRawBytes: number): RideCodexEventBatch | undefined {
-    const copied = copyData(value, 0, { nodes: 0, bytes: 0, maxBytes: maxRawBytes });
+    if (typeof structuredClone !== 'function') {
+        return undefined;
+    }
+    let cloned: unknown;
+    try {
+        cloned = structuredClone(value);
+    } catch {
+        return undefined;
+    }
+    if (hasAccessorGraph(value, cloned, 0)) {
+        return undefined;
+    }
+    const copied = copyClonedData(cloned, 0, { nodes: 0, bytes: 0, maxBytes: maxRawBytes });
     if (!isPlainRecord(copied)) {
         return undefined;
     }
@@ -508,12 +603,12 @@ function copySafeBatch(value: RideCodexEventBatch, maxRawBytes: number): RideCod
     if (events.some(event => !isUiEvent(event))) {
         return undefined;
     }
-    return {
+    return deepFreezeRideCodex({
         generation: generation as number,
         threadId,
         turnId,
         events: events as RideCodexUiEvent[]
-    };
+    }) as RideCodexEventBatch;
 }
 
 function isUiEvent(value: unknown): value is RideCodexUiEvent {
@@ -542,6 +637,8 @@ function isUiEvent(value: unknown): value is RideCodexUiEvent {
             return identifier(value.itemId) && text(value.delta);
         case 'reasoning-summary-delta':
             return identifier(value.itemId) && index(value.summaryIndex) && text(value.delta);
+        case 'reasoning-delta':
+            return identifier(value.itemId) && index(value.contentIndex) && text(value.delta);
         case 'reasoning-summary-part':
             return identifier(value.itemId) && index(value.summaryIndex);
         case 'file-patch':
@@ -578,7 +675,35 @@ interface CopyBudget {
     readonly maxBytes: number;
 }
 
-function copyData(value: unknown, depth: number, budget: CopyBudget): unknown {
+function hasAccessorGraph(original: unknown, cloned: unknown, depth: number): boolean {
+    if (depth > 16 || !original || typeof original !== 'object') {
+        return depth > 16;
+    }
+    if (!cloned || typeof cloned !== 'object') {
+        return true;
+    }
+    const originalDescriptors = Object.getOwnPropertyDescriptors(original);
+    const cloneDescriptors = Object.getOwnPropertyDescriptors(cloned);
+    if (Object.getOwnPropertySymbols(original).length > 0
+        || Object.keys(originalDescriptors).some(key =>
+            !(Array.isArray(original) && key === 'length') && !(key in cloneDescriptors)
+        )) {
+        return true;
+    }
+    for (const key of Object.keys(cloneDescriptors)) {
+        if (Array.isArray(cloned) && key === 'length') {
+            continue;
+        }
+        const descriptor = originalDescriptors[key];
+        if (!descriptor || descriptor.get || descriptor.set
+            || hasAccessorGraph(descriptor.value, cloneDescriptors[key].value, depth + 1)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function copyClonedData(value: unknown, depth: number, budget: CopyBudget): unknown {
     budget.nodes += 1;
     if (depth > 16 || budget.nodes > 8_192) {
         return undefined;
@@ -618,7 +743,7 @@ function copyData(value: unknown, depth: number, budget: CopyBudget): unknown {
             if (!descriptor) {
                 return undefined;
             }
-            const child = copyData(descriptor.value, depth + 1, budget);
+            const child = copyClonedData(descriptor.value, depth + 1, budget);
             if (child === undefined && descriptor.value !== undefined) {
                 return undefined;
             }
@@ -636,7 +761,7 @@ function copyData(value: unknown, depth: number, budget: CopyBudget): unknown {
     const objectResult: Record<string, unknown> = {};
     for (const key of keys) {
         const descriptor = descriptors[key];
-        const child = copyData(descriptor.value, depth + 1, budget);
+        const child = copyClonedData(descriptor.value, depth + 1, budget);
         if (child === undefined && descriptor.value !== undefined) {
             return undefined;
         }
@@ -655,4 +780,45 @@ function estimateEventBytes(event: RideCodexUiEvent): number {
     } catch {
         return Number.MAX_SAFE_INTEGER;
     }
+}
+
+function pendingBatchBytes(batch: RideCodexEventBatch): number {
+    return utf8ByteLength(batch.threadId) + utf8ByteLength(batch.turnId)
+        + batch.events.reduce((sum, event) => sum + estimateEventBytes(event), 0);
+}
+
+function isTurnBoundary(event: RideCodexUiEvent): boolean {
+    return event.type === 'turn-started' || event.type === 'turn-terminal';
+}
+
+function findLastOrdinaryEvent(events: readonly RideCodexUiEvent[]): number {
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+        if (!isTurnBoundary(events[index])) {
+            return index;
+        }
+    }
+    return -1;
+}
+
+function selectPriorityEvents(
+    events: readonly RideCodexUiEvent[],
+    limit: number
+): readonly RideCodexUiEvent[] {
+    const selected: Array<{ readonly event: RideCodexUiEvent; readonly index: number }> = [];
+    for (let index = 0; index < events.length; index += 1) {
+        const event = events[index];
+        if (selected.length < limit) {
+            selected.push({ event, index });
+            continue;
+        }
+        if (!isTurnBoundary(event)) {
+            continue;
+        }
+        const removable = findLastOrdinaryEvent(selected.map(entry => entry.event));
+        if (removable >= 0) {
+            selected.splice(removable, 1, { event, index });
+        }
+    }
+    selected.sort((left, right) => left.index - right.index);
+    return selected.map(entry => entry.event);
 }
