@@ -393,27 +393,45 @@ export class RideCodexEventReducer {
             this.#queuedBytes -= pendingBatchBytes(removed);
         }
 
-        let accepted = [...fitted.events];
-        let candidate = freezePendingBatch(incoming, accepted);
+        const accepted = [...fitted.events];
+        let candidate = freezePendingBatch(incoming, [...accepted]);
+        if (accepted.some(isProtectedPendingEvent)) {
+            while (this.#queuedBytes + pendingBatchBytes(candidate) > this.#maxQueuedBytes) {
+                const removable = findLastOrdinaryEvent(accepted);
+                if (removable < 0) {
+                    break;
+                }
+                accepted.splice(removable, 1);
+                dropped = saturatingAdd(dropped, 1);
+                candidate = freezePendingBatch(incoming, [...accepted]);
+            }
+        }
         dropped = saturatingAdd(dropped, this.#makePendingRoom(pendingBatchBytes(candidate), incoming));
+        let candidateBytes = pendingBatchBytes(candidate);
+        if (candidate.events.length === 0 || candidateBytes > this.#maxQueuedBytes
+            || this.#queuedBytes + candidateBytes > this.#maxQueuedBytes) {
+            return;
+        }
         if (dropped > 0) {
             const warned = addDropWarning(
                 incoming, accepted, dropped, this.#maxBatchEvents, this.#maxQueuedBytes
             );
-            accepted = [...warned.events];
-            dropped = warned.dropped;
-            candidate = freezePendingBatch(incoming, accepted);
-            const reserved = reserveDropWarningCount(candidate);
-            const pressureDropped = this.#makePendingRoom(pendingBatchBytes(reserved), incoming);
-            if (pressureDropped > 0) {
-                dropped = saturatingAdd(dropped, pressureDropped);
-                candidate = freezePendingBatch(incoming, replaceDropWarningCount(accepted, dropped));
+            const warnedEvents = [...warned.events];
+            if (warnedEvents.some(event => event.type === 'warning' && event.code === 'events-dropped')) {
+                const warnedCandidate = freezePendingBatch(incoming, warnedEvents);
+                const reserved = reserveDropWarningCount(warnedCandidate);
+                const pressureDropped = this.#makePendingRoom(pendingBatchBytes(reserved), incoming);
+                const totalDropped = saturatingAdd(warned.dropped, pressureDropped);
+                const countedCandidate = freezePendingBatch(
+                    incoming, replaceDropWarningCount(warnedEvents, totalDropped)
+                );
+                const countedBytes = pendingBatchBytes(countedCandidate);
+                if (countedBytes <= this.#maxQueuedBytes
+                    && this.#queuedBytes + countedBytes <= this.#maxQueuedBytes) {
+                    candidate = countedCandidate;
+                    candidateBytes = countedBytes;
+                }
             }
-        }
-        const candidateBytes = pendingBatchBytes(candidate);
-        if (candidate.events.length === 0 || candidateBytes > this.#maxQueuedBytes
-            || this.#queuedBytes + candidateBytes > this.#maxQueuedBytes) {
-            return;
         }
         this.#pending.push(candidate);
         this.#queuedBytes += candidateBytes;

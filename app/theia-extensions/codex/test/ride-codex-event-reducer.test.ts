@@ -1608,6 +1608,85 @@ describe('RideCodexEventReducer minimal frame contract', () => {
         }
     });
 
+    for (const delivery of ['same-wire', 'separate-wire'] as const) {
+        for (const maxBatchEvents of [2, 8]) {
+            it(`fits ${delivery} protected recovery events before candidate-local ordinary data at ${maxBatchEvents}`, () => {
+                const frames: Array<() => void> = [];
+                const reducer = new RideCodexEventReducer({
+                    scheduleFrame: callback => {
+                        frames.push(callback);
+                        return { dispose: () => undefined };
+                    },
+                    maxQueuedBytes: MIN_COHERENT_QUEUE_BYTES,
+                    maxBatchEvents
+                });
+                const identity = {
+                    generation: Number.MAX_SAFE_INTEGER,
+                    turnSequence: Number.MAX_SAFE_INTEGER,
+                    threadId: WORST_VALID_IDENTIFIER,
+                    turnId: WORST_VALID_IDENTIFIER
+                };
+                const boundaryEvents: RideCodexEventBatch['events'] = [
+                    { type: 'turn-started' },
+                    {
+                        type: 'turn-terminal',
+                        status: 'interrupt-uncertain',
+                        error: {
+                            code: 'interrupt-timeout',
+                            message: 'Codex turn interrupt could not be confirmed.'
+                        }
+                    }
+                ];
+                const ordinaryWarning: RideCodexEventBatch['events'][number] = {
+                    type: 'warning',
+                    code: 'server-warning',
+                    message: 'ordinary warning'
+                };
+                const recoveryFailed: RideCodexEventBatch['events'][number] = {
+                    type: 'error',
+                    code: 'recovery-failed',
+                    message: 'Codex thread recovery failed.',
+                    retryable: false
+                };
+                const boundaryBytes = Buffer.byteLength(batchWire({
+                    ...identity,
+                    events: boundaryEvents
+                }), 'utf8');
+                const recoveryBytes = Buffer.byteLength(batchWire({
+                    ...identity,
+                    events: [recoveryFailed]
+                }), 'utf8');
+                const pressuredRecoveryBytes = Buffer.byteLength(batchWire({
+                    ...identity,
+                    events: [ordinaryWarning, recoveryFailed]
+                }), 'utf8');
+                assert.equal(boundaryBytes + recoveryBytes, MIN_COHERENT_QUEUE_BYTES);
+                assert.ok(boundaryBytes + pressuredRecoveryBytes > MIN_COHERENT_QUEUE_BYTES);
+
+                if (delivery === 'same-wire') {
+                    reducer.notifyMany(batchWire({
+                        ...identity,
+                        events: [...boundaryEvents, ordinaryWarning, recoveryFailed]
+                    }));
+                } else {
+                    reducer.notifyMany(batchWire({ ...identity, events: boundaryEvents }));
+                    reducer.notifyMany(batchWire({
+                        ...identity,
+                        events: [ordinaryWarning, recoveryFailed]
+                    }));
+                }
+                assert.equal(frames.length, 1);
+                frames.shift()?.();
+
+                const snapshot = reducer.snapshot();
+                assert.equal(snapshot.status, 'interrupt-uncertain');
+                assert.deepEqual(snapshot.errors.map(error => error.code), [
+                    'interrupt-timeout', 'recovery-failed'
+                ], `${delivery}, maxBatchEvents=${maxBatchEvents}`);
+            });
+        }
+    }
+
     it('reports trailing ordinary events dropped from a later same-wire chunk', () => {
         const frames: Array<() => void> = [];
         const reducer = new RideCodexEventReducer({
