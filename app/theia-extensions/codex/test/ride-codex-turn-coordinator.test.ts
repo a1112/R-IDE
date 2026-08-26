@@ -16,6 +16,7 @@ import {
     RideCodexTurnCoordinator,
     RideCodexTurnHost,
     RideCodexTurnHostLease,
+    RideCodexTurnHostState,
     RideCodexTurnScheduler
 } from '../src/node/ride-codex-turn-coordinator';
 
@@ -256,7 +257,7 @@ class FakeTurnHost implements RideCodexTurnHost {
     restartPromise: Promise<number> | undefined;
     resumeResponse: unknown = validResumeResponse();
     readonly #notifications = new Set<(notification: RideCodexNotification, generation: number) => void>();
-    readonly #states = new Set<(event: Readonly<{ state: 'ready'; generation: number }>) => void>();
+    readonly #states = new Set<(event: Readonly<{ state: RideCodexTurnHostState; generation: number }>) => void>();
 
     async acquire(kind: 'active-turn' | 'foreground-panel'): Promise<RideCodexTurnHostLease> {
         return {
@@ -297,7 +298,7 @@ class FakeTurnHost implements RideCodexTurnHost {
         return { dispose: () => this.#notifications.delete(listener) };
     }
 
-    onStateChange(listener: (event: Readonly<{ state: 'ready'; generation: number }>) => void) {
+    onStateChange(listener: (event: Readonly<{ state: RideCodexTurnHostState; generation: number }>) => void) {
         this.#states.add(listener);
         return { dispose: () => this.#states.delete(listener) };
     }
@@ -322,9 +323,9 @@ class FakeTurnHost implements RideCodexTurnHost {
     }
 
 
-    emitState(state: 'ready' | 'restarting' | 'circuit-open' | 'disposed', generation = this.generation): void {
+    emitState(state: RideCodexTurnHostState, generation = this.generation): void {
         for (const listener of [...this.#states]) {
-            listener(Object.freeze({ state, generation }) as Readonly<{ state: 'ready'; generation: number }>);
+            listener(Object.freeze({ state, generation }));
         }
     }
 }
@@ -1973,6 +1974,10 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
                 threadId: WORST_VALID_IDENTIFIER,
                 input: [{ type: 'text', text: status }]
             });
+            host.emit('warning', {
+                threadId: WORST_VALID_IDENTIFIER,
+                message: 'x'.repeat(65_536)
+            });
             host.emit('turn/completed', {
                 threadId: WORST_VALID_IDENTIFIER,
                 turn: { id: WORST_VALID_IDENTIFIER, status, items: [] }
@@ -2014,6 +2019,10 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
             threadId: WORST_VALID_IDENTIFIER,
             input: [{ type: 'text', text: 'uncertain' }]
         });
+        host.emit('warning', {
+            threadId: WORST_VALID_IDENTIFIER,
+            message: 'x'.repeat(65_536)
+        });
         const interrupting = service.interruptTurn({
             threadId: WORST_VALID_IDENTIFIER,
             turnId: WORST_VALID_IDENTIFIER
@@ -2030,6 +2039,113 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         assert.equal(uncertainEvents[1].type === 'turn-terminal' && uncertainEvents[1].status, 'interrupt-uncertain');
         assert.ok(wires.every(wire => Buffer.byteLength(wire, 'utf8') <= RIDE_CODEX_MIN_QUEUED_BYTES));
         assert.ok(wires.every(wire => decodeBatch(wire).events.length > 0));
+    });
+
+    it('prioritizes an operation-failed terminal over same-identity drop metadata at the exact queue bound', async () => {
+        const escapedIdentifier = '\u0000'.repeat(400);
+        const host = new FakeTurnHost();
+        host.generation = Number.MAX_SAFE_INTEGER;
+        host.nextTurnId = escapedIdentifier;
+        const scheduler = new FakeScheduler();
+        const wires: string[] = [];
+        const coordinator = new RideCodexTurnCoordinator({
+            host,
+            scheduler,
+            maxQueuedBytes: RIDE_CODEX_MIN_QUEUED_BYTES,
+            maxBatchEvents: 2
+        });
+        const service = coordinator.connectClient({ turnEvents: wire => { wires.push(wire); } });
+
+        await service.startTurn({
+            threadId: escapedIdentifier,
+            input: [{ type: 'text', text: 'terminal priority' }]
+        });
+        host.emit('warning', {
+            threadId: escapedIdentifier,
+            message: 'x'.repeat(65_536)
+        });
+        host.emitState('stopped');
+        while (scheduler.callbacks.length > 0) {
+            scheduler.flushOne();
+            await Promise.resolve();
+        }
+
+        assert.ok(wires.every(wire => Buffer.byteLength(wire, 'utf8') <= RIDE_CODEX_MIN_QUEUED_BYTES));
+        assert.ok(wires.reduce((sum, wire) => sum + Buffer.byteLength(wire, 'utf8'), 0)
+            <= RIDE_CODEX_MIN_QUEUED_BYTES);
+        assert.ok(wires.every(wire => decodeBatch(wire).events.length > 0));
+        const boundary = wires.flatMap(wire => decodeBatch(wire).events).filter(event =>
+            event.type === 'turn-started' || event.type === 'turn-terminal'
+        );
+        assert.deepEqual(boundary, [
+            { type: 'turn-started' },
+            {
+                type: 'turn-terminal',
+                status: 'failed',
+                error: { code: 'operation-failed', message: 'Codex turn operation failed.' }
+            }
+        ]);
+        assert.equal(host.releases, 1);
+    });
+
+    it('prioritizes the terminal in the bounded slow-client pending path after metadata pressure', async () => {
+        const escapedIdentifier = '\u0000'.repeat(400);
+        const host = new FakeTurnHost();
+        host.generation = Number.MAX_SAFE_INTEGER;
+        host.nextTurnId = escapedIdentifier;
+        const scheduler = new FakeScheduler();
+        let unblock!: () => void;
+        const blocked = new Promise<void>(resolve => { unblock = resolve; });
+        const wires: string[] = [];
+        const coordinator = new RideCodexTurnCoordinator({
+            host,
+            scheduler,
+            maxQueuedBytes: RIDE_CODEX_MIN_QUEUED_BYTES,
+            maxBatchEvents: 2
+        });
+        let deliveries = 0;
+        const service = coordinator.connectClient({
+            turnEvents: wire => {
+                wires.push(wire);
+                deliveries += 1;
+                return deliveries === 1 ? blocked : undefined;
+            }
+        });
+
+        await service.startTurn({
+            threadId: escapedIdentifier,
+            input: [{ type: 'text', text: 'slow terminal priority' }]
+        });
+        scheduler.flushOne();
+        for (let index = 0; index < 100; index += 1) {
+            host.emit('warning', {
+                threadId: escapedIdentifier,
+                message: `warning-${index}-${'x'.repeat(64)}`
+            });
+        }
+        host.emitState('stopped');
+        while (scheduler.callbacks.length > 0) {
+            scheduler.flushOne();
+            await Promise.resolve();
+        }
+        unblock();
+        await Promise.resolve();
+        await Promise.resolve();
+
+        assert.ok(wires.every(wire => Buffer.byteLength(wire, 'utf8') <= RIDE_CODEX_MIN_QUEUED_BYTES));
+        assert.ok(wires.every(wire => decodeBatch(wire).events.length > 0));
+        const boundary = wires.flatMap(wire => decodeBatch(wire).events).filter(event =>
+            event.type === 'turn-started' || event.type === 'turn-terminal'
+        );
+        assert.deepEqual(boundary, [
+            { type: 'turn-started' },
+            {
+                type: 'turn-terminal',
+                status: 'failed',
+                error: { code: 'operation-failed', message: 'Codex turn operation failed.' }
+            }
+        ]);
+        assert.equal(host.releases, 1);
     });
 
     it('accounts for exact chunked wire bytes and never delivers empty batches', async () => {

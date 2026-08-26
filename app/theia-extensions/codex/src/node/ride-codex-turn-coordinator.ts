@@ -958,12 +958,29 @@ export class RideCodexTurnCoordinator {
 
     #makeRoomForBoundary(incoming: QueuedEvent): void {
         while (this.#queuedBytes([...this.#queue, incoming]) > this.#maxQueuedBytes) {
+            const incomingMetadataKey = queueIdentityKey(incoming.identity);
+            if (this.#queueMetadata.delete(incomingMetadataKey)) {
+                continue;
+            }
+            const queuedMetadataKey = [...this.#queueMetadata].find(([, metadata]) =>
+                this.#queue.some(entry => sameIdentity(entry.identity, metadata.identity))
+            )?.[0];
+            if (queuedMetadataKey !== undefined) {
+                this.#queueMetadata.delete(queuedMetadataKey);
+                continue;
+            }
             const index = this.#queue.findIndex(entry =>
                 entry.event.type !== 'turn-started' && entry.event.type !== 'turn-terminal'
             );
             if (index >= 0) {
                 const [removed] = this.#queue.splice(index, 1);
-                this.#addDropMetadata(removed.identity, removed.bytes);
+                if (sameIdentity(removed.identity, incoming.identity)
+                    || this.#queue.some(entry => sameIdentity(entry.identity, removed.identity))) {
+                    this.#addDropMetadata(removed.identity, removed.bytes);
+                    if (this.#queuedBytes([...this.#queue, incoming]) > this.#maxQueuedBytes) {
+                        this.#queueMetadata.delete(queueIdentityKey(removed.identity));
+                    }
+                }
                 continue;
             }
             const oldestOther = this.#queue.find(entry => !sameIdentity(entry.identity, incoming.identity));
