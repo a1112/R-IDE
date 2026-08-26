@@ -1351,7 +1351,7 @@ describe('RideCodexEventReducer minimal frame contract', () => {
                 events: [{
                     type: 'warning',
                     code: 'server-warning',
-                    message: 'unauthorized'
+                    message: 'x'.repeat(MIN_COHERENT_QUEUE_BYTES)
                 }]
             });
             assert.ok(Buffer.byteLength(protectedWire, 'utf8')
@@ -1441,6 +1441,106 @@ describe('RideCodexEventReducer minimal frame contract', () => {
         const snapshot = reducer.snapshot();
         assert.equal(snapshot.status, 'interrupt-uncertain');
         assert.deepEqual(snapshot.errors.map(error => error.code), ['interrupt-timeout', 'recovery-failed']);
+    });
+
+    it('reserves recovery-failed in one canonical batch at the exported minimum', () => {
+        const frames: Array<() => void> = [];
+        const reducer = new RideCodexEventReducer({
+            scheduleFrame: callback => {
+                frames.push(callback);
+                return { dispose: () => undefined };
+            },
+            maxQueuedBytes: MIN_COHERENT_QUEUE_BYTES,
+            maxBatchEvents: 8
+        });
+        const wire = batchWire({
+            generation: Number.MAX_SAFE_INTEGER,
+            turnSequence: Number.MAX_SAFE_INTEGER,
+            threadId: WORST_VALID_IDENTIFIER,
+            turnId: WORST_VALID_IDENTIFIER,
+            events: [
+                { type: 'turn-started' },
+                {
+                    type: 'turn-terminal',
+                    status: 'interrupt-uncertain',
+                    error: {
+                        code: 'interrupt-timeout',
+                        message: 'Codex turn interrupt could not be confirmed.'
+                    }
+                },
+                {
+                    type: 'error',
+                    code: 'recovery-failed',
+                    message: 'Codex thread recovery failed.',
+                    retryable: false
+                }
+            ]
+        });
+
+        assert.ok(Buffer.byteLength(wire, 'utf8') <= MIN_COHERENT_QUEUE_BYTES);
+        reducer.notifyMany(wire);
+        frames.shift()?.();
+
+        assert.equal(reducer.snapshot().status, 'interrupt-uncertain');
+        assert.deepEqual(reducer.snapshot().errors.map(error => error.code), [
+            'interrupt-timeout', 'recovery-failed'
+        ]);
+    });
+
+    it('reserves recovery-failed across canonical batches before RAF flush', () => {
+        for (const maxBatchEvents of [2, 8]) {
+            const frames: Array<() => void> = [];
+            const reducer = new RideCodexEventReducer({
+                scheduleFrame: callback => {
+                    frames.push(callback);
+                    return { dispose: () => undefined };
+                },
+                maxQueuedBytes: MIN_COHERENT_QUEUE_BYTES,
+                maxBatchEvents
+            });
+            const identity = {
+                generation: Number.MAX_SAFE_INTEGER,
+                turnSequence: Number.MAX_SAFE_INTEGER,
+                threadId: WORST_VALID_IDENTIFIER,
+                turnId: WORST_VALID_IDENTIFIER
+            };
+            const boundaryWire = batchWire({
+                ...identity,
+                events: [
+                    { type: 'turn-started' },
+                    {
+                        type: 'turn-terminal',
+                        status: 'interrupt-uncertain',
+                        error: {
+                            code: 'interrupt-timeout',
+                            message: 'Codex turn interrupt could not be confirmed.'
+                        }
+                    }
+                ]
+            });
+            const recoveryWire = batchWire({
+                ...identity,
+                events: [{
+                    type: 'error',
+                    code: 'recovery-failed',
+                    message: 'Codex thread recovery failed.',
+                    retryable: false
+                }]
+            });
+            assert.ok(Buffer.byteLength(boundaryWire, 'utf8') + Buffer.byteLength(recoveryWire, 'utf8')
+                <= MIN_COHERENT_QUEUE_BYTES);
+
+            reducer.notifyMany(boundaryWire);
+            reducer.notifyMany(recoveryWire);
+            reducer.notifyMany(recoveryWire);
+            assert.equal(frames.length, 1);
+            frames.shift()?.();
+
+            assert.equal(reducer.snapshot().status, 'interrupt-uncertain');
+            assert.deepEqual(reducer.snapshot().errors.map(error => error.code), [
+                'interrupt-timeout', 'recovery-failed'
+            ]);
+        }
     });
 
     it('accepts bounded deduplicated diagnostics for only the current finalized identity', () => {

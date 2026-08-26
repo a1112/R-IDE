@@ -19,6 +19,7 @@ import {
     RideCodexTurnHostState,
     RideCodexTurnScheduler
 } from '../src/node/ride-codex-turn-coordinator';
+import { RideCodexEventReducer } from '../src/browser/ride-codex-event-reducer';
 
 const WORST_VALID_IDENTIFIER = '\u0000'.repeat(512);
 const MIN_COHERENT_QUEUE_BYTES = RIDE_CODEX_MIN_QUEUED_BYTES;
@@ -2227,6 +2228,144 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         assert.equal(uncertainEvents[1].type === 'turn-terminal' && uncertainEvents[1].status, 'interrupt-uncertain');
         assert.ok(wires.every(wire => Buffer.byteLength(wire, 'utf8') <= RIDE_CODEX_MIN_QUEUED_BYTES));
         assert.ok(wires.every(wire => decodeBatch(wire).events.length > 0));
+    });
+
+    it('reserves recovery-failed end to end at the exported minimum for two- and eight-event batches', async () => {
+        for (const maxBatchEvents of [2, 8]) {
+            const host = new FakeTurnHost();
+            host.generation = Number.MAX_SAFE_INTEGER - 1;
+            host.nextTurnId = WORST_VALID_IDENTIFIER;
+            host.interruptPromise = Promise.resolve({});
+            host.resumeResponse = {};
+            const scheduler = new FakeScheduler();
+            const timeoutCallbacks: Array<() => void> = [];
+            const frames: Array<() => void> = [];
+            const wires: string[] = [];
+            const reducer = new RideCodexEventReducer({
+                maxQueuedBytes: RIDE_CODEX_MIN_QUEUED_BYTES,
+                maxBatchEvents,
+                scheduleFrame: callback => {
+                    frames.push(callback);
+                    return { dispose: () => undefined };
+                }
+            });
+            const coordinator = new RideCodexTurnCoordinator({
+                host,
+                scheduler,
+                maxQueuedBytes: RIDE_CODEX_MIN_QUEUED_BYTES,
+                maxBatchEvents,
+                interruptTimeoutMs: 10,
+                timers: {
+                    setTimeout: callback => { timeoutCallbacks.push(callback); return callback; },
+                    clearTimeout: () => undefined
+                }
+            });
+            const service = coordinator.connectClient({
+                turnEvents: wire => {
+                    wires.push(wire);
+                    reducer.notifyMany(wire);
+                }
+            });
+
+            await service.startTurn({
+                threadId: WORST_VALID_IDENTIFIER,
+                input: [{ type: 'text', text: 'recover' }]
+            });
+            const interrupting = service.interruptTurn({
+                threadId: WORST_VALID_IDENTIFIER,
+                turnId: WORST_VALID_IDENTIFIER
+            });
+            await Promise.resolve();
+            timeoutCallbacks.shift()?.();
+            assert.equal((await interrupting).status, 'interrupt-uncertain');
+            while (scheduler.callbacks.length > 0) {
+                scheduler.flushOne();
+                await Promise.resolve();
+            }
+
+            const events = wires.flatMap(wire => decodeBatch(wire).events);
+            assert.deepEqual(events.map(event => event.type), ['turn-started', 'turn-terminal', 'error']);
+            assert.equal(events[1].type === 'turn-terminal' && events[1].status, 'interrupt-uncertain');
+            assert.equal(events[2].type === 'error' && events[2].code, 'recovery-failed');
+            assert.ok(wires.every(wire => Buffer.byteLength(wire, 'utf8') <= RIDE_CODEX_MIN_QUEUED_BYTES));
+            assert.ok(wires.every(wire => decodeBatch(wire).events.length > 0));
+            assert.ok(wires.reduce((sum, wire) => sum + Buffer.byteLength(wire, 'utf8'), 0)
+                <= RIDE_CODEX_MIN_QUEUED_BYTES);
+
+            frames.shift()?.();
+            const snapshot = reducer.snapshot();
+            assert.equal(snapshot.status, 'interrupt-uncertain');
+            assert.deepEqual(snapshot.errors.map(error => error.code), ['interrupt-timeout', 'recovery-failed']);
+            reducer.dispose();
+            await coordinator.dispose();
+        }
+    });
+
+    it('keeps one recovery-failed diagnostic through the bounded slow-client pending path', async () => {
+        const host = new FakeTurnHost();
+        host.generation = Number.MAX_SAFE_INTEGER - 1;
+        host.nextTurnId = WORST_VALID_IDENTIFIER;
+        host.interruptPromise = Promise.resolve({});
+        host.resumeResponse = {};
+        let resolveRestart!: (generation: number) => void;
+        host.restartPromise = new Promise(resolve => { resolveRestart = resolve; });
+        const scheduler = new FakeScheduler();
+        const timeoutCallbacks: Array<() => void> = [];
+        const wires: string[] = [];
+        let unblock!: () => void;
+        const blocked = new Promise<void>(resolve => { unblock = resolve; });
+        const coordinator = new RideCodexTurnCoordinator({
+            host,
+            scheduler,
+            maxQueuedBytes: RIDE_CODEX_MIN_QUEUED_BYTES,
+            maxBatchEvents: 2,
+            interruptTimeoutMs: 10,
+            timers: {
+                setTimeout: callback => { timeoutCallbacks.push(callback); return callback; },
+                clearTimeout: () => undefined
+            }
+        });
+        let deliveries = 0;
+        const service = coordinator.connectClient({
+            turnEvents: wire => {
+                wires.push(wire);
+                deliveries += 1;
+                return deliveries === 1 ? blocked : undefined;
+            }
+        });
+
+        await service.startTurn({
+            threadId: WORST_VALID_IDENTIFIER,
+            input: [{ type: 'text', text: 'slow recovery' }]
+        });
+        scheduler.flushOne();
+        host.emit('warning', { threadId: WORST_VALID_IDENTIFIER, message: 'ordinary metadata' });
+        scheduler.flushOne();
+        const interrupting = service.interruptTurn({
+            threadId: WORST_VALID_IDENTIFIER,
+            turnId: WORST_VALID_IDENTIFIER
+        });
+        await Promise.resolve();
+        timeoutCallbacks.shift()?.();
+        scheduler.flushOne();
+        host.generation = Number.MAX_SAFE_INTEGER;
+        resolveRestart(Number.MAX_SAFE_INTEGER);
+        await interrupting;
+        while (scheduler.callbacks.length > 0) {
+            scheduler.flushOne();
+            await Promise.resolve();
+        }
+        unblock();
+        await Promise.resolve();
+        await Promise.resolve();
+
+        const events = wires.flatMap(wire => decodeBatch(wire).events);
+        assert.deepEqual(events.filter(event => event.type === 'turn-started').length, 1);
+        assert.deepEqual(events.filter(event => event.type === 'turn-terminal').length, 1);
+        assert.deepEqual(events.filter(event => event.type === 'error' && event.code === 'recovery-failed').length, 1);
+        assert.ok(wires.every(wire => Buffer.byteLength(wire, 'utf8') <= RIDE_CODEX_MIN_QUEUED_BYTES));
+        assert.ok(wires.every(wire => decodeBatch(wire).events.length > 0));
+        await coordinator.dispose();
     });
 
     it('prioritizes an operation-failed terminal over same-identity drop metadata at the exact queue bound', async () => {

@@ -35,12 +35,24 @@ const RIDE_CODEX_TERMINAL_BOUNDARIES = Object.freeze([
         })
     })
 ]);
-export const RIDE_CODEX_MIN_QUEUED_BYTES = Math.max(...RIDE_CODEX_TERMINAL_BOUNDARIES.map(terminal =>
+const RIDE_CODEX_RECOVERY_FAILED_DIAGNOSTIC = Object.freeze({
+    type: 'error',
+    code: 'recovery-failed',
+    message: 'Codex thread recovery failed.',
+    retryable: false
+});
+const RIDE_CODEX_MAX_BOUNDARY_BATCH_BYTES = Math.max(...RIDE_CODEX_TERMINAL_BOUNDARIES.map(terminal =>
     utf8ByteLength(JSON.stringify({
         ...RIDE_CODEX_BOUNDARY_IDENTITY,
         events: [Object.freeze({ type: 'turn-started' }), terminal]
     }))
 ));
+const RIDE_CODEX_RECOVERY_BATCH_BYTES = utf8ByteLength(JSON.stringify({
+    ...RIDE_CODEX_BOUNDARY_IDENTITY,
+    events: [RIDE_CODEX_RECOVERY_FAILED_DIAGNOSTIC]
+}));
+export const RIDE_CODEX_MIN_QUEUED_BYTES =
+    RIDE_CODEX_MAX_BOUNDARY_BATCH_BYTES + RIDE_CODEX_RECOVERY_BATCH_BYTES;
 export type RideCodexItemKind =
     | 'user-message' | 'agent-message' | 'plan' | 'reasoning'
     | 'command' | 'file-change' | 'other';

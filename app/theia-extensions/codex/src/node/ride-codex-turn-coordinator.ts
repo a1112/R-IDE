@@ -201,6 +201,7 @@ export class RideCodexTurnCoordinator {
     readonly #diagnostics: RideCodexUiEvent[] = [];
     readonly #queue: QueuedEvent[] = [];
     readonly #queueMetadata = new Map<string, QueueMetadata>();
+    readonly #reservedRecoveryIdentities = new Set<string>();
     readonly #releasedLeases = new WeakSet<object>();
     readonly #disposedSignal: Promise<never>;
     readonly #rejectDisposed: (error: RideCodexTurnError) => void;
@@ -306,6 +307,7 @@ export class RideCodexTurnCoordinator {
         this.#queue.length = 0;
         this.#queueIdentity = undefined;
         this.#queueMetadata.clear();
+        this.#reservedRecoveryIdentities.clear();
         for (const listener of this.#listeners.splice(0)) {
             disposeSafely(listener);
         }
@@ -941,6 +943,23 @@ export class RideCodexTurnCoordinator {
     }
 
     #enqueueDiagnostic(event: Extract<RideCodexUiEvent, { type: 'warning' | 'error' }>): void {
+        if (isReservedRecoveryDiagnostic(event)) {
+            const identity = this.#queueIdentity;
+            if (!identity) {
+                return;
+            }
+            const key = queueIdentityKey(identity);
+            if (this.#reservedRecoveryIdentities.has(key)) {
+                return;
+            }
+            if (this.#reservedRecoveryIdentities.size >= MAX_QUEUE_METADATA_IDENTITIES) {
+                const oldest = this.#reservedRecoveryIdentities.values().next().value as string | undefined;
+                if (oldest !== undefined) {
+                    this.#reservedRecoveryIdentities.delete(oldest);
+                }
+            }
+            this.#reservedRecoveryIdentities.add(key);
+        }
         this.#diagnostics.push(event);
         this.#diagnostics.splice(0, Math.max(0, this.#diagnostics.length - this.#maxDiagnosticHistory));
         this.#enqueue(event);
@@ -956,12 +975,16 @@ export class RideCodexTurnCoordinator {
             event: bounded,
             bytes: eventBytes(bounded)
         });
-        if (bounded.type === 'turn-started' || bounded.type === 'turn-terminal') {
+        if (isReservedRecoveryDiagnostic(bounded)) {
+            this.#makeRoomForReservedRecovery(entry);
+        } else if (bounded.type === 'turn-started' || bounded.type === 'turn-terminal') {
             this.#makeRoomForBoundary(entry);
         }
         const candidateBytes = this.#queuedBytes([...this.#queue, entry]);
         if (candidateBytes > this.#maxQueuedBytes) {
-            this.#recordDrop(this.#queueIdentity, entry.bytes);
+            if (!isReservedRecoveryDiagnostic(bounded)) {
+                this.#recordDrop(this.#queueIdentity, entry.bytes);
+            }
             this.#scheduleFlush();
             return;
         }
@@ -983,7 +1006,7 @@ export class RideCodexTurnCoordinator {
                 continue;
             }
             const index = this.#queue.findIndex(entry =>
-                entry.event.type !== 'turn-started' && entry.event.type !== 'turn-terminal'
+                !isProtectedQueueEvent(entry.event)
             );
             if (index >= 0) {
                 const [removed] = this.#queue.splice(index, 1);
@@ -1004,6 +1027,30 @@ export class RideCodexTurnCoordinator {
                 const candidate = this.#queue[queueIndex];
                 if (sameIdentity(candidate.identity, oldestOther.identity)) {
                     this.#queue.splice(queueIndex, 1);
+                }
+            }
+            this.#queueMetadata.delete(queueIdentityKey(oldestOther.identity));
+        }
+    }
+
+    #makeRoomForReservedRecovery(incoming: QueuedEvent): void {
+        while (this.#queuedBytes([...this.#queue, incoming]) > this.#maxQueuedBytes) {
+            if (this.#queueMetadata.size > 0) {
+                this.#queueMetadata.clear();
+                continue;
+            }
+            const ordinary = this.#queue.findIndex(entry => !isProtectedQueueEvent(entry.event));
+            if (ordinary >= 0) {
+                this.#queue.splice(ordinary, 1);
+                continue;
+            }
+            const oldestOther = this.#queue.find(entry => !sameIdentity(entry.identity, incoming.identity));
+            if (!oldestOther) {
+                break;
+            }
+            for (let index = this.#queue.length - 1; index >= 0; index -= 1) {
+                if (sameIdentity(this.#queue[index].identity, oldestOther.identity)) {
+                    this.#queue.splice(index, 1);
                 }
             }
             this.#queueMetadata.delete(queueIdentityKey(oldestOther.identity));
@@ -1036,7 +1083,7 @@ export class RideCodexTurnCoordinator {
     #trimQueueToBudget(): void {
         while (this.#queuedBytes() > this.#maxQueuedBytes) {
             const ordinary = this.#queue.findIndex(entry =>
-                entry.event.type !== 'turn-started' && entry.event.type !== 'turn-terminal'
+                !isProtectedQueueEvent(entry.event)
             );
             if (ordinary >= 0) {
                 const [removed] = this.#queue.splice(ordinary, 1);
@@ -1102,6 +1149,18 @@ export class RideCodexTurnCoordinator {
             const entry = this.#queue.shift() as QueuedEvent;
             events.push(entry.event);
         }
+        while (metadata && events.length + queueMetadataBudgetEvents(metadata).length > this.#maxBatchEvents) {
+            const removable = findLastIndex(events, event => !isProtectedQueueEvent(event));
+            if (removable < 0) {
+                break;
+            }
+            const [removed] = events.splice(removable, 1);
+            metadata.droppedEvents = Math.min(Number.MAX_SAFE_INTEGER, metadata.droppedEvents + 1);
+            metadata.droppedBytes = Math.min(
+                Number.MAX_SAFE_INTEGER,
+                metadata.droppedBytes + Math.min(eventBytes(removed), this.#maxQueuedBytes)
+            );
+        }
         if (metadata && metadata.droppedEvents > 0 && events.length < this.#maxBatchEvents) {
             const warning = Object.freeze({
                 type: 'warning', code: 'events-dropped',
@@ -1136,7 +1195,7 @@ export class RideCodexTurnCoordinator {
         while (events.length > 0
             && batchBytes({ ...identity, events }) > this.#maxQueuedBytes) {
             const removable = findLastIndex(events, event =>
-                event.type !== 'turn-started' && event.type !== 'turn-terminal'
+                !isProtectedQueueEvent(event)
             );
             if (removable < 0) {
                 break;
@@ -1234,10 +1293,17 @@ export class RideCodexTurnCoordinator {
     }
 
     #queueClientDelivery(client: ClientRecord, batch: RideCodexEventBatch): void {
+        const reservedRecovery = batch.events.some(isReservedRecoveryDiagnostic);
+        if (reservedRecovery && client.pending.some(candidate =>
+            sameBatchIdentity(candidate, batch) && candidate.events.some(isReservedRecoveryDiagnostic)
+        )) {
+            return;
+        }
         const previous = client.pending[client.pending.length - 1];
         if (previous && previous.generation === batch.generation
             && previous.turnSequence === batch.turnSequence
-            && previous.threadId === batch.threadId && previous.turnId === batch.turnId) {
+            && previous.threadId === batch.threadId && previous.turnId === batch.turnId
+            && !reservedRecovery) {
             const merged = mergeBatches(previous, batch, this.#maxBatchEvents, this.#maxQueuedBytes);
             client.pendingBytes -= batchBytes(previous);
             client.pending[client.pending.length - 1] = merged;
@@ -1248,8 +1314,42 @@ export class RideCodexTurnCoordinator {
         }
         while (client.pending.length > MAX_CLIENT_PENDING_BATCHES
             || client.pendingBytes > this.#maxQueuedBytes) {
+            let ordinaryRemoved = false;
+            for (let batchIndex = 0; batchIndex < client.pending.length; batchIndex += 1) {
+                const pending = client.pending[batchIndex];
+                const eventIndex = pending.events.findIndex(event => !isProtectedQueueEvent(event));
+                if (eventIndex < 0) {
+                    continue;
+                }
+                const previousBytes = batchBytes(pending);
+                const events = pending.events.filter((_event, index) => index !== eventIndex);
+                const removed = pending.events[eventIndex];
+                if (events.length === 0) {
+                    client.pending.splice(batchIndex, 1);
+                    client.pendingBytes -= previousBytes;
+                } else {
+                    const replacement = freezeRideCodexEventBatch({ ...pending, events });
+                    client.pending[batchIndex] = replacement;
+                    client.pendingBytes -= previousBytes - batchBytes(replacement);
+                }
+                client.droppedEvents = Math.min(
+                    Number.MAX_SAFE_INTEGER,
+                    client.droppedEvents + (removed.type === 'warning' && removed.code === 'events-dropped'
+                        ? removed.droppedEvents ?? 1 : 1)
+                );
+                client.droppedBytes = Math.min(
+                    Number.MAX_SAFE_INTEGER,
+                    client.droppedBytes + Math.min(eventBytes(removed), this.#maxQueuedBytes)
+                );
+                ordinaryRemoved = true;
+                break;
+            }
+            if (ordinaryRemoved) {
+                continue;
+            }
             const removable = client.pending.findIndex(candidate =>
-                !client.inFlightIdentity || !sameBatchIdentity(candidate, client.inFlightIdentity)
+                (!client.inFlightIdentity || !sameBatchIdentity(candidate, client.inFlightIdentity))
+                && !sameBatchIdentity(candidate, batch)
             );
             if (removable < 0) {
                 break;
@@ -1303,7 +1403,7 @@ export class RideCodexTurnCoordinator {
         while (events.length >= this.#maxBatchEvents
             || batchBytes({ ...batch, events: [...events, warning] }) > this.#maxQueuedBytes) {
             const removable = findLastIndex(events, event =>
-                event.type !== 'turn-started' && event.type !== 'turn-terminal'
+                !isProtectedQueueEvent(event)
             );
             if (removable < 0) {
                 return batch;
@@ -2946,22 +3046,20 @@ function mergeBatches(
         }
         events.push(event);
     }
-    for (const terminal of candidates.filter(event => event.type === 'turn-terminal')) {
-        if (events.includes(terminal)) {
+    for (const priority of candidates.filter(isProtectedQueueEvent)) {
+        if (events.includes(priority)) {
             continue;
         }
-        while (events.length >= maxEvents || !fits([...events, terminal])) {
-            const removable = findLastIndex(events, event =>
-                event.type !== 'turn-started' && event.type !== 'turn-terminal'
-            );
+        while (events.length >= maxEvents || !fits([...events, priority])) {
+            const removable = findLastIndex(events, event => !isProtectedQueueEvent(event));
             if (removable < 0) {
                 break;
             }
             events.splice(removable, 1);
             dropped += 1;
         }
-        if (events.length < maxEvents && fits([...events, terminal])) {
-            events.push(terminal);
+        if (events.length < maxEvents && fits([...events, priority])) {
+            events.push(priority);
             dropped = Math.max(0, dropped - 1);
         }
     }
@@ -2974,7 +3072,7 @@ function mergeBatches(
         let warning = warningFor();
         while (events.length >= maxEvents || !fits([...events, warning])) {
             const removable = findLastIndex(events, event =>
-                event.type !== 'turn-started' && event.type !== 'turn-terminal'
+                !isProtectedQueueEvent(event)
             );
             if (removable < 0) {
                 break;
@@ -3010,6 +3108,15 @@ function sameBatchIdentity(batch: RideCodexEventBatch, identity: QueueIdentity):
     return batch.generation === identity.generation
         && batch.turnSequence === identity.turnSequence
         && batch.threadId === identity.threadId && batch.turnId === identity.turnId;
+}
+
+function isReservedRecoveryDiagnostic(event: RideCodexUiEvent): boolean {
+    return event.type === 'error' && event.code === 'recovery-failed';
+}
+
+function isProtectedQueueEvent(event: RideCodexUiEvent): boolean {
+    return event.type === 'turn-started' || event.type === 'turn-terminal'
+        || isReservedRecoveryDiagnostic(event);
 }
 
 function queueIdentityKey(identity: QueueIdentity): string {

@@ -97,6 +97,7 @@ export class RideCodexEventReducer {
     #snapshot: RideCodexTurnSnapshot = EMPTY_SNAPSHOT;
     #frame: RideCodexFrameDisposable | undefined;
     #queuedBytes = 0;
+    #recoveryFailureRetained = false;
     #generation = 0;
     #highestTurnSequence: number | undefined;
     #threadId: string | undefined;
@@ -181,6 +182,7 @@ export class RideCodexEventReducer {
         this.#frame = undefined;
         this.#pending.length = 0;
         this.#queuedBytes = 0;
+        this.#recoveryFailureRetained = false;
         this.#items.clear();
         this.#truncatedItems.clear();
         this.#finalizedIdentities.clear();
@@ -349,9 +351,16 @@ export class RideCodexEventReducer {
         let dropped = initialDropped;
         const events: RideCodexUiEvent[] = [];
         const matching: number[] = [];
+        const reservedRecovery = incoming.events.some(isReservedRecoveryDiagnostic);
+        if (reservedRecovery && this.#pending.some(pending =>
+            sameBatchIdentity(pending, incoming) && pending.events.some(isReservedRecoveryDiagnostic)
+        )) {
+            return;
+        }
         for (let index = 0; index < this.#pending.length; index += 1) {
             const pending = this.#pending[index];
-            if (!sameBatchIdentity(pending, incoming)) {
+            if (!sameBatchIdentity(pending, incoming) || reservedRecovery
+                || pending.events.some(isReservedRecoveryDiagnostic)) {
                 continue;
             }
             matching.push(index);
@@ -414,7 +423,7 @@ export class RideCodexEventReducer {
             let removed = false;
             for (let batchIndex = 0; batchIndex < this.#pending.length; batchIndex += 1) {
                 const pendingBatch = this.#pending[batchIndex];
-                const eventIndex = pendingBatch.events.findIndex(event => !isTurnBoundary(event));
+                const eventIndex = pendingBatch.events.findIndex(event => !isProtectedPendingEvent(event));
                 if (eventIndex < 0) {
                     continue;
                 }
@@ -453,6 +462,7 @@ export class RideCodexEventReducer {
     #resetFor(batch: RideCodexEventBatch): void {
         this.#generation = batch.generation;
         this.#highestTurnSequence = batch.turnSequence;
+        this.#recoveryFailureRetained = false;
         this.#threadId = batch.threadId;
         this.#turnId = batch.turnId;
         this.#status = 'idle';
@@ -474,8 +484,7 @@ export class RideCodexEventReducer {
                 return true;
             }
             if (event.type === 'error') {
-                this.#pushError(event);
-                return true;
+                return this.#pushErrorOnce(event);
             }
             return false;
         }
@@ -489,7 +498,7 @@ export class RideCodexEventReducer {
             case 'turn-terminal':
                 this.#status = event.status;
                 if (event.error) {
-                    this.#pushError({
+                    this.#pushErrorOnce({
                         type: 'error', code: event.error.code, message: event.error.message, retryable: false
                     });
                 }
@@ -551,8 +560,7 @@ export class RideCodexEventReducer {
                 this.#pushWarning(event);
                 return true;
             case 'error':
-                this.#pushError(event);
-                return true;
+                return this.#pushErrorOnce(event);
         }
     }
 
@@ -708,6 +716,17 @@ export class RideCodexEventReducer {
         this.#errors.push(bounded);
         this.#diagnosticRetainedBytes += diagnosticEventBytes(bounded);
         this.#trimDiagnostics();
+    }
+
+    #pushErrorOnce(event: Extract<RideCodexUiEvent, { type: 'error' }>): boolean {
+        if (isReservedRecoveryDiagnostic(event)) {
+            if (this.#recoveryFailureRetained) {
+                return false;
+            }
+            this.#recoveryFailureRetained = true;
+        }
+        this.#pushError(event);
+        return true;
     }
 
     #trimDiagnostics(): void {
@@ -1355,7 +1374,7 @@ function isDiagnosticOnly(events: readonly RideCodexUiEvent[]): boolean {
 
 function findLastOrdinaryEvent(events: readonly RideCodexUiEvent[]): number {
     for (let index = events.length - 1; index >= 0; index -= 1) {
-        if (!isTurnBoundary(events[index])) {
+        if (!isProtectedPendingEvent(events[index])) {
             return index;
         }
     }
@@ -1373,7 +1392,7 @@ function selectPriorityEvents(
             selected.push({ event, index });
             continue;
         }
-        if (!isTurnBoundary(event)) {
+        if (!isProtectedPendingEvent(event)) {
             continue;
         }
         const removable = findLastOrdinaryEvent(selected.map(entry => entry.event));
@@ -1383,4 +1402,12 @@ function selectPriorityEvents(
     }
     selected.sort((left, right) => left.index - right.index);
     return selected.map(entry => entry.event);
+}
+
+function isReservedRecoveryDiagnostic(event: RideCodexUiEvent): boolean {
+    return event.type === 'error' && event.code === 'recovery-failed';
+}
+
+function isProtectedPendingEvent(event: RideCodexUiEvent): boolean {
+    return isTurnBoundary(event) || isReservedRecoveryDiagnostic(event);
 }
