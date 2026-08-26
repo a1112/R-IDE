@@ -48,6 +48,7 @@ class FakeThreadHost implements RideCodexThreadHost {
     releaseCount = 0;
     activeLeases = 0;
     acquireFailure: Error | undefined;
+    acquireGate: ReturnType<typeof deferred<void>> | undefined;
     startGenerationOnAcquire: number | undefined;
 
     async acquire(): Promise<{
@@ -58,6 +59,9 @@ class FakeThreadHost implements RideCodexThreadHost {
         this.acquireCount += 1;
         if (this.acquireFailure) {
             throw this.acquireFailure;
+        }
+        if (this.acquireGate) {
+            await this.acquireGate.promise;
         }
         if (this.startGenerationOnAcquire !== undefined) {
             const generation = this.startGenerationOnAcquire;
@@ -498,6 +502,82 @@ test('bounds archive reconciliation tombstones during a notification storm', asy
     await coordinator.dispose();
 });
 
+test('does not revive an archived thread after its bounded tombstone is evicted', async () => {
+    const host = new FakeThreadHost();
+    const delayed = deferred<unknown>();
+    host.responder = () => delayed.promise;
+    const coordinator = new RideCodexThreadCoordinator({ host });
+    const listing = coordinator.listThreads();
+    await tick();
+
+    for (let index = 0; index < 513; index += 1) {
+        host.notify('thread/archived', { threadId: `archived-${index}` });
+    }
+    delayed.resolve({
+        data: [rawThread('archived-0')], nextCursor: null, backwardsCursor: null
+    });
+    const page = await listing;
+
+    assert.deepEqual(page.data.map(thread => thread.id), ['archived-0']);
+    assert.equal(coordinator.snapshot().threads.some(thread => thread.id === 'archived-0'), false);
+    await coordinator.dispose();
+});
+
+test('does not commit an old list after its pending status evidence is evicted', async () => {
+    const host = new FakeThreadHost();
+    const delayed = deferred<unknown>();
+    host.responder = () => delayed.promise;
+    const coordinator = new RideCodexThreadCoordinator({ host });
+    const listing = coordinator.listThreads();
+    await tick();
+
+    for (let index = 0; index < 513; index += 1) {
+        host.notify('thread/status/changed', {
+            threadId: `pending-${index}`,
+            status: { type: 'active', activeFlags: ['waitingOnApproval'] }
+        });
+    }
+    delayed.resolve({
+        data: [rawThread('pending-0', { status: { type: 'idle' } })],
+        nextCursor: null,
+        backwardsCursor: null
+    });
+    const page = await listing;
+
+    assert.deepEqual(page.data.map(thread => thread.id), ['pending-0']);
+    assert.equal(coordinator.snapshot().threads.some(thread => thread.id === 'pending-0'), false);
+    await coordinator.dispose();
+});
+
+test('does not revive thread and status state after bounded cache trimming evicts its revisions', async () => {
+    const host = new FakeThreadHost();
+    const delayed = deferred<unknown>();
+    host.responder = () => delayed.promise;
+    const coordinator = new RideCodexThreadCoordinator({ host });
+    const listing = coordinator.listThreads();
+    await tick();
+
+    host.notify('thread/started', { thread: rawThread('trimmed', { status: { type: 'idle' } }) });
+    host.notify('thread/status/changed', {
+        threadId: 'trimmed', status: { type: 'active', activeFlags: ['waitingOnUserInput'] }
+    });
+    for (let index = 0; index < 500; index += 1) {
+        host.notify('thread/started', { thread: rawThread(`retained-${index}`) });
+    }
+    assert.equal(coordinator.snapshot().threads.some(thread => thread.id === 'trimmed'), false);
+
+    delayed.resolve({
+        data: [rawThread('trimmed', { status: { type: 'idle' } })],
+        nextCursor: null,
+        backwardsCursor: null
+    });
+    const page = await listing;
+
+    assert.deepEqual(page.data.map(thread => thread.id), ['trimmed']);
+    assert.equal(coordinator.snapshot().threads.some(thread => thread.id === 'trimmed'), false);
+    await coordinator.dispose();
+});
+
 test('rejects an old-generation response before it can replace trusted thread state', async () => {
     const host = new FakeThreadHost();
     host.responder = () => ({
@@ -520,6 +600,38 @@ test('rejects an old-generation response before it can replace trusted thread st
     assert.equal(host.acquireCount, host.releaseCount);
     await coordinator.dispose();
 });
+
+for (const boundary of [
+    { state: 'restarting', generation: 2 },
+    { state: 'circuit-open', generation: 1 },
+    { state: 'disposed', generation: 1 }
+] as const) {
+    test(`immediately cancels a bound request when the host becomes ${boundary.state}`, async () => {
+        const host = new FakeThreadHost();
+        const pending = deferred<unknown>();
+        host.responder = () => pending.promise;
+        const coordinator = new RideCodexThreadCoordinator({ host });
+        const operation = coordinator.listThreads().catch(error => error as Error);
+        await waitFor(() => host.activeLeases === 1 && host.requests.length === 1);
+
+        host.changeState(boundary.state, boundary.generation);
+        const immediate = await Promise.race([
+            operation,
+            tick().then(() => 'still-pending' as const)
+        ]);
+
+        assert.ok(immediate instanceof Error);
+        assert.match(immediate.message, /disposed|superseded/i);
+        assert.equal(host.releaseCount, 1);
+        assert.equal(host.activeLeases, 0);
+
+        pending.reject(new Error('late bound request failure'));
+        await operation;
+        await tick();
+        assert.equal(host.releaseCount, 1);
+        await coordinator.dispose();
+    });
+}
 
 test('refreshes the selected thread through the same host after a new ready generation', async () => {
     const host = new FakeThreadHost();
@@ -598,7 +710,7 @@ test('dispose immediately rejects a hung request and releases only its own lease
     host.responder = () => pending.promise;
     const coordinator = new RideCodexThreadCoordinator({ host });
     const operation = coordinator.listThreads().catch(error => error as Error);
-    await waitFor(() => host.activeLeases === 1);
+    await waitFor(() => host.activeLeases === 1 && host.requests.length === 1);
 
     await coordinator.dispose();
     const immediate = await Promise.race([
@@ -617,6 +729,72 @@ test('dispose immediately rejects a hung request and releases only its own lease
     assert.equal(releasedAtDispose, 1);
     assert.equal(activeAtDispose, 0);
     assert.equal(host.acquireCount, host.releaseCount);
+});
+
+test('dispose immediately rejects a request whose host acquire is hung and releases a late lease', async () => {
+    const host = new FakeThreadHost();
+    const gate = deferred<void>();
+    host.acquireGate = gate;
+    const coordinator = new RideCodexThreadCoordinator({ host });
+    const operation = coordinator.listModels().catch(error => error as Error);
+    await waitFor(() => host.acquireCount === 1);
+
+    await coordinator.dispose();
+    const immediate = await Promise.race([
+        operation,
+        tick().then(() => 'still-pending' as const)
+    ]);
+    gate.resolve(undefined);
+    await waitFor(() => host.releaseCount === 1);
+    await operation;
+
+    assert.ok(immediate instanceof Error);
+    assert.match(immediate.message, /disposed|superseded/i);
+    assert.equal(host.activeLeases, 0);
+    assert.equal(host.acquireCount, host.releaseCount);
+});
+
+test('absorbs a late acquire rejection after dispose', async () => {
+    const host = new FakeThreadHost();
+    const gate = deferred<void>();
+    host.acquireGate = gate;
+    const coordinator = new RideCodexThreadCoordinator({ host });
+    const operation = coordinator.listModels().catch(error => error as Error);
+    await waitFor(() => host.acquireCount === 1);
+
+    await coordinator.dispose();
+    gate.reject(new Error('late acquire failure'));
+    const result = await operation;
+    assert.ok(result instanceof Error);
+    assert.match(result.message, /disposed|superseded/i);
+
+    await tick();
+    assert.equal(host.releaseCount, 0);
+});
+
+test('bounds requests waiting for host acquisition', async () => {
+    const host = new FakeThreadHost();
+    const gate = deferred<void>();
+    host.acquireGate = gate;
+    const coordinator = new RideCodexThreadCoordinator({ host });
+    const waiting = Array.from({ length: 128 }, () => coordinator.listModels().catch(error => error as Error));
+    await waitFor(() => host.acquireCount === 128);
+
+    const overflow = coordinator.listModels().catch(error => error as Error);
+    const immediate = await Promise.race([
+        overflow,
+        tick().then(() => 'still-pending' as const)
+    ]);
+
+    await coordinator.dispose();
+    gate.resolve(undefined);
+    await Promise.all([...waiting, overflow]);
+    await waitFor(() => host.releaseCount === host.acquireCount);
+
+    assert.ok(immediate instanceof Error);
+    assert.match(immediate.message, /operation failed/i);
+    assert.equal(host.acquireCount, 128);
+    assert.equal(host.activeLeases, 0);
 });
 
 test('a newer explicit selection wins over an older start response and clients receive immutable state', async () => {

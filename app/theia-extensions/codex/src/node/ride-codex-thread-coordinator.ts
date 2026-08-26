@@ -68,6 +68,7 @@ const MAX_PAGE_SIZE = 100;
 const MAX_CACHED_THREADS = 500;
 const MAX_ARCHIVE_TOMBSTONES = 512;
 const MAX_PENDING_STATUSES = 512;
+const MAX_ACTIVE_REQUESTS = 128;
 const MAX_CURSOR_LENGTH = 4_096;
 const MAX_ID_LENGTH = 256;
 const MAX_MODEL_LENGTH = 256;
@@ -100,7 +101,9 @@ interface PendingThreadStatus {
 }
 
 interface ActiveThreadRequest {
+    generation: number | undefined;
     readonly invalidated: Promise<never>;
+    bind(lease: RideCodexThreadHostLease, generation: number): boolean;
     invalidate(error: RideCodexConversationsError): void;
     release(): void;
 }
@@ -118,6 +121,7 @@ export class RideCodexThreadCoordinator {
     readonly #archiveRevisions = new Map<string, number>();
     #generation: number;
     #stateRevision = 0;
+    #metadataEvictionFloor = 0;
     #selectionRevision = 0;
     #threadListRevision = 0;
     #lifecycle = 0;
@@ -208,7 +212,8 @@ export class RideCodexThreadCoordinator {
         const context = this.#operationContext();
         const page = normalizeThreadPage(await this.#request('thread/list', params, context.lifecycle));
         if (archived !== true && operation === this.#threadListRevision
-            && context.selectionRevision === this.#selectionRevision && !this.#disposed) {
+            && context.selectionRevision === this.#selectionRevision && !this.#disposed
+            && context.stateRevision >= this.#metadataEvictionFloor) {
             let changed = false;
             if (cursor === undefined && context.stateRevision === this.#stateRevision) {
                 changed = this.#threads.size > 0;
@@ -336,6 +341,7 @@ export class RideCodexThreadCoordinator {
         for (const active of [...this.#activeRequests]) {
             active.invalidate(new RideCodexConversationsError('disposed'));
             active.release();
+            this.#activeRequests.delete(active);
         }
         for (const listener of this.#listeners.splice(0)) {
             disposeSafely(listener);
@@ -361,7 +367,8 @@ export class RideCodexThreadCoordinator {
     }
 
     #commitThreadOperation(summary: RideCodexThreadSummary, context: ThreadOperationContext, select: boolean): void {
-        if (this.#disposed || context.lifecycle !== this.#lifecycle) {
+        if (this.#disposed || context.lifecycle !== this.#lifecycle
+            || context.stateRevision < this.#metadataEvictionFloor) {
             throw new RideCodexConversationsError('operation-superseded');
         }
         let changed = this.#mergeThread(summary, context.stateRevision);
@@ -382,16 +389,31 @@ export class RideCodexThreadCoordinator {
         params: unknown,
         lifecycle: number
     ): Promise<unknown> {
-        let lease: RideCodexThreadHostLease;
-        let active: ActiveThreadRequest | undefined;
+        const active = this.#trackRequest();
         try {
-            lease = await this.#host.acquire('foreground-panel');
-        } catch {
-            throw new RideCodexConversationsError('operation-failed');
-        }
-        try {
-            const generation = requireGeneration(lease.generation);
-            active = this.#trackRequest(lease);
+            let acquiring: Promise<RideCodexThreadHostLease>;
+            try {
+                acquiring = Promise.resolve(this.#host.acquire('foreground-panel'));
+            } catch {
+                throw new RideCodexConversationsError('operation-failed');
+            }
+            const binding = acquiring.then(lease => {
+                let generation: number;
+                try {
+                    generation = requireGeneration(lease.generation);
+                } catch (error) {
+                    releaseLeaseSafely(lease);
+                    throw error;
+                }
+                if (!active.bind(lease, generation)) {
+                    throw new RideCodexConversationsError(
+                        this.#disposed ? 'disposed' : 'operation-superseded'
+                    );
+                }
+                return Object.freeze({ lease, generation });
+            });
+            void binding.catch(() => undefined);
+            const { lease, generation } = await Promise.race([binding, active.invalidated]);
             this.#requireOperation(lifecycle, generation);
             const pending = lease.request(method, params);
             if (typeof pending === 'object' && pending !== null && utilTypes.isProxy(pending)) {
@@ -406,29 +428,35 @@ export class RideCodexThreadCoordinator {
             }
             throw new RideCodexConversationsError('operation-failed');
         } finally {
-            if (active) {
-                active.release();
-                this.#activeRequests.delete(active);
-            } else {
-                try {
-                    lease.release();
-                } catch {
-                    // The host owns idempotent lease cleanup.
-                }
-            }
+            active.release();
+            this.#activeRequests.delete(active);
         }
     }
 
-    #trackRequest(lease: RideCodexThreadHostLease): ActiveThreadRequest {
+    #trackRequest(): ActiveThreadRequest {
+        if (this.#activeRequests.size >= MAX_ACTIVE_REQUESTS) {
+            throw new RideCodexConversationsError('operation-failed');
+        }
         let invalidated = false;
         let released = false;
+        let lease: RideCodexThreadHostLease | undefined;
         let rejectInvalidated!: (error: RideCodexConversationsError) => void;
         const invalidation = new Promise<never>((_resolve, reject) => {
             rejectInvalidated = reject;
         });
         void invalidation.catch(() => undefined);
         const active: ActiveThreadRequest = {
+            generation: undefined,
             invalidated: invalidation,
+            bind: (nextLease, generation) => {
+                if (invalidated || released || lease !== undefined) {
+                    releaseLeaseSafely(nextLease);
+                    return false;
+                }
+                lease = nextLease;
+                active.generation = generation;
+                return true;
+            },
             invalidate: error => {
                 if (!invalidated) {
                     invalidated = true;
@@ -440,10 +468,8 @@ export class RideCodexThreadCoordinator {
                     return;
                 }
                 released = true;
-                try {
-                    lease.release();
-                } catch {
-                    // The host owns idempotent lease cleanup.
+                if (lease) {
+                    releaseLeaseSafely(lease);
                 }
             }
         };
@@ -538,6 +564,8 @@ export class RideCodexThreadCoordinator {
             if (oldest === undefined) {
                 break;
             }
+            const evicted = this.#pendingStatuses.get(oldest);
+            this.#recordMetadataEviction(evicted?.revision);
             this.#pendingStatuses.delete(oldest);
         }
         return false;
@@ -559,6 +587,7 @@ export class RideCodexThreadCoordinator {
             if (oldest === undefined) {
                 break;
             }
+            this.#recordMetadataEviction(this.#archiveRevisions.get(oldest));
             this.#archiveRevisions.delete(oldest);
         }
         this.#pendingStatuses.delete(threadId);
@@ -579,13 +608,28 @@ export class RideCodexThreadCoordinator {
             if (!removable) {
                 break;
             }
+            this.#recordMetadataEviction(
+                this.#threadRevisions.get(removable) ?? this.#stateRevision,
+                this.#statusRevisions.get(removable),
+                this.#pendingStatuses.get(removable)?.revision,
+                this.#archiveRevisions.get(removable)
+            );
             this.#threads.delete(removable);
             this.#threadRevisions.delete(removable);
             this.#statusRevisions.delete(removable);
+            this.#pendingStatuses.delete(removable);
             this.#archiveRevisions.delete(removable);
             changed = true;
         }
         return changed;
+    }
+
+    #recordMetadataEviction(...revisions: readonly (number | undefined)[]): void {
+        for (const revision of revisions) {
+            if (revision !== undefined && revision > this.#metadataEvictionFloor) {
+                this.#metadataEvictionFloor = revision;
+            }
+        }
     }
 
     #onNotification(notification: RideCodexNotification, generation: number): void {
@@ -634,12 +678,22 @@ export class RideCodexThreadCoordinator {
         if (event.generation > this.#generation) {
             this.#generation = event.generation;
             this.#nextStateRevision();
+            this.#metadataEvictionFloor = 0;
             this.#threadRevisions.clear();
             this.#statusRevisions.clear();
             this.#pendingStatuses.clear();
             this.#archiveRevisions.clear();
             this.#restartRefreshGeneration = 0;
             this.#publish();
+        }
+        const hostInvalid = event.state === 'circuit-open' || event.state === 'disposed';
+        for (const active of [...this.#activeRequests]) {
+            if (active.generation !== undefined
+                && (hostInvalid || active.generation !== this.#generation)) {
+                active.invalidate(new RideCodexConversationsError('operation-superseded'));
+                active.release();
+                this.#activeRequests.delete(active);
+            }
         }
         const selected = this.#selectedThreadId;
         if (event.state === 'ready' && selected && this.#restartRefreshGeneration !== event.generation) {
@@ -1094,6 +1148,14 @@ function threadEquals(left: RideCodexThreadSummary, right: RideCodexThreadSummar
         && left.modelProvider === right.modelProvider && left.createdAt === right.createdAt
         && left.updatedAt === right.updatedAt && left.recencyAt === right.recencyAt
         && left.cwd === right.cwd && statusEquals(left.status, right.status);
+}
+
+function releaseLeaseSafely(lease: RideCodexThreadHostLease): void {
+    try {
+        lease.release();
+    } catch {
+        // The host owns idempotent lease cleanup.
+    }
 }
 
 function disposeSafely(disposable: RideCodexDisposable): void {
