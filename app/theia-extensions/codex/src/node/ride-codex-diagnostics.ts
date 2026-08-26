@@ -206,15 +206,19 @@ function redactUntrustedText(value: string): string {
         .replace(/\bauthorization\s*[:=]\s*(?:bearer\s+)?[^\s,;&]+/gi, 'authorization=<redacted>')
         .replace(/\bbearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer <redacted>')
         .replace(
-            /\b((?:openai[\s_-]*)?api[\s_-]*key|access[\s_-]*token|refresh[\s_-]*token|credential|password|key|token|secret)\b\s*(?:[:=]\s*|\s+)[^\s,;&]+/gi,
+            /(["'])((?:openai[\s_-]*)?api[\s_-]*key|access[\s_-]*token|refresh[\s_-]*token|credential|password|key|token|secret)\1\s*[:=]\s*(?:"(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|[^\r\n,;&}]+)/gi,
+            '$1$2$1=<redacted>'
+        )
+        .replace(
+            /\b((?:openai[\s_-]*)?api[\s_-]*key|access[\s_-]*token|refresh[\s_-]*token|credential|password|key|token|secret)\b\s*(?:[:=]\s*|\s+)(?:"(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|[^\r\n,;&}]+)/gi,
             '$1=<redacted>'
         )
         .replace(/\bsk-[A-Za-z0-9_-]+\b/gi, '<redacted>')
         .replace(/(["'])(?:file:\/{2,3}|[A-Za-z]:[\\/]|\\\\|\/)[^"'\r\n]*\1/gi, '<path>')
-        .replace(/\bfile:\/{2,3}[^\s,;]+/gi, '<path>')
+        .replace(/\bfile:\/{2,3}[^\r\n,;)"'\]}]*/gi, '<path>')
         .replace(/\\\\[^\r\n]*/g, '<path>')
         .replace(/\b[A-Za-z]:[\\/][^\r\n]*/g, '<path>')
-        .replace(/(^|\s)\/(?!\/)[^\r\n]*/g, '$1<path>')
+        .replace(/(^|[\s=:(\[,])\/(?!\/)[^\r\n,;)"'\]}]*/g, '$1<path>')
         .replace(/\b[A-Za-z0-9._-]*secret[A-Za-z0-9._-]*\b/gi, '<redacted>')
         .replace(/\b[A-Za-z0-9+/_=-]{64,}\b/g, '<redacted>');
 }

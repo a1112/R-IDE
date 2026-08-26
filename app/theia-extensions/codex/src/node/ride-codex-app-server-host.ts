@@ -129,6 +129,7 @@ interface Connection {
     ready: boolean;
     finalized: boolean;
     killRequested: boolean;
+    exitHandling: boolean;
 }
 
 const INITIALIZE_PARAMS = Object.freeze({
@@ -221,6 +222,21 @@ export class RideCodexAppServerHost {
     async retry(): Promise<void> {
         if (this.#disposed) {
             throw new RideCodexAppServerHostError('disposed');
+        }
+        const stopping = this.#stopPromise;
+        if (stopping) {
+            await stopping.catch(() => undefined);
+        }
+        const owned = this.#connection;
+        if (owned && !owned.finalized && (!owned.ready || this.#state === 'circuit-open')) {
+            try {
+                await this.#stopConnection(owned, 'retry');
+            } catch {
+                if (!this.#disposed) {
+                    this.#state = 'circuit-open';
+                }
+                throw new RideCodexAppServerHostError('shutdown-timeout');
+            }
         }
         this.#restartAttempts = 0;
         if (this.#state === 'circuit-open') {
@@ -382,6 +398,12 @@ export class RideCodexAppServerHost {
         if (this.#startPromise) {
             return this.#startPromise;
         }
+        if (this.#connection && !this.#connection.finalized) {
+            if (!this.#disposed) {
+                this.#state = 'circuit-open';
+            }
+            throw new RideCodexAppServerHostError('circuit-open');
+        }
         this.#state = restarting ? 'restarting' : 'starting';
         const generation = this.#generation + 1;
         this.#generation = generation;
@@ -428,7 +450,10 @@ export class RideCodexAppServerHost {
             if (this.#disposed || this.#connection !== connection || generation !== this.#generation) {
                 throw new RideCodexAppServerHostError(this.#disposed ? 'disposed' : 'early-exit');
             }
-            connection.client.notify('initialized', {});
+            await connection.client.notifyConfirmed('initialized', {});
+            if (this.#disposed || this.#connection !== connection || generation !== this.#generation) {
+                throw new RideCodexAppServerHostError(this.#disposed ? 'disposed' : 'early-exit');
+            }
             connection.ready = true;
             this.#state = 'ready';
             return connection;
@@ -484,7 +509,8 @@ export class RideCodexAppServerHost {
             }
             throw error;
         }
-        const connection: Connection = {
+        let connection!: Connection;
+        connection = {
             generation,
             child,
             pid: child.pid,
@@ -494,12 +520,16 @@ export class RideCodexAppServerHost {
             resolveExit,
             stderrDataListener,
             stderrErrorListener,
-            processExitListener: () => resolveExit(),
+            processExitListener: () => {
+                resolveExit();
+                void this.#handleConnectionExit(connection);
+            },
             clientListeners,
             intentionalStop: false,
             ready: false,
             finalized: false,
-            killRequested: false
+            killRequested: false,
+            exitHandling: false
         };
         child.on('exit', connection.processExitListener);
         child.on('close', connection.processExitListener);
@@ -513,61 +543,68 @@ export class RideCodexAppServerHost {
     }
 
     async #handleConnectionExit(connection: Connection, _reason?: Error): Promise<void> {
-        if (connection.finalized) {
+        if (connection.finalized || connection.exitHandling) {
             return;
         }
-        const wasCurrent = this.#connection === connection && this.#generation === connection.generation;
-        if (!hasProcessExited(connection.child)) {
-            connection.client.dispose();
-            this.#killExactChild(connection);
-            if (!await settlesWithin(connection.exitPromise, this.#shutdownGraceMs)) {
-                this.diagnostics.record('shutdown-timeout');
-                if (wasCurrent && !this.#disposed) {
-                    this.#openCircuit('circuit-open');
+        connection.exitHandling = true;
+        try {
+            const wasCurrent = this.#connection === connection && this.#generation === connection.generation;
+            if (!hasProcessExited(connection.child)) {
+                connection.client.dispose();
+                this.#killExactChild(connection);
+                if (!await settlesWithin(connection.exitPromise, this.#shutdownGraceMs)) {
+                    this.diagnostics.record('shutdown-timeout');
+                    if (wasCurrent && !this.#disposed) {
+                        this.#openCircuit('circuit-open');
+                    }
+                    return;
+                }
+            }
+            this.#finalizeConnection(connection);
+            if (!wasCurrent) {
+                return;
+            }
+            this.#connection = undefined;
+            if (this.#disposed) {
+                this.#state = 'disposed';
+                return;
+            }
+            if (connection.intentionalStop) {
+                if (!this.#connection && this.#state !== 'circuit-open') {
+                    this.#state = 'stopped';
                 }
                 return;
             }
-        }
-        this.#finalizeConnection(connection);
-        if (!wasCurrent) {
-            return;
-        }
-        this.#connection = undefined;
-        if (this.#disposed) {
-            this.#state = 'disposed';
-            return;
-        }
-        if (connection.intentionalStop) {
-            if (!this.#connection) {
-                this.#state = 'stopped';
+            if (!connection.ready) {
+                if (this.#state !== 'circuit-open') {
+                    this.#state = 'stopped';
+                }
+                return;
             }
-            return;
-        }
-        if (!connection.ready) {
-            this.#state = 'stopped';
-            return;
-        }
 
-        this.diagnostics.record('unexpected-exit');
-        if (this.#unsafeApprovalCount > 0) {
-            this.#openCircuit('unsafe-approval-exit');
-            return;
-        }
-        if (this.#restartAttempts >= 1) {
-            this.#openCircuit('circuit-open');
-            return;
-        }
-        if (this.#leases.size === 0) {
-            this.#state = 'stopped';
-            return;
-        }
-        this.#restartAttempts += 1;
-        try {
-            await this.#ensureStarted(true);
-        } catch {
-            if (!this.#disposed && this.#state !== 'circuit-open') {
-                this.#openCircuit('circuit-open');
+            this.diagnostics.record('unexpected-exit');
+            if (this.#unsafeApprovalCount > 0) {
+                this.#openCircuit('unsafe-approval-exit');
+                return;
             }
+            if (this.#restartAttempts >= 1) {
+                this.#openCircuit('circuit-open');
+                return;
+            }
+            if (this.#leases.size === 0) {
+                this.#state = 'stopped';
+                return;
+            }
+            this.#restartAttempts += 1;
+            try {
+                await this.#ensureStarted(true);
+            } catch {
+                if (!this.#disposed && this.#state !== 'circuit-open') {
+                    this.#openCircuit('circuit-open');
+                }
+            }
+        } finally {
+            connection.exitHandling = false;
         }
     }
 
@@ -598,7 +635,7 @@ export class RideCodexAppServerHost {
         }
     }
 
-    #stopConnection(connection: Connection, reason: 'idle' | 'dispose' | 'startup-failure'): Promise<void> {
+    #stopConnection(connection: Connection, reason: 'idle' | 'dispose' | 'startup-failure' | 'retry'): Promise<void> {
         if (this.#stopPromise) {
             if (this.#stoppingConnection === connection) {
                 return this.#stopPromise;
@@ -613,7 +650,7 @@ export class RideCodexAppServerHost {
         });
         this.#stopPromise = stopPromise;
         this.#stoppingConnection = connection;
-        void this.#performStopConnection(connection).then(
+        void this.#performStopConnection(connection, reason === 'retry').then(
             () => {
                 if (this.#stopPromise === stopPromise) {
                     this.#stopPromise = undefined;
@@ -633,17 +670,17 @@ export class RideCodexAppServerHost {
         return stopPromise;
     }
 
-    async #performStopConnection(connection: Connection): Promise<void> {
+    async #performStopConnection(connection: Connection, retryTermination: boolean): Promise<void> {
         if (connection.finalized) {
             return;
         }
         connection.intentionalStop = true;
         connection.ready = false;
-        if (!this.#disposed) {
+        if (!this.#disposed && this.#state !== 'circuit-open') {
             this.#state = 'stopping';
         }
         connection.client.dispose();
-        if (await settlesWithin(connection.exitPromise, this.#shutdownGraceMs)) {
+        if (!connection.killRequested && await settlesWithin(connection.exitPromise, this.#shutdownGraceMs)) {
             this.#finalizeConnection(connection);
             if (this.#connection === connection) {
                 this.#connection = undefined;
@@ -653,14 +690,16 @@ export class RideCodexAppServerHost {
             }
             return;
         }
-        this.diagnostics.record('shutdown-forced');
-        this.#killExactChild(connection);
+        if (!connection.killRequested) {
+            this.diagnostics.record('shutdown-forced');
+        }
+        this.#killExactChild(connection, retryTermination);
         if (!await settlesWithin(connection.exitPromise, this.#shutdownGraceMs)) {
             this.diagnostics.record('shutdown-timeout');
             if (!this.#disposed) {
                 this.#openCircuit('circuit-open');
             }
-            return;
+            throw new RideCodexAppServerHostError('shutdown-timeout');
         }
         this.#finalizeConnection(connection);
         if (this.#connection === connection) {
@@ -671,8 +710,8 @@ export class RideCodexAppServerHost {
         }
     }
 
-    #killExactChild(connection: Connection): void {
-        if (connection.killRequested) {
+    #killExactChild(connection: Connection, retry = false): void {
+        if (connection.killRequested && !retry) {
             return;
         }
         connection.killRequested = true;
@@ -725,6 +764,7 @@ class ChildJsonlTransport implements RideCodexJsonlTransport {
     readonly #onExit = (): void => this.#emitExit(new Error('Codex App Server process exited'));
     readonly #onProcessError = (): void => this.#emitExit(new Error('Codex App Server process failed'));
     readonly #onStreamError = (): void => this.#emitExit(new Error('Codex App Server stdio failed'));
+    readonly #onStdinClose = (): void => this.#emitExit(new Error('Codex App Server stdin closed'));
     #exited = false;
     #closeRequested = false;
     #disposed = false;
@@ -736,6 +776,7 @@ class ChildJsonlTransport implements RideCodexJsonlTransport {
             this.#stdout.on('data', this.#onData);
             this.#stdout.on('error', this.#onStreamError);
             this.#stdin.on('error', this.#onStreamError);
+            this.#stdin.on('close', this.#onStdinClose);
             child.on('error', this.#onProcessError);
             child.on('exit', this.#onExit);
         } catch (error) {
@@ -745,14 +786,48 @@ class ChildJsonlTransport implements RideCodexJsonlTransport {
     }
 
     write(data: string): void {
+        const operation = this.writeConfirmed(data);
+        void operation.catch(() => undefined);
+    }
+
+    writeConfirmed(data: string): Promise<void> {
         if (this.#exited || this.#disposed || this.#closeRequested || !this.#stdin.writable) {
-            throw new Error('Codex App Server stdin is unavailable');
+            return containedWriteRejection(new Error('Codex App Server stdin is unavailable'));
         }
-        this.#stdin.write(data, 'utf8', error => {
-            if (error) {
-                this.#emitExit(new Error('Codex App Server stdio failed'));
+        let exitListener: RideCodexDisposable | undefined;
+        const operation = new Promise<void>((resolve, reject) => {
+            let settled = false;
+            const settle = (error?: Error): void => {
+                if (settled) {
+                    return;
+                }
+                settled = true;
+                exitListener?.dispose();
+                if (error) {
+                    reject(error);
+                } else {
+                    resolve();
+                }
+            };
+            exitListener = this.onExit(reason => settle(reason ?? new Error('Codex App Server process exited')));
+            try {
+                this.#stdin.write(data, 'utf8', error => {
+                    if (error) {
+                        const failure = new Error('Codex App Server stdio failed');
+                        this.#emitExit(failure);
+                        settle(failure);
+                    } else {
+                        settle();
+                    }
+                });
+            } catch {
+                const failure = new Error('Codex App Server stdio failed');
+                this.#emitExit(failure);
+                settle(failure);
             }
         });
+        void operation.catch(() => undefined);
+        return operation;
     }
 
     onData(listener: (chunk: Uint8Array) => void): RideCodexDisposable {
@@ -787,6 +862,7 @@ class ChildJsonlTransport implements RideCodexJsonlTransport {
         this.#stdout.off('data', this.#onData);
         this.#stdout.off('error', this.#onStreamError);
         this.#stdin.off('error', this.#onStreamError);
+        this.#stdin.off('close', this.#onStdinClose);
         this.child.off('error', this.#onProcessError);
         this.child.off('exit', this.#onExit);
         this.#dataListeners.clear();
@@ -976,6 +1052,12 @@ function disposeSafely(disposable: RideCodexDisposable): void {
     } catch {
         // Listener disposal is idempotent and best effort.
     }
+}
+
+function containedWriteRejection(error: Error): Promise<never> {
+    const rejection = Promise.reject(error);
+    void rejection.catch(() => undefined);
+    return rejection;
 }
 
 async function settlesWithin(promise: Promise<void>, timeoutMs: number): Promise<boolean> {

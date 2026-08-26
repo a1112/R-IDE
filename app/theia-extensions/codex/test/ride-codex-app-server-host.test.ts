@@ -271,6 +271,65 @@ test('actual child early exit, handshake timeout, and malformed output reject st
     }
 });
 
+test('initialized delivery failures reject startup before ready and clean the owned child', async t => {
+    const cases = [
+        'synchronous-throw',
+        'asynchronous-callback-error',
+        'asynchronous-close'
+    ] as const;
+    for (const failureMode of cases) {
+        await t.test(failureMode, async () => {
+            const records: SpawnRecord[] = [];
+            const spawn = fakeSpawn(['normal'], records);
+            let writes = 0;
+            const host = new RideCodexAppServerHost({
+                resolver: { resolve: async () => launchSpec() },
+                spawn: (executable, args, options) => {
+                    const child = spawn(executable, args, options);
+                    const originalWrite = child.stdin.write.bind(child.stdin) as (...writeArgs: unknown[]) => boolean;
+                    child.stdin.write = ((...writeArgs: unknown[]) => {
+                        writes += 1;
+                        if (writes !== 2) {
+                            return originalWrite(...writeArgs);
+                        }
+                        if (failureMode === 'synchronous-throw') {
+                            throw new Error('initialized synchronous write failure');
+                        }
+                        const callback = writeArgs.find(value => typeof value === 'function') as
+                            ((error?: Error | null) => void) | undefined;
+                        if (failureMode === 'asynchronous-callback-error') {
+                            setImmediate(() => callback?.(new Error('initialized asynchronous write failure')));
+                        } else {
+                            setImmediate(() => child.stdin.emit('close'));
+                        }
+                        return true;
+                    }) as typeof child.stdin.write;
+                    return child;
+                },
+                handshakeTimeoutMs: 500,
+                shutdownGraceMs: 200
+            });
+
+            try {
+                await assert.rejects(host.acquire('foreground-panel'), /initialize|startup|exited/i);
+                assert.equal(writes, 2);
+                assert.notEqual(host.snapshot().state, 'ready');
+                assert.equal(host.snapshot().initialization, undefined);
+                assert.equal(records.length, 1);
+                await waitFor(() => records[0].child.exitCode !== null || records[0].child.signalCode !== null);
+                assert.equal(host.snapshot().pid, undefined);
+            } finally {
+                await host.dispose().catch(() => undefined);
+                for (const record of records) {
+                    if (record.child.exitCode === null && record.child.signalCode === null) {
+                        record.child.kill();
+                    }
+                }
+            }
+        });
+    }
+});
+
 test('exit and dispose reject every pending RPC exactly once', async t => {
     await t.test('unexpected exit', async () => {
         const harness = createHost({ modes: ['normal', 'normal'] });
@@ -416,6 +475,84 @@ test('acquire during irreversible idle stop waits for one fresh generation and i
     assert.ok(harness.records.every(record => record.child.exitCode !== null || record.child.signalCode !== null));
 });
 
+test('shutdown timeout retains sole child authority until exit is confirmed and an explicit retry follows', async () => {
+    const harness = createHost({
+        modes: ['ignore-stdin-close', 'normal'],
+        idleTimeoutMs: 5,
+        shutdownGraceMs: 15
+    });
+    const first = await harness.host.acquire('foreground-panel');
+    const oldChild = harness.records[0].child;
+    const originalKill = oldChild.kill.bind(oldChild);
+    let killCalls = 0;
+    oldChild.kill = (() => {
+        killCalls += 1;
+        return false;
+    }) as typeof oldChild.kill;
+    let accidentalLease: Awaited<ReturnType<RideCodexAppServerHost['acquire']>> | undefined;
+
+    try {
+        first.release();
+        await waitFor(() => harness.host.snapshot().state === 'circuit-open');
+        assert.equal(oldChild.exitCode, null);
+        assert.equal(oldChild.signalCode, null);
+        assert.equal(harness.records.length, 1);
+
+        const retryError = await harness.host.retry().then(
+            () => undefined,
+            error => error as Error
+        );
+        const acquireResult = await harness.host.acquire('active-turn').then(
+            lease => lease,
+            error => error as Error
+        );
+        if (!(acquireResult instanceof Error)) {
+            accidentalLease = acquireResult;
+        }
+
+        assert.ok(retryError instanceof RideCodexAppServerHostError);
+        assert.equal(retryError.code, 'shutdown-timeout');
+        assert.ok(acquireResult instanceof RideCodexAppServerHostError);
+        assert.equal((acquireResult as RideCodexAppServerHostError).code, 'circuit-open');
+        assert.equal(harness.host.snapshot().state, 'circuit-open');
+        assert.equal(harness.records.length, 1);
+        assert.ok(killCalls >= 2, 'explicit retry must attempt exact-child termination again');
+        assert.ok(harness.records.filter(record =>
+            record.child.exitCode === null && record.child.signalCode === null
+        ).length <= 1);
+
+        oldChild.kill = originalKill as typeof oldChild.kill;
+        assert.equal(originalKill(), true);
+        await waitFor(() => oldChild.exitCode !== null || oldChild.signalCode !== null);
+        await waitFor(() => harness.host.snapshot().pid === undefined);
+        await assert.rejects(harness.host.acquire('foreground-panel'), error => {
+            assert.equal((error as RideCodexAppServerHostError).code, 'circuit-open');
+            return true;
+        });
+
+        await harness.host.retry();
+        const second = await harness.host.acquire('foreground-panel');
+        assert.equal(harness.records.length, 2);
+        assert.equal(harness.host.snapshot().generation, 2);
+        assert.ok(harness.records.filter(record =>
+            record.child.exitCode === null && record.child.signalCode === null
+        ).length <= 1);
+        second.release();
+    } finally {
+        accidentalLease?.release();
+        oldChild.kill = originalKill as typeof oldChild.kill;
+        if (oldChild.exitCode === null && oldChild.signalCode === null) {
+            originalKill();
+        }
+        await harness.host.dispose().catch(() => undefined);
+        for (const record of harness.records) {
+            if (record.child.exitCode === null && record.child.signalCode === null) {
+                record.child.kill();
+            }
+        }
+    }
+});
+
 test('one unexpected crash restarts once, a second crash opens a stable circuit, and retry resets it', async () => {
     const harness = createHost({ modes: ['crash-after-initialize', 'crash-after-initialize', 'normal'] });
     const lease = await harness.host.acquire('active-turn');
@@ -529,6 +666,53 @@ test('diagnostic records redact generic credentials and local path forms without
     assert.ok(snapshot.entries.every(entry => Buffer.byteLength(entry.message) <= 512));
 });
 
+test('diagnostics redact quoted and spaced secrets, arbitrary local paths, and URL credentials across records and chunks', () => {
+    const secretFragments = /audit password|audit api key|audit token|audit credential phrase|audit-user|audit-query|Audit(?:%20| )User|private|repo/i;
+    const recordDiagnostics = new RideCodexAppServerDiagnostics({
+        maxEntries: 8,
+        maxEntryBytes: 1_024,
+        maxStderrLines: 8,
+        maxStderrBytes: 2_048,
+        maxLineBytes: 1_024
+    });
+    recordDiagnostics.record(
+        'protocol-error',
+        '{"password":"audit password","api_key":\'audit api key\',"token" : "audit token"}'
+    );
+    recordDiagnostics.record('protocol-error', 'credential: audit credential phrase with spaces');
+    recordDiagnostics.record('protocol-error', 'cwd=/home/Audit User/private/repo');
+    recordDiagnostics.record('protocol-error', 'path:(/home/Audit User/private/repo)');
+    recordDiagnostics.record('protocol-error', 'uri=file:///home/Audit User/private/repo');
+    recordDiagnostics.record('protocol-error', 'cwd=C:\\Users\\Audit User\\private\\repo');
+    recordDiagnostics.record('protocol-error', 'cwd=\\\\server\\Audit User\\private\\repo');
+    recordDiagnostics.record(
+        'protocol-error',
+        'endpoint=https://audit-user:audit-password@example.test/reference?token=audit-query&public=ok'
+    );
+
+    const recordSnapshot = recordDiagnostics.snapshot();
+    const serializedRecords = JSON.stringify(recordSnapshot);
+    assert.doesNotMatch(serializedRecords, secretFragments);
+    assert.ok(recordSnapshot.entries.every(entry => Buffer.byteLength(entry.message) <= 1_024));
+
+    const streamDiagnostics = new RideCodexAppServerDiagnostics({
+        maxStderrLines: 4,
+        maxStderrBytes: 1_024,
+        maxLineBytes: 512
+    });
+    streamDiagnostics.appendStderr(Buffer.from('{"password":"audit pass'));
+    streamDiagnostics.appendStderr(Buffer.from('word","api_key":\'audit api'));
+    streamDiagnostics.appendStderr(Buffer.from(' key\',"token":"audit token"} cwd=/home/Au'));
+    streamDiagnostics.appendStderr(Buffer.from('dit User/private/repo file:///home/Audit User/private/repo'));
+    streamDiagnostics.flushStderr();
+
+    const streamSnapshot = streamDiagnostics.snapshot();
+    assert.doesNotMatch(JSON.stringify(streamSnapshot), secretFragments);
+    assert.ok(streamSnapshot.stderr.lines.length <= 4);
+    assert.ok(streamSnapshot.stderr.bytes <= 1_024);
+    assert.equal(streamSnapshot.stderr.truncated, false);
+});
+
 test('stderr redaction survives chunk boundaries and bounds an overlong unterminated line', () => {
     const diagnostics = new RideCodexAppServerDiagnostics({
         maxEntries: 2,
@@ -612,13 +796,13 @@ test('synchronous spawn and listener failures roll back without leaking a child 
 });
 
 test('a live stdio failure cleans the old exact child before starting the next generation', async () => {
-    const harness = createHost({ modes: ['normal', 'normal'], shutdownGraceMs: 50 });
+    const harness = createHost({ modes: ['normal', 'normal'], shutdownGraceMs: 100 });
     const lease = await harness.host.acquire('active-turn');
     const oldChild = harness.records[0].child;
     try {
         oldChild.stdout.emit('error', new Error('Bearer private-transport-value'));
-        await waitFor(() => harness.records.length === 2 && harness.host.snapshot().state === 'ready');
-        await waitFor(() => oldChild.exitCode !== null || oldChild.signalCode !== null, 500);
+        await waitFor(() => harness.records.length === 2 && harness.host.snapshot().state === 'ready', 5_000);
+        await waitFor(() => oldChild.exitCode !== null || oldChild.signalCode !== null, 1_000);
         assertSafeDiagnostics(harness.host.diagnostics.snapshot());
     } finally {
         if (oldChild.exitCode === null && oldChild.signalCode === null) {

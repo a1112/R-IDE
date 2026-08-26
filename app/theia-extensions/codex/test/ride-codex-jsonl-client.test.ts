@@ -200,6 +200,50 @@ test('dispatches reviewed notifications and bounds unknown diagnostics', async (
     client.dispose();
 });
 
+test('confirmed notifications reuse the reviewed serializer and support synchronous transports', async () => {
+    const transport = new FakeTransport();
+    const client = new RideCodexJsonlClient(transport);
+
+    await client.notifyConfirmed('initialized', { ready: true });
+    assert.deepEqual(parseWrite(transport, 0), {
+        method: 'initialized',
+        params: { ready: true }
+    });
+
+    const unsafeNotify = client.notifyConfirmed.bind(client) as (method: string, params: unknown) => Promise<void>;
+    await assert.rejects(unsafeNotify('future/unreviewed', {}), /unsupported client notification/i);
+    assert.equal(transport.writes.length, 1);
+    client.dispose();
+});
+
+test('confirmed notifications reject synchronous and asynchronous transport write failures without pending work', async t => {
+    await t.test('synchronous fallback write', async () => {
+        const transport = new ThrowingWriteTransport();
+        const client = new RideCodexJsonlClient(transport);
+
+        await assert.rejects(client.notifyConfirmed('initialized', {}), /transport write failed/i);
+        assert.equal(client.pendingCount, 0);
+        assert.equal(transport.listenerCount, 0);
+        assert.equal(transport.closeCalls, 1);
+    });
+
+    await t.test('asynchronous confirmed write', async () => {
+        class RejectingConfirmedTransport extends FakeTransport {
+            writeConfirmed(data: string): Promise<void> {
+                this.writes.push(data);
+                return Promise.reject(new Error('asynchronous confirmed write failure'));
+            }
+        }
+        const transport = new RejectingConfirmedTransport();
+        const client = new RideCodexJsonlClient(transport);
+
+        await assert.rejects(client.notifyConfirmed('initialized', {}), /transport write failed/i);
+        assert.equal(client.pendingCount, 0);
+        assert.equal(transport.listenerCount, 0);
+        assert.equal(transport.closeCalls, 1);
+    });
+});
+
 test('bounds unknown-notification diagnostics without retaining untrusted method strings', () => {
     const transport = new FakeTransport();
     const client = new RideCodexJsonlClient(transport, { maxDiagnostics: 1 });

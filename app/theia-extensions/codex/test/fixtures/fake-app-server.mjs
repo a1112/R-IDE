@@ -39,6 +39,9 @@ input.on('line', async line => {
 
     if (message.method === 'initialize') {
         initializeParams = message.params;
+        if (mode === 'early-exit') {
+            return;
+        }
         if (mode === 'handshake-timeout') {
             return;
         }

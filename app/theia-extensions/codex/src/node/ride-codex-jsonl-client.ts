@@ -24,6 +24,7 @@ export interface RideCodexDisposable {
 
 export interface RideCodexJsonlTransport {
     write(data: string): void;
+    writeConfirmed?(data: string): Promise<void>;
     onData(listener: (chunk: Uint8Array) => void): RideCodexDisposable;
     onExit(listener: (reason?: Error) => void): RideCodexDisposable;
     close(): void;
@@ -170,6 +171,22 @@ export class RideCodexJsonlClient implements RideCodexDisposable {
             throw new Error(`Unsupported client notification method: ${String(method)}`);
         }
         this.writePayload(serializeEnvelope({ method, params }, ['method', 'params']));
+    }
+
+    notifyConfirmed(method: RideCodexClientNotificationMethod, params: unknown): Promise<void> {
+        if (this.closed) {
+            return containedRejection(this.closedRequestError());
+        }
+        if (!(CLIENT_NOTIFICATION_METHODS as readonly string[]).includes(method)) {
+            return containedRejection(new Error(`Unsupported client notification method: ${String(method)}`));
+        }
+        let payload: string;
+        try {
+            payload = serializeEnvelope({ method, params }, ['method', 'params']);
+        } catch {
+            return containedRejection(new Error('Unable to serialize Codex notification'));
+        }
+        return this.writePayloadConfirmed(payload);
     }
 
     respondError(id: RideCodexRequestId, code: number, message: string): void {
@@ -354,6 +371,36 @@ export class RideCodexJsonlClient implements RideCodexDisposable {
         }
     }
 
+    protected writePayloadConfirmed(payload: string): Promise<void> {
+        if (this.closed) {
+            return containedRejection(this.closedRequestError());
+        }
+        let write: Promise<void>;
+        try {
+            write = this.transport.writeConfirmed
+                ? this.transport.writeConfirmed(`${payload}\n`)
+                : (this.transport.write(`${payload}\n`), Promise.resolve());
+        } catch {
+            const failure = new Error('Codex App Server transport write failed');
+            this.shutdown(failure, true);
+            return containedRejection(failure);
+        }
+        const operation = Promise.resolve(write).then(
+            () => {
+                if (this.closed) {
+                    throw this.closedRequestError();
+                }
+            },
+            () => {
+                const failure = new Error('Codex App Server transport write failed');
+                this.shutdown(failure, true);
+                throw failure;
+            }
+        );
+        void operation.catch(() => undefined);
+        return operation;
+    }
+
     protected shutdown(reason: Error, closeTransport: boolean): void {
         if (this.closed) {
             return;
@@ -456,6 +503,12 @@ function disposeSafely(disposable: RideCodexDisposable): void {
     } catch {
         // Listener cleanup is best effort; pending requests still need deterministic rejection.
     }
+}
+
+function containedRejection(error: Error): Promise<never> {
+    const rejection = Promise.reject(error);
+    void rejection.catch(() => undefined);
+    return rejection;
 }
 
 function asError(value: unknown, fallbackMessage: string): Error {
