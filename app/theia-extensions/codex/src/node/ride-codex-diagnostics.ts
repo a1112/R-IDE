@@ -83,12 +83,13 @@ export class RideCodexAppServerDiagnostics {
         const raw = typeof detail === 'string' && detail.trim().length > 0
             ? detail
             : DEFAULT_MESSAGE_BY_CODE[code];
-        const redacted = redactUntrustedText(raw);
+        const input = boundUtf8(raw, this.#maxEntryBytes);
+        const redacted = input.truncated ? '[truncated] <redacted>' : redactUntrustedText(input.value);
         const bounded = boundUtf8(redacted, this.#maxEntryBytes);
         this.#entries.push(Object.freeze({
             code,
             message: bounded.value,
-            truncated: bounded.truncated
+            truncated: input.truncated || bounded.truncated
         }));
         while (this.#entries.length > this.#maxEntries) {
             this.#entries.shift();
@@ -201,16 +202,19 @@ function safeLimit(value: number | undefined, fallback: number, minimum: number,
 function redactUntrustedText(value: string): string {
     return value
         .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '')
-        .replace(/\bauthorization\s*[:=]\s*[^\r\n]*/gi, 'authorization=<redacted>')
+        .replace(/\b(https?:\/\/)[^/\s:@]+:[^/\s@]+@/gi, '$1<redacted>@')
+        .replace(/\bauthorization\s*[:=]\s*(?:bearer\s+)?[^\s,;&]+/gi, 'authorization=<redacted>')
         .replace(/\bbearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer <redacted>')
         .replace(
-            /\b((?:openai[\s_-]*)?api[\s_-]*key|access[\s_-]*token|refresh[\s_-]*token|token|secret)\b\s*(?:[:=]\s*|\s+)[^\s,;]+/gi,
+            /\b((?:openai[\s_-]*)?api[\s_-]*key|access[\s_-]*token|refresh[\s_-]*token|credential|password|key|token|secret)\b\s*(?:[:=]\s*|\s+)[^\s,;&]+/gi,
             '$1=<redacted>'
         )
         .replace(/\bsk-[A-Za-z0-9_-]+\b/gi, '<redacted>')
+        .replace(/(["'])(?:file:\/{2,3}|[A-Za-z]:[\\/]|\\\\|\/)[^"'\r\n]*\1/gi, '<path>')
+        .replace(/\bfile:\/{2,3}[^\s,;]+/gi, '<path>')
         .replace(/\\\\[^\r\n]*/g, '<path>')
-        .replace(/\b[A-Za-z]:\\[^\r\n]*/g, '<path>')
-        .replace(/(^|\s)\/[^\r\n]*/g, '$1<path>')
+        .replace(/\b[A-Za-z]:[\\/][^\r\n]*/g, '<path>')
+        .replace(/(^|\s)\/(?!\/)[^\r\n]*/g, '$1<path>')
         .replace(/\b[A-Za-z0-9._-]*secret[A-Za-z0-9._-]*\b/gi, '<redacted>')
         .replace(/\b[A-Za-z0-9+/_=-]{64,}\b/g, '<redacted>');
 }

@@ -140,6 +140,19 @@ const DEFAULT_HANDSHAKE_TIMEOUT_MS = 5_000;
 const DEFAULT_IDLE_TIMEOUT_MS = 10 * 60 * 1_000;
 const DEFAULT_SHUTDOWN_GRACE_MS = 2_000;
 const MAX_TIMER_MS = 0x7fffffff;
+const MAX_APP_SERVER_ENVIRONMENT_ENTRIES = 32;
+const MAX_APP_SERVER_ENVIRONMENT_SOURCE_ENTRIES = 1_024;
+const MAX_APP_SERVER_ENVIRONMENT_KEY_BYTES = 64;
+const MAX_APP_SERVER_ENVIRONMENT_VALUE_BYTES = 8 * 1024;
+const MAX_APP_SERVER_ENVIRONMENT_BYTES = 16 * 1024;
+const SECRET_ENVIRONMENT_KEY = /(?:API.?KEY|TOKEN|AUTHORIZATION|BEARER|SECRET|PASSWORD|CREDENTIAL)/i;
+const WINDOWS_APP_SERVER_ENVIRONMENT_KEYS = new Map([
+    'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATH', 'PATHEXT', 'USERPROFILE',
+    'HOMEDRIVE', 'HOMEPATH', 'APPDATA', 'LOCALAPPDATA', 'TEMP', 'TMP', 'LANG', 'TZ'
+].map(key => [key, key]));
+const POSIX_APP_SERVER_ENVIRONMENT_KEYS = new Set([
+    'HOME', 'USER', 'LOGNAME', 'PATH', 'TMPDIR', 'LANG', 'TZ'
+]);
 
 export class RideCodexAppServerHost {
     readonly diagnostics: RideCodexAppServerDiagnostics;
@@ -158,6 +171,8 @@ export class RideCodexAppServerHost {
     #restartAttempts = 0;
     #connection: Connection | undefined;
     #startPromise: Promise<Connection> | undefined;
+    #stopPromise: Promise<void> | undefined;
+    #stoppingConnection: Connection | undefined;
     #idleTimer: ReturnType<typeof setTimeout> | undefined;
     #disposePromise: Promise<void> | undefined;
     #disposed = false;
@@ -349,14 +364,20 @@ export class RideCodexAppServerHost {
         }
     }
 
-    #ensureStarted(restarting: boolean): Promise<Connection> {
+    async #ensureStarted(restarting: boolean): Promise<Connection> {
         try {
             this.#requireUsable();
         } catch (error) {
-            return Promise.reject(error);
+            throw error;
+        }
+        const stopping = this.#stopPromise;
+        if (stopping) {
+            await stopping;
+            this.#requireUsable();
+            return this.#ensureStarted(restarting);
         }
         if (this.#connection?.ready) {
-            return Promise.resolve(this.#connection);
+            return this.#connection;
         }
         if (this.#startPromise) {
             return this.#startPromise;
@@ -396,7 +417,7 @@ export class RideCodexAppServerHost {
             child = this.#spawn(launchSpec.executable, ['app-server', '--stdio'], Object.freeze({
                 shell: false,
                 stdio: Object.freeze(['pipe', 'pipe', 'pipe'] as const),
-                env: { ...process.env, ...launchSpec.environment },
+                env: createAppServerEnvironment(process.env, launchSpec.environment, process.platform),
                 windowsHide: true
             }));
             requirePipedChild(child);
@@ -577,11 +598,47 @@ export class RideCodexAppServerHost {
         }
     }
 
-    async #stopConnection(connection: Connection, _reason: 'idle' | 'dispose' | 'startup-failure'): Promise<void> {
+    #stopConnection(connection: Connection, reason: 'idle' | 'dispose' | 'startup-failure'): Promise<void> {
+        if (this.#stopPromise) {
+            if (this.#stoppingConnection === connection) {
+                return this.#stopPromise;
+            }
+            return this.#stopPromise.then(() => this.#stopConnection(connection, reason));
+        }
+        let resolveStop!: () => void;
+        let rejectStop!: (error: unknown) => void;
+        const stopPromise = new Promise<void>((resolve, reject) => {
+            resolveStop = resolve;
+            rejectStop = reject;
+        });
+        this.#stopPromise = stopPromise;
+        this.#stoppingConnection = connection;
+        void this.#performStopConnection(connection).then(
+            () => {
+                if (this.#stopPromise === stopPromise) {
+                    this.#stopPromise = undefined;
+                    this.#stoppingConnection = undefined;
+                }
+                resolveStop();
+            },
+            error => {
+                if (this.#stopPromise === stopPromise) {
+                    this.#stopPromise = undefined;
+                    this.#stoppingConnection = undefined;
+                }
+                rejectStop(error);
+            }
+        );
+        void stopPromise.catch(() => undefined);
+        return stopPromise;
+    }
+
+    async #performStopConnection(connection: Connection): Promise<void> {
         if (connection.finalized) {
             return;
         }
         connection.intentionalStop = true;
+        connection.ready = false;
         if (!this.#disposed) {
             this.#state = 'stopping';
         }
@@ -600,6 +657,9 @@ export class RideCodexAppServerHost {
         this.#killExactChild(connection);
         if (!await settlesWithin(connection.exitPromise, this.#shutdownGraceMs)) {
             this.diagnostics.record('shutdown-timeout');
+            if (!this.#disposed) {
+                this.#openCircuit('circuit-open');
+            }
             return;
         }
         this.#finalizeConnection(connection);
@@ -755,6 +815,92 @@ function defaultSpawn(
         env: options.env,
         windowsHide: options.windowsHide
     });
+}
+
+function createAppServerEnvironment(
+    inherited: Readonly<Record<string, string | undefined>>,
+    overlay: Readonly<Record<string, string>>,
+    platform: NodeJS.Platform
+): Readonly<NodeJS.ProcessEnv> {
+    const values = new Map<string, string>();
+    collectAllowedEnvironment(values, inherited, platform, false);
+    collectAllowedEnvironment(values, overlay, platform, true);
+    if (values.size > MAX_APP_SERVER_ENVIRONMENT_ENTRIES) {
+        throw new Error('Codex App Server environment is invalid');
+    }
+    const safe: NodeJS.ProcessEnv = Object.create(null) as NodeJS.ProcessEnv;
+    let totalBytes = 0;
+    for (const [key, value] of values) {
+        const entryBytes = Buffer.byteLength(key) + Buffer.byteLength(value);
+        if (totalBytes + entryBytes > MAX_APP_SERVER_ENVIRONMENT_BYTES) {
+            throw new Error('Codex App Server environment is invalid');
+        }
+        safe[key] = value;
+        totalBytes += entryBytes;
+    }
+    return Object.freeze(safe);
+}
+
+function collectAllowedEnvironment(
+    destination: Map<string, string>,
+    source: Readonly<Record<string, string | undefined>>,
+    platform: NodeJS.Platform,
+    rejectUndefined: boolean
+): void {
+    if (typeof source !== 'object' || source === null || Array.isArray(source)) {
+        throw new Error('Codex App Server environment is invalid');
+    }
+    const keys = Object.getOwnPropertyNames(source);
+    if (keys.length > MAX_APP_SERVER_ENVIRONMENT_SOURCE_ENTRIES) {
+        throw new Error('Codex App Server environment is invalid');
+    }
+    const seen = new Set<string>();
+    for (const key of keys) {
+        if (Buffer.byteLength(key) > MAX_APP_SERVER_ENVIRONMENT_KEY_BYTES
+            || key.includes('\0') || key.includes('=')) {
+            throw new Error('Codex App Server environment is invalid');
+        }
+        if (SECRET_ENVIRONMENT_KEY.test(key)) {
+            continue;
+        }
+        const canonicalKey = canonicalAppServerEnvironmentKey(key, platform);
+        if (!canonicalKey) {
+            continue;
+        }
+        const descriptor = Object.getOwnPropertyDescriptor(source, key);
+        if (!descriptor || !Object.prototype.hasOwnProperty.call(descriptor, 'value')
+            || Object.prototype.hasOwnProperty.call(descriptor, 'get')
+            || Object.prototype.hasOwnProperty.call(descriptor, 'set')) {
+            throw new Error('Codex App Server environment is invalid');
+        }
+        const value = descriptor.value;
+        if (value === undefined && !rejectUndefined) {
+            continue;
+        }
+        if (typeof value !== 'string' || value.includes('\0')
+            || Buffer.byteLength(value) > MAX_APP_SERVER_ENVIRONMENT_VALUE_BYTES) {
+            throw new Error('Codex App Server environment is invalid');
+        }
+        if (seen.has(canonicalKey)) {
+            throw new Error('Codex App Server environment is invalid');
+        }
+        seen.add(canonicalKey);
+        destination.set(canonicalKey, value);
+    }
+}
+
+function canonicalAppServerEnvironmentKey(key: string, platform: NodeJS.Platform): string | undefined {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
+        return undefined;
+    }
+    const upper = key.toUpperCase();
+    if (platform === 'win32') {
+        return WINDOWS_APP_SERVER_ENVIRONMENT_KEYS.get(upper)
+            ?? (/^LC_[A-Z0-9_]+$/.test(upper) ? upper : undefined);
+    }
+    return POSIX_APP_SERVER_ENVIRONMENT_KEYS.has(key)
+        ? key
+        : /^(?:XDG|LC)_[A-Z0-9_]+$/.test(key) ? key : undefined;
 }
 
 function requirePipedChild(child: ChildProcessWithoutNullStreams): void {

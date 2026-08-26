@@ -170,6 +170,86 @@ test('spawns only the resolver native executable with exact app-server stdio arg
     await harness.host.dispose();
 });
 
+test('App Server spawn receives only a bounded platform allowlist and cannot inherit or overlay secrets', async () => {
+    const secretEnvironment = {
+        RIDE_TASK8_AUDIT_API_KEY: 'api-secret',
+        RIDE_TASK8_AUDIT_TOKEN: 'token-secret',
+        RIDE_TASK8_AUDIT_CREDENTIAL: 'credential-secret',
+        RIDE_TASK8_AUDIT_PASSWORD: 'password-secret',
+        RIDE_TASK8_AUDIT_SECRET: 'plain-secret'.repeat(800)
+    } as const;
+    const allowedKey = process.platform === 'win32' ? 'PATH' : 'HOME';
+    const previous = new Map<string, string | undefined>();
+    for (const [key, value] of Object.entries({
+        ...secretEnvironment,
+        [allowedKey]: 'safe-host-value'
+    })) {
+        previous.set(key, process.env[key]);
+        process.env[key] = value;
+    }
+
+    const overlay = Object.freeze({
+        [allowedKey]: 'safe-overlay-value',
+        RIDE_TASK8_AUDIT_TOKEN: 'overlay-token-secret'.repeat(800),
+        RIDE_TASK8_INNOCENT_BUT_UNREVIEWED: 'must-not-pass'
+    });
+    const spec = Object.freeze({ ...launchSpec(), environment: overlay });
+    const harness = createHost({ resolve: async () => spec });
+    try {
+        const lease = await harness.host.acquire('foreground-panel');
+        const environment = harness.records[0].options.env;
+        assert.equal(environment[allowedKey], 'safe-overlay-value');
+        for (const key of Object.keys(secretEnvironment)) {
+            assert.equal(environment[key], undefined);
+        }
+        assert.equal(environment.RIDE_TASK8_INNOCENT_BUT_UNREVIEWED, undefined);
+        assert.ok(Object.keys(environment).length <= 32);
+        assert.ok(Buffer.byteLength(JSON.stringify(environment)) <= 16 * 1024);
+        lease.release();
+    } finally {
+        await harness.host.dispose();
+        for (const [key, value] of previous) {
+            if (value === undefined) {
+                delete process.env[key];
+            } else {
+                process.env[key] = value;
+            }
+        }
+    }
+});
+
+test('App Server environment overlay validation is descriptor-safe and fails closed on invalid values', async t => {
+    await t.test('accessors are rejected without executing them', async () => {
+        let getterCalls = 0;
+        const environment = Object.create(null) as Record<string, string>;
+        Object.defineProperty(environment, 'PATH', {
+            enumerable: true,
+            get: () => {
+                getterCalls += 1;
+                throw new Error('getter secret');
+            }
+        });
+        const spec = Object.freeze({ ...launchSpec(), environment });
+        const harness = createHost({ resolve: async () => spec });
+        await assert.rejects(harness.host.acquire('foreground-panel'), /start|spawn/i);
+        assert.equal(getterCalls, 0);
+        assert.equal(harness.records.length, 0);
+        await harness.host.dispose();
+    });
+
+    await t.test('oversized allowed values are rejected before spawn', async () => {
+        const allowedKey = process.platform === 'win32' ? 'PATH' : 'HOME';
+        const spec = Object.freeze({
+            ...launchSpec(),
+            environment: Object.freeze({ [allowedKey]: 'x'.repeat(16 * 1024) })
+        });
+        const harness = createHost({ resolve: async () => spec });
+        await assert.rejects(harness.host.acquire('foreground-panel'), /start|spawn/i);
+        assert.equal(harness.records.length, 0);
+        await harness.host.dispose();
+    });
+});
+
 test('actual child early exit, handshake timeout, and malformed output reject startup with safe diagnostics', async t => {
     const cases: ReadonlyArray<readonly [string, string, number, RegExp]> = [
         ['early exit', 'early-exit', 500, /exited|startup/i],
@@ -288,6 +368,54 @@ test('leases drive one cancellable idle timer then graceful stdin close and boun
     });
 });
 
+test('acquire during irreversible idle stop waits for one fresh generation and ignores the old late exit', async () => {
+    const harness = createHost({
+        modes: ['ignore-stdin-close', 'normal'],
+        idleTimeoutMs: 5,
+        shutdownGraceMs: 80
+    });
+    const first = await harness.host.acquire('foreground-panel');
+    const oldChild = harness.records[0].child;
+    first.release();
+    await waitFor(() => harness.host.snapshot().state === 'stopping');
+    assert.equal(oldChild.exitCode, null);
+    assert.equal(oldChild.signalCode, null);
+
+    let acquiredWhileStopping = false;
+    const pending = Promise.all([
+        harness.host.acquire('active-turn'),
+        harness.host.acquire('foreground-panel')
+    ]).then(leases => {
+        acquiredWhileStopping = true;
+        return leases;
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(acquiredWhileStopping, false);
+    assert.equal(harness.records.length, 1);
+
+    const leases = await pending;
+    assert.equal(harness.records.length, 2);
+    assert.equal(harness.host.snapshot().generation, 2);
+    assert.equal(harness.host.snapshot().state, 'ready');
+    assert.deepEqual(await leases[0].request('account/read', {}), {
+        initialized: true,
+        method: 'account/read',
+        pid: harness.records[1].child.pid
+    });
+
+    oldChild.emit('exit', 0, null);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(harness.host.snapshot().generation, 2);
+    assert.equal(harness.host.snapshot().state, 'ready');
+    assert.equal(harness.records.length, 2);
+    assert.equal(oldChild.listenerCount('exit'), 0);
+    assert.equal(oldChild.listenerCount('close'), 0);
+
+    leases.forEach(lease => lease.release());
+    await harness.host.dispose();
+    assert.ok(harness.records.every(record => record.child.exitCode !== null || record.child.signalCode !== null));
+});
+
 test('one unexpected crash restarts once, a second crash opens a stable circuit, and retry resets it', async () => {
     const harness = createHost({ modes: ['crash-after-initialize', 'crash-after-initialize', 'normal'] });
     const lease = await harness.host.acquire('active-turn');
@@ -372,6 +500,58 @@ test('diagnostic ring independently redacts secrets and paths while retaining re
     assert.equal(snapshot.entriesTruncated, true);
     assert.equal(snapshot.stderr.truncated, true);
     assertSafeDiagnostics(snapshot);
+});
+
+test('diagnostic records redact generic credentials and local path forms without hiding HTTPS URLs', () => {
+    const diagnostics = new RideCodexAppServerDiagnostics({
+        maxEntries: 8,
+        maxEntryBytes: 512
+    });
+    diagnostics.record(
+        'spawn-failed',
+        'credential=audit-credential password=audit-password key=audit-key api_key=audit-api '
+        + 'token=audit-token secret=audit-secret authorization=Bearer audit-auth'
+    );
+    diagnostics.record('protocol-error', 'C:/Users/Audit User/private/repo/file.txt');
+    diagnostics.record('protocol-error', 'C:\\Users\\Audit User\\private\\repo\\file.txt');
+    diagnostics.record('protocol-error', '\\\\server\\private\\Audit User\\repo\\file.txt');
+    diagnostics.record('protocol-error', '"/home/Audit User/private/repo/file.txt"');
+    diagnostics.record('protocol-error', 'file:///C:/Users/Audit%20User/private/repo/file.txt');
+    diagnostics.record('protocol-error', 'See https://example.test/reference?q=public for public guidance');
+
+    const snapshot = diagnostics.snapshot();
+    const serialized = JSON.stringify(snapshot);
+    assert.doesNotMatch(
+        serialized,
+        /audit-(?:credential|password|key|api|token|secret|auth)|Audit(?:%20| )User|private[\\/]repo/i
+    );
+    assert.match(serialized, /https:\/\/example\.test\/reference\?q=public/);
+    assert.ok(snapshot.entries.every(entry => Buffer.byteLength(entry.message) <= 512));
+});
+
+test('stderr redaction survives chunk boundaries and bounds an overlong unterminated line', () => {
+    const diagnostics = new RideCodexAppServerDiagnostics({
+        maxEntries: 2,
+        maxStderrLines: 3,
+        maxStderrBytes: 256,
+        maxLineBytes: 160
+    });
+    diagnostics.appendStderr(Buffer.from('credential=stream-credential api_'));
+    diagnostics.appendStderr(Buffer.from('key=stream-api C:/Users/Au'));
+    diagnostics.appendStderr(Buffer.from('dit User/private/repo "'));
+    diagnostics.appendStderr(Buffer.from('/home/Audit User/private/repo"\n'));
+    diagnostics.appendStderr(Buffer.from(`password=unterminated-password ${'x'.repeat(512)} Audit User/private/repo`));
+    diagnostics.flushStderr();
+
+    const snapshot = diagnostics.snapshot();
+    const serialized = JSON.stringify(snapshot);
+    assert.doesNotMatch(
+        serialized,
+        /stream-(?:credential|api)|unterminated-password|Audit User|private[\\/]repo/i
+    );
+    assert.ok(snapshot.stderr.lines.length <= 3);
+    assert.ok(snapshot.stderr.bytes <= 256);
+    assert.equal(snapshot.stderr.truncated, true);
 });
 
 test('synchronous spawn and listener failures roll back without leaking a child or allowing stale late events', async t => {
