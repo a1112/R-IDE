@@ -789,7 +789,11 @@ class ChildJsonlTransport implements RideCodexJsonlTransport {
     readonly #onExit = (): void => this.#emitExit(new Error('Codex App Server process exited'));
     readonly #onProcessError = (): void => this.#emitExit(new Error('Codex App Server process failed'));
     readonly #onStreamError = (): void => this.#emitExit(new Error('Codex App Server stdio failed'));
-    readonly #onStdinClose = (): void => this.#emitExit(new Error('Codex App Server stdin closed'));
+    readonly #onStdinClose = (): void => {
+        if (!this.#closeRequested) {
+            this.#emitExit(new Error('Codex App Server stdin closed'));
+        }
+    };
     #exited = false;
     #closeRequested = false;
     #disposed = false;

@@ -89,7 +89,15 @@ input.on('line', async line => {
 });
 
 input.on('close', () => {
+    if (mode === 'delayed-stdin-close' || mode === 'ignore-stdin-close') {
+        process.stderr.write('RIDE_FAKE_STDIN_EOF\n');
+    }
+    if (mode === 'delayed-stdin-close') {
+        setTimeout(() => process.exit(0), 30);
+        return;
+    }
     if (mode === 'ignore-stdin-close') {
+        setTimeout(() => process.stderr.write('RIDE_FAKE_BEFORE_GRACE\n'), 25);
         setInterval(() => undefined, 1_000);
         return;
     }

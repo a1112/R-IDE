@@ -182,6 +182,32 @@ async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<voi
     }
 }
 
+function waitForStderrMarker(
+    child: ChildProcessWithoutNullStreams,
+    marker: string,
+    timeoutMs = 2_000
+): Promise<void> {
+    return new Promise<void>((resolvePromise, rejectPromise) => {
+        let buffered = '';
+        const timeout = setTimeout(() => {
+            dispose();
+            rejectPromise(new Error(`Timed out waiting for fake App Server stderr marker: ${marker}`));
+        }, timeoutMs);
+        const onData = (chunk: Buffer | string): void => {
+            buffered += chunk.toString();
+            if (buffered.includes(marker)) {
+                dispose();
+                resolvePromise();
+            }
+        };
+        const dispose = (): void => {
+            clearTimeout(timeout);
+            child.stderr.off('data', onData);
+        };
+        child.stderr.on('data', onData);
+    });
+}
+
 function assertSafeDiagnostics(snapshot: RideCodexAppServerDiagnosticSnapshot): void {
     const serialized = JSON.stringify(snapshot);
     assert.doesNotMatch(
@@ -615,6 +641,66 @@ test('leases drive one cancellable idle timer then graceful stdin close and boun
         assert.equal(killCalls, 1);
         await harness.host.dispose();
         assert.equal(killCalls, 1);
+    });
+
+    await t.test('real child that exits after EOF within grace is never killed', async () => {
+        const harness = createHost({ modes: ['delayed-stdin-close'], shutdownGraceMs: 100 });
+        const lease = await harness.host.acquire('foreground-panel');
+        const child = harness.records[0].child;
+        const eofReceived = waitForStderrMarker(child, 'RIDE_FAKE_STDIN_EOF');
+        const originalKill = child.kill.bind(child);
+        let killCalls = 0;
+        child.kill = ((signal?: NodeJS.Signals | number) => {
+            killCalls += 1;
+            return originalKill(signal);
+        }) as typeof child.kill;
+
+        try {
+            await harness.host.dispose();
+            await eofReceived;
+            assert.equal(killCalls, 0);
+            assert.equal(child.exitCode, 0);
+            assert.equal(child.signalCode, null);
+        } finally {
+            lease.release();
+            if (child.exitCode === null && child.signalCode === null) {
+                originalKill();
+            }
+        }
+    });
+
+    await t.test('real child that remains after EOF is killed only after the grace barrier', async () => {
+        const harness = createHost({ modes: ['ignore-stdin-close'], shutdownGraceMs: 100 });
+        const lease = await harness.host.acquire('foreground-panel');
+        const child = harness.records[0].child;
+        const eofReceived = waitForStderrMarker(child, 'RIDE_FAKE_STDIN_EOF');
+        const beforeGrace = waitForStderrMarker(child, 'RIDE_FAKE_BEFORE_GRACE');
+        const originalKill = child.kill.bind(child);
+        let killCalls = 0;
+        let resolveKilled!: () => void;
+        const killed = new Promise<void>(resolvePromise => {
+            resolveKilled = resolvePromise;
+        });
+        child.kill = ((signal?: NodeJS.Signals | number) => {
+            killCalls += 1;
+            resolveKilled();
+            return originalKill(signal);
+        }) as typeof child.kill;
+
+        try {
+            const disposal = harness.host.dispose();
+            await eofReceived;
+            await beforeGrace;
+            assert.equal(killCalls, 0, 'the child-side pre-grace barrier must precede termination');
+            await killed;
+            assert.equal(killCalls, 1);
+            await disposal;
+        } finally {
+            lease.release();
+            if (child.exitCode === null && child.signalCode === null) {
+                originalKill();
+            }
+        }
     });
 });
 
