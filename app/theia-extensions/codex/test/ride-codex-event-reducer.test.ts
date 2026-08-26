@@ -1608,6 +1608,193 @@ describe('RideCodexEventReducer minimal frame contract', () => {
         }
     });
 
+    it('rebuilds one-wire protected recovery events around ordinary pressure at the exact minimum', () => {
+        for (const maxBatchEvents of [2, 8]) {
+            const frames: Array<() => void> = [];
+            const reducer = new RideCodexEventReducer({
+                scheduleFrame: callback => {
+                    frames.push(callback);
+                    return { dispose: () => undefined };
+                },
+                maxQueuedBytes: MIN_COHERENT_QUEUE_BYTES,
+                maxBatchEvents
+            });
+            const identity = {
+                generation: Number.MAX_SAFE_INTEGER,
+                turnSequence: Number.MAX_SAFE_INTEGER,
+                threadId: WORST_VALID_IDENTIFIER,
+                turnId: WORST_VALID_IDENTIFIER
+            };
+            const ordinaryWarning: RideCodexEventBatch['events'][number] = {
+                type: 'warning', code: 'server-warning', message: 'ordinary warning'
+            };
+
+            reducer.notifyMany(batchWire({
+                ...identity,
+                events: [
+                    { type: 'turn-started' },
+                    ordinaryWarning,
+                    {
+                        type: 'turn-terminal',
+                        status: 'interrupt-uncertain',
+                        error: {
+                            code: 'interrupt-timeout',
+                            message: 'Codex turn interrupt could not be confirmed.'
+                        }
+                    },
+                    ordinaryWarning,
+                    {
+                        type: 'error',
+                        code: 'recovery-failed',
+                        message: 'Codex thread recovery failed.',
+                        retryable: false
+                    }
+                ]
+            }));
+            assert.equal(frames.length, 1);
+            frames.shift()?.();
+
+            assert.equal(reducer.snapshot().status, 'interrupt-uncertain');
+            assert.deepEqual(reducer.snapshot().errors.map(error => error.code), [
+                'interrupt-timeout', 'recovery-failed'
+            ], `maxBatchEvents=${maxBatchEvents}`);
+        }
+    });
+
+    it('keeps separate protected recovery FIFO ahead of trailing ordinary diagnostics', () => {
+        for (const maxBatchEvents of [2, 8]) {
+            const frames: Array<() => void> = [];
+            const reducer = new RideCodexEventReducer({
+                scheduleFrame: callback => {
+                    frames.push(callback);
+                    return { dispose: () => undefined };
+                },
+                maxQueuedBytes: MIN_COHERENT_QUEUE_BYTES,
+                maxBatchEvents
+            });
+            const identity = {
+                generation: Number.MAX_SAFE_INTEGER,
+                turnSequence: Number.MAX_SAFE_INTEGER,
+                threadId: WORST_VALID_IDENTIFIER,
+                turnId: WORST_VALID_IDENTIFIER
+            };
+            const wires: readonly RideCodexEventBatch['events'][] = [
+                [{ type: 'turn-started' }],
+                [{
+                    type: 'turn-terminal',
+                    status: 'interrupt-uncertain',
+                    error: {
+                        code: 'interrupt-timeout',
+                        message: 'Codex turn interrupt could not be confirmed.'
+                    }
+                }],
+                [{
+                    type: 'error',
+                    code: 'recovery-failed',
+                    message: 'Codex thread recovery failed.',
+                    retryable: false
+                }],
+                [{ type: 'warning', code: 'server-warning', message: 'ordinary warning' }]
+            ];
+            for (const events of wires) {
+                reducer.notifyMany(batchWire({ ...identity, events }));
+            }
+            assert.equal(frames.length, 1);
+            frames.shift()?.();
+
+            assert.equal(reducer.snapshot().status, 'interrupt-uncertain');
+            assert.deepEqual(reducer.snapshot().errors.map(error => error.code), [
+                'interrupt-timeout', 'recovery-failed'
+            ], `maxBatchEvents=${maxBatchEvents}`);
+        }
+    });
+
+    it('atomically rebuilds protected FIFO for ordinary placements and superseded pending identities', () => {
+        const placements: readonly RideCodexEventBatch['events'][] = [
+            [
+                { type: 'warning', code: 'server-warning', message: 'before' },
+                { type: 'turn-started' },
+                {
+                    type: 'turn-terminal', status: 'interrupt-uncertain',
+                    error: { code: 'interrupt-timeout', message: 'interrupt uncertain' }
+                },
+                {
+                    type: 'error', code: 'recovery-failed', message: 'resume failed', retryable: false
+                }
+            ],
+            [
+                { type: 'turn-started' },
+                { type: 'warning', code: 'server-warning', message: 'between start and terminal' },
+                {
+                    type: 'turn-terminal', status: 'interrupt-uncertain',
+                    error: { code: 'interrupt-timeout', message: 'interrupt uncertain' }
+                },
+                { type: 'warning', code: 'server-warning', message: 'between terminal and recovery' },
+                {
+                    type: 'error', code: 'recovery-failed', message: 'resume failed', retryable: false
+                }
+            ],
+            [
+                { type: 'turn-started' },
+                {
+                    type: 'turn-terminal', status: 'interrupt-uncertain',
+                    error: { code: 'interrupt-timeout', message: 'interrupt uncertain' }
+                },
+                {
+                    type: 'error', code: 'recovery-failed', message: 'resume failed', retryable: false
+                },
+                { type: 'warning', code: 'server-warning', message: 'after' }
+            ]
+        ];
+        for (const delivery of ['same-wire', 'separate-wire'] as const) {
+            for (const maxBatchEvents of [2, 8]) {
+                for (const events of placements) {
+                    const frames: Array<() => void> = [];
+                    const reducer = new RideCodexEventReducer({
+                        scheduleFrame: callback => {
+                            frames.push(callback);
+                            return { dispose: () => undefined };
+                        },
+                        maxQueuedBytes: MIN_COHERENT_QUEUE_BYTES,
+                        maxBatchEvents
+                    });
+                    reducer.notifyMany(batchWire({
+                        generation: Number.MAX_SAFE_INTEGER,
+                        turnSequence: Number.MAX_SAFE_INTEGER - 1,
+                        threadId: WORST_VALID_IDENTIFIER,
+                        turnId: WORST_VALID_IDENTIFIER,
+                        events: [
+                            { type: 'turn-started' },
+                            { type: 'warning', code: 'server-warning', message: 'superseded' }
+                        ]
+                    }));
+                    const identity = {
+                        generation: Number.MAX_SAFE_INTEGER,
+                        turnSequence: Number.MAX_SAFE_INTEGER,
+                        threadId: WORST_VALID_IDENTIFIER,
+                        turnId: `${WORST_VALID_IDENTIFIER.slice(0, -1)}x`
+                    };
+                    if (delivery === 'same-wire') {
+                        reducer.notifyMany(batchWire({ ...identity, events }));
+                    } else {
+                        for (const event of events) {
+                            reducer.notifyMany(batchWire({ ...identity, events: [event] }));
+                        }
+                    }
+                    assert.equal(frames.length, 1);
+                    frames.shift()?.();
+
+                    const snapshot = reducer.snapshot();
+                    assert.equal(snapshot.turnId, identity.turnId);
+                    assert.equal(snapshot.status, 'interrupt-uncertain');
+                    assert.deepEqual(snapshot.errors.map(error => error.code), [
+                        'interrupt-timeout', 'recovery-failed'
+                    ], `${delivery}, maxBatchEvents=${maxBatchEvents}`);
+                }
+            }
+        }
+    });
+
     for (const delivery of ['same-wire', 'separate-wire'] as const) {
         for (const maxBatchEvents of [2, 8]) {
             it(`fits ${delivery} protected recovery events before candidate-local ordinary data at ${maxBatchEvents}`, () => {
