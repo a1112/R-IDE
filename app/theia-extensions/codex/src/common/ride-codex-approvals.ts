@@ -28,7 +28,7 @@ export interface RideCodexApprovalCardBase {
 
 export interface RideCodexCommandApprovalCard extends RideCodexApprovalCardBase {
     readonly kind: 'command';
-    readonly command: string;
+    readonly command?: string;
     readonly cwd?: string;
     readonly network?: Readonly<{
         readonly host: string;

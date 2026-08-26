@@ -78,6 +78,7 @@ export class RideCodexJsonlClient implements RideCodexDisposable {
     protected readonly framer: RideCodexJsonlFramer;
     protected readonly decoder = new TextDecoder('utf-8', { fatal: true });
     protected readonly pending = new Map<number, PendingRequest>();
+    protected readonly inboundRequests = new Map<RideCodexRequestId, true>();
     protected readonly notificationListeners = new Set<(notification: RideCodexNotification) => void>();
     protected readonly serverRequestListeners = new Set<(request: RideCodexIncomingRequest) => void>();
     protected readonly diagnosticListeners = new Set<(diagnostic: RideCodexDiagnostic) => void>();
@@ -105,6 +106,10 @@ export class RideCodexJsonlClient implements RideCodexDisposable {
 
     get pendingCount(): number {
         return this.pending.size;
+    }
+
+    ownsServerRequest(id: RideCodexRequestId): boolean {
+        return this.inboundRequests.has(id);
     }
 
     readonly request = (method: StableClientMethod, params: unknown, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS): Promise<unknown> => {
@@ -135,6 +140,8 @@ export class RideCodexJsonlClient implements RideCodexDisposable {
         this.nextRequestId = id === Number.MAX_SAFE_INTEGER ? undefined : id + 1;
 
         const promise = new Promise<unknown>((resolve, reject) => {
+            // The timer callback closes over the entry installed immediately below.
+            // eslint-disable-next-line prefer-const
             let entry: PendingRequest;
             const timer = setTimeout(() => {
                 if (this.pending.get(id) !== entry) {
@@ -148,7 +155,7 @@ export class RideCodexJsonlClient implements RideCodexDisposable {
             this.pending.set(id, entry);
             this.writePayload(payload);
         });
-        void promise.catch(() => undefined);
+        promise.catch(() => undefined);
         return promise;
     };
 
@@ -157,10 +164,14 @@ export class RideCodexJsonlClient implements RideCodexDisposable {
             return;
         }
         validateOutboundRequestId(id);
-        this.writePayload(serializeEnvelope(
+        const payload = serializeEnvelope(
+            // JSON-RPC represents an absent result as JSON null.
+            // eslint-disable-next-line no-null/no-null
             { id, result: result === undefined ? null : result },
             ['id', 'result']
-        ));
+        );
+        this.consumeServerRequest(id);
+        this.writePayload(payload);
     }
 
     respondConfirmed(id: RideCodexRequestId, result: unknown): Promise<void> {
@@ -171,11 +182,18 @@ export class RideCodexJsonlClient implements RideCodexDisposable {
         try {
             validateOutboundRequestId(id);
             payload = serializeEnvelope(
+                // JSON-RPC represents an absent result as JSON null.
+                // eslint-disable-next-line no-null/no-null
                 { id, result: result === undefined ? null : result },
                 ['id', 'result']
             );
         } catch {
             return containedRejection(new Error('Unable to serialize Codex response'));
+        }
+        try {
+            this.consumeServerRequest(id);
+        } catch (error) {
+            return containedRejection(asError(error, 'Codex response has no pending request ownership'));
         }
         return this.writePayloadConfirmed(payload);
     }
@@ -217,7 +235,9 @@ export class RideCodexJsonlClient implements RideCodexDisposable {
         if (typeof message !== 'string' || message.length > MAX_ERROR_MESSAGE_LENGTH) {
             throw new RangeError(`Codex response error message must be a string of at most ${MAX_ERROR_MESSAGE_LENGTH} characters`);
         }
-        this.writePayload(serializeEnvelope({ id, error: { code, message } }, ['id', 'error']));
+        const payload = serializeEnvelope({ id, error: { code, message } }, ['id', 'error']);
+        this.consumeServerRequest(id);
+        this.writePayload(payload);
     }
 
     onNotification(listener: (notification: RideCodexNotification) => void): RideCodexDisposable {
@@ -304,15 +324,63 @@ export class RideCodexJsonlClient implements RideCodexDisposable {
     }
 
     protected handleServerRequest(request: RideCodexServerRequest): void {
+        this.registerServerRequest(request.id);
         if (!request.approved) {
             this.respondError(request.id, -32601, 'Method not found');
             return;
         }
-        this.emitSafely(this.serverRequestListeners, {
+        const event = {
             id: request.id,
             method: request.method,
             params: request.params
-        }, 'server-request-listener-error', 'A Codex server request listener failed.');
+        };
+        let delivered = false;
+        for (const listener of [...this.serverRequestListeners]) {
+            try {
+                const result = (listener as (value: RideCodexIncomingRequest) => unknown)(event);
+                delivered = true;
+                if (result !== undefined) {
+                    Promise.resolve(result).catch(() => {
+                        this.settleServerRequestListenerFailure(request.id);
+                    });
+                }
+            } catch {
+                this.settleServerRequestListenerFailure(request.id);
+            }
+        }
+        if (!delivered && this.ownsServerRequest(request.id)) {
+            this.respondError(request.id, -32603, 'Internal error');
+        }
+    }
+
+    protected settleServerRequestListenerFailure(id: RideCodexRequestId): void {
+        this.emitDiagnostic({
+            code: 'server-request-listener-error',
+            message: 'A Codex server request listener failed.'
+        });
+        if (this.ownsServerRequest(id)) {
+            try {
+                this.respondError(id, -32603, 'Internal error');
+            } catch {
+                // Another listener may have synchronously consumed the single-use response authority.
+            }
+        }
+    }
+
+    protected registerServerRequest(id: RideCodexRequestId): void {
+        if (this.inboundRequests.has(id)) {
+            throw new Error('Codex App Server protocol error: duplicate pending inbound request ID');
+        }
+        if (this.inboundRequests.size >= this.maxPending) {
+            throw new Error(`Maximum pending inbound request count of ${this.maxPending} reached`);
+        }
+        this.inboundRequests.set(id, true);
+    }
+
+    protected consumeServerRequest(id: RideCodexRequestId): void {
+        if (!this.inboundRequests.delete(id)) {
+            throw new Error('Codex response has no pending inbound request ownership');
+        }
     }
 
     protected diagnoseUnknownNotification(): void {
@@ -414,7 +482,7 @@ export class RideCodexJsonlClient implements RideCodexDisposable {
                 throw failure;
             }
         );
-        void operation.catch(() => undefined);
+        operation.catch(() => undefined);
         return operation;
     }
 
@@ -429,6 +497,7 @@ export class RideCodexJsonlClient implements RideCodexDisposable {
 
         const pending = [...this.pending.values()];
         this.pending.clear();
+        this.inboundRequests.clear();
         for (const entry of pending) {
             clearTimeout(entry.timer);
             entry.reject(reason);
@@ -490,7 +559,7 @@ function serializeEnvelope(value: unknown, requiredProperties: readonly string[]
         const envelope: unknown = JSON.parse(serialized);
         if (
             typeof envelope === 'object'
-            && envelope !== null
+            && !!envelope
             && !Array.isArray(envelope)
             && requiredProperties.every(property => Object.prototype.hasOwnProperty.call(envelope, property))
         ) {
@@ -524,7 +593,7 @@ function disposeSafely(disposable: RideCodexDisposable): void {
 
 function containedRejection(error: Error): Promise<never> {
     const rejection = Promise.reject(error);
-    void rejection.catch(() => undefined);
+    rejection.catch(() => undefined);
     return rejection;
 }
 

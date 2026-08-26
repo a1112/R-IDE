@@ -344,6 +344,51 @@ test('server requests carry their process generation and responses cannot cross 
     await harness.host.dispose();
 });
 
+test('a replacement connection cannot consume an old inbound request with the same ID', async () => {
+    const harness = createControlledHost({ shutdownGraceMs: 20 });
+    const requests: Array<Readonly<{ id: string | number; generation: number }>> = [];
+    harness.host.onServerRequest((request, generation) => {
+        requests.push(Object.freeze({ id: request.id, generation }));
+    });
+    const approval = await harness.host.acquire('approval');
+    const id = 'generation-local-approval';
+    (harness.children[0].child.stdout as PassThrough).write(`${JSON.stringify({
+        id, method: 'item/commandExecution/requestApproval', params: {}
+    })}\n`);
+    await waitFor(() => requests.length === 1);
+    assert.equal(harness.host.ownsServerRequest(1, id), true);
+    const oldWrites = harness.children[0].writes.length;
+
+    approval.release();
+    const replacement = harness.host.restartForRecovery(1);
+    setImmediate(harness.children[0].emitExit);
+    assert.equal(await replacement, 2);
+    assert.equal(harness.host.ownsServerRequest(1, id), false);
+    assert.equal(harness.host.ownsServerRequest(2, id), false);
+    await assert.rejects(
+        harness.host.respondServerRequest(1, id, { decision: 'decline' }),
+        /generation|superseded/i
+    );
+    await assert.rejects(
+        harness.host.respondServerRequest(2, id, { decision: 'decline' }),
+        /generation|superseded/i
+    );
+    assert.equal(harness.children[0].writes.length, oldWrites);
+
+    (harness.children[1].child.stdout as PassThrough).write(`${JSON.stringify({
+        id, method: 'item/commandExecution/requestApproval', params: {}
+    })}\n`);
+    await waitFor(() => requests.length === 2);
+    assert.deepEqual(requests, [{ id, generation: 1 }, { id, generation: 2 }]);
+    assert.equal(harness.host.ownsServerRequest(2, id), true);
+    await harness.host.respondServerRequest(2, id, { decision: 'cancel' });
+    assert.equal(harness.host.ownsServerRequest(2, id), false);
+    assert.deepEqual(harness.children[1].writes[harness.children[1].writes.length - 1], {
+        id, result: { decision: 'cancel' }
+    });
+    await harness.host.dispose();
+});
+
 test('concurrent panel, thread, and approval acquires share one resolver result, process, and RPC connection', async () => {
     const harness = createHost();
     const leases = await Promise.all([

@@ -350,10 +350,20 @@ export class RideCodexAppServerHost {
         if (!Number.isSafeInteger(generation) || generation < 1
             || this.#state !== 'ready' || generation !== this.#generation
             || !connection || connection.generation !== generation
-            || !connection.ready || connection.finalized) {
+            || !connection.ready || connection.finalized
+            || !connection.client.ownsServerRequest(id)) {
             return Promise.reject(new RideCodexAppServerHostError('recovery-superseded'));
         }
         return connection.client.respondConfirmed(id, result);
+    }
+
+    ownsServerRequest(generation: number, id: string | number): boolean {
+        const connection = this.#connection;
+        return Number.isSafeInteger(generation) && generation >= 1
+            && this.#state === 'ready' && generation === this.#generation
+            && !!connection && connection.generation === generation
+            && connection.ready && !connection.finalized
+            && connection.client.ownsServerRequest(id);
     }
 
     snapshot(): RideCodexAppServerHostSnapshot {
@@ -512,8 +522,7 @@ export class RideCodexAppServerHost {
         this.#generation = generation;
         this.#setState(restarting ? 'restarting' : 'starting', true);
         const operation = this.#startGeneration(generation);
-        let tracked!: Promise<Connection>;
-        tracked = operation.then(
+        const tracked = operation.then(
             connection => {
                 if (this.#startPromise === tracked) {
                     this.#startPromise = undefined;
@@ -527,7 +536,7 @@ export class RideCodexAppServerHost {
                 throw error;
             }
         );
-        void tracked.catch(() => undefined);
+        tracked.catch(() => undefined);
         this.#startPromise = tracked;
         return tracked;
     }
@@ -614,8 +623,7 @@ export class RideCodexAppServerHost {
             }
             throw error;
         }
-        let connection!: Connection;
-        connection = {
+        const connection: Connection = {
             generation,
             child,
             pid: child.pid,
@@ -627,7 +635,7 @@ export class RideCodexAppServerHost {
             stderrErrorListener,
             processExitListener: () => {
                 resolveExit();
-                void this.#handleConnectionExit(connection);
+                this.#handleConnectionExit(connection);
             },
             clientListeners,
             intentionalStop: false,
@@ -642,7 +650,7 @@ export class RideCodexAppServerHost {
             if (hasProcessExited(child)) {
                 connection.resolveExit();
             }
-            void this.#handleConnectionExit(connection, reason);
+            this.#handleConnectionExit(connection, reason);
         });
         return connection;
     }
@@ -727,7 +735,7 @@ export class RideCodexAppServerHost {
             }
             const connection = this.#connection;
             if (connection) {
-                void this.#stopConnection(connection, 'idle');
+                this.#stopConnection(connection, 'idle');
             }
         }, this.#idleTimeoutMs);
         this.#idleTimer.unref?.();
@@ -758,7 +766,7 @@ export class RideCodexAppServerHost {
         });
         this.#stopPromise = stopPromise;
         this.#stoppingConnection = connection;
-        void this.#performStopConnection(connection, reason === 'retry' || reason === 'recovery').then(
+        this.#performStopConnection(connection, reason === 'retry' || reason === 'recovery').then(
             () => {
                 if (this.#stopPromise === stopPromise) {
                     this.#stopPromise = undefined;
@@ -774,7 +782,7 @@ export class RideCodexAppServerHost {
                 rejectStop(error);
             }
         );
-        void stopPromise.catch(() => undefined);
+        stopPromise.catch(() => undefined);
         return stopPromise;
     }
 
@@ -941,7 +949,7 @@ class ChildJsonlTransport implements RideCodexJsonlTransport {
 
     write(data: string): void {
         const operation = this.writeConfirmed(data);
-        void operation.catch(() => undefined);
+        operation.catch(() => undefined);
     }
 
     writeConfirmed(data: string): Promise<void> {
@@ -980,7 +988,7 @@ class ChildJsonlTransport implements RideCodexJsonlTransport {
                 settle(failure);
             }
         });
-        void operation.catch(() => undefined);
+        operation.catch(() => undefined);
         return operation;
     }
 
@@ -1058,6 +1066,8 @@ function createAppServerEnvironment(
     if (values.size > MAX_APP_SERVER_ENVIRONMENT_ENTRIES) {
         throw new Error('Codex App Server environment is invalid');
     }
+    // A null prototype prevents special inherited keys from entering the child environment.
+    // eslint-disable-next-line no-null/no-null
     const safe: NodeJS.ProcessEnv = Object.create(null) as NodeJS.ProcessEnv;
     let totalBytes = 0;
     for (const [key, value] of values) {
@@ -1077,7 +1087,7 @@ function collectAllowedEnvironment(
     platform: NodeJS.Platform,
     rejectUndefined: boolean
 ): void {
-    if (typeof source !== 'object' || source === null || Array.isArray(source)) {
+    if (typeof source !== 'object' || !source || Array.isArray(source)) {
         throw new Error('Codex App Server environment is invalid');
     }
     const keys = Object.getOwnPropertyNames(source);
@@ -1166,7 +1176,7 @@ function requirePipedChild(child: ChildProcessWithoutNullStreams): void {
 }
 
 function hasProcessExited(child: ChildProcessWithoutNullStreams): boolean {
-    return child.exitCode !== null || child.signalCode !== null;
+    return typeof child.exitCode === 'number' || typeof child.signalCode === 'string';
 }
 
 async function terminateUnpublishedChild(child: ChildProcessWithoutNullStreams, graceMs: number): Promise<void> {
@@ -1236,7 +1246,7 @@ function disposeSafely(disposable: RideCodexDisposable): void {
 
 function containedWriteRejection(error: Error): Promise<never> {
     const rejection = Promise.reject(error);
-    void rejection.catch(() => undefined);
+    rejection.catch(() => undefined);
     return rejection;
 }
 

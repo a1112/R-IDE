@@ -28,6 +28,10 @@ import { RideCodexThreadCoordinator } from './ride-codex-thread-coordinator';
 import { RideCodexTurnCoordinator } from './ride-codex-turn-coordinator';
 import { RideCodexApprovalBroker } from './ride-codex-approval-broker';
 
+export function RIDE_CODEX_0_144_APPROVAL_POLICY(kind: 'command' | 'file-change'): boolean {
+    return kind === 'command' || kind === 'file-change';
+}
+
 export default new ContainerModule(bind => {
     bind(RideCodexRuntimeResolver).toSelf().inSingletonScope();
     bind(RideCodexAppServerDiagnostics).toSelf().inSingletonScope();
@@ -76,7 +80,8 @@ export default new ContainerModule(bind => {
         })
     ).inSingletonScope();
     bind(RideCodexApprovalBroker).toDynamicValue(context => new RideCodexApprovalBroker({
-        host: context.container.get(RideCodexAppServerHost)
+        host: context.container.get(RideCodexAppServerHost),
+        allowAcceptForSession: RIDE_CODEX_0_144_APPROVAL_POLICY
     })).inSingletonScope();
     bind(BackendApplicationContribution).toService(RideCodexApprovalBroker);
     bind(ConnectionHandler).toDynamicValue(context =>

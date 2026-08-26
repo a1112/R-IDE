@@ -30,6 +30,7 @@ export interface RideCodexApprovalHostLease {
 export interface RideCodexApprovalHost {
     acquire(kind: 'approval'): Promise<RideCodexApprovalHostLease>;
     respondServerRequest(generation: number, id: RequestId, result: unknown): Promise<void>;
+    ownsServerRequest(generation: number, id: RequestId): boolean;
     onServerRequest?(listener: (request: Readonly<{
         id: RequestId;
         method: string;
@@ -39,7 +40,7 @@ export interface RideCodexApprovalHost {
         state: string;
         generation: number;
     }>) => void): { dispose(): void };
-    snapshot?(): Readonly<{ state: string; generation: number }>;
+    snapshot(): Readonly<{ state: string; generation: number }>;
     onNotification?(listener: (notification: Readonly<{
         method: string;
         params: unknown;
@@ -81,6 +82,7 @@ interface SessionRecord {
     readonly id: number;
     readonly client: RideCodexApprovalClient;
     context?: RideCodexApprovalContext;
+    contextRevision: number;
     disposed: boolean;
 }
 
@@ -93,10 +95,21 @@ interface PendingApproval {
     readonly turnId: string;
     readonly itemId: string;
     readonly ownerId: number;
+    readonly issuedAt: number;
+    readonly expiresAt: number;
     readonly allowedDecisions: readonly RideCodexApprovalDecision[];
     readonly card: RideCodexApprovalCard;
     readonly lease: RideCodexApprovalHostLease;
     readonly timer: { dispose(): void };
+}
+
+interface AuthorizingApproval {
+    readonly generation: number;
+    readonly requestId: RequestId;
+    readonly threadId: string;
+    readonly turnId: string;
+    readonly ownerId: number;
+    readonly lease: RideCodexApprovalHostLease;
 }
 
 interface ValidatedCommandRequest {
@@ -104,8 +117,11 @@ interface ValidatedCommandRequest {
     readonly threadId: string;
     readonly turnId: string;
     readonly itemId: string;
-    readonly command: string;
-    readonly cwd?: string;
+    readonly command?: string;
+    readonly cwd?: Readonly<{
+        display: string;
+        normalized: string;
+    }>;
     readonly reason?: string;
     readonly network?: Readonly<{
         host: string;
@@ -152,7 +168,7 @@ const ALLOWED_COMMAND_KEYS = Object.freeze([
     'proposedExecpolicyAmendment', 'proposedNetworkPolicyAmendments'
 ]);
 const REQUIRED_COMMAND_KEYS = Object.freeze([
-    'threadId', 'turnId', 'itemId', 'startedAtMs', 'environmentId'
+    'threadId', 'turnId', 'itemId', 'startedAtMs'
 ]);
 const ALLOWED_FILE_KEYS = Object.freeze([
     'threadId', 'turnId', 'itemId', 'startedAtMs', 'reason', 'grantRoot'
@@ -184,6 +200,7 @@ export class RideCodexApprovalBroker {
     readonly #resolveRealPath: (path: string) => Promise<string>;
     readonly #instanceKey = randomBytes(32);
     readonly #sessions = new Map<number, SessionRecord>();
+    readonly #authorizing = new Set<AuthorizingApproval>();
     readonly #pending = new Map<string, PendingApproval>();
     readonly #threadRoots = new Map<string, TrackedThreadRoot>();
     readonly #fileScopes = new Map<string, TrackedFileScope>();
@@ -227,6 +244,7 @@ export class RideCodexApprovalBroker {
         const record: SessionRecord = {
             id: this.#nextSessionId++,
             client,
+            contextRevision: 0,
             disposed: false
         };
         this.#sessions.set(record.id, record);
@@ -269,20 +287,33 @@ export class RideCodexApprovalBroker {
             await this.#respondAndRelease(lease, generation, validated.id, 'cancel');
             return;
         }
+        const ownerContextRevision = owner.contextRevision;
 
         const kind = envelope.method === 'item/commandExecution/requestApproval'
             ? 'command' as const : 'file-change' as const;
+        const authorizing: AuthorizingApproval = {
+            generation,
+            requestId: validated.id,
+            threadId: validated.threadId,
+            turnId: validated.turnId,
+            ownerId: owner.id,
+            lease
+        };
+        this.#authorizing.add(authorizing);
         let scope: Record<string, unknown>;
         let ownershipScope: Record<string, unknown>;
         if (kind === 'command') {
             const command = validated as ValidatedCommandRequest;
             scope = {
-                command: command.command,
-                ...(command.cwd === undefined ? {} : { cwd: command.cwd }),
+                ...(command.command === undefined ? {} : { command: command.command }),
+                ...(command.cwd === undefined ? {} : { cwd: command.cwd.display }),
                 ...(command.reason === undefined ? {} : { reason: command.reason }),
                 ...(command.network === undefined ? {} : { network: command.network })
             };
-            ownershipScope = scope;
+            ownershipScope = {
+                ...scope,
+                ...(command.cwd === undefined ? {} : { cwd: command.cwd.normalized })
+            };
         } else {
             let resolved: RideCodexApprovalScopeResolution | undefined;
             try {
@@ -295,11 +326,23 @@ export class RideCodexApprovalBroker {
             } catch {
                 resolved = undefined;
             }
+            if (!this.#isStillAuthorized(
+                owner, ownerContextRevision, validated, generation, lease, authorizing
+            )) {
+                await this.#settleAuthorizing(authorizing, 'cancel');
+                return;
+            }
             const fileScope = resolved && await normalizeFileScope(
                 resolved, this.#pathStyle, this.#resolveRealPath
             );
+            if (!this.#isStillAuthorized(
+                owner, ownerContextRevision, validated, generation, lease, authorizing
+            )) {
+                await this.#settleAuthorizing(authorizing, 'cancel');
+                return;
+            }
             if (!fileScope) {
-                await this.#respondAndRelease(lease, generation, validated.id, 'decline');
+                await this.#settleAuthorizing(authorizing, 'decline');
                 return;
             }
             scope = {
@@ -312,6 +355,12 @@ export class RideCodexApprovalBroker {
             };
         }
 
+        if (!this.#isStillAuthorized(
+            owner, ownerContextRevision, validated, generation, lease, authorizing
+        )) {
+            await this.#settleAuthorizing(authorizing, 'cancel');
+            return;
+        }
         while (this.#pending.size >= this.#maxPending) {
             const oldest = this.#pending.values().next().value as PendingApproval | undefined;
             if (!oldest) {
@@ -319,18 +368,25 @@ export class RideCodexApprovalBroker {
             }
             await this.#settle(oldest, 'cancel');
         }
+        if (!this.#isStillAuthorized(
+            owner, ownerContextRevision, validated, generation, lease, authorizing
+        )) {
+            await this.#settleAuthorizing(authorizing, 'cancel');
+            return;
+        }
         let sessionDecisionAllowed = false;
+        let issuedAt: number;
         let expiresAt: number;
         try {
             sessionDecisionAllowed = this.#allowAcceptForSession(kind) === true;
-            const issuedAt = this.#now();
+            issuedAt = Reflect.apply(this.#now, undefined, []);
             if (!Number.isSafeInteger(issuedAt) || issuedAt < 0
                 || issuedAt > Number.MAX_SAFE_INTEGER - this.#ttlMs) {
                 throw new RangeError('Invalid approval clock');
             }
             expiresAt = issuedAt + this.#ttlMs;
         } catch {
-            await this.#respondAndRelease(lease, generation, validated.id, 'decline');
+            await this.#settleAuthorizing(authorizing, 'decline');
             return;
         }
         const allowedDecisions = Object.freeze([
@@ -365,7 +421,14 @@ export class RideCodexApprovalBroker {
                 }
             }, this.#ttlMs);
         } catch {
-            await this.#respondAndRelease(lease, generation, validated.id, 'decline');
+            await this.#settleAuthorizing(authorizing, 'decline');
+            return;
+        }
+        if (!this.#isStillAuthorized(
+            owner, ownerContextRevision, validated, generation, lease, authorizing
+        )) {
+            timer.dispose();
+            await this.#settleAuthorizing(authorizing, 'cancel');
             return;
         }
         const pending: PendingApproval = {
@@ -377,12 +440,18 @@ export class RideCodexApprovalBroker {
             turnId: validated.turnId,
             itemId: validated.itemId,
             ownerId: owner.id,
+            issuedAt,
+            expiresAt,
             allowedDecisions,
             card,
             lease,
             timer
         };
         pendingHolder.value = pending;
+        if (!this.#authorizing.delete(authorizing)) {
+            timer.dispose();
+            return;
+        }
         this.#pending.set(token, pending);
         this.#publish(owner);
         if (expiredBeforeInsertion) {
@@ -400,7 +469,15 @@ export class RideCodexApprovalBroker {
             && pending.threadId === safe.threadId
             && pending.turnId === safe.turnId
         );
-        await Promise.all(matches.map(pending => this.#settle(pending, 'cancel')));
+        const authorizing = [...this.#authorizing].filter(entry =>
+            entry.generation === safe.generation
+            && entry.threadId === safe.threadId
+            && entry.turnId === safe.turnId
+        );
+        await Promise.all([
+            ...matches.map(pending => this.#settle(pending, 'cancel')),
+            ...authorizing.map(entry => this.#settleAuthorizing(entry, 'cancel'))
+        ]);
     }
 
     async dispose(): Promise<void> {
@@ -412,7 +489,11 @@ export class RideCodexApprovalBroker {
         this.#hostStateListener?.dispose();
         this.#hostNotificationListener?.dispose();
         const pending = [...this.#pending.values()];
-        await Promise.all(pending.map(entry => this.#settle(entry, 'cancel')));
+        const authorizing = [...this.#authorizing];
+        await Promise.all([
+            ...pending.map(entry => this.#settle(entry, 'cancel')),
+            ...authorizing.map(entry => this.#settleAuthorizing(entry, 'cancel'))
+        ]);
         this.#sessions.clear();
         this.#threadRoots.clear();
         this.#fileScopes.clear();
@@ -435,6 +516,7 @@ export class RideCodexApprovalBroker {
         if (record.context && !sameContext(record.context, safe)) {
             await this.#cancelOwned(record);
         }
+        record.contextRevision += 1;
         record.context = safe;
         this.#publish(record);
     }
@@ -444,6 +526,7 @@ export class RideCodexApprovalBroker {
             return;
         }
         await this.#cancelOwned(record);
+        record.contextRevision += 1;
         record.context = undefined;
         this.#publish(record);
     }
@@ -453,13 +536,18 @@ export class RideCodexApprovalBroker {
             return;
         }
         record.disposed = true;
+        record.contextRevision += 1;
         this.#sessions.delete(record.id);
         await this.#cancelOwned(record);
     }
 
     async #cancelOwned(record: SessionRecord): Promise<void> {
         const owned = [...this.#pending.values()].filter(pending => pending.ownerId === record.id);
-        await Promise.all(owned.map(pending => this.#settle(pending, 'cancel')));
+        const authorizing = [...this.#authorizing].filter(entry => entry.ownerId === record.id);
+        await Promise.all([
+            ...owned.map(pending => this.#settle(pending, 'cancel')),
+            ...authorizing.map(entry => this.#settleAuthorizing(entry, 'cancel'))
+        ]);
     }
 
     async #decide(
@@ -487,7 +575,73 @@ export class RideCodexApprovalBroker {
         if (!pending.allowedDecisions.includes(safe.decision)) {
             return INVALID_RESULT;
         }
+        let decisionTime: number;
+        try {
+            decisionTime = Reflect.apply(this.#now, undefined, []);
+        } catch {
+            return this.#settle(pending, 'decline');
+        }
+        if (!Number.isSafeInteger(decisionTime) || decisionTime < pending.issuedAt) {
+            return this.#settle(pending, 'decline');
+        }
+        if (decisionTime >= pending.expiresAt) {
+            return this.#settle(pending, 'cancel');
+        }
         return this.#settle(pending, safe.decision);
+    }
+
+    #isStillAuthorized(
+        owner: SessionRecord,
+        contextRevision: number,
+        request: ValidatedCommandRequest | ValidatedFileRequest,
+        generation: number,
+        lease: RideCodexApprovalHostLease,
+        authorizing: AuthorizingApproval
+    ): boolean {
+        if (this.#disposed || owner.disposed || this.#sessions.get(owner.id) !== owner
+            || !this.#authorizing.has(authorizing)
+            || owner.contextRevision !== contextRevision || lease.generation !== generation
+            || !owner.context || owner.context.generation !== generation
+            || owner.context.threadId !== request.threadId || owner.context.turnId !== request.turnId) {
+            return false;
+        }
+        try {
+            const snapshot = dataRecord(this.#host.snapshot());
+            return snapshot?.state === 'ready' && snapshot.generation === generation
+                && this.#host.ownsServerRequest(generation, request.id);
+        } catch {
+            return false;
+        }
+    }
+
+    async #settleAuthorizing(
+        authorizing: AuthorizingApproval,
+        decision: 'decline' | 'cancel'
+    ): Promise<void> {
+        if (!this.#authorizing.delete(authorizing)) {
+            return;
+        }
+        let canRespond = false;
+        try {
+            const snapshot = dataRecord(this.#host.snapshot());
+            canRespond = snapshot?.state === 'ready' && snapshot.generation === authorizing.generation
+                && this.#host.ownsServerRequest(authorizing.generation, authorizing.requestId);
+        } catch {
+            canRespond = false;
+        }
+        if (canRespond) {
+            await this.#respondAndRelease(
+                authorizing.lease, authorizing.generation, authorizing.requestId, decision
+            );
+        } else {
+            releaseOnce(authorizing.lease);
+        }
+    }
+
+    #abandonAuthorizing(authorizing: AuthorizingApproval): void {
+        if (this.#authorizing.delete(authorizing)) {
+            releaseOnce(authorizing.lease);
+        }
     }
 
     async #respondAndRelease(
@@ -529,10 +683,18 @@ export class RideCodexApprovalBroker {
                     this.#abandon(pending);
                 }
             }
+            for (const authorizing of [...this.#authorizing]) {
+                if (authorizing.generation !== event.generation) {
+                    this.#abandonAuthorizing(authorizing);
+                }
+            }
             return;
         }
         for (const pending of [...this.#pending.values()]) {
             this.#abandon(pending);
+        }
+        for (const authorizing of [...this.#authorizing]) {
+            this.#abandonAuthorizing(authorizing);
         }
         this.#threadRoots.clear();
         this.#fileScopes.clear();
@@ -721,16 +883,16 @@ function validateCommandRequest(
     const threadId = boundedString(params.threadId, MAX_IDENTIFIER_BYTES);
     const turnId = boundedString(params.turnId, MAX_IDENTIFIER_BYTES);
     const itemId = boundedString(params.itemId, MAX_IDENTIFIER_BYTES);
-    const command = boundedString(params.command, MAX_COMMAND_BYTES);
-    if (threadId === undefined || turnId === undefined || itemId === undefined || command === undefined
+    if (threadId === undefined || turnId === undefined || itemId === undefined
         || !Number.isSafeInteger(params.startedAtMs) || (params.startedAtMs as number) < 0
-        || !nullableBoundedString(params.environmentId, MAX_ENVIRONMENT_BYTES)
+        || !optionalNullableBoundedString(params.environmentId, MAX_ENVIRONMENT_BYTES)
         || !optionalNullableBoundedString(params.approvalId, MAX_IDENTIFIER_BYTES)
         || !optionalNullableBoundedString(params.reason, MAX_REASON_BYTES)
+        || !optionalNullableBoundedString(params.command, MAX_COMMAND_BYTES)
         || !optionalNullableBoundedString(params.cwd, MAX_PATH_BYTES)
         || !validateCommandActions(params.commandActions)
-        || !absentOrNull(params.proposedExecpolicyAmendment)
-        || !absentOrNull(params.proposedNetworkPolicyAmendments)) {
+        || !validateExecPolicyAmendment(params.proposedExecpolicyAmendment)
+        || !validateNetworkPolicyAmendments(params.proposedNetworkPolicyAmendments)) {
         return undefined;
     }
     const network = validateNetwork(params.networkApprovalContext);
@@ -738,7 +900,7 @@ function validateCommandRequest(
         return undefined;
     }
     const rawCwd = typeof params.cwd === 'string' ? params.cwd : undefined;
-    const cwd = rawCwd === undefined ? undefined : normalizeDisplayPath(rawCwd, pathStyle);
+    const cwd = rawCwd === undefined ? undefined : validateCommandCwd(rawCwd, pathStyle);
     if (rawCwd !== undefined && cwd === undefined) {
         return undefined;
     }
@@ -747,7 +909,7 @@ function validateCommandRequest(
         threadId,
         turnId,
         itemId,
-        command,
+        ...(typeof params.command === 'string' ? { command: params.command } : {}),
         ...(cwd === undefined ? {} : { cwd }),
         ...(typeof params.reason === 'string' ? { reason: params.reason } : {}),
         ...(network ? { network } : {})
@@ -765,7 +927,7 @@ function validateFileRequest(envelope: SupportedEnvelope): ValidatedFileRequest 
     if (threadId === undefined || turnId === undefined || itemId === undefined
         || !Number.isSafeInteger(params.startedAtMs) || (params.startedAtMs as number) < 0
         || !optionalNullableBoundedString(params.reason, MAX_REASON_BYTES)
-        || !absentOrNull(params.grantRoot)) {
+        || !optionalNullableBoundedString(params.grantRoot, MAX_PATH_BYTES)) {
         return undefined;
     }
     return Object.freeze({
@@ -810,8 +972,7 @@ function validateNetwork(value: unknown): ValidatedCommandRequest['network'] | f
     }
     const record = exactDataRecord(value, ['host', 'protocol']);
     const host = record && boundedString(record.host, 253);
-    if (!record || host === undefined || host.length === 0
-        || !isNetworkHost(host)
+    if (!record || host === undefined
         || !['http', 'https', 'socks5Tcp', 'socks5Udp'].includes(record.protocol as string)) {
         return false;
     }
@@ -845,19 +1006,42 @@ function validateCommandActions(value: unknown): boolean {
                     && boundedString(record.path, MAX_PATH_BYTES) !== undefined;
             }
             case 'listFiles': {
-                const record = exactDataRecord(item, ['type', 'command', 'path']);
+                const record = exactDataRecord(item, ['type', 'command'], ['type', 'command', 'path']);
                 return !!record && boundedString(record.command, MAX_COMMAND_BYTES) !== undefined
-                    && nullableBoundedString(record.path, MAX_PATH_BYTES);
+                    && optionalNullableBoundedString(record.path, MAX_PATH_BYTES);
             }
             case 'search': {
-                const record = exactDataRecord(item, ['type', 'command', 'query', 'path']);
+                const record = exactDataRecord(
+                    item, ['type', 'command'], ['type', 'command', 'query', 'path']
+                );
                 return !!record && boundedString(record.command, MAX_COMMAND_BYTES) !== undefined
-                    && nullableBoundedString(record.query, MAX_REASON_BYTES)
-                    && nullableBoundedString(record.path, MAX_PATH_BYTES);
+                    && optionalNullableBoundedString(record.query, MAX_REASON_BYTES)
+                    && optionalNullableBoundedString(record.path, MAX_PATH_BYTES);
             }
             default:
                 return false;
         }
+    });
+}
+
+function validateExecPolicyAmendment(value: unknown): boolean {
+    if (value === undefined || isNull(value)) {
+        return true;
+    }
+    const items = safeArray(value, MAX_COMMAND_ACTIONS);
+    return !!items && items.every(item => boundedString(item, MAX_COMMAND_BYTES) !== undefined);
+}
+
+function validateNetworkPolicyAmendments(value: unknown): boolean {
+    if (value === undefined || isNull(value)) {
+        return true;
+    }
+    const items = safeArray(value, MAX_COMMAND_ACTIONS);
+    return !!items && items.every(item => {
+        const record = exactDataRecord(item, ['host', 'action']);
+        const host = record && boundedString(record.host, 253);
+        return !!record && host !== undefined
+            && (record.action === 'allow' || record.action === 'deny');
     });
 }
 
@@ -966,10 +1150,6 @@ function optionalNullableBoundedString(value: unknown, maxBytes: number): boolea
     return value === undefined || nullableBoundedString(value, maxBytes);
 }
 
-function absentOrNull(value: unknown): boolean {
-    return value === undefined || isNull(value);
-}
-
 function isNull(value: unknown): boolean {
     return typeof value === 'object' && !value;
 }
@@ -1002,18 +1182,18 @@ function setBounded<K, V>(map: Map<K, V>, key: K, value: V, limit: number): void
     map.set(key, value);
 }
 
-function normalizeDisplayPath(value: string, style: 'posix' | 'win32'): string | undefined {
-    if (!isSafeLocalPath(value, style)) {
+function validateCommandCwd(
+    value: string,
+    style: 'posix' | 'win32'
+): Readonly<{ display: string; normalized: string }> | undefined {
+    if (value.length > 0 && !isSafeLocalPath(value, style)) {
         return undefined;
     }
     const paths = style === 'win32' ? win32 : posix;
     const normalized = paths.normalize(value);
-    return utf8ByteLength(normalized) <= MAX_PATH_BYTES ? normalized : undefined;
-}
-
-function isNetworkHost(value: string): boolean {
-    return /^(?:[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?|\[[0-9A-Fa-f:.]{2,253}\])$/u.test(value)
-        && !value.includes('..');
+    return utf8ByteLength(normalized) <= MAX_PATH_BYTES
+        ? Object.freeze({ display: value, normalized })
+        : undefined;
 }
 
 async function normalizeFileScope(
@@ -1127,10 +1307,23 @@ function isSafeLocalPath(value: string, style: 'posix' | 'win32'): boolean {
         if (/^(?:\\\\|\/\/)/u.test(value)) {
             return false;
         }
+        if (/^[A-Za-z]:(?:$|[^\\/])/u.test(value)) {
+            return false;
+        }
         const withoutDrive = /^[A-Za-z]:/u.test(value) ? value.slice(2) : value;
-        return !withoutDrive.includes(':');
+        return !withoutDrive.includes(':') && !hasWindowsDeviceSegment(withoutDrive);
     }
     return !value.startsWith('//');
+}
+
+function hasWindowsDeviceSegment(value: string): boolean {
+    return value.split(/[\\/]/u).some(segment => {
+        if (!segment || segment === '.' || segment === '..') {
+            return false;
+        }
+        const stem = (segment.split('.', 1)[0] ?? '').replace(/ +$/u, '').toUpperCase();
+        return /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/u.test(stem);
+    });
 }
 
 function isWithin(

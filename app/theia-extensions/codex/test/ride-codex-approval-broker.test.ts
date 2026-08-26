@@ -17,6 +17,7 @@ import {
     RideCodexApprovalHostLease,
     RideCodexApprovalScopeResolution
 } from '../src/node/ride-codex-approval-broker';
+import * as backendModuleExports from '../src/node/ride-codex-backend-module';
 
 type RequestId = string | number;
 
@@ -34,6 +35,7 @@ class FakeLease implements RideCodexApprovalHostLease {
 class FakeHost implements RideCodexApprovalHost {
     generation = 7;
     state = 'ready';
+    requestOwnership = true;
     readonly leases: FakeLease[] = [];
     readonly responses: Array<Readonly<{
         generation: number;
@@ -64,6 +66,10 @@ class FakeHost implements RideCodexApprovalHost {
         if (this.failingResponses.has(id)) {
             throw new Error('C:\\Users\\alice\\secret.txt sk-live-secret');
         }
+    }
+
+    ownsServerRequest(generation: number, _id: RequestId): boolean {
+        return this.requestOwnership && this.state === 'ready' && this.generation === generation;
     }
 
     onStateChange(listener: (event: Readonly<{ state: string; generation: number }>) => void): { dispose(): void } {
@@ -132,10 +138,12 @@ class RecordingClient implements RideCodexApprovalClient {
 class FakeClock {
     now = 1_000;
     readonly timers = new Map<number, Readonly<{ due: number; callback: () => void }>>();
+    readonly callbacks: Array<() => void> = [];
     #nextId = 1;
 
     readonly schedule = (callback: () => void, delayMs: number): { dispose(): void } => {
         const id = this.#nextId++;
+        this.callbacks.push(callback);
         this.timers.set(id, Object.freeze({ due: this.now + delayMs, callback }));
         return { dispose: () => this.timers.delete(id) };
     };
@@ -150,6 +158,23 @@ class FakeClock {
                 timer.callback();
             }
         }
+    }
+}
+
+class Deferred<T> {
+    readonly promise: Promise<T>;
+    readonly resolve: (value: T) => void;
+    readonly reject: (reason: Error) => void;
+
+    constructor() {
+        let resolve!: (value: T) => void;
+        let reject!: (reason: Error) => void;
+        this.promise = new Promise<T>((resolvePromise, rejectPromise) => {
+            resolve = resolvePromise;
+            reject = rejectPromise;
+        });
+        this.resolve = resolve;
+        this.reject = reject;
     }
 }
 
@@ -185,6 +210,23 @@ function commandRequest(overrides: Record<string, unknown> = {}, id: RequestId =
     });
 }
 
+function minimalCommandRequest(
+    optional: Record<string, unknown> = {},
+    id: RequestId = 'rpc-minimal-command'
+): Readonly<{ id: RequestId; method: string; params: unknown }> {
+    return Object.freeze({
+        id,
+        method: 'item/commandExecution/requestApproval',
+        params: {
+            threadId: CONTEXT.threadId,
+            turnId: CONTEXT.turnId,
+            itemId: 'item-minimal-command',
+            startedAtMs: 1_700_000_000_000,
+            ...optional
+        }
+    });
+}
+
 function fileRequest(overrides: Record<string, unknown> = {}, id: RequestId = 'rpc-file-1'): Readonly<{
     id: RequestId;
     method: string;
@@ -209,21 +251,25 @@ function resolution(changes: RideCodexApprovalScopeResolution['changes']): RideC
 }
 
 function createFixture(options: Readonly<{
-    allowAcceptForSession?: boolean;
+    allowAcceptForSession?: boolean | ((kind: 'command' | 'file-change') => boolean);
     maxPending?: number;
     resolveFileScope?: () => Promise<RideCodexApprovalScopeResolution | undefined>;
     resolveRealPath?: (path: string) => Promise<string>;
+    now?: () => number;
+    pathStyle?: 'posix' | 'win32';
 }> = {}) {
     const host = new FakeHost();
     const clock = new FakeClock();
     const broker = new RideCodexApprovalBroker({
         host,
-        now: () => clock.now,
+        now: options.now ?? (() => clock.now),
         schedule: clock.schedule,
         ttlMs: 1_000,
         maxPending: options.maxPending ?? 8,
-        pathStyle: 'win32',
-        allowAcceptForSession: () => options.allowAcceptForSession === true,
+        pathStyle: options.pathStyle ?? 'win32',
+        allowAcceptForSession: typeof options.allowAcceptForSession === 'function'
+            ? options.allowAcceptForSession
+            : () => options.allowAcceptForSession === true,
         resolveFileScope: options.resolveFileScope ?? (async () => resolution([
             { path: 'src\\..\\src\\a.ts', kind: 'update', movePath: 'src\\renamed.ts', diff: 'secret patch' },
             { path: 'src\\new.ts', kind: 'add', diff: '<script>unsafe</script>' }
@@ -333,7 +379,7 @@ describe('RideCodexApprovalBroker ownership', () => {
                 fingerprint: card.fingerprint,
                 expiresAt: 2_000,
                 command: 'printf "<unsafe>& exact"',
-                cwd: 'C:\\workspace\\src',
+                cwd: 'C:\\workspace\\src\\..\\src',
                 reason: 'Needs access to the package registry.',
                 network: { host: 'registry.example.test', protocol: 'https' },
                 allowedDecisions: allowAcceptForSession
@@ -364,18 +410,10 @@ describe('RideCodexApprovalBroker ownership', () => {
         const fixture = createFixture();
         await fixture.session.setContext(CONTEXT);
         const rejected = [
-            commandRequest({ proposedExecpolicyAmendment: ['prefix_rule'] }, 'exec-policy'),
-            commandRequest({
-                proposedNetworkPolicyAmendments: [{ host: 'example.test', action: 'allow' }]
-            }, 'network-policy'),
             commandRequest({ networkApprovalContext: { host: 'example.test', protocol: 'ftp' } }, 'protocol'),
-            commandRequest({
-                networkApprovalContext: { host: 'user@example.test/path', protocol: 'https' }
-            }, 'network-host'),
             commandRequest({ cwd: '\\\\server\\share' }, 'network-cwd'),
             commandRequest({ startedAtMs: Number.POSITIVE_INFINITY }, 'number'),
-            commandRequest({ command: 'x'.repeat(64 * 1024 + 1) }, 'bytes'),
-            fileRequest({ grantRoot: 'C:\\workspace' }, 'grant-root')
+            commandRequest({ command: 'x'.repeat(64 * 1024 + 1) }, 'bytes')
         ];
         for (const request of rejected) {
             await fixture.broker.handleServerRequest(request, CONTEXT.generation);
@@ -389,6 +427,300 @@ describe('RideCodexApprovalBroker ownership', () => {
             rejected.map(request => ({ id: request.id, result: { decision: 'decline' } })));
         assert.equal(fixture.host.leases.length, rejected.length);
         assert.ok(fixture.host.leases.every(lease => lease.releases === 1));
+    });
+
+    it('mirrors the reviewed Codex 0.144 command approval schema table and ignores amendments', async () => {
+        const valid: ReadonlyArray<Readonly<{ name: string; optional: Record<string, unknown> }>> = [
+            { name: 'minimal', optional: {} },
+            {
+                name: 'all nullable',
+                optional: {
+                    approvalId: null,
+                    environmentId: null,
+                    reason: null,
+                    networkApprovalContext: null,
+                    command: null,
+                    cwd: null,
+                    commandActions: null,
+                    proposedExecpolicyAmendment: null,
+                    proposedNetworkPolicyAmendments: null
+                }
+            },
+            {
+                name: 'all supplied',
+                optional: {
+                    approvalId: 'approval-callback',
+                    environmentId: 'local-environment',
+                    reason: 'reviewed reason',
+                    networkApprovalContext: { host: 'registry.example.test', protocol: 'https' },
+                    command: 'npm test -- --runInBand',
+                    cwd: 'C:/workspace\\src\\..\\pkg',
+                    commandActions: [
+                        { type: 'read', command: 'type README.md', name: 'README.md', path: 'C:\\workspace\\README.md' },
+                        { type: 'listFiles', command: 'dir' },
+                        { type: 'listFiles', command: 'dir src', path: null },
+                        { type: 'listFiles', command: 'dir test', path: 'test' },
+                        { type: 'search', command: 'rg TODO' },
+                        { type: 'search', command: 'rg TODO src', query: null, path: null },
+                        { type: 'search', command: 'rg Task test', query: 'Task', path: 'test' },
+                        { type: 'unknown', command: 'custom-command' }
+                    ],
+                    proposedExecpolicyAmendment: ['npm', 'test'],
+                    proposedNetworkPolicyAmendments: [
+                        { host: 'registry.example.test', action: 'allow' },
+                        { host: 'blocked.example.test', action: 'deny' }
+                    ]
+                }
+            },
+            {
+                name: 'empty defaults',
+                optional: {
+                    environmentId: null,
+                    command: '',
+                    cwd: '',
+                    commandActions: [],
+                    proposedExecpolicyAmendment: [],
+                    proposedNetworkPolicyAmendments: []
+                }
+            },
+            {
+                name: 'schema strings without hostname format',
+                optional: {
+                    networkApprovalContext: { host: '', protocol: 'http' },
+                    proposedNetworkPolicyAmendments: [
+                        { host: 'user@example.test/path', action: 'allow' }
+                    ]
+                }
+            }
+        ];
+        for (const entry of valid) {
+            const fixture = createFixture();
+            await fixture.session.setContext(CONTEXT);
+            await fixture.broker.handleServerRequest(
+                minimalCommandRequest(entry.optional, `valid-${entry.name}`), CONTEXT.generation
+            );
+
+            const card = fixture.client.latest()[0] as RideCodexApprovalCard | undefined;
+            assert.ok(card, entry.name);
+            assert.equal(card.kind, 'command', entry.name);
+            assert.deepEqual(card.allowedDecisions, ['accept', 'decline', 'cancel'], entry.name);
+            assert.equal(JSON.stringify(card).includes('Amendment'), false, entry.name);
+            if (!Object.prototype.hasOwnProperty.call(entry.optional, 'command')
+                || entry.optional.command === null) {
+                assert.equal(Object.prototype.hasOwnProperty.call(card, 'command'), false, entry.name);
+            } else {
+                assert.equal((card as { command?: string }).command, entry.optional.command, entry.name);
+            }
+            if (typeof entry.optional.cwd === 'string') {
+                assert.equal((card as { cwd?: string }).cwd, entry.optional.cwd, entry.name);
+            }
+            await fixture.session.disposeContext();
+            assert.equal(fixture.host.leases[0].releases, 1, entry.name);
+        }
+
+        const invalid: ReadonlyArray<Readonly<{ name: string; optional: Record<string, unknown> }>> = [
+            { name: 'unknown top-level field', optional: { unknown: true } },
+            { name: 'invalid environment', optional: { environmentId: 1 } },
+            { name: 'invalid command', optional: { command: [] } },
+            { name: 'invalid cwd', optional: { cwd: 1 } },
+            { name: 'invalid approval id', optional: { approvalId: false } },
+            { name: 'invalid reason', optional: { reason: {} } },
+            { name: 'invalid network field', optional: { networkApprovalContext: { host: 'example.test', protocol: 'https', extra: true } } },
+            { name: 'invalid exec amendment type', optional: { proposedExecpolicyAmendment: 'npm' } },
+            { name: 'invalid exec amendment item', optional: { proposedExecpolicyAmendment: ['npm', 1] } },
+            { name: 'oversized exec amendment array', optional: { proposedExecpolicyAmendment: Array(129).fill('npm') } },
+            { name: 'invalid network amendment action', optional: { proposedNetworkPolicyAmendments: [{ host: 'example.test', action: 'permit' }] } },
+            { name: 'invalid network amendment host', optional: { proposedNetworkPolicyAmendments: [{ host: 1, action: 'allow' }] } },
+            { name: 'unknown network amendment field', optional: { proposedNetworkPolicyAmendments: [{ host: 'example.test', action: 'allow', extra: true }] } },
+            { name: 'oversized network amendment array', optional: { proposedNetworkPolicyAmendments: Array(129).fill({ host: 'example.test', action: 'allow' }) } },
+            { name: 'read action missing path', optional: { commandActions: [{ type: 'read', command: 'type', name: 'name' }] } },
+            { name: 'list action invalid path', optional: { commandActions: [{ type: 'listFiles', command: 'dir', path: 1 }] } },
+            { name: 'search action invalid query', optional: { commandActions: [{ type: 'search', command: 'rg', query: 1 }] } },
+            { name: 'action unknown field', optional: { commandActions: [{ type: 'unknown', command: 'x', extra: true }] } }
+        ];
+        const fixture = createFixture();
+        await fixture.session.setContext(CONTEXT);
+        for (const [index, entry] of invalid.entries()) {
+            await fixture.broker.handleServerRequest(
+                minimalCommandRequest(entry.optional, `invalid-${index}`), CONTEXT.generation
+            );
+        }
+        assert.ok(fixture.client.states.every(state => state.length === 0));
+        assert.deepEqual(fixture.host.responses.map(response => response.id),
+            invalid.map((_, index) => `invalid-${index}`));
+        assert.ok(fixture.host.responses.every(response =>
+            (response.result as { decision?: string }).decision === 'decline'));
+        assert.ok(fixture.host.leases.every(lease => lease.releases === 1));
+    });
+
+    it('validates nested amendments and actions without invoking accessors or Proxy traps', async () => {
+        let traps = 0;
+        const proxy = new Proxy([], {
+            get: () => { traps += 1; return undefined; },
+            getOwnPropertyDescriptor: () => { traps += 1; return undefined; }
+        });
+        let getters = 0;
+        const amendment = { action: 'allow' } as Record<string, unknown>;
+        Object.defineProperty(amendment, 'host', {
+            enumerable: true,
+            get: () => { getters += 1; return 'example.test'; }
+        });
+        const action: unknown[] = [{ type: 'listFiles', command: 'dir' }];
+        Object.defineProperty(action, '0', {
+            enumerable: true,
+            configurable: true,
+            get: () => { getters += 1; return { type: 'listFiles', command: 'dir' }; }
+        });
+        const fixture = createFixture();
+        await fixture.session.setContext(CONTEXT);
+        for (const [index, optional] of [
+            { proposedExecpolicyAmendment: proxy },
+            { proposedNetworkPolicyAmendments: [amendment] },
+            { commandActions: action }
+        ].entries()) {
+            await fixture.broker.handleServerRequest(
+                minimalCommandRequest(optional, `descriptor-${index}`), CONTEXT.generation
+            );
+        }
+        assert.equal(traps, 0);
+        assert.equal(getters, 0);
+        assert.deepEqual(fixture.host.responses.map(response => response.id),
+            ['descriptor-0', 'descriptor-1', 'descriptor-2']);
+        assert.ok(fixture.host.leases.every(lease => lease.releases === 1));
+    });
+
+    it('retains the original safe cwd byte-for-byte and omits absent or null command text', async () => {
+        const exactCwds = ['C:/workspace\\src\\..\\pkg', 'src/../pkg', 'C:\\workspace\\double\\\\separator'];
+        for (const [index, cwd] of exactCwds.entries()) {
+            const fixture = createFixture();
+            await fixture.session.setContext(CONTEXT);
+            await fixture.broker.handleServerRequest(
+                minimalCommandRequest({ command: null, cwd }, `cwd-${index}`), CONTEXT.generation
+            );
+            const card = fixture.client.latest()[0] as RideCodexApprovalCard;
+            assert.equal((card as { cwd?: string }).cwd, cwd);
+            assert.equal(Object.prototype.hasOwnProperty.call(card, 'command'), false);
+            await fixture.session.disposeContext();
+        }
+    });
+
+    it('accepts bounded file grantRoot schema strings but never exposes grant decisions or the root', async () => {
+        for (const [index, grantRoot] of [undefined, null, '', 'C:\\workspace\\reviewed'].entries()) {
+            const fixture = createFixture({ allowAcceptForSession: true });
+            await fixture.session.setContext(CONTEXT);
+            const optional = grantRoot === undefined ? {} : { grantRoot };
+            await fixture.broker.handleServerRequest(
+                fileRequest(optional, `grant-root-${index}`), CONTEXT.generation
+            );
+            const card = fixture.client.latest()[0];
+            assert.ok(card, String(grantRoot));
+            assert.deepEqual(card.allowedDecisions,
+                ['accept', 'acceptForSession', 'decline', 'cancel']);
+            assert.equal(JSON.stringify(card).includes('grantRoot'), false);
+            assert.equal(JSON.stringify(card).includes('C:\\workspace\\reviewed'), false);
+            await fixture.broker.dispose();
+        }
+    });
+
+    it('rejects drive-relative, network, and ADS command cwd forms', async () => {
+        const unsafe = ['C:', 'C:relative', '\\\\server\\share', 'src\\file.txt:stream'];
+        for (const [index, cwd] of unsafe.entries()) {
+            const fixture = createFixture();
+            await fixture.session.setContext(CONTEXT);
+            await fixture.broker.handleServerRequest(
+                minimalCommandRequest({ cwd }, `unsafe-cwd-${index}`), CONTEXT.generation
+            );
+            assert.equal(fixture.client.latest().length, 0, cwd);
+            assert.deepEqual(fixture.host.responses[0]?.result, { decision: 'decline' }, cwd);
+            assert.equal(fixture.host.leases[0].releases, 1, cwd);
+        }
+    });
+
+    it('rejects every Windows DOS device alias in cwd, relative/absolute scopes, and movePath', async () => {
+        const aliases = [
+            'CON', 'prn.txt', 'Aux .log', 'nul...', 'COM1', 'com9.json', 'LPT1 ', 'lpt9...txt'
+        ];
+        for (const [index, alias] of aliases.entries()) {
+            const cwdFixture = createFixture();
+            await cwdFixture.session.setContext(CONTEXT);
+            await cwdFixture.broker.handleServerRequest(
+                minimalCommandRequest({ cwd: `C:\\workspace\\src\\${alias}` }, `device-cwd-${index}`),
+                CONTEXT.generation
+            );
+            assert.equal(cwdFixture.client.latest().length, 0, `cwd ${alias}`);
+            assert.deepEqual(cwdFixture.host.responses[0]?.result, { decision: 'decline' }, `cwd ${alias}`);
+
+            for (const [scopeKind, scope] of [
+                ['relative', resolution([{ path: `src\\${alias}\\file.ts`, kind: 'update' }])],
+                ['absolute', resolution([{ path: `C:\\workspace\\${alias}`, kind: 'update' }])],
+                ['move', resolution([{ path: 'src\\safe.ts', kind: 'update', movePath: `src\\${alias}` }])],
+                ['workspace', { workspaceRoot: `C:\\${alias}\\workspace`, changes: [{ path: 'safe.ts', kind: 'update' as const }] }]
+            ] as const) {
+                const fixture = createFixture({ resolveFileScope: async () => scope });
+                await fixture.session.setContext(CONTEXT);
+                await fixture.broker.handleServerRequest(
+                    fileRequest({}, `device-${index}-${scopeKind}`), CONTEXT.generation
+                );
+                assert.equal(fixture.client.latest().length, 0, `${scopeKind} ${alias}`);
+                assert.deepEqual(fixture.host.responses[0]?.result,
+                    { decision: 'decline' }, `${scopeKind} ${alias}`);
+                assert.equal(fixture.host.leases[0].releases, 1, `${scopeKind} ${alias}`);
+            }
+        }
+    });
+
+    it('keeps DOS device spellings valid for POSIX cwd and file scopes', async () => {
+        const fixture = createFixture({
+            pathStyle: 'posix',
+            resolveFileScope: async () => Object.freeze({
+                workspaceRoot: '/workspace',
+                changes: Object.freeze([
+                    { path: 'CON/prn.txt', kind: 'update' as const, movePath: 'AUX/NUL.log' }
+                ])
+            })
+        });
+        await fixture.session.setContext(CONTEXT);
+        await fixture.broker.handleServerRequest(
+            minimalCommandRequest({ command: 'pwd', cwd: 'CON/PRN.txt' }, 'posix-command'),
+            CONTEXT.generation
+        );
+        assert.equal((fixture.client.latest()[0] as { cwd?: string }).cwd, 'CON/PRN.txt');
+        await fixture.session.disposeContext();
+        await fixture.session.setContext(CONTEXT);
+        await fixture.broker.handleServerRequest(fileRequest({}, 'posix-file'), CONTEXT.generation);
+        const card = fixture.client.latest()[0];
+        assert.equal(card.kind, 'file-change');
+        assert.deepEqual(card.changes, [{
+            path: 'CON/prn.txt', kind: 'update', movePath: 'AUX/NUL.log'
+        }]);
+        await fixture.broker.dispose();
+    });
+
+    it('uses the explicit reviewed 0.144 production policy for both stable approval families only', async () => {
+        const policy = (backendModuleExports as unknown as {
+            RIDE_CODEX_0_144_APPROVAL_POLICY?: (kind: 'command' | 'file-change') => boolean;
+        }).RIDE_CODEX_0_144_APPROVAL_POLICY;
+        assert.equal(typeof policy, 'function');
+        assert.equal(policy?.('command'), true);
+        assert.equal(policy?.('file-change'), true);
+        assert.equal((policy as (kind: string) => boolean)('permissions'), false);
+
+        const fixture = createFixture({ allowAcceptForSession: policy });
+        await fixture.session.setContext(CONTEXT);
+        await fixture.broker.handleServerRequest(commandRequest(), CONTEXT.generation);
+        assert.deepEqual(fixture.client.latest()[0].allowedDecisions,
+            ['accept', 'acceptForSession', 'decline', 'cancel']);
+        await fixture.session.disposeContext();
+        await fixture.session.setContext(CONTEXT);
+        await fixture.broker.handleServerRequest(fileRequest(), CONTEXT.generation);
+        assert.deepEqual(fixture.client.latest()[0].allowedDecisions,
+            ['accept', 'acceptForSession', 'decline', 'cancel']);
+        await fixture.broker.handleServerRequest({
+            id: 'experimental-policy', method: 'item/permissions/requestApproval', params: {}
+        }, CONTEXT.generation);
+        assert.equal(fixture.client.latest().length, 1);
+        assert.equal(fixture.host.responses.some(response => response.id === 'experimental-policy'), false);
+        await fixture.broker.dispose();
     });
 
     it('normalizes resolver-owned file scopes without retaining diffs or grant roots', async () => {
@@ -516,6 +848,164 @@ describe('RideCodexApprovalBroker ownership', () => {
         });
         assert.equal(fixture.host.leases[1].releases, 1);
         assert.equal(fixture.client.latest().length, 0);
+    });
+
+    it('enforces the hard TTL at expiresAt - 1, expiresAt, and expiresAt + 1 despite delayed timers', async () => {
+        for (const offset of [-1, 0, 1]) {
+            const fixture = createFixture();
+            await fixture.session.setContext(CONTEXT);
+            await fixture.broker.handleServerRequest(
+                commandRequest({}, `ttl-${offset}`), CONTEXT.generation
+            );
+            const card = fixture.client.latest()[0];
+            const lateTimer = fixture.clock.callbacks[0];
+            assert.ok(lateTimer);
+            fixture.clock.now = card.expiresAt + offset;
+
+            assert.deepEqual(await fixture.session.decide({
+                token: card.token, fingerprint: card.fingerprint, decision: 'accept'
+            }), { status: 'responded' });
+            assert.deepEqual(fixture.host.responses, [{
+                generation: 7,
+                id: `ttl-${offset}`,
+                result: { decision: offset < 0 ? 'accept' : 'cancel' }
+            }], `offset ${offset}`);
+            assert.equal(fixture.host.leases[0].releases, 1, `offset ${offset}`);
+            assert.equal(fixture.client.latest().length, 0, `offset ${offset}`);
+
+            lateTimer();
+            await flushAsync();
+            assert.equal(fixture.host.responses.length, 1, `late callback at offset ${offset}`);
+            assert.equal(fixture.host.leases[0].releases, 1, `late callback at offset ${offset}`);
+            await fixture.broker.dispose();
+        }
+    });
+
+    it('fails closed once when the decision clock rolls backward, is invalid, or throws', async () => {
+        const cases: ReadonlyArray<Readonly<{
+            name: string;
+            decideNow: () => number;
+        }>> = [
+            { name: 'rollback', decideNow: () => 999 },
+            { name: 'NaN', decideNow: () => Number.NaN },
+            { name: 'fractional', decideNow: () => 1_000.5 },
+            { name: 'infinite', decideNow: () => Number.POSITIVE_INFINITY },
+            { name: 'throwing', decideNow: () => { throw new Error('clock failure'); } }
+        ];
+        for (const entry of cases) {
+            let deciding = false;
+            const fixture = createFixture({ now: () => deciding ? entry.decideNow() : 1_000 });
+            await fixture.session.setContext(CONTEXT);
+            await fixture.broker.handleServerRequest(
+                commandRequest({}, `clock-${entry.name}`), CONTEXT.generation
+            );
+            const card = fixture.client.latest()[0];
+            const lateTimer = fixture.clock.callbacks[0];
+            deciding = true;
+
+            assert.deepEqual(await fixture.session.decide({
+                token: card.token, fingerprint: card.fingerprint, decision: 'accept'
+            }), { status: 'responded' }, entry.name);
+            assert.deepEqual(fixture.host.responses, [{
+                generation: 7,
+                id: `clock-${entry.name}`,
+                result: { decision: 'decline' }
+            }], entry.name);
+            assert.equal(fixture.host.leases[0].releases, 1, entry.name);
+            lateTimer();
+            await flushAsync();
+            assert.equal(fixture.host.responses.length, 1, entry.name);
+            assert.equal(fixture.host.leases[0].releases, 1, entry.name);
+            await fixture.broker.dispose();
+        }
+    });
+
+    it('reauthorizes after delayed file-scope and realpath settlement for every owner and host race', async () => {
+        const races = [
+            'context-switch', 'disconnect', 'broker-dispose', 'process-exit', 'restart', 'request-lost'
+        ] as const;
+        for (const stage of ['scope', 'realpath'] as const) {
+            for (const outcome of ['resolve', 'reject'] as const) {
+                for (const race of races) {
+                    const deferred = new Deferred<RideCodexApprovalScopeResolution | string>();
+                    let entered = false;
+                    let realPathCalls = 0;
+                    const fixture = createFixture({
+                        resolveFileScope: stage === 'scope'
+                            ? async () => {
+                                entered = true;
+                                return deferred.promise as Promise<RideCodexApprovalScopeResolution>;
+                            }
+                            : async () => resolution([{ path: 'src\\pending.ts', kind: 'update' }]),
+                        resolveRealPath: stage === 'realpath'
+                            ? async path => {
+                                realPathCalls += 1;
+                                if (realPathCalls === 1) {
+                                    entered = true;
+                                    return deferred.promise as Promise<string>;
+                                }
+                                return path;
+                            }
+                            : async path => path
+                    });
+                    await fixture.session.setContext(CONTEXT);
+                    const id = `${stage}-${outcome}-${race}`;
+                    const operation = fixture.broker.handleServerRequest(fileRequest({}, id), CONTEXT.generation);
+                    await waitForAsync(() => entered);
+
+                    if (race === 'context-switch') {
+                        await fixture.session.setContext({ ...CONTEXT, turnId: 'turn-after-race' });
+                    } else if (race === 'disconnect') {
+                        fixture.session.dispose();
+                        await flushAsync();
+                    } else if (race === 'broker-dispose') {
+                        await fixture.broker.dispose();
+                    } else if (race === 'process-exit') {
+                        fixture.host.emitState('circuit-open', CONTEXT.generation);
+                    } else if (race === 'restart') {
+                        fixture.host.emitState('ready', CONTEXT.generation + 1);
+                    } else {
+                        fixture.host.requestOwnership = false;
+                    }
+
+                    if (race !== 'request-lost') {
+                        assert.ok(fixture.client.states.every(state => state.length === 0),
+                            `${id} before late settlement`);
+                        assert.equal(fixture.clock.timers.size, 0, `${id} before late settlement`);
+                        assert.equal(fixture.host.leases[0].releases, 1,
+                            `${id} before late settlement`);
+                        if (race === 'context-switch' || race === 'disconnect' || race === 'broker-dispose') {
+                            assert.deepEqual(fixture.host.responses, [{
+                                generation: 7, id, result: { decision: 'cancel' }
+                            }], `${id} before late settlement`);
+                        } else {
+                            assert.deepEqual(fixture.host.responses, [], `${id} before late settlement`);
+                        }
+                    }
+
+                    if (outcome === 'reject') {
+                        deferred.reject(new Error('late scope failure'));
+                    } else if (stage === 'scope') {
+                        deferred.resolve(resolution([{ path: 'src\\pending.ts', kind: 'update' }]));
+                    } else {
+                        deferred.resolve('C:\\workspace');
+                    }
+                    await assert.doesNotReject(operation, id);
+
+                    assert.ok(fixture.client.states.every(state => state.length === 0), id);
+                    assert.equal(fixture.clock.timers.size, 0, id);
+                    assert.equal(fixture.host.leases[0].releases, 1, id);
+                    if (race === 'process-exit' || race === 'restart' || race === 'request-lost') {
+                        assert.deepEqual(fixture.host.responses, [], id);
+                    } else {
+                        assert.deepEqual(fixture.host.responses, [{
+                            generation: 7, id, result: { decision: 'cancel' }
+                        }], id);
+                    }
+                    await fixture.broker.dispose();
+                }
+            }
+        }
     });
 
     it('contains responder and listener failures and releases their leases once', async () => {

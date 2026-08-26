@@ -280,6 +280,11 @@ test('dispatches approved server requests and replies method-not-found to unknow
         params: { path: 'README.md' }
     })}\n`);
     transport.emitData(`${JSON.stringify({ id: 42, method: 'item/tool/requestUserInput', params: { secret: 'hidden' } })}\n`);
+    transport.emitData(`${JSON.stringify({
+        id: 'approval-3',
+        method: 'item/commandExecution/requestApproval',
+        params: { command: 'npm run lint' }
+    })}\n`);
 
     assert.deepEqual(requests, [
         {
@@ -291,6 +296,11 @@ test('dispatches approved server requests and replies method-not-found to unknow
             id: 'approval-2',
             method: 'item/fileChange/requestApproval',
             params: { path: 'README.md' }
+        },
+        {
+            id: 'approval-3',
+            method: 'item/commandExecution/requestApproval',
+            params: { command: 'npm run lint' }
         }
     ]);
     assert.deepEqual(parseWrite(transport, 0), {
@@ -312,9 +322,180 @@ test('dispatches approved server requests and replies method-not-found to unknow
     client.dispose();
 });
 
+test('owns inbound request IDs by exact JSON type and consumes each response authority once', () => {
+    const transport = new FakeTransport();
+    const client = new RideCodexJsonlClient(transport);
+    const ownership = client as unknown as { ownsServerRequest(id: string | number): boolean };
+    const requests: Array<string | number> = [];
+    client.onServerRequest(request => requests.push(request.id));
+
+    for (const id of ['7', 7] as const) {
+        transport.emitData(`${JSON.stringify({
+            id,
+            method: 'item/commandExecution/requestApproval',
+            params: { itemId: String(id) }
+        })}\n`);
+        assert.equal(ownership.ownsServerRequest(id), true);
+    }
+    assert.deepEqual(requests, ['7', 7]);
+
+    client.respond('7', { decision: 'accept' });
+    client.respondError(7, -32000, 'Approval unavailable');
+    assert.equal(ownership.ownsServerRequest('7'), false);
+    assert.equal(ownership.ownsServerRequest(7), false);
+    assert.equal(transport.writes.length, 2);
+    assert.deepEqual(parseWrite(transport, 0), { id: '7', result: { decision: 'accept' } });
+    assert.deepEqual(parseWrite(transport, 1), {
+        id: 7,
+        error: { code: -32000, message: 'Approval unavailable' }
+    });
+
+    for (const id of ['7', 7, 'unknown'] as const) {
+        assert.throws(() => client.respond(id, { decision: 'decline' }), /request|ownership|pending|response/i);
+        assert.throws(() => client.respondError(id, -32603, 'replay'), /request|ownership|pending|response/i);
+    }
+    assert.equal(transport.writes.length, 2);
+    client.dispose();
+});
+
+test('treats a duplicate still-pending inbound ID and inbound-capacity overflow as fatal', async t => {
+    await t.test('duplicate ID', () => {
+        const transport = new FakeTransport();
+        const client = new RideCodexJsonlClient(transport);
+        const requests: Array<string | number> = [];
+        client.onServerRequest(request => requests.push(request.id));
+        const envelope = `${JSON.stringify({
+            id: 'duplicate', method: 'item/fileChange/requestApproval', params: {}
+        })}\n`;
+
+        transport.emitData(envelope);
+        transport.emitData(envelope);
+
+        assert.deepEqual(requests, ['duplicate']);
+        assert.equal(transport.closeCalls, 1);
+        assert.equal(transport.writes.length, 0);
+        client.respond('duplicate', { decision: 'accept' });
+        assert.equal(transport.writes.length, 0);
+    });
+
+    await t.test('bounded inbound registry', () => {
+        const transport = new FakeTransport();
+        const client = new RideCodexJsonlClient(transport, { maxPending: 1 });
+        const requests: Array<string | number> = [];
+        client.onServerRequest(request => requests.push(request.id));
+
+        for (const id of ['first', 'second']) {
+            transport.emitData(`${JSON.stringify({
+                id, method: 'item/commandExecution/requestApproval', params: {}
+            })}\n`);
+        }
+
+        assert.deepEqual(requests, ['first']);
+        assert.equal(transport.closeCalls, 1);
+        assert.equal(transport.writes.length, 0);
+    });
+});
+
+test('registers unsupported requests before auto-response and rejects response replay', () => {
+    const transport = new FakeTransport();
+    const client = new RideCodexJsonlClient(transport);
+
+    transport.emitData(`${JSON.stringify({
+        id: 'unsupported', method: 'item/tool/requestUserInput', params: {}
+    })}\n`);
+
+    assert.deepEqual(parseWrite(transport, 0), {
+        id: 'unsupported', error: { code: -32601, message: 'Method not found' }
+    });
+    assert.throws(
+        () => client.respond('unsupported', { decision: 'accept' }),
+        /request|ownership|pending|response/i
+    );
+    assert.equal(transport.writes.length, 1);
+    client.dispose();
+});
+
+test('settles listener failures once and clears inbound ownership on exit', () => {
+    const transport = new FakeTransport();
+    const client = new RideCodexJsonlClient(transport);
+    const ownership = client as unknown as { ownsServerRequest(id: string | number): boolean };
+    const diagnostics: string[] = [];
+    client.onDiagnostic(diagnostic => diagnostics.push(diagnostic.code));
+    client.onServerRequest(() => {
+        throw new Error('listener failed');
+    });
+
+    transport.emitData(`${JSON.stringify({
+        id: 'listener-failure', method: 'item/fileChange/requestApproval', params: {}
+    })}\n`);
+    assert.deepEqual(parseWrite(transport, 0), {
+        id: 'listener-failure', error: { code: -32603, message: 'Internal error' }
+    });
+    assert.deepEqual(diagnostics, ['server-request-listener-error']);
+    assert.equal(ownership.ownsServerRequest('listener-failure'), false);
+
+    transport.emitData(`${JSON.stringify({
+        id: 'exit-owned', method: 'item/fileChange/requestApproval', params: {}
+    })}\n`);
+    assert.equal(ownership.ownsServerRequest('exit-owned'), false,
+        'the throwing listener must settle every request before returning');
+    transport.exit();
+    assert.equal(ownership.ownsServerRequest('exit-owned'), false);
+    assert.equal(transport.writes.length, 2);
+});
+
+test('settles an asynchronous inbound listener rejection without an unhandled replay', async () => {
+    const transport = new FakeTransport();
+    const client = new RideCodexJsonlClient(transport);
+    const ownership = client as unknown as { ownsServerRequest(id: string | number): boolean };
+    const diagnostics: string[] = [];
+    client.onDiagnostic(diagnostic => diagnostics.push(diagnostic.code));
+    client.onServerRequest(async () => {
+        throw new Error('asynchronous listener failure');
+    });
+
+    transport.emitData(`${JSON.stringify({
+        id: 'async-listener-failure', method: 'item/fileChange/requestApproval', params: {}
+    })}\n`);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    assert.deepEqual(parseWrite(transport, 0), {
+        id: 'async-listener-failure', error: { code: -32603, message: 'Internal error' }
+    });
+    assert.deepEqual(diagnostics, ['server-request-listener-error']);
+    assert.equal(ownership.ownsServerRequest('async-listener-failure'), false);
+    assert.equal(transport.writes.length, 1);
+    client.dispose();
+});
+
+test('confirmed inbound responses consume ownership before exactly one write', async () => {
+    const transport = new FakeTransport();
+    const client = new RideCodexJsonlClient(transport);
+    client.onServerRequest(() => undefined);
+    transport.emitData(`${JSON.stringify({
+        id: 'confirmed', method: 'item/commandExecution/requestApproval', params: {}
+    })}\n`);
+
+    await client.respondConfirmed('confirmed', { decision: 'cancel' });
+    await assert.rejects(
+        client.respondConfirmed('confirmed', { decision: 'accept' }),
+        /request|ownership|pending|response/i
+    );
+    assert.equal(transport.writes.length, 1);
+    assert.deepEqual(parseWrite(transport, 0), {
+        id: 'confirmed', result: { decision: 'cancel' }
+    });
+    client.dispose();
+});
+
 test('validates outbound response IDs and errors before writing complete envelopes', () => {
     const transport = new FakeTransport();
     const client = new RideCodexJsonlClient(transport);
+    client.onServerRequest(() => undefined);
+    transport.emitData(`${JSON.stringify({
+        id: 'approval-1', method: 'item/commandExecution/requestApproval', params: {}
+    })}\n`);
 
     client.respond('approval-1', undefined);
     assert.deepEqual(parseWrite(transport, 0), { id: 'approval-1', result: null });
@@ -324,6 +505,9 @@ test('validates outbound response IDs and errors before writing complete envelop
         assert.throws(() => client.respond(id as string | number, true), /request ID/i);
         assert.throws(() => client.respondError(id as string | number, -32603, 'failure'), /request ID/i);
     }
+    transport.emitData(`${JSON.stringify({
+        id: 'approval-2', method: 'item/commandExecution/requestApproval', params: {}
+    })}\n`);
     for (const code of [NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
         assert.throws(() => client.respondError('approval-2', code, 'failure'), /error code/i);
     }
@@ -387,6 +571,12 @@ test('rejects lossy response results without closing the connection', async t =>
         await t.test(label, () => {
             const transport = new FakeTransport();
             const client = new RideCodexJsonlClient(transport);
+            client.onServerRequest(() => undefined);
+            for (const id of ['approval-lossy', 'approval-safe', 'approval-empty']) {
+                transport.emitData(`${JSON.stringify({
+                    id, method: 'item/commandExecution/requestApproval', params: {}
+                })}\n`);
+            }
 
             assert.throws(() => client.respond('approval-lossy', result), error => {
                 assert.match((error as Error).message, /serialize/i);
