@@ -11,6 +11,8 @@ import {
     RideCodexFileChange,
     RideCodexItemKind,
     RideCodexRenderedItem,
+    RIDE_CODEX_MAX_IDENTIFIER_BYTES,
+    RIDE_CODEX_MIN_QUEUED_BYTES,
     RideCodexTurnSnapshot,
     RideCodexUiEvent,
     truncateUtf8,
@@ -51,23 +53,15 @@ const DEFAULT_MAX_RETAINED_BYTES = 2 * 1024 * 1024;
 const DEFAULT_MAX_DIAGNOSTIC_HISTORY = 64;
 const MAX_FILE_PATCH_PATH_BYTES = 32 * 1024;
 const MAX_FILE_PATCH_DIFF_BYTES = 64 * 1024;
-const MAX_IDENTIFIER_BYTES = 512;
 const MAX_REASONING_INDEX = 1_024;
 const RETAINED_ARRAY_SLOT_BYTES = 8;
+const MAX_RETAINED_PLAN_STEPS = 256;
+const MAX_DIAGNOSTIC_BYTES = 64 * 1024;
+const MAX_DIAGNOSTIC_HISTORY_LIMIT = 256;
 const MAX_WIRE_DEPTH = 16;
 const MAX_WIRE_NODES = 8_192;
 const MAX_WIRE_ARRAY_ITEMS = 8_192;
 const MAX_WIRE_OBJECT_KEYS = 128;
-const MIN_COHERENT_BOUNDARY_BYTES = pendingBatchBytes({
-    generation: 0,
-    threadId: 'x',
-    turnId: 'x',
-    events: [
-        { type: 'turn-started' },
-        { type: 'turn-terminal', status: 'completed' }
-    ]
-});
-
 const EMPTY_SNAPSHOT: RideCodexTurnSnapshot = deepFreezeRideCodex({
     generation: 0,
     status: 'idle' as const,
@@ -102,20 +96,22 @@ export class RideCodexEventReducer {
     #usage: RideCodexTurnSnapshot['usage'];
     #warnings: Extract<RideCodexUiEvent, { type: 'warning' }>[] = [];
     #errors: Extract<RideCodexUiEvent, { type: 'error' }>[] = [];
+    #diagnosticRetainedBytes = 0;
+    #retentionTruncated = false;
     #disposed = false;
 
     constructor(options: RideCodexEventReducerOptions = {}) {
         this.#scheduleFrame = options.scheduleFrame ?? defaultScheduleFrame;
         this.#maxWireBytes = positiveLimit(options.maxWireBytes, DEFAULT_MAX_WIRE_BYTES);
-        this.#maxQueuedBytes = Math.max(
-            MIN_COHERENT_BOUNDARY_BYTES,
-            positiveLimit(options.maxQueuedBytes, DEFAULT_MAX_QUEUED_BYTES)
-        );
+        this.#maxQueuedBytes = requireQueueLimit(options.maxQueuedBytes, DEFAULT_MAX_QUEUED_BYTES);
         this.#maxBatchEvents = Math.max(2, positiveLimit(options.maxBatchEvents, DEFAULT_MAX_BATCH_EVENTS));
         this.#maxItemBytes = positiveLimit(options.maxItemBytes, DEFAULT_MAX_ITEM_BYTES);
         this.#maxRetainedItems = positiveLimit(options.maxRetainedItems, DEFAULT_MAX_RETAINED_ITEMS);
         this.#maxRetainedBytes = positiveLimit(options.maxRetainedBytes, DEFAULT_MAX_RETAINED_BYTES);
-        this.#maxDiagnosticHistory = positiveLimit(options.maxDiagnosticHistory, DEFAULT_MAX_DIAGNOSTIC_HISTORY);
+        this.#maxDiagnosticHistory = Math.min(
+            positiveLimit(options.maxDiagnosticHistory, DEFAULT_MAX_DIAGNOSTIC_HISTORY),
+            MAX_DIAGNOSTIC_HISTORY_LIMIT
+        );
     }
 
     snapshot(): RideCodexTurnSnapshot {
@@ -352,6 +348,8 @@ export class RideCodexEventReducer {
         this.#usage = undefined;
         this.#warnings = [];
         this.#errors = [];
+        this.#diagnosticRetainedBytes = 0;
+        this.#retentionTruncated = false;
     }
 
     #applyEvent(event: RideCodexUiEvent): boolean {
@@ -393,14 +391,31 @@ export class RideCodexEventReducer {
                 return this.#appendReasoning(event.itemId, event.contentIndex, event.delta);
             case 'file-patch':
                 return this.#replaceChanges(event.itemId, event.changes);
-            case 'turn-plan':
-                this.#plan = deepFreezeRideCodex({
-                    ...(event.explanation === undefined ? {} : { explanation: event.explanation }),
-                    steps: event.steps.map(step => ({ ...step }))
-                }) as RideCodexTurnSnapshot['plan'];
+            case 'turn-plan': {
+                if (event.steps.length > MAX_RETAINED_PLAN_STEPS) {
+                    this.#retentionTruncated = true;
+                }
+                const plan = deepFreezeRideCodex({
+                    ...(event.explanation === undefined ? {} : {
+                        explanation: truncateUtf8(event.explanation, this.#maxItemBytes)
+                    }),
+                    steps: event.steps.slice(0, MAX_RETAINED_PLAN_STEPS).map(step => ({
+                        ...step,
+                        step: truncateUtf8(step.step, this.#maxItemBytes)
+                    }))
+                }) as NonNullable<RideCodexTurnSnapshot['plan']>;
+                this.#plan = plan;
+                if ((event.explanation !== undefined && plan.explanation !== event.explanation)
+                    || plan.steps.some((step, index) => step.step !== event.steps[index].step)) {
+                    this.#retentionTruncated = true;
+                }
                 return true;
+            }
             case 'turn-diff':
                 this.#diff = truncateUtf8(event.diff, this.#maxItemBytes);
+                if (this.#diff !== event.diff) {
+                    this.#retentionTruncated = true;
+                }
                 return true;
             case 'token-usage':
                 this.#usage = Object.freeze({
@@ -529,8 +544,18 @@ export class RideCodexEventReducer {
     }
 
     #pushWarning(event: Extract<RideCodexUiEvent, { type: 'warning' }>): void {
-        this.#warnings.push(deepFreezeRideCodex({ ...event }) as typeof event);
-        this.#warnings.splice(0, Math.max(0, this.#warnings.length - this.#maxDiagnosticHistory));
+        if (event.code === 'data-truncated'
+            && this.#warnings.some(warning => warning.code === 'data-truncated')) {
+            return;
+        }
+        const message = truncateUtf8(event.message, Math.min(this.#maxItemBytes, MAX_DIAGNOSTIC_BYTES));
+        if (message !== event.message) {
+            this.#retentionTruncated = true;
+        }
+        const bounded = deepFreezeRideCodex({ ...event, message }) as typeof event;
+        this.#warnings.push(bounded);
+        this.#diagnosticRetainedBytes += diagnosticEventBytes(bounded);
+        this.#trimDiagnostics();
     }
 
     #pushError(event: Extract<RideCodexUiEvent, { type: 'error' }>): void {
@@ -539,8 +564,49 @@ export class RideCodexEventReducer {
             && previous.retryable === event.retryable) {
             return;
         }
-        this.#errors.push(deepFreezeRideCodex({ ...event }) as typeof event);
-        this.#errors.splice(0, Math.max(0, this.#errors.length - this.#maxDiagnosticHistory));
+        const message = truncateUtf8(event.message, Math.min(this.#maxItemBytes, MAX_DIAGNOSTIC_BYTES));
+        if (message !== event.message) {
+            this.#retentionTruncated = true;
+        }
+        const bounded = deepFreezeRideCodex({ ...event, message }) as typeof event;
+        this.#errors.push(bounded);
+        this.#diagnosticRetainedBytes += diagnosticEventBytes(bounded);
+        this.#trimDiagnostics();
+    }
+
+    #trimDiagnostics(): void {
+        const byteLimit = Math.min(this.#maxRetainedBytes, MAX_DIAGNOSTIC_BYTES);
+        while (this.#warnings.length + this.#errors.length > this.#maxDiagnosticHistory
+            || this.#diagnosticBytes() > byteLimit) {
+            if (this.#warnings.length > 0) {
+                this.#shiftWarning();
+            } else if (this.#errors.length > 0) {
+                this.#shiftError();
+            } else {
+                break;
+            }
+            this.#retentionTruncated = true;
+        }
+    }
+
+    #diagnosticBytes(): number {
+        return this.#diagnosticRetainedBytes;
+    }
+
+    #shiftWarning(): Extract<RideCodexUiEvent, { type: 'warning' }> | undefined {
+        const warning = this.#warnings.shift();
+        if (warning) {
+            this.#diagnosticRetainedBytes -= diagnosticEventBytes(warning);
+        }
+        return warning;
+    }
+
+    #shiftError(): Extract<RideCodexUiEvent, { type: 'error' }> | undefined {
+        const error = this.#errors.shift();
+        if (error) {
+            this.#diagnosticRetainedBytes -= diagnosticEventBytes(error);
+        }
+        return error;
     }
 
     #trimItemsByCount(): void {
@@ -551,11 +617,21 @@ export class RideCodexEventReducer {
             }
             this.#items.delete(oldest);
             this.#truncatedItems.delete(oldest);
+            this.#retentionTruncated = true;
         }
     }
 
     #trimRetained(): void {
         this.#trimItemsByCount();
+        let truncated = this.#retentionTruncated;
+        while (this.#retainedBytes() > this.#maxRetainedBytes && this.#warnings.length > 0) {
+            this.#shiftWarning();
+            truncated = true;
+        }
+        while (this.#retainedBytes() > this.#maxRetainedBytes && this.#errors.length > 0) {
+            this.#shiftError();
+            truncated = true;
+        }
         while (this.#retainedBytes() > this.#maxRetainedBytes && this.#items.size > 0) {
             const oldest = this.#items.keys().next().value;
             if (oldest === undefined) {
@@ -563,22 +639,94 @@ export class RideCodexEventReducer {
             }
             this.#items.delete(oldest);
             this.#truncatedItems.delete(oldest);
+            truncated = true;
+        }
+        while (this.#retainedBytes() > this.#maxRetainedBytes && this.#plan && this.#plan.steps.length > 0) {
+            this.#plan = deepFreezeRideCodex({
+                ...(this.#plan.explanation === undefined ? {} : { explanation: this.#plan.explanation }),
+                steps: this.#plan.steps.slice(1).map(step => ({ ...step }))
+            }) as RideCodexTurnSnapshot['plan'];
+            truncated = true;
+        }
+        if (this.#retainedBytes() > this.#maxRetainedBytes && this.#plan?.explanation !== undefined) {
+            const explanationBytes = utf8ByteLength(this.#plan.explanation);
+            const available = Math.max(0,
+                this.#maxRetainedBytes - (this.#retainedBytes() - explanationBytes));
+            const explanation = truncateUtf8(this.#plan.explanation, available);
+            this.#plan = deepFreezeRideCodex({
+                explanation,
+                steps: this.#plan.steps.map(step => ({ ...step }))
+            }) as RideCodexTurnSnapshot['plan'];
+            truncated = true;
+        }
+        if (this.#retainedBytes() > this.#maxRetainedBytes && this.#diff !== undefined) {
+            const diffBytes = utf8ByteLength(this.#diff);
+            const available = Math.max(0, this.#maxRetainedBytes - (this.#retainedBytes() - diffBytes));
+            this.#diff = truncateUtf8(this.#diff, available);
+            truncated = true;
+        }
+        if (this.#retainedBytes() > this.#maxRetainedBytes) {
+            this.#plan = undefined;
+            this.#diff = undefined;
+            truncated = true;
+        }
+        this.#retentionTruncated = false;
+        if (truncated) {
+            this.#appendRetentionDiagnostic();
         }
     }
 
+    #appendRetentionDiagnostic(): void {
+        if (this.#warnings.some(warning => warning.code === 'data-truncated')) {
+            return;
+        }
+        while (this.#warnings.length + this.#errors.length >= this.#maxDiagnosticHistory) {
+            if (this.#warnings.length > 0) {
+                this.#shiftWarning();
+            } else {
+                return;
+            }
+        }
+        const fixedBytes = RETAINED_ARRAY_SLOT_BYTES
+            + utf8ByteLength('warning') + utf8ByteLength('data-truncated');
+        const available = Math.min(
+            this.#maxRetainedBytes - this.#retainedBytes() - fixedBytes,
+            MAX_DIAGNOSTIC_BYTES - this.#diagnosticBytes() - fixedBytes
+        );
+        if (available < 0) {
+            return;
+        }
+        const message = truncateUtf8('Codex UI data was truncated.', available);
+        const diagnostic = deepFreezeRideCodex({
+            type: 'warning', code: 'data-truncated', message
+        }) as Extract<RideCodexUiEvent, { type: 'warning' }>;
+        this.#warnings.push(diagnostic);
+        this.#diagnosticRetainedBytes += diagnosticEventBytes(diagnostic);
+    }
+
     #retainedBytes(): number {
-        let bytes = 0;
+        let bytes = this.#items.size * RETAINED_ARRAY_SLOT_BYTES;
         for (const item of this.#items.values()) {
-            bytes += utf8ByteLength(item.id) + utf8ByteLength(item.text);
+            bytes += utf8ByteLength(item.id) + utf8ByteLength(item.kind)
+                + utf8ByteLength(item.state) + utf8ByteLength(item.text);
             bytes += item.summaries.reduce((sum, summary) => sum + utf8ByteLength(summary), 0);
             bytes += item.reasoning.reduce((sum, reasoning) => sum + utf8ByteLength(reasoning), 0);
-            bytes += (item.summaries.length + item.reasoning.length) * RETAINED_ARRAY_SLOT_BYTES;
+            bytes += (item.summaries.length + item.reasoning.length + item.changes.length)
+                * RETAINED_ARRAY_SLOT_BYTES;
             bytes += item.changes.reduce((sum, change) =>
                 sum + utf8ByteLength(change.path) + utf8ByteLength(change.kind)
                 + utf8ByteLength(change.diff)
                 + (change.kind === 'update' && typeof change.movePath === 'string'
                     ? utf8ByteLength(change.movePath) : 0), 0);
         }
+        if (this.#plan) {
+            bytes += this.#plan.steps.length * RETAINED_ARRAY_SLOT_BYTES;
+            bytes += this.#plan.explanation === undefined ? 0 : utf8ByteLength(this.#plan.explanation);
+            bytes += this.#plan.steps.reduce((sum, step) =>
+                sum + utf8ByteLength(step.step) + utf8ByteLength(step.status), 0);
+        }
+        bytes += this.#diff === undefined ? 0 : utf8ByteLength(this.#diff);
+        bytes += this.#diagnosticBytes();
         return bytes;
     }
 
@@ -624,6 +772,16 @@ function defaultScheduleFrame(callback: () => void): RideCodexFrameDisposable {
 
 function positiveLimit(value: number | undefined, fallback: number): number {
     return Number.isSafeInteger(value) && (value as number) > 0 ? value as number : fallback;
+}
+
+function requireQueueLimit(value: number | undefined, fallback: number): number {
+    if (value === undefined) {
+        return fallback;
+    }
+    if (!Number.isSafeInteger(value) || value < RIDE_CODEX_MIN_QUEUED_BYTES) {
+        throw new RangeError('Codex event queue budget is below the coherent boundary.');
+    }
+    return value;
 }
 
 function parseSafeBatch(wire: RideCodexEventBatchWire, maxWireBytes: number): RideCodexEventBatch | undefined {
@@ -775,7 +933,7 @@ function hasExactKeys(
 
 function isIdentifier(value: unknown): value is string {
     return typeof value === 'string' && value.length > 0
-        && utf8ByteLength(value) <= MAX_IDENTIFIER_BYTES;
+        && utf8ByteLength(value) <= RIDE_CODEX_MAX_IDENTIFIER_BYTES;
 }
 
 interface WireBudget {
@@ -911,6 +1069,13 @@ function sameFileChanges(
         return change.path === other.path && change.kind === other.kind && change.diff === other.diff
             && (change.kind !== 'update' || other.kind !== 'update' || change.movePath === other.movePath);
     });
+}
+
+function diagnosticEventBytes(
+    event: Extract<RideCodexUiEvent, { type: 'warning' | 'error' }>
+): number {
+    return RETAINED_ARRAY_SLOT_BYTES + utf8ByteLength(event.type)
+        + utf8ByteLength(event.code) + utf8ByteLength(event.message);
 }
 
 function fitBatchEvents(

@@ -12,6 +12,7 @@ import {
     RideCodexFileChange,
     RideCodexItemKind,
     RideCodexPlanStep,
+    RIDE_CODEX_MIN_QUEUED_BYTES,
     RideCodexSafeError,
     RideCodexTurnClient,
     RideCodexTurnInterruptRequest,
@@ -195,7 +196,6 @@ export class RideCodexTurnCoordinator {
     readonly #disposedSignal: Promise<never>;
     readonly #rejectDisposed: (error: RideCodexTurnError) => void;
     #queueIdentity: QueueIdentity | undefined;
-    #queuedBytes = 0;
     #flushHandle: RideCodexDisposable | undefined;
     #active: ActiveTurn | undefined;
     #generation: number;
@@ -215,7 +215,7 @@ export class RideCodexTurnCoordinator {
         this.#timers = options.timers ?? defaultTimers;
         this.#interruptTimeoutMs = positiveLimit(options.interruptTimeoutMs, DEFAULT_INTERRUPT_TIMEOUT_MS);
         this.#recoveryTimeoutMs = positiveLimit(options.recoveryTimeoutMs, DEFAULT_RECOVERY_TIMEOUT_MS);
-        this.#maxQueuedBytes = positiveLimit(options.maxQueuedBytes, DEFAULT_MAX_QUEUED_BYTES);
+        this.#maxQueuedBytes = requireQueueLimit(options.maxQueuedBytes, DEFAULT_MAX_QUEUED_BYTES);
         this.#maxBatchEvents = positiveLimit(options.maxBatchEvents, DEFAULT_MAX_BATCH_EVENTS);
         this.#maxItemBytes = positiveLimit(options.maxItemBytes, DEFAULT_MAX_ITEM_BYTES);
         this.#maxRetainedItems = positiveLimit(options.maxRetainedItems, DEFAULT_MAX_RETAINED_ITEMS);
@@ -288,7 +288,6 @@ export class RideCodexTurnCoordinator {
         this.#flushHandle?.dispose();
         this.#flushHandle = undefined;
         this.#queue.length = 0;
-        this.#queuedBytes = 0;
         this.#queueIdentity = undefined;
         this.#queueMetadata.clear();
         for (const listener of this.#listeners.splice(0)) {
@@ -411,7 +410,7 @@ export class RideCodexTurnCoordinator {
         });
         timeout.catch(() => undefined);
         try {
-            await Promise.race([
+            const rawAck = await Promise.race([
                 safePromise(lease.request('turn/interrupt', Object.freeze({
                     threadId: request.threadId,
                     turnId: request.turnId
@@ -419,11 +418,9 @@ export class RideCodexTurnCoordinator {
                 active.invalidated,
                 timeout
             ]);
-            return Object.freeze({
-                threadId: active.threadId,
-                turnId: request.turnId,
-                status: 'in-progress'
-            });
+            requireOptions(rawAck, []);
+            await Promise.race([active.invalidated, timeout]);
+            throw new RideCodexTurnError('operation-superseded');
         } catch (error) {
             if (timedOut) {
                 await this.#recoverPersistentThread(request.threadId, expectedGeneration);
@@ -858,14 +855,20 @@ export class RideCodexTurnCoordinator {
             const combined = previous.event.delta + event.delta;
             const merged = truncateUtf8(combined, this.#maxItemBytes);
             const replacement = Object.freeze({ ...previous.event, delta: merged }) as RideCodexUiEvent;
-            const replacementBytes = queueEventBytes(replacement);
-            if (this.#queuedBytes - previous.bytes + replacementBytes < this.#maxQueuedBytes) {
+            const replacementBytes = eventBytes(replacement);
+            const replacementEntry = Object.freeze({
+                identity: previous.identity,
+                event: replacement,
+                bytes: replacementBytes
+            });
+            const candidate = [...this.#queue.slice(0, -1), replacementEntry];
+            const candidateBytes = queuedEntriesBytes(candidate);
+            if (candidateBytes <= this.#maxQueuedBytes) {
                 this.#queue[this.#queue.length - 1] = Object.freeze({
                     identity: previous.identity,
                     event: replacement,
                     bytes: replacementBytes
                 });
-                this.#queuedBytes = this.#queuedBytes - previous.bytes + replacementBytes;
                 if (merged !== combined) {
                     this.#recordTruncation(identity);
                 }
@@ -887,31 +890,45 @@ export class RideCodexTurnCoordinator {
             return;
         }
         const bounded = boundEvent(event, this.#maxItemBytes, this.#maxRetainedItems);
-        const bytes = queueEventBytes(bounded);
-        if (bounded.type === 'turn-terminal') {
-            this.#makeRoomForTerminal(bytes);
+        const entry = Object.freeze({
+            identity: this.#queueIdentity,
+            event: bounded,
+            bytes: eventBytes(bounded)
+        });
+        if (bounded.type === 'turn-started' || bounded.type === 'turn-terminal') {
+            this.#makeRoomForBoundary(entry);
         }
-        if (bytes >= this.#maxQueuedBytes || this.#queuedBytes + bytes >= this.#maxQueuedBytes) {
-            this.#recordDrop(this.#queueIdentity, bytes);
+        const candidateBytes = queuedEntriesBytes([...this.#queue, entry]);
+        if (candidateBytes > this.#maxQueuedBytes) {
+            this.#recordDrop(this.#queueIdentity, entry.bytes);
             this.#scheduleFlush();
             return;
         }
-        this.#queue.push(Object.freeze({ identity: this.#queueIdentity, event: bounded, bytes }));
-        this.#queuedBytes += bytes;
+        this.#queue.push(entry);
         this.#scheduleFlush();
     }
 
-    #makeRoomForTerminal(bytes: number): void {
-        while (this.#queuedBytes + bytes >= this.#maxQueuedBytes) {
+    #makeRoomForBoundary(incoming: QueuedEvent): void {
+        while (queuedEntriesBytes([...this.#queue, incoming]) > this.#maxQueuedBytes) {
             const index = this.#queue.findIndex(entry =>
                 entry.event.type !== 'turn-started' && entry.event.type !== 'turn-terminal'
             );
-            if (index < 0) {
+            if (index >= 0) {
+                const [removed] = this.#queue.splice(index, 1);
+                this.#recordDrop(removed.identity, removed.bytes);
+                continue;
+            }
+            const oldestOther = this.#queue.find(entry => !sameIdentity(entry.identity, incoming.identity));
+            if (!oldestOther) {
                 break;
             }
-            const [removed] = this.#queue.splice(index, 1);
-            this.#queuedBytes -= removed.bytes;
-            this.#recordDrop(removed.identity, removed.bytes);
+            for (let queueIndex = this.#queue.length - 1; queueIndex >= 0; queueIndex -= 1) {
+                const candidate = this.#queue[queueIndex];
+                if (sameIdentity(candidate.identity, oldestOther.identity)) {
+                    const [removed] = this.#queue.splice(queueIndex, 1);
+                    this.#recordDrop(removed.identity, removed.bytes);
+                }
+            }
         }
     }
 
@@ -967,7 +984,6 @@ export class RideCodexTurnCoordinator {
         while (events.length < this.#maxBatchEvents && this.#queue.length > 0
             && sameIdentity(this.#queue[0].identity, identity)) {
             const entry = this.#queue.shift() as QueuedEvent;
-            this.#queuedBytes -= entry.bytes;
             events.push(entry.event);
         }
         if (metadata && metadata.droppedEvents > 0 && events.length < this.#maxBatchEvents) {
@@ -977,8 +993,11 @@ export class RideCodexTurnCoordinator {
                 droppedEvents: metadata.droppedEvents,
                 droppedBytes: metadata.droppedBytes
             } as const);
-            if (eventArrayBytes([...events, warning]) <= this.#maxQueuedBytes) {
+            if (batchBytes({ ...identity, events: [...events, warning] }) <= this.#maxQueuedBytes) {
                 events.push(warning);
+                metadata.droppedEvents = 0;
+                metadata.droppedBytes = 0;
+            } else if (events.length === 0) {
                 metadata.droppedEvents = 0;
                 metadata.droppedBytes = 0;
             }
@@ -988,8 +1007,10 @@ export class RideCodexTurnCoordinator {
                 type: 'warning', code: 'data-truncated',
                 message: 'A Codex streaming item was truncated to preserve responsiveness.'
             } as const);
-            if (eventArrayBytes([...events, warning]) <= this.#maxQueuedBytes) {
+            if (batchBytes({ ...identity, events: [...events, warning] }) <= this.#maxQueuedBytes) {
                 events.push(warning);
+                metadata.truncated = false;
+            } else if (events.length === 0) {
                 metadata.truncated = false;
             }
         }
@@ -1566,10 +1587,6 @@ function eventBytes(event: RideCodexUiEvent): number {
     }
 }
 
-function queueEventBytes(event: RideCodexUiEvent): number {
-    return eventBytes(event) + 1;
-}
-
 function eventArrayBytes(events: readonly RideCodexUiEvent[]): number {
     if (events.length === 0) {
         return 2;
@@ -1694,6 +1711,27 @@ function batchBytes(batch: RideCodexEventBatch): number {
     }
 }
 
+function queuedEntriesBytes(entries: readonly QueuedEvent[]): number {
+    let bytes = 0;
+    let identity: QueueIdentity | undefined;
+    let events: RideCodexUiEvent[] = [];
+    const flush = (): void => {
+        if (identity) {
+            bytes += batchBytes({ ...identity, events });
+        }
+        events = [];
+    };
+    for (const entry of entries) {
+        if (!identity || !sameIdentity(identity, entry.identity)) {
+            flush();
+            identity = entry.identity;
+        }
+        events.push(entry.event);
+    }
+    flush();
+    return bytes;
+}
+
 function serializeValidatedRideCodexEventBatch(
     batch: RideCodexEventBatch,
     maxBytes: number
@@ -1763,6 +1801,16 @@ function requireGeneration(value: unknown): number {
 
 function positiveLimit(value: number | undefined, fallback: number): number {
     return Number.isSafeInteger(value) && (value as number) > 0 ? value as number : fallback;
+}
+
+function requireQueueLimit(value: number | undefined, fallback: number): number {
+    if (value === undefined) {
+        return fallback;
+    }
+    if (!Number.isSafeInteger(value) || value < RIDE_CODEX_MIN_QUEUED_BYTES) {
+        throw new RideCodexTurnError('invalid-data');
+    }
+    return value;
 }
 
 function releaseSafely(lease: RideCodexTurnHostLease): void {

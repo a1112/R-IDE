@@ -6,11 +6,52 @@
 
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { RideCodexEventBatch } from '../src/common/ride-codex-events';
+import { RideCodexEventBatch, RideCodexTurnSnapshot } from '../src/common/ride-codex-events';
 import { RideCodexEventReducer } from '../src/browser/ride-codex-event-reducer';
+
+const RETAINED_ARRAY_SLOT_BYTES = 8;
+const WORST_VALID_IDENTIFIER = '\u0000'.repeat(512);
+const MIN_COHERENT_QUEUE_BYTES = Buffer.byteLength(JSON.stringify({
+    generation: Number.MAX_SAFE_INTEGER,
+    threadId: WORST_VALID_IDENTIFIER,
+    turnId: WORST_VALID_IDENTIFIER,
+    events: [
+        { type: 'turn-started' },
+        { type: 'turn-terminal', status: 'completed' }
+    ]
+}), 'utf8');
 
 function batchWire(batch: unknown): string {
     return JSON.stringify(batch);
+}
+
+function independentlyRetainedBytes(snapshot: RideCodexTurnSnapshot): number {
+    let bytes = snapshot.items.length * RETAINED_ARRAY_SLOT_BYTES;
+    for (const item of snapshot.items) {
+        bytes += Buffer.byteLength(item.id + item.kind + item.state + item.text, 'utf8');
+        bytes += (item.summaries.length + item.reasoning.length + item.changes.length)
+            * RETAINED_ARRAY_SLOT_BYTES;
+        bytes += item.summaries.reduce((sum, value) => sum + Buffer.byteLength(value, 'utf8'), 0);
+        bytes += item.reasoning.reduce((sum, value) => sum + Buffer.byteLength(value, 'utf8'), 0);
+        bytes += item.changes.reduce((sum, change) => sum
+            + Buffer.byteLength(change.path + change.kind + change.diff, 'utf8')
+            + (change.kind === 'update' && typeof change.movePath === 'string'
+                ? Buffer.byteLength(change.movePath, 'utf8') : 0), 0);
+    }
+    if (snapshot.plan) {
+        bytes += snapshot.plan.steps.length * RETAINED_ARRAY_SLOT_BYTES;
+        bytes += snapshot.plan.explanation === undefined
+            ? 0 : Buffer.byteLength(snapshot.plan.explanation, 'utf8');
+        bytes += snapshot.plan.steps.reduce((sum, step) =>
+            sum + Buffer.byteLength(step.step + step.status, 'utf8'), 0);
+    }
+    bytes += snapshot.diff === undefined ? 0 : Buffer.byteLength(snapshot.diff, 'utf8');
+    bytes += (snapshot.warnings.length + snapshot.errors.length) * RETAINED_ARRAY_SLOT_BYTES;
+    bytes += snapshot.warnings.reduce((sum, warning) =>
+        sum + Buffer.byteLength(warning.type + warning.code + warning.message, 'utf8'), 0);
+    bytes += snapshot.errors.reduce((sum, error) =>
+        sum + Buffer.byteLength(error.type + error.code + error.message, 'utf8'), 0);
+    return bytes;
 }
 
 describe('RideCodexEventReducer minimal frame contract', () => {
@@ -176,7 +217,7 @@ describe('RideCodexEventReducer minimal frame contract', () => {
                 return { dispose: () => undefined };
             },
             maxItemBytes: 12,
-            maxRetainedBytes: 64
+            maxRetainedBytes: 128
         });
         reducer.notifyMany(batchWire({
             generation: 1,
@@ -369,8 +410,222 @@ describe('RideCodexEventReducer minimal frame contract', () => {
         assert.ok(snapshot.items.length <= 2);
         assert.ok(Buffer.byteLength(snapshot.items.find(item => item.id === 'item-4')?.text ?? '', 'utf8') <= 8);
         assert.ok(snapshot.retainedBytes <= 16);
-        assert.equal(snapshot.warnings.length, 2);
-        assert.equal(snapshot.errors.length, 2);
+        assert.equal(snapshot.retainedBytes, independentlyRetainedBytes(snapshot));
+        assert.equal(snapshot.warnings.length, 0);
+        assert.equal(snapshot.errors.length, 0);
+    });
+
+    it('accounts for plan, diff, diagnostics, item fields, and slots in one hard retained budget', () => {
+        const frames: Array<() => void> = [];
+        const reducer = new RideCodexEventReducer({
+            scheduleFrame: callback => {
+                frames.push(callback);
+                return { dispose: () => undefined };
+            },
+            maxItemBytes: 4_096,
+            maxRetainedBytes: 32,
+            maxDiagnosticHistory: 128
+        });
+        reducer.notifyMany(batchWire({
+            generation: 1, threadId: 't', turnId: 'u',
+            events: [
+                { type: 'turn-started' },
+                {
+                    type: 'turn-plan', explanation: '你'.repeat(1_000),
+                    steps: [{ step: 'plan'.repeat(250), status: 'in-progress' }]
+                },
+                { type: 'turn-diff', diff: 'd'.repeat(1_000) },
+                { type: 'warning', code: 'server-warning', message: 'w'.repeat(1_000) },
+                { type: 'turn-terminal', status: 'completed' }
+            ]
+        }));
+        frames.shift()?.();
+
+        const snapshot = reducer.snapshot();
+        assert.equal(snapshot.status, 'completed');
+        assert.equal(snapshot.retainedBytes, independentlyRetainedBytes(snapshot));
+        assert.ok(snapshot.retainedBytes <= 32);
+        assert.ok(snapshot.warnings.filter(warning => warning.code === 'data-truncated').length <= 1);
+    });
+
+    it('caps multibyte plans and diagnostic storms while keeping retainedBytes exact', () => {
+        const frames: Array<() => void> = [];
+        const reducer = new RideCodexEventReducer({
+            scheduleFrame: callback => {
+                frames.push(callback);
+                return { dispose: () => undefined };
+            },
+            maxItemBytes: 2_048,
+            maxRetainedBytes: 4_096,
+            maxDiagnosticHistory: 1_000
+        });
+        reducer.notifyMany(batchWire({
+            generation: 1, threadId: 'thread-1', turnId: 'turn-1',
+            events: [
+                { type: 'turn-started' },
+                {
+                    type: 'turn-plan', explanation: '界'.repeat(1_000),
+                    steps: Array.from({ length: 1_000 }, (_, index) => ({
+                        step: `你${index}`, status: 'pending'
+                    }))
+                },
+                ...Array.from({ length: 500 }, (_, index) => ({
+                    type: 'warning' as const,
+                    code: 'server-warning' as const,
+                    message: `警告${index}${'你'.repeat(20)}`
+                })),
+                ...Array.from({ length: 500 }, (_, index) => ({
+                    type: 'error' as const,
+                    code: 'turn-error' as const,
+                    message: `错误${index}${'界'.repeat(20)}`,
+                    retryable: false
+                }))
+            ]
+        }));
+        frames.shift()?.();
+
+        const snapshot = reducer.snapshot();
+        assert.ok((snapshot.plan?.steps.length ?? 0) <= 256);
+        assert.equal(snapshot.retainedBytes, independentlyRetainedBytes(snapshot));
+        assert.ok(snapshot.retainedBytes <= 4_096);
+        assert.ok(snapshot.warnings.filter(warning => warning.code === 'data-truncated').length <= 1);
+    });
+
+    it('keeps the truncation diagnostic inside configured count and byte caps after item eviction', () => {
+        const frames: Array<() => void> = [];
+        const reducer = new RideCodexEventReducer({
+            scheduleFrame: callback => {
+                frames.push(callback);
+                return { dispose: () => undefined };
+            },
+            maxRetainedBytes: 128 * 1024,
+            maxRetainedItems: 1,
+            maxDiagnosticHistory: 2
+        });
+        reducer.notifyMany(batchWire({
+            generation: 1, threadId: 'thread-1', turnId: 'turn-1',
+            events: [
+                { type: 'turn-started' },
+                { type: 'item-started', itemId: 'old', itemKind: 'other' },
+                { type: 'item-started', itemId: 'new', itemKind: 'other' },
+                {
+                    type: 'turn-plan',
+                    steps: Array.from({ length: 257 }, (_, index) => ({
+                        step: `step-${index}`, status: 'pending'
+                    }))
+                },
+                { type: 'warning', code: 'server-warning', message: 'first' },
+                { type: 'warning', code: 'server-warning', message: 'second' }
+            ]
+        }));
+        frames.shift()?.();
+
+        const snapshot = reducer.snapshot();
+        assert.deepEqual(snapshot.items.map(item => item.id), ['new']);
+        assert.ok(snapshot.warnings.length + snapshot.errors.length <= 2);
+        assert.equal(snapshot.warnings.filter(warning => warning.code === 'data-truncated').length, 1);
+        assert.equal(snapshot.retainedBytes, independentlyRetainedBytes(snapshot));
+        assert.ok(snapshot.retainedBytes <= 128 * 1024);
+    });
+
+    it('preserves a capped error instead of evicting it for a truncation diagnostic', () => {
+        const frames: Array<() => void> = [];
+        const reducer = new RideCodexEventReducer({
+            scheduleFrame: callback => {
+                frames.push(callback);
+                return { dispose: () => undefined };
+            },
+            maxRetainedBytes: 128 * 1024,
+            maxDiagnosticHistory: 1
+        });
+        reducer.notifyMany(batchWire({
+            generation: 1, threadId: 'thread-1', turnId: 'turn-1',
+            events: [
+                { type: 'turn-started' },
+                {
+                    type: 'turn-plan',
+                    steps: Array.from({ length: 257 }, (_, index) => ({
+                        step: `step-${index}`, status: 'pending'
+                    }))
+                },
+                { type: 'error', code: 'turn-error', message: 'kept error', retryable: false }
+            ]
+        }));
+        frames.shift()?.();
+
+        const snapshot = reducer.snapshot();
+        assert.deepEqual(snapshot.errors.map(error => error.message), ['kept error']);
+        assert.equal(snapshot.warnings.filter(warning => warning.code === 'data-truncated').length, 0);
+        assert.equal(snapshot.retainedBytes, independentlyRetainedBytes(snapshot));
+    });
+
+    it('enforces an absolute diagnostic history count even when configuration is larger', () => {
+        const frames: Array<() => void> = [];
+        const reducer = new RideCodexEventReducer({
+            scheduleFrame: callback => {
+                frames.push(callback);
+                return { dispose: () => undefined };
+            },
+            maxRetainedBytes: 1024 * 1024,
+            maxDiagnosticHistory: 1_000
+        });
+        reducer.notifyMany(batchWire({
+            generation: 1, threadId: 'thread-1', turnId: 'turn-1',
+            events: [
+                { type: 'turn-started' },
+                ...Array.from({ length: 500 }, (_, index) => ({
+                    type: 'warning' as const,
+                    code: 'server-warning' as const,
+                    message: `warning-${index}`
+                }))
+            ]
+        }));
+        frames.shift()?.();
+
+        const snapshot = reducer.snapshot();
+        assert.ok(snapshot.warnings.length + snapshot.errors.length <= 256);
+        assert.equal(snapshot.retainedBytes, independentlyRetainedBytes(snapshot));
+        assert.ok(snapshot.retainedBytes <= 64 * 1024);
+    });
+
+    it('honors the exact retained boundary and omits diagnostics that cannot fit', () => {
+        const frames: Array<() => void> = [];
+        const exact = new RideCodexEventReducer({
+            scheduleFrame: callback => {
+                frames.push(callback);
+                return { dispose: () => undefined };
+            },
+            maxRetainedBytes: 32
+        });
+        exact.notifyMany(batchWire({
+            generation: 1, threadId: 't', turnId: 'u',
+            events: [
+                { type: 'turn-started' },
+                { type: 'warning', code: 'server-warning', message: 'abc' }
+            ]
+        }));
+        frames.shift()?.();
+        assert.equal(exact.snapshot().retainedBytes, 32);
+        assert.equal(exact.snapshot().retainedBytes, independentlyRetainedBytes(exact.snapshot()));
+
+        const tinyFrames: Array<() => void> = [];
+        const tiny = new RideCodexEventReducer({
+            scheduleFrame: callback => {
+                tinyFrames.push(callback);
+                return { dispose: () => undefined };
+            },
+            maxRetainedBytes: 8
+        });
+        tiny.notifyMany(batchWire({
+            generation: 1, threadId: 't', turnId: 'u',
+            events: [
+                { type: 'turn-started' },
+                { type: 'warning', code: 'server-warning', message: '你'.repeat(100) }
+            ]
+        }));
+        tinyFrames.shift()?.();
+        assert.equal(tiny.snapshot().retainedBytes, 0);
+        assert.equal(tiny.snapshot().warnings.length, 0);
     });
 
     it('ignores duplicate, late, cross-turn, and old-generation batches', () => {
@@ -568,7 +823,7 @@ describe('RideCodexEventReducer minimal frame contract', () => {
                 frames.push(callback);
                 return { dispose: () => undefined };
             },
-            maxQueuedBytes: 256,
+            maxQueuedBytes: MIN_COHERENT_QUEUE_BYTES,
             maxBatchEvents: 16
         });
         reducer.notifyMany(batchWire({
@@ -576,7 +831,7 @@ describe('RideCodexEventReducer minimal frame contract', () => {
             events: [
                 { type: 'turn-started' },
                 { type: 'item-started', itemId: 'item-1', itemKind: 'agent-message' },
-                { type: 'agent-delta', itemId: 'item-1', delta: 'x'.repeat(96) }
+                { type: 'agent-delta', itemId: 'item-1', delta: 'x'.repeat(MIN_COHERENT_QUEUE_BYTES) }
             ]
         }));
         reducer.notifyMany(batchWire({
@@ -589,28 +844,10 @@ describe('RideCodexEventReducer minimal frame contract', () => {
         assert.ok(reducer.snapshot().warnings.some(warning => warning.code === 'events-dropped'));
     });
 
-    it('normalizes a tiny queue budget and preserves separate start and terminal wires coherently', () => {
-        const frames: Array<() => void> = [];
-        const reducer = new RideCodexEventReducer({
-            scheduleFrame: callback => {
-                frames.push(callback);
-                return { dispose: () => undefined };
-            },
-            maxQueuedBytes: 50,
-            maxBatchEvents: 8
-        });
-        reducer.notifyMany(batchWire({
-            generation: 1, threadId: 't', turnId: 'u',
-            events: [{ type: 'turn-started' }]
+    it('rejects queue budgets below the coherent worst-identity boundary', () => {
+        assert.throws(() => new RideCodexEventReducer({
+            maxQueuedBytes: MIN_COHERENT_QUEUE_BYTES - 1
         }));
-        reducer.notifyMany(batchWire({
-            generation: 1, threadId: 't', turnId: 'u',
-            events: [{ type: 'turn-terminal', status: 'completed' }]
-        }));
-        frames.shift()?.();
-
-        assert.equal(reducer.snapshot().turnId, 'u');
-        assert.equal(reducer.snapshot().status, 'completed');
     });
 
     it('uses full batch bytes consistently and preserves terminal under a delta storm', () => {
@@ -628,7 +865,7 @@ describe('RideCodexEventReducer minimal frame contract', () => {
                 frames.push(callback);
                 return { dispose: () => undefined };
             },
-            maxQueuedBytes: Buffer.byteLength(startWire, 'utf8') + Buffer.byteLength(terminalWire, 'utf8') - 1,
+            maxQueuedBytes: MIN_COHERENT_QUEUE_BYTES,
             maxBatchEvents: 8
         });
         reducer.notifyMany(startWire);
@@ -642,7 +879,34 @@ describe('RideCodexEventReducer minimal frame contract', () => {
         frames.shift()?.();
 
         assert.equal(reducer.snapshot().status, 'completed');
-        assert.equal(reducer.snapshot().items.length, 0);
+        assert.ok(reducer.snapshot().retainedBytes <= 2 * 1024 * 1024);
+    });
+
+    it('accepts a max-size identity start and terminal at the exact queue boundary', () => {
+        const frames: Array<() => void> = [];
+        const reducer = new RideCodexEventReducer({
+            scheduleFrame: callback => {
+                frames.push(callback);
+                return { dispose: () => undefined };
+            },
+            maxQueuedBytes: MIN_COHERENT_QUEUE_BYTES,
+            maxBatchEvents: 8
+        });
+        const wire = batchWire({
+            generation: Number.MAX_SAFE_INTEGER,
+            threadId: WORST_VALID_IDENTIFIER,
+            turnId: WORST_VALID_IDENTIFIER,
+            events: [
+                { type: 'turn-started' },
+                { type: 'turn-terminal', status: 'completed' }
+            ]
+        });
+        assert.equal(Buffer.byteLength(wire, 'utf8'), MIN_COHERENT_QUEUE_BYTES);
+        reducer.notifyMany(wire);
+        frames.shift()?.();
+
+        assert.equal(reducer.snapshot().status, 'completed');
+        assert.equal(reducer.snapshot().turnId, WORST_VALID_IDENTIFIER);
     });
 
     it('uses an exact terminal batch as an identity boundary when its start was compacted upstream', () => {
@@ -676,7 +940,7 @@ describe('RideCodexEventReducer minimal frame contract', () => {
             },
             maxWireBytes: 4_096,
             maxBatchEvents: 4,
-            maxQueuedBytes: 4_096,
+            maxQueuedBytes: MIN_COHERENT_QUEUE_BYTES,
             maxItemBytes: 2_048
         });
         for (const wire of [
@@ -736,7 +1000,7 @@ describe('RideCodexEventReducer minimal frame contract', () => {
                 return { dispose: () => undefined };
             },
             maxItemBytes: 8,
-            maxRetainedBytes: 64
+            maxRetainedBytes: 128
         });
         reducer.notifyMany(batchWire({
             generation: 1,

@@ -6,6 +6,16 @@
 
 export type RideCodexTurnTerminalStatus = 'completed' | 'failed' | 'interrupted' | 'interrupt-uncertain';
 export type RideCodexTurnStatus = 'idle' | 'in-progress' | RideCodexTurnTerminalStatus;
+export const RIDE_CODEX_MAX_IDENTIFIER_BYTES = 512;
+export const RIDE_CODEX_MIN_QUEUED_BYTES = utf8ByteLength(JSON.stringify({
+    generation: Number.MAX_SAFE_INTEGER,
+    threadId: '\u0000'.repeat(RIDE_CODEX_MAX_IDENTIFIER_BYTES),
+    turnId: '\u0000'.repeat(RIDE_CODEX_MAX_IDENTIFIER_BYTES),
+    events: [
+        { type: 'turn-started' },
+        { type: 'turn-terminal', status: 'completed' }
+    ]
+}));
 export type RideCodexItemKind =
     | 'user-message' | 'agent-message' | 'plan' | 'reasoning'
     | 'command' | 'file-change' | 'other';

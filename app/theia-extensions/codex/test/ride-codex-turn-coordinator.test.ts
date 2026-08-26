@@ -15,6 +15,17 @@ import {
     RideCodexTurnScheduler
 } from '../src/node/ride-codex-turn-coordinator';
 
+const WORST_VALID_IDENTIFIER = '\u0000'.repeat(512);
+const MIN_COHERENT_QUEUE_BYTES = Buffer.byteLength(JSON.stringify({
+    generation: Number.MAX_SAFE_INTEGER,
+    threadId: WORST_VALID_IDENTIFIER,
+    turnId: WORST_VALID_IDENTIFIER,
+    events: [
+        { type: 'turn-started' },
+        { type: 'turn-terminal', status: 'completed' }
+    ]
+}), 'utf8');
+
 function decodeBatch(wire: string): RideCodexEventBatch {
     return JSON.parse(wire) as RideCodexEventBatch;
 }
@@ -140,7 +151,12 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
             expectedTurnId: 'turn-1',
             input: [{ type: 'local-image', path: 'C:\\workspace\\image.png' }]
         });
-        await service.interruptTurn({ threadId: 'thread-1', turnId: 'turn-1' });
+        const interrupting = service.interruptTurn({ threadId: 'thread-1', turnId: 'turn-1' });
+        await Promise.resolve();
+        host.emit('turn/completed', {
+            threadId: 'thread-1', turn: { id: 'turn-1', status: 'interrupted', items: [] }
+        });
+        await interrupting;
 
         assert.deepEqual(host.calls, [
             {
@@ -191,7 +207,7 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         const coordinator = new RideCodexTurnCoordinator({
             host,
             scheduler,
-            maxQueuedBytes: 4_096,
+            maxQueuedBytes: MIN_COHERENT_QUEUE_BYTES,
             maxItemBytes: 2_048
         });
         const service = coordinator.connectClient({ turnEvents: wire => { wires.push(wire); } });
@@ -223,7 +239,7 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         const host = new FakeTurnHost();
         const scheduler = new FakeScheduler();
         const deliveries: unknown[] = [];
-        const coordinator = new RideCodexTurnCoordinator({ host, scheduler, maxQueuedBytes: 4_096 });
+        const coordinator = new RideCodexTurnCoordinator({ host, scheduler, maxQueuedBytes: MIN_COHERENT_QUEUE_BYTES });
         const service = coordinator.connectClient({
             turnEvents: wire => { deliveries.push(wire); }
         });
@@ -414,19 +430,25 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         const host = new FakeTurnHost();
         const scheduler = new FakeScheduler();
         const timeoutCallbacks: Array<() => void> = [];
-        host.interruptPromise = new Promise(() => undefined);
+        host.interruptPromise = Promise.resolve({});
+        let clearedTimers = 0;
         const coordinator = new RideCodexTurnCoordinator({
             host,
             scheduler,
             interruptTimeoutMs: 25,
             timers: {
                 setTimeout: callback => { timeoutCallbacks.push(callback); return callback; },
-                clearTimeout: () => undefined
+                clearTimeout: () => { clearedTimers += 1; }
             }
         });
         const service = coordinator.connectClient({ turnEvents: () => undefined });
         await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'hello' }] });
         const interrupting = service.interruptTurn({ threadId: 'thread-1', turnId: 'turn-1' });
+        let settled = false;
+        void interrupting.finally(() => { settled = true; });
+        await Promise.resolve();
+        await Promise.resolve();
+        assert.equal(settled, false, 'an empty interrupt ACK is not a terminal result');
         timeoutCallbacks.shift()?.();
 
         const result = await interrupting;
@@ -438,6 +460,33 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
             method: 'thread/resume',
             params: { threadId: 'thread-1' }
         });
+        assert.equal(clearedTimers, 1);
+    });
+
+    it('fails malformed interrupt ACKs closed and releases the active lease without recovery', async () => {
+        const host = new FakeTurnHost();
+        host.interruptPromise = Promise.resolve({ unexpected: true });
+        let clearedTimers = 0;
+        const coordinator = new RideCodexTurnCoordinator({
+            host,
+            timers: {
+                setTimeout: callback => setTimeout(callback, 1_000),
+                clearTimeout: handle => {
+                    clearedTimers += 1;
+                    clearTimeout(handle as ReturnType<typeof setTimeout>);
+                }
+            }
+        });
+        const service = coordinator.connectClient({ turnEvents: () => undefined });
+        await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'one' }] });
+
+        await assert.rejects(
+            service.interruptTurn({ threadId: 'thread-1', turnId: 'turn-1' }),
+            error => (error as { code?: string }).code === 'invalid-data'
+        );
+        assert.equal(host.releases, 1);
+        assert.deepEqual(host.restartCalls, []);
+        assert.equal(clearedTimers, 1);
     });
 
     it('fails recovery closed for malformed resume responses without invoking Proxy or accessor traps', async () => {
@@ -613,7 +662,7 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         const scheduler = new FakeScheduler();
         const batches: RideCodexEventBatch[] = [];
         const coordinator = new RideCodexTurnCoordinator({
-            host, scheduler, maxQueuedBytes: 4_096, maxItemBytes: 8
+            host, scheduler, maxQueuedBytes: MIN_COHERENT_QUEUE_BYTES, maxItemBytes: 8
         });
         const service = coordinator.connectClient({ turnEvents: wire => { batches.push(decodeBatch(wire)); } });
 
@@ -678,7 +727,7 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         const scheduler = new FakeScheduler();
         const types: string[] = [];
         const coordinator = new RideCodexTurnCoordinator({
-            host, scheduler, maxQueuedBytes: 256, maxItemBytes: 2_048, maxBatchEvents: 64
+            host, scheduler, maxQueuedBytes: MIN_COHERENT_QUEUE_BYTES, maxItemBytes: 2_048, maxBatchEvents: 64
         });
         const service = coordinator.connectClient({
             turnEvents: wire => { types.push(...decodeBatch(wire).events.map(event => event.type)); }
@@ -697,6 +746,37 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
 
         assert.ok(types.includes('turn-terminal'));
         assert.equal(host.releases, 1);
+    });
+
+    it('rejects queues below the coherent identity boundary and accepts the exact boundary', async () => {
+        const host = new FakeTurnHost();
+        assert.throws(() => new RideCodexTurnCoordinator({
+            host, maxQueuedBytes: MIN_COHERENT_QUEUE_BYTES - 1
+        }));
+
+        host.generation = Number.MAX_SAFE_INTEGER;
+        host.nextTurnId = WORST_VALID_IDENTIFIER;
+        const scheduler = new FakeScheduler();
+        const wires: string[] = [];
+        const coordinator = new RideCodexTurnCoordinator({
+            host, scheduler, maxQueuedBytes: MIN_COHERENT_QUEUE_BYTES
+        });
+        const service = coordinator.connectClient({ turnEvents: wire => { wires.push(wire); } });
+        await service.startTurn({
+            threadId: WORST_VALID_IDENTIFIER,
+            input: [{ type: 'text', text: 'one' }]
+        });
+        host.emit('turn/completed', {
+            threadId: WORST_VALID_IDENTIFIER,
+            turn: { id: WORST_VALID_IDENTIFIER, status: 'completed', items: [] }
+        });
+        scheduler.flushOne();
+
+        assert.equal(wires.length, 1);
+        assert.equal(Buffer.byteLength(wires[0], 'utf8'), MIN_COHERENT_QUEUE_BYTES);
+        assert.deepEqual(decodeBatch(wires[0]).events.map(event => event.type), [
+            'turn-started', 'turn-terminal'
+        ]);
     });
 
     it('keeps terminal then next-start ordering for a slow frontend with a bounded pending queue', async () => {
@@ -744,7 +824,7 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         const delivered: RideCodexEventBatch[] = [];
         let calls = 0;
         const coordinator = new RideCodexTurnCoordinator({
-            host, scheduler, maxQueuedBytes: 512, maxBatchEvents: 8
+            host, scheduler, maxQueuedBytes: MIN_COHERENT_QUEUE_BYTES, maxBatchEvents: 8
         });
         const service = coordinator.connectClient({
             turnEvents: wire => {
@@ -777,7 +857,7 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
             const types = byTurn.get(batch.turnId) ?? [];
             types.push(...batch.events.map(event => event.type));
             byTurn.set(batch.turnId, types);
-            assert.ok(Buffer.byteLength(JSON.stringify(batch), 'utf8') <= 512);
+            assert.ok(Buffer.byteLength(JSON.stringify(batch), 'utf8') <= MIN_COHERENT_QUEUE_BYTES);
         }
         for (const [turnId, types] of byTurn) {
             assert.ok(types.includes('turn-started'), `missing start for ${turnId}`);
@@ -798,7 +878,7 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         const delivered: RideCodexEventBatch[] = [];
         let calls = 0;
         const coordinator = new RideCodexTurnCoordinator({
-            host, scheduler, maxQueuedBytes: 512, maxBatchEvents: 8, maxItemBytes: 128
+            host, scheduler, maxQueuedBytes: MIN_COHERENT_QUEUE_BYTES, maxBatchEvents: 8, maxItemBytes: 128
         });
         const service = coordinator.connectClient({
             turnEvents: wire => {
@@ -853,19 +933,37 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         }
     });
 
-    it('normal interrupt confirmation waits for exact terminal before releasing once', async () => {
+    it('normal interrupt confirmation waits after the empty ACK for the exact terminal and clears its timer', async () => {
         const host = new FakeTurnHost();
         const scheduler = new FakeScheduler();
-        const coordinator = new RideCodexTurnCoordinator({ host, scheduler });
+        let clearedTimers = 0;
+        const coordinator = new RideCodexTurnCoordinator({
+            host,
+            scheduler,
+            timers: {
+                setTimeout: callback => setTimeout(callback, 1_000),
+                clearTimeout: handle => {
+                    clearedTimers += 1;
+                    clearTimeout(handle as ReturnType<typeof setTimeout>);
+                }
+            }
+        });
         const service = coordinator.connectClient({ turnEvents: () => undefined });
         await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'one' }] });
-        const result = await service.interruptTurn({ threadId: 'thread-1', turnId: 'turn-1' });
-        assert.equal(result.status, 'in-progress');
+        const interrupting = service.interruptTurn({ threadId: 'thread-1', turnId: 'turn-1' });
+        let settled = false;
+        void interrupting.finally(() => { settled = true; });
+        await Promise.resolve();
+        await Promise.resolve();
+        assert.equal(settled, false);
         assert.equal(host.releases, 0);
         host.emit('turn/completed', {
             threadId: 'thread-1', turn: { id: 'turn-1', status: 'interrupted', items: [] }
         });
+        const result = await interrupting;
+        assert.equal(result.status, 'interrupted');
         assert.equal(host.releases, 1);
+        assert.equal(clearedTimers, 1);
         host.emit('turn/completed', {
             threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', items: [] }
         });
@@ -1030,7 +1128,7 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         const coordinator = new RideCodexTurnCoordinator({
             host,
             scheduler,
-            maxQueuedBytes: 4_096,
+            maxQueuedBytes: MIN_COHERENT_QUEUE_BYTES,
             maxItemBytes: 2_048,
             maxBatchEvents: 16,
             maxRetainedItems: 2,
@@ -1061,7 +1159,7 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         }
 
         assert.ok(batches.every(batch => batch.events.length <= 16));
-        assert.ok(batches.every(batch => Buffer.byteLength(JSON.stringify(batch.events), 'utf8') <= 4_096));
+        assert.ok(batches.every(batch => Buffer.byteLength(JSON.stringify(batch), 'utf8') <= MIN_COHERENT_QUEUE_BYTES));
         const deltas = batches.flatMap(batch => batch.events)
             .filter((event): event is RideCodexUiEvent & { type: 'agent-delta'; itemId: string; delta: string } =>
                 event.type === 'agent-delta'
@@ -1167,7 +1265,7 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         const scheduler = new FakeScheduler();
         const events: RideCodexUiEvent[] = [];
         const coordinator = new RideCodexTurnCoordinator({
-            host, scheduler, maxQueuedBytes: 4_096, maxItemBytes: 2_048
+            host, scheduler, maxQueuedBytes: MIN_COHERENT_QUEUE_BYTES, maxItemBytes: 2_048
         });
         const service = coordinator.connectClient({
             turnEvents: wire => { events.push(...decodeBatch(wire).events); }
