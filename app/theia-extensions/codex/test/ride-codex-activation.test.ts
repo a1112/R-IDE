@@ -7,6 +7,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { FrontendApplicationContribution } from '@theia/core/lib/browser/frontend-application-contribution';
+import { MessageService } from '@theia/core/lib/common/message-service';
+import { PreferenceService } from '@theia/core/lib/common/preferences/preference-service';
 import { CommandContribution, CommandRegistry } from '@theia/core/lib/common/command';
 import { Container } from '@theia/core/shared/inversify';
 import { RideCodexActivation } from '../src/browser/ride-codex-activation';
@@ -268,8 +270,22 @@ test('registering the Codex command is inert and execution delegates to the perm
 test('frontend bindings expose one inert activation graph to command and shutdown contributions', async () => {
     const container = new Container();
     container.load(rideCodexFrontendModule);
+    container.bind(PreferenceService).toConstantValue({
+        get: () => undefined,
+        updateValue: async () => undefined
+    } as unknown as PreferenceService);
+    container.bind(MessageService).toConstantValue({
+        info: async () => 'Keep for manual handling'
+    } as unknown as MessageService);
+    container.rebind(RideCodexAuthService).toConstantValue({
+        activate: async () => Object.freeze({ state: 'unauthenticated' as const }),
+        readAccount: async () => Object.freeze({ state: 'unauthenticated' as const }),
+        login: async () => Object.freeze({ type: 'apiKey' as const }),
+        status: async () => Object.freeze({ state: 'unauthenticated' as const })
+    });
     const activation = container.get(RideCodexActivation);
     const proxy = container.get(RideCodexChatAgentProxy);
+    const authController = container.get(RideCodexAuthController);
 
     assert.equal(activation.state, 'inactive');
     assert.equal(container.isBound(RideCodexAuthController), true);
@@ -277,11 +293,14 @@ test('frontend bindings expose one inert activation graph to command and shutdow
     assert.equal(container.isBound(RideCodexAuthService), true);
     assert.ok(container.getAll(CommandContribution).includes(proxy));
     assert.equal(container.isBound(FrontendApplicationContribution), true);
-    const lifecycle = container.getAll(FrontendApplicationContribution);
-    assert.equal(lifecycle.length, 1);
-    const lifecycleContribution = lifecycle[0] as FrontendApplicationContribution;
-    lifecycleContribution.onStop?.(undefined as never);
-    assert.equal(lifecycle[0], activation);
+    const lifecycle = container.getAll<FrontendApplicationContribution>(FrontendApplicationContribution);
+    assert.equal(lifecycle.length, 2);
+    assert.ok(lifecycle.includes(activation));
+    assert.ok(lifecycle.includes(authController));
+    for (const contribution of lifecycle) {
+        contribution.onStop?.(undefined as never);
+    }
 
     await assert.rejects(proxy.open(), /disposed/i);
+    await assert.rejects(authController.activate(), /disposed/i);
 });

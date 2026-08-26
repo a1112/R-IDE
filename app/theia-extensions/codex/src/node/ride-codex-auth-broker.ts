@@ -80,6 +80,7 @@ export class RideCodexAuthBroker {
     #activeGeneration = 0;
     #authOperation = 0;
     #rateOperation = 0;
+    #rateVersion = 0;
     #disposed = false;
 
     constructor(options: RideCodexAuthBrokerOptions) {
@@ -223,7 +224,7 @@ export class RideCodexAuthBroker {
         this.#requireUsable();
         await this.#ensureLease();
         const token = ++this.#authOperation;
-        ++this.#rateOperation;
+        this.#invalidateRateReads();
         try {
             await this.#lease!.request('account/logout', {});
             this.#requireCurrentOperation(token);
@@ -238,14 +239,21 @@ export class RideCodexAuthBroker {
         this.#requireUsable();
         await this.#ensureLease();
         const token = ++this.#rateOperation;
+        const version = this.#rateVersion;
         try {
             const raw = await this.#lease!.request('account/rateLimits/read', {});
             if (token !== this.#rateOperation) {
                 throw new RideCodexAuthError('operation-superseded');
             }
             const rateLimits = normalizeRideCodexRateLimits(raw);
+            if (version !== this.#rateVersion) {
+                return this.#snapshot;
+            }
             return this.#setSnapshot({ ...this.#snapshot, rateLimits });
         } catch (error) {
+            if (token === this.#rateOperation && version !== this.#rateVersion) {
+                return this.#snapshot;
+            }
             throw this.#failRateOperation(error, token);
         }
     }
@@ -256,7 +264,7 @@ export class RideCodexAuthBroker {
         }
         this.#disposed = true;
         ++this.#authOperation;
-        ++this.#rateOperation;
+        this.#invalidateRateReads();
         for (const listener of this.#listeners.splice(0)) {
             disposeSafely(listener);
         }
@@ -387,7 +395,14 @@ export class RideCodexAuthBroker {
                     return;
                 }
                 case 'account/rateLimits/updated': {
-                    const update = normalizeRideCodexRateLimitUpdate(notification.params);
+                    let update: RideCodexRateLimits;
+                    try {
+                        update = normalizeRideCodexRateLimitUpdate(notification.params);
+                    } catch {
+                        this.#diagnostics.record('protocol-error');
+                        return;
+                    }
+                    ++this.#rateVersion;
                     if (this.#isDuplicateNotification(notification.method, update)) {
                         return;
                     }
@@ -430,6 +445,7 @@ export class RideCodexAuthBroker {
         if (event.generation !== this.#activeGeneration) {
             this.#activeGeneration = event.generation;
             this.#notificationSignatures.clear();
+            this.#invalidateRateReads();
         }
         if (event.state === 'ready') {
             const token = ++this.#authOperation;
@@ -439,7 +455,7 @@ export class RideCodexAuthBroker {
         if (event.state === 'restarting' || event.state === 'stopped'
             || event.state === 'circuit-open' || event.state === 'disposed') {
             ++this.#authOperation;
-            ++this.#rateOperation;
+            this.#invalidateRateReads();
             this.#setSnapshot({ state: 'disconnected' });
         }
     }
@@ -462,8 +478,12 @@ export class RideCodexAuthBroker {
         if (token !== this.#rateOperation) {
             return new RideCodexAuthError('operation-superseded');
         }
-        this.#setGenericError(error instanceof TypeError || error instanceof RangeError ? 'invalid-data' : 'operation-failed');
-        return new RideCodexAuthError(error instanceof TypeError || error instanceof RangeError ? 'invalid-data' : 'operation-failed');
+        if (error instanceof TypeError || error instanceof RangeError) {
+            this.#diagnostics.record('protocol-error');
+            return new RideCodexAuthError('invalid-data');
+        }
+        this.#setGenericError('operation-failed');
+        return new RideCodexAuthError('operation-failed');
     }
 
     #setGenericError(code: 'invalid-data' | 'operation-failed'): void {
@@ -479,6 +499,11 @@ export class RideCodexAuthBroker {
         if (token !== this.#authOperation) {
             throw new RideCodexAuthError('operation-superseded');
         }
+    }
+
+    #invalidateRateReads(): void {
+        ++this.#rateOperation;
+        ++this.#rateVersion;
     }
 
     #rememberLogin(loginId: string, status: 'active' | 'canceled' | 'completed'): void {

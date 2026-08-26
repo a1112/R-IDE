@@ -5,6 +5,7 @@
  ********************************************************************************/
 
 import { ContainerModule } from '@theia/core/shared/inversify';
+import { FrontendApplicationContribution } from '@theia/core/lib/browser/frontend-application-contribution';
 import { MessageService } from '@theia/core/lib/common/message-service';
 import { PreferenceService } from '@theia/core/lib/common/preferences/preference-service';
 import { WebSocketConnectionProvider } from '@theia/core/lib/browser/messaging/ws-connection-provider';
@@ -45,6 +46,7 @@ export default new ContainerModule(bind => {
                     return preferences.get(name) === undefined;
                 }
             },
+            relay,
             prompt: {
                 confirmLegacyApiKeyMigration: async sources => {
                     const action = await messages.info(
@@ -56,7 +58,7 @@ export default new ContainerModule(bind => {
                 }
             }
         });
-        relay.attach(controller);
         return controller;
     }).inSingletonScope();
+    bind(FrontendApplicationContribution).toService(RideCodexAuthController);
 });

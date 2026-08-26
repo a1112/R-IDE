@@ -126,6 +126,38 @@ test('validates, bounds and deeply freezes the public auth model', () => {
     assert.throws(() => normalizeRideCodexRateLimits({ rateLimits: { primary: { usedPercent: 101 } } }));
 });
 
+test('rate-limit response validation rejects unknown and descriptor-unsafe top-level data without invoking getters', () => {
+    const valid = emptyRateLimits();
+    assert.throws(
+        () => normalizeRideCodexRateLimits({ ...valid, unknownSecret: 'sk-unknown-rate-limit' }),
+        /unsupported property/i
+    );
+
+    const nullPrototype = Object.assign(Object.create(null) as Record<string, unknown>, valid);
+    assert.deepEqual(normalizeRideCodexRateLimits(nullPrototype), normalizeRideCodexRateLimits(valid));
+
+    let getterCalls = 0;
+    const accessor = Object.create(null) as Record<string, unknown>;
+    Object.defineProperty(accessor, 'rateLimits', {
+        enumerable: true,
+        get: () => {
+            getterCalls += 1;
+            return valid.rateLimits;
+        }
+    });
+    Object.defineProperty(accessor, 'rateLimitsByLimitId', { enumerable: true, value: null });
+    Object.defineProperty(accessor, 'rateLimitResetCredits', { enumerable: true, value: null });
+    assert.throws(() => normalizeRideCodexRateLimits(accessor), /unsafe property/i);
+    assert.equal(getterCalls, 0);
+
+    const inherited = Object.create({ rateLimits: valid.rateLimits }) as Record<string, unknown>;
+    assert.throws(() => normalizeRideCodexRateLimits(inherited), /plain record/i);
+
+    const revoked = Proxy.revocable(valid, {});
+    revoked.revoke();
+    assert.throws(() => normalizeRideCodexRateLimits(revoked.proxy));
+});
+
 test('host acquisition failures are generic and never echo API key input', async () => {
     const key = 'sk-acquire-failure-AAAABBBBCCCC';
     const host = new FakeAuthHost();
@@ -300,25 +332,147 @@ test('login completion refreshes the account and maps remote failure to a generi
     assert.ok(client.snapshots.every(snapshot => Object.isFrozen(snapshot)));
 });
 
-test('strictly maps rate limits, merges sparse notifications, and drops unknown raw fields', async () => {
+test('strictly maps rate limits and merges sparse notifications', async () => {
     const host = new FakeAuthHost();
     host.responder = async method => method === 'account/read'
         ? { account: { type: 'apiKey' }, requiresOpenaiAuth: false }
         : {
             rateLimits: rateSnapshot({ usedPercent: 10 }),
             rateLimitsByLimitId: { codex: rateSnapshot({ usedPercent: 20 }) },
-            rateLimitResetCredits: { availableCount: '1', credits: null },
-            unknownSecret: 'must-not-survive'
+            rateLimitResetCredits: { availableCount: '1', credits: null }
         };
     const broker = new RideCodexAuthBroker({ host, diagnostics: new RideCodexAppServerDiagnostics() });
     await broker.activate();
     await broker.readRateLimits();
     host.notify('account/rateLimits/updated', { rateLimits: rateSnapshot({ usedPercent: 33 }) });
     assert.equal(broker.snapshot().rateLimits?.primary?.usedPercent, 33);
-    assert.equal(JSON.stringify(broker.snapshot()).includes('must-not-survive'), false);
 
+    const beforeInvalid = broker.snapshot();
     host.notify('account/rateLimits/updated', { rateLimits: rateSnapshot({ usedPercent: Number.NaN }) });
-    assert.equal(broker.snapshot().state, 'error');
+    assert.equal(broker.snapshot(), beforeInvalid);
+});
+
+test('unknown rate-limit response and notification fields fail closed without replacing trusted rate state', async () => {
+    const host = new FakeAuthHost();
+    const diagnostics = new RideCodexAppServerDiagnostics();
+    const secret = 'sk-unknown-rate-limit-must-not-survive';
+    host.responder = async method => method === 'account/read'
+        ? { account: { type: 'apiKey' }, requiresOpenaiAuth: false }
+        : {
+            rateLimits: rateSnapshot({ usedPercent: 10 }),
+            rateLimitsByLimitId: null,
+            rateLimitResetCredits: null,
+            unknownSecret: secret
+        };
+    const broker = new RideCodexAuthBroker({ host, diagnostics });
+    await broker.activate();
+    const beforeUnknownRead = broker.snapshot();
+    await assert.rejects(broker.readRateLimits(), /invalid data/i);
+    assert.equal(broker.snapshot(), beforeUnknownRead);
+
+    host.responder = async method => method === 'account/rateLimits/read'
+        ? { ...emptyRateLimits(), rateLimits: rateSnapshot({ usedPercent: 20 }) }
+        : { account: { type: 'apiKey' }, requiresOpenaiAuth: false };
+    await broker.readRateLimits();
+    const trusted = broker.snapshot();
+    host.notify('account/rateLimits/updated', {
+        rateLimits: rateSnapshot({ usedPercent: 80 }),
+        unknownSecret: secret
+    });
+    assert.equal(broker.snapshot(), trusted);
+    assert.equal(JSON.stringify({ snapshot: broker.snapshot(), diagnostics: diagnostics.snapshot() }).includes(secret), false);
+});
+
+test('a validated rate notification wins over an older pending read without rejecting the read', async () => {
+    const host = new FakeAuthHost();
+    const pending = deferred<unknown>();
+    host.responder = async method => method === 'account/read'
+        ? { account: { type: 'apiKey' }, requiresOpenaiAuth: false }
+        : pending.promise;
+    const broker = new RideCodexAuthBroker({ host, diagnostics: new RideCodexAppServerDiagnostics() });
+    await broker.activate();
+
+    const read = broker.readRateLimits();
+    await tick();
+    host.notify('account/rateLimits/updated', { rateLimits: rateSnapshot({ usedPercent: 80 }) });
+    pending.resolve({ ...emptyRateLimits(), rateLimits: rateSnapshot({ usedPercent: 10 }) });
+
+    const result = await read;
+    assert.equal(result.rateLimits?.primary?.usedPercent, 80);
+    assert.equal(broker.snapshot().rateLimits?.primary?.usedPercent, 80);
+});
+
+test('invalid rate notifications do not invalidate a pending valid read', async () => {
+    const host = new FakeAuthHost();
+    const pending = deferred<unknown>();
+    host.responder = async method => method === 'account/read'
+        ? { account: { type: 'apiKey' }, requiresOpenaiAuth: false }
+        : pending.promise;
+    const broker = new RideCodexAuthBroker({ host, diagnostics: new RideCodexAppServerDiagnostics() });
+    await broker.activate();
+
+    const read = broker.readRateLimits();
+    await tick();
+    host.notify('account/rateLimits/updated', {
+        rateLimits: rateSnapshot({ usedPercent: 80 }),
+        unknownField: 'invalid'
+    });
+    pending.resolve({ ...emptyRateLimits(), rateLimits: rateSnapshot({ usedPercent: 10 }) });
+
+    const result = await read;
+    assert.equal(result.rateLimits?.primary?.usedPercent, 10);
+    assert.equal(broker.snapshot().rateLimits?.primary?.usedPercent, 10);
+});
+
+test('new reads, validated notifications, logout, and host generations order rate-limit commits', async () => {
+    const host = new FakeAuthHost();
+    const first = deferred<unknown>();
+    const second = deferred<unknown>();
+    let rateReads = 0;
+    host.responder = async method => {
+        if (method === 'account/read') {
+            return { account: { type: 'apiKey' }, requiresOpenaiAuth: false };
+        }
+        if (method === 'account/logout') {
+            return {};
+        }
+        rateReads += 1;
+        return rateReads === 1 ? first.promise : second.promise;
+    };
+    const broker = new RideCodexAuthBroker({ host, diagnostics: new RideCodexAppServerDiagnostics() });
+    await broker.activate();
+
+    const oldRead = broker.readRateLimits().catch(error => error as Error);
+    await tick();
+    const currentRead = broker.readRateLimits();
+    await tick();
+    host.notify('account/rateLimits/updated', { rateLimits: rateSnapshot({ usedPercent: 80 }) });
+    second.resolve({ ...emptyRateLimits(), rateLimits: rateSnapshot({ usedPercent: 20 }) });
+    assert.equal((await currentRead).rateLimits?.primary?.usedPercent, 80);
+    first.resolve({ ...emptyRateLimits(), rateLimits: rateSnapshot({ usedPercent: 10 }) });
+    assert.match(String(await oldRead), /superseded/i);
+    assert.equal(broker.snapshot().rateLimits?.primary?.usedPercent, 80);
+
+    const logoutRead = deferred<unknown>();
+    host.responder = async method => method === 'account/rateLimits/read' ? logoutRead.promise : {};
+    const pendingLogoutRead = broker.readRateLimits().catch(error => error as Error);
+    await tick();
+    await broker.logout();
+    logoutRead.resolve({ ...emptyRateLimits(), rateLimits: rateSnapshot({ usedPercent: 5 }) });
+    assert.match(String(await pendingLogoutRead), /superseded/i);
+    assert.equal(broker.snapshot().rateLimits, undefined);
+
+    const generationRead = deferred<unknown>();
+    host.responder = async method => method === 'account/rateLimits/read' ? generationRead.promise : {
+        account: { type: 'apiKey' }, requiresOpenaiAuth: false
+    };
+    const pendingGenerationRead = broker.readRateLimits().catch(error => error as Error);
+    await tick();
+    host.changeState('circuit-open', 2);
+    generationRead.resolve({ ...emptyRateLimits(), rateLimits: rateSnapshot({ usedPercent: 1 }) });
+    assert.match(String(await pendingGenerationRead), /superseded/i);
+    assert.equal(broker.snapshot().state, 'disconnected');
+    assert.equal(broker.snapshot().rateLimits, undefined);
 });
 
 test('notification validation never invokes raw toJSON hooks or retains unvalidated payloads', async () => {

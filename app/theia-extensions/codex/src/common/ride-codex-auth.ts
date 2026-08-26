@@ -214,6 +214,9 @@ export function normalizeRideCodexRateLimits(value: unknown): RideCodexRateLimit
         return undefined;
     }
     const response = requireRecord(value, 'rate-limit response');
+    requireOnlyKeys(response, [
+        'rateLimits', 'rateLimitsByLimitId', 'rateLimitResetCredits'
+    ], 'rate-limit response');
     const current = normalizeRateLimitBucket(readOwn(response, 'rateLimits'));
     const byLimitValue = readOwn(response, 'rateLimitsByLimitId');
     const resetCreditsValue = readOwn(response, 'rateLimitResetCredits');
