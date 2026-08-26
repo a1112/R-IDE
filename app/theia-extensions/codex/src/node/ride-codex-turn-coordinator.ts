@@ -525,6 +525,7 @@ export class RideCodexTurnCoordinator {
             if (snapshot.state !== 'ready' || requireGeneration(snapshot.generation) !== generation) {
                 throw new RideCodexTurnError('operation-superseded');
             }
+            remainingRecoveryTimeout(this.#timers, startedAt, this.#recoveryTimeoutMs);
             this.#generation = generation;
             acquiring = Promise.resolve(this.#host.acquire('foreground-panel'));
             acquiring.catch(() => undefined);
