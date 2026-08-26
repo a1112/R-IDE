@@ -1007,50 +1007,138 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         assert.equal(host.releases, 2);
     });
 
-    it('bounds a hung recovery restart and clears the barrier for a later turn', async () => {
+    it('keeps a timed-out recovery restart quarantined until its late resolve or reject settles', async () => {
+        for (const settlement of ['resolve', 'reject'] as const) {
+            const host = new FakeTurnHost();
+            const scheduler = new FakeScheduler();
+            const timeoutCallbacks: Array<() => void> = [];
+            const timeoutDurations: number[] = [];
+            const events: RideCodexUiEvent[] = [];
+            let resolveRestart!: (generation: number) => void;
+            let rejectRestart!: (error: unknown) => void;
+            host.interruptPromise = Promise.resolve({});
+            host.restartPromise = new Promise((resolve, reject) => {
+                resolveRestart = resolve;
+                rejectRestart = reject;
+            });
+            const coordinator = new RideCodexTurnCoordinator({
+                host,
+                scheduler,
+                interruptTimeoutMs: 10,
+                recoveryTimeoutMs: 20,
+                timers: {
+                    setTimeout: (callback, milliseconds) => {
+                        timeoutCallbacks.push(callback);
+                        timeoutDurations.push(milliseconds);
+                        return callback;
+                    },
+                    clearTimeout: () => undefined
+                }
+            });
+            const client = { turnEvents: (wire: string) => { events.push(...decodeBatch(wire).events); } };
+            const service = coordinator.connectClient(client);
+            await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'one' }] });
+            const interrupting = service.interruptTurn({ threadId: 'thread-1', turnId: 'turn-1' });
+            timeoutCallbacks[0]?.();
+            await settleTurnMicrotasks();
+
+            assert.deepEqual(timeoutDurations, [10, 20]);
+            assert.ok(timeoutCallbacks[1], 'recovery installs one deadline before awaiting restart');
+            timeoutCallbacks[1]();
+            assert.equal((await interrupting).status, 'interrupt-uncertain');
+            while (scheduler.callbacks.length > 0) {
+                scheduler.flushOne();
+                await Promise.resolve();
+            }
+            assert.equal(events.filter(event => event.type === 'error' && event.code === 'recovery-failed').length, 1);
+
+            const isSuperseded = (error: unknown) =>
+                (error as { code?: string }).code === 'operation-superseded';
+            await assert.rejects(
+                service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'blocked' }] }),
+                isSuperseded
+            );
+            await assert.rejects(service.steerTurn({
+                threadId: 'thread-1', expectedTurnId: 'turn-1', input: [{ type: 'text', text: 'blocked' }]
+            }), isSuperseded);
+            await assert.rejects(
+                service.interruptTurn({ threadId: 'thread-1', turnId: 'turn-1' }),
+                isSuperseded
+            );
+            assert.throws(() => service.setClient(client), isSuperseded);
+            assert.equal(host.calls.filter(call => call.method === 'turn/start').length, 1);
+            assert.equal(host.calls.filter(call => call.method === 'thread/resume').length, 0);
+
+            if (settlement === 'resolve') {
+                host.generation = 2;
+                resolveRestart(2);
+            } else {
+                rejectRestart(new Error('C:\\private\\restart token=secret'));
+            }
+            await settleTurnMicrotasks();
+            assert.equal(host.calls.filter(call => call.method === 'thread/resume').length, 0,
+                'late restart settlement must not resume after the hard deadline');
+
+            host.nextTurnId = 'turn-2';
+            assert.equal((await service.startTurn({
+                threadId: 'thread-1', input: [{ type: 'text', text: `after late ${settlement}` }]
+            })).turnId, 'turn-2');
+            await coordinator.dispose();
+        }
+    });
+
+    it('does not let stale recovery settlement clear a newer restart quarantine', async () => {
         const host = new FakeTurnHost();
-        const scheduler = new FakeScheduler();
         const timeoutCallbacks: Array<() => void> = [];
-        const timeoutDurations: number[] = [];
-        const events: RideCodexUiEvent[] = [];
+        let resolveFirstRestart!: (generation: number) => void;
+        let rejectSecondRestart!: (error: unknown) => void;
         host.interruptPromise = Promise.resolve({});
-        host.restartPromise = new Promise(() => undefined);
+        host.restartPromise = new Promise(resolve => { resolveFirstRestart = resolve; });
         const coordinator = new RideCodexTurnCoordinator({
             host,
-            scheduler,
             interruptTimeoutMs: 10,
             recoveryTimeoutMs: 20,
             timers: {
-                setTimeout: (callback, milliseconds) => {
-                    timeoutCallbacks.push(callback);
-                    timeoutDurations.push(milliseconds);
-                    return callback;
-                },
+                setTimeout: callback => { timeoutCallbacks.push(callback); return callback; },
                 clearTimeout: () => undefined
             }
         });
-        const service = coordinator.connectClient({
-            turnEvents: wire => { events.push(...decodeBatch(wire).events); }
-        });
+        const service = coordinator.connectClient({ turnEvents: () => undefined });
         await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'one' }] });
-        const interrupting = service.interruptTurn({ threadId: 'thread-1', turnId: 'turn-1' });
+
+        const firstInterrupt = service.interruptTurn({ threadId: 'thread-1', turnId: 'turn-1' });
         timeoutCallbacks[0]?.();
         await settleTurnMicrotasks();
-
-        assert.deepEqual(timeoutDurations, [10, 20]);
-        assert.ok(timeoutCallbacks[1], 'recovery installs one deadline before awaiting restart');
-        timeoutCallbacks[1]();
-        assert.equal((await interrupting).status, 'interrupt-uncertain');
-        while (scheduler.callbacks.length > 0) {
-            scheduler.flushOne();
-            await Promise.resolve();
-        }
-        assert.equal(events.filter(event => event.type === 'error' && event.code === 'recovery-failed').length, 1);
+        timeoutCallbacks[1]?.();
+        assert.equal((await firstInterrupt).status, 'interrupt-uncertain');
+        host.generation = 2;
+        resolveFirstRestart(2);
+        await settleTurnMicrotasks();
 
         host.nextTurnId = 'turn-2';
+        await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'two' }] });
+        host.restartPromise = new Promise((_resolve, reject) => { rejectSecondRestart = reject; });
+        const secondInterrupt = service.interruptTurn({ threadId: 'thread-1', turnId: 'turn-2' });
+        timeoutCallbacks[2]?.();
+        await settleTurnMicrotasks();
+        assert.deepEqual(host.restartCalls, [1, 2]);
+
+        timeoutCallbacks[1]?.();
+        resolveFirstRestart(99);
+        await settleTurnMicrotasks();
+        timeoutCallbacks[3]?.();
+        assert.equal((await secondInterrupt).status, 'interrupt-uncertain');
+        await assert.rejects(
+            service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'still blocked' }] }),
+            error => (error as { code?: string }).code === 'operation-superseded'
+        );
+
+        rejectSecondRestart(new Error('late second restart rejection'));
+        await settleTurnMicrotasks();
+        host.nextTurnId = 'turn-3';
         assert.equal((await service.startTurn({
-            threadId: 'thread-1', input: [{ type: 'text', text: 'after recovery deadline' }]
-        })).turnId, 'turn-2');
+            threadId: 'thread-1', input: [{ type: 'text', text: 'after second quarantine' }]
+        })).turnId, 'turn-3');
         await coordinator.dispose();
     });
 
@@ -1689,30 +1777,39 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         assert.equal(recoveryReleases, 1);
     });
 
-    it('fails malformed interrupt ACKs closed and releases the active lease without recovery', async () => {
-        const host = new FakeTurnHost();
-        host.interruptPromise = Promise.resolve({ unexpected: true });
-        let clearedTimers = 0;
-        const coordinator = new RideCodexTurnCoordinator({
-            host,
-            timers: {
-                setTimeout: callback => setTimeout(callback, 1_000),
-                clearTimeout: handle => {
-                    clearedTimers += 1;
-                    clearTimeout(handle as ReturnType<typeof setTimeout>);
-                }
+    it('treats rejected and malformed interrupt acknowledgements as uncertain and recovers', async () => {
+        for (const failure of ['rejected', 'malformed'] as const) {
+            const host = new FakeTurnHost();
+            const scheduler = new FakeScheduler();
+            const events: RideCodexUiEvent[] = [];
+            if (failure === 'rejected') {
+                host.rejectMethod = 'turn/interrupt';
+            } else {
+                host.interruptPromise = Promise.resolve({ unexpected: true });
             }
-        });
-        const service = coordinator.connectClient({ turnEvents: () => undefined });
-        await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'one' }] });
+            const coordinator = new RideCodexTurnCoordinator({ host, scheduler });
+            const service = coordinator.connectClient({
+                turnEvents: wire => { events.push(...decodeBatch(wire).events); }
+            });
+            await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'one' }] });
 
-        await assert.rejects(
-            service.interruptTurn({ threadId: 'thread-1', turnId: 'turn-1' }),
-            error => (error as { code?: string }).code === 'invalid-data'
-        );
-        assert.equal(host.releases, 1);
-        assert.deepEqual(host.restartCalls, []);
-        assert.equal(clearedTimers, 1);
+            const result = await service.interruptTurn({ threadId: 'thread-1', turnId: 'turn-1' });
+            while (scheduler.callbacks.length > 0) {
+                scheduler.flushOne();
+                await Promise.resolve();
+            }
+
+            assert.equal(result.status, 'interrupt-uncertain', failure);
+            assert.deepEqual(host.restartCalls, [1], failure);
+            assert.equal(host.calls.filter(call => call.method === 'thread/resume').length, 1, failure);
+            assert.equal(host.releases, 2, failure);
+            assert.equal(events.filter(event =>
+                event.type === 'turn-terminal' && event.status === 'interrupt-uncertain'
+            ).length, 1, failure);
+            assert.doesNotMatch(JSON.stringify(events), /secret|apiKey|workspace/i);
+            await coordinator.dispose();
+            assert.equal(host.releases, 2, failure);
+        }
     });
 
     it('fails recovery closed for malformed resume responses without invoking Proxy or accessor traps', async () => {
@@ -2361,25 +2458,54 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         assert.ok(delivered.length <= 2);
     });
 
-    it('releases the active lease and exposes only a stable error when steer or interrupt RPC fails', async () => {
-        for (const method of ['turn/steer', 'turn/interrupt'] as const) {
+    it('keeps the active lease after ambiguous steer failures until an exact terminal arrives', async () => {
+        for (const failure of ['rejected', 'malformed', 'mismatched'] as const) {
             const host = new FakeTurnHost();
-            host.rejectMethod = method;
-            const coordinator = new RideCodexTurnCoordinator({ host });
-            const service = coordinator.connectClient({ turnEvents: () => undefined });
+            const scheduler = new FakeScheduler();
+            const events: RideCodexUiEvent[] = [];
+            if (failure === 'rejected') {
+                host.rejectMethod = 'turn/steer';
+            } else {
+                host.steerPromise = Promise.resolve(failure === 'malformed'
+                    ? { unexpected: true }
+                    : { turnId: 'turn-other' });
+            }
+            const coordinator = new RideCodexTurnCoordinator({ host, scheduler });
+            const service = coordinator.connectClient({
+                turnEvents: wire => { events.push(...decodeBatch(wire).events); }
+            });
             await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'one' }] });
-            const operation = method === 'turn/steer'
-                ? service.steerTurn({
-                    threadId: 'thread-1', expectedTurnId: 'turn-1', input: [{ type: 'text', text: 'more' }]
-                })
-                : service.interruptTurn({ threadId: 'thread-1', turnId: 'turn-1' });
-            await assert.rejects(operation, error => {
+            await assert.rejects(service.steerTurn({
+                threadId: 'thread-1', expectedTurnId: 'turn-1', input: [{ type: 'text', text: 'more' }]
+            }), error => {
                 assert.equal((error as { code?: string }).code, 'operation-failed');
                 assert.doesNotMatch(String((error as Error).message), /secret|apiKey|workspace/i);
                 return true;
             });
-            assert.equal(host.releases, 1, method);
+
+            assert.equal(host.releases, 0, failure);
+            await assert.rejects(
+                service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'blocked' }] }),
+                error => (error as { code?: string }).code === 'turn-active'
+            );
+            host.emit('turn/completed', {
+                threadId: 'thread-1', turn: validTurn('turn-1', 'completed')
+            });
+            while (scheduler.callbacks.length > 0) {
+                scheduler.flushOne();
+                await Promise.resolve();
+            }
+            assert.equal(events.filter(event =>
+                event.type === 'turn-terminal' && event.status === 'completed'
+            ).length, 1, failure);
+            assert.equal(host.releases, 1, failure);
+
+            host.nextTurnId = 'turn-2';
+            assert.equal((await service.startTurn({
+                threadId: 'thread-1', input: [{ type: 'text', text: 'after terminal' }]
+            })).turnId, 'turn-2');
             await coordinator.dispose();
+            assert.equal(host.releases, 2, failure);
         }
     });
 
@@ -2519,32 +2645,52 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         assert.equal(host.releases, 2);
     });
 
-    it('dispose terminates interrupt recovery even when the host restart is hung', async () => {
-        const host = new FakeTurnHost();
-        const timeoutCallbacks: Array<() => void> = [];
-        let clearedTimers = 0;
-        host.interruptPromise = new Promise(() => undefined);
-        host.restartPromise = new Promise(() => undefined);
-        const coordinator = new RideCodexTurnCoordinator({
-            host,
-            interruptTimeoutMs: 10,
-            recoveryTimeoutMs: 20,
-            timers: {
-                setTimeout: callback => { timeoutCallbacks.push(callback); return callback; },
-                clearTimeout: () => { clearedTimers += 1; }
-            }
-        });
-        const service = coordinator.connectClient({ turnEvents: () => undefined });
-        await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'one' }] });
-        const interrupting = service.interruptTurn({ threadId: 'thread-1', turnId: 'turn-1' });
-        timeoutCallbacks.shift()?.();
-        await settleTurnMicrotasks();
-        assert.equal(timeoutCallbacks.length, 1, 'the recovery deadline is active before disposal');
-        await coordinator.dispose();
+    it('dispose invalidates a restart quarantine and absorbs its late resolve or reject', async () => {
+        for (const settlement of ['resolve', 'reject'] as const) {
+            const host = new FakeTurnHost();
+            const timeoutCallbacks: Array<() => void> = [];
+            let clearedTimers = 0;
+            let resolveRestart!: (generation: number) => void;
+            let rejectRestart!: (error: unknown) => void;
+            host.interruptPromise = new Promise(() => undefined);
+            host.restartPromise = new Promise((resolve, reject) => {
+                resolveRestart = resolve;
+                rejectRestart = reject;
+            });
+            const coordinator = new RideCodexTurnCoordinator({
+                host,
+                interruptTimeoutMs: 10,
+                recoveryTimeoutMs: 20,
+                timers: {
+                    setTimeout: callback => { timeoutCallbacks.push(callback); return callback; },
+                    clearTimeout: () => { clearedTimers += 1; }
+                }
+            });
+            const service = coordinator.connectClient({ turnEvents: () => undefined });
+            await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'one' }] });
+            const interrupting = service.interruptTurn({ threadId: 'thread-1', turnId: 'turn-1' });
+            timeoutCallbacks.shift()?.();
+            await settleTurnMicrotasks();
+            assert.equal(timeoutCallbacks.length, 1, 'the recovery deadline is active before disposal');
+            await coordinator.dispose();
 
-        await assert.rejects(interrupting, error => (error as { code?: string }).code === 'disposed');
-        assert.equal(host.releases, 1);
-        assert.equal(clearedTimers, 2, 'dispose clears both interrupt and recovery timers');
+            await assert.rejects(interrupting, error => (error as { code?: string }).code === 'disposed');
+            assert.equal(host.releases, 1);
+            assert.equal(clearedTimers, 2, 'dispose clears both interrupt and recovery timers');
+            if (settlement === 'resolve') {
+                host.generation = 2;
+                resolveRestart(2);
+            } else {
+                rejectRestart(new Error('late restart rejection'));
+            }
+            await settleTurnMicrotasks();
+            assert.equal(host.calls.filter(call => call.method === 'thread/resume').length, 0, settlement);
+            assert.equal(host.releases, 1, settlement);
+            assert.throws(
+                () => service.setClient({ turnEvents: () => undefined }),
+                error => (error as { code?: string }).code === 'disposed'
+            );
+        }
     });
 
     it('ignores duplicate item lifecycle and late deltas after item completion', async () => {
@@ -2661,7 +2807,7 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         }
     });
 
-    it('linearizes concurrent starts and mismatched steer responses without leaking the active lease', async () => {
+    it('linearizes concurrent starts and keeps ownership after a mismatched steer response', async () => {
         const host = new FakeTurnHost();
         let resolveStart!: (value: unknown) => void;
         host.startPromise = new Promise(resolve => { resolveStart = resolve; });
@@ -2677,7 +2823,11 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         host.steerTurnId = 'turn-2';
         await assert.rejects(service.steerTurn({
             threadId: 'thread-1', expectedTurnId: 'turn-1', input: [{ type: 'text', text: 'more' }]
-        }));
+        }), error => (error as { code?: string }).code === 'operation-failed');
+        assert.equal(host.releases, 0);
+        host.emit('turn/completed', {
+            threadId: 'thread-1', turn: validTurn('turn-1', 'completed')
+        });
         assert.equal(host.releases, 1);
     });
 
@@ -3642,8 +3792,11 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
                 service.steerTurn({
                     threadId: 'thread-1', expectedTurnId: 'turn-1', input: [{ type: 'text', text: 'more' }]
                 }),
-                error => (error as { code?: string }).code === 'invalid-data'
+                error => (error as { code?: string }).code === 'operation-failed'
             );
+            assert.equal(host.releases, 0);
+            await coordinator.dispose();
+            assert.equal(host.releases, 1);
         }
     });
 

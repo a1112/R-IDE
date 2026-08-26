@@ -131,6 +131,12 @@ interface RecoveryBarrier {
     promise: Promise<void>;
 }
 
+interface RecoveryRestartQuarantine {
+    readonly expectedGeneration: number;
+    readonly lifecycle: number;
+    readonly promise: Promise<number>;
+}
+
 interface QueueIdentity {
     readonly generation: number;
     readonly turnSequence: number;
@@ -210,6 +216,7 @@ export class RideCodexTurnCoordinator {
     #flushHandle: RideCodexDisposable | undefined;
     #active: ActiveTurn | undefined;
     #recovery: RecoveryBarrier | undefined;
+    #recoveryRestartQuarantine: RecoveryRestartQuarantine | undefined;
     #generation: number;
     #lastTurnSequence = 0;
     #lifecycle = 0;
@@ -301,6 +308,7 @@ export class RideCodexTurnCoordinator {
         this.#disposed = true;
         this.#lifecycle += 1;
         this.#recovery = undefined;
+        this.#recoveryRestartQuarantine = undefined;
         this.#rejectDisposed(new RideCodexTurnError('disposed'));
         this.#finishActive('failed', SAFE_FAILURE, new RideCodexTurnError('disposed'), false);
         this.#flushHandle?.dispose();
@@ -392,10 +400,13 @@ export class RideCodexTurnCoordinator {
             if (active.terminalResult) {
                 return active.terminalResult;
             }
-            if (this.#active === active) {
-                this.#finishActive('failed', SAFE_FAILURE);
+            if (this.#disposed) {
+                throw new RideCodexTurnError('disposed');
             }
-            throw stableTurnError(error, 'operation-failed');
+            if (this.#active !== active || active.terminal) {
+                throw stableTurnError(error, 'operation-failed');
+            }
+            throw new RideCodexTurnError('operation-failed');
         } finally {
             if (this.#active === active) {
                 active.controlPending = false;
@@ -461,7 +472,14 @@ export class RideCodexTurnCoordinator {
                 throw new RideCodexTurnError('disposed');
             }
             if (this.#active === active) {
-                this.#finishActive('failed', SAFE_FAILURE);
+                recovery = this.#beginRecovery(request.threadId, expectedGeneration);
+                this.#finishActive('interrupt-uncertain', SAFE_FAILURE, undefined, true, true);
+                await recovery;
+                return active.terminalResult ?? Object.freeze({
+                    threadId: request.threadId,
+                    turnId: request.turnId,
+                    status: 'interrupt-uncertain'
+                });
             }
             throw stableTurnError(error, 'operation-failed');
         } finally {
@@ -480,6 +498,9 @@ export class RideCodexTurnCoordinator {
             if (existing.threadId === threadId && existing.expectedGeneration === expectedGeneration) {
                 return existing.promise;
             }
+            return Promise.reject(new RideCodexTurnError('operation-superseded'));
+        }
+        if (this.#recoveryRestartQuarantine) {
             return Promise.reject(new RideCodexTurnError('operation-superseded'));
         }
         const barrier: RecoveryBarrier = {
@@ -514,8 +535,7 @@ export class RideCodexTurnCoordinator {
         const stopped = Promise.race([deadline, this.#disposedSignal]);
         stopped.catch(() => undefined);
         try {
-            const restarting = Promise.resolve(this.#host.restartForRecovery(expectedGeneration));
-            restarting.catch(() => undefined);
+            const restarting = this.#restartForRecovery(expectedGeneration, lifecycle);
             const generation = requireGeneration(await Promise.race([restarting, stopped]));
             remainingRecoveryTimeout(this.#timers, startedAt, this.#recoveryTimeoutMs);
             if (this.#disposed || lifecycle !== this.#lifecycle) {
@@ -565,6 +585,38 @@ export class RideCodexTurnCoordinator {
                 this.#releaseLease(acquiredLease);
             }, () => undefined);
         }
+    }
+
+    #restartForRecovery(expectedGeneration: number, lifecycle: number): Promise<number> {
+        const existing = this.#recoveryRestartQuarantine;
+        if (existing) {
+            if (existing.expectedGeneration === expectedGeneration && existing.lifecycle === lifecycle) {
+                return existing.promise;
+            }
+            return Promise.reject(new RideCodexTurnError('operation-superseded'));
+        }
+        let restarting: Promise<number>;
+        try {
+            if (this.#disposed || lifecycle !== this.#lifecycle) {
+                throw new RideCodexTurnError(this.#disposed ? 'disposed' : 'operation-superseded');
+            }
+            restarting = Promise.resolve(this.#host.restartForRecovery(expectedGeneration));
+        } catch (error) {
+            restarting = Promise.reject(error);
+        }
+        const quarantine: RecoveryRestartQuarantine = {
+            expectedGeneration,
+            lifecycle,
+            promise: restarting
+        };
+        const clearQuarantine = () => {
+            if (this.#recoveryRestartQuarantine === quarantine) {
+                this.#recoveryRestartQuarantine = undefined;
+            }
+        };
+        this.#recoveryRestartQuarantine = quarantine;
+        restarting.then(clearQuarantine, clearQuarantine);
+        return quarantine.promise;
     }
 
     #newActive(owner: ClientRecord, threadId: string): ActiveTurn {
@@ -1508,7 +1560,7 @@ export class RideCodexTurnCoordinator {
     }
 
     #requireNoRecovery(): void {
-        if (this.#recovery) {
+        if (this.#recovery || this.#recoveryRestartQuarantine) {
             throw new RideCodexTurnError('operation-superseded');
         }
     }
