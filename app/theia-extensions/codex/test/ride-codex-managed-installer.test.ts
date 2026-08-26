@@ -2339,28 +2339,17 @@ test('real Task 6 tree attestation protects staging and activation post-conditio
     const presentation = presentationFor('0.144.0', runtimeRoot);
     try {
         const staged = await createStagedRuntime(runtimeRoot, presentation);
-        const baseline = await attestPublishedRuntime(staged.stagingDirectory, staged.unpackedBytes);
-        const attested = Object.freeze({
-            ...staged,
-            revalidate: async () => {
-                const current = await attestPublishedRuntime(staged.stagingDirectory, staged.unpackedBytes);
-                if (current.treeDigest !== baseline.treeDigest
-                    || current.entries !== baseline.entries
-                    || current.totalReadBytes !== baseline.totalReadBytes
-                    || current.totalPathBytes !== baseline.totalPathBytes) {
-                    throw new Error('staged runtime attestation changed');
-                }
-            }
-        });
-        await writeFile(join(attested.resourcesDirectory, 'helper.bin'), 'MUTATED-STAGED-RESOURCE');
+        await writeFile(join(staged.resourcesDirectory, 'helper.bin'), 'MUTATED-STAGED-RESOURCE');
         await assert.rejects(
             withAuthorizedStoreTransaction(store, presentation, transaction => store.publish(
                 transaction,
-                attested,
+                staged,
                 presentation
             )),
             /attestation|staged|provenance|activation/i
         );
+        assert.deepEqual(await store.versions(), []);
+        assert.equal(await store.activeVersion(), undefined);
 
         const clean = await createStagedRuntime(runtimeRoot, presentation);
         await withAuthorizedStoreTransaction(store, presentation, async transaction => {
@@ -2664,6 +2653,98 @@ test('directory fsync propagates permission errors instead of treating them as u
         assert.equal(injected, true);
     } finally {
         Object.defineProperty(fsPromises, 'open', { ...Object.getOwnPropertyDescriptor(fsPromises, 'open'), value: originalOpen });
+        await rm(trustedRuntimeBase, { recursive: true, force: true });
+    }
+});
+
+test('recovery propagates EIO after quarantine deletion instead of reporting cleanup success', async () => {
+    const trustedRuntimeBase = await mkdtemp(join(tmpdir(), 'ride-codex-quarantine-recover-fsync-'));
+    const runtimeRoot = join(trustedRuntimeBase, 'managed');
+    const quarantine = join(runtimeRoot, `.install-quarantine-stale-${randomUUID()}`);
+    await mkdir(quarantine, { recursive: true });
+    await writeFile(join(quarantine, 'stale.bin'), 'stale');
+    const store = new RideCodexRuntimeStore({ trustedRuntimeBase, runtimeRoot });
+    const originalOpen = fsPromises.open;
+    let injected = false;
+    const replacement = (async (...args: readonly unknown[]) => {
+        const [path, flags] = args;
+        const quarantineExists = await stat(quarantine).then(() => true, () => false);
+        if (!injected && path === runtimeRoot && flags === fsConstants.O_RDONLY && !quarantineExists) {
+            injected = true;
+            const error = new Error('simulated post-delete directory fsync EIO') as NodeJS.ErrnoException;
+            error.code = 'EIO';
+            throw error;
+        }
+        return Reflect.apply(originalOpen, fsPromises, args);
+    }) as typeof fsPromises.open;
+    try {
+        Object.defineProperty(fsPromises, 'open', { ...Object.getOwnPropertyDescriptor(fsPromises, 'open'), value: replacement });
+        await assert.rejects(store.recover(), /EIO|fsync|input\/output/i);
+        assert.equal(injected, true);
+    } finally {
+        Object.defineProperty(fsPromises, 'open', { ...Object.getOwnPropertyDescriptor(fsPromises, 'open'), value: originalOpen });
+    }
+    try {
+        await store.recover();
+        assert.equal(await stat(quarantine).then(() => true, () => false), false);
+    } finally {
+        await rm(trustedRuntimeBase, { recursive: true, force: true });
+    }
+});
+
+test('finalize propagates EACCES after journal quarantine deletion and restores recovery authority', async () => {
+    const trustedRuntimeBase = await mkdtemp(join(tmpdir(), 'ride-codex-quarantine-finalize-fsync-'));
+    const runtimeRoot = join(trustedRuntimeBase, 'managed');
+    const store = new RideCodexRuntimeStore({ trustedRuntimeBase, runtimeRoot });
+    const consent = new RideCodexInstallConsent();
+    const originalOpen = fsPromises.open;
+    let sawCommittedJournal = false;
+    let injected = false;
+    try {
+        await createInstaller(runtimeRoot, consent, store).install(
+            consent.issue(presentationFor('0.143.0', runtimeRoot))
+        );
+        const replacement = (async (...args: readonly unknown[]) => {
+            const [path, flags] = args;
+            if (path === runtimeRoot && flags === fsConstants.O_RDONLY) {
+                const entries = await readdir(runtimeRoot);
+                const hasCommittedJournal = entries.some(name => name.startsWith('.install-quarantine-pending-'));
+                sawCommittedJournal ||= hasCommittedJournal;
+                if (!injected && sawCommittedJournal && !hasCommittedJournal) {
+                    injected = true;
+                    const error = new Error('simulated post-delete directory fsync EACCES') as NodeJS.ErrnoException;
+                    error.code = 'EACCES';
+                    throw error;
+                }
+            }
+            return Reflect.apply(originalOpen, fsPromises, args);
+        }) as typeof fsPromises.open;
+        Object.defineProperty(fsPromises, 'open', { ...Object.getOwnPropertyDescriptor(fsPromises, 'open'), value: replacement });
+        await assert.rejects(
+            createInstaller(runtimeRoot, consent, store).install(
+                consent.issue(presentationFor('0.144.0', runtimeRoot))
+            ),
+            /finalize|rollback|activation/i
+        );
+        assert.equal(injected, true);
+        const entries = await readdir(runtimeRoot);
+        assert.equal(
+            entries.includes('pending-activation.json')
+                || entries.some(name => name.startsWith('.install-quarantine-pending-')),
+            true
+        );
+    } finally {
+        Object.defineProperty(fsPromises, 'open', { ...Object.getOwnPropertyDescriptor(fsPromises, 'open'), value: originalOpen });
+    }
+    try {
+        await new RideCodexRuntimeStore({ trustedRuntimeBase, runtimeRoot }).recover();
+        assert.equal(await store.activeVersion(), '0.144.0');
+        assert.equal(
+            (await readdir(runtimeRoot)).some(name => name === 'pending-activation.json'
+                || name.startsWith('.install-quarantine-pending-')),
+            false
+        );
+    } finally {
         await rm(trustedRuntimeBase, { recursive: true, force: true });
     }
 });
@@ -2988,7 +3069,7 @@ test('direct finalize without a same-transaction handshake completion is rejecte
     }
 });
 
-test('obsolete cleanup is private and an empty retain set cannot delete the active runtime', async () => {
+test('runtime store prototype exposes only controlled public operations', async () => {
     const trustedRuntimeBase = await mkdtemp(join(tmpdir(), 'ride-codex-cleanup-sealed-'));
     const runtimeRoot = join(trustedRuntimeBase, 'managed');
     const store = new RideCodexRuntimeStore({ trustedRuntimeBase, runtimeRoot });
@@ -2997,11 +3078,29 @@ test('obsolete cleanup is private and an empty retain set cannot delete the acti
         await createInstaller(runtimeRoot, consent, store).install(
             consent.issue(presentationFor('0.144.0', runtimeRoot))
         );
-        assert.equal(
-            (store as unknown as { cleanupObsolete?: unknown }).cleanupObsolete,
-            undefined
+        const publicOperations = [
+            'activate',
+            'activeVersion',
+            'completeHandshake',
+            'discard',
+            'finalizeActivation',
+            'publish',
+            'readActiveRuntime',
+            'recover',
+            'restore',
+            'revalidate',
+            'versions',
+            'withAuthorizedTransaction'
+        ];
+        assert.deepEqual(
+            Object.getOwnPropertyNames(RideCodexRuntimeStore.prototype)
+                .filter(name => name !== 'constructor')
+                .sort(),
+            publicOperations
         );
         assert.equal(await store.activeVersion(), '0.144.0');
+        assert.deepEqual(await store.versions(), ['0.144.0']);
+        assert.equal(await stat(join(runtimeRoot, 'pending-activation.json')).then(() => true, () => false), false);
     } finally {
         await rm(trustedRuntimeBase, { recursive: true, force: true });
     }
