@@ -184,7 +184,7 @@ export class RideCodexAppServerHost {
     readonly #leases = new Map<number, LeaseRecord>();
     readonly #notificationListeners = new Set<(notification: RideCodexNotification, generation: number) => void>();
     readonly #stateListeners = new Set<(event: RideCodexAppServerHostStateEvent) => void>();
-    readonly #serverRequestListeners = new Set<(request: RideCodexIncomingRequest) => void>();
+    readonly #serverRequestListeners = new Set<(request: RideCodexIncomingRequest, generation: number) => void>();
     #state: RideCodexAppServerState = 'stopped';
     #generation = 0;
     #nextLeaseId = 1;
@@ -332,8 +332,28 @@ export class RideCodexAppServerHost {
         return addListener(this.#stateListeners, listener);
     }
 
-    onServerRequest(listener: (request: RideCodexIncomingRequest) => void): RideCodexDisposable {
-        return addListener(this.#serverRequestListeners, listener);
+    onServerRequest(listener: (request: RideCodexIncomingRequest, generation: number) => void): RideCodexDisposable {
+        this.#serverRequestListeners.add(listener);
+        let disposed = false;
+        return {
+            dispose: () => {
+                if (!disposed) {
+                    disposed = true;
+                    this.#serverRequestListeners.delete(listener);
+                }
+            }
+        };
+    }
+
+    respondServerRequest(generation: number, id: string | number, result: unknown): Promise<void> {
+        const connection = this.#connection;
+        if (!Number.isSafeInteger(generation) || generation < 1
+            || this.#state !== 'ready' || generation !== this.#generation
+            || !connection || connection.generation !== generation
+            || !connection.ready || connection.finalized) {
+            return Promise.reject(new RideCodexAppServerHostError('recovery-superseded'));
+        }
+        return connection.client.respondConfirmed(id, result);
     }
 
     snapshot(): RideCodexAppServerHostSnapshot {
@@ -578,7 +598,7 @@ export class RideCodexAppServerHost {
             child.stderr.resume();
             clientListeners.push(
                 client.onNotification(notification => this.#emitNotification(notification, generation)),
-                client.onServerRequest(request => this.#emitSafely(this.#serverRequestListeners, request))
+                client.onServerRequest(request => this.#emitServerRequest(request, generation))
             );
         } catch (error) {
             for (const listener of clientListeners) {
@@ -857,6 +877,16 @@ export class RideCodexAppServerHost {
                 listener(notification, generation);
             } catch {
                 // Downstream listeners must not own or destabilize the shared process.
+            }
+        }
+    }
+
+    #emitServerRequest(request: RideCodexIncomingRequest, generation: number): void {
+        for (const listener of [...this.#serverRequestListeners]) {
+            try {
+                listener(request, generation);
+            } catch {
+                // Approval listeners cannot own or destabilize the shared process.
             }
         }
     }

@@ -12,6 +12,8 @@ import {
     RideCodexAuthClient,
     RideCodexAuthService,
     RideCodexAuthServicePath,
+    RideCodexApprovalClient,
+    RideCodexApprovalsServicePath,
     RideCodexConversationsClient,
     RideCodexConversationsService,
     RideCodexConversationsServicePath,
@@ -24,6 +26,7 @@ import { RideCodexAppServerDiagnostics } from './ride-codex-diagnostics';
 import { RideCodexRuntimeResolver } from './ride-codex-runtime-resolver';
 import { RideCodexThreadCoordinator } from './ride-codex-thread-coordinator';
 import { RideCodexTurnCoordinator } from './ride-codex-turn-coordinator';
+import { RideCodexApprovalBroker } from './ride-codex-approval-broker';
 
 export default new ContainerModule(bind => {
     bind(RideCodexRuntimeResolver).toSelf().inSingletonScope();
@@ -69,6 +72,17 @@ export default new ContainerModule(bind => {
             const coordinator = context.container.get(RideCodexTurnCoordinator);
             const session = coordinator.connectClient(client);
             client.onDidCloseConnection(() => session.disconnectClient());
+            return session;
+        })
+    ).inSingletonScope();
+    bind(RideCodexApprovalBroker).toDynamicValue(context => new RideCodexApprovalBroker({
+        host: context.container.get(RideCodexAppServerHost)
+    })).inSingletonScope();
+    bind(BackendApplicationContribution).toService(RideCodexApprovalBroker);
+    bind(ConnectionHandler).toDynamicValue(context =>
+        new JsonRpcConnectionHandler<RideCodexApprovalClient>(RideCodexApprovalsServicePath, client => {
+            const session = context.container.get(RideCodexApprovalBroker).connectClient(client);
+            client.onDidCloseConnection(() => session.dispose());
             return session;
         })
     ).inSingletonScope();

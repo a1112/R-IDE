@@ -42,6 +42,9 @@ interface MutableItem {
     summaries: string[];
     reasoning: string[];
     changes: RideCodexFileChange[];
+    omittedUtf8Bytes: number;
+    omittedChanges: number;
+    omittedPaths: number;
 }
 
 interface TurnAuthority {
@@ -76,6 +79,7 @@ const MAX_WIRE_DEPTH = 16;
 const MAX_WIRE_NODES = 8_192;
 const MAX_WIRE_ARRAY_ITEMS = 8_192;
 const MAX_WIRE_OBJECT_KEYS = 128;
+const REDUCER_ITEMS = new WeakSet<object>();
 const EMPTY_SNAPSHOT: RideCodexTurnSnapshot = deepFreezeRideCodex({
     generation: 0,
     status: 'idle' as const,
@@ -527,7 +531,7 @@ export class RideCodexEventReducer {
         if (this.#items.has(id)) {
             return false;
         }
-        this.#items.set(id, { id, kind, state: 'started', text: '', summaries: [], reasoning: [], changes: [] });
+        this.#items.set(id, newMutableItem(id, kind));
         this.#trimItemsByCount();
         return true;
     }
@@ -544,7 +548,7 @@ export class RideCodexEventReducer {
     #item(id: string, kind: RideCodexItemKind): MutableItem {
         let item = this.#items.get(id);
         if (!item) {
-            item = { id, kind, state: 'started', text: '', summaries: [], reasoning: [], changes: [] };
+            item = newMutableItem(id, kind);
             this.#items.set(id, item);
             this.#trimItemsByCount();
         }
@@ -556,6 +560,12 @@ export class RideCodexEventReducer {
         const combined = item.text + delta;
         const available = this.#availableItemBytes(item, utf8ByteLength(item.text));
         const next = truncateUtf8(combined, available);
+        if (next !== combined) {
+            item.omittedUtf8Bytes = saturatingAdd(
+                item.omittedUtf8Bytes,
+                utf8ByteLength(combined) - utf8ByteLength(next)
+            );
+        }
         const warned = next !== combined && this.#warnItemTruncated(id);
         if (next === item.text) {
             return warned;
@@ -626,6 +636,9 @@ export class RideCodexEventReducer {
         const bounded = boundFileChanges(changes, available);
         const changed = !sameFileChanges(item.changes, bounded.changes);
         item.changes = bounded.changes;
+        item.omittedUtf8Bytes = bounded.omittedUtf8Bytes;
+        item.omittedChanges = bounded.omittedChanges;
+        item.omittedPaths = bounded.omittedPaths;
         const warned = bounded.truncated && this.#warnItemTruncated(id);
         return warned || changed;
     }
@@ -845,15 +858,27 @@ export class RideCodexEventReducer {
     }
 
     #buildSnapshot(): RideCodexTurnSnapshot {
-        const items: RideCodexRenderedItem[] = [...this.#items.values()].map(item => ({
-            id: item.id,
-            kind: item.kind,
-            state: item.state,
-            text: item.text,
-            summaries: [...item.summaries],
-            reasoning: [...item.reasoning],
-            changes: item.changes.map(change => ({ ...change }))
-        }));
+        const items: RideCodexRenderedItem[] = [...this.#items.values()].map(item => {
+            const rendered: RideCodexRenderedItem = {
+                id: item.id,
+                kind: item.kind,
+                state: item.state,
+                text: item.text,
+                summaries: [...item.summaries],
+                reasoning: [...item.reasoning],
+                changes: item.changes.map(change => ({ ...change })),
+                ...(item.omittedUtf8Bytes === 0 && item.omittedChanges === 0 && item.omittedPaths === 0
+                    ? {} : {
+                        truncation: {
+                            omittedUtf8Bytes: item.omittedUtf8Bytes,
+                            omittedChanges: item.omittedChanges,
+                            omittedPaths: item.omittedPaths
+                        }
+                    })
+            };
+            REDUCER_ITEMS.add(rendered);
+            return rendered;
+        });
         return deepFreezeRideCodex({
             generation: this.#generation,
             ...(this.#threadId === undefined ? {} : { threadId: this.#threadId }),
@@ -873,6 +898,10 @@ export class RideCodexEventReducer {
         return this.#status === 'completed' || this.#status === 'failed'
             || this.#status === 'interrupted' || this.#status === 'interrupt-uncertain';
     }
+}
+
+export function isRideCodexReducerItem(value: unknown): value is RideCodexRenderedItem {
+    return !!value && typeof value === 'object' && REDUCER_ITEMS.has(value as object);
 }
 
 function defaultScheduleFrame(callback: () => void): RideCodexFrameDisposable {
@@ -1117,6 +1146,21 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
     return prototype === Object.prototype || !prototype;
 }
 
+function newMutableItem(id: string, kind: RideCodexItemKind): MutableItem {
+    return {
+        id,
+        kind,
+        state: 'started',
+        text: '',
+        summaries: [],
+        reasoning: [],
+        changes: [],
+        omittedUtf8Bytes: 0,
+        omittedChanges: 0,
+        omittedPaths: 0
+    };
+}
+
 function itemPayloadBytes(item: MutableItem): number {
     return utf8ByteLength(item.text)
         + (item.summaries.length + item.reasoning.length + item.changes.length) * RETAINED_ARRAY_SLOT_BYTES
@@ -1140,7 +1184,13 @@ function fileChangeStringBytes(changes: readonly RideCodexFileChange[]): number 
 function boundFileChanges(
     changes: readonly RideCodexFileChange[],
     maxBytes: number
-): { readonly changes: RideCodexFileChange[]; readonly truncated: boolean } {
+): Readonly<{
+    changes: RideCodexFileChange[];
+    truncated: boolean;
+    omittedUtf8Bytes: number;
+    omittedChanges: number;
+    omittedPaths: number;
+}> {
     const bounded: RideCodexFileChange[] = [];
     let remaining = maxBytes;
     let truncated = false;
@@ -1194,7 +1244,26 @@ function boundFileChanges(
     if (bounded.length < changes.length) {
         truncated = true;
     }
-    return { changes: bounded, truncated };
+    let omittedPaths = 0;
+    for (let index = 0; index < bounded.length; index += 1) {
+        const boundedChange = bounded[index];
+        const sourceChange = changes[index];
+        if (boundedChange.path !== sourceChange.path) {
+            omittedPaths += 1;
+        }
+        const boundedMove = boundedChange.kind === 'update' ? boundedChange.movePath : undefined;
+        const sourceMove = sourceChange.kind === 'update' ? sourceChange.movePath : undefined;
+        if (boundedMove !== sourceMove && typeof sourceMove === 'string') {
+            omittedPaths += 1;
+        }
+    }
+    return {
+        changes: bounded,
+        truncated,
+        omittedUtf8Bytes: Math.max(0, fileChangeStringBytes(changes) - fileChangeStringBytes(bounded)),
+        omittedChanges: changes.length - bounded.length,
+        omittedPaths
+    };
 }
 
 function sameFileChanges(

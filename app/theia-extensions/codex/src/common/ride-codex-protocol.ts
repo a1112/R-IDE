@@ -29,6 +29,13 @@ import type {
     RideCodexTurnStartRequest,
     RideCodexTurnSteerRequest
 } from './ride-codex-events';
+import type {
+    RideCodexApprovalClient as RideCodexApprovalClientModel,
+    RideCodexApprovalContext,
+    RideCodexApprovalDecisionRequest,
+    RideCodexApprovalDecisionResult,
+    RideCodexApprovalCard
+} from './ride-codex-approvals';
 
 export const RideCodexServicePath = '/services/ride-codex';
 export const RideCodexService = Symbol('RideCodexService');
@@ -84,4 +91,17 @@ export interface RideCodexTurnsService extends RpcServer<RideCodexTurnClient> {
     steerTurn(request: RideCodexTurnSteerRequest): Promise<RideCodexTurnResult>;
     interruptTurn(request: RideCodexTurnInterruptRequest): Promise<RideCodexTurnResult>;
     disconnectClient(): void;
+}
+
+export const RideCodexApprovalsServicePath = '/services/ride-codex-approvals';
+export const RideCodexApprovalsService = Symbol('RideCodexApprovalsService');
+export const RideCodexApprovalClient = Symbol('RideCodexApprovalClient');
+
+export interface RideCodexApprovalClient extends RideCodexApprovalClientModel { }
+
+export interface RideCodexApprovalsService extends RpcServer<RideCodexApprovalClient> {
+    setContext(context: RideCodexApprovalContext): Promise<void>;
+    disposeContext(): Promise<void>;
+    approvals(): Promise<readonly RideCodexApprovalCard[]>;
+    decide(request: RideCodexApprovalDecisionRequest): Promise<RideCodexApprovalDecisionResult>;
 }

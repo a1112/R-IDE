@@ -163,6 +163,23 @@ export class RideCodexJsonlClient implements RideCodexDisposable {
         ));
     }
 
+    respondConfirmed(id: RideCodexRequestId, result: unknown): Promise<void> {
+        if (this.closed) {
+            return containedRejection(this.closedRequestError());
+        }
+        let payload: string;
+        try {
+            validateOutboundRequestId(id);
+            payload = serializeEnvelope(
+                { id, result: result === undefined ? null : result },
+                ['id', 'result']
+            );
+        } catch {
+            return containedRejection(new Error('Unable to serialize Codex response'));
+        }
+        return this.writePayloadConfirmed(payload);
+    }
+
     notify(method: RideCodexClientNotificationMethod, params: unknown): void {
         if (this.closed) {
             throw this.closedRequestError();

@@ -160,6 +160,13 @@ export interface RideCodexRenderedItem {
     readonly summaries: readonly string[];
     readonly reasoning: readonly string[];
     readonly changes: readonly RideCodexFileChange[];
+    readonly truncation?: RideCodexRenderTruncation;
+}
+
+export interface RideCodexRenderTruncation {
+    readonly omittedUtf8Bytes: number;
+    readonly omittedChanges: number;
+    readonly omittedPaths: number;
 }
 
 export interface RideCodexRenderedPlan {

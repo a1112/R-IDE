@@ -31,7 +31,9 @@ import { RideCodexRuntimeResolver } from '../src/node/ride-codex-runtime-resolve
 import { RideCodexAuthBroker } from '../src/node/ride-codex-auth-broker';
 import { RideCodexThreadCoordinator } from '../src/node/ride-codex-thread-coordinator';
 import { RideCodexTurnCoordinator } from '../src/node/ride-codex-turn-coordinator';
+import { RideCodexApprovalBroker } from '../src/node/ride-codex-approval-broker';
 import {
+    RideCodexApprovalsServicePath,
     RideCodexAuthService,
     RideCodexConversationsService
 } from '../src/common/ride-codex-protocol';
@@ -76,6 +78,7 @@ interface ControlledChild {
     readonly child: ChildProcessWithoutNullStreams;
     readonly killCalls: () => number;
     readonly emitExit: () => void;
+    readonly writes: readonly unknown[];
 }
 
 let nextControlledPid = 50_000;
@@ -87,6 +90,7 @@ function createControlledChild(options: {
     const events = new EventEmitter();
     const stdout = new PassThrough();
     const stderr = new PassThrough();
+    const writes: unknown[] = [];
     let input = '';
     const stdin = new Writable({
         autoDestroy: false,
@@ -97,7 +101,8 @@ function createControlledChild(options: {
                 const line = input.slice(0, newline);
                 input = input.slice(newline + 1);
                 if (line) {
-                    const message = JSON.parse(line) as { id?: number; method?: string; params?: unknown };
+                    const message = JSON.parse(line) as { id?: number | string; method?: string; params?: unknown };
+                    writes.push(message);
                     if (message.method === 'initialize') {
                         stdout.write(`${JSON.stringify({ id: message.id, result: { initializeParams: message.params } })}\n`);
                     }
@@ -137,7 +142,7 @@ function createControlledChild(options: {
         setTimeout(() => setImmediate(emitExit), options.shutdownGraceMs + 1);
         return true;
     }) as typeof child.kill;
-    return { child, killCalls: () => kills, emitExit };
+    return { child, killCalls: () => kills, emitExit, writes };
 }
 
 function createControlledHost(options: {
@@ -245,6 +250,9 @@ test('constructors and backend singleton bindings stay inert until first acquire
     const turns = container.get(RideCodexTurnCoordinator);
     assert.strictEqual(turns, container.get(RideCodexTurnCoordinator));
     assert.ok(container.getAll(BackendApplicationContribution).includes(turns));
+    const approvals = container.get(RideCodexApprovalBroker);
+    assert.strictEqual(approvals, container.get(RideCodexApprovalBroker));
+    assert.ok(container.getAll(BackendApplicationContribution).includes(approvals));
     assert.equal(authBroker.snapshot().state, 'inactive');
     assert.equal(boundHost.snapshot().state, 'stopped');
     assert.ok((container.getAll(ConnectionHandler) as ConnectionHandler[])
@@ -253,6 +261,8 @@ test('constructors and backend singleton bindings stay inert until first acquire
         .some(handler => handler.path === '/services/ride-codex-conversations'));
     assert.ok((container.getAll(ConnectionHandler) as ConnectionHandler[])
         .some(handler => handler.path === '/services/ride-codex-turns'));
+    assert.ok((container.getAll(ConnectionHandler) as ConnectionHandler[])
+        .some(handler => handler.path === RideCodexApprovalsServicePath));
 
     const lease = await direct.host.acquire('foreground-panel');
     assert.equal(lease.generation, 1);
@@ -295,6 +305,43 @@ test('state and notification observers receive immutable generation-tagged event
     lease.release();
     await harness.host.dispose();
     assert.equal(states.length, stateCount);
+});
+
+test('server requests carry their process generation and responses cannot cross generations', async () => {
+    const harness = createControlledHost({ shutdownGraceMs: 20 });
+    const requests: Array<Readonly<{ id: string | number; method: string; generation: number }>> = [];
+    harness.host.onServerRequest((request: Readonly<{
+        id: string | number;
+        method: string;
+        params: unknown;
+    }>, generation: number) => {
+        requests.push(Object.freeze({ id: request.id, method: request.method, generation }));
+    });
+    const lease = await harness.host.acquire('approval');
+
+    (harness.children[0].child.stdout as PassThrough).write(`${JSON.stringify({
+        id: 'approval-1',
+        method: 'item/commandExecution/requestApproval',
+        params: {}
+    })}\n`);
+    await waitFor(() => requests.length === 1);
+    assert.deepEqual(requests, [{
+        id: 'approval-1', method: 'item/commandExecution/requestApproval', generation: 1
+    }]);
+
+    await harness.host.respondServerRequest(1, 'approval-1', { decision: 'accept' });
+    assert.deepEqual(harness.children[0].writes[harness.children[0].writes.length - 1], {
+        id: 'approval-1', result: { decision: 'accept' }
+    });
+    const writesBeforeStaleResponse = harness.children[0].writes.length;
+    await assert.rejects(
+        harness.host.respondServerRequest(2, 'approval-stale', { decision: 'decline' }),
+        /generation|superseded/i
+    );
+    assert.equal(harness.children[0].writes.length, writesBeforeStaleResponse);
+
+    lease.release();
+    await harness.host.dispose();
 });
 
 test('concurrent panel, thread, and approval acquires share one resolver result, process, and RPC connection', async () => {
