@@ -99,11 +99,62 @@ const AUTH_STATES = new Set<RideCodexAuthState>([
     'inactive', 'disconnected', 'unauthenticated', 'authenticating', 'authenticated', 'error'
 ]);
 
-export function normalizeRideCodexAccount(value: unknown): RideCodexAuthAccount | undefined {
+export interface RideCodexAuthObjectInspector {
+    readonly isProxy: (value: object) => boolean;
+}
+
+export interface RideCodexAuthNormalizers {
+    normalizeRideCodexAccount(value: unknown): RideCodexAuthAccount | undefined;
+    normalizeRideCodexAccountReadResult(value: unknown): RideCodexAccountReadResult;
+    normalizeRideCodexCancelResult(value: unknown): 'canceled' | 'notFound';
+    normalizeRideCodexLoginCompletion(value: unknown): Readonly<{ loginId?: string; success: boolean }>;
+    normalizeRideCodexAccountUpdate(value: unknown): RideCodexAuthAccount | undefined;
+    normalizeRideCodexLoginResult(value: unknown): RideCodexLoginResult;
+    normalizeRideCodexRateLimits(value: unknown): RideCodexRateLimits | undefined;
+    normalizeRideCodexRateLimitUpdate(value: unknown): RideCodexRateLimitBucket;
+    normalizeRideCodexLoginRequest(value: unknown): RideCodexLoginRequest;
+    createRideCodexAuthSnapshot(value: RideCodexAuthSnapshot): RideCodexAuthSnapshot;
+}
+
+export class RideCodexUnsafeAuthPayloadError extends TypeError {
+    constructor() {
+        super('Codex authentication data contains an unsafe Proxy');
+        this.name = 'RideCodexUnsafeAuthPayloadError';
+    }
+}
+
+type RideCodexProxyPredicate = (value: object) => boolean;
+
+export function createRideCodexAuthNormalizers(inspector: RideCodexAuthObjectInspector): RideCodexAuthNormalizers {
+    const isProxy = inspector.isProxy;
+    if (typeof isProxy !== 'function') {
+        throw new TypeError('Codex auth object inspector is invalid');
+    }
+    const normalizers: RideCodexAuthNormalizers = {
+        normalizeRideCodexAccount: value => normalizeRideCodexAccount(value, isProxy),
+        normalizeRideCodexAccountReadResult: value => normalizeRideCodexAccountReadResult(value, isProxy),
+        normalizeRideCodexCancelResult: value => normalizeRideCodexCancelResult(value, isProxy),
+        normalizeRideCodexLoginCompletion: value => normalizeRideCodexLoginCompletion(value, isProxy),
+        normalizeRideCodexAccountUpdate: value => normalizeRideCodexAccountUpdate(value, isProxy),
+        normalizeRideCodexLoginResult: value => normalizeRideCodexLoginResult(value, isProxy),
+        normalizeRideCodexRateLimits: value => normalizeRideCodexRateLimits(value, isProxy),
+        normalizeRideCodexRateLimitUpdate: value => normalizeRideCodexRateLimitUpdate(value, isProxy),
+        normalizeRideCodexLoginRequest: value => normalizeRideCodexLoginRequest(value, isProxy),
+        createRideCodexAuthSnapshot: value => createRideCodexAuthSnapshot(value, isProxy)
+    };
+    return Object.freeze(normalizers);
+}
+
+export const trustedRideCodexAuthNormalizers = createRideCodexAuthNormalizers({ isProxy: () => false });
+
+function normalizeRideCodexAccount(
+    value: unknown,
+    isProxy: RideCodexProxyPredicate
+): RideCodexAuthAccount | undefined {
     if (value === null || value === undefined) {
         return undefined;
     }
-    const record = requireRecord(value, 'account');
+    const record = requireRecord(value, 'account', isProxy);
     const type = requireString(readOwn(record, 'type'), 'account type', 32);
     if (type === 'apiKey') {
         requireOnlyKeys(record, ['type'], 'API key account');
@@ -121,17 +172,20 @@ export function normalizeRideCodexAccount(value: unknown): RideCodexAuthAccount 
     return Object.freeze({ type: 'chatgpt', ...(email === undefined ? {} : { email }), plan });
 }
 
-export function normalizeRideCodexAccountReadResult(value: unknown): RideCodexAccountReadResult {
-    const record = requireRecord(value, 'account response');
+function normalizeRideCodexAccountReadResult(
+    value: unknown,
+    isProxy: RideCodexProxyPredicate
+): RideCodexAccountReadResult {
+    const record = requireRecord(value, 'account response', isProxy);
     requireOnlyKeys(record, ['account', 'requiresOpenaiAuth'], 'account response');
     return Object.freeze({
-        account: normalizeRideCodexAccount(readOwn(record, 'account')),
+        account: normalizeRideCodexAccount(readOwn(record, 'account'), isProxy),
         requiresOpenaiAuth: requireBoolean(readOwn(record, 'requiresOpenaiAuth'), 'OpenAI auth requirement')
     });
 }
 
-export function normalizeRideCodexCancelResult(value: unknown): 'canceled' | 'notFound' {
-    const record = requireRecord(value, 'cancel-login response');
+function normalizeRideCodexCancelResult(value: unknown, isProxy: RideCodexProxyPredicate): 'canceled' | 'notFound' {
+    const record = requireRecord(value, 'cancel-login response', isProxy);
     requireOnlyKeys(record, ['status'], 'cancel-login response');
     const status = readOwn(record, 'status');
     if (status !== 'canceled' && status !== 'notFound') {
@@ -140,11 +194,11 @@ export function normalizeRideCodexCancelResult(value: unknown): 'canceled' | 'no
     return status;
 }
 
-export function normalizeRideCodexLoginCompletion(value: unknown): Readonly<{
+function normalizeRideCodexLoginCompletion(value: unknown, isProxy: RideCodexProxyPredicate): Readonly<{
     loginId?: string;
     success: boolean;
 }> {
-    const record = requireRecord(value, 'login completion');
+    const record = requireRecord(value, 'login completion', isProxy);
     requireOnlyKeys(record, ['loginId', 'success', 'error'], 'login completion');
     const loginIdValue = readOwn(record, 'loginId');
     const loginId = loginIdValue === null || loginIdValue === undefined
@@ -156,8 +210,11 @@ export function normalizeRideCodexLoginCompletion(value: unknown): Readonly<{
     });
 }
 
-export function normalizeRideCodexAccountUpdate(value: unknown): RideCodexAuthAccount | undefined {
-    const record = requireRecord(value, 'account update');
+function normalizeRideCodexAccountUpdate(
+    value: unknown,
+    isProxy: RideCodexProxyPredicate
+): RideCodexAuthAccount | undefined {
+    const record = requireRecord(value, 'account update', isProxy);
     requireOnlyKeys(record, ['authMode', 'planType'], 'account update');
     const authMode = readOwn(record, 'authMode');
     const planValue = readOwn(record, 'planType');
@@ -182,8 +239,8 @@ export function normalizeRideCodexAccountUpdate(value: unknown): RideCodexAuthAc
     throw new TypeError('Unsupported Codex account auth mode');
 }
 
-export function normalizeRideCodexLoginResult(value: unknown): RideCodexLoginResult {
-    const record = requireRecord(value, 'login result');
+function normalizeRideCodexLoginResult(value: unknown, isProxy: RideCodexProxyPredicate): RideCodexLoginResult {
+    const record = requireRecord(value, 'login result', isProxy);
     const type = requireString(readOwn(record, 'type'), 'login type', 32);
     if (type === 'apiKey') {
         requireOnlyKeys(record, ['type'], 'API key login result');
@@ -209,23 +266,26 @@ export function normalizeRideCodexLoginResult(value: unknown): RideCodexLoginRes
     throw new TypeError('Unsupported Codex login result type');
 }
 
-export function normalizeRideCodexRateLimits(value: unknown): RideCodexRateLimits | undefined {
+function normalizeRideCodexRateLimits(
+    value: unknown,
+    isProxy: RideCodexProxyPredicate
+): RideCodexRateLimits | undefined {
     if (value === null || value === undefined) {
         return undefined;
     }
-    const response = requireRecord(value, 'rate-limit response');
+    const response = requireRecord(value, 'rate-limit response', isProxy);
     requireOnlyKeys(response, [
         'rateLimits', 'rateLimitsByLimitId', 'rateLimitResetCredits'
     ], 'rate-limit response');
-    const current = normalizeRateLimitBucket(readOwn(response, 'rateLimits'));
+    const current = normalizeRateLimitBucket(readOwn(response, 'rateLimits'), isProxy);
     const byLimitValue = readOwn(response, 'rateLimitsByLimitId');
     const resetCreditsValue = readOwn(response, 'rateLimitResetCredits');
     const byLimitId = byLimitValue === null || byLimitValue === undefined
         ? undefined
-        : normalizeRateLimitRecord(byLimitValue);
+        : normalizeRateLimitRecord(byLimitValue, isProxy);
     const resetCredits = resetCreditsValue === null || resetCreditsValue === undefined
         ? undefined
-        : normalizeResetCredits(resetCreditsValue);
+        : normalizeResetCredits(resetCreditsValue, isProxy);
     return Object.freeze({
         ...current,
         ...(byLimitId === undefined ? {} : { byLimitId }),
@@ -233,14 +293,17 @@ export function normalizeRideCodexRateLimits(value: unknown): RideCodexRateLimit
     });
 }
 
-export function normalizeRideCodexRateLimitUpdate(value: unknown): RideCodexRateLimitBucket {
-    const notification = requireRecord(value, 'rate-limit notification');
+function normalizeRideCodexRateLimitUpdate(
+    value: unknown,
+    isProxy: RideCodexProxyPredicate
+): RideCodexRateLimitBucket {
+    const notification = requireRecord(value, 'rate-limit notification', isProxy);
     requireOnlyKeys(notification, ['rateLimits'], 'rate-limit notification');
-    return normalizeRateLimitBucket(readOwn(notification, 'rateLimits'));
+    return normalizeRateLimitBucket(readOwn(notification, 'rateLimits'), isProxy);
 }
 
-export function normalizeRideCodexLoginRequest(request: unknown): RideCodexLoginRequest {
-    const record = requireRecord(request, 'login request');
+function normalizeRideCodexLoginRequest(request: unknown, isProxy: RideCodexProxyPredicate): RideCodexLoginRequest {
+    const record = requireRecord(request, 'login request', isProxy);
     const type = requireString(readOwn(record, 'type'), 'login type', 32);
     if (type === 'apiKey') {
         requireOnlyKeys(record, ['type', 'apiKey'], 'API key login request');
@@ -257,17 +320,20 @@ export function normalizeRideCodexLoginRequest(request: unknown): RideCodexLogin
     throw new TypeError('Unsupported Codex login type');
 }
 
-export function createRideCodexAuthSnapshot(value: RideCodexAuthSnapshot): RideCodexAuthSnapshot {
-    const record = requireRecord(value, 'auth snapshot');
+function createRideCodexAuthSnapshot(
+    value: RideCodexAuthSnapshot,
+    isProxy: RideCodexProxyPredicate
+): RideCodexAuthSnapshot {
+    const record = requireRecord(value, 'auth snapshot', isProxy);
     requireOnlyKeys(record, ['state', 'account', 'rateLimits', 'pendingLogin', 'error'], 'auth snapshot');
     const state = readOwn(record, 'state');
     if (typeof state !== 'string' || !AUTH_STATES.has(state as RideCodexAuthState)) {
         throw new TypeError('Unsupported Codex auth state');
     }
-    const account = normalizePublicAccount(readOwn(record, 'account'));
-    const rateLimits = normalizePublicRateLimits(readOwn(record, 'rateLimits'));
-    const pendingLogin = normalizePendingLogin(readOwn(record, 'pendingLogin'));
-    const error = normalizeAuthError(readOwn(record, 'error'));
+    const account = normalizePublicAccount(readOwn(record, 'account'), isProxy);
+    const rateLimits = normalizePublicRateLimits(readOwn(record, 'rateLimits'), isProxy);
+    const pendingLogin = normalizePendingLogin(readOwn(record, 'pendingLogin'), isProxy);
+    const error = normalizeAuthError(readOwn(record, 'error'), isProxy);
     if (state === 'authenticated' && account === undefined) {
         throw new TypeError('Authenticated Codex state requires an account');
     }
@@ -283,17 +349,17 @@ export function createRideCodexAuthSnapshot(value: RideCodexAuthSnapshot): RideC
     });
 }
 
-function normalizeRateLimitBucket(value: unknown): RideCodexRateLimitBucket {
-    const record = requireRecord(value, 'rate-limit bucket');
+function normalizeRateLimitBucket(value: unknown, isProxy: RideCodexProxyPredicate): RideCodexRateLimitBucket {
+    const record = requireRecord(value, 'rate-limit bucket', isProxy);
     requireOnlyKeys(record, [
         'limitId', 'limitName', 'primary', 'secondary', 'credits', 'individualLimit',
         'planType', 'rateLimitReachedType'
     ], 'rate-limit bucket');
     const limitId = optionalString(readOwn(record, 'limitId'), 'rate-limit ID', MAX_IDENTIFIER_LENGTH);
     const limitName = optionalString(readOwn(record, 'limitName'), 'rate-limit name', MAX_LABEL_LENGTH);
-    const primary = optionalWindow(readOwn(record, 'primary'));
-    const secondary = optionalWindow(readOwn(record, 'secondary'));
-    const credits = optionalCredits(readOwn(record, 'credits'));
+    const primary = optionalWindow(readOwn(record, 'primary'), isProxy);
+    const secondary = optionalWindow(readOwn(record, 'secondary'), isProxy);
+    const credits = optionalCredits(readOwn(record, 'credits'), isProxy);
     const planValue = readOwn(record, 'planType');
     const plan = planValue === null || planValue === undefined ? undefined : requirePlan(planValue);
     return Object.freeze({
@@ -306,8 +372,11 @@ function normalizeRateLimitBucket(value: unknown): RideCodexRateLimitBucket {
     });
 }
 
-function normalizeRateLimitRecord(value: unknown): Readonly<Record<string, RideCodexRateLimitBucket>> {
-    const record = requireRecord(value, 'rate-limit buckets');
+function normalizeRateLimitRecord(
+    value: unknown,
+    isProxy: RideCodexProxyPredicate
+): Readonly<Record<string, RideCodexRateLimitBucket>> {
+    const record = requireRecord(value, 'rate-limit buckets', isProxy);
     const keys = Object.keys(record);
     if (keys.length > MAX_RATE_LIMIT_BUCKETS) {
         throw new RangeError('Too many Codex rate-limit buckets');
@@ -315,16 +384,16 @@ function normalizeRateLimitRecord(value: unknown): Readonly<Record<string, RideC
     const output: Record<string, RideCodexRateLimitBucket> = Object.create(null);
     for (const key of keys.sort()) {
         const safeKey = requireString(key, 'rate-limit bucket ID', MAX_IDENTIFIER_LENGTH);
-        output[safeKey] = normalizeRateLimitBucket(readOwn(record, key));
+        output[safeKey] = normalizeRateLimitBucket(readOwn(record, key), isProxy);
     }
     return Object.freeze(output);
 }
 
-function optionalWindow(value: unknown): RideCodexRateLimitWindow | undefined {
+function optionalWindow(value: unknown, isProxy: RideCodexProxyPredicate): RideCodexRateLimitWindow | undefined {
     if (value === null || value === undefined) {
         return undefined;
     }
-    const record = requireRecord(value, 'rate-limit window');
+    const record = requireRecord(value, 'rate-limit window', isProxy);
     requireOnlyKeys(record, ['usedPercent', 'windowDurationMins', 'resetsAt'], 'rate-limit window');
     const usedPercent = requireFiniteNumber(readOwn(record, 'usedPercent'), 'used percent', 0, 100);
     const durationValue = readOwn(record, 'windowDurationMins');
@@ -342,11 +411,11 @@ function optionalWindow(value: unknown): RideCodexRateLimitWindow | undefined {
     });
 }
 
-function optionalCredits(value: unknown): RideCodexCredits | undefined {
+function optionalCredits(value: unknown, isProxy: RideCodexProxyPredicate): RideCodexCredits | undefined {
     if (value === null || value === undefined) {
         return undefined;
     }
-    const record = requireRecord(value, 'credits');
+    const record = requireRecord(value, 'credits', isProxy);
     requireOnlyKeys(record, ['hasCredits', 'unlimited', 'balance'], 'credits');
     const hasCredits = requireBoolean(readOwn(record, 'hasCredits'), 'has credits');
     const unlimited = requireBoolean(readOwn(record, 'unlimited'), 'unlimited credits');
@@ -357,8 +426,11 @@ function optionalCredits(value: unknown): RideCodexCredits | undefined {
     return Object.freeze({ hasCredits, unlimited, ...(balance === undefined ? {} : { balance }) });
 }
 
-function normalizeResetCredits(value: unknown): Readonly<{ availableCount: string }> {
-    const record = requireRecord(value, 'reset credits');
+function normalizeResetCredits(
+    value: unknown,
+    isProxy: RideCodexProxyPredicate
+): Readonly<{ availableCount: string }> {
+    const record = requireRecord(value, 'reset credits', isProxy);
     requireOnlyKeys(record, ['availableCount', 'credits'], 'reset credits');
     const raw = readOwn(record, 'availableCount');
     let availableCount: string;
@@ -375,11 +447,14 @@ function normalizeResetCredits(value: unknown): Readonly<{ availableCount: strin
     return Object.freeze({ availableCount });
 }
 
-function normalizePublicAccount(value: unknown): RideCodexAuthAccount | undefined {
+function normalizePublicAccount(
+    value: unknown,
+    isProxy: RideCodexProxyPredicate
+): RideCodexAuthAccount | undefined {
     if (value === undefined) {
         return undefined;
     }
-    const record = requireRecord(value, 'public account');
+    const record = requireRecord(value, 'public account', isProxy);
     const type = readOwn(record, 'type');
     if (type === 'apiKey') {
         requireOnlyKeys(record, ['type'], 'public API key account');
@@ -394,17 +469,20 @@ function normalizePublicAccount(value: unknown): RideCodexAuthAccount | undefine
     throw new TypeError('Unsupported public account type');
 }
 
-function normalizePublicRateLimits(value: unknown): RideCodexRateLimits | undefined {
+function normalizePublicRateLimits(
+    value: unknown,
+    isProxy: RideCodexProxyPredicate
+): RideCodexRateLimits | undefined {
     if (value === undefined) {
         return undefined;
     }
-    const record = requireRecord(value, 'public rate limits');
-    const bucket = normalizePublicBucket(record);
+    const record = requireRecord(value, 'public rate limits', isProxy);
+    const bucket = normalizePublicBucket(record, isProxy);
     const byLimitValue = readOwn(record, 'byLimitId');
     const resetValue = readOwn(record, 'resetCredits');
     let byLimitId: Readonly<Record<string, RideCodexRateLimitBucket>> | undefined;
     if (byLimitValue !== undefined) {
-        const byLimitRecord = requireRecord(byLimitValue, 'public rate-limit buckets');
+        const byLimitRecord = requireRecord(byLimitValue, 'public rate-limit buckets', isProxy);
         const entries: Record<string, RideCodexRateLimitBucket> = Object.create(null);
         const keys = Object.keys(byLimitRecord);
         if (keys.length > MAX_RATE_LIMIT_BUCKETS) {
@@ -412,13 +490,16 @@ function normalizePublicRateLimits(value: unknown): RideCodexRateLimits | undefi
         }
         for (const key of keys.sort()) {
             entries[requireString(key, 'rate-limit bucket ID', MAX_IDENTIFIER_LENGTH)] =
-                normalizePublicBucket(requireRecord(readOwn(byLimitRecord, key), 'public rate-limit bucket'));
+                normalizePublicBucket(
+                    requireRecord(readOwn(byLimitRecord, key), 'public rate-limit bucket', isProxy),
+                    isProxy
+                );
         }
         byLimitId = Object.freeze(entries);
     }
     let resetCredits: Readonly<{ availableCount: string }> | undefined;
     if (resetValue !== undefined) {
-        const resetRecord = requireRecord(resetValue, 'public reset credits');
+        const resetRecord = requireRecord(resetValue, 'public reset credits', isProxy);
         requireOnlyKeys(resetRecord, ['availableCount'], 'public reset credits');
         resetCredits = Object.freeze({
             availableCount: requireDecimalString(readOwn(resetRecord, 'availableCount'), 'reset credit count', 64)
@@ -431,15 +512,18 @@ function normalizePublicRateLimits(value: unknown): RideCodexRateLimits | undefi
     });
 }
 
-function normalizePublicBucket(record: Record<string, unknown>): RideCodexRateLimitBucket {
+function normalizePublicBucket(
+    record: Record<string, unknown>,
+    isProxy: RideCodexProxyPredicate
+): RideCodexRateLimitBucket {
     requireOnlyKeys(record, [
         'limitId', 'limitName', 'primary', 'secondary', 'credits', 'plan', 'byLimitId', 'resetCredits'
     ], 'public rate-limit bucket');
     const limitId = optionalString(readOwn(record, 'limitId'), 'rate-limit ID', MAX_IDENTIFIER_LENGTH);
     const limitName = optionalString(readOwn(record, 'limitName'), 'rate-limit name', MAX_LABEL_LENGTH);
-    const primary = optionalWindow(readOwn(record, 'primary'));
-    const secondary = optionalWindow(readOwn(record, 'secondary'));
-    const credits = optionalCredits(readOwn(record, 'credits'));
+    const primary = optionalWindow(readOwn(record, 'primary'), isProxy);
+    const secondary = optionalWindow(readOwn(record, 'secondary'), isProxy);
+    const credits = optionalCredits(readOwn(record, 'credits'), isProxy);
     const planValue = readOwn(record, 'plan');
     const plan = planValue === undefined ? undefined : requirePlan(planValue);
     return Object.freeze({
@@ -452,11 +536,14 @@ function normalizePublicBucket(record: Record<string, unknown>): RideCodexRateLi
     });
 }
 
-function normalizePendingLogin(value: unknown): RideCodexAuthSnapshot['pendingLogin'] {
+function normalizePendingLogin(
+    value: unknown,
+    isProxy: RideCodexProxyPredicate
+): RideCodexAuthSnapshot['pendingLogin'] {
     if (value === undefined) {
         return undefined;
     }
-    const record = requireRecord(value, 'pending login');
+    const record = requireRecord(value, 'pending login', isProxy);
     requireOnlyKeys(record, ['type', 'loginId'], 'pending login');
     const type = readOwn(record, 'type');
     if (type !== 'apiKey' && type !== 'chatgpt' && type !== 'chatgptDeviceCode') {
@@ -467,11 +554,11 @@ function normalizePendingLogin(value: unknown): RideCodexAuthSnapshot['pendingLo
     return Object.freeze({ type, ...(loginId === undefined ? {} : { loginId }) });
 }
 
-function normalizeAuthError(value: unknown): RideCodexAuthSnapshot['error'] {
+function normalizeAuthError(value: unknown, isProxy: RideCodexProxyPredicate): RideCodexAuthSnapshot['error'] {
     if (value === undefined) {
         return undefined;
     }
-    const record = requireRecord(value, 'auth error');
+    const record = requireRecord(value, 'auth error', isProxy);
     requireOnlyKeys(record, ['code', 'message'], 'auth error');
     return Object.freeze({
         code: requireString(readOwn(record, 'code'), 'auth error code', MAX_ERROR_CODE_LENGTH),
@@ -479,8 +566,18 @@ function normalizeAuthError(value: unknown): RideCodexAuthSnapshot['error'] {
     });
 }
 
-function requireRecord(value: unknown, label: string): Record<string, unknown> {
-    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+function requireRecord(
+    value: unknown,
+    label: string,
+    isProxy: RideCodexProxyPredicate
+): Record<string, unknown> {
+    if (typeof value !== 'object' || value === null) {
+        throw new TypeError(`Codex ${label} must be a record`);
+    }
+    if (isProxy(value)) {
+        throw new RideCodexUnsafeAuthPayloadError();
+    }
+    if (Array.isArray(value)) {
         throw new TypeError(`Codex ${label} must be a record`);
     }
     const prototype = Object.getPrototypeOf(value);

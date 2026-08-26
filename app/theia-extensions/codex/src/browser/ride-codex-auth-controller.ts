@@ -5,13 +5,15 @@
  ********************************************************************************/
 
 import {
-    createRideCodexAuthSnapshot,
     MAX_CODEX_API_KEY_LENGTH,
     RideCodexAuthClient,
     RideCodexAuthSnapshot,
     RideCodexLoginRequest,
-    RideCodexLoginResult
+    RideCodexLoginResult,
+    trustedRideCodexAuthNormalizers
 } from '../common/ride-codex-auth';
+
+const { createRideCodexAuthSnapshot } = trustedRideCodexAuthNormalizers;
 
 export const LEGACY_CODEX_API_KEY_PREFERENCES = Object.freeze([
     'ai-features.codex.apiKey',

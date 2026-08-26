@@ -7,11 +7,9 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
-    normalizeRideCodexAccount,
-    normalizeRideCodexAccountUpdate,
-    normalizeRideCodexRateLimits,
     RideCodexAuthClient,
-    RideCodexAuthSnapshot
+    RideCodexAuthSnapshot,
+    trustedRideCodexAuthNormalizers
 } from '../src/common/ride-codex-auth';
 import {
     RideCodexAuthBroker,
@@ -19,8 +17,15 @@ import {
     RideCodexAuthHostLease,
     RideCodexAuthHostStateEvent
 } from '../src/node/ride-codex-auth-broker';
+import { rideCodexNodeAuthNormalizers } from '../src/node/ride-codex-auth-normalizers';
 import { RideCodexAppServerDiagnostics } from '../src/node/ride-codex-diagnostics';
 import type { RideCodexNotification } from '../src/node/ride-codex-jsonl-client';
+
+const {
+    normalizeRideCodexAccount,
+    normalizeRideCodexAccountUpdate,
+    normalizeRideCodexRateLimits
+} = trustedRideCodexAuthNormalizers;
 
 interface RequestRecord {
     readonly method: string;
@@ -37,7 +42,7 @@ class FakeAuthHost implements RideCodexAuthHost {
     state: RideCodexAuthHostStateEvent['state'] = 'ready';
     acquireFailure: Error | undefined;
     stateListenerFailure: Error | undefined;
-    responder: (method: string, params: unknown) => Promise<unknown> = async method => {
+    responder: (method: string, params: unknown) => unknown | Promise<unknown> = method => {
         if (method === 'account/read') {
             return { account: null, requiresOpenaiAuth: true };
         }
@@ -53,7 +58,7 @@ class FakeAuthHost implements RideCodexAuthHost {
             throw this.acquireFailure;
         }
         return {
-            request: async (method, params) => {
+            request: (method, params) => {
                 this.requests.push({ method, params });
                 return this.responder(method, params);
             },
@@ -156,6 +161,159 @@ test('rate-limit response validation rejects unknown and descriptor-unsafe top-l
     const revoked = Proxy.revocable(valid, {});
     revoked.revoke();
     assert.throws(() => normalizeRideCodexRateLimits(revoked.proxy));
+});
+
+test('rate-limit reads reject an ordinary Proxy without invoking any traps or changing state', async () => {
+    const host = new FakeAuthHost();
+    const diagnostics = new RideCodexAppServerDiagnostics();
+    host.responder = async method => method === 'account/read'
+        ? { account: { type: 'apiKey' }, requiresOpenaiAuth: false }
+        : emptyRateLimits();
+    const broker = new RideCodexAuthBroker({ host, diagnostics });
+    await broker.activate();
+    const before = broker.snapshot();
+    const hostile = trapCountingProxy(emptyRateLimits());
+    host.responder = () => hostile.proxy;
+
+    await assert.rejects(broker.readRateLimits(), /invalid data/i);
+    assert.equal(hostile.trapCount(), 0);
+    assert.equal(broker.snapshot(), before);
+    assert.equal(JSON.stringify(diagnostics.snapshot()).includes('sk-proxy-target-secret'), false);
+});
+
+test('node auth normalizers reject top-level and nested Proxies before every reflective trap', () => {
+    const cases: Array<readonly [string, (proxy: object) => unknown, (value: unknown) => unknown]> = [
+        ['rate response', proxy => proxy, value => rideCodexNodeAuthNormalizers.normalizeRideCodexRateLimits(value)],
+        ['rateLimits', proxy => ({ ...emptyRateLimits(), rateLimits: proxy }), value =>
+            rideCodexNodeAuthNormalizers.normalizeRideCodexRateLimits(value)],
+        ['rateLimitsByLimitId', proxy => ({ ...emptyRateLimits(), rateLimitsByLimitId: proxy }), value =>
+            rideCodexNodeAuthNormalizers.normalizeRideCodexRateLimits(value)],
+        ['rate-limit bucket', proxy => ({ ...emptyRateLimits(), rateLimitsByLimitId: { codex: proxy } }), value =>
+            rideCodexNodeAuthNormalizers.normalizeRideCodexRateLimits(value)],
+        ['primary window', proxy => ({ ...emptyRateLimits(), rateLimits: { ...rateSnapshot({ usedPercent: 10 }), primary: proxy } }), value =>
+            rideCodexNodeAuthNormalizers.normalizeRideCodexRateLimits(value)],
+        ['secondary window', proxy => ({ ...emptyRateLimits(), rateLimits: { ...rateSnapshot({ usedPercent: 10 }), secondary: proxy } }), value =>
+            rideCodexNodeAuthNormalizers.normalizeRideCodexRateLimits(value)],
+        ['credits', proxy => ({ ...emptyRateLimits(), rateLimits: { ...rateSnapshot({ usedPercent: 10 }), credits: proxy } }), value =>
+            rideCodexNodeAuthNormalizers.normalizeRideCodexRateLimits(value)],
+        ['reset credits', proxy => ({ ...emptyRateLimits(), rateLimitResetCredits: proxy }), value =>
+            rideCodexNodeAuthNormalizers.normalizeRideCodexRateLimits(value)],
+        ['account response', proxy => ({ account: proxy, requiresOpenaiAuth: false }), value =>
+            rideCodexNodeAuthNormalizers.normalizeRideCodexAccountReadResult(value)],
+        ['account', proxy => proxy, value => rideCodexNodeAuthNormalizers.normalizeRideCodexAccount(value)],
+        ['login request', proxy => proxy, value => rideCodexNodeAuthNormalizers.normalizeRideCodexLoginRequest(value)],
+        ['login result', proxy => proxy, value => rideCodexNodeAuthNormalizers.normalizeRideCodexLoginResult(value)],
+        ['cancel result', proxy => proxy, value => rideCodexNodeAuthNormalizers.normalizeRideCodexCancelResult(value)],
+        ['account notification', proxy => proxy, value => rideCodexNodeAuthNormalizers.normalizeRideCodexAccountUpdate(value)],
+        ['login notification', proxy => proxy, value => rideCodexNodeAuthNormalizers.normalizeRideCodexLoginCompletion(value)],
+        ['rate notification', proxy => ({ rateLimits: proxy }), value =>
+            rideCodexNodeAuthNormalizers.normalizeRideCodexRateLimitUpdate(value)]
+    ];
+    const targets: Readonly<Record<string, object>> = {
+        'rate response': emptyRateLimits(),
+        rateLimits: rateSnapshot({ usedPercent: 10 }),
+        rateLimitsByLimitId: { codex: rateSnapshot({ usedPercent: 10 }) },
+        'rate-limit bucket': rateSnapshot({ usedPercent: 10 }),
+        'primary window': { usedPercent: 10, windowDurationMins: 300, resetsAt: 1_800_000_000 },
+        'secondary window': { usedPercent: 10, windowDurationMins: 10_080, resetsAt: 1_800_000_000 },
+        credits: { hasCredits: false, unlimited: false, balance: null },
+        'reset credits': { availableCount: '1', credits: null },
+        'account response': { type: 'apiKey' },
+        account: { type: 'apiKey' },
+        'login request': { type: 'chatgpt' },
+        'login result': { type: 'chatgpt', loginId: 'proxy-login', authUrl: 'https://auth.openai.com/' },
+        'cancel result': { status: 'canceled' },
+        'account notification': { authMode: 'apikey', planType: null },
+        'login notification': { loginId: 'proxy-login', success: true, error: null },
+        'rate notification': rateSnapshot({ usedPercent: 10 })
+    };
+
+    for (const [label, wrap, normalize] of cases) {
+        const hostile = trapCountingProxy(targets[label]);
+        assert.throws(() => normalize(wrap(hostile.proxy)), /proxy|unsafe/i, label);
+        assert.equal(hostile.trapCount(), 0, label);
+        assert.deepEqual(hostile.trapCounts(), {
+            get: 0,
+            getOwnPropertyDescriptor: 0,
+            getPrototypeOf: 0,
+            ownKeys: 0
+        }, label);
+    }
+
+    const revoked = Proxy.revocable(emptyRateLimits(), {});
+    revoked.revoke();
+    assert.throws(
+        () => rideCodexNodeAuthNormalizers.normalizeRideCodexRateLimits(revoked.proxy),
+        /proxy|unsafe/i
+    );
+});
+
+test('all broker auth response paths reject Proxies without traps, state mutation, or diagnostic leakage', async () => {
+    const host = new FakeAuthHost();
+    const diagnostics = new RideCodexAppServerDiagnostics();
+    host.responder = async method => method === 'account/read'
+        ? { account: { type: 'apiKey' }, requiresOpenaiAuth: false }
+        : emptyRateLimits();
+    const broker = new RideCodexAuthBroker({ host, diagnostics });
+    await broker.activate();
+
+    const account = trapCountingProxy({ account: { type: 'chatgpt', planType: 'plus' }, requiresOpenaiAuth: false });
+    host.responder = () => account.proxy;
+    const beforeAccount = broker.snapshot();
+    await assert.rejects(broker.readAccount(), /invalid data/i);
+    assert.equal(account.trapCount(), 0);
+    assert.equal(broker.snapshot(), beforeAccount);
+
+    const login = trapCountingProxy({ type: 'chatgpt', loginId: 'proxy-login', authUrl: 'https://auth.openai.com/' });
+    host.responder = () => login.proxy;
+    const beforeLogin = broker.snapshot();
+    await assert.rejects(broker.login({ type: 'chatgpt' }), /invalid data/i);
+    assert.equal(login.trapCount(), 0);
+    assert.equal(broker.snapshot(), beforeLogin);
+
+    host.responder = async method => method === 'account/login/start'
+        ? { type: 'chatgpt', loginId: 'cancel-proxy-login', authUrl: 'https://auth.openai.com/' }
+        : { status: 'canceled' };
+    await broker.login({ type: 'chatgpt' });
+    const cancel = trapCountingProxy({ status: 'canceled' });
+    host.responder = () => cancel.proxy;
+    const beforeCancel = broker.snapshot();
+    await assert.rejects(broker.cancelLogin('cancel-proxy-login'), /invalid data/i);
+    assert.equal(cancel.trapCount(), 0);
+    assert.equal(broker.snapshot(), beforeCancel);
+
+    assert.equal(JSON.stringify(diagnostics.snapshot()).includes('sk-proxy-target-secret'), false);
+});
+
+test('all broker auth notification paths reject Proxies without traps or trusted-state replacement', async () => {
+    const host = new FakeAuthHost();
+    const diagnostics = new RideCodexAppServerDiagnostics();
+    host.responder = async method => method === 'account/read'
+        ? { account: { type: 'apiKey' }, requiresOpenaiAuth: false }
+        : method === 'account/login/start'
+            ? { type: 'chatgpt', loginId: 'notification-login', authUrl: 'https://auth.openai.com/' }
+            : emptyRateLimits();
+    const broker = new RideCodexAuthBroker({ host, diagnostics });
+    await broker.activate();
+
+    for (const [method, target] of [
+        ['account/updated', { authMode: 'apikey', planType: null }],
+        ['account/rateLimits/updated', { rateLimits: rateSnapshot({ usedPercent: 50 }) }]
+    ] as const) {
+        const hostile = trapCountingProxy(target);
+        const before = broker.snapshot();
+        host.notify(method, hostile.proxy);
+        assert.equal(hostile.trapCount(), 0, method);
+        assert.equal(broker.snapshot(), before, method);
+    }
+
+    await broker.login({ type: 'chatgpt' });
+    const completion = trapCountingProxy({ loginId: 'notification-login', success: true, error: null });
+    const beforeCompletion = broker.snapshot();
+    host.notify('account/login/completed', completion.proxy);
+    assert.equal(completion.trapCount(), 0);
+    assert.equal(broker.snapshot(), beforeCompletion);
+    assert.equal(JSON.stringify(diagnostics.snapshot()).includes('sk-proxy-target-secret'), false);
 });
 
 test('host acquisition failures are generic and never echo API key input', async () => {
@@ -594,6 +752,34 @@ function emptyRateLimits(): Record<string, unknown> {
         },
         rateLimitsByLimitId: null,
         rateLimitResetCredits: null
+    };
+}
+
+function trapCountingProxy<T extends object>(target: T): {
+    proxy: T;
+    trapCount(): number;
+    trapCounts(): Readonly<Record<'get' | 'getOwnPropertyDescriptor' | 'getPrototypeOf' | 'ownKeys', number>>;
+} {
+    const traps = { get: 0, getOwnPropertyDescriptor: 0, getPrototypeOf: 0, ownKeys: 0 };
+    const count = <K extends keyof typeof traps, R>(key: K, value: R): R => {
+        traps[key] += 1;
+        return value;
+    };
+    Object.defineProperty(target, 'proxyTargetSecret', {
+        configurable: true,
+        enumerable: false,
+        value: 'sk-proxy-target-secret'
+    });
+    return {
+        proxy: new Proxy(target, {
+            get: (object, key, receiver) => count('get', Reflect.get(object, key, receiver)),
+            getOwnPropertyDescriptor: (object, key) =>
+                count('getOwnPropertyDescriptor', Reflect.getOwnPropertyDescriptor(object, key)),
+            getPrototypeOf: object => count('getPrototypeOf', Reflect.getPrototypeOf(object)),
+            ownKeys: object => count('ownKeys', Reflect.ownKeys(object))
+        }),
+        trapCount: () => Object.values(traps).reduce((total, value) => total + value, 0),
+        trapCounts: () => Object.freeze({ ...traps })
     };
 }
 

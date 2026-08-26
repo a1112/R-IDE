@@ -4,23 +4,17 @@
  * SPDX-License-Identifier: MIT
  ********************************************************************************/
 
+import { types as utilTypes } from 'node:util';
 import {
-    createRideCodexAuthSnapshot,
-    normalizeRideCodexAccountReadResult,
-    normalizeRideCodexAccountUpdate,
-    normalizeRideCodexCancelResult,
-    normalizeRideCodexLoginCompletion,
-    normalizeRideCodexLoginRequest,
-    normalizeRideCodexLoginResult,
-    normalizeRideCodexRateLimits,
-    normalizeRideCodexRateLimitUpdate,
     RideCodexAuthClient,
     RideCodexAuthSnapshot,
     RideCodexLoginRequest,
     RideCodexLoginResult,
-    RideCodexRateLimits
+    RideCodexRateLimits,
+    RideCodexUnsafeAuthPayloadError
 } from '../common/ride-codex-auth';
 import type { StableClientMethod, RideCodexDisposable, RideCodexNotification } from './ride-codex-jsonl-client';
+import { rideCodexNodeAuthNormalizers } from './ride-codex-auth-normalizers';
 import { RideCodexAppServerDiagnostics } from './ride-codex-diagnostics';
 
 export type RideCodexAuthHostState =
@@ -32,7 +26,7 @@ export interface RideCodexAuthHostStateEvent {
 }
 
 export interface RideCodexAuthHostLease {
-    request(method: StableClientMethod, params: unknown, timeoutMs?: number): Promise<unknown>;
+    request(method: StableClientMethod, params: unknown, timeoutMs?: number): unknown | Promise<unknown>;
     release(): void;
 }
 
@@ -65,6 +59,17 @@ const AUTH_ERROR_MESSAGES: Readonly<Record<RideCodexAuthError['code'], string>> 
     'disposed': 'Codex authentication broker is disposed.'
 });
 const MAX_KNOWN_LOGINS = 32;
+const {
+    createRideCodexAuthSnapshot,
+    normalizeRideCodexAccountReadResult,
+    normalizeRideCodexAccountUpdate,
+    normalizeRideCodexCancelResult,
+    normalizeRideCodexLoginCompletion,
+    normalizeRideCodexLoginRequest,
+    normalizeRideCodexLoginResult,
+    normalizeRideCodexRateLimits,
+    normalizeRideCodexRateLimitUpdate
+} = rideCodexNodeAuthNormalizers;
 
 export class RideCodexAuthBroker {
     readonly #host: RideCodexAuthHost;
@@ -156,7 +161,8 @@ export class RideCodexAuthBroker {
         let normalized: RideCodexLoginRequest | undefined = normalizeRideCodexLoginRequest(request);
         await this.#ensureLease();
         const token = ++this.#authOperation;
-        this.#setSnapshot({
+        const previousSnapshot = this.#snapshot;
+        const authenticatingSnapshot = this.#setSnapshot({
             state: 'authenticating',
             account: this.#snapshot.account,
             rateLimits: this.#snapshot.rateLimits,
@@ -166,14 +172,20 @@ export class RideCodexAuthBroker {
             let apiKey = normalized.apiKey;
             normalized = undefined;
             try {
-                return await this.#loginWithApiKey(apiKey, token);
+                return await this.#loginWithApiKey(apiKey, token, {
+                    current: authenticatingSnapshot,
+                    previous: previousSnapshot
+                });
             } finally {
                 apiKey = '';
             }
         }
         const interactiveLogin = normalized;
         try {
-            const raw = await this.#lease!.request('account/login/start', { type: interactiveLogin.type });
+            const pending = rejectProxyBeforeAwait(
+                this.#lease!.request('account/login/start', { type: interactiveLogin.type })
+            );
+            const raw = await pending;
             this.#requireCurrentOperation(token);
             const result = normalizeRideCodexLoginResult(raw);
             if (result.type !== interactiveLogin.type) {
@@ -188,7 +200,10 @@ export class RideCodexAuthBroker {
             });
             return result;
         } catch (error) {
-            throw this.#failOperation(error, token);
+            throw this.#failOperation(error, token, {
+                current: authenticatingSnapshot,
+                previous: previousSnapshot
+            });
         }
     }
 
@@ -204,7 +219,8 @@ export class RideCodexAuthBroker {
         await this.#ensureLease();
         const token = ++this.#authOperation;
         try {
-            const raw = await this.#lease!.request('account/login/cancel', { loginId });
+            const pending = rejectProxyBeforeAwait(this.#lease!.request('account/login/cancel', { loginId }));
+            const raw = await pending;
             this.#requireCurrentOperation(token);
             normalizeRideCodexCancelResult(raw);
             this.#rememberLogin(loginId, 'canceled');
@@ -241,7 +257,8 @@ export class RideCodexAuthBroker {
         const token = ++this.#rateOperation;
         const version = this.#rateVersion;
         try {
-            const raw = await this.#lease!.request('account/rateLimits/read', {});
+            const pending = rejectProxyBeforeAwait(this.#lease!.request('account/rateLimits/read', {}));
+            const raw = await pending;
             if (token !== this.#rateOperation) {
                 throw new RideCodexAuthError('operation-superseded');
             }
@@ -279,15 +296,20 @@ export class RideCodexAuthBroker {
         this.dispose();
     }
 
-    async #loginWithApiKey(input: string, token: number): Promise<RideCodexLoginResult> {
+    async #loginWithApiKey(
+        input: string,
+        token: number,
+        rollback: Readonly<{ current: RideCodexAuthSnapshot; previous: RideCodexAuthSnapshot }>
+    ): Promise<RideCodexLoginResult> {
         let secret = input;
         let params: { type: 'apiKey'; apiKey: string } | undefined = { type: 'apiKey', apiKey: secret };
         const scope = this.#diagnostics.registerTransientSecret(secret);
         let raw: unknown;
         try {
-            raw = await this.#lease!.request('account/login/start', params);
+            const pending = rejectProxyBeforeAwait(this.#lease!.request('account/login/start', params));
+            raw = await pending;
         } catch (error) {
-            throw this.#failOperation(error, token);
+            throw this.#failOperation(error, token, rollback);
         } finally {
             params = undefined;
             secret = '';
@@ -300,13 +322,13 @@ export class RideCodexAuthBroker {
             if (result.type !== 'apiKey') {
                 throw new TypeError('Mismatched Codex API key login response');
             }
-            await this.#readAccountForToken(token, false);
+            await this.#readAccountForToken(token, false, rollback);
             if (this.#snapshot.state !== 'authenticated' || this.#snapshot.account?.type !== 'apiKey') {
                 throw new TypeError('Codex API key login was not confirmed');
             }
             return result;
         } catch (error) {
-            throw this.#failOperation(error, token);
+            throw this.#failOperation(error, token, rollback);
         }
     }
 
@@ -346,9 +368,14 @@ export class RideCodexAuthBroker {
         return this.#leasePromise;
     }
 
-    async #readAccountForToken(token: number, refreshToken: boolean): Promise<RideCodexAuthSnapshot> {
+    async #readAccountForToken(
+        token: number,
+        refreshToken: boolean,
+        rollback?: Readonly<{ current: RideCodexAuthSnapshot; previous: RideCodexAuthSnapshot }>
+    ): Promise<RideCodexAuthSnapshot> {
         try {
-            const raw = await this.#lease!.request('account/read', { refreshToken });
+            const pending = rejectProxyBeforeAwait(this.#lease!.request('account/read', { refreshToken }));
+            const raw = await pending;
             if (token !== this.#authOperation) {
                 return this.#snapshot;
             }
@@ -362,7 +389,7 @@ export class RideCodexAuthBroker {
             if (token !== this.#authOperation) {
                 return this.#snapshot;
             }
-            throw this.#failOperation(error, token);
+            throw this.#failOperation(error, token, rollback);
         }
     }
 
@@ -411,7 +438,11 @@ export class RideCodexAuthBroker {
                     return;
                 }
             }
-        } catch {
+        } catch (error) {
+            if (error instanceof RideCodexUnsafeAuthPayloadError) {
+                this.#diagnostics.record('protocol-error');
+                return;
+            }
             this.#setGenericError('invalid-data');
         }
     }
@@ -460,12 +491,23 @@ export class RideCodexAuthBroker {
         }
     }
 
-    #failOperation(error: unknown, token: number): RideCodexAuthError {
+    #failOperation(
+        error: unknown,
+        token: number,
+        rollback?: Readonly<{ current: RideCodexAuthSnapshot; previous: RideCodexAuthSnapshot }>
+    ): RideCodexAuthError {
         if (error instanceof RideCodexAuthError) {
             return error;
         }
         if (token !== this.#authOperation) {
             return new RideCodexAuthError('operation-superseded');
+        }
+        if (error instanceof RideCodexUnsafeAuthPayloadError) {
+            this.#diagnostics.record('protocol-error');
+            if (rollback && this.#snapshot === rollback.current) {
+                this.#restoreSnapshot(rollback.previous);
+            }
+            return new RideCodexAuthError('invalid-data');
         }
         this.#setGenericError(error instanceof TypeError ? 'invalid-data' : 'operation-failed');
         return new RideCodexAuthError(error instanceof TypeError ? 'invalid-data' : 'operation-failed');
@@ -522,6 +564,13 @@ export class RideCodexAuthBroker {
         return this.#snapshot;
     }
 
+    #restoreSnapshot(snapshot: RideCodexAuthSnapshot): void {
+        this.#snapshot = snapshot;
+        for (const client of [...this.#clients]) {
+            this.#emitClient(client, snapshot);
+        }
+    }
+
     #emitClient(client: RideCodexAuthClient, snapshot: RideCodexAuthSnapshot): void {
         try {
             client.authStateChanged(snapshot);
@@ -538,7 +587,7 @@ export class RideCodexAuthBroker {
 }
 
 function requirePlainOptions(value: unknown, allowed: readonly string[]): Record<string, unknown> {
-    if (typeof value !== 'object' || value === null || Array.isArray(value)
+    if (typeof value !== 'object' || value === null || utilTypes.isProxy(value) || Array.isArray(value)
         || (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null)) {
         throw new TypeError('Codex auth options are invalid');
     }
@@ -553,6 +602,13 @@ function requirePlainOptions(value: unknown, allowed: readonly string[]): Record
         }
     }
     return record;
+}
+
+function rejectProxyBeforeAwait<T>(value: T): T {
+    if (typeof value === 'object' && value !== null && utilTypes.isProxy(value)) {
+        throw new RideCodexUnsafeAuthPayloadError();
+    }
+    return value;
 }
 
 function disposeSafely(disposable: RideCodexDisposable): void {
