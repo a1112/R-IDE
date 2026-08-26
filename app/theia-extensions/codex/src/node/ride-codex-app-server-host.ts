@@ -1,0 +1,849 @@
+/********************************************************************************
+ * Copyright (C) 2026 R-IDE contributors.
+ *
+ * SPDX-License-Identifier: MIT
+ ********************************************************************************/
+
+import {
+    ChildProcessWithoutNullStreams,
+    spawn as nodeSpawn
+} from 'node:child_process';
+import { Readable, Writable } from 'node:stream';
+import { INITIALIZE_CAPABILITIES } from '../common/ride-codex-methods';
+import {
+    RideCodexClientNotificationMethod,
+    RideCodexDisposable,
+    RideCodexIncomingRequest,
+    RideCodexJsonlClient,
+    RideCodexJsonlTransport,
+    RideCodexNotification,
+    StableClientMethod
+} from './ride-codex-jsonl-client';
+import { RideCodexLaunchSpec } from './ride-codex-launch-spec';
+import { RideCodexRuntimeResolver } from './ride-codex-runtime-resolver';
+import {
+    RideCodexAppServerDiagnosticCode,
+    RideCodexAppServerDiagnostics,
+    RideCodexAppServerDiagnosticSnapshot
+} from './ride-codex-diagnostics';
+
+export type RideCodexAppServerLeaseKind = 'foreground-panel' | 'active-turn' | 'approval';
+export type RideCodexAppServerState =
+    | 'stopped'
+    | 'starting'
+    | 'ready'
+    | 'restarting'
+    | 'stopping'
+    | 'circuit-open'
+    | 'disposed';
+
+export interface RideCodexAppServerSpawnOptions {
+    readonly shell: false;
+    readonly stdio: readonly ['pipe', 'pipe', 'pipe'];
+    readonly env: NodeJS.ProcessEnv;
+    readonly windowsHide: true;
+}
+
+export type RideCodexAppServerSpawn = (
+    executable: string,
+    args: readonly string[],
+    options: RideCodexAppServerSpawnOptions
+) => ChildProcessWithoutNullStreams;
+
+export interface RideCodexAppServerResolver {
+    resolve(): Promise<RideCodexLaunchSpec>;
+}
+
+export interface RideCodexAppServerHostOptions {
+    readonly resolver?: RideCodexAppServerResolver;
+    readonly diagnostics?: RideCodexAppServerDiagnostics;
+    readonly spawn?: RideCodexAppServerSpawn;
+    readonly handshakeTimeoutMs?: number;
+    readonly idleTimeoutMs?: number;
+    readonly shutdownGraceMs?: number;
+}
+
+export interface RideCodexAppServerLease {
+    readonly kind: RideCodexAppServerLeaseKind;
+    request(method: StableClientMethod, params: unknown, timeoutMs?: number): Promise<unknown>;
+    notify(method: RideCodexClientNotificationMethod, params: unknown): Promise<void>;
+    release(): void;
+}
+
+export interface RideCodexAppServerHostSnapshot {
+    readonly state: RideCodexAppServerState;
+    readonly generation: number;
+    readonly pid?: number;
+    readonly leaseCount: number;
+    readonly unsafeApprovalCount: number;
+    readonly restartAttempts: number;
+    readonly initialization?: typeof INITIALIZE_PARAMS;
+    readonly diagnostics: RideCodexAppServerDiagnosticSnapshot;
+}
+
+export type RideCodexAppServerHostErrorCode =
+    | RideCodexAppServerDiagnosticCode
+    | 'disposed'
+    | 'lease-released';
+
+const ERROR_MESSAGE_BY_CODE: Readonly<Record<RideCodexAppServerHostErrorCode, string>> = Object.freeze({
+    'early-exit': 'Codex App Server exited before initialize completed.',
+    'handshake-timeout': 'Codex App Server initialize handshake timed out.',
+    'protocol-error': 'Codex App Server initialize protocol failed.',
+    'spawn-failed': 'Codex App Server start failed.',
+    'unexpected-exit': 'Codex App Server exited unexpectedly.',
+    'unsafe-approval-exit': 'Codex App Server exited during an unsafe approval.',
+    'circuit-open': 'Codex App Server restart circuit is open.',
+    'shutdown-forced': 'Codex App Server required bounded exact-child termination.',
+    'shutdown-timeout': 'Codex App Server did not confirm shutdown within the configured bound.',
+    'disposed': 'Codex App Server host is disposed.',
+    'lease-released': 'Codex App Server lease is released.'
+});
+
+export class RideCodexAppServerHostError extends Error {
+    constructor(readonly code: RideCodexAppServerHostErrorCode) {
+        super(ERROR_MESSAGE_BY_CODE[code]);
+        this.name = 'RideCodexAppServerHostError';
+    }
+}
+
+interface LeaseRecord {
+    readonly id: number;
+    readonly kind: RideCodexAppServerLeaseKind;
+    released: boolean;
+}
+
+interface Connection {
+    readonly generation: number;
+    readonly child: ChildProcessWithoutNullStreams;
+    readonly pid?: number;
+    readonly transport: ChildJsonlTransport;
+    readonly client: RideCodexJsonlClient;
+    readonly exitPromise: Promise<void>;
+    readonly resolveExit: () => void;
+    readonly stderrDataListener: (chunk: Buffer) => void;
+    readonly stderrErrorListener: () => void;
+    readonly processExitListener: () => void;
+    readonly clientListeners: RideCodexDisposable[];
+    intentionalStop: boolean;
+    ready: boolean;
+    finalized: boolean;
+    killRequested: boolean;
+}
+
+const INITIALIZE_PARAMS = Object.freeze({
+    clientInfo: Object.freeze({ name: 'r-ide', title: 'R-IDE', version: '1.72.100' }),
+    capabilities: INITIALIZE_CAPABILITIES
+});
+
+const DEFAULT_HANDSHAKE_TIMEOUT_MS = 5_000;
+const DEFAULT_IDLE_TIMEOUT_MS = 10 * 60 * 1_000;
+const DEFAULT_SHUTDOWN_GRACE_MS = 2_000;
+const MAX_TIMER_MS = 0x7fffffff;
+
+export class RideCodexAppServerHost {
+    readonly diagnostics: RideCodexAppServerDiagnostics;
+    readonly #resolver: RideCodexAppServerResolver;
+    readonly #spawn: RideCodexAppServerSpawn;
+    readonly #handshakeTimeoutMs: number;
+    readonly #idleTimeoutMs: number;
+    readonly #shutdownGraceMs: number;
+    readonly #leases = new Map<number, LeaseRecord>();
+    readonly #notificationListeners = new Set<(notification: RideCodexNotification) => void>();
+    readonly #serverRequestListeners = new Set<(request: RideCodexIncomingRequest) => void>();
+    #state: RideCodexAppServerState = 'stopped';
+    #generation = 0;
+    #nextLeaseId = 1;
+    #unsafeApprovalCount = 0;
+    #restartAttempts = 0;
+    #connection: Connection | undefined;
+    #startPromise: Promise<Connection> | undefined;
+    #idleTimer: ReturnType<typeof setTimeout> | undefined;
+    #disposePromise: Promise<void> | undefined;
+    #disposed = false;
+
+    constructor(options: RideCodexAppServerHostOptions = {}) {
+        this.#resolver = options.resolver ?? new RideCodexRuntimeResolver();
+        this.diagnostics = options.diagnostics ?? new RideCodexAppServerDiagnostics();
+        this.#spawn = options.spawn ?? defaultSpawn;
+        this.#handshakeTimeoutMs = timerLimit(
+            options.handshakeTimeoutMs,
+            DEFAULT_HANDSHAKE_TIMEOUT_MS,
+            'initialize handshake timeout',
+            1
+        );
+        this.#idleTimeoutMs = timerLimit(options.idleTimeoutMs, DEFAULT_IDLE_TIMEOUT_MS, 'idle timeout', 0);
+        this.#shutdownGraceMs = timerLimit(
+            options.shutdownGraceMs,
+            DEFAULT_SHUTDOWN_GRACE_MS,
+            'shutdown grace period',
+            0
+        );
+    }
+
+    async acquire(kind: RideCodexAppServerLeaseKind): Promise<RideCodexAppServerLease> {
+        this.#requireUsable();
+        if (!isLeaseKind(kind)) {
+            throw new TypeError('Unsupported Codex App Server lease kind');
+        }
+        this.#cancelIdleTimer();
+        const record: LeaseRecord = { id: this.#nextLeaseId, kind, released: false };
+        this.#nextLeaseId += 1;
+        this.#leases.set(record.id, record);
+        if (kind === 'approval') {
+            this.#unsafeApprovalCount += 1;
+        }
+        try {
+            await this.#ensureStarted(false);
+            this.#requireUsable();
+            return this.#createLease(record);
+        } catch (error) {
+            this.#releaseRecord(record);
+            throw error;
+        }
+    }
+
+    async retry(): Promise<void> {
+        if (this.#disposed) {
+            throw new RideCodexAppServerHostError('disposed');
+        }
+        this.#restartAttempts = 0;
+        if (this.#state === 'circuit-open') {
+            this.#state = 'stopped';
+        }
+        if (this.#leases.size > 0) {
+            await this.#ensureStarted(false);
+        }
+    }
+
+    onNotification(listener: (notification: RideCodexNotification) => void): RideCodexDisposable {
+        return addListener(this.#notificationListeners, listener);
+    }
+
+    onServerRequest(listener: (request: RideCodexIncomingRequest) => void): RideCodexDisposable {
+        return addListener(this.#serverRequestListeners, listener);
+    }
+
+    snapshot(): RideCodexAppServerHostSnapshot {
+        return Object.freeze({
+            state: this.#state,
+            generation: this.#generation,
+            ...(this.#connection?.pid === undefined ? {} : { pid: this.#connection.pid }),
+            leaseCount: this.#leases.size,
+            unsafeApprovalCount: this.#unsafeApprovalCount,
+            restartAttempts: this.#restartAttempts,
+            ...(this.#connection?.ready ? { initialization: INITIALIZE_PARAMS } : {}),
+            diagnostics: this.diagnostics.snapshot()
+        });
+    }
+
+    dispose(): Promise<void> {
+        if (this.#disposePromise) {
+            return this.#disposePromise;
+        }
+        this.#disposed = true;
+        this.#state = 'disposed';
+        this.#cancelIdleTimer();
+        for (const record of this.#leases.values()) {
+            record.released = true;
+        }
+        this.#leases.clear();
+        this.#unsafeApprovalCount = 0;
+        this.#notificationListeners.clear();
+        this.#serverRequestListeners.clear();
+
+        const operation = (async () => {
+            const starting = this.#startPromise;
+            const current = this.#connection;
+            if (current) {
+                await this.#stopConnection(current, 'dispose');
+            }
+            if (starting) {
+                await starting.catch(() => undefined);
+            }
+            if (this.#connection) {
+                await this.#stopConnection(this.#connection, 'dispose');
+            }
+            this.#state = 'disposed';
+        })();
+        this.#disposePromise = operation;
+        return operation;
+    }
+
+    onStop(): Promise<void> {
+        return this.dispose();
+    }
+
+    #createLease(record: LeaseRecord): RideCodexAppServerLease {
+        return Object.freeze({
+            kind: record.kind,
+            request: (method: StableClientMethod, params: unknown, timeoutMs?: number) =>
+                this.#request(record, method, params, timeoutMs),
+            notify: (method: RideCodexClientNotificationMethod, params: unknown) =>
+                this.#notify(record, method, params),
+            release: () => this.#releaseRecord(record)
+        });
+    }
+
+    async #request(
+        record: LeaseRecord,
+        method: StableClientMethod,
+        params: unknown,
+        timeoutMs?: number
+    ): Promise<unknown> {
+        this.#requireLease(record);
+        if (method === 'initialize') {
+            throw new Error('Initialize is owned by the Codex App Server host');
+        }
+        const connection = await this.#ensureStarted(false);
+        this.#requireLease(record);
+        if (!connection.ready || this.#connection !== connection) {
+            throw new RideCodexAppServerHostError('unexpected-exit');
+        }
+        return connection.client.request(method, params, timeoutMs);
+    }
+
+    async #notify(
+        record: LeaseRecord,
+        method: RideCodexClientNotificationMethod,
+        params: unknown
+    ): Promise<void> {
+        this.#requireLease(record);
+        if (method === 'initialized') {
+            throw new Error('Initialized is owned by the Codex App Server host');
+        }
+        const connection = await this.#ensureStarted(false);
+        this.#requireLease(record);
+        connection.client.notify(method, params);
+    }
+
+    #releaseRecord(record: LeaseRecord): void {
+        if (record.released) {
+            return;
+        }
+        record.released = true;
+        if (!this.#leases.delete(record.id)) {
+            return;
+        }
+        if (record.kind === 'approval') {
+            this.#unsafeApprovalCount = Math.max(0, this.#unsafeApprovalCount - 1);
+        }
+        if (!this.#disposed && this.#leases.size === 0 && (this.#connection || this.#startPromise)) {
+            this.#scheduleIdleShutdown();
+        }
+    }
+
+    #requireLease(record: LeaseRecord): void {
+        this.#requireUsable();
+        if (record.released || this.#leases.get(record.id) !== record) {
+            throw new RideCodexAppServerHostError('lease-released');
+        }
+    }
+
+    #requireUsable(): void {
+        if (this.#disposed) {
+            throw new RideCodexAppServerHostError('disposed');
+        }
+        if (this.#state === 'circuit-open') {
+            throw new RideCodexAppServerHostError('circuit-open');
+        }
+    }
+
+    #ensureStarted(restarting: boolean): Promise<Connection> {
+        try {
+            this.#requireUsable();
+        } catch (error) {
+            return Promise.reject(error);
+        }
+        if (this.#connection?.ready) {
+            return Promise.resolve(this.#connection);
+        }
+        if (this.#startPromise) {
+            return this.#startPromise;
+        }
+        this.#state = restarting ? 'restarting' : 'starting';
+        const generation = this.#generation + 1;
+        this.#generation = generation;
+        const operation = this.#startGeneration(generation);
+        let tracked!: Promise<Connection>;
+        tracked = operation.then(
+            connection => {
+                if (this.#startPromise === tracked) {
+                    this.#startPromise = undefined;
+                }
+                return connection;
+            },
+            error => {
+                if (this.#startPromise === tracked) {
+                    this.#startPromise = undefined;
+                }
+                throw error;
+            }
+        );
+        void tracked.catch(() => undefined);
+        this.#startPromise = tracked;
+        return tracked;
+    }
+
+    async #startGeneration(generation: number): Promise<Connection> {
+        let child: ChildProcessWithoutNullStreams | undefined;
+        let connection: Connection | undefined;
+        try {
+            const launchSpec = await this.#resolver.resolve();
+            if (this.#disposed || generation !== this.#generation) {
+                throw new RideCodexAppServerHostError('disposed');
+            }
+            child = this.#spawn(launchSpec.executable, ['app-server', '--stdio'], Object.freeze({
+                shell: false,
+                stdio: Object.freeze(['pipe', 'pipe', 'pipe'] as const),
+                env: { ...process.env, ...launchSpec.environment },
+                windowsHide: true
+            }));
+            requirePipedChild(child);
+            connection = this.#createConnection(generation, child);
+            this.#connection = connection;
+
+            await connection.client.request('initialize', INITIALIZE_PARAMS, this.#handshakeTimeoutMs);
+            if (this.#disposed || this.#connection !== connection || generation !== this.#generation) {
+                throw new RideCodexAppServerHostError(this.#disposed ? 'disposed' : 'early-exit');
+            }
+            connection.client.notify('initialized', {});
+            connection.ready = true;
+            this.#state = 'ready';
+            return connection;
+        } catch (error) {
+            const safe = classifyStartupError(error, connection);
+            if (connection) {
+                await this.#stopConnection(connection, 'startup-failure');
+            } else if (child) {
+                await terminateUnpublishedChild(child, this.#shutdownGraceMs);
+            }
+            if (!this.#disposed && this.#state !== 'circuit-open') {
+                this.#state = 'stopped';
+            }
+            if (safe.code !== 'disposed' && safe.code !== 'lease-released') {
+                this.diagnostics.record(safe.code);
+            }
+            throw safe;
+        }
+    }
+
+    #createConnection(generation: number, child: ChildProcessWithoutNullStreams): Connection {
+        let resolveExit!: () => void;
+        const exitPromise = new Promise<void>(resolve => { resolveExit = resolve; });
+        const transport = new ChildJsonlTransport(child);
+        const stderrDataListener = (chunk: Buffer): void => this.diagnostics.appendStderr(chunk);
+        const stderrErrorListener = (): void => undefined;
+        let client: RideCodexJsonlClient | undefined;
+        const clientListeners: RideCodexDisposable[] = [];
+        let stderrDataRegistered = false;
+        let stderrErrorRegistered = false;
+        try {
+            client = new RideCodexJsonlClient(transport);
+            child.stderr.on('data', stderrDataListener);
+            stderrDataRegistered = true;
+            child.stderr.on('error', stderrErrorListener);
+            stderrErrorRegistered = true;
+            child.stderr.resume();
+            clientListeners.push(
+                client.onNotification(notification => this.#emitSafely(this.#notificationListeners, notification)),
+                client.onServerRequest(request => this.#emitSafely(this.#serverRequestListeners, request))
+            );
+        } catch (error) {
+            for (const listener of clientListeners) {
+                disposeSafely(listener);
+            }
+            client?.dispose();
+            transport.dispose();
+            if (stderrDataRegistered) {
+                child.stderr.off('data', stderrDataListener);
+            }
+            if (stderrErrorRegistered) {
+                child.stderr.off('error', stderrErrorListener);
+            }
+            throw error;
+        }
+        const connection: Connection = {
+            generation,
+            child,
+            pid: child.pid,
+            transport,
+            client,
+            exitPromise,
+            resolveExit,
+            stderrDataListener,
+            stderrErrorListener,
+            processExitListener: () => resolveExit(),
+            clientListeners,
+            intentionalStop: false,
+            ready: false,
+            finalized: false,
+            killRequested: false
+        };
+        child.on('exit', connection.processExitListener);
+        child.on('close', connection.processExitListener);
+        transport.onExit(reason => {
+            if (hasProcessExited(child)) {
+                connection.resolveExit();
+            }
+            void this.#handleConnectionExit(connection, reason);
+        });
+        return connection;
+    }
+
+    async #handleConnectionExit(connection: Connection, _reason?: Error): Promise<void> {
+        if (connection.finalized) {
+            return;
+        }
+        const wasCurrent = this.#connection === connection && this.#generation === connection.generation;
+        if (!hasProcessExited(connection.child)) {
+            connection.client.dispose();
+            this.#killExactChild(connection);
+            if (!await settlesWithin(connection.exitPromise, this.#shutdownGraceMs)) {
+                this.diagnostics.record('shutdown-timeout');
+                if (wasCurrent && !this.#disposed) {
+                    this.#openCircuit('circuit-open');
+                }
+                return;
+            }
+        }
+        this.#finalizeConnection(connection);
+        if (!wasCurrent) {
+            return;
+        }
+        this.#connection = undefined;
+        if (this.#disposed) {
+            this.#state = 'disposed';
+            return;
+        }
+        if (connection.intentionalStop) {
+            if (!this.#connection) {
+                this.#state = 'stopped';
+            }
+            return;
+        }
+        if (!connection.ready) {
+            this.#state = 'stopped';
+            return;
+        }
+
+        this.diagnostics.record('unexpected-exit');
+        if (this.#unsafeApprovalCount > 0) {
+            this.#openCircuit('unsafe-approval-exit');
+            return;
+        }
+        if (this.#restartAttempts >= 1) {
+            this.#openCircuit('circuit-open');
+            return;
+        }
+        if (this.#leases.size === 0) {
+            this.#state = 'stopped';
+            return;
+        }
+        this.#restartAttempts += 1;
+        try {
+            await this.#ensureStarted(true);
+        } catch {
+            if (!this.#disposed && this.#state !== 'circuit-open') {
+                this.#openCircuit('circuit-open');
+            }
+        }
+    }
+
+    #openCircuit(code: 'unsafe-approval-exit' | 'circuit-open'): void {
+        this.#state = 'circuit-open';
+        this.diagnostics.record(code);
+    }
+
+    #scheduleIdleShutdown(): void {
+        this.#cancelIdleTimer();
+        this.#idleTimer = setTimeout(() => {
+            this.#idleTimer = undefined;
+            if (this.#disposed || this.#leases.size > 0) {
+                return;
+            }
+            const connection = this.#connection;
+            if (connection) {
+                void this.#stopConnection(connection, 'idle');
+            }
+        }, this.#idleTimeoutMs);
+        this.#idleTimer.unref?.();
+    }
+
+    #cancelIdleTimer(): void {
+        if (this.#idleTimer) {
+            clearTimeout(this.#idleTimer);
+            this.#idleTimer = undefined;
+        }
+    }
+
+    async #stopConnection(connection: Connection, _reason: 'idle' | 'dispose' | 'startup-failure'): Promise<void> {
+        if (connection.finalized) {
+            return;
+        }
+        connection.intentionalStop = true;
+        if (!this.#disposed) {
+            this.#state = 'stopping';
+        }
+        connection.client.dispose();
+        if (await settlesWithin(connection.exitPromise, this.#shutdownGraceMs)) {
+            this.#finalizeConnection(connection);
+            if (this.#connection === connection) {
+                this.#connection = undefined;
+            }
+            if (!this.#disposed) {
+                this.#state = 'stopped';
+            }
+            return;
+        }
+        this.diagnostics.record('shutdown-forced');
+        this.#killExactChild(connection);
+        if (!await settlesWithin(connection.exitPromise, this.#shutdownGraceMs)) {
+            this.diagnostics.record('shutdown-timeout');
+            return;
+        }
+        this.#finalizeConnection(connection);
+        if (this.#connection === connection) {
+            this.#connection = undefined;
+        }
+        if (!this.#disposed) {
+            this.#state = 'stopped';
+        }
+    }
+
+    #killExactChild(connection: Connection): void {
+        if (connection.killRequested) {
+            return;
+        }
+        connection.killRequested = true;
+        try {
+            connection.child.kill();
+        } catch {
+            // Only the exact owned child is eligible for termination. Tauri's existing
+            // process-tree containment remains the final descendant cleanup boundary.
+        }
+    }
+
+    #finalizeConnection(connection: Connection): void {
+        if (connection.finalized) {
+            return;
+        }
+        connection.finalized = true;
+        for (const listener of connection.clientListeners) {
+            disposeSafely(listener);
+        }
+        connection.client.dispose();
+        connection.transport.dispose();
+        connection.child.stderr.off('data', connection.stderrDataListener);
+        connection.child.stderr.off('error', connection.stderrErrorListener);
+        connection.child.off('exit', connection.processExitListener);
+        connection.child.off('close', connection.processExitListener);
+        this.diagnostics.flushStderr();
+    }
+
+    #emitSafely<T>(listeners: ReadonlySet<(event: T) => void>, event: T): void {
+        for (const listener of [...listeners]) {
+            try {
+                listener(event);
+            } catch {
+                // Downstream listeners must not own or destabilize the shared process.
+            }
+        }
+    }
+}
+
+class ChildJsonlTransport implements RideCodexJsonlTransport {
+    readonly #dataListeners = new Set<(chunk: Uint8Array) => void>();
+    readonly #exitListeners = new Set<(reason?: Error) => void>();
+    readonly #stdout: Readable;
+    readonly #stdin: Writable;
+    readonly #onData = (chunk: Buffer): void => {
+        for (const listener of [...this.#dataListeners]) {
+            listener(chunk);
+        }
+    };
+    readonly #onExit = (): void => this.#emitExit(new Error('Codex App Server process exited'));
+    readonly #onProcessError = (): void => this.#emitExit(new Error('Codex App Server process failed'));
+    readonly #onStreamError = (): void => this.#emitExit(new Error('Codex App Server stdio failed'));
+    #exited = false;
+    #closeRequested = false;
+    #disposed = false;
+
+    constructor(readonly child: ChildProcessWithoutNullStreams) {
+        this.#stdout = child.stdout;
+        this.#stdin = child.stdin;
+        try {
+            this.#stdout.on('data', this.#onData);
+            this.#stdout.on('error', this.#onStreamError);
+            this.#stdin.on('error', this.#onStreamError);
+            child.on('error', this.#onProcessError);
+            child.on('exit', this.#onExit);
+        } catch (error) {
+            this.dispose();
+            throw error;
+        }
+    }
+
+    write(data: string): void {
+        if (this.#exited || this.#disposed || this.#closeRequested || !this.#stdin.writable) {
+            throw new Error('Codex App Server stdin is unavailable');
+        }
+        this.#stdin.write(data, 'utf8', error => {
+            if (error) {
+                this.#emitExit(new Error('Codex App Server stdio failed'));
+            }
+        });
+    }
+
+    onData(listener: (chunk: Uint8Array) => void): RideCodexDisposable {
+        return addListener(this.#dataListeners, listener);
+    }
+
+    onExit(listener: (reason?: Error) => void): RideCodexDisposable {
+        if (this.#exited) {
+            listener(new Error('Codex App Server process exited'));
+            return { dispose: () => undefined };
+        }
+        return addListener(this.#exitListeners, listener);
+    }
+
+    close(): void {
+        if (this.#closeRequested) {
+            return;
+        }
+        this.#closeRequested = true;
+        try {
+            this.#stdin.end();
+        } catch {
+            this.#emitExit(new Error('Codex App Server stdio failed'));
+        }
+    }
+
+    dispose(): void {
+        if (this.#disposed) {
+            return;
+        }
+        this.#disposed = true;
+        this.#stdout.off('data', this.#onData);
+        this.#stdout.off('error', this.#onStreamError);
+        this.#stdin.off('error', this.#onStreamError);
+        this.child.off('error', this.#onProcessError);
+        this.child.off('exit', this.#onExit);
+        this.#dataListeners.clear();
+        this.#exitListeners.clear();
+    }
+
+    #emitExit(reason: Error): void {
+        if (this.#exited) {
+            return;
+        }
+        this.#exited = true;
+        for (const listener of [...this.#exitListeners]) {
+            listener(reason);
+        }
+    }
+}
+
+function defaultSpawn(
+    executable: string,
+    args: readonly string[],
+    options: RideCodexAppServerSpawnOptions
+): ChildProcessWithoutNullStreams {
+    return nodeSpawn(executable, [...args], {
+        shell: options.shell,
+        stdio: [...options.stdio],
+        env: options.env,
+        windowsHide: options.windowsHide
+    });
+}
+
+function requirePipedChild(child: ChildProcessWithoutNullStreams): void {
+    if (!child || !child.stdin || !child.stdout || !child.stderr) {
+        throw new Error('Codex App Server spawn did not provide all required stdio pipes');
+    }
+}
+
+function hasProcessExited(child: ChildProcessWithoutNullStreams): boolean {
+    return child.exitCode !== null || child.signalCode !== null;
+}
+
+async function terminateUnpublishedChild(child: ChildProcessWithoutNullStreams, graceMs: number): Promise<void> {
+    const exited = new Promise<void>(resolve => child.once('exit', () => resolve()));
+    try {
+        child.stdin?.end();
+    } catch {
+        // Continue to bounded exact-child termination.
+    }
+    if (await settlesWithin(exited, graceMs)) {
+        return;
+    }
+    try {
+        child.kill();
+    } catch {
+        // No global process lookup or tree kill is allowed here.
+    }
+    await settlesWithin(exited, graceMs);
+}
+
+function classifyStartupError(error: unknown, connection: Connection | undefined): RideCodexAppServerHostError {
+    if (error instanceof RideCodexAppServerHostError) {
+        return error;
+    }
+    const message = error instanceof Error ? error.message : '';
+    if (/timed out/i.test(message)) {
+        return new RideCodexAppServerHostError('handshake-timeout');
+    }
+    if (/protocol|malformed|JSON|UTF-8|envelope/i.test(message)) {
+        return new RideCodexAppServerHostError('protocol-error');
+    }
+    return new RideCodexAppServerHostError(connection ? 'early-exit' : 'spawn-failed');
+}
+
+function timerLimit(value: number | undefined, fallback: number, label: string, minimum: number): number {
+    const resolved = value ?? fallback;
+    if (!Number.isSafeInteger(resolved) || resolved < minimum || resolved > MAX_TIMER_MS) {
+        throw new RangeError(`${label} must be a safe timer duration between ${minimum} and ${MAX_TIMER_MS}`);
+    }
+    return resolved;
+}
+
+function isLeaseKind(value: string): value is RideCodexAppServerLeaseKind {
+    return value === 'foreground-panel' || value === 'active-turn' || value === 'approval';
+}
+
+function addListener<T>(listeners: Set<(event: T) => void>, listener: (event: T) => void): RideCodexDisposable {
+    listeners.add(listener);
+    let disposed = false;
+    return {
+        dispose: () => {
+            if (!disposed) {
+                disposed = true;
+                listeners.delete(listener);
+            }
+        }
+    };
+}
+
+function disposeSafely(disposable: RideCodexDisposable): void {
+    try {
+        disposable.dispose();
+    } catch {
+        // Listener disposal is idempotent and best effort.
+    }
+}
+
+async function settlesWithin(promise: Promise<void>, timeoutMs: number): Promise<boolean> {
+    if (timeoutMs === 0) {
+        return false;
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<false>(resolve => {
+        timer = setTimeout(() => resolve(false), timeoutMs);
+        timer.unref?.();
+    });
+    const settled = await Promise.race([promise.then(() => true as const), timeout]);
+    if (timer) {
+        clearTimeout(timer);
+    }
+    return settled;
+}

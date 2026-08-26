@@ -14,6 +14,7 @@ import {
     StableClientMethod,
     validateRideCodexIncomingMessage
 } from './ride-codex-message-validator';
+import { CLIENT_NOTIFICATION_METHODS } from '../common/ride-codex-methods';
 
 export { StableClientMethod } from './ride-codex-message-validator';
 
@@ -39,6 +40,8 @@ export interface RideCodexNotification {
     method: string;
     params: unknown;
 }
+
+export type RideCodexClientNotificationMethod = typeof CLIENT_NOTIFICATION_METHODS[number];
 
 export interface RideCodexIncomingRequest extends RideCodexNotification {
     id: RideCodexRequestId;
@@ -157,6 +160,16 @@ export class RideCodexJsonlClient implements RideCodexDisposable {
             { id, result: result === undefined ? null : result },
             ['id', 'result']
         ));
+    }
+
+    notify(method: RideCodexClientNotificationMethod, params: unknown): void {
+        if (this.closed) {
+            throw this.closedRequestError();
+        }
+        if (!(CLIENT_NOTIFICATION_METHODS as readonly string[]).includes(method)) {
+            throw new Error(`Unsupported client notification method: ${String(method)}`);
+        }
+        this.writePayload(serializeEnvelope({ method, params }, ['method', 'params']));
     }
 
     respondError(id: RideCodexRequestId, code: number, message: string): void {
