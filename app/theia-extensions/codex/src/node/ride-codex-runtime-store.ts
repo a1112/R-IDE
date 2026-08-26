@@ -84,7 +84,7 @@ interface StoreTransactionRecord {
     mutationInProgress: boolean;
     readonly presentation: InstallPresentation;
     readonly operations: Set<StoreTransactionOperation>;
-    operationLimitFailure?: RideCodexRuntimeStoreError;
+    operationLimitPromise?: Promise<never>;
     published?: PublishedManagedRuntime;
     activated?: ValidatedManagedRuntime;
 }
@@ -190,32 +190,48 @@ class TransactionOperationPromise<T> extends Promise<T> {
         onfulfilled?: ((value: T) => TResult1 | PromiseLike<TResult1>) | null,
         onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null
     ): Promise<TResult1 | TResult2> {
-        TRANSACTION_OPERATION_OBSERVERS.get(this)?.();
-        return super.then(onfulfilled, onrejected);
+        const onObserved = TRANSACTION_OPERATION_OBSERVERS.get(this);
+        if (typeof onrejected === 'function') {
+            onObserved?.();
+        }
+        return containTransactionOperationPromise(super.then(onfulfilled, onrejected), onObserved);
     }
 
     override catch<TResult = never>(
         onrejected?: ((reason: unknown) => TResult | PromiseLike<TResult>) | null
     ): Promise<T | TResult> {
-        TRANSACTION_OPERATION_OBSERVERS.get(this)?.();
-        return super.catch(onrejected);
+        return this.then(undefined, onrejected);
     }
 
     override finally(onfinally?: (() => void) | null): Promise<T> {
-        TRANSACTION_OPERATION_OBSERVERS.get(this)?.();
-        return super.finally(onfinally);
+        const onObserved = TRANSACTION_OPERATION_OBSERVERS.get(this);
+        const derived = typeof onfinally === 'function'
+            ? Promise.prototype.then.call(
+                this,
+                (value: T) => Promise.resolve(onfinally()).then(() => value),
+                (reason: unknown) => Promise.resolve(onfinally()).then(() => { throw reason; })
+            ) as Promise<T>
+            : Promise.prototype.then.call(this) as Promise<T>;
+        return containTransactionOperationPromise(derived, onObserved);
     }
 }
 
-function containedRejectedPromise<T>(reason: unknown): Promise<T> {
-    const rejected = Promise.reject<T>(reason);
+function containTransactionOperationPromise<T>(
+    source: Promise<T>,
+    onObserved?: () => void
+): TransactionOperationPromise<T> {
     const contained = new TransactionOperationPromise<T>(
         (resolveOperation, rejectOperation) => {
-            rejected.then(resolveOperation, rejectOperation);
-        }
+            source.then(resolveOperation, rejectOperation);
+        },
+        onObserved
     );
     Promise.prototype.then.call(contained, undefined, () => undefined);
     return contained;
+}
+
+function containedRejectedPromise<T>(reason: unknown): Promise<T> {
+    return containTransactionOperationPromise(Promise.reject<T>(reason));
 }
 
 export class RideCodexRuntimeStoreError extends Error {
@@ -289,19 +305,15 @@ export class RideCodexRuntimeStore {
             const detachedFailures = operations.filter(
                 tracked => tracked.status === 'rejected' && !tracked.observed
             );
-            const detachedFailureReasons = [
-                ...detachedFailures.map(tracked => tracked.reason),
-                ...(record.operationLimitFailure ? [record.operationLimitFailure] : [])
-            ];
             if (callbackRejected) {
-                if (detachedFailureReasons.some(reason => reason !== callbackFailure)) {
+                if (detachedFailures.length > 0) {
                     throw new RideCodexRuntimeStoreError(
                         'Codex install transaction callback and detached mutation both failed.'
                     );
                 }
                 throw callbackFailure;
             }
-            const operationFailure = detachedFailureReasons[0];
+            const operationFailure = detachedFailures[0]?.reason;
             if (operationFailure) {
                 throw operationFailure;
             }
@@ -1638,12 +1650,16 @@ export class RideCodexRuntimeStore {
             return containedRejectedPromise(error);
         }
         if (record.operations.size >= MAX_TRANSACTION_OPERATIONS) {
-            if (!record.operationLimitFailure) {
-                record.operationLimitFailure = new RideCodexRuntimeStoreError(
-                    'Codex install transaction exceeded its operation limit.'
+            if (!record.operationLimitPromise) {
+                record.operationLimitPromise = this.#recordTransactionOperation(
+                    record,
+                    Promise.reject(new RideCodexRuntimeStoreError(
+                        'Codex install transaction exceeded its operation limit.'
+                    )),
+                    false
                 );
             }
-            return containedRejectedPromise(record.operationLimitFailure);
+            return record.operationLimitPromise;
         }
         if (record.mutationInProgress) {
             return this.#recordTransactionOperation(
