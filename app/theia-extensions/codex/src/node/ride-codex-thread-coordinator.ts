@@ -686,10 +686,11 @@ export class RideCodexThreadCoordinator {
             this.#restartRefreshGeneration = 0;
             this.#publish();
         }
-        const hostInvalid = event.state === 'circuit-open' || event.state === 'disposed';
+        const hostInvalid = event.state === 'stopped' || event.state === 'restarting'
+            || event.state === 'stopping' || event.state === 'circuit-open' || event.state === 'disposed';
         for (const active of [...this.#activeRequests]) {
-            if (active.generation !== undefined
-                && (hostInvalid || active.generation !== this.#generation)) {
+            if (hostInvalid
+                || (active.generation !== undefined && active.generation !== this.#generation)) {
                 active.invalidate(new RideCodexConversationsError('operation-superseded'));
                 active.release();
                 this.#activeRequests.delete(active);

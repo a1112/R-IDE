@@ -633,6 +633,71 @@ for (const boundary of [
     });
 }
 
+test('circuit-open immediately cancels an unbound request and releases its late lease exactly once', async () => {
+    const host = new FakeThreadHost();
+    const gate = deferred<void>();
+    host.acquireGate = gate;
+    const coordinator = new RideCodexThreadCoordinator({ host });
+    const operation = coordinator.listModels().catch(error => error as Error);
+    await waitFor(() => host.acquireCount === 1);
+
+    host.changeState('circuit-open', 1);
+    const immediate = await Promise.race([
+        operation,
+        tick().then(() => 'still-pending' as const)
+    ]);
+
+    assert.ok(immediate instanceof Error);
+    assert.match(immediate.message, /superseded/i);
+    assert.equal(host.releaseCount, 0);
+
+    gate.resolve(undefined);
+    await waitFor(() => host.releaseCount === 1);
+    await tick();
+    assert.equal(host.activeLeases, 0);
+    assert.equal(host.releaseCount, 1);
+    await coordinator.dispose();
+});
+
+test('disposed host immediately clears all unbound request slots and absorbs late acquire rejections', async () => {
+    const host = new FakeThreadHost();
+    const gate = deferred<void>();
+    host.acquireGate = gate;
+    const coordinator = new RideCodexThreadCoordinator({ host });
+    const operations = Array.from(
+        { length: 128 },
+        () => coordinator.listModels().catch(error => error as Error)
+    );
+    await waitFor(() => host.acquireCount === 128);
+
+    host.changeState('disposed', 1);
+    const immediate = await Promise.race([
+        Promise.all(operations),
+        tick().then(() => 'still-pending' as const)
+    ]);
+
+    assert.notEqual(immediate, 'still-pending');
+    assert.ok(Array.isArray(immediate));
+    assert.equal(immediate.length, 128);
+    for (const result of immediate) {
+        assert.ok(result instanceof Error);
+        assert.match(result.message, /superseded/i);
+    }
+
+    host.acquireGate = undefined;
+    host.changeState('ready', 1);
+    await coordinator.listModels();
+    assert.equal(host.acquireCount, 129);
+    assert.equal(host.releaseCount, 1);
+
+    gate.reject(new Error('late acquire failure'));
+    await Promise.all(operations);
+    await tick();
+    assert.equal(host.releaseCount, 1);
+    assert.equal(host.activeLeases, 0);
+    await coordinator.dispose();
+});
+
 test('refreshes the selected thread through the same host after a new ready generation', async () => {
     const host = new FakeThreadHost();
     host.responder = method => method === 'thread/list'
