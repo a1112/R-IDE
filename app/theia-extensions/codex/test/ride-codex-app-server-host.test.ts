@@ -872,25 +872,50 @@ test('an unsafe approval crash never restarts and remains circuit-open after app
 });
 
 test('release, crash, restart, and dispose races are idempotent and generation-isolated', async () => {
-    const harness = createHost({ modes: ['normal', 'normal'], idleTimeoutMs: 10, shutdownGraceMs: 20 });
+    const harness = createControlledHost({ exitAfterKill: 'never', shutdownGraceMs: 5 });
     const lease = await harness.host.acquire('active-turn');
-    const oldChild = harness.records[0].child;
+    const oldChild = harness.children[0];
     lease.release();
     lease.release();
     const reacquired = await harness.host.acquire('foreground-panel');
-    await assert.rejects(reacquired.request('model/list', { fixture: 'crash' }));
-    await waitFor(() => harness.records.length === 2 && harness.host.snapshot().state === 'ready');
-    oldChild.emit('exit', 29, null);
-    await new Promise(resolve => setTimeout(resolve, 30));
+    oldChild.emitExit();
+    await waitFor(() => harness.children.length === 2 && harness.host.snapshot().state === 'ready');
+    oldChild.child.emit('close', 29, null);
+    oldChild.child.emit('exit', 29, null);
     assert.equal(harness.host.snapshot().leaseCount, 1);
     assert.equal(harness.host.snapshot().state, 'ready');
-    assert.equal(harness.records.length, 2);
+    assert.equal(harness.children.length, 2);
 
-    await Promise.all([harness.host.dispose(), harness.host.dispose(), harness.host.dispose()]);
+    const replacement = harness.children[1];
+    const first = harness.host.dispose();
+    const second = harness.host.dispose();
+    const third = harness.host.dispose();
+    assert.strictEqual(second, first);
+    assert.strictEqual(third, first);
+    await Promise.all([first, second, third]);
     reacquired.release();
-    await assert.rejects(harness.host.acquire('foreground-panel'), /disposed/i);
-    await assert.rejects(harness.host.retry(), /disposed/i);
-    assert.ok(harness.records.every(record => record.child.exitCode !== null || record.child.signalCode !== null));
+
+    assert.equal(harness.host.snapshot().state, 'disposed');
+    assert.equal(harness.host.snapshot().pid, replacement.child.pid, 'host must retain the lingering child authority');
+    assert.equal(replacement.child.exitCode, null);
+    assert.equal(replacement.child.signalCode, null);
+    assert.ok(replacement.child.listenerCount('exit') > 0);
+    assert.ok(replacement.child.listenerCount('close') > 0);
+    await assert.rejects(harness.host.acquire('foreground-panel'), error => {
+        assert.equal((error as RideCodexAppServerHostError).code, 'disposed');
+        return true;
+    });
+    await assert.rejects(harness.host.retry(), error => {
+        assert.equal((error as RideCodexAppServerHostError).code, 'disposed');
+        return true;
+    });
+    assert.equal(harness.children.length, 2, 'disposal must not spawn another generation');
+
+    replacement.emitExit();
+    await waitFor(() => harness.host.snapshot().pid === undefined, 2_000);
+    assert.equal(replacement.child.listenerCount('exit'), 0);
+    assert.equal(replacement.child.listenerCount('close'), 0);
+    assert.equal(harness.host.snapshot().state, 'disposed');
 });
 
 test('final disposal resolves across late exit races and never starts another generation', async () => {
