@@ -216,7 +216,7 @@ export class RideCodexTurnCoordinator {
         this.#interruptTimeoutMs = positiveLimit(options.interruptTimeoutMs, DEFAULT_INTERRUPT_TIMEOUT_MS);
         this.#recoveryTimeoutMs = positiveLimit(options.recoveryTimeoutMs, DEFAULT_RECOVERY_TIMEOUT_MS);
         this.#maxQueuedBytes = requireQueueLimit(options.maxQueuedBytes, DEFAULT_MAX_QUEUED_BYTES);
-        this.#maxBatchEvents = positiveLimit(options.maxBatchEvents, DEFAULT_MAX_BATCH_EVENTS);
+        this.#maxBatchEvents = requireBatchLimit(options.maxBatchEvents, DEFAULT_MAX_BATCH_EVENTS);
         this.#maxItemBytes = positiveLimit(options.maxItemBytes, DEFAULT_MAX_ITEM_BYTES);
         this.#maxRetainedItems = positiveLimit(options.maxRetainedItems, DEFAULT_MAX_RETAINED_ITEMS);
         this.#maxDiagnosticHistory = positiveLimit(options.maxDiagnosticHistory, DEFAULT_MAX_DIAGNOSTIC_HISTORY);
@@ -321,10 +321,10 @@ export class RideCodexTurnCoordinator {
             });
             const pending = safePromise(lease.request('turn/start', params));
             const raw = await Promise.race([pending, active.invalidated]);
-            const response = requireRecord(raw);
-            const turn = requireRecord(ownValue(response, 'turn'));
-            const turnId = requireIdentifier(ownValue(turn, 'id'));
-            const status = normalizeServerTurnStatus(ownValue(turn, 'status'));
+            const response = requireExactOptions(raw, ['turn']);
+            const turn = requireTurn(ownValue(response, 'turn'));
+            const turnId = turn.id;
+            const status = turn.status;
             this.#establishTurn(active, turnId);
             if (status !== 'in-progress') {
                 this.#finishActive(status, status === 'failed' ? SAFE_FAILURE : undefined, undefined, true, true);
@@ -361,7 +361,7 @@ export class RideCodexTurnCoordinator {
                 expectedTurnId: request.expectedTurnId
             });
             const raw = await Promise.race([safePromise(lease.request('turn/steer', params)), active.invalidated]);
-            const response = requireRecord(raw);
+            const response = requireExactOptions(raw, ['turnId']);
             const responseTurnId = requireIdentifier(ownValue(response, 'turnId'));
             if (responseTurnId !== request.expectedTurnId || this.#active !== active || active.terminal) {
                 throw new RideCodexTurnError('operation-superseded');
@@ -476,11 +476,7 @@ export class RideCodexTurnCoordinator {
                     }), this.#recoveryTimeoutMs)),
                     this.#disposedSignal
                 ]);
-                const response = requireRecord(raw);
-                const resumedThread = requireRecord(ownValue(response, 'thread'));
-                if (requireIdentifier(ownValue(resumedThread, 'id')) !== threadId) {
-                    throw new RideCodexTurnError('invalid-data');
-                }
+                requireThreadResumeResponse(raw, threadId);
             } finally {
                 this.#releaseLease(lease);
             }
@@ -790,18 +786,22 @@ export class RideCodexTurnCoordinator {
                 }));
                 return;
             }
-            case 'turn/plan/updated':
+            case 'turn/plan/updated': {
+                const planParams = requireExactOptions(params, ['threadId', 'turnId', 'explanation', 'plan']);
                 this.#enqueue(Object.freeze({
                     type: 'turn-plan',
-                    ...normalizeExplanation(params, this.#maxItemBytes),
-                    steps: normalizePlan(ownValue(params, 'plan'), this.#maxRetainedItems)
+                    ...normalizeExplanation(planParams, this.#maxItemBytes),
+                    steps: normalizePlan(ownValue(planParams, 'plan'), this.#maxRetainedItems)
                 }));
                 return;
-            case 'turn/diff/updated':
+            }
+            case 'turn/diff/updated': {
+                const diffParams = requireExactOptions(params, ['threadId', 'turnId', 'diff']);
                 this.#enqueue(Object.freeze({
-                    type: 'turn-diff', diff: requireString(ownValue(params, 'diff'), this.#maxItemBytes)
+                    type: 'turn-diff', diff: requireBoundedText(ownValue(diffParams, 'diff'), this.#maxItemBytes)
                 }));
                 return;
+            }
             case 'thread/tokenUsage/updated':
                 this.#enqueue(normalizeTokenUsage(ownValue(params, 'tokenUsage')));
                 return;
@@ -862,7 +862,7 @@ export class RideCodexTurnCoordinator {
                 bytes: replacementBytes
             });
             const candidate = [...this.#queue.slice(0, -1), replacementEntry];
-            const candidateBytes = queuedEntriesBytes(candidate);
+            const candidateBytes = this.#queuedBytes(candidate);
             if (candidateBytes <= this.#maxQueuedBytes) {
                 this.#queue[this.#queue.length - 1] = Object.freeze({
                     identity: previous.identity,
@@ -898,7 +898,7 @@ export class RideCodexTurnCoordinator {
         if (bounded.type === 'turn-started' || bounded.type === 'turn-terminal') {
             this.#makeRoomForBoundary(entry);
         }
-        const candidateBytes = queuedEntriesBytes([...this.#queue, entry]);
+        const candidateBytes = this.#queuedBytes([...this.#queue, entry]);
         if (candidateBytes > this.#maxQueuedBytes) {
             this.#recordDrop(this.#queueIdentity, entry.bytes);
             this.#scheduleFlush();
@@ -909,13 +909,13 @@ export class RideCodexTurnCoordinator {
     }
 
     #makeRoomForBoundary(incoming: QueuedEvent): void {
-        while (queuedEntriesBytes([...this.#queue, incoming]) > this.#maxQueuedBytes) {
+        while (this.#queuedBytes([...this.#queue, incoming]) > this.#maxQueuedBytes) {
             const index = this.#queue.findIndex(entry =>
                 entry.event.type !== 'turn-started' && entry.event.type !== 'turn-terminal'
             );
             if (index >= 0) {
                 const [removed] = this.#queue.splice(index, 1);
-                this.#recordDrop(removed.identity, removed.bytes);
+                this.#addDropMetadata(removed.identity, removed.bytes);
                 continue;
             }
             const oldestOther = this.#queue.find(entry => !sameIdentity(entry.identity, incoming.identity));
@@ -925,14 +925,19 @@ export class RideCodexTurnCoordinator {
             for (let queueIndex = this.#queue.length - 1; queueIndex >= 0; queueIndex -= 1) {
                 const candidate = this.#queue[queueIndex];
                 if (sameIdentity(candidate.identity, oldestOther.identity)) {
-                    const [removed] = this.#queue.splice(queueIndex, 1);
-                    this.#recordDrop(removed.identity, removed.bytes);
+                    this.#queue.splice(queueIndex, 1);
                 }
             }
+            this.#queueMetadata.delete(queueIdentityKey(oldestOther.identity));
         }
     }
 
     #recordDrop(identity: QueueIdentity, bytes: number): void {
+        this.#addDropMetadata(identity, bytes);
+        this.#trimQueueToBudget();
+    }
+
+    #addDropMetadata(identity: QueueIdentity, bytes: number): void {
         const metadata = this.#metadataFor(identity);
         metadata.droppedEvents = Math.min(Number.MAX_SAFE_INTEGER, metadata.droppedEvents + 1);
         metadata.droppedBytes = Math.min(
@@ -943,6 +948,39 @@ export class RideCodexTurnCoordinator {
 
     #recordTruncation(identity: QueueIdentity): void {
         this.#metadataFor(identity).truncated = true;
+        this.#trimQueueToBudget();
+    }
+
+    #queuedBytes(entries: readonly QueuedEvent[] = this.#queue): number {
+        return queuedEntriesBytes(entries, this.#maxBatchEvents, this.#queueMetadata);
+    }
+
+    #trimQueueToBudget(): void {
+        while (this.#queuedBytes() > this.#maxQueuedBytes) {
+            const ordinary = this.#queue.findIndex(entry =>
+                entry.event.type !== 'turn-started' && entry.event.type !== 'turn-terminal'
+            );
+            if (ordinary >= 0) {
+                const [removed] = this.#queue.splice(ordinary, 1);
+                this.#addDropMetadata(removed.identity, removed.bytes);
+                continue;
+            }
+            const metadata = [...this.#queueMetadata.values()].find(candidate =>
+                this.#queue.some(entry => sameIdentity(entry.identity, candidate.identity))
+            );
+            if (!metadata) {
+                break;
+            }
+            metadata.droppedEvents = 0;
+            metadata.droppedBytes = 0;
+            metadata.truncated = false;
+            this.#queueMetadata.delete(queueIdentityKey(metadata.identity));
+        }
+        for (const [key, metadata] of [...this.#queueMetadata]) {
+            if (!this.#queue.some(entry => sameIdentity(entry.identity, metadata.identity))) {
+                this.#queueMetadata.delete(key);
+            }
+        }
     }
 
     #metadataFor(identity: QueueIdentity): QueueMetadata {
@@ -973,9 +1011,9 @@ export class RideCodexTurnCoordinator {
     #flush(): void {
         this.#flushHandle = undefined;
         const first = this.#queue[0];
-        const firstMetadata = this.#queueMetadata.values().next().value as QueueMetadata | undefined;
-        const identity = first?.identity ?? firstMetadata?.identity;
+        const identity = first?.identity;
         if (!identity) {
+            this.#queueMetadata.clear();
             return;
         }
         const metadataKey = queueIdentityKey(identity);
@@ -1028,11 +1066,21 @@ export class RideCodexTurnCoordinator {
             const [removed] = events.splice(removable, 1);
             this.#recordDrop(identity, eventBytes(removed));
         }
+        if (events.length === 0) {
+            this.#queueMetadata.delete(metadataKey);
+            if (this.#queue.length > 0) {
+                this.#scheduleFlush();
+            }
+            return;
+        }
         const batch = freezeRideCodexEventBatch({ ...identity, events });
         for (const client of [...this.#clients]) {
             this.#deliver(client, batch);
         }
-        if (this.#queue.length > 0 || this.#queueMetadata.size > 0) {
+        if (!this.#queue.some(entry => sameIdentity(entry.identity, identity))) {
+            this.#queueMetadata.delete(metadataKey);
+        }
+        if (this.#queue.length > 0) {
             this.#scheduleFlush();
         }
     }
@@ -1332,6 +1380,471 @@ function requireOptions(value: unknown, keys: readonly string[]): Record<string,
     return record;
 }
 
+function requireExactOptions(value: unknown, keys: readonly string[]): Record<string, unknown> {
+    const record = requireOptions(value, keys);
+    const descriptors = Object.getOwnPropertyDescriptors(record);
+    if (Object.keys(descriptors).length !== keys.length
+        || keys.some(key => !Object.prototype.hasOwnProperty.call(descriptors, key))) {
+        throw new RideCodexTurnError('invalid-data');
+    }
+    return record;
+}
+
+function requireTurn(value: unknown): Readonly<{
+    id: string;
+    status: 'in-progress' | RideCodexTurnTerminalStatus;
+}> {
+    const turn = requireExactOptions(value, [
+        'id', 'items', 'itemsView', 'status', 'error', 'startedAt', 'completedAt', 'durationMs'
+    ]);
+    const items = ownValue(turn, 'items');
+    if (!Array.isArray(items) || utilTypes.isProxy(items) || items.length > MAX_RAW_ARRAY) {
+        throw new RideCodexTurnError('invalid-data');
+    }
+    for (const item of items) {
+        requireStableThreadItem(item);
+    }
+    if (!['notLoaded', 'summary', 'full'].includes(ownValue(turn, 'itemsView') as string)) {
+        throw new RideCodexTurnError('invalid-data');
+    }
+    requireTurnError(ownValue(turn, 'error'));
+    requireNullableNonNegativeNumber(ownValue(turn, 'startedAt'));
+    requireNullableNonNegativeNumber(ownValue(turn, 'completedAt'));
+    requireNullableNonNegativeNumber(ownValue(turn, 'durationMs'));
+    return Object.freeze({
+        id: requireIdentifier(ownValue(turn, 'id')),
+        status: normalizeServerTurnStatus(ownValue(turn, 'status'))
+    });
+}
+
+function requireStableThreadItem(value: unknown): void {
+    const record = requireRecord(value);
+    const type = ownValue(record, 'type');
+    switch (type) {
+        case 'contextCompaction': {
+            const item = requireExactOptions(record, ['type', 'id']);
+            requireIdentifier(ownValue(item, 'id'));
+            return;
+        }
+        case 'agentMessage': {
+            const item = requireExactOptions(record, ['type', 'id', 'text', 'phase', 'memoryCitation']);
+            requireIdentifier(ownValue(item, 'id'));
+            requireBoundedText(ownValue(item, 'text'), MAX_INPUT_TEXT_BYTES);
+            const phase = ownValue(item, 'phase');
+            if (!isNullish(phase) && phase !== 'commentary' && phase !== 'final_answer') {
+                throw new RideCodexTurnError('invalid-data');
+            }
+            const citation = ownValue(item, 'memoryCitation');
+            if (!isNullish(citation)) {
+                requireRecord(citation);
+            }
+            return;
+        }
+        case 'plan': {
+            const item = requireExactOptions(record, ['type', 'id', 'text']);
+            requireIdentifier(ownValue(item, 'id'));
+            requireBoundedText(ownValue(item, 'text'), MAX_INPUT_TEXT_BYTES);
+            return;
+        }
+        case 'reasoning': {
+            const item = requireExactOptions(record, ['type', 'id', 'summary', 'content']);
+            requireIdentifier(ownValue(item, 'id'));
+            requireStringArray(ownValue(item, 'summary'), MAX_RAW_ARRAY, MAX_INPUT_TEXT_BYTES, true);
+            requireStringArray(ownValue(item, 'content'), MAX_RAW_ARRAY, MAX_INPUT_TEXT_BYTES, true);
+            return;
+        }
+        case 'commandExecution': {
+            const item = requireExactOptions(record, [
+                'type', 'id', 'command', 'cwd', 'processId', 'source', 'status', 'commandActions',
+                'aggregatedOutput', 'exitCode', 'durationMs'
+            ]);
+            requireIdentifier(ownValue(item, 'id'));
+            requireBoundedText(ownValue(item, 'command'), MAX_INPUT_TEXT_BYTES);
+            requireString(ownValue(item, 'cwd'), MAX_LOCAL_PATH_BYTES);
+            requireNullableIdentifier(ownValue(item, 'processId'));
+            if (!['agent', 'userShell', 'unifiedExecStartup', 'unifiedExecInteraction']
+                .includes(ownValue(item, 'source') as string)
+                || !['inProgress', 'completed', 'failed', 'declined']
+                    .includes(ownValue(item, 'status') as string)) {
+                throw new RideCodexTurnError('invalid-data');
+            }
+            requireBoundedArray(ownValue(item, 'commandActions'));
+            requireNullableText(ownValue(item, 'aggregatedOutput'), MAX_INPUT_TEXT_BYTES);
+            requireNullableSafeInteger(ownValue(item, 'exitCode'));
+            requireNullableNonNegativeNumber(ownValue(item, 'durationMs'));
+            return;
+        }
+        case 'fileChange': {
+            const item = requireExactOptions(record, ['type', 'id', 'changes', 'status']);
+            requireIdentifier(ownValue(item, 'id'));
+            normalizeFileChanges(ownValue(item, 'changes'), MAX_RAW_ARRAY);
+            if (!['inProgress', 'completed', 'failed', 'declined'].includes(ownValue(item, 'status') as string)) {
+                throw new RideCodexTurnError('invalid-data');
+            }
+            return;
+        }
+        case 'userMessage': {
+            const item = requireExactOptions(record, ['type', 'id', 'clientId', 'content']);
+            requireIdentifier(ownValue(item, 'id'));
+            requireNullableIdentifier(ownValue(item, 'clientId'));
+            const content = ownValue(item, 'content');
+            if (!Array.isArray(content) || utilTypes.isProxy(content) || content.length > MAX_INPUT_ITEMS) {
+                throw new RideCodexTurnError('invalid-data');
+            }
+            for (const input of content) {
+                requireStableUserInput(input);
+            }
+            return;
+        }
+        default:
+            throw new RideCodexTurnError('invalid-data');
+    }
+}
+
+function requireStableUserInput(value: unknown): void {
+    const input = requireRecord(value);
+    switch (ownValue(input, 'type')) {
+        case 'text': {
+            const textInput = requireExactOptions(input, ['type', 'text', 'text_elements']);
+            requireBoundedText(ownValue(textInput, 'text'), MAX_INPUT_TEXT_BYTES);
+            requireBoundedArray(ownValue(textInput, 'text_elements'));
+            return;
+        }
+        case 'image': {
+            const image = requireOptions(input, ['type', 'detail', 'url']);
+            requireRequiredKeys(image, ['type', 'url']);
+            requireString(ownValue(image, 'url'), MAX_LOCAL_PATH_BYTES);
+            requireOptionalImageDetail(image);
+            return;
+        }
+        case 'localImage': {
+            const image = requireOptions(input, ['type', 'detail', 'path']);
+            requireRequiredKeys(image, ['type', 'path']);
+            requireString(ownValue(image, 'path'), MAX_LOCAL_PATH_BYTES);
+            requireOptionalImageDetail(image);
+            return;
+        }
+        case 'skill':
+        case 'mention': {
+            const reference = requireExactOptions(input, ['type', 'name', 'path']);
+            requireString(ownValue(reference, 'name'), MAX_IDENTIFIER_BYTES);
+            requireString(ownValue(reference, 'path'), MAX_LOCAL_PATH_BYTES);
+            return;
+        }
+        default:
+            throw new RideCodexTurnError('invalid-data');
+    }
+}
+
+function requireOptionalImageDetail(record: Record<string, unknown>): void {
+    if (!Object.prototype.hasOwnProperty.call(record, 'detail')) {
+        return;
+    }
+    if (!['auto', 'low', 'high', 'original'].includes(ownValue(record, 'detail') as string)) {
+        throw new RideCodexTurnError('invalid-data');
+    }
+}
+
+function requireTurnError(value: unknown): void {
+    if (isNullish(value)) {
+        if (value === undefined) {
+            throw new RideCodexTurnError('invalid-data');
+        }
+        return;
+    }
+    const error = requireExactOptions(value, ['message', 'codexErrorInfo', 'additionalDetails']);
+    requireBoundedText(ownValue(error, 'message'), MAX_INPUT_TEXT_BYTES);
+    requireNullableText(ownValue(error, 'additionalDetails'), MAX_INPUT_TEXT_BYTES);
+    const info = ownValue(error, 'codexErrorInfo');
+    if (!isNullish(info)) {
+        requireCodexErrorInfo(info);
+    }
+}
+
+function requireCodexErrorInfo(value: unknown): void {
+    if (typeof value === 'string') {
+        if (![
+            'contextWindowExceeded', 'sessionBudgetExceeded', 'usageLimitExceeded', 'serverOverloaded',
+            'cyberPolicy', 'internalServerError', 'unauthorized', 'badRequest', 'threadRollbackFailed',
+            'sandboxError', 'other'
+        ].includes(value)) {
+            throw new RideCodexTurnError('invalid-data');
+        }
+        return;
+    }
+    const tagged = requireRecord(value);
+    const keys = Object.keys(tagged);
+    if (keys.length !== 1 || ![
+        'httpConnectionFailed', 'responseStreamConnectionFailed', 'responseStreamDisconnected',
+        'responseTooManyFailedAttempts', 'activeTurnNotSteerable'
+    ].includes(keys[0])) {
+        throw new RideCodexTurnError('invalid-data');
+    }
+    const payload = ownValue(tagged, keys[0]);
+    if (keys[0] === 'activeTurnNotSteerable') {
+        const active = requireExactOptions(payload, ['turnKind']);
+        if (!['review', 'compact'].includes(ownValue(active, 'turnKind') as string)) {
+            throw new RideCodexTurnError('invalid-data');
+        }
+        return;
+    }
+    const connection = requireExactOptions(payload, ['httpStatusCode']);
+    const httpStatusCode = ownValue(connection, 'httpStatusCode');
+    if (isNullish(httpStatusCode)) {
+        if (httpStatusCode === undefined) {
+            throw new RideCodexTurnError('invalid-data');
+        }
+        return;
+    }
+    if (!Number.isSafeInteger(httpStatusCode) || (httpStatusCode as number) < 0) {
+        throw new RideCodexTurnError('invalid-data');
+    }
+}
+
+function requireThreadResumeResponse(value: unknown, expectedThreadId: string): void {
+    const response = requireExactOptions(value, [
+        'thread', 'model', 'modelProvider', 'serviceTier', 'cwd', 'instructionSources',
+        'approvalPolicy', 'approvalsReviewer', 'sandbox', 'reasoningEffort'
+    ]);
+    const threadId = requireThread(ownValue(response, 'thread'));
+    if (threadId !== expectedThreadId) {
+        throw new RideCodexTurnError('invalid-data');
+    }
+    requireString(ownValue(response, 'model'), MAX_IDENTIFIER_BYTES);
+    requireString(ownValue(response, 'modelProvider'), MAX_IDENTIFIER_BYTES);
+    requireNullableText(ownValue(response, 'serviceTier'), MAX_IDENTIFIER_BYTES);
+    requireString(ownValue(response, 'cwd'), MAX_LOCAL_PATH_BYTES);
+    requireStringArray(ownValue(response, 'instructionSources'), MAX_RAW_ARRAY, MAX_LOCAL_PATH_BYTES, true);
+    requireApprovalPolicy(ownValue(response, 'approvalPolicy'));
+    if (!['user', 'auto_review', 'guardian_subagent'].includes(ownValue(response, 'approvalsReviewer') as string)) {
+        throw new RideCodexTurnError('invalid-data');
+    }
+    requireSandboxPolicy(ownValue(response, 'sandbox'));
+    requireNullableText(ownValue(response, 'reasoningEffort'), MAX_IDENTIFIER_BYTES);
+}
+
+function requireThread(value: unknown): string {
+    const thread = requireExactOptions(value, [
+        'id', 'sessionId', 'forkedFromId', 'parentThreadId', 'preview', 'ephemeral', 'modelProvider',
+        'createdAt', 'updatedAt', 'recencyAt', 'status', 'path', 'cwd', 'cliVersion', 'source',
+        'threadSource', 'agentNickname', 'agentRole', 'gitInfo', 'name', 'turns'
+    ]);
+    const id = requireIdentifier(ownValue(thread, 'id'));
+    requireIdentifier(ownValue(thread, 'sessionId'));
+    requireNullableIdentifier(ownValue(thread, 'forkedFromId'));
+    requireNullableIdentifier(ownValue(thread, 'parentThreadId'));
+    requireBoundedText(ownValue(thread, 'preview'), MAX_INPUT_TEXT_BYTES);
+    if (typeof ownValue(thread, 'ephemeral') !== 'boolean') {
+        throw new RideCodexTurnError('invalid-data');
+    }
+    requireString(ownValue(thread, 'modelProvider'), MAX_IDENTIFIER_BYTES);
+    requireNonNegativeFiniteNumber(ownValue(thread, 'createdAt'));
+    requireNonNegativeFiniteNumber(ownValue(thread, 'updatedAt'));
+    requireNullableNonNegativeNumber(ownValue(thread, 'recencyAt'));
+    requireThreadStatus(ownValue(thread, 'status'));
+    requireNullableText(ownValue(thread, 'path'), MAX_LOCAL_PATH_BYTES);
+    requireString(ownValue(thread, 'cwd'), MAX_LOCAL_PATH_BYTES);
+    requireString(ownValue(thread, 'cliVersion'), MAX_IDENTIFIER_BYTES);
+    requireSessionSource(ownValue(thread, 'source'));
+    requireNullableText(ownValue(thread, 'threadSource'), MAX_IDENTIFIER_BYTES);
+    requireNullableText(ownValue(thread, 'agentNickname'), MAX_IDENTIFIER_BYTES);
+    requireNullableText(ownValue(thread, 'agentRole'), MAX_IDENTIFIER_BYTES);
+    requireGitInfo(ownValue(thread, 'gitInfo'));
+    requireNullableText(ownValue(thread, 'name'), MAX_INPUT_TEXT_BYTES);
+    const turns = ownValue(thread, 'turns');
+    if (!Array.isArray(turns) || utilTypes.isProxy(turns) || turns.length > MAX_RAW_ARRAY) {
+        throw new RideCodexTurnError('invalid-data');
+    }
+    for (const turn of turns) {
+        requireTurn(turn);
+    }
+    return id;
+}
+
+function requireThreadStatus(value: unknown): void {
+    const status = requireRecord(value);
+    const type = ownValue(status, 'type');
+    if (type === 'active') {
+        const active = requireExactOptions(status, ['type', 'activeFlags']);
+        const flags = ownValue(active, 'activeFlags');
+        if (!Array.isArray(flags) || utilTypes.isProxy(flags) || flags.length > 2
+            || flags.some(flag => flag !== 'waitingOnApproval' && flag !== 'waitingOnUserInput')) {
+            throw new RideCodexTurnError('invalid-data');
+        }
+        return;
+    }
+    if (!['notLoaded', 'idle', 'systemError'].includes(type as string)) {
+        throw new RideCodexTurnError('invalid-data');
+    }
+    requireExactOptions(status, ['type']);
+}
+
+function requireSessionSource(value: unknown): void {
+    if (typeof value === 'string') {
+        if (!['cli', 'vscode', 'exec', 'appServer', 'unknown'].includes(value)) {
+            throw new RideCodexTurnError('invalid-data');
+        }
+        return;
+    }
+    const source = requireRecord(value);
+    const keys = Object.keys(source);
+    if (keys.length !== 1 || (keys[0] !== 'custom' && keys[0] !== 'subAgent')) {
+        throw new RideCodexTurnError('invalid-data');
+    }
+    if (keys[0] === 'custom') {
+        requireString(ownValue(source, 'custom'), MAX_IDENTIFIER_BYTES);
+    } else {
+        requireRecord(ownValue(source, 'subAgent'));
+    }
+}
+
+function requireGitInfo(value: unknown): void {
+    if (isNullish(value)) {
+        if (value === undefined) {
+            throw new RideCodexTurnError('invalid-data');
+        }
+        return;
+    }
+    const git = requireExactOptions(value, ['sha', 'branch', 'originUrl']);
+    requireNullableText(ownValue(git, 'sha'), MAX_IDENTIFIER_BYTES);
+    requireNullableText(ownValue(git, 'branch'), MAX_IDENTIFIER_BYTES);
+    requireNullableText(ownValue(git, 'originUrl'), MAX_LOCAL_PATH_BYTES);
+}
+
+function requireApprovalPolicy(value: unknown): void {
+    if (value === 'untrusted' || value === 'on-request' || value === 'never') {
+        return;
+    }
+    const policy = requireExactOptions(value, ['granular']);
+    const granular = requireExactOptions(ownValue(policy, 'granular'), [
+        'sandbox_approval', 'rules', 'skill_approval', 'request_permissions', 'mcp_elicitations'
+    ]);
+    for (const key of Object.keys(granular)) {
+        if (typeof ownValue(granular, key) !== 'boolean') {
+            throw new RideCodexTurnError('invalid-data');
+        }
+    }
+}
+
+function requireSandboxPolicy(value: unknown): void {
+    const policy = requireRecord(value);
+    switch (ownValue(policy, 'type')) {
+        case 'dangerFullAccess':
+            requireExactOptions(policy, ['type']);
+            return;
+        case 'readOnly': {
+            const readOnly = requireExactOptions(policy, ['type', 'networkAccess']);
+            requireBoolean(ownValue(readOnly, 'networkAccess'));
+            return;
+        }
+        case 'externalSandbox': {
+            const external = requireExactOptions(policy, ['type', 'networkAccess']);
+            if (!['restricted', 'enabled'].includes(ownValue(external, 'networkAccess') as string)) {
+                throw new RideCodexTurnError('invalid-data');
+            }
+            return;
+        }
+        case 'workspaceWrite': {
+            const workspace = requireExactOptions(policy, [
+                'type', 'writableRoots', 'networkAccess', 'excludeTmpdirEnvVar', 'excludeSlashTmp'
+            ]);
+            requireStringArray(ownValue(workspace, 'writableRoots'), MAX_RAW_ARRAY, MAX_LOCAL_PATH_BYTES, true);
+            requireBoolean(ownValue(workspace, 'networkAccess'));
+            requireBoolean(ownValue(workspace, 'excludeTmpdirEnvVar'));
+            requireBoolean(ownValue(workspace, 'excludeSlashTmp'));
+            return;
+        }
+        default:
+            throw new RideCodexTurnError('invalid-data');
+    }
+}
+
+function requireRequiredKeys(record: Record<string, unknown>, keys: readonly string[]): void {
+    if (keys.some(key => !Object.prototype.hasOwnProperty.call(record, key))) {
+        throw new RideCodexTurnError('invalid-data');
+    }
+}
+
+function requireBoundedArray(value: unknown): readonly unknown[] {
+    if (!Array.isArray(value) || utilTypes.isProxy(value) || value.length > MAX_RAW_ARRAY) {
+        throw new RideCodexTurnError('invalid-data');
+    }
+    return value;
+}
+
+function requireStringArray(
+    value: unknown,
+    maxItems: number,
+    maxBytes: number,
+    allowEmpty: boolean
+): readonly string[] {
+    if (!Array.isArray(value) || utilTypes.isProxy(value) || value.length > maxItems) {
+        throw new RideCodexTurnError('invalid-data');
+    }
+    for (const entry of value) {
+        if (allowEmpty) {
+            requireBoundedText(entry, maxBytes);
+        } else {
+            requireString(entry, maxBytes);
+        }
+    }
+    return value as readonly string[];
+}
+
+function requireNullableText(value: unknown, maxBytes: number): void {
+    if (isNullish(value)) {
+        if (value === undefined) {
+            throw new RideCodexTurnError('invalid-data');
+        }
+        return;
+    }
+    requireBoundedText(value, maxBytes);
+}
+
+function requireNullableIdentifier(value: unknown): void {
+    if (isNullish(value)) {
+        if (value === undefined) {
+            throw new RideCodexTurnError('invalid-data');
+        }
+        return;
+    }
+    requireIdentifier(value);
+}
+
+function requireNullableSafeInteger(value: unknown): void {
+    if (isNullish(value)) {
+        if (value === undefined) {
+            throw new RideCodexTurnError('invalid-data');
+        }
+        return;
+    }
+    if (!Number.isSafeInteger(value)) {
+        throw new RideCodexTurnError('invalid-data');
+    }
+}
+
+function requireNonNegativeFiniteNumber(value: unknown): void {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+        throw new RideCodexTurnError('invalid-data');
+    }
+}
+
+function requireNullableNonNegativeNumber(value: unknown): void {
+    if (isNullish(value)) {
+        if (value === undefined) {
+            throw new RideCodexTurnError('invalid-data');
+        }
+        return;
+    }
+    requireNonNegativeFiniteNumber(value);
+}
+
+function requireBoolean(value: unknown): void {
+    if (typeof value !== 'boolean') {
+        throw new RideCodexTurnError('invalid-data');
+    }
+}
+
 function requireRecord(value: unknown): Record<string, unknown> {
     const budget: RawBudget = { nodes: 0, bytes: 0 };
     validateRaw(value, 0, budget);
@@ -1506,20 +2019,35 @@ function normalizePlan(value: unknown, limit: number): readonly RideCodexPlanSte
         throw new RideCodexTurnError('invalid-data');
     }
     return Object.freeze(value.map(raw => {
-        const record = requireRecord(raw);
+        const record = requireExactOptions(raw, ['step', 'status']);
         const status = ownValue(record, 'status');
+        let normalizedStatus: RideCodexPlanStep['status'];
+        switch (status) {
+            case 'pending':
+                normalizedStatus = 'pending';
+                break;
+            case 'inProgress':
+                normalizedStatus = 'in-progress';
+                break;
+            case 'completed':
+                normalizedStatus = 'completed';
+                break;
+            default:
+                throw new RideCodexTurnError('invalid-data');
+        }
         return Object.freeze({
-            step: requireString(ownValue(record, 'step'), MAX_INPUT_TEXT_BYTES),
-            status: status === 'completed' ? 'completed' as const
-                : status === 'inProgress' || status === 'in-progress' ? 'in-progress' as const
-                    : 'pending' as const
+            step: requireBoundedText(ownValue(record, 'step'), MAX_INPUT_TEXT_BYTES),
+            status: normalizedStatus
         });
     }));
 }
 
 function normalizeExplanation(record: Record<string, unknown>, maxBytes: number): { explanation?: string } {
     const value = ownValue(record, 'explanation');
-    return isNullish(value) ? {} : { explanation: requireString(value, maxBytes) };
+    if (value === undefined) {
+        throw new RideCodexTurnError('invalid-data');
+    }
+    return isNullish(value) ? {} : { explanation: requireBoundedText(value, maxBytes) };
 }
 
 function normalizeTokenUsage(value: unknown): Extract<RideCodexUiEvent, { type: 'token-usage' }> {
@@ -1711,13 +2239,36 @@ function batchBytes(batch: RideCodexEventBatch): number {
     }
 }
 
-function queuedEntriesBytes(entries: readonly QueuedEvent[]): number {
+function queuedEntriesBytes(
+    entries: readonly QueuedEvent[],
+    maxBatchEvents: number,
+    metadata: ReadonlyMap<string, QueueMetadata>
+): number {
     let bytes = 0;
     let identity: QueueIdentity | undefined;
     let events: RideCodexUiEvent[] = [];
+    const accountedMetadata = new Set<string>();
     const flush = (): void => {
         if (identity) {
-            bytes += batchBytes({ ...identity, events });
+            const key = queueIdentityKey(identity);
+            const queuedEvents = [...events];
+            const queuedMetadata = accountedMetadata.has(key) ? undefined : metadata.get(key);
+            if (queuedMetadata) {
+                accountedMetadata.add(key);
+                const terminalIndex = queuedEvents.findIndex(event => event.type === 'turn-terminal');
+                const insertionIndex = terminalIndex < 0 ? queuedEvents.length : terminalIndex;
+                queuedEvents.splice(insertionIndex, 0, ...queueMetadataBudgetEvents(queuedMetadata));
+            }
+            for (let index = 0; index < queuedEvents.length; index += maxBatchEvents) {
+                bytes += batchBytes({
+                    ...identity,
+                    events: queuedEvents.slice(index, index + maxBatchEvents)
+                });
+                if (!Number.isSafeInteger(bytes)) {
+                    bytes = Number.MAX_SAFE_INTEGER;
+                    break;
+                }
+            }
         }
         events = [];
     };
@@ -1730,6 +2281,27 @@ function queuedEntriesBytes(entries: readonly QueuedEvent[]): number {
     }
     flush();
     return bytes;
+}
+
+function queueMetadataBudgetEvents(metadata: QueueMetadata): RideCodexUiEvent[] {
+    const events: RideCodexUiEvent[] = [];
+    if (metadata.droppedEvents > 0) {
+        events.push({
+            type: 'warning',
+            code: 'events-dropped',
+            message: 'Some Codex streaming events were dropped to preserve responsiveness.',
+            droppedEvents: Number.MAX_SAFE_INTEGER,
+            droppedBytes: Number.MAX_SAFE_INTEGER
+        });
+    }
+    if (metadata.truncated) {
+        events.push({
+            type: 'warning',
+            code: 'data-truncated',
+            message: 'A Codex streaming item was truncated to preserve responsiveness.'
+        });
+    }
+    return events;
 }
 
 function serializeValidatedRideCodexEventBatch(
@@ -1801,6 +2373,16 @@ function requireGeneration(value: unknown): number {
 
 function positiveLimit(value: number | undefined, fallback: number): number {
     return Number.isSafeInteger(value) && (value as number) > 0 ? value as number : fallback;
+}
+
+function requireBatchLimit(value: number | undefined, fallback: number): number {
+    if (value === undefined) {
+        return fallback;
+    }
+    if (!Number.isSafeInteger(value) || value < 2) {
+        throw new RideCodexTurnError('invalid-data');
+    }
+    return value;
 }
 
 function requireQueueLimit(value: number | undefined, fallback: number): number {

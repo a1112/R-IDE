@@ -7,15 +7,39 @@
 export type RideCodexTurnTerminalStatus = 'completed' | 'failed' | 'interrupted' | 'interrupt-uncertain';
 export type RideCodexTurnStatus = 'idle' | 'in-progress' | RideCodexTurnTerminalStatus;
 export const RIDE_CODEX_MAX_IDENTIFIER_BYTES = 512;
-export const RIDE_CODEX_MIN_QUEUED_BYTES = utf8ByteLength(JSON.stringify({
+const RIDE_CODEX_BOUNDARY_IDENTITY = Object.freeze({
     generation: Number.MAX_SAFE_INTEGER,
     threadId: '\u0000'.repeat(RIDE_CODEX_MAX_IDENTIFIER_BYTES),
-    turnId: '\u0000'.repeat(RIDE_CODEX_MAX_IDENTIFIER_BYTES),
-    events: [
-        { type: 'turn-started' },
-        { type: 'turn-terminal', status: 'completed' }
-    ]
-}));
+    turnId: '\u0000'.repeat(RIDE_CODEX_MAX_IDENTIFIER_BYTES)
+});
+const RIDE_CODEX_TERMINAL_BOUNDARIES = Object.freeze([
+    Object.freeze({ type: 'turn-terminal', status: 'completed' }),
+    Object.freeze({ type: 'turn-terminal', status: 'interrupted' }),
+    Object.freeze({
+        type: 'turn-terminal',
+        status: 'failed',
+        error: Object.freeze({ code: 'turn-error', message: 'Codex turn failed.' })
+    }),
+    Object.freeze({
+        type: 'turn-terminal',
+        status: 'failed',
+        error: Object.freeze({ code: 'operation-failed', message: 'Codex turn operation failed.' })
+    }),
+    Object.freeze({
+        type: 'turn-terminal',
+        status: 'interrupt-uncertain',
+        error: Object.freeze({
+            code: 'interrupt-timeout',
+            message: 'Codex turn interrupt could not be confirmed.'
+        })
+    })
+]);
+export const RIDE_CODEX_MIN_QUEUED_BYTES = Math.max(...RIDE_CODEX_TERMINAL_BOUNDARIES.map(terminal =>
+    utf8ByteLength(JSON.stringify({
+        ...RIDE_CODEX_BOUNDARY_IDENTITY,
+        events: [Object.freeze({ type: 'turn-started' }), terminal]
+    }))
+));
 export type RideCodexItemKind =
     | 'user-message' | 'agent-message' | 'plan' | 'reasoning'
     | 'command' | 'file-change' | 'other';

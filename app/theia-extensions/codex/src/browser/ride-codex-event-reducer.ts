@@ -58,6 +58,7 @@ const RETAINED_ARRAY_SLOT_BYTES = 8;
 const MAX_RETAINED_PLAN_STEPS = 256;
 const MAX_DIAGNOSTIC_BYTES = 64 * 1024;
 const MAX_DIAGNOSTIC_HISTORY_LIMIT = 256;
+const MAX_FINALIZED_IDENTITIES = 256;
 const MAX_WIRE_DEPTH = 16;
 const MAX_WIRE_NODES = 8_192;
 const MAX_WIRE_ARRAY_ITEMS = 8_192;
@@ -84,6 +85,7 @@ export class RideCodexEventReducer {
     readonly #pending: RideCodexEventBatch[] = [];
     readonly #items = new Map<string, MutableItem>();
     readonly #truncatedItems = new Set<string>();
+    readonly #finalizedIdentities = new Set<string>();
     #snapshot: RideCodexTurnSnapshot = EMPTY_SNAPSHOT;
     #frame: RideCodexFrameDisposable | undefined;
     #queuedBytes = 0;
@@ -104,7 +106,7 @@ export class RideCodexEventReducer {
         this.#scheduleFrame = options.scheduleFrame ?? defaultScheduleFrame;
         this.#maxWireBytes = positiveLimit(options.maxWireBytes, DEFAULT_MAX_WIRE_BYTES);
         this.#maxQueuedBytes = requireQueueLimit(options.maxQueuedBytes, DEFAULT_MAX_QUEUED_BYTES);
-        this.#maxBatchEvents = Math.max(2, positiveLimit(options.maxBatchEvents, DEFAULT_MAX_BATCH_EVENTS));
+        this.#maxBatchEvents = requireBatchLimit(options.maxBatchEvents, DEFAULT_MAX_BATCH_EVENTS);
         this.#maxItemBytes = positiveLimit(options.maxItemBytes, DEFAULT_MAX_ITEM_BYTES);
         this.#maxRetainedItems = positiveLimit(options.maxRetainedItems, DEFAULT_MAX_RETAINED_ITEMS);
         this.#maxRetainedBytes = positiveLimit(options.maxRetainedBytes, DEFAULT_MAX_RETAINED_BYTES);
@@ -171,6 +173,7 @@ export class RideCodexEventReducer {
         this.#queuedBytes = 0;
         this.#items.clear();
         this.#truncatedItems.clear();
+        this.#finalizedIdentities.clear();
         this.#listeners.clear();
         this.#snapshot = EMPTY_SNAPSHOT;
     }
@@ -204,12 +207,17 @@ export class RideCodexEventReducer {
         if (batch.generation < this.#generation) {
             return false;
         }
+        const identityKey = finalizedIdentityKey(batch);
+        if (batch.generation === this.#generation && this.#finalizedIdentities.has(identityKey)) {
+            return false;
+        }
         const startsTurn = batch.events.some(event => event.type === 'turn-started');
         const terminatesTurn = batch.events.some(event => event.type === 'turn-terminal');
         if (batch.generation > this.#generation) {
             if (!startsTurn && !terminatesTurn) {
                 return false;
             }
+            this.#finalizedIdentities.clear();
             this.#resetFor(batch);
         } else if (this.#turnId !== undefined
             && (batch.threadId !== this.#threadId || batch.turnId !== this.#turnId)) {
@@ -229,7 +237,23 @@ export class RideCodexEventReducer {
         for (const event of batch.events) {
             changed = this.#applyEvent(event) || changed;
         }
+        if (this.#isTerminal()) {
+            this.#rememberFinalized(identityKey);
+        }
         return changed;
+    }
+
+    #rememberFinalized(identityKey: string): void {
+        if (this.#finalizedIdentities.has(identityKey)) {
+            return;
+        }
+        if (this.#finalizedIdentities.size >= MAX_FINALIZED_IDENTITIES) {
+            const oldest = this.#finalizedIdentities.values().next().value as string | undefined;
+            if (oldest !== undefined) {
+                this.#finalizedIdentities.delete(oldest);
+            }
+        }
+        this.#finalizedIdentities.add(identityKey);
     }
 
     #enqueuePending(incoming: RideCodexEventBatch, initialDropped: number): void {
@@ -774,6 +798,16 @@ function positiveLimit(value: number | undefined, fallback: number): number {
     return Number.isSafeInteger(value) && (value as number) > 0 ? value as number : fallback;
 }
 
+function requireBatchLimit(value: number | undefined, fallback: number): number {
+    if (value === undefined) {
+        return fallback;
+    }
+    if (!Number.isSafeInteger(value) || value < 2) {
+        throw new RangeError('Codex event batches require room for a coherent turn boundary.');
+    }
+    return value;
+}
+
 function requireQueueLimit(value: number | undefined, fallback: number): number {
     if (value === undefined) {
         return fallback;
@@ -1162,6 +1196,12 @@ function freezePendingBatch(
 function sameBatchIdentity(left: RideCodexEventBatch, right: RideCodexEventBatch): boolean {
     return left.generation === right.generation
         && left.threadId === right.threadId && left.turnId === right.turnId;
+}
+
+function finalizedIdentityKey(
+    identity: Pick<RideCodexEventBatch, 'generation' | 'threadId' | 'turnId'>
+): string {
+    return JSON.stringify([identity.generation, identity.threadId, identity.turnId]);
 }
 
 function saturatingAdd(left: number, right: number): number {

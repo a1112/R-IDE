@@ -6,20 +6,16 @@
 
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { RideCodexEventBatch, RideCodexTurnSnapshot } from '../src/common/ride-codex-events';
+import {
+    RIDE_CODEX_MIN_QUEUED_BYTES,
+    RideCodexEventBatch,
+    RideCodexTurnSnapshot
+} from '../src/common/ride-codex-events';
 import { RideCodexEventReducer } from '../src/browser/ride-codex-event-reducer';
 
 const RETAINED_ARRAY_SLOT_BYTES = 8;
 const WORST_VALID_IDENTIFIER = '\u0000'.repeat(512);
-const MIN_COHERENT_QUEUE_BYTES = Buffer.byteLength(JSON.stringify({
-    generation: Number.MAX_SAFE_INTEGER,
-    threadId: WORST_VALID_IDENTIFIER,
-    turnId: WORST_VALID_IDENTIFIER,
-    events: [
-        { type: 'turn-started' },
-        { type: 'turn-terminal', status: 'completed' }
-    ]
-}), 'utf8');
+const MIN_COHERENT_QUEUE_BYTES = RIDE_CODEX_MIN_QUEUED_BYTES;
 
 function batchWire(batch: unknown): string {
     return JSON.stringify(batch);
@@ -901,7 +897,7 @@ describe('RideCodexEventReducer minimal frame contract', () => {
                 { type: 'turn-terminal', status: 'completed' }
             ]
         });
-        assert.equal(Buffer.byteLength(wire, 'utf8'), MIN_COHERENT_QUEUE_BYTES);
+        assert.ok(Buffer.byteLength(wire, 'utf8') <= MIN_COHERENT_QUEUE_BYTES);
         reducer.notifyMany(wire);
         frames.shift()?.();
 
@@ -1018,5 +1014,79 @@ describe('RideCodexEventReducer minimal frame contract', () => {
 
         assert.ok(Buffer.byteLength(reducer.snapshot().items[0].text, 'utf8') <= 8);
         assert.equal(reducer.snapshot().warnings.filter(warning => warning.code === 'data-truncated').length, 1);
+    });
+
+    it('rejects maxBatchEvents below the coherent start-terminal pair', () => {
+        assert.throws(() => new RideCodexEventReducer({ maxBatchEvents: 1 }), RangeError);
+    });
+
+    it('does not let a late finalized terminal replace the current turn', () => {
+        const frames: Array<() => void> = [];
+        const reducer = new RideCodexEventReducer({
+            scheduleFrame: callback => {
+                frames.push(callback);
+                return { dispose: () => undefined };
+            }
+        });
+        reducer.notifyMany(batchWire({
+            generation: 1,
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            events: [{ type: 'turn-started' }, { type: 'turn-terminal', status: 'completed' }]
+        }));
+        frames.shift()?.();
+        reducer.notifyMany(batchWire({
+            generation: 1,
+            threadId: 'thread-1',
+            turnId: 'turn-2',
+            events: [{ type: 'turn-started' }]
+        }));
+        frames.shift()?.();
+        reducer.notifyMany(batchWire({
+            generation: 1,
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            events: [{ type: 'turn-terminal', status: 'completed' }]
+        }));
+        frames.shift()?.();
+
+        assert.equal(reducer.snapshot().turnId, 'turn-2');
+        assert.equal(reducer.snapshot().status, 'in-progress');
+    });
+
+    it('keeps finalized identity history bounded while recent duplicates remain idempotent', () => {
+        const frames: Array<() => void> = [];
+        const reducer = new RideCodexEventReducer({
+            scheduleFrame: callback => {
+                frames.push(callback);
+                return { dispose: () => undefined };
+            }
+        });
+        for (let index = 0; index < 300; index += 1) {
+            reducer.notifyMany(batchWire({
+                generation: 1,
+                threadId: 'thread-1',
+                turnId: `turn-${index}`,
+                events: [{ type: 'turn-started' }, { type: 'turn-terminal', status: 'completed' }]
+            }));
+            frames.shift()?.();
+        }
+        reducer.notifyMany(batchWire({
+            generation: 1,
+            threadId: 'thread-1',
+            turnId: 'turn-current',
+            events: [{ type: 'turn-started' }]
+        }));
+        frames.shift()?.();
+        reducer.notifyMany(batchWire({
+            generation: 1,
+            threadId: 'thread-1',
+            turnId: 'turn-299',
+            events: [{ type: 'turn-terminal', status: 'completed' }]
+        }));
+        frames.shift()?.();
+
+        assert.equal(reducer.snapshot().turnId, 'turn-current');
+        assert.equal(reducer.snapshot().status, 'in-progress');
     });
 });

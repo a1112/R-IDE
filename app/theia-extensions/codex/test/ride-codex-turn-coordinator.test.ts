@@ -6,7 +6,11 @@
 
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import type { RideCodexEventBatch, RideCodexUiEvent } from '../src/common/ride-codex-events';
+import {
+    RIDE_CODEX_MIN_QUEUED_BYTES,
+    type RideCodexEventBatch,
+    type RideCodexUiEvent
+} from '../src/common/ride-codex-events';
 import type { RideCodexNotification } from '../src/node/ride-codex-jsonl-client';
 import {
     RideCodexTurnCoordinator,
@@ -16,15 +20,67 @@ import {
 } from '../src/node/ride-codex-turn-coordinator';
 
 const WORST_VALID_IDENTIFIER = '\u0000'.repeat(512);
-const MIN_COHERENT_QUEUE_BYTES = Buffer.byteLength(JSON.stringify({
-    generation: Number.MAX_SAFE_INTEGER,
-    threadId: WORST_VALID_IDENTIFIER,
-    turnId: WORST_VALID_IDENTIFIER,
-    events: [
-        { type: 'turn-started' },
-        { type: 'turn-terminal', status: 'completed' }
-    ]
-}), 'utf8');
+const MIN_COHERENT_QUEUE_BYTES = RIDE_CODEX_MIN_QUEUED_BYTES;
+
+function validTurn(id = 'turn-1', status = 'inProgress'): Record<string, unknown> {
+    return {
+        id,
+        items: [],
+        itemsView: 'full',
+        status,
+        error: null,
+        startedAt: null,
+        completedAt: null,
+        durationMs: null
+    };
+}
+
+function validThread(id = 'thread-1'): Record<string, unknown> {
+    return {
+        id,
+        sessionId: 'session-1',
+        forkedFromId: null,
+        parentThreadId: null,
+        preview: '',
+        ephemeral: false,
+        modelProvider: 'openai',
+        createdAt: 1,
+        updatedAt: 1,
+        recencyAt: null,
+        status: { type: 'idle' },
+        path: null,
+        cwd: 'C:\\workspace',
+        cliVersion: '0.144.0',
+        source: 'appServer',
+        threadSource: null,
+        agentNickname: null,
+        agentRole: null,
+        gitInfo: null,
+        name: null,
+        turns: []
+    };
+}
+
+function validResumeResponse(threadId = 'thread-1'): Record<string, unknown> {
+    return {
+        thread: validThread(threadId),
+        model: 'gpt-5.4',
+        modelProvider: 'openai',
+        serviceTier: null,
+        cwd: 'C:\\workspace',
+        instructionSources: [],
+        approvalPolicy: 'on-request',
+        approvalsReviewer: 'user',
+        sandbox: {
+            type: 'workspaceWrite',
+            writableRoots: ['C:\\workspace'],
+            networkAccess: false,
+            excludeTmpdirEnvVar: false,
+            excludeSlashTmp: false
+        },
+        reasoningEffort: null
+    };
+}
 
 function decodeBatch(wire: string): RideCodexEventBatch {
     return JSON.parse(wire) as RideCodexEventBatch;
@@ -60,7 +116,7 @@ class FakeTurnHost implements RideCodexTurnHost {
     steerTurnId = 'turn-1';
     rejectMethod: string | undefined;
     restartPromise: Promise<number> | undefined;
-    resumeResponse: unknown = { thread: { id: 'thread-1' } };
+    resumeResponse: unknown = validResumeResponse();
     readonly #notifications = new Set<(notification: RideCodexNotification, generation: number) => void>();
     readonly #states = new Set<(event: Readonly<{ state: 'ready'; generation: number }>) => void>();
 
@@ -76,7 +132,7 @@ class FakeTurnHost implements RideCodexTurnHost {
                     if (this.startPromise) {
                         return this.startPromise;
                     }
-                    return { turn: { id: this.nextTurnId, status: 'inProgress', items: [] } };
+                    return { turn: validTurn(this.nextTurnId) };
                 }
                 if (method === 'turn/steer') {
                     if (this.steerPromise) {
@@ -501,7 +557,22 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
             enumerable: true,
             get: () => { traps += 1; return { id: 'thread-1' }; }
         });
-        for (const response of [{}, { thread: { id: 'wrong-thread' } }, proxied, accessor]) {
+        for (const response of [
+            {},
+            { thread: { id: 'wrong-thread' } },
+            { thread: { id: 'thread-1' } },
+            { ...validResumeResponse(), extra: true },
+            {
+                ...validResumeResponse(),
+                thread: { ...validThread(), status: { type: 'futureStatus' } }
+            },
+            {
+                ...validResumeResponse(),
+                thread: { ...validThread(), createdAt: Number.NaN }
+            },
+            proxied,
+            accessor
+        ]) {
             const host = new FakeTurnHost();
             const scheduler = new FakeScheduler();
             const timeoutCallbacks: Array<() => void> = [];
@@ -773,7 +844,7 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         scheduler.flushOne();
 
         assert.equal(wires.length, 1);
-        assert.equal(Buffer.byteLength(wires[0], 'utf8'), MIN_COHERENT_QUEUE_BYTES);
+        assert.ok(Buffer.byteLength(wires[0], 'utf8') <= MIN_COHERENT_QUEUE_BYTES);
         assert.deepEqual(decodeBatch(wires[0]).events.map(event => event.type), [
             'turn-started', 'turn-terminal'
         ]);
@@ -1215,7 +1286,7 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
             service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'two' }] }),
             error => (error as { code?: string }).code === 'turn-active'
         );
-        resolveStart({ turn: { id: 'turn-1', status: 'inProgress', items: [] } });
+        resolveStart({ turn: validTurn('turn-1') });
         await first;
         host.steerTurnId = 'turn-2';
         await assert.rejects(service.steerTurn({
@@ -1360,7 +1431,7 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         host.emit('turn/started', {
             threadId: 'thread-1', turn: { id: 'turn-1', status: 'inProgress', items: [] }
         });
-        resolveStart({ turn: { id: 'turn-1', status: 'inProgress', items: [] } });
+        resolveStart({ turn: validTurn('turn-1') });
         await starting;
         let resolveSteer!: (value: unknown) => void;
         host.steerPromise = new Promise(resolve => { resolveSteer = resolve; });
@@ -1378,5 +1449,255 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
 
         assert.equal(types.filter(type => type === 'turn-started').length, 1);
         assert.equal(host.releases, 0);
+    });
+
+    it('delivers every terminal boundary at the exported exact queue minimum with maximum identities', async () => {
+        for (const status of ['completed', 'interrupted', 'failed'] as const) {
+            const host = new FakeTurnHost();
+            host.generation = Number.MAX_SAFE_INTEGER;
+            host.nextTurnId = WORST_VALID_IDENTIFIER;
+            const scheduler = new FakeScheduler();
+            const wires: string[] = [];
+            const coordinator = new RideCodexTurnCoordinator({
+                host,
+                scheduler,
+                maxQueuedBytes: RIDE_CODEX_MIN_QUEUED_BYTES,
+                maxBatchEvents: 2
+            });
+            const service = coordinator.connectClient({ turnEvents: wire => { wires.push(wire); } });
+            await service.startTurn({
+                threadId: WORST_VALID_IDENTIFIER,
+                input: [{ type: 'text', text: status }]
+            });
+            host.emit('turn/completed', {
+                threadId: WORST_VALID_IDENTIFIER,
+                turn: { id: WORST_VALID_IDENTIFIER, status, items: [] }
+            });
+            while (scheduler.callbacks.length > 0) {
+                scheduler.flushOne();
+                await Promise.resolve();
+            }
+
+            const events = wires.flatMap(wire => decodeBatch(wire).events);
+            assert.deepEqual(events.filter(event => event.type === 'turn-started').length, 1, status);
+            assert.deepEqual(events.filter(event => event.type === 'turn-terminal').length, 1, status);
+            assert.equal(events.find(event => event.type === 'turn-terminal')?.status, status);
+            assert.ok(wires.every(wire => Buffer.byteLength(wire, 'utf8') <= RIDE_CODEX_MIN_QUEUED_BYTES));
+            assert.ok(wires.every(wire => decodeBatch(wire).events.length > 0));
+        }
+
+        const host = new FakeTurnHost();
+        host.generation = Number.MAX_SAFE_INTEGER - 1;
+        host.nextTurnId = WORST_VALID_IDENTIFIER;
+        host.interruptPromise = Promise.resolve({});
+        host.resumeResponse = validResumeResponse(WORST_VALID_IDENTIFIER);
+        const scheduler = new FakeScheduler();
+        const timeoutCallbacks: Array<() => void> = [];
+        const wires: string[] = [];
+        const coordinator = new RideCodexTurnCoordinator({
+            host,
+            scheduler,
+            maxQueuedBytes: RIDE_CODEX_MIN_QUEUED_BYTES,
+            maxBatchEvents: 2,
+            interruptTimeoutMs: 10,
+            timers: {
+                setTimeout: callback => { timeoutCallbacks.push(callback); return callback; },
+                clearTimeout: () => undefined
+            }
+        });
+        const service = coordinator.connectClient({ turnEvents: wire => { wires.push(wire); } });
+        await service.startTurn({
+            threadId: WORST_VALID_IDENTIFIER,
+            input: [{ type: 'text', text: 'uncertain' }]
+        });
+        const interrupting = service.interruptTurn({
+            threadId: WORST_VALID_IDENTIFIER,
+            turnId: WORST_VALID_IDENTIFIER
+        });
+        await Promise.resolve();
+        timeoutCallbacks.shift()?.();
+        assert.equal((await interrupting).status, 'interrupt-uncertain');
+        while (scheduler.callbacks.length > 0) {
+            scheduler.flushOne();
+            await Promise.resolve();
+        }
+        const uncertainEvents = wires.flatMap(wire => decodeBatch(wire).events);
+        assert.deepEqual(uncertainEvents.map(event => event.type), ['turn-started', 'turn-terminal']);
+        assert.equal(uncertainEvents[1].type === 'turn-terminal' && uncertainEvents[1].status, 'interrupt-uncertain');
+        assert.ok(wires.every(wire => Buffer.byteLength(wire, 'utf8') <= RIDE_CODEX_MIN_QUEUED_BYTES));
+        assert.ok(wires.every(wire => decodeBatch(wire).events.length > 0));
+    });
+
+    it('accounts for exact chunked wire bytes and never delivers empty batches', async () => {
+        const host = new FakeTurnHost();
+        const scheduler = new FakeScheduler();
+        const wires: string[] = [];
+        const coordinator = new RideCodexTurnCoordinator({
+            host,
+            scheduler,
+            maxQueuedBytes: RIDE_CODEX_MIN_QUEUED_BYTES,
+            maxBatchEvents: 2
+        });
+        const service = coordinator.connectClient({ turnEvents: wire => { wires.push(wire); } });
+        await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'one' }] });
+        for (let index = 0; index < 100; index += 1) {
+            host.emit('warning', { threadId: 'thread-1', message: `warning-${index}` });
+        }
+        host.emit('turn/completed', {
+            threadId: 'thread-1', turn: { id: 'turn-1', status: 'failed', items: [] }
+        });
+        while (scheduler.callbacks.length > 0) {
+            scheduler.flushOne();
+            await Promise.resolve();
+        }
+
+        assert.ok(wires.length > 0);
+        assert.ok(wires.every(wire => decodeBatch(wire).events.length > 0));
+        assert.ok(wires.reduce((sum, wire) => sum + Buffer.byteLength(wire, 'utf8'), 0)
+            <= RIDE_CODEX_MIN_QUEUED_BYTES);
+        const events = wires.flatMap(wire => decodeBatch(wire).events);
+        assert.ok(events.some(event => event.type === 'turn-started'));
+        assert.ok(events.some(event => event.type === 'turn-terminal'));
+    });
+
+    it('rejects maxBatchEvents below the coherent start-terminal pair', () => {
+        assert.throws(
+            () => new RideCodexTurnCoordinator({ host: new FakeTurnHost(), maxBatchEvents: 1 }),
+            error => (error as { code?: string }).code === 'invalid-data'
+        );
+    });
+
+    it('strictly validates complete turn/start and exact turn/steer responses', async () => {
+        const malformedStarts: unknown[] = [
+            { turn: { id: 'turn-1', status: 'inProgress', items: [] } },
+            { turn: { ...validTurn(), itemsView: 'unknown' } },
+            { turn: { ...validTurn(), items: [{ type: 'contextCompaction' }] } },
+            { turn: { ...validTurn(), startedAt: Number.POSITIVE_INFINITY } },
+            {
+                turn: {
+                    ...validTurn('turn-1', 'failed'),
+                    error: {
+                        message: 'failed',
+                        codexErrorInfo: {
+                            httpConnectionFailed: { httpStatusCode: 500, extra: true }
+                        },
+                        additionalDetails: null
+                    }
+                }
+            },
+            { turn: validTurn(), extra: true },
+            Object.assign(Object.create({ inherited: true }), { turn: validTurn() }),
+            { turn: { ...validTurn(), items: Array.from({ length: 1_025 }, () => null) } }
+        ];
+        let accessorReads = 0;
+        malformedStarts.push(Object.defineProperty({}, 'turn', {
+            enumerable: true,
+            get: () => {
+                accessorReads += 1;
+                return validTurn();
+            }
+        }));
+        for (const response of malformedStarts) {
+            const host = new FakeTurnHost();
+            host.startPromise = Promise.resolve(response);
+            const coordinator = new RideCodexTurnCoordinator({ host });
+            const service = coordinator.connectClient({ turnEvents: () => undefined });
+            await assert.rejects(
+                service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'one' }] }),
+                error => (error as { code?: string }).code === 'invalid-data'
+            );
+            assert.equal(host.releases, 1);
+        }
+        assert.equal(accessorReads, 0);
+
+        const validItemHost = new FakeTurnHost();
+        validItemHost.startPromise = Promise.resolve({
+            turn: { ...validTurn(), items: [{ type: 'contextCompaction', id: 'item-1' }] }
+        });
+        const validItemCoordinator = new RideCodexTurnCoordinator({ host: validItemHost });
+        const validItemService = validItemCoordinator.connectClient({ turnEvents: () => undefined });
+        assert.equal((await validItemService.startTurn({
+            threadId: 'thread-1', input: [{ type: 'text', text: 'one' }]
+        })).status, 'in-progress');
+
+        const originalImageHost = new FakeTurnHost();
+        originalImageHost.startPromise = Promise.resolve({
+            turn: {
+                ...validTurn(),
+                items: [{
+                    type: 'userMessage',
+                    id: 'item-2',
+                    clientId: null,
+                    content: [{ type: 'localImage', detail: 'original', path: 'C:\\workspace\\image.png' }]
+                }]
+            }
+        });
+        const originalImageCoordinator = new RideCodexTurnCoordinator({ host: originalImageHost });
+        const originalImageService = originalImageCoordinator.connectClient({ turnEvents: () => undefined });
+        assert.equal((await originalImageService.startTurn({
+            threadId: 'thread-1', input: [{ type: 'text', text: 'one' }]
+        })).status, 'in-progress');
+
+        for (const response of [
+            {},
+            { turnId: 'turn-1', extra: true },
+            Object.assign(Object.create({ inherited: true }), { turnId: 'turn-1' })
+        ]) {
+            const host = new FakeTurnHost();
+            host.steerPromise = Promise.resolve(response);
+            const coordinator = new RideCodexTurnCoordinator({ host });
+            const service = coordinator.connectClient({ turnEvents: () => undefined });
+            await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'one' }] });
+            await assert.rejects(
+                service.steerTurn({
+                    threadId: 'thread-1', expectedTurnId: 'turn-1', input: [{ type: 'text', text: 'more' }]
+                }),
+                error => (error as { code?: string }).code === 'invalid-data'
+            );
+        }
+    });
+
+    it('preserves empty plan text and diff updates while rejecting unknown plan enums', async () => {
+        const host = new FakeTurnHost();
+        const scheduler = new FakeScheduler();
+        const events: RideCodexUiEvent[] = [];
+        const coordinator = new RideCodexTurnCoordinator({ host, scheduler });
+        const service = coordinator.connectClient({
+            turnEvents: wire => { events.push(...decodeBatch(wire).events); }
+        });
+        await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'one' }] });
+        host.emit('turn/diff/updated', { threadId: 'thread-1', turnId: 'turn-1', diff: '+line' });
+        host.emit('turn/diff/updated', { threadId: 'thread-1', turnId: 'turn-1', diff: '' });
+        host.emit('turn/plan/updated', {
+            threadId: 'thread-1', turnId: 'turn-1', explanation: 'invalid',
+            plan: [{ step: 'must-not-appear', status: 'futureStatus' }]
+        });
+        host.emit('turn/plan/updated', {
+            threadId: 'thread-1', turnId: 'turn-1', explanation: '',
+            plan: [{ step: '', status: 'inProgress' }]
+        });
+        host.emit('turn/plan/updated', {
+            threadId: 'thread-1', turnId: 'turn-1', explanation: null,
+            plan: [{ step: '', status: 'pending' }]
+        });
+        while (scheduler.callbacks.length > 0) {
+            scheduler.flushOne();
+            await Promise.resolve();
+        }
+
+        const diffs = events.filter((event): event is Extract<RideCodexUiEvent, { type: 'turn-diff' }> =>
+            event.type === 'turn-diff'
+        );
+        assert.deepEqual(diffs.map(event => event.diff), ['+line', '']);
+        const plans = events.filter((event): event is Extract<RideCodexUiEvent, { type: 'turn-plan' }> =>
+            event.type === 'turn-plan'
+        );
+        assert.equal(plans.length, 2);
+        assert.deepEqual(plans[0], {
+            type: 'turn-plan', explanation: '', steps: [{ step: '', status: 'in-progress' }]
+        });
+        assert.deepEqual(plans[1], {
+            type: 'turn-plan', steps: [{ step: '', status: 'pending' }]
+        });
     });
 });
