@@ -410,17 +410,105 @@ export class RideCodexApprovalBroker {
             kind, token, fingerprint, expiresAt, ...scope, allowedDecisions
         }) as unknown as RideCodexApprovalCard;
         const pendingHolder: { value?: PendingApproval } = {};
-        let expiredBeforeInsertion = false;
-        let timer: { dispose(): void };
-        try {
-            timer = this.#schedule(() => {
-                if (pendingHolder.value) {
-                    this.#settle(pendingHolder.value, 'cancel').catch(() => undefined);
-                } else {
-                    expiredBeforeInsertion = true;
+        let callbackBeforeInsertion: number | undefined;
+        let activeTimer: { dispose(): void } | undefined;
+        let timerVersion = 0;
+        let timerStopped = false;
+        const timer = Object.freeze({
+            dispose: (): void => {
+                if (timerStopped) {
+                    return;
                 }
-            }, this.#ttlMs);
-        } catch {
+                timerStopped = true;
+                timerVersion += 1;
+                const scheduled = activeTimer;
+                activeTimer = undefined;
+                try {
+                    scheduled?.dispose();
+                } catch {
+                    // A scheduler-owned disposer cannot reopen a settled approval.
+                }
+            }
+        });
+        const onTimer = async (version: number, mayReschedule = true): Promise<void> => {
+            if (timerStopped || version !== timerVersion) {
+                return;
+            }
+            const scheduledPending = pendingHolder.value;
+            if (!scheduledPending) {
+                callbackBeforeInsertion = version;
+                return;
+            }
+            let callbackTime: number;
+            try {
+                callbackTime = Reflect.apply(this.#now, undefined, []);
+            } catch {
+                await this.#settle(scheduledPending, 'decline');
+                return;
+            }
+            if (!Number.isSafeInteger(callbackTime) || callbackTime < scheduledPending.issuedAt) {
+                await this.#settle(scheduledPending, 'decline');
+                return;
+            }
+            if (callbackTime >= scheduledPending.expiresAt) {
+                await this.#settle(scheduledPending, 'cancel');
+                return;
+            }
+            if (!mayReschedule || !scheduleTimer(scheduledPending.expiresAt - callbackTime)) {
+                await this.#settle(scheduledPending, 'decline');
+            }
+        };
+        const scheduleTimer = (delayMs: number): boolean => {
+            if (timerStopped) {
+                return false;
+            }
+            const version = timerVersion + 1;
+            timerVersion = version;
+            let scheduling = true;
+            let invokedSynchronously = false;
+            let scheduled: { dispose(): void };
+            try {
+                scheduled = this.#schedule(() => {
+                    if (timerStopped || version !== timerVersion) {
+                        return;
+                    }
+                    if (scheduling) {
+                        invokedSynchronously = true;
+                        return;
+                    }
+                    onTimer(version).catch(() => undefined);
+                }, delayMs);
+            } catch {
+                scheduling = false;
+                return false;
+            }
+            scheduling = false;
+            if (timerStopped || version !== timerVersion) {
+                try {
+                    scheduled.dispose();
+                } catch {
+                    // The current timer state already makes this callback inert.
+                }
+                return true;
+            }
+            const previous = activeTimer;
+            activeTimer = scheduled;
+            try {
+                previous?.dispose();
+            } catch {
+                return false;
+            }
+            if (invokedSynchronously) {
+                if (pendingHolder.value) {
+                    onTimer(version, false).catch(() => undefined);
+                } else {
+                    callbackBeforeInsertion = version;
+                }
+            }
+            return true;
+        };
+        if (!scheduleTimer(this.#ttlMs)) {
+            timer.dispose();
             await this.#settleAuthorizing(authorizing, 'decline');
             return;
         }
@@ -454,8 +542,10 @@ export class RideCodexApprovalBroker {
         }
         this.#pending.set(token, pending);
         this.#publish(owner);
-        if (expiredBeforeInsertion) {
-            await this.#settle(pending, 'cancel');
+        if (callbackBeforeInsertion !== undefined) {
+            const callbackVersion = callbackBeforeInsertion;
+            callbackBeforeInsertion = undefined;
+            await onTimer(callbackVersion);
         }
     }
 

@@ -257,13 +257,14 @@ function createFixture(options: Readonly<{
     resolveRealPath?: (path: string) => Promise<string>;
     now?: () => number;
     pathStyle?: 'posix' | 'win32';
+    schedule?: (callback: () => void, delayMs: number) => { dispose(): void };
 }> = {}) {
     const host = new FakeHost();
     const clock = new FakeClock();
     const broker = new RideCodexApprovalBroker({
         host,
         now: options.now ?? (() => clock.now),
-        schedule: clock.schedule,
+        schedule: options.schedule ?? clock.schedule,
         ttlMs: 1_000,
         maxPending: options.maxPending ?? 8,
         pathStyle: options.pathStyle ?? 'win32',
@@ -848,6 +849,299 @@ describe('RideCodexApprovalBroker ownership', () => {
         });
         assert.equal(fixture.host.leases[1].releases, 1);
         assert.equal(fixture.client.latest().length, 0);
+    });
+
+    it('reschedules a scheduled TTL callback invoked at expiresAt - 1 without extending the TTL', async () => {
+        const fixture = createFixture();
+        await fixture.session.setContext(CONTEXT);
+        await fixture.broker.handleServerRequest(commandRequest(), CONTEXT.generation);
+        const card = fixture.client.latest()[0];
+        const earlyCallback = fixture.clock.callbacks[0];
+        assert.ok(earlyCallback);
+        fixture.clock.now = card.expiresAt - 1;
+
+        earlyCallback();
+        await flushAsync();
+
+        assert.equal(fixture.host.responses.length, 0);
+        assert.deepEqual(fixture.client.latest(), [card]);
+        assert.equal(fixture.client.latest()[0].expiresAt, card.expiresAt);
+        assert.equal(fixture.clock.callbacks.length, 2);
+        assert.equal(fixture.clock.timers.size, 1);
+        assert.deepEqual([...fixture.clock.timers.values()].map(timer => timer.due), [card.expiresAt]);
+
+        earlyCallback();
+        await flushAsync();
+        assert.equal(fixture.host.responses.length, 0);
+        assert.deepEqual(await fixture.session.decide({
+            token: card.token, fingerprint: card.fingerprint, decision: 'accept'
+        }), { status: 'responded' });
+        assert.deepEqual(fixture.host.responses, [{
+            generation: 7, id: 'rpc-command-1', result: { decision: 'accept' }
+        }]);
+        assert.equal(fixture.host.leases[0].releases, 1);
+
+        fixture.clock.callbacks[1]();
+        await flushAsync();
+        assert.equal(fixture.host.responses.length, 1);
+        assert.equal(fixture.host.leases[0].releases, 1);
+    });
+
+    it('settles a scheduled TTL callback invoked exactly at expiresAt once', async () => {
+        const fixture = createFixture();
+        await fixture.session.setContext(CONTEXT);
+        await fixture.broker.handleServerRequest(commandRequest(), CONTEXT.generation);
+        const card = fixture.client.latest()[0];
+        const callback = fixture.clock.callbacks[0];
+        assert.ok(callback);
+        fixture.clock.now = card.expiresAt;
+
+        callback();
+        callback();
+        await flushAsync();
+
+        assert.deepEqual(fixture.host.responses, [{
+            generation: 7, id: 'rpc-command-1', result: { decision: 'cancel' }
+        }]);
+        assert.equal(fixture.host.leases[0].releases, 1);
+        assert.equal(fixture.client.latest().length, 0);
+    });
+
+    it('settles a scheduled TTL callback invoked at expiresAt + 1 once', async () => {
+        const fixture = createFixture();
+        await fixture.session.setContext(CONTEXT);
+        await fixture.broker.handleServerRequest(commandRequest(), CONTEXT.generation);
+        const card = fixture.client.latest()[0];
+        const callback = fixture.clock.callbacks[0];
+        assert.ok(callback);
+        fixture.clock.now = card.expiresAt + 1;
+
+        callback();
+        callback();
+        await flushAsync();
+
+        assert.deepEqual(fixture.host.responses, [{
+            generation: 7, id: 'rpc-command-1', result: { decision: 'cancel' }
+        }]);
+        assert.equal(fixture.host.leases[0].releases, 1);
+        assert.equal(fixture.client.latest().length, 0);
+    });
+
+    it('fails closed once when the scheduled TTL callback clock rolls back, is invalid, or throws', async () => {
+        const cases: ReadonlyArray<Readonly<{
+            name: string;
+            callbackNow: () => number;
+        }>> = [
+            { name: 'rollback', callbackNow: () => 999 },
+            { name: 'NaN', callbackNow: () => Number.NaN },
+            { name: 'fractional', callbackNow: () => 1_999.5 },
+            { name: 'infinite', callbackNow: () => Number.POSITIVE_INFINITY },
+            { name: 'unsafe', callbackNow: () => Number.MAX_SAFE_INTEGER + 1 },
+            { name: 'throwing', callbackNow: () => { throw new Error('clock failure'); } }
+        ];
+        for (const entry of cases) {
+            let callbackInvoked = false;
+            const fixture = createFixture({
+                now: () => callbackInvoked ? entry.callbackNow() : 1_000
+            });
+            await fixture.session.setContext(CONTEXT);
+            await fixture.broker.handleServerRequest(
+                commandRequest({}, `callback-clock-${entry.name}`), CONTEXT.generation
+            );
+            const card = fixture.client.latest()[0];
+            const callback = fixture.clock.callbacks[0];
+            assert.ok(callback);
+            callbackInvoked = true;
+
+            callback();
+            callback();
+            await flushAsync();
+
+            assert.deepEqual(fixture.host.responses, [{
+                generation: 7,
+                id: `callback-clock-${entry.name}`,
+                result: { decision: 'decline' }
+            }], entry.name);
+            assert.equal(fixture.host.leases[0].releases, 1, entry.name);
+            assert.deepEqual(await fixture.session.decide({
+                token: card.token, fingerprint: card.fingerprint, decision: 'accept'
+            }), { status: 'rejected', code: 'stale-approval' }, entry.name);
+            await fixture.broker.dispose();
+        }
+    });
+
+    it('fails closed once when rescheduling an early TTL callback throws', async () => {
+        const callbacks: Array<() => void> = [];
+        const delays: number[] = [];
+        let disposals = 0;
+        const fixture = createFixture({
+            schedule: (callback, delayMs) => {
+                callbacks.push(callback);
+                delays.push(delayMs);
+                if (callbacks.length === 2) {
+                    throw new Error('reschedule failure');
+                }
+                let disposed = false;
+                return {
+                    dispose: () => {
+                        if (!disposed) {
+                            disposed = true;
+                            disposals += 1;
+                        }
+                    }
+                };
+            }
+        });
+        await fixture.session.setContext(CONTEXT);
+        await fixture.broker.handleServerRequest(commandRequest(), CONTEXT.generation);
+        const card = fixture.client.latest()[0];
+        fixture.clock.now = card.expiresAt - 1;
+
+        callbacks[0]();
+        callbacks[0]();
+        await flushAsync();
+
+        assert.deepEqual(delays, [1_000, 1]);
+        assert.equal(disposals, 1);
+        assert.deepEqual(fixture.host.responses, [{
+            generation: 7, id: 'rpc-command-1', result: { decision: 'decline' }
+        }]);
+        assert.equal(fixture.host.leases[0].releases, 1);
+        assert.equal(fixture.client.latest().length, 0);
+        assert.deepEqual(await fixture.session.decide({
+            token: card.token, fingerprint: card.fingerprint, decision: 'accept'
+        }), { status: 'rejected', code: 'stale-approval' });
+    });
+
+    it('reschedules a synchronous early TTL callback invoked before pending insertion', async () => {
+        const callbacks: Array<() => void> = [];
+        const delays: number[] = [];
+        let scheduleCalls = 0;
+        const fixture = createFixture({
+            schedule: (callback, delayMs) => {
+                callbacks.push(callback);
+                delays.push(delayMs);
+                scheduleCalls += 1;
+                if (scheduleCalls === 1) {
+                    callback();
+                }
+                return { dispose: () => undefined };
+            }
+        });
+        await fixture.session.setContext(CONTEXT);
+
+        await fixture.broker.handleServerRequest(commandRequest(), CONTEXT.generation);
+
+        const card = fixture.client.latest()[0];
+        assert.ok(card);
+        assert.deepEqual(delays, [1_000, 1_000]);
+        assert.equal(card.expiresAt, 2_000);
+        assert.equal(fixture.host.responses.length, 0);
+        assert.deepEqual(await fixture.session.decide({
+            token: card.token, fingerprint: card.fingerprint, decision: 'accept'
+        }), { status: 'responded' });
+        callbacks.forEach(callback => callback());
+        await flushAsync();
+        assert.deepEqual(fixture.host.responses, [{
+            generation: 7, id: 'rpc-command-1', result: { decision: 'accept' }
+        }]);
+        assert.equal(fixture.host.leases[0].releases, 1);
+    });
+
+    it('reschedules repeated early TTL callbacks and makes superseded callbacks inert', async () => {
+        const fixture = createFixture();
+        await fixture.session.setContext(CONTEXT);
+        await fixture.broker.handleServerRequest(commandRequest(), CONTEXT.generation);
+        const card = fixture.client.latest()[0];
+
+        for (const offset of [-3, -2, -1]) {
+            fixture.clock.now = card.expiresAt + offset;
+            const callback = fixture.clock.callbacks[fixture.clock.callbacks.length - 1];
+            assert.ok(callback);
+            callback();
+            await flushAsync();
+            assert.equal(fixture.host.responses.length, 0, `offset ${offset}`);
+            assert.equal(fixture.client.latest()[0].expiresAt, card.expiresAt, `offset ${offset}`);
+            assert.equal(fixture.clock.timers.size, 1, `offset ${offset}`);
+            assert.deepEqual(
+                [...fixture.clock.timers.values()].map(timer => timer.due),
+                [card.expiresAt],
+                `offset ${offset}`
+            );
+        }
+
+        fixture.clock.now = card.expiresAt;
+        fixture.clock.callbacks.slice(0, -1).forEach(callback => callback());
+        await flushAsync();
+        assert.equal(fixture.host.responses.length, 0);
+        fixture.clock.callbacks[fixture.clock.callbacks.length - 1]?.();
+        await flushAsync();
+        assert.deepEqual(fixture.host.responses, [{
+            generation: 7, id: 'rpc-command-1', result: { decision: 'cancel' }
+        }]);
+        assert.equal(fixture.host.leases[0].releases, 1);
+        assert.equal(fixture.client.latest().length, 0);
+    });
+
+    it('settles once when a TTL callback races a decision', async () => {
+        const fixture = createFixture();
+        await fixture.session.setContext(CONTEXT);
+        await fixture.broker.handleServerRequest(commandRequest(), CONTEXT.generation);
+        const card = fixture.client.latest()[0];
+        const callback = fixture.clock.callbacks[0];
+        assert.ok(callback);
+        fixture.clock.now = card.expiresAt;
+
+        callback();
+        const decision = await fixture.session.decide({
+            token: card.token, fingerprint: card.fingerprint, decision: 'accept'
+        });
+        await flushAsync();
+
+        assert.deepEqual(decision, { status: 'rejected', code: 'stale-approval' });
+        assert.deepEqual(fixture.host.responses, [{
+            generation: 7, id: 'rpc-command-1', result: { decision: 'cancel' }
+        }]);
+        assert.equal(fixture.host.leases[0].releases, 1);
+    });
+
+    it('makes rescheduled TTL callbacks inert after context, broker, and process cleanup', async () => {
+        for (const ending of ['context', 'broker', 'process'] as const) {
+            const fixture = createFixture();
+            await fixture.session.setContext(CONTEXT);
+            await fixture.broker.handleServerRequest(
+                commandRequest({}, `rescheduled-cleanup-${ending}`), CONTEXT.generation
+            );
+            const card = fixture.client.latest()[0];
+            fixture.clock.now = card.expiresAt - 1;
+            fixture.clock.callbacks[0]();
+            await flushAsync();
+            const lateCallbacks = [...fixture.clock.callbacks];
+
+            if (ending === 'context') {
+                await fixture.session.disposeContext();
+            } else if (ending === 'broker') {
+                await fixture.broker.dispose();
+            } else {
+                fixture.host.emitState('circuit-open', CONTEXT.generation);
+                await flushAsync();
+            }
+
+            fixture.clock.now = card.expiresAt + 1;
+            lateCallbacks.forEach(callback => callback());
+            await flushAsync();
+            assert.deepEqual(fixture.host.responses, ending === 'process' ? [] : [{
+                generation: 7,
+                id: `rescheduled-cleanup-${ending}`,
+                result: { decision: 'cancel' }
+            }], ending);
+            assert.equal(fixture.host.leases[0].releases, 1, ending);
+            assert.equal(fixture.client.latest().length, 0, ending);
+            assert.deepEqual(await fixture.session.decide({
+                token: card.token, fingerprint: card.fingerprint, decision: 'accept'
+            }), { status: 'rejected', code: 'stale-approval' }, ending);
+            await fixture.broker.dispose();
+        }
     });
 
     it('enforces the hard TTL at expiresAt - 1, expiresAt, and expiresAt + 1 despite delayed timers', async () => {
