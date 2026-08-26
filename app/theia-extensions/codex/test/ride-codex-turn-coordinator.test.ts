@@ -15,6 +15,10 @@ import {
     RideCodexTurnScheduler
 } from '../src/node/ride-codex-turn-coordinator';
 
+function decodeBatch(wire: string): RideCodexEventBatch {
+    return JSON.parse(wire) as RideCodexEventBatch;
+}
+
 class FakeScheduler implements RideCodexTurnScheduler {
     readonly callbacks: Array<() => void> = [];
 
@@ -183,14 +187,14 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
     it('coalesces 1000 backend agent deltas into one scheduled immutable batch', async () => {
         const host = new FakeTurnHost();
         const scheduler = new FakeScheduler();
-        const batches: unknown[] = [];
+        const wires: string[] = [];
         const coordinator = new RideCodexTurnCoordinator({
             host,
             scheduler,
             maxQueuedBytes: 4_096,
             maxItemBytes: 2_048
         });
-        const service = coordinator.connectClient({ turnEvents: batch => { batches.push(batch); } });
+        const service = coordinator.connectClient({ turnEvents: wire => { wires.push(wire); } });
         await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'hello' }] });
         host.emit('item/started', {
             threadId: 'thread-1', turnId: 'turn-1', startedAtMs: 1,
@@ -202,17 +206,56 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
             });
         }
 
-        assert.equal(batches.length, 0);
+        assert.equal(wires.length, 0);
         assert.equal(scheduler.callbacks.length, 1);
         scheduler.flushOne();
         await Promise.resolve();
 
-        assert.equal(batches.length, 1);
-        const batch = batches[0] as { events: Array<{ type: string; delta?: string }> };
-        const delta = batch.events.find(event => event.type === 'agent-delta');
+        assert.equal(wires.length, 1);
+        const batch = decodeBatch(wires[0]);
+        const delta = batch.events.find(event => event.type === 'agent-delta') as
+            | Extract<RideCodexUiEvent, { delta: string }>
+            | undefined;
         assert.equal(delta?.delta, 'x'.repeat(1_000));
-        assert.ok(Object.isFrozen(batch));
-        assert.ok(Object.isFrozen(batch.events));
+    });
+
+    it('delivers a primitive bounded JSON wire with exact event fidelity', async () => {
+        const host = new FakeTurnHost();
+        const scheduler = new FakeScheduler();
+        const deliveries: unknown[] = [];
+        const coordinator = new RideCodexTurnCoordinator({ host, scheduler, maxQueuedBytes: 4_096 });
+        const service = coordinator.connectClient({
+            turnEvents: wire => { deliveries.push(wire); }
+        });
+        await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'hello' }] });
+        host.emit('turn/started', {
+            threadId: 'thread-1',
+            turn: { id: 'turn-1', status: 'inProgress', items: [] }
+        });
+        host.emit('item/started', {
+            threadId: 'thread-1', turnId: 'turn-1', startedAtMs: 1,
+            item: { type: 'agentMessage', id: 'item-1', text: '', phase: null, memoryCitation: null }
+        });
+        host.emit('item/agentMessage/delta', {
+            threadId: 'thread-1', turnId: 'turn-1', itemId: 'item-1', delta: '你好'
+        });
+        scheduler.flushOne();
+        await Promise.resolve();
+
+        assert.equal(deliveries.length, 1);
+        assert.equal(typeof deliveries[0], 'string');
+        const wire = deliveries[0] as string;
+        assert.ok(Buffer.byteLength(wire, 'utf8') <= 4_096);
+        assert.deepEqual(JSON.parse(wire), {
+            generation: 1,
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            events: [
+                { type: 'turn-started' },
+                { type: 'item-started', itemId: 'item-1', itemKind: 'agent-message' },
+                { type: 'agent-delta', itemId: 'item-1', delta: '你好' }
+            ]
+        });
     });
 
     it('normalizes the reviewed turn, item, reasoning, plan, command, file, usage, warning, and error families', async () => {
@@ -222,7 +265,8 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         const normalizedEvents: RideCodexUiEvent[] = [];
         const coordinator = new RideCodexTurnCoordinator({ host, scheduler });
         const service = coordinator.connectClient({
-            turnEvents: batch => {
+            turnEvents: wire => {
+                const batch = decodeBatch(wire);
                 eventTypes.push(...batch.events.map(event => event.type));
                 normalizedEvents.push(...batch.events);
             }
@@ -296,7 +340,7 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         const scheduler = new FakeScheduler();
         const events: RideCodexUiEvent[] = [];
         const coordinator = new RideCodexTurnCoordinator({ host, scheduler, maxItemBytes: 8 });
-        const service = coordinator.connectClient({ turnEvents: batch => { events.push(...batch.events); } });
+        const service = coordinator.connectClient({ turnEvents: wire => { events.push(...decodeBatch(wire).events); } });
         await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'one' }] });
         const base = { threadId: 'thread-1', turnId: 'turn-1', itemId: 'reasoning-1' };
         host.emit('item/started', {
@@ -322,7 +366,7 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         const scheduler = new FakeScheduler();
         const types: string[] = [];
         const coordinator = new RideCodexTurnCoordinator({ host, scheduler });
-        const service = coordinator.connectClient({ turnEvents: batch => { types.push(...batch.events.map(event => event.type)); } });
+        const service = coordinator.connectClient({ turnEvents: wire => { types.push(...decodeBatch(wire).events.map(event => event.type)); } });
         await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'hello' }] });
         host.emit('item/agentMessage/delta', { threadId: 'thread-2', turnId: 'turn-1', itemId: 'i', delta: 'bad' });
         host.emit('item/agentMessage/delta', { threadId: 'thread-1', turnId: 'turn-2', itemId: 'i', delta: 'bad' });
@@ -425,7 +469,7 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
                 }
             });
             const service = coordinator.connectClient({
-                turnEvents: batch => { events.push(...batch.events); }
+                turnEvents: wire => { events.push(...decodeBatch(wire).events); }
             });
             await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'one' }] });
             const interrupting = service.interruptTurn({ threadId: 'thread-1', turnId: 'turn-1' });
@@ -478,7 +522,7 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         const scheduler = new FakeScheduler();
         const batches: unknown[] = [];
         const coordinator = new RideCodexTurnCoordinator({ host, scheduler });
-        const service = coordinator.connectClient({ turnEvents: batch => { batches.push(batch); } });
+        const service = coordinator.connectClient({ turnEvents: wire => { batches.push(wire); } });
         await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'hello' }] });
         scheduler.flushOne();
         await Promise.resolve();
@@ -514,7 +558,7 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         const scheduler = new FakeScheduler();
         const batches: RideCodexEventBatch[] = [];
         const coordinator = new RideCodexTurnCoordinator({ host, scheduler });
-        const service = coordinator.connectClient({ turnEvents: batch => { batches.push(batch); } });
+        const service = coordinator.connectClient({ turnEvents: wire => { batches.push(decodeBatch(wire)); } });
         await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'hello' }] });
         scheduler.flushOne();
         await Promise.resolve();
@@ -571,7 +615,7 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         const coordinator = new RideCodexTurnCoordinator({
             host, scheduler, maxQueuedBytes: 4_096, maxItemBytes: 8
         });
-        const service = coordinator.connectClient({ turnEvents: batch => { batches.push(batch); } });
+        const service = coordinator.connectClient({ turnEvents: wire => { batches.push(decodeBatch(wire)); } });
 
         for (const turnId of ['turn-1', 'turn-2']) {
             host.nextTurnId = turnId;
@@ -607,7 +651,8 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         const batches: Array<{ turnId: string; types: string[] }> = [];
         const coordinator = new RideCodexTurnCoordinator({ host, scheduler });
         const service = coordinator.connectClient({
-            turnEvents: batch => {
+            turnEvents: wire => {
+                const batch = decodeBatch(wire);
                 batches.push({ turnId: batch.turnId, types: batch.events.map(event => event.type) });
             }
         });
@@ -636,7 +681,7 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
             host, scheduler, maxQueuedBytes: 256, maxItemBytes: 2_048, maxBatchEvents: 64
         });
         const service = coordinator.connectClient({
-            turnEvents: batch => { types.push(...batch.events.map(event => event.type)); }
+            turnEvents: wire => { types.push(...decodeBatch(wire).events.map(event => event.type)); }
         });
         await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'one' }] });
         for (let index = 0; index < 100; index += 1) {
@@ -663,7 +708,8 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         const coordinator = new RideCodexTurnCoordinator({ host, scheduler });
         let call = 0;
         const service = coordinator.connectClient({
-            turnEvents: batch => {
+            turnEvents: wire => {
+                const batch = decodeBatch(wire);
                 deliveries.push({ turnId: batch.turnId, types: batch.events.map(event => event.type) });
                 call += 1;
                 return call === 1 ? firstDelivery : undefined;
@@ -701,8 +747,8 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
             host, scheduler, maxQueuedBytes: 512, maxBatchEvents: 8
         });
         const service = coordinator.connectClient({
-            turnEvents: batch => {
-                delivered.push(batch);
+            turnEvents: wire => {
+                delivered.push(decodeBatch(wire));
                 calls += 1;
                 return calls === 1 ? blocked : undefined;
             }
@@ -755,8 +801,8 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
             host, scheduler, maxQueuedBytes: 512, maxBatchEvents: 8, maxItemBytes: 128
         });
         const service = coordinator.connectClient({
-            turnEvents: batch => {
-                delivered.push(batch);
+            turnEvents: wire => {
+                delivered.push(decodeBatch(wire));
                 calls += 1;
                 return calls === 1 ? blocked : undefined;
             }
@@ -955,7 +1001,7 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         const types: string[] = [];
         const coordinator = new RideCodexTurnCoordinator({ host, scheduler });
         const service = coordinator.connectClient({
-            turnEvents: batch => { types.push(...batch.events.map(event => event.type)); }
+            turnEvents: wire => { types.push(...decodeBatch(wire).events.map(event => event.type)); }
         });
         await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'one' }] });
         const params = {
@@ -990,7 +1036,7 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
             maxRetainedItems: 2,
             maxDiagnosticHistory: 2
         });
-        const service = coordinator.connectClient({ turnEvents: batch => { batches.push(batch); } });
+        const service = coordinator.connectClient({ turnEvents: wire => { batches.push(decodeBatch(wire)); } });
         await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'one' }] });
         for (let index = 0; index < 3; index += 1) {
             host.emit('item/started', {
@@ -1098,7 +1144,7 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
             }
         });
         const service = coordinator.connectClient({
-            turnEvents: batch => { events.push(...batch.events); }
+            turnEvents: wire => { events.push(...decodeBatch(wire).events); }
         });
         await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'one' }] });
         const interrupting = service.interruptTurn({ threadId: 'thread-1', turnId: 'turn-1' });
@@ -1124,7 +1170,7 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
             host, scheduler, maxQueuedBytes: 4_096, maxItemBytes: 2_048
         });
         const service = coordinator.connectClient({
-            turnEvents: batch => { events.push(...batch.events); }
+            turnEvents: wire => { events.push(...decodeBatch(wire).events); }
         });
         await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'one' }] });
         host.emit('item/started', {
@@ -1156,8 +1202,8 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         let calls = 0;
         const coordinator = new RideCodexTurnCoordinator({ host, scheduler, maxBatchEvents: 4 });
         const service = coordinator.connectClient({
-            turnEvents: batch => {
-                delivered.push(...batch.events);
+            turnEvents: wire => {
+                delivered.push(...decodeBatch(wire).events);
                 calls += 1;
                 return calls === 1 ? first : undefined;
             }
@@ -1208,7 +1254,7 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         const types: string[] = [];
         const coordinator = new RideCodexTurnCoordinator({ host, scheduler });
         const service = coordinator.connectClient({
-            turnEvents: batch => { types.push(...batch.events.map(event => event.type)); }
+            turnEvents: wire => { types.push(...decodeBatch(wire).events.map(event => event.type)); }
         });
         const starting = service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'one' }] });
         await Promise.resolve();

@@ -9,6 +9,10 @@ import { describe, it } from 'node:test';
 import { RideCodexEventBatch } from '../src/common/ride-codex-events';
 import { RideCodexEventReducer } from '../src/browser/ride-codex-event-reducer';
 
+function batchWire(batch: unknown): string {
+    return JSON.stringify(batch);
+}
+
 describe('RideCodexEventReducer minimal frame contract', () => {
     it('coalesces 1000 agent deltas without publishing before one animation frame', () => {
         const frames: Array<() => void> = [];
@@ -39,7 +43,7 @@ describe('RideCodexEventReducer minimal frame contract', () => {
             ]
         };
 
-        reducer.notifyMany(batch);
+        reducer.notifyMany(batchWire(batch));
 
         assert.equal(publishes, 0);
         assert.equal(reducer.snapshot().items.length, 0);
@@ -81,7 +85,7 @@ describe('RideCodexEventReducer minimal frame contract', () => {
             { type: 'agent-delta', itemId: 'item-1', delta: 'late' },
             { type: 'turn-terminal', status: 'completed' }
         ];
-        reducer.notifyMany({ generation: 1, threadId: 'thread-1', turnId: 'turn-1', events });
+        reducer.notifyMany(batchWire({ generation: 1, threadId: 'thread-1', turnId: 'turn-1', events }));
         frames.shift()?.();
 
         const snapshot = reducer.snapshot();
@@ -107,7 +111,7 @@ describe('RideCodexEventReducer minimal frame contract', () => {
                 return { dispose: () => undefined };
             }
         });
-        reducer.notifyMany({
+        reducer.notifyMany(batchWire({
             generation: 1,
             threadId: 'thread-1',
             turnId: 'turn-1',
@@ -122,7 +126,7 @@ describe('RideCodexEventReducer minimal frame contract', () => {
                     ]
                 }
             ]
-        } as RideCodexEventBatch);
+        } as RideCodexEventBatch));
         frames.shift()?.();
 
         const changes = reducer.snapshot().items[0].changes;
@@ -154,10 +158,10 @@ describe('RideCodexEventReducer minimal frame contract', () => {
             { path: 'src/a.ts', kind: 'update', diff: 'x', movePath: '你'.repeat(11_000) },
             { path: 'src/a.ts', kind: 'unknown', diff: 'x' }
         ]) {
-            reducer.notifyMany({
+            reducer.notifyMany(batchWire({
                 generation: 1, threadId: 'thread-1', turnId: 'turn-1',
                 events: [{ type: 'turn-started' }, { type: 'file-patch', itemId: 'file-1', changes: [change] }]
-            } as RideCodexEventBatch);
+            } as RideCodexEventBatch));
         }
 
         assert.equal(frames.length, 0);
@@ -174,7 +178,7 @@ describe('RideCodexEventReducer minimal frame contract', () => {
             maxItemBytes: 8,
             maxRetainedBytes: 64
         });
-        reducer.notifyMany({
+        reducer.notifyMany(batchWire({
             generation: 1,
             threadId: 'thread-1',
             turnId: 'turn-1',
@@ -185,7 +189,7 @@ describe('RideCodexEventReducer minimal frame contract', () => {
                 { type: 'reasoning-summary-part', itemId: 'reasoning-1', summaryIndex: 1 },
                 { type: 'reasoning-delta', itemId: 'reasoning-1', contentIndex: 0, delta: '界界界' }
             ]
-        });
+        }));
         frames.shift()?.();
 
         const item = reducer.snapshot().items[0];
@@ -230,7 +234,7 @@ describe('RideCodexEventReducer minimal frame contract', () => {
                 retryable: false
             }))
         ];
-        reducer.notifyMany({ generation: 1, threadId: 'thread-1', turnId: 'turn-1', events });
+        reducer.notifyMany(batchWire({ generation: 1, threadId: 'thread-1', turnId: 'turn-1', events }));
         frames.shift()?.();
 
         const snapshot = reducer.snapshot();
@@ -249,18 +253,18 @@ describe('RideCodexEventReducer minimal frame contract', () => {
                 return { dispose: () => undefined };
             }
         });
-        reducer.notifyMany({
+        reducer.notifyMany(batchWire({
             generation: 2, threadId: 'thread-1', turnId: 'turn-1',
             events: [{ type: 'turn-started' }, { type: 'turn-terminal', status: 'completed' }]
-        });
-        reducer.notifyMany({
+        }));
+        reducer.notifyMany(batchWire({
             generation: 1, threadId: 'thread-1', turnId: 'turn-1',
             events: [{ type: 'warning', code: 'server-warning', message: 'old' }]
-        });
-        reducer.notifyMany({
+        }));
+        reducer.notifyMany(batchWire({
             generation: 2, threadId: 'thread-1', turnId: 'turn-2',
             events: [{ type: 'warning', code: 'server-warning', message: 'cross' }]
-        });
+        }));
         frames.shift()?.();
 
         assert.equal(reducer.snapshot().status, 'completed');
@@ -278,10 +282,10 @@ describe('RideCodexEventReducer minimal frame contract', () => {
         });
         let publishes = 0;
         reducer.onDidChange(() => { publishes += 1; });
-        reducer.notifyMany({
+        reducer.notifyMany(batchWire({
             generation: 1, threadId: 'thread-1', turnId: 'turn-1',
             events: [{ type: 'turn-started' }, { type: 'agent-delta', itemId: 'i', delta: 'queued' }]
-        });
+        }));
         reducer.dispose();
         frames.shift()?.();
 
@@ -298,14 +302,14 @@ describe('RideCodexEventReducer minimal frame contract', () => {
                 return { dispose: () => undefined };
             }
         });
-        reducer.notifyMany({
+        reducer.notifyMany(batchWire({
             generation: 1, threadId: 'thread-1', turnId: 'turn-1',
             events: [{ type: 'turn-started' }, { type: 'turn-terminal', status: 'completed' }]
-        });
-        reducer.notifyMany({
+        }));
+        reducer.notifyMany(batchWire({
             generation: 1, threadId: 'thread-1', turnId: 'turn-2',
             events: [{ type: 'turn-started' }, { type: 'agent-delta', itemId: 'item-2', delta: 'new' }]
-        });
+        }));
         frames.shift()?.();
 
         assert.equal(reducer.snapshot().turnId, 'turn-2');
@@ -313,7 +317,55 @@ describe('RideCodexEventReducer minimal frame contract', () => {
         assert.equal(reducer.snapshot().items[0].text, 'new');
     });
 
-    it('rejects accessor-backed event data after native clone without changing state', () => {
+    it('accepts only canonical wire strings without observing top-level objects', () => {
+        const frames: Array<() => void> = [];
+        const reducer = new RideCodexEventReducer({
+            scheduleFrame: callback => {
+                frames.push(callback);
+                return { dispose: () => undefined };
+            }
+        });
+        const notify = reducer.notifyMany.bind(reducer) as (wire: unknown) => void;
+        let traps = 0;
+        let getters = 0;
+        const proxy = new Proxy({}, {
+            get: () => { traps += 1; return undefined; },
+            ownKeys: () => { traps += 1; return []; },
+            getOwnPropertyDescriptor: () => { traps += 1; return undefined; },
+            getPrototypeOf: () => { traps += 1; return Object.prototype; }
+        });
+        const accessor = Object.defineProperty({}, 'generation', {
+            enumerable: true,
+            get: () => {
+                getters += 1;
+                return 1;
+            }
+        });
+
+        notify(proxy);
+        notify(accessor);
+
+        assert.equal(traps, 0);
+        assert.equal(getters, 0);
+        assert.equal(frames.length, 0);
+        assert.equal(reducer.snapshot().status, 'idle');
+
+        notify(JSON.stringify({
+            generation: 1,
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            events: [
+                { type: 'turn-started' },
+                { type: 'agent-delta', itemId: 'item-1', delta: 'canonical' }
+            ]
+        }));
+        frames.shift()?.();
+
+        assert.equal(reducer.snapshot().status, 'in-progress');
+        assert.equal(reducer.snapshot().items[0].text, 'canonical');
+    });
+
+    it('rejects accessor-backed event data without executing getters or changing state', () => {
         const frames: Array<() => void> = [];
         const reducer = new RideCodexEventReducer({
             scheduleFrame: callback => {
@@ -329,14 +381,14 @@ describe('RideCodexEventReducer minimal frame contract', () => {
                 return 'unsafe';
             }
         });
-        reducer.notifyMany({
+        (reducer.notifyMany as (value: unknown) => void)({
             generation: 1,
             threadId: 'thread-1',
             turnId: 'turn-1',
             events: [event as never]
         });
 
-        assert.equal(getterCalls, 1);
+        assert.equal(getterCalls, 0);
         assert.equal(frames.length, 0);
         assert.equal(reducer.snapshot().status, 'idle');
     });
@@ -373,7 +425,7 @@ describe('RideCodexEventReducer minimal frame contract', () => {
             }
         ];
         for (const batch of batches) {
-            reducer.notifyMany(batch as RideCodexEventBatch);
+            (reducer.notifyMany as (value: unknown) => void)(batch);
         }
 
         assert.equal(traps, 0);
@@ -391,18 +443,18 @@ describe('RideCodexEventReducer minimal frame contract', () => {
             maxQueuedBytes: 256,
             maxBatchEvents: 16
         });
-        reducer.notifyMany({
+        reducer.notifyMany(batchWire({
             generation: 1, threadId: 'thread-1', turnId: 'turn-1',
             events: [
                 { type: 'turn-started' },
                 { type: 'item-started', itemId: 'item-1', itemKind: 'agent-message' },
                 { type: 'agent-delta', itemId: 'item-1', delta: 'x'.repeat(96) }
             ]
-        });
-        reducer.notifyMany({
+        }));
+        reducer.notifyMany(batchWire({
             generation: 1, threadId: 'thread-1', turnId: 'turn-1',
             events: [{ type: 'turn-terminal', status: 'completed' }]
-        });
+        }));
         frames.shift()?.();
 
         assert.equal(reducer.snapshot().status, 'completed');
@@ -417,41 +469,62 @@ describe('RideCodexEventReducer minimal frame contract', () => {
                 return { dispose: () => undefined };
             }
         });
-        reducer.notifyMany({
+        reducer.notifyMany(batchWire({
             generation: 1, threadId: 'thread-1', turnId: 'turn-1',
             events: [{ type: 'turn-started' }]
-        });
-        reducer.notifyMany({
+        }));
+        reducer.notifyMany(batchWire({
             generation: 1, threadId: 'thread-1', turnId: 'turn-2',
             events: [{ type: 'turn-terminal', status: 'completed' }]
-        });
+        }));
         frames.shift()?.();
 
         assert.equal(reducer.snapshot().turnId, 'turn-2');
         assert.equal(reducer.snapshot().status, 'completed');
     });
 
-    it('rejects malformed typed events and bounds an oversized frontend batch with drop metadata', () => {
+    it('rejects malformed, oversized, and wrong-schema wires before accepting a bounded batch', () => {
         const frames: Array<() => void> = [];
         const reducer = new RideCodexEventReducer({
             scheduleFrame: callback => {
                 frames.push(callback);
                 return { dispose: () => undefined };
             },
+            maxWireBytes: 4_096,
             maxBatchEvents: 4,
             maxQueuedBytes: 4_096,
             maxItemBytes: 2_048
         });
-        reducer.notifyMany({
-            generation: 1,
-            threadId: 'thread-1',
-            turnId: 'bad-turn',
-            events: [{ type: 'turn-started' }, { type: 'turn-terminal' } as never]
-        });
+        for (const wire of [
+            '{',
+            ` ${batchWire({
+                generation: 1, threadId: 'thread-1', turnId: 'non-canonical',
+                events: [{ type: 'turn-started' }]
+            })}`,
+            '{"generation":1,"generation":2,"threadId":"thread-1","turnId":"duplicate","events":[{"type":"turn-started"}]}',
+            batchWire({
+                generation: 1, threadId: 'thread-1', turnId: 'bad-turn',
+                events: [{ type: 'turn-started' }, { type: 'turn-terminal' }]
+            }),
+            batchWire({
+                generation: 1, threadId: 'thread-1', turnId: 'bad-turn', unknown: true,
+                events: [{ type: 'turn-started' }]
+            }),
+            batchWire({
+                generation: 1, threadId: 'thread-1', turnId: 'bad-turn',
+                events: [{ type: 'turn-started', unknown: true }]
+            }),
+            batchWire({
+                generation: 1, threadId: 'thread-1', turnId: 'oversized',
+                events: [{ type: 'agent-delta', itemId: 'item-1', delta: 'x'.repeat(4_096) }]
+            })
+        ]) {
+            reducer.notifyMany(wire);
+        }
         assert.equal(frames.length, 0);
         assert.equal(reducer.snapshot().status, 'idle');
 
-        reducer.notifyMany({
+        reducer.notifyMany(batchWire({
             generation: 1,
             threadId: 'thread-1',
             turnId: 'turn-1',
@@ -463,7 +536,7 @@ describe('RideCodexEventReducer minimal frame contract', () => {
                     message: `warning ${index}`
                 }))
             ]
-        });
+        }));
         assert.equal(frames.length, 1);
         frames.shift()?.();
 
@@ -481,7 +554,7 @@ describe('RideCodexEventReducer minimal frame contract', () => {
             maxItemBytes: 8,
             maxRetainedBytes: 64
         });
-        reducer.notifyMany({
+        reducer.notifyMany(batchWire({
             generation: 1,
             threadId: 'thread-1',
             turnId: 'turn-1',
@@ -492,7 +565,7 @@ describe('RideCodexEventReducer minimal frame contract', () => {
                     type: 'agent-delta' as const, itemId: 'item-1', delta: '你'
                 }))
             ]
-        });
+        }));
         frames.shift()?.();
 
         assert.ok(Buffer.byteLength(reducer.snapshot().items[0].text, 'utf8') <= 8);

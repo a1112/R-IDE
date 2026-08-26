@@ -7,6 +7,7 @@
 import {
     deepFreezeRideCodex,
     RideCodexEventBatch,
+    RideCodexEventBatchWire,
     RideCodexFileChange,
     RideCodexItemKind,
     RideCodexRenderedItem,
@@ -22,6 +23,7 @@ export interface RideCodexFrameDisposable {
 
 export interface RideCodexEventReducerOptions {
     readonly scheduleFrame?: (callback: () => void) => RideCodexFrameDisposable;
+    readonly maxWireBytes?: number;
     readonly maxQueuedBytes?: number;
     readonly maxBatchEvents?: number;
     readonly maxItemBytes?: number;
@@ -41,6 +43,7 @@ interface MutableItem {
 }
 
 const DEFAULT_MAX_QUEUED_BYTES = 256 * 1024;
+const DEFAULT_MAX_WIRE_BYTES = 4 * 1024 * 1024;
 const DEFAULT_MAX_BATCH_EVENTS = 4_096;
 const DEFAULT_MAX_ITEM_BYTES = 64 * 1024;
 const DEFAULT_MAX_RETAINED_ITEMS = 256;
@@ -48,6 +51,11 @@ const DEFAULT_MAX_RETAINED_BYTES = 2 * 1024 * 1024;
 const DEFAULT_MAX_DIAGNOSTIC_HISTORY = 64;
 const MAX_FILE_PATCH_PATH_BYTES = 32 * 1024;
 const MAX_FILE_PATCH_DIFF_BYTES = 64 * 1024;
+const MAX_IDENTIFIER_BYTES = 512;
+const MAX_WIRE_DEPTH = 16;
+const MAX_WIRE_NODES = 8_192;
+const MAX_WIRE_ARRAY_ITEMS = 8_192;
+const MAX_WIRE_OBJECT_KEYS = 128;
 
 const EMPTY_SNAPSHOT: RideCodexTurnSnapshot = deepFreezeRideCodex({
     generation: 0,
@@ -60,6 +68,7 @@ const EMPTY_SNAPSHOT: RideCodexTurnSnapshot = deepFreezeRideCodex({
 
 export class RideCodexEventReducer {
     readonly #scheduleFrame: (callback: () => void) => RideCodexFrameDisposable;
+    readonly #maxWireBytes: number;
     readonly #maxQueuedBytes: number;
     readonly #maxBatchEvents: number;
     readonly #maxItemBytes: number;
@@ -86,6 +95,7 @@ export class RideCodexEventReducer {
 
     constructor(options: RideCodexEventReducerOptions = {}) {
         this.#scheduleFrame = options.scheduleFrame ?? defaultScheduleFrame;
+        this.#maxWireBytes = positiveLimit(options.maxWireBytes, DEFAULT_MAX_WIRE_BYTES);
         this.#maxQueuedBytes = positiveLimit(options.maxQueuedBytes, DEFAULT_MAX_QUEUED_BYTES);
         this.#maxBatchEvents = Math.max(2, positiveLimit(options.maxBatchEvents, DEFAULT_MAX_BATCH_EVENTS));
         this.#maxItemBytes = positiveLimit(options.maxItemBytes, DEFAULT_MAX_ITEM_BYTES);
@@ -114,14 +124,11 @@ export class RideCodexEventReducer {
         };
     }
 
-    notifyMany(batch: RideCodexEventBatch): void {
+    notifyMany(wire: RideCodexEventBatchWire): void {
         if (this.#disposed) {
             return;
         }
-        const safeBatch = copySafeBatch(batch, Math.min(
-            4 * 1024 * 1024,
-            Math.max(64 * 1024, this.#maxQueuedBytes * 4, this.#maxItemBytes * 2)
-        ));
+        const safeBatch = parseSafeBatch(wire, this.#maxWireBytes);
         if (!safeBatch) {
             return;
         }
@@ -575,30 +582,28 @@ function positiveLimit(value: number | undefined, fallback: number): number {
     return Number.isSafeInteger(value) && (value as number) > 0 ? value as number : fallback;
 }
 
-function copySafeBatch(value: RideCodexEventBatch, maxRawBytes: number): RideCodexEventBatch | undefined {
-    if (typeof structuredClone !== 'function') {
+function parseSafeBatch(wire: RideCodexEventBatchWire, maxWireBytes: number): RideCodexEventBatch | undefined {
+    if (typeof wire !== 'string' || utf8ByteLength(wire) > maxWireBytes) {
         return undefined;
     }
-    let cloned: unknown;
+    let parsed: unknown;
     try {
-        cloned = structuredClone(value);
+        parsed = JSON.parse(wire) as unknown;
     } catch {
         return undefined;
     }
-    if (hasAccessorGraph(value, cloned, 0)) {
+    if (!validateJsonGraph(parsed, 0, { nodes: 0, bytes: 0, maxBytes: maxWireBytes })
+        || JSON.stringify(parsed) !== wire
+        || !isPlainRecord(parsed)
+        || !hasExactKeys(parsed, ['generation', 'threadId', 'turnId', 'events'])) {
         return undefined;
     }
-    const copied = copyClonedData(cloned, 0, { nodes: 0, bytes: 0, maxBytes: maxRawBytes });
-    if (!isPlainRecord(copied)) {
-        return undefined;
-    }
-    const generation = copied.generation;
-    const threadId = copied.threadId;
-    const turnId = copied.turnId;
-    const events = copied.events;
+    const generation = parsed.generation;
+    const threadId = parsed.threadId;
+    const turnId = parsed.turnId;
+    const events = parsed.events;
     if (!Number.isSafeInteger(generation) || (generation as number) < 0
-        || typeof threadId !== 'string' || threadId.length === 0
-        || typeof turnId !== 'string' || turnId.length === 0
+        || !isIdentifier(threadId) || !isIdentifier(turnId)
         || !Array.isArray(events) || events.length === 0 || events.length > 8_192) {
         return undefined;
     }
@@ -617,53 +622,65 @@ function isUiEvent(value: unknown): value is RideCodexUiEvent {
     if (!isPlainRecord(value) || typeof value.type !== 'string') {
         return false;
     }
-    const identifier = (candidate: unknown): candidate is string =>
-        typeof candidate === 'string' && candidate.length > 0;
+    const identifier = isIdentifier;
     const text = (candidate: unknown): candidate is string => typeof candidate === 'string';
     const index = (candidate: unknown): candidate is number =>
         Number.isSafeInteger(candidate) && (candidate as number) >= 0;
     switch (value.type) {
         case 'turn-started':
-            return true;
+            return hasExactKeys(value, ['type']);
         case 'turn-terminal':
-            return ['completed', 'failed', 'interrupted', 'interrupt-uncertain'].includes(value.status as string)
+            return hasExactKeys(value, ['type', 'status'], ['error'])
+                && ['completed', 'failed', 'interrupted', 'interrupt-uncertain'].includes(value.status as string)
                 && (value.error === undefined || (isPlainRecord(value.error)
-                    && text(value.error.code) && text(value.error.message)));
+                    && hasExactKeys(value.error, ['code', 'message'])
+                    && ['turn-error', 'operation-failed', 'interrupt-timeout', 'recovery-failed'].includes(value.error.code as string)
+                    && text(value.error.message)));
         case 'item-started':
         case 'item-completed':
-            return identifier(value.itemId) && text(value.itemKind);
+            return hasExactKeys(value, ['type', 'itemId', 'itemKind'])
+                && identifier(value.itemId)
+                && ['user-message', 'agent-message', 'plan', 'reasoning', 'command', 'file-change', 'other'].includes(value.itemKind as string);
         case 'agent-delta':
         case 'plan-delta':
         case 'command-output':
         case 'file-output':
-            return identifier(value.itemId) && text(value.delta);
+            return hasExactKeys(value, ['type', 'itemId', 'delta'])
+                && identifier(value.itemId) && text(value.delta);
         case 'reasoning-summary-delta':
-            return identifier(value.itemId) && index(value.summaryIndex) && text(value.delta);
+            return hasExactKeys(value, ['type', 'itemId', 'summaryIndex', 'delta'])
+                && identifier(value.itemId) && index(value.summaryIndex) && text(value.delta);
         case 'reasoning-delta':
-            return identifier(value.itemId) && index(value.contentIndex) && text(value.delta);
+            return hasExactKeys(value, ['type', 'itemId', 'contentIndex', 'delta'])
+                && identifier(value.itemId) && index(value.contentIndex) && text(value.delta);
         case 'reasoning-summary-part':
-            return identifier(value.itemId) && index(value.summaryIndex);
+            return hasExactKeys(value, ['type', 'itemId', 'summaryIndex'])
+                && identifier(value.itemId) && index(value.summaryIndex);
         case 'file-patch':
             return hasOnlyKeys(value, ['type', 'itemId', 'changes'])
                 && identifier(value.itemId) && Array.isArray(value.changes)
                 && value.changes.every(isFileChange);
         case 'turn-plan':
-            return (value.explanation === undefined || text(value.explanation))
+            return hasExactKeys(value, ['type', 'steps'], ['explanation'])
+                && (value.explanation === undefined || text(value.explanation))
                 && Array.isArray(value.steps) && value.steps.every(step =>
-                    isPlainRecord(step) && text(step.step)
+                    isPlainRecord(step) && hasExactKeys(step, ['step', 'status']) && text(step.step)
                     && ['pending', 'in-progress', 'completed'].includes(step.status as string)
                 );
         case 'turn-diff':
-            return text(value.diff);
+            return hasExactKeys(value, ['type', 'diff']) && text(value.diff);
         case 'token-usage':
-            return index(value.totalTokens) && index(value.inputTokens) && index(value.outputTokens);
+            return hasExactKeys(value, ['type', 'totalTokens', 'inputTokens', 'outputTokens'])
+                && index(value.totalTokens) && index(value.inputTokens) && index(value.outputTokens);
         case 'warning':
-            return ['server-warning', 'events-dropped', 'data-truncated'].includes(value.code as string)
+            return hasExactKeys(value, ['type', 'code', 'message'], ['droppedEvents', 'droppedBytes'])
+                && ['server-warning', 'events-dropped', 'data-truncated'].includes(value.code as string)
                 && text(value.message)
                 && (value.droppedEvents === undefined || index(value.droppedEvents))
                 && (value.droppedBytes === undefined || index(value.droppedBytes));
         case 'error':
-            return ['turn-error', 'operation-failed', 'interrupt-timeout', 'recovery-failed'].includes(value.code as string)
+            return hasExactKeys(value, ['type', 'code', 'message', 'retryable'])
+                && ['turn-error', 'operation-failed', 'interrupt-timeout', 'recovery-failed'].includes(value.code as string)
                 && text(value.message) && typeof value.retryable === 'boolean';
         default:
             return false;
@@ -699,109 +716,73 @@ function hasOnlyKeys(value: Record<string, unknown>, allowed: readonly string[])
     return Object.keys(value).every(key => allowed.includes(key));
 }
 
-interface CopyBudget {
+function hasExactKeys(
+    value: Record<string, unknown>,
+    required: readonly string[],
+    optional: readonly string[] = []
+): boolean {
+    const keys = Object.keys(value);
+    return required.every(key => Object.prototype.hasOwnProperty.call(value, key))
+        && keys.every(key => required.includes(key) || optional.includes(key));
+}
+
+function isIdentifier(value: unknown): value is string {
+    return typeof value === 'string' && value.length > 0
+        && utf8ByteLength(value) <= MAX_IDENTIFIER_BYTES;
+}
+
+interface WireBudget {
     nodes: number;
     bytes: number;
     readonly maxBytes: number;
 }
 
-function hasAccessorGraph(original: unknown, cloned: unknown, depth: number): boolean {
-    if (depth > 16 || !original || typeof original !== 'object') {
-        return depth > 16;
-    }
-    if (!cloned || typeof cloned !== 'object') {
-        return true;
-    }
-    const originalDescriptors = Object.getOwnPropertyDescriptors(original);
-    const cloneDescriptors = Object.getOwnPropertyDescriptors(cloned);
-    if (Object.getOwnPropertySymbols(original).length > 0
-        || Object.keys(originalDescriptors).some(key =>
-            !(Array.isArray(original) && key === 'length') && !(key in cloneDescriptors)
-        )) {
-        return true;
-    }
-    for (const key of Object.keys(cloneDescriptors)) {
-        if (Array.isArray(cloned) && key === 'length') {
-            continue;
-        }
-        const descriptor = originalDescriptors[key];
-        if (!descriptor || descriptor.get || descriptor.set
-            || hasAccessorGraph(descriptor.value, cloneDescriptors[key].value, depth + 1)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-function copyClonedData(value: unknown, depth: number, budget: CopyBudget): unknown {
+function validateJsonGraph(value: unknown, depth: number, budget: WireBudget): boolean {
     budget.nodes += 1;
-    if (depth > 16 || budget.nodes > 8_192) {
-        return undefined;
+    if (depth > MAX_WIRE_DEPTH || budget.nodes > MAX_WIRE_NODES) {
+        return false;
     }
     if (typeof value === 'string') {
         budget.bytes += utf8ByteLength(value);
-        return budget.bytes <= budget.maxBytes ? value : undefined;
+        return budget.bytes <= budget.maxBytes;
     }
     if (!value || typeof value === 'boolean') {
-        return value;
+        return true;
     }
     if (typeof value === 'number') {
-        return Number.isFinite(value) ? value : undefined;
+        return Number.isFinite(value);
     }
     if (typeof value !== 'object') {
-        return undefined;
-    }
-    let descriptors: PropertyDescriptorMap;
-    let prototype: object | undefined;
-    try {
-        descriptors = Object.getOwnPropertyDescriptors(value);
-        prototype = Object.getPrototypeOf(value) || undefined;
-    } catch {
-        return undefined;
-    }
-    if (Object.values(descriptors).some(descriptor => descriptor.get || descriptor.set)) {
-        return undefined;
+        return false;
     }
     if (Array.isArray(value)) {
-        const length = descriptors.length?.value;
-        if (!Number.isSafeInteger(length) || length < 0 || length > 8_192) {
-            return undefined;
+        if (value.length > MAX_WIRE_ARRAY_ITEMS) {
+            return false;
         }
-        const arrayResult: unknown[] = [];
-        for (let index = 0; index < length; index += 1) {
-            const descriptor = descriptors[String(index)];
-            if (!descriptor) {
-                return undefined;
-            }
-            const child = copyClonedData(descriptor.value, depth + 1, budget);
-            if (child === undefined && descriptor.value !== undefined) {
-                return undefined;
-            }
-            arrayResult.push(child);
-        }
-        return arrayResult;
+        return value.every(child => validateJsonGraph(child, depth + 1, budget));
     }
-    if (prototype !== Object.prototype && prototype) {
-        return undefined;
+    if (!isPlainRecord(value)) {
+        return false;
     }
-    const keys = Object.keys(descriptors);
-    if (keys.length > 128 || Object.getOwnPropertySymbols(value).length > 0) {
-        return undefined;
+    const keys = Object.keys(value);
+    if (keys.length > MAX_WIRE_OBJECT_KEYS) {
+        return false;
     }
-    const objectResult: Record<string, unknown> = {};
     for (const key of keys) {
-        const descriptor = descriptors[key];
-        const child = copyClonedData(descriptor.value, depth + 1, budget);
-        if (child === undefined && descriptor.value !== undefined) {
-            return undefined;
+        budget.bytes += utf8ByteLength(key);
+        if (budget.bytes > budget.maxBytes || !validateJsonGraph(value[key], depth + 1, budget)) {
+            return false;
         }
-        objectResult[key] = child;
     }
-    return objectResult;
+    return true;
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
-    return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        return false;
+    }
+    const prototype = Object.getPrototypeOf(value);
+    return prototype === Object.prototype || !prototype;
 }
 
 function estimateEventBytes(event: RideCodexUiEvent): number {
@@ -813,8 +794,7 @@ function estimateEventBytes(event: RideCodexUiEvent): number {
 }
 
 function pendingBatchBytes(batch: RideCodexEventBatch): number {
-    return utf8ByteLength(batch.threadId) + utf8ByteLength(batch.turnId)
-        + batch.events.reduce((sum, event) => sum + estimateEventBytes(event), 0);
+    return utf8ByteLength(JSON.stringify(batch));
 }
 
 function isTurnBoundary(event: RideCodexUiEvent): boolean {

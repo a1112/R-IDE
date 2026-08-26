@@ -20,6 +20,7 @@ import {
     RideCodexTurnSteerRequest,
     RideCodexTurnTerminalStatus,
     RideCodexUiEvent,
+    serializeRideCodexEventBatch,
     truncateUtf8,
     utf8ByteLength
 } from '../common/ride-codex-events';
@@ -995,6 +996,17 @@ export class RideCodexTurnCoordinator {
         if (metadata && metadata.droppedEvents === 0 && !metadata.truncated) {
             this.#queueMetadata.delete(metadataKey);
         }
+        while (events.length > 0
+            && batchBytes({ ...identity, events }) > this.#maxQueuedBytes) {
+            const removable = findLastIndex(events, event =>
+                event.type !== 'turn-started' && event.type !== 'turn-terminal'
+            );
+            if (removable < 0) {
+                break;
+            }
+            const [removed] = events.splice(removable, 1);
+            this.#recordDrop(identity, eventBytes(removed));
+        }
         const batch = freezeRideCodexEventBatch({ ...identity, events });
         for (const client of [...this.#clients]) {
             this.#deliver(client, batch);
@@ -1012,12 +1024,17 @@ export class RideCodexTurnCoordinator {
             this.#queueClientDelivery(client, batch);
             return;
         }
+        const wire = serializeValidatedRideCodexEventBatch(batch, this.#maxQueuedBytes);
+        if (wire === undefined) {
+            this.#disconnect(client);
+            return;
+        }
         let delivery: void | Promise<void>;
         client.inFlightIdentity = Object.freeze({
             generation: batch.generation, threadId: batch.threadId, turnId: batch.turnId
         });
         try {
-            delivery = client.client.turnEvents(batch);
+            delivery = client.client.turnEvents(wire);
         } catch {
             this.#disconnect(client);
             return;
@@ -1581,61 +1598,63 @@ function mergeBatches(
         event.type !== 'warning' || event.code !== 'events-dropped'
     );
     const events: RideCodexUiEvent[] = [];
-    let bytes = 0;
+    const identity = {
+        generation: incoming.generation,
+        threadId: incoming.threadId,
+        turnId: incoming.turnId
+    };
+    const fits = (candidateEvents: readonly RideCodexUiEvent[]): boolean =>
+        batchBytes({ ...identity, events: candidateEvents }) <= maxBytes;
     for (const event of candidates) {
-        const size = eventBytes(event);
-        if (events.length >= maxEvents || bytes + size > maxBytes) {
+        if (events.length >= maxEvents || !fits([...events, event])) {
             dropped += 1;
             continue;
         }
         events.push(event);
-        bytes += size;
     }
     for (const terminal of candidates.filter(event => event.type === 'turn-terminal')) {
         if (events.includes(terminal)) {
             continue;
         }
-        const removable = findLastIndex(events, event =>
-            event.type !== 'turn-started' && event.type !== 'turn-terminal'
-        );
-        if (removable >= 0) {
-            bytes -= eventBytes(events[removable]);
-            events.splice(removable, 1);
-            dropped += 1;
-        }
-        if (events.length < maxEvents && bytes + eventBytes(terminal) <= maxBytes) {
-            events.push(terminal);
-            bytes += eventBytes(terminal);
-            dropped = Math.max(0, dropped - 1);
-        }
-    }
-    if (dropped > 0) {
-        const warning: RideCodexUiEvent = Object.freeze({
-            type: 'warning', code: 'events-dropped',
-            message: 'Some Codex frontend deliveries were dropped to preserve responsiveness.',
-            droppedEvents: dropped
-        });
-        while (events.length >= maxEvents || bytes + eventBytes(warning) > maxBytes) {
+        while (events.length >= maxEvents || !fits([...events, terminal])) {
             const removable = findLastIndex(events, event =>
                 event.type !== 'turn-started' && event.type !== 'turn-terminal'
             );
             if (removable < 0) {
                 break;
             }
-            bytes -= eventBytes(events[removable]);
             events.splice(removable, 1);
             dropped += 1;
         }
-        if (events.length < maxEvents && bytes + eventBytes(warning) <= maxBytes) {
-            events.push(Object.freeze({ ...warning, droppedEvents: dropped }));
+        if (events.length < maxEvents && fits([...events, terminal])) {
+            events.push(terminal);
+            dropped = Math.max(0, dropped - 1);
         }
     }
-    return freezeRideCodexEventBatch({
-        generation: incoming.generation,
-        threadId: incoming.threadId,
-        turnId: incoming.turnId,
-        events
-    });
+    if (dropped > 0) {
+        const warningFor = (): RideCodexUiEvent => Object.freeze({
+            type: 'warning', code: 'events-dropped',
+            message: 'Some Codex frontend deliveries were dropped to preserve responsiveness.',
+            droppedEvents: dropped
+        });
+        let warning = warningFor();
+        while (events.length >= maxEvents || !fits([...events, warning])) {
+            const removable = findLastIndex(events, event =>
+                event.type !== 'turn-started' && event.type !== 'turn-terminal'
+            );
+            if (removable < 0) {
+                break;
+            }
+            events.splice(removable, 1);
+            dropped += 1;
+            warning = warningFor();
+        }
+        if (events.length < maxEvents && fits([...events, warning])) {
+            const terminalIndex = events.findIndex(event => event.type === 'turn-terminal');
+            events.splice(terminalIndex < 0 ? events.length : terminalIndex, 0, warning);
+        }
+    }
+    return freezeRideCodexEventBatch({ ...identity, events });
 }
 
 function findLastIndex<T>(values: readonly T[], predicate: (value: T) => boolean): number {
@@ -1662,8 +1681,45 @@ function queueIdentityKey(identity: QueueIdentity): string {
 }
 
 function batchBytes(batch: RideCodexEventBatch): number {
-    return utf8ByteLength(batch.threadId) + utf8ByteLength(batch.turnId)
-        + batch.events.reduce((sum, event) => sum + eventBytes(event), 0);
+    try {
+        const emptyBatchBytes = utf8ByteLength(JSON.stringify({
+            generation: batch.generation,
+            threadId: batch.threadId,
+            turnId: batch.turnId,
+            events: []
+        }));
+        return emptyBatchBytes - 2 + eventArrayBytes(batch.events);
+    } catch {
+        return Number.MAX_SAFE_INTEGER;
+    }
+}
+
+function serializeValidatedRideCodexEventBatch(
+    batch: RideCodexEventBatch,
+    maxBytes: number
+): string | undefined {
+    try {
+        validateRaw(batch, 0, { nodes: 0, bytes: 0 });
+        if (!isDeepFrozenRaw(batch, 0)) {
+            return undefined;
+        }
+        return serializeRideCodexEventBatch(batch, maxBytes);
+    } catch {
+        return undefined;
+    }
+}
+
+function isDeepFrozenRaw(value: unknown, depth: number): boolean {
+    if (!value || typeof value !== 'object') {
+        return true;
+    }
+    if (depth > MAX_RAW_DEPTH || !Object.isFrozen(value)) {
+        return false;
+    }
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    return Object.values(descriptors).every(descriptor =>
+        !descriptor.get && !descriptor.set && isDeepFrozenRaw(descriptor.value, depth + 1)
+    );
 }
 
 function sanitizeMessage(value: string): string {

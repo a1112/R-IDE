@@ -98,8 +98,10 @@ export interface RideCodexEventBatch {
     readonly events: readonly RideCodexUiEvent[];
 }
 
+export type RideCodexEventBatchWire = string;
+
 export interface RideCodexTurnClient {
-    turnEvents(batch: RideCodexEventBatch): void | Promise<void>;
+    turnEvents(wire: RideCodexEventBatchWire): void | Promise<void>;
 }
 
 export interface RideCodexRenderedItem {
@@ -175,4 +177,23 @@ export function freezeRideCodexEventBatch(batch: RideCodexEventBatch): RideCodex
         turnId: batch.turnId,
         events: batch.events.map(event => deepFreezeRideCodex({ ...event }))
     }) as RideCodexEventBatch;
+}
+
+/**
+ * Serializes a coordinator-owned batch after the Node boundary has rejected
+ * proxies/accessors and verified that the normalized graph is deeply frozen.
+ */
+export function serializeRideCodexEventBatch(
+    batch: RideCodexEventBatch,
+    maxBytes: number
+): RideCodexEventBatchWire | undefined {
+    if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
+        return undefined;
+    }
+    try {
+        const wire = JSON.stringify(batch);
+        return utf8ByteLength(wire) <= maxBytes ? wire : undefined;
+    } catch {
+        return undefined;
+    }
 }
