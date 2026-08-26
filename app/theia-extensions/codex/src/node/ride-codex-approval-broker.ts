@@ -95,6 +95,7 @@ interface PendingApproval {
     readonly turnId: string;
     readonly itemId: string;
     readonly fileScopeFingerprint?: string;
+    readonly fileScopeRealpathFingerprint?: string;
     readonly ownerId: number;
     readonly ownerContextRevision: number;
     readonly issuedAt: number;
@@ -113,6 +114,11 @@ interface AuthorizingApproval {
     readonly ownerId: number;
     readonly ownerContextRevision: number;
     readonly lease: RideCodexApprovalHostLease;
+    readonly issuedAt: number;
+    readonly expiresAt: number;
+    readonly timer: { dispose(): void };
+    readonly cancelled: Promise<void>;
+    readonly signalCancelled: () => void;
 }
 
 interface ValidatedCommandRequest {
@@ -170,6 +176,18 @@ interface CapturedFileScope {
     readonly fingerprint: string;
 }
 
+interface NormalizedFileScope {
+    readonly scope: CanonicalFileScope;
+    readonly realIdentity: Readonly<{
+        workspace: string;
+        changes: readonly Readonly<{
+            path: string;
+            kind: 'add' | 'delete' | 'update';
+            movePath?: string;
+        }>[];
+    }>;
+}
+
 const DEFAULT_TTL_MS = 2 * 60 * 1_000;
 const DEFAULT_MAX_PENDING = 32;
 const MAX_TIMER_MS = 0x7fffffff;
@@ -202,6 +220,7 @@ const OWNERSHIP_RESULT = Object.freeze({ status: 'rejected', code: 'ownership-mi
 const INVALID_RESULT = Object.freeze({ status: 'rejected', code: 'invalid-decision' } as const);
 const RESPONSE_FAILED_RESULT = Object.freeze({ status: 'rejected', code: 'response-failed' } as const);
 const RESPONDED_RESULT = Object.freeze({ status: 'responded' } as const);
+const AUTHORIZATION_CANCELLED = Symbol('authorization-cancelled');
 
 export class RideCodexApprovalBroker {
     readonly #host: RideCodexApprovalHost;
@@ -311,120 +330,17 @@ export class RideCodexApprovalBroker {
 
         const kind = envelope.method === 'item/commandExecution/requestApproval'
             ? 'command' as const : 'file-change' as const;
-        const authorizing: AuthorizingApproval = {
-            generation,
-            requestId: validated.id,
-            threadId: validated.threadId,
-            turnId: validated.turnId,
-            ownerId: owner.id,
-            ownerContextRevision,
-            lease
-        };
-        this.#authorizing.add(authorizing);
-        let scope: Record<string, unknown>;
-        let ownershipScope: Record<string, unknown>;
-        let fileScopeFingerprint: string | undefined;
-        if (kind === 'command') {
-            const command = validated as ValidatedCommandRequest;
-            scope = {
-                ...(command.command === undefined ? {} : { command: command.command }),
-                ...(command.cwd === undefined ? {} : { cwd: command.cwd.display }),
-                ...(command.reason === undefined ? {} : { reason: command.reason }),
-                ...(command.network === undefined ? {} : { network: command.network })
-            };
-            ownershipScope = {
-                ...scope,
-                ...(command.cwd === undefined ? {} : { cwd: command.cwd.normalized })
-            };
-        } else {
-            const identity = Object.freeze({
-                generation,
-                threadId: validated.threadId,
-                turnId: validated.turnId,
-                itemId: validated.itemId
-            });
-            const trackedFingerprintBeforeResolve = this.#usesTrackedFileScope
-                ? this.#currentTrackedFileScopeFingerprint(identity) : undefined;
-            const captured = await this.#captureFileScope(identity);
-            if (!this.#isStillAuthorized(
-                owner, ownerContextRevision, validated, generation, lease, authorizing
-            )) {
-                await this.#settleAuthorizing(authorizing, 'cancel');
-                return;
+        while (this.#authorizing.size + this.#pending.size >= this.#maxPending) {
+            const oldestPending = this.#pending.values().next().value as PendingApproval | undefined;
+            if (oldestPending) {
+                this.#settle(oldestPending, 'cancel').catch(() => undefined);
+                continue;
             }
-            if (this.#usesTrackedFileScope
-                && trackedFingerprintBeforeResolve !== captured?.fingerprint) {
-                await this.#settleAuthorizing(authorizing, 'cancel');
-                return;
-            }
-            if (!captured) {
-                await this.#settleAuthorizing(authorizing, 'decline');
-                return;
-            }
-            if (!await this.#isFileScopeCurrent(identity, captured.fingerprint)) {
-                await this.#settleAuthorizing(authorizing, 'cancel');
-                return;
-            }
-            if (!this.#isStillAuthorized(
-                owner, ownerContextRevision, validated, generation, lease, authorizing
-            )) {
-                await this.#settleAuthorizing(authorizing, 'cancel');
-                return;
-            }
-            const fileScope = await normalizeFileScope(
-                captured.scope,
-                this.#pathStyle,
-                this.#resolveRealPath,
-                () => this.#isFileScopeCurrent(identity, captured.fingerprint)
-            );
-            if (!this.#isStillAuthorized(
-                owner, ownerContextRevision, validated, generation, lease, authorizing
-            )) {
-                await this.#settleAuthorizing(authorizing, 'cancel');
-                return;
-            }
-            if (!await this.#isFileScopeCurrent(identity, captured.fingerprint)) {
-                await this.#settleAuthorizing(authorizing, 'cancel');
-                return;
-            }
-            if (!this.#isStillAuthorized(
-                owner, ownerContextRevision, validated, generation, lease, authorizing
-            )) {
-                await this.#settleAuthorizing(authorizing, 'cancel');
-                return;
-            }
-            if (!fileScope) {
-                await this.#settleAuthorizing(authorizing, 'decline');
-                return;
-            }
-            scope = {
-                ...(validated.reason === undefined ? {} : { reason: validated.reason }),
-                changes: fileScope.changes
-            };
-            ownershipScope = {
-                workspace: fileScope.workspace,
-                ...scope
-            };
-            fileScopeFingerprint = captured.fingerprint;
-        }
-
-        if (!this.#isStillAuthorized(
-            owner, ownerContextRevision, validated, generation, lease, authorizing
-        )) {
-            await this.#settleAuthorizing(authorizing, 'cancel');
-            return;
-        }
-        while (this.#pending.size >= this.#maxPending) {
-            const oldest = this.#pending.values().next().value as PendingApproval | undefined;
-            if (!oldest) {
+            const oldestAuthorizing = this.#authorizing.values().next().value as AuthorizingApproval | undefined;
+            if (!oldestAuthorizing) {
                 break;
             }
-            await this.#settle(oldest, 'cancel');
-        }
-        if (!this.#isStillAuthorized(
-            owner, ownerContextRevision, validated, generation, lease, authorizing
-        )) {
-            await this.#settleAuthorizing(authorizing, 'cancel');
+            await this.#respondAndRelease(lease, generation, validated.id, 'cancel');
             return;
         }
         let sessionDecisionAllowed = false;
@@ -439,7 +355,7 @@ export class RideCodexApprovalBroker {
             }
             expiresAt = issuedAt + this.#ttlMs;
         } catch {
-            await this.#settleAuthorizing(authorizing, 'decline');
+            await this.#respondAndRelease(lease, generation, validated.id, 'decline');
             return;
         }
         const allowedDecisions = Object.freeze([
@@ -448,25 +364,23 @@ export class RideCodexApprovalBroker {
             'decline',
             'cancel'
         ] as const);
-        const token = randomBytes(32).toString('base64url');
-        const fingerprint = this.#fingerprint({
-            generation,
-            requestId: validated.id,
-            threadId: validated.threadId,
-            turnId: validated.turnId,
-            itemId: validated.itemId,
-            kind,
-            scope: ownershipScope,
-            allowedDecisions
+        let signalCancelled!: () => void;
+        let cancellationSignalled = false;
+        const cancelled = new Promise<void>(resolve => {
+            signalCancelled = () => {
+                if (!cancellationSignalled) {
+                    cancellationSignalled = true;
+                    resolve();
+                }
+            };
         });
-        const card = deepFreezeRideCodex({
-            kind, token, fingerprint, expiresAt, ...scope, allowedDecisions
-        }) as unknown as RideCodexApprovalCard;
+        const authorizingHolder: { value?: AuthorizingApproval } = {};
         const pendingHolder: { value?: PendingApproval } = {};
-        let callbackBeforeInsertion: number | undefined;
+        let callbackBeforeTimerReady: number | undefined;
         let activeTimer: { dispose(): void } | undefined;
         let timerVersion = 0;
         let timerStopped = false;
+        let timerReady = false;
         const timer = Object.freeze({
             dispose: (): void => {
                 if (timerStopped) {
@@ -483,32 +397,38 @@ export class RideCodexApprovalBroker {
                 }
             }
         });
-        const onTimer = async (version: number, mayReschedule = true): Promise<void> => {
-            if (timerStopped || version !== timerVersion) {
+        const settleTimedApproval = async (decision: 'decline' | 'cancel'): Promise<void> => {
+            const pendingApproval = pendingHolder.value;
+            if (pendingApproval && this.#pending.get(pendingApproval.token) === pendingApproval) {
+                await this.#settle(pendingApproval, decision);
                 return;
             }
-            const scheduledPending = pendingHolder.value;
-            if (!scheduledPending) {
-                callbackBeforeInsertion = version;
+            const authorizingApproval = authorizingHolder.value;
+            if (authorizingApproval && this.#authorizing.has(authorizingApproval)) {
+                await this.#settleAuthorizing(authorizingApproval, decision);
+            }
+        };
+        const onTimer = async (version: number, mayReschedule = true): Promise<void> => {
+            if (timerStopped || version !== timerVersion) {
                 return;
             }
             let callbackTime: number;
             try {
                 callbackTime = Reflect.apply(this.#now, undefined, []);
             } catch {
-                await this.#settle(scheduledPending, 'decline');
+                await settleTimedApproval('decline');
                 return;
             }
-            if (!Number.isSafeInteger(callbackTime) || callbackTime < scheduledPending.issuedAt) {
-                await this.#settle(scheduledPending, 'decline');
+            if (!Number.isSafeInteger(callbackTime) || callbackTime < issuedAt) {
+                await settleTimedApproval('decline');
                 return;
             }
-            if (callbackTime >= scheduledPending.expiresAt) {
-                await this.#settle(scheduledPending, 'cancel');
+            if (callbackTime >= expiresAt) {
+                await settleTimedApproval('cancel');
                 return;
             }
-            if (!mayReschedule || !scheduleTimer(scheduledPending.expiresAt - callbackTime)) {
-                await this.#settle(scheduledPending, 'decline');
+            if (!mayReschedule || !scheduleTimer(expiresAt - callbackTime)) {
+                await settleTimedApproval('decline');
             }
         };
         const scheduleTimer = (delayMs: number): boolean => {
@@ -552,26 +472,200 @@ export class RideCodexApprovalBroker {
                 return false;
             }
             if (invokedSynchronously) {
-                if (pendingHolder.value) {
+                if (timerReady) {
                     onTimer(version, false).catch(() => undefined);
                 } else {
-                    callbackBeforeInsertion = version;
+                    callbackBeforeTimerReady = version;
                 }
             }
             return true;
         };
+        const authorizing: AuthorizingApproval = {
+            generation,
+            requestId: validated.id,
+            threadId: validated.threadId,
+            turnId: validated.turnId,
+            ownerId: owner.id,
+            ownerContextRevision,
+            lease,
+            issuedAt,
+            expiresAt,
+            timer,
+            cancelled,
+            signalCancelled
+        };
+        authorizingHolder.value = authorizing;
+        this.#authorizing.add(authorizing);
         if (!scheduleTimer(this.#ttlMs)) {
             timer.dispose();
             await this.#settleAuthorizing(authorizing, 'decline');
             return;
         }
+        timerReady = true;
+        if (callbackBeforeTimerReady !== undefined) {
+            const callbackVersion = callbackBeforeTimerReady;
+            callbackBeforeTimerReady = undefined;
+            await onTimer(callbackVersion);
+            if (!this.#authorizing.has(authorizing)) {
+                return;
+            }
+        }
+        let scope: Record<string, unknown>;
+        let ownershipScope: Record<string, unknown>;
+        let fileScopeFingerprint: string | undefined;
+        let fileScopeRealpathFingerprint: string | undefined;
+        if (kind === 'command') {
+            const command = validated as ValidatedCommandRequest;
+            scope = {
+                ...(command.command === undefined ? {} : { command: command.command }),
+                ...(command.cwd === undefined ? {} : { cwd: command.cwd.display }),
+                ...(command.reason === undefined ? {} : { reason: command.reason }),
+                ...(command.network === undefined ? {} : { network: command.network })
+            };
+            ownershipScope = {
+                ...scope,
+                ...(command.cwd === undefined ? {} : { cwd: command.cwd.normalized })
+            };
+        } else {
+            const identity = Object.freeze({
+                generation,
+                threadId: validated.threadId,
+                turnId: validated.turnId,
+                itemId: validated.itemId
+            });
+            const trackedFingerprintBeforeResolve = this.#usesTrackedFileScope
+                ? this.#currentTrackedFileScopeFingerprint(identity) : undefined;
+            const capturedResult = await this.#waitForAuthorization(
+                authorizing,
+                this.#captureFileScope(identity)
+            );
+            if (capturedResult === AUTHORIZATION_CANCELLED) {
+                return;
+            }
+            const captured = capturedResult;
+            if (!this.#isStillAuthorized(
+                owner, ownerContextRevision, validated, generation, lease, authorizing
+            )) {
+                await this.#settleAuthorizing(authorizing, 'cancel');
+                return;
+            }
+            if (this.#usesTrackedFileScope
+                && trackedFingerprintBeforeResolve !== captured?.fingerprint) {
+                await this.#settleAuthorizing(authorizing, 'cancel');
+                return;
+            }
+            if (!captured) {
+                await this.#settleAuthorizing(authorizing, 'decline');
+                return;
+            }
+            const initiallyCurrent = await this.#waitForAuthorization(
+                authorizing,
+                this.#isFileScopeCurrent(identity, captured.fingerprint)
+            );
+            if (initiallyCurrent === AUTHORIZATION_CANCELLED) {
+                return;
+            }
+            if (!initiallyCurrent) {
+                await this.#settleAuthorizing(authorizing, 'cancel');
+                return;
+            }
+            if (!this.#isStillAuthorized(
+                owner, ownerContextRevision, validated, generation, lease, authorizing
+            )) {
+                await this.#settleAuthorizing(authorizing, 'cancel');
+                return;
+            }
+            const normalizedFileScopeResult = await this.#waitForAuthorization(
+                authorizing,
+                normalizeFileScope(
+                    captured.scope,
+                    this.#pathStyle,
+                    this.#resolveRealPath,
+                    () => this.#isFileScopeCurrent(identity, captured.fingerprint)
+                )
+            );
+            if (normalizedFileScopeResult === AUTHORIZATION_CANCELLED) {
+                return;
+            }
+            const normalizedFileScope = normalizedFileScopeResult;
+            if (!this.#isStillAuthorized(
+                owner, ownerContextRevision, validated, generation, lease, authorizing
+            )) {
+                await this.#settleAuthorizing(authorizing, 'cancel');
+                return;
+            }
+            const finallyCurrent = await this.#waitForAuthorization(
+                authorizing,
+                this.#isFileScopeCurrent(identity, captured.fingerprint)
+            );
+            if (finallyCurrent === AUTHORIZATION_CANCELLED) {
+                return;
+            }
+            if (!finallyCurrent) {
+                await this.#settleAuthorizing(authorizing, 'cancel');
+                return;
+            }
+            if (!this.#isStillAuthorized(
+                owner, ownerContextRevision, validated, generation, lease, authorizing
+            )) {
+                await this.#settleAuthorizing(authorizing, 'cancel');
+                return;
+            }
+            if (!normalizedFileScope) {
+                await this.#settleAuthorizing(authorizing, 'decline');
+                return;
+            }
+            const fileScope = normalizedFileScope.scope;
+            scope = {
+                ...(validated.reason === undefined ? {} : { reason: validated.reason }),
+                changes: fileScope.changes
+            };
+            ownershipScope = {
+                workspace: fileScope.workspace,
+                ...scope
+            };
+            fileScopeFingerprint = captured.fingerprint;
+            fileScopeRealpathFingerprint = this.#fileScopeRealpathFingerprint(
+                identity,
+                normalizedFileScope.realIdentity
+            );
+        }
+
         if (!this.#isStillAuthorized(
             owner, ownerContextRevision, validated, generation, lease, authorizing
         )) {
-            timer.dispose();
             await this.#settleAuthorizing(authorizing, 'cancel');
             return;
         }
+        let publicationTime: number;
+        try {
+            publicationTime = Reflect.apply(this.#now, undefined, []);
+        } catch {
+            await this.#settleAuthorizing(authorizing, 'decline');
+            return;
+        }
+        if (!Number.isSafeInteger(publicationTime) || publicationTime < issuedAt) {
+            await this.#settleAuthorizing(authorizing, 'decline');
+            return;
+        }
+        if (publicationTime >= expiresAt) {
+            await this.#settleAuthorizing(authorizing, 'cancel');
+            return;
+        }
+        const token = randomBytes(32).toString('base64url');
+        const fingerprint = this.#fingerprint({
+            generation,
+            requestId: validated.id,
+            threadId: validated.threadId,
+            turnId: validated.turnId,
+            itemId: validated.itemId,
+            kind,
+            scope: ownershipScope,
+            allowedDecisions
+        });
+        const card = deepFreezeRideCodex({
+            kind, token, fingerprint, expiresAt, ...scope, allowedDecisions
+        }) as unknown as RideCodexApprovalCard;
         if (kind === 'file-change') {
             const identity = Object.freeze({
                 generation,
@@ -579,12 +673,17 @@ export class RideCodexApprovalBroker {
                 turnId: validated.turnId,
                 itemId: validated.itemId
             });
-            if (!fileScopeFingerprint
-                || !await this.#isFileScopeCurrent(identity, fileScopeFingerprint)
-                || !this.#isStillAuthorized(
+            const current = fileScopeFingerprint
+                ? await this.#waitForAuthorization(
+                    authorizing,
+                    this.#isFileScopeCurrent(identity, fileScopeFingerprint)
+                ) : false;
+            if (current === AUTHORIZATION_CANCELLED) {
+                return;
+            }
+            if (!current || !this.#isStillAuthorized(
                     owner, ownerContextRevision, validated, generation, lease, authorizing
-                )) {
-                timer.dispose();
+            )) {
                 await this.#settleAuthorizing(authorizing, 'cancel');
                 return;
             }
@@ -598,6 +697,7 @@ export class RideCodexApprovalBroker {
             turnId: validated.turnId,
             itemId: validated.itemId,
             ...(fileScopeFingerprint === undefined ? {} : { fileScopeFingerprint }),
+            ...(fileScopeRealpathFingerprint === undefined ? {} : { fileScopeRealpathFingerprint }),
             ownerId: owner.id,
             ownerContextRevision,
             issuedAt,
@@ -614,11 +714,6 @@ export class RideCodexApprovalBroker {
         }
         this.#pending.set(token, pending);
         this.#publish(owner);
-        if (callbackBeforeInsertion !== undefined) {
-            const callbackVersion = callbackBeforeInsertion;
-            callbackBeforeInsertion = undefined;
-            await onTimer(callbackVersion);
-        }
     }
 
     async closeContext(context: RideCodexApprovalContext): Promise<void> {
@@ -748,7 +843,7 @@ export class RideCodexApprovalBroker {
                 threadId: pending.threadId,
                 turnId: pending.turnId,
                 itemId: pending.itemId
-            }), pending.fileScopeFingerprint);
+            }), pending.fileScopeFingerprint, pending.fileScopeRealpathFingerprint);
             if (this.#pending.get(pending.token) !== pending) {
                 return STALE_RESULT;
             }
@@ -803,6 +898,16 @@ export class RideCodexApprovalBroker {
         }
     }
 
+    #waitForAuthorization<T>(
+        authorizing: AuthorizingApproval,
+        operation: Promise<T>
+    ): Promise<T | typeof AUTHORIZATION_CANCELLED> {
+        return Promise.race<T | typeof AUTHORIZATION_CANCELLED>([
+            operation,
+            authorizing.cancelled.then<typeof AUTHORIZATION_CANCELLED>(() => AUTHORIZATION_CANCELLED)
+        ]);
+    }
+
     async #settleAuthorizing(
         authorizing: AuthorizingApproval,
         decision: 'decline' | 'cancel'
@@ -810,6 +915,8 @@ export class RideCodexApprovalBroker {
         if (!this.#authorizing.delete(authorizing)) {
             return;
         }
+        authorizing.timer.dispose();
+        authorizing.signalCancelled();
         let canRespond = false;
         try {
             const snapshot = dataRecord(this.#host.snapshot());
@@ -829,6 +936,8 @@ export class RideCodexApprovalBroker {
 
     #abandonAuthorizing(authorizing: AuthorizingApproval): void {
         if (this.#authorizing.delete(authorizing)) {
+            authorizing.timer.dispose();
+            authorizing.signalCancelled();
             releaseOnce(authorizing.lease);
         }
     }
@@ -1011,8 +1120,12 @@ export class RideCodexApprovalBroker {
 
     async #isFileScopeDecisionSafe(
         identity: RideCodexApprovalScopeIdentity,
-        fingerprint: string
+        fingerprint: string,
+        realpathFingerprint: string | undefined
     ): Promise<boolean> {
+        if (realpathFingerprint === undefined) {
+            return false;
+        }
         const current = await this.#captureFileScope(identity);
         if (!current || !constantTimeEqual(current.fingerprint, fingerprint)) {
             return false;
@@ -1023,7 +1136,12 @@ export class RideCodexApprovalBroker {
             this.#resolveRealPath,
             () => this.#isFileScopeCurrent(identity, fingerprint)
         );
-        return normalized !== undefined && this.#isFileScopeCurrent(identity, fingerprint);
+        return normalized !== undefined
+            && constantTimeEqual(
+                this.#fileScopeRealpathFingerprint(identity, normalized.realIdentity),
+                realpathFingerprint
+            )
+            && this.#isFileScopeCurrent(identity, fingerprint);
     }
 
     #currentTrackedFileScopeFingerprint(identity: RideCodexApprovalScopeIdentity): string | undefined {
@@ -1048,6 +1166,29 @@ export class RideCodexApprovalBroker {
             turnId: identity.turnId,
             itemId: identity.itemId,
             scope: canonical
+        });
+    }
+
+    #fileScopeRealpathFingerprint(
+        identity: RideCodexApprovalScopeIdentity,
+        realIdentity: NormalizedFileScope['realIdentity']
+    ): string {
+        const canonical = this.#pathStyle === 'win32'
+            ? {
+                workspace: realIdentity.workspace.toLowerCase(),
+                changes: realIdentity.changes.map(change => ({
+                    path: change.path.toLowerCase(),
+                    kind: change.kind,
+                    ...(change.movePath === undefined ? {} : { movePath: change.movePath.toLowerCase() })
+                }))
+            }
+            : realIdentity;
+        return this.#fingerprint({
+            generation: identity.generation,
+            threadId: identity.threadId,
+            turnId: identity.turnId,
+            itemId: identity.itemId,
+            realIdentity: canonical
         });
     }
 
@@ -1525,7 +1666,7 @@ async function normalizeFileScope(
     style: 'posix' | 'win32',
     resolveRealPath: (path: string) => Promise<string>,
     isScopeCurrent: () => Promise<boolean>
-): Promise<CanonicalFileScope | undefined> {
+): Promise<NormalizedFileScope | undefined> {
     const paths = style === 'win32' ? win32 : posix;
     let realWorkspace: string;
     try {
@@ -1538,6 +1679,7 @@ async function normalizeFileScope(
         return undefined;
     }
     const changes: CanonicalFileScope['changes'][number][] = [];
+    const realChanges: NormalizedFileScope['realIdentity']['changes'][number][] = [];
     for (const change of value.changes) {
         const normalizedPath = await normalizeScopedPath(
             change.path, value.workspace, realWorkspace, style, resolveRealPath, isScopeCurrent
@@ -1545,22 +1687,30 @@ async function normalizeFileScope(
         if (!normalizedPath) {
             return undefined;
         }
-        let movePath: string | undefined;
+        let normalizedMovePath: Awaited<ReturnType<typeof normalizeScopedPath>>;
         if (change.movePath !== undefined) {
-            movePath = await normalizeScopedPath(
+            normalizedMovePath = await normalizeScopedPath(
                 change.movePath, value.workspace, realWorkspace, style, resolveRealPath, isScopeCurrent
             );
-            if (!movePath) {
+            if (!normalizedMovePath) {
                 return undefined;
             }
         }
         changes.push(Object.freeze({
-            path: normalizedPath,
+            path: normalizedPath.relative,
             kind: change.kind,
-            ...(movePath === undefined ? {} : { movePath })
+            ...(normalizedMovePath === undefined ? {} : { movePath: normalizedMovePath.relative })
+        }));
+        realChanges.push(Object.freeze({
+            path: normalizedPath.real,
+            kind: change.kind,
+            ...(normalizedMovePath === undefined ? {} : { movePath: normalizedMovePath.real })
         }));
     }
-    return deepFreezeRideCodex({ workspace: value.workspace, changes });
+    return deepFreezeRideCodex({
+        scope: { workspace: value.workspace, changes },
+        realIdentity: { workspace: realWorkspace, changes: realChanges }
+    });
 }
 
 async function normalizeScopedPath(
@@ -1570,7 +1720,7 @@ async function normalizeScopedPath(
     style: 'posix' | 'win32',
     resolveRealPath: (path: string) => Promise<string>,
     isScopeCurrent: () => Promise<boolean>
-): Promise<string | undefined> {
+): Promise<Readonly<{ relative: string; real: string }> | undefined> {
     const paths = style === 'win32' ? win32 : posix;
     if (!isSafeLocalPath(rawPath, style)) {
         return undefined;
@@ -1591,7 +1741,8 @@ async function normalizeScopedPath(
         return undefined;
     }
     const relative = paths.relative(workspace, target);
-    return relative.length > 0 && utf8ByteLength(relative) <= MAX_PATH_BYTES ? relative : undefined;
+    return relative.length > 0 && utf8ByteLength(relative) <= MAX_PATH_BYTES
+        ? Object.freeze({ relative, real: realTarget }) : undefined;
 }
 
 function isSafeLocalPath(value: string, style: 'posix' | 'win32'): boolean {

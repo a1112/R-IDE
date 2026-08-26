@@ -1329,6 +1329,144 @@ describe('RideCodexApprovalBroker ownership', () => {
         assert.equal(fixture.host.leases[0].releases, 1);
     });
 
+    it('binds published file approvals to workspace, path, and movePath real identities', async () => {
+        const cases = [
+            {
+                name: 'workspace junction retarget',
+                before: {
+                    workspace: 'C:\\real-a',
+                    path: 'C:\\real-a\\src\\a.ts',
+                    movePath: 'C:\\real-a\\src\\moved.ts'
+                },
+                after: {
+                    workspace: 'C:\\outside',
+                    path: 'C:\\outside\\src\\a.ts',
+                    movePath: 'C:\\outside\\src\\moved.ts'
+                },
+                expectedDecision: 'cancel'
+            },
+            {
+                name: 'target symlink retarget inside workspace',
+                before: {
+                    workspace: 'C:\\real-root',
+                    path: 'C:\\real-root\\physical-a.ts',
+                    movePath: 'C:\\real-root\\physical-move.ts'
+                },
+                after: {
+                    workspace: 'C:\\real-root',
+                    path: 'C:\\real-root\\physical-b.ts',
+                    movePath: 'C:\\real-root\\physical-move.ts'
+                },
+                expectedDecision: 'cancel'
+            },
+            {
+                name: 'movePath symlink retarget inside workspace',
+                before: {
+                    workspace: 'C:\\real-root',
+                    path: 'C:\\real-root\\physical-a.ts',
+                    movePath: 'C:\\real-root\\physical-move-a.ts'
+                },
+                after: {
+                    workspace: 'C:\\real-root',
+                    path: 'C:\\real-root\\physical-a.ts',
+                    movePath: 'C:\\real-root\\physical-move-b.ts'
+                },
+                expectedDecision: 'cancel'
+            },
+            {
+                name: 'Windows casing-only change',
+                before: {
+                    workspace: 'C:\\REAL-ROOT',
+                    path: 'C:\\REAL-ROOT\\SRC\\A.TS',
+                    movePath: 'C:\\REAL-ROOT\\SRC\\MOVED.TS'
+                },
+                after: {
+                    workspace: 'c:\\real-root',
+                    path: 'c:\\real-root\\src\\a.ts',
+                    movePath: 'c:\\real-root\\src\\moved.ts'
+                },
+                expectedDecision: 'accept'
+            }
+        ] as const;
+        for (const entry of cases) {
+            let deciding = false;
+            const fixture = createFixture({
+                resolveFileScope: async () => resolution([{
+                    path: 'src\\a.ts', kind: 'update', movePath: 'src\\moved.ts'
+                }]),
+                resolveRealPath: async path => {
+                    const identities = deciding ? entry.after : entry.before;
+                    switch (path.toLowerCase()) {
+                        case 'c:\\workspace':
+                            return identities.workspace;
+                        case 'c:\\workspace\\src\\a.ts':
+                            return identities.path;
+                        case 'c:\\workspace\\src\\moved.ts':
+                            return identities.movePath;
+                        default:
+                            throw new Error(`unexpected path: ${path}`);
+                    }
+                }
+            });
+            await fixture.session.setContext(CONTEXT);
+            await fixture.broker.handleServerRequest(
+                fileRequest({}, `real-identity-${entry.name}`), CONTEXT.generation
+            );
+            const card = fixture.client.latest()[0];
+            assert.ok(card, entry.name);
+            const serializedCard = JSON.stringify(card).toLowerCase();
+            assert.equal(serializedCard.includes('real-root'), false, entry.name);
+            assert.equal(serializedCard.includes('real-a'), false, entry.name);
+            assert.equal(serializedCard.includes('outside'), false, entry.name);
+
+            deciding = true;
+            assert.deepEqual(await fixture.session.decide({
+                token: card.token, fingerprint: card.fingerprint, decision: 'accept'
+            }), { status: 'responded' }, entry.name);
+            assert.deepEqual(fixture.host.responses, [{
+                generation: 7,
+                id: `real-identity-${entry.name}`,
+                result: { decision: entry.expectedDecision }
+            }], entry.name);
+            assert.equal(fixture.host.leases[0].releases, 1, entry.name);
+            assert.equal(JSON.stringify(fixture.host.responses).toLowerCase().includes('real-root'), false);
+            await fixture.broker.dispose();
+        }
+    });
+
+    it('cancels a published file approval when decision-time real identity resolution fails', async () => {
+        let failResolution = false;
+        const fixture = createFixture({
+            resolveFileScope: async () => resolution([{
+                path: 'src\\a.ts', kind: 'update', movePath: 'src\\moved.ts'
+            }]),
+            resolveRealPath: async path => {
+                if (failResolution && path.toLowerCase().endsWith('moved.ts')) {
+                    throw new Error('private absolute path must not escape');
+                }
+                return path;
+            }
+        });
+        await fixture.session.setContext(CONTEXT);
+        await fixture.broker.handleServerRequest(
+            fileRequest({}, 'real-identity-resolution-failure'), CONTEXT.generation
+        );
+        const card = fixture.client.latest()[0];
+        assert.ok(card);
+
+        failResolution = true;
+        assert.deepEqual(await fixture.session.decide({
+            token: card.token, fingerprint: card.fingerprint, decision: 'accept'
+        }), { status: 'responded' });
+        assert.deepEqual(fixture.host.responses, [{
+            generation: 7,
+            id: 'real-identity-resolution-failure',
+            result: { decision: 'cancel' }
+        }]);
+        assert.equal(JSON.stringify(fixture.host.responses).includes('private absolute path'), false);
+        assert.equal(fixture.host.leases[0].releases, 1);
+    });
+
     it('cancels and releases exactly once on panel, context, turn, and backend disposal', async () => {
         for (const ending of ['panel', 'context', 'turn', 'backend'] as const) {
             const fixture = createFixture();
@@ -1395,6 +1533,96 @@ describe('RideCodexApprovalBroker ownership', () => {
         });
         assert.equal(fixture.host.leases[1].releases, 1);
         assert.equal(fixture.client.latest().length, 0);
+    });
+
+    it('bounds authorizing and pending together and times out unresolved authorization', async () => {
+        const scopes = [
+            new Deferred<RideCodexApprovalScopeResolution>(),
+            new Deferred<RideCodexApprovalScopeResolution>()
+        ];
+        let resolverCalls = 0;
+        const fixture = createFixture({
+            maxPending: 1,
+            resolveFileScope: async () => scopes[resolverCalls++].promise
+        });
+        await fixture.session.setContext(CONTEXT);
+
+        let firstSettled = false;
+        const first = fixture.broker.handleServerRequest(
+            fileRequest({}, 'authorizing-capacity-1'), CONTEXT.generation
+        ).then(() => { firstSettled = true; });
+        await waitForAsync(() => resolverCalls === 1);
+        assert.equal(fixture.host.leases[0].releases, 0);
+
+        let secondSettled = false;
+        const second = fixture.broker.handleServerRequest(
+            fileRequest({ itemId: 'item-file-2' }, 'authorizing-capacity-2'), CONTEXT.generation
+        ).then(() => { secondSettled = true; });
+        await waitForAsync(() => secondSettled);
+        assert.equal(resolverCalls, 1);
+        assert.deepEqual(fixture.host.responses, [{
+            generation: 7, id: 'authorizing-capacity-2', result: { decision: 'cancel' }
+        }]);
+        assert.equal(fixture.host.leases[0].releases, 0);
+        assert.equal(fixture.host.leases[1].releases, 1);
+        assert.equal(fixture.client.latest().length, 0);
+
+        fixture.clock.advance(1_000);
+        await waitForAsync(() => firstSettled);
+        assert.deepEqual(fixture.host.responses[1], {
+            generation: 7, id: 'authorizing-capacity-1', result: { decision: 'cancel' }
+        });
+        assert.equal(fixture.host.leases[0].releases, 1);
+        assert.equal(fixture.client.latest().length, 0);
+
+        scopes[0].resolve(resolution([{ path: 'src\\late-a.ts', kind: 'update' }]));
+        scopes[1].resolve(resolution([{ path: 'src\\late-b.ts', kind: 'update' }]));
+        await Promise.all([first, second]);
+        await flushAsync();
+        assert.equal(fixture.host.responses.length, 2);
+        assert.ok(fixture.host.leases.every(lease => lease.releases === 1));
+        assert.equal(fixture.client.latest().length, 0);
+        await fixture.broker.dispose();
+    });
+
+    it('returns from unresolved authorization immediately after lifecycle cancellation', async () => {
+        for (const ending of ['context', 'dispose', 'process-exit'] as const) {
+            const scope = new Deferred<RideCodexApprovalScopeResolution>();
+            let entered = false;
+            const fixture = createFixture({
+                resolveFileScope: async () => {
+                    entered = true;
+                    return scope.promise;
+                }
+            });
+            await fixture.session.setContext(CONTEXT);
+            let operationSettled = false;
+            const operation = fixture.broker.handleServerRequest(
+                fileRequest({}, `authorizing-${ending}`), CONTEXT.generation
+            ).then(() => { operationSettled = true; });
+            await waitForAsync(() => entered);
+
+            if (ending === 'context') {
+                await fixture.session.disposeContext();
+            } else if (ending === 'dispose') {
+                await fixture.broker.dispose();
+            } else {
+                fixture.host.emitState('circuit-open', CONTEXT.generation);
+            }
+            await waitForAsync(() => operationSettled);
+            assert.equal(fixture.host.leases[0].releases, 1, ending);
+            assert.equal(fixture.client.latest().length, 0, ending);
+            assert.deepEqual(fixture.host.responses, ending === 'process-exit' ? [] : [{
+                generation: 7, id: `authorizing-${ending}`, result: { decision: 'cancel' }
+            }], ending);
+
+            scope.resolve(resolution([{ path: 'src\\late.ts', kind: 'update' }]));
+            await operation;
+            await flushAsync();
+            assert.equal(fixture.host.responses.length, ending === 'process-exit' ? 0 : 1, ending);
+            assert.equal(fixture.host.leases[0].releases, 1, ending);
+            await fixture.broker.dispose();
+        }
     });
 
     it('reschedules a scheduled TTL callback invoked at expiresAt - 1 without extending the TTL', async () => {
