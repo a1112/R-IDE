@@ -540,6 +540,7 @@ export class RideCodexTurnCoordinator {
             }), requestTimeoutMs));
             resuming.catch(() => undefined);
             const raw = await Promise.race([resuming, stopped]);
+            remainingRecoveryTimeout(this.#timers, startedAt, this.#recoveryTimeoutMs);
             requireThreadResumeResponse(raw, threadId);
         } catch (error) {
             if (!this.#disposed) {
