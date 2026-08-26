@@ -353,6 +353,7 @@ function isAuthorizationCredentialSegments(segments: readonly string[]): boolean
     const collapsed = segments.join('');
     return collapsed === 'authorization'
         || collapsed === 'proxyauthorization'
+        || collapsed === 'authenticate'
         || collapsed === 'wwwauthenticate'
         || collapsed === 'proxyauthenticate';
 }

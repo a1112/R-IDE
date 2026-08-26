@@ -914,6 +914,53 @@ test('diagnostics redact Basic and Digest authorization values across records an
     assert.doesNotMatch(JSON.stringify(chunkedDiagnostics.snapshot()), credentialFragments);
 });
 
+test('diagnostics redact literal Authenticate values across records and stderr chunks', () => {
+    const credentialFragments = /AUDIT_BLOB|AUDIT_USER|AUDIT_RESPONSE|AUDIT_TOKEN_VALUE/i;
+    const authenticateCases = [
+        'Authenticate: Basic AUDIT_BLOB',
+        'Authenticate=Digest username="AUDIT_USER", response="AUDIT_RESPONSE"',
+        '{"Authenticate":"Bearer AUDIT_TOKEN_VALUE"}'
+    ];
+    const recordDiagnostics = new RideCodexAppServerDiagnostics({
+        maxEntries: authenticateCases.length + 1,
+        maxEntryBytes: 512
+    });
+    for (const detail of authenticateCases) {
+        recordDiagnostics.record('protocol-error', detail);
+    }
+    recordDiagnostics.record('protocol-error', 'basic mode remains available');
+    const recordSnapshot = JSON.stringify(recordDiagnostics.snapshot());
+    assert.doesNotMatch(recordSnapshot, credentialFragments);
+    assert.match(recordSnapshot, /basic mode remains available/);
+
+    const stderrDiagnostics = new RideCodexAppServerDiagnostics({
+        maxStderrLines: authenticateCases.length + 1,
+        maxStderrBytes: 4_096,
+        maxLineBytes: 512
+    });
+    stderrDiagnostics.appendStderr(Buffer.from(`${authenticateCases.join('\n')}\nbasic mode remains available\n`));
+    stderrDiagnostics.flushStderr();
+    const stderrSnapshot = JSON.stringify(stderrDiagnostics.snapshot());
+    assert.doesNotMatch(stderrSnapshot, credentialFragments);
+    assert.match(stderrSnapshot, /basic mode remains available/);
+
+    const chunkedDiagnostics = new RideCodexAppServerDiagnostics({
+        maxStderrLines: authenticateCases.length + 1,
+        maxStderrBytes: 4_096,
+        maxLineBytes: 512
+    });
+    chunkedDiagnostics.appendStderr(Buffer.from('Authen'));
+    chunkedDiagnostics.appendStderr(Buffer.from('ticate: Basic AUDIT_'));
+    chunkedDiagnostics.appendStderr(Buffer.from('BLOB\nAuthenticate=Digest username="AUDIT_'));
+    chunkedDiagnostics.appendStderr(Buffer.from('USER", response="AUDIT_RESPONSE"\n{"Authen'));
+    chunkedDiagnostics.appendStderr(Buffer.from('ticate":"Bearer AUDIT_TOKEN_'));
+    chunkedDiagnostics.appendStderr(Buffer.from('VALUE"}\nbasic mode remains available\n'));
+    chunkedDiagnostics.flushStderr();
+    const chunkedSnapshot = JSON.stringify(chunkedDiagnostics.snapshot());
+    assert.doesNotMatch(chunkedSnapshot, credentialFragments);
+    assert.match(chunkedSnapshot, /basic mode remains available/);
+});
+
 test('stderr redaction survives chunk boundaries and bounds an overlong unterminated line', () => {
     const diagnostics = new RideCodexAppServerDiagnostics({
         maxEntries: 2,
