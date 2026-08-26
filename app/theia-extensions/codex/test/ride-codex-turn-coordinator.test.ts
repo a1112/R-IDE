@@ -3232,6 +3232,58 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         }), [], 'token usage requires last and the complete breakdown');
     });
 
+    it('rejects a null ErrorNotification error without mutating trusted UI state', async () => {
+        const host = new FakeTurnHost();
+        const scheduler = new FakeScheduler();
+        const events: RideCodexUiEvent[] = [];
+        const coordinator = new RideCodexTurnCoordinator({ host, scheduler });
+        const service = coordinator.connectClient({
+            turnEvents: wire => { events.push(...decodeBatch(wire).events); }
+        });
+        await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'fixture' }] });
+        while (scheduler.callbacks.length > 0) {
+            scheduler.flushOne();
+            await Promise.resolve();
+        }
+        events.length = 0;
+
+        host.emit('error', {
+            threadId: 'thread-1', turnId: 'turn-1', error: null, willRetry: false
+        });
+        while (scheduler.callbacks.length > 0) {
+            scheduler.flushOne();
+            await Promise.resolve();
+        }
+
+        assert.deepEqual(events, []);
+        await coordinator.dispose();
+    });
+
+    it('enforces the generated ReasoningEffort minimum length for collaboration items', async () => {
+        const base = {
+            type: 'collabAgentToolCall', id: 'collab-1', tool: 'wait', status: 'inProgress',
+            senderThreadId: 'thread-1', receiverThreadIds: [], agentsStates: {}
+        };
+        const fixtures: readonly Readonly<{
+            label: string;
+            item: Record<string, unknown>;
+            accepted: boolean;
+        }>[] = [
+            { label: 'omitted', item: { ...base }, accepted: true },
+            { label: 'null', item: { ...base, reasoningEffort: null }, accepted: true },
+            { label: 'nonempty', item: { ...base, reasoningEffort: 'high' }, accepted: true },
+            { label: 'empty', item: { ...base, reasoningEffort: '' }, accepted: false }
+        ];
+
+        for (const fixture of fixtures) {
+            assert.equal(
+                await acceptsTurnStartResponse({ ...minimalTurn(), items: [fixture.item] }),
+                fixture.accepted,
+                fixture.label
+            );
+        }
+    });
+
     it('validates turn/started exactly before establishing a pending turn', async () => {
         const collectBeforeResponse = async (params: Record<string, unknown>): Promise<readonly RideCodexUiEvent[]> => {
             const host = new FakeTurnHost();

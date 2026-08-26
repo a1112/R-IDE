@@ -1555,7 +1555,7 @@ function requireTurn(value: unknown): Readonly<{
         throw new RideCodexTurnError('invalid-data');
     }
     if (hasOwn(turn, 'error')) {
-        requireTurnError(ownValue(turn, 'error'));
+        requireNullableTurnError(ownValue(turn, 'error'));
     }
     if (hasOwn(turn, 'startedAt')) {
         requireNullableJsonInt64(ownValue(turn, 'startedAt'));
@@ -1992,7 +1992,7 @@ function requireCollabAgentToolCall(value: unknown): void {
         requireNullableText(ownValue(item, 'model'), MAX_IDENTIFIER_BYTES);
     }
     if (hasOwn(item, 'reasoningEffort')) {
-        requireNullableIdentifier(ownValue(item, 'reasoningEffort'));
+        requireNullableNonEmptyString(ownValue(item, 'reasoningEffort'), MAX_IDENTIFIER_BYTES);
     }
     const states = requireRecord(ownValue(item, 'agentsStates'));
     for (const [threadId, rawState] of Object.entries(states)) {
@@ -2127,13 +2127,17 @@ function requireOptionalImageDetail(record: Record<string, unknown>): void {
     requireEnum(detail, ['auto', 'low', 'high', 'original']);
 }
 
-function requireTurnError(value: unknown): void {
+function requireNullableTurnError(value: unknown): void {
     if (isNullish(value)) {
         if (value === undefined) {
             throw new RideCodexTurnError('invalid-data');
         }
         return;
     }
+    requireTurnError(value);
+}
+
+function requireTurnError(value: unknown): void {
     const error = requireOptions(value, ['message', 'codexErrorInfo', 'additionalDetails']);
     requireRequiredKeys(error, ['message']);
     requireBoundedText(ownValue(error, 'message'), MAX_INPUT_TEXT_BYTES);
