@@ -22,6 +22,13 @@ import type {
     RideCodexThreadStartRequest,
     RideCodexThreadSummary
 } from './ride-codex-conversations';
+import type {
+    RideCodexTurnClient as RideCodexTurnClientModel,
+    RideCodexTurnInterruptRequest,
+    RideCodexTurnResult,
+    RideCodexTurnStartRequest,
+    RideCodexTurnSteerRequest
+} from './ride-codex-events';
 
 export const RideCodexServicePath = '/services/ride-codex';
 export const RideCodexService = Symbol('RideCodexService');
@@ -64,4 +71,17 @@ export interface RideCodexConversationsService extends RpcServer<RideCodexConver
     archiveThread(threadId: string): Promise<void>;
     selectThread(threadId: string | null): Promise<void>;
     disconnectClient(client: RideCodexConversationsClient): void;
+}
+
+export const RideCodexTurnsServicePath = '/services/ride-codex-turns';
+export const RideCodexTurnsService = Symbol('RideCodexTurnsService');
+export const RideCodexTurnClient = Symbol('RideCodexTurnClient');
+
+export interface RideCodexTurnClient extends RideCodexTurnClientModel { }
+
+export interface RideCodexTurnsService extends RpcServer<RideCodexTurnClient> {
+    startTurn(request: RideCodexTurnStartRequest): Promise<RideCodexTurnResult>;
+    steerTurn(request: RideCodexTurnSteerRequest): Promise<RideCodexTurnResult>;
+    interruptTurn(request: RideCodexTurnInterruptRequest): Promise<RideCodexTurnResult>;
+    disconnectClient(): void;
 }

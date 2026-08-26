@@ -14,13 +14,16 @@ import {
     RideCodexAuthServicePath,
     RideCodexConversationsClient,
     RideCodexConversationsService,
-    RideCodexConversationsServicePath
+    RideCodexConversationsServicePath,
+    RideCodexTurnClient,
+    RideCodexTurnsServicePath
 } from '../common/ride-codex-protocol';
 import { RideCodexAppServerHost } from './ride-codex-app-server-host';
 import { RideCodexAuthBroker } from './ride-codex-auth-broker';
 import { RideCodexAppServerDiagnostics } from './ride-codex-diagnostics';
 import { RideCodexRuntimeResolver } from './ride-codex-runtime-resolver';
 import { RideCodexThreadCoordinator } from './ride-codex-thread-coordinator';
+import { RideCodexTurnCoordinator } from './ride-codex-turn-coordinator';
 
 export default new ContainerModule(bind => {
     bind(RideCodexRuntimeResolver).toSelf().inSingletonScope();
@@ -55,6 +58,18 @@ export default new ContainerModule(bind => {
             coordinator.setClient(client);
             client.onDidCloseConnection(() => coordinator.disconnectClient(client));
             return coordinator;
+        })
+    ).inSingletonScope();
+    bind(RideCodexTurnCoordinator).toDynamicValue(context => new RideCodexTurnCoordinator({
+        host: context.container.get(RideCodexAppServerHost)
+    })).inSingletonScope();
+    bind(BackendApplicationContribution).toService(RideCodexTurnCoordinator);
+    bind(ConnectionHandler).toDynamicValue(context =>
+        new JsonRpcConnectionHandler<RideCodexTurnClient>(RideCodexTurnsServicePath, client => {
+            const coordinator = context.container.get(RideCodexTurnCoordinator);
+            const session = coordinator.connectClient(client);
+            client.onDidCloseConnection(() => session.disconnectClient());
+            return session;
         })
     ).inSingletonScope();
 });

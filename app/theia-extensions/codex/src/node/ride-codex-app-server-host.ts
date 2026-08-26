@@ -90,7 +90,8 @@ export interface RideCodexAppServerHostStateEvent {
 export type RideCodexAppServerHostErrorCode =
     | RideCodexAppServerDiagnosticCode
     | 'disposed'
-    | 'lease-released';
+    | 'lease-released'
+    | 'recovery-superseded';
 
 const ERROR_MESSAGE_BY_CODE: Readonly<Record<RideCodexAppServerHostErrorCode, string>> = Object.freeze({
     'early-exit': 'Codex App Server exited before initialize completed.',
@@ -103,7 +104,8 @@ const ERROR_MESSAGE_BY_CODE: Readonly<Record<RideCodexAppServerHostErrorCode, st
     'shutdown-forced': 'Codex App Server required bounded exact-child termination.',
     'shutdown-timeout': 'Codex App Server did not confirm shutdown within the configured bound.',
     'disposed': 'Codex App Server host is disposed.',
-    'lease-released': 'Codex App Server lease is released.'
+    'lease-released': 'Codex App Server lease is released.',
+    'recovery-superseded': 'Codex App Server recovery generation was superseded.'
 });
 
 export class RideCodexAppServerHostError extends Error {
@@ -194,6 +196,8 @@ export class RideCodexAppServerHost {
     #stoppingConnection: Connection | undefined;
     #idleTimer: ReturnType<typeof setTimeout> | undefined;
     #disposePromise: Promise<void> | undefined;
+    #recoveryPromise: Promise<number> | undefined;
+    #recoveryGeneration: number | undefined;
     #disposed = false;
 
     constructor(options: RideCodexAppServerHostOptions = {}) {
@@ -263,6 +267,52 @@ export class RideCodexAppServerHost {
         if (this.#leases.size > 0) {
             await this.#ensureStarted(false);
         }
+    }
+
+    restartForRecovery(expectedGeneration: number): Promise<number> {
+        if (this.#disposed) {
+            return Promise.reject(new RideCodexAppServerHostError('disposed'));
+        }
+        if (!Number.isSafeInteger(expectedGeneration) || expectedGeneration < 1) {
+            return Promise.reject(new RideCodexAppServerHostError('recovery-superseded'));
+        }
+        if (this.#recoveryPromise) {
+            return this.#recoveryGeneration === expectedGeneration
+                ? this.#recoveryPromise
+                : Promise.reject(new RideCodexAppServerHostError('recovery-superseded'));
+        }
+        const connection = this.#connection;
+        if (expectedGeneration !== this.#generation || this.#state !== 'ready'
+            || !connection || connection.generation !== expectedGeneration
+            || !connection.ready || connection.finalized || this.#unsafeApprovalCount > 0) {
+            return Promise.reject(new RideCodexAppServerHostError('recovery-superseded'));
+        }
+        this.#cancelIdleTimer();
+        this.#recoveryGeneration = expectedGeneration;
+        const operation: Promise<number> = (async (): Promise<number> => {
+            try {
+                await this.#stopConnection(connection, 'recovery');
+                this.#requireUsable();
+                if (this.#connection && this.#connection !== connection) {
+                    throw new RideCodexAppServerHostError('recovery-superseded');
+                }
+                this.#restartAttempts = 0;
+                const replacement = await this.#ensureStarted(true);
+                this.#requireUsable();
+                if (this.#leases.size === 0) {
+                    this.#scheduleIdleShutdown();
+                }
+                return replacement.generation;
+            } finally {
+                if (this.#recoveryGeneration === expectedGeneration) {
+                    this.#recoveryPromise = undefined;
+                    this.#recoveryGeneration = undefined;
+                }
+            }
+        })();
+        this.#recoveryPromise = operation;
+        operation.catch(() => undefined);
+        return operation;
     }
 
     onNotification(listener: (notification: RideCodexNotification, generation: number) => void): RideCodexDisposable {
@@ -501,7 +551,8 @@ export class RideCodexAppServerHost {
             if (!this.#disposed && this.#state !== 'circuit-open') {
                 this.#setState('stopped');
             }
-            if (safe.code !== 'disposed' && safe.code !== 'lease-released') {
+            if (safe.code !== 'disposed' && safe.code !== 'lease-released'
+                && safe.code !== 'recovery-superseded') {
                 this.diagnostics.record(safe.code);
             }
             throw safe;
@@ -669,7 +720,10 @@ export class RideCodexAppServerHost {
         }
     }
 
-    #stopConnection(connection: Connection, reason: 'idle' | 'dispose' | 'startup-failure' | 'retry'): Promise<void> {
+    #stopConnection(
+        connection: Connection,
+        reason: 'idle' | 'dispose' | 'startup-failure' | 'retry' | 'recovery'
+    ): Promise<void> {
         if (this.#stopPromise) {
             if (this.#stoppingConnection === connection) {
                 return this.#stopPromise;
@@ -684,7 +738,7 @@ export class RideCodexAppServerHost {
         });
         this.#stopPromise = stopPromise;
         this.#stoppingConnection = connection;
-        void this.#performStopConnection(connection, reason === 'retry').then(
+        void this.#performStopConnection(connection, reason === 'retry' || reason === 'recovery').then(
             () => {
                 if (this.#stopPromise === stopPromise) {
                     this.#stopPromise = undefined;

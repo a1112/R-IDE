@@ -30,6 +30,7 @@ import { createRideCodexLaunchSpec, RideCodexLaunchSpec } from '../src/node/ride
 import { RideCodexRuntimeResolver } from '../src/node/ride-codex-runtime-resolver';
 import { RideCodexAuthBroker } from '../src/node/ride-codex-auth-broker';
 import { RideCodexThreadCoordinator } from '../src/node/ride-codex-thread-coordinator';
+import { RideCodexTurnCoordinator } from '../src/node/ride-codex-turn-coordinator';
 import {
     RideCodexAuthService,
     RideCodexConversationsService
@@ -241,12 +242,17 @@ test('constructors and backend singleton bindings stay inert until first acquire
     const conversations = container.get(RideCodexThreadCoordinator);
     assert.strictEqual(container.get(RideCodexConversationsService), conversations);
     assert.ok(container.getAll(BackendApplicationContribution).includes(conversations));
+    const turns = container.get(RideCodexTurnCoordinator);
+    assert.strictEqual(turns, container.get(RideCodexTurnCoordinator));
+    assert.ok(container.getAll(BackendApplicationContribution).includes(turns));
     assert.equal(authBroker.snapshot().state, 'inactive');
     assert.equal(boundHost.snapshot().state, 'stopped');
     assert.ok((container.getAll(ConnectionHandler) as ConnectionHandler[])
         .some(handler => handler.path === '/services/ride-codex-auth'));
     assert.ok((container.getAll(ConnectionHandler) as ConnectionHandler[])
         .some(handler => handler.path === '/services/ride-codex-conversations'));
+    assert.ok((container.getAll(ConnectionHandler) as ConnectionHandler[])
+        .some(handler => handler.path === '/services/ride-codex-turns'));
 
     const lease = await direct.host.acquire('foreground-panel');
     assert.equal(lease.generation, 1);
@@ -927,6 +933,49 @@ test('one unexpected crash restarts once, a second crash opens a stable circuit,
         pid: harness.records[2].child.pid
     });
     lease.release();
+    await harness.host.dispose();
+});
+
+test('bounded recovery restart replaces only the exact ready child and coalesces one generation', async () => {
+    const harness = createHost({ modes: ['normal', 'normal'], shutdownGraceMs: 100 });
+    const lease = await harness.host.acquire('active-turn');
+    assert.equal(lease.generation, 1);
+    const oldChild = harness.records[0].child;
+
+    const [first, second] = await Promise.all([
+        harness.host.restartForRecovery(1),
+        harness.host.restartForRecovery(1)
+    ]);
+
+    assert.equal(first, 2);
+    assert.equal(second, 2);
+    assert.equal(harness.records.length, 2);
+    assert.notEqual(harness.records[1].child.pid, oldChild.pid);
+    assert.equal(harness.host.snapshot().state, 'ready');
+    assert.equal(harness.host.snapshot().generation, 2);
+    assert.equal(harness.host.snapshot().leaseCount, 1);
+    assert.ok(harness.records.filter(record =>
+        record.child.exitCode === null && record.child.signalCode === null
+    ).length <= 1);
+
+    await assert.rejects(harness.host.restartForRecovery(1), /generation|superseded|recovery/i);
+    assert.equal(harness.records.length, 2);
+    lease.release();
+    await harness.host.dispose();
+});
+
+test('recovery replacement with no leases retains bounded idle shutdown', async () => {
+    const harness = createHost({ modes: ['normal', 'normal'], idleTimeoutMs: 20, shutdownGraceMs: 100 });
+    const lease = await harness.host.acquire('active-turn');
+    const generation = lease.generation;
+    lease.release();
+
+    assert.equal(await harness.host.restartForRecovery(generation), 2);
+    assert.equal(harness.host.snapshot().leaseCount, 0);
+    assert.equal(harness.host.snapshot().state, 'ready');
+
+    await waitFor(() => harness.host.snapshot().state === 'stopped');
+    assert.equal(harness.records.length, 2);
     await harness.host.dispose();
 });
 
