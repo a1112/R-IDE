@@ -44,6 +44,13 @@ export interface RideCodexAuthBrokerOptions {
     readonly diagnostics: RideCodexAppServerDiagnostics;
 }
 
+interface NotificationAccountRefreshContext {
+    readonly refresh: number;
+    readonly callerOperation: number;
+    readonly accountRevision: number;
+    readonly generation: number;
+}
+
 export class RideCodexAuthError extends Error {
     constructor(readonly code: 'invalid-data' | 'operation-failed' | 'operation-superseded' | 'unknown-login' | 'disposed') {
         super(AUTH_ERROR_MESSAGES[code]);
@@ -88,6 +95,8 @@ export class RideCodexAuthBroker {
     #activeGeneration = 0;
     #callerAuthOperation = 0;
     #notificationAccountRefresh = 0;
+    #notificationAccountRefreshFlight: NotificationAccountRefreshContext | undefined;
+    #notificationAccountRefreshPending: NotificationAccountRefreshContext | undefined;
     #accountRevision = 0;
     #rateOperation = 0;
     #rateVersion = 0;
@@ -135,7 +144,7 @@ export class RideCodexAuthBroker {
         }
         const operation = (async () => {
             await this.#ensureLease();
-            const token = ++this.#callerAuthOperation;
+            const token = this.#beginCallerAuthOperation();
             return this.#readAccountForToken(token, false);
         })();
         let tracked!: Promise<RideCodexAuthSnapshot>;
@@ -157,7 +166,7 @@ export class RideCodexAuthBroker {
             throw new TypeError('Codex refresh-token option must be boolean');
         }
         await this.#ensureLease();
-        const token = ++this.#callerAuthOperation;
+        const token = this.#beginCallerAuthOperation();
         return this.#readAccountForToken(token, refreshToken);
     }
 
@@ -165,7 +174,7 @@ export class RideCodexAuthBroker {
         this.#requireUsable();
         let normalized: RideCodexLoginRequest | undefined = normalizeRideCodexLoginRequest(request);
         await this.#ensureLease();
-        const token = ++this.#callerAuthOperation;
+        const token = this.#beginCallerAuthOperation();
         const previousSnapshot = this.#snapshot;
         const authenticatingSnapshot = this.#setAuthSnapshot({
             state: 'authenticating',
@@ -222,7 +231,7 @@ export class RideCodexAuthBroker {
             return;
         }
         await this.#ensureLease();
-        const token = ++this.#callerAuthOperation;
+        const token = this.#beginCallerAuthOperation();
         try {
             const pending = rejectProxyBeforeAwait(this.#lease!.request('account/login/cancel', { loginId }));
             const raw = await pending;
@@ -244,7 +253,7 @@ export class RideCodexAuthBroker {
     async logout(): Promise<RideCodexAuthSnapshot> {
         this.#requireUsable();
         await this.#ensureLease();
-        const token = ++this.#callerAuthOperation;
+        const token = this.#beginCallerAuthOperation();
         this.#invalidateRateReads();
         try {
             await this.#lease!.request('account/logout', {});
@@ -285,8 +294,7 @@ export class RideCodexAuthBroker {
             return;
         }
         this.#disposed = true;
-        ++this.#callerAuthOperation;
-        ++this.#notificationAccountRefresh;
+        this.#beginCallerAuthOperation();
         this.#invalidateRateReads();
         for (const listener of this.#listeners.splice(0)) {
             disposeSafely(listener);
@@ -414,23 +422,36 @@ export class RideCodexAuthBroker {
     }
 
     #scheduleNotificationAccountRefresh(generation: number): void {
-        const refresh = ++this.#notificationAccountRefresh;
-        const callerOperation = this.#callerAuthOperation;
-        const accountRevision = this.#accountRevision;
-        void this.#readAccountForNotification({
-            refresh,
-            callerOperation,
-            accountRevision,
+        const context: NotificationAccountRefreshContext = {
+            refresh: ++this.#notificationAccountRefresh,
+            callerOperation: this.#callerAuthOperation,
+            accountRevision: this.#accountRevision,
             generation
+        };
+        if (this.#notificationAccountRefreshFlight) {
+            this.#notificationAccountRefreshPending = context;
+            return;
+        }
+        this.#startNotificationAccountRefresh(context);
+    }
+
+    #startNotificationAccountRefresh(context: NotificationAccountRefreshContext): void {
+        this.#notificationAccountRefreshFlight = context;
+        const operation = this.#readAccountForNotification(context);
+        void operation.finally(() => {
+            if (this.#notificationAccountRefreshFlight !== context) {
+                return;
+            }
+            this.#notificationAccountRefreshFlight = undefined;
+            const pending = this.#notificationAccountRefreshPending;
+            this.#notificationAccountRefreshPending = undefined;
+            if (pending && this.#isCurrentNotificationAccountRefresh(pending)) {
+                this.#startNotificationAccountRefresh(pending);
+            }
         }).catch(() => undefined);
     }
 
-    async #readAccountForNotification(context: Readonly<{
-        refresh: number;
-        callerOperation: number;
-        accountRevision: number;
-        generation: number;
-    }>): Promise<void> {
+    async #readAccountForNotification(context: NotificationAccountRefreshContext): Promise<void> {
         try {
             const pending = rejectProxyBeforeAwait(this.#lease!.request('account/read', { refreshToken: false }));
             const raw = await pending;
@@ -453,12 +474,7 @@ export class RideCodexAuthBroker {
         }
     }
 
-    #isCurrentNotificationAccountRefresh(context: Readonly<{
-        refresh: number;
-        callerOperation: number;
-        accountRevision: number;
-        generation: number;
-    }>): boolean {
+    #isCurrentNotificationAccountRefresh(context: NotificationAccountRefreshContext): boolean {
         return !this.#disposed
             && context.generation === this.#activeGeneration
             && context.callerOperation === this.#callerAuthOperation
@@ -532,7 +548,7 @@ export class RideCodexAuthBroker {
             return;
         }
         if (!completion.success) {
-            ++this.#notificationAccountRefresh;
+            this.#invalidateNotificationAccountRefresh();
             this.#setGenericError('operation-failed');
             return;
         }
@@ -555,23 +571,21 @@ export class RideCodexAuthBroker {
         let invalidated = false;
         if (event.generation !== this.#activeGeneration) {
             this.#activeGeneration = event.generation;
-            ++this.#callerAuthOperation;
-            ++this.#notificationAccountRefresh;
+            this.#beginCallerAuthOperation();
             this.#knownLogins.clear();
             this.#notificationSignatures.clear();
             this.#invalidateRateReads();
             invalidated = true;
         }
         if (event.state === 'ready') {
-            const token = invalidated ? this.#callerAuthOperation : ++this.#callerAuthOperation;
+            const token = invalidated ? this.#callerAuthOperation : this.#beginCallerAuthOperation();
             void this.#readAccountForToken(token, false).catch(() => undefined);
             return;
         }
         if (event.state === 'restarting' || event.state === 'stopped'
             || event.state === 'circuit-open' || event.state === 'disposed') {
             if (!invalidated) {
-                ++this.#callerAuthOperation;
-                ++this.#notificationAccountRefresh;
+                this.#beginCallerAuthOperation();
                 this.#invalidateRateReads();
             }
             this.#setAuthSnapshot({ state: 'disconnected' });
@@ -628,6 +642,17 @@ export class RideCodexAuthBroker {
         if (token !== this.#callerAuthOperation) {
             throw new RideCodexAuthError('operation-superseded');
         }
+    }
+
+    #beginCallerAuthOperation(): number {
+        const token = ++this.#callerAuthOperation;
+        this.#invalidateNotificationAccountRefresh();
+        return token;
+    }
+
+    #invalidateNotificationAccountRefresh(): void {
+        ++this.#notificationAccountRefresh;
+        this.#notificationAccountRefreshPending = undefined;
     }
 
     #invalidateRateReads(): void {

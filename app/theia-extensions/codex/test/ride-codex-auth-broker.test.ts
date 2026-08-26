@@ -459,15 +459,147 @@ test('later account notifications and caller commits reject older notification r
 
     host.notify('account/updated', { authMode: 'apikey', planType: null });
     host.notify('account/updated', { authMode: 'chatgpt', planType: 'plus' });
+    await eventually(() => accountReads === 1);
+    firstRefresh.resolve({ account: { type: 'apiKey' }, requiresOpenaiAuth: false });
     await eventually(() => accountReads === 2);
     secondRefresh.resolve({
         account: { type: 'chatgpt', email: null, planType: 'plus' },
         requiresOpenaiAuth: false
     });
-    firstRefresh.resolve({ account: { type: 'apiKey' }, requiresOpenaiAuth: false });
-    await tick();
+    await eventually(() => broker.snapshot().account?.type === 'chatgpt');
 
     assert.deepEqual(broker.snapshot().account, { type: 'chatgpt', plan: 'plus' });
+});
+
+test('account notification storms keep confirmation refreshes single-flight and converge on the latest state', async () => {
+    const host = new FakeAuthHost();
+    const firstRefresh = deferred<unknown>();
+    const secondRefresh = deferred<unknown>();
+    let accountReads = 0;
+    let inFlightReads = 0;
+    let maxInFlightReads = 0;
+    host.responder = method => {
+        assert.equal(method, 'account/read');
+        return { account: null, requiresOpenaiAuth: true };
+    };
+    const broker = new RideCodexAuthBroker({ host, diagnostics: new RideCodexAppServerDiagnostics() });
+    await broker.activate();
+    host.responder = method => {
+        assert.equal(method, 'account/read');
+        accountReads += 1;
+        inFlightReads += 1;
+        maxInFlightReads = Math.max(maxInFlightReads, inFlightReads);
+        const response = accountReads === 1 ? firstRefresh.promise : secondRefresh.promise;
+        return response.finally(() => { inFlightReads -= 1; });
+    };
+
+    for (let index = 0; index < 200; index += 1) {
+        host.notify('account/updated', index % 2 === 0
+            ? { authMode: 'apikey', planType: null }
+            : { authMode: 'chatgpt', planType: 'plus' });
+    }
+    await eventually(() => accountReads > 0);
+    assert.equal(accountReads, 1);
+    assert.equal(maxInFlightReads, 1);
+
+    firstRefresh.resolve({ account: { type: 'apiKey' }, requiresOpenaiAuth: false });
+    await eventually(() => accountReads === 2);
+    assert.equal(maxInFlightReads, 1);
+    await tick();
+    assert.equal(accountReads, 2);
+
+    secondRefresh.resolve({
+        account: { type: 'chatgpt', email: null, planType: 'plus' },
+        requiresOpenaiAuth: false
+    });
+    await eventually(() => inFlightReads === 0);
+    assert.equal(accountReads, 2);
+    assert.deepEqual(broker.snapshot().account, { type: 'chatgpt', plan: 'plus' });
+});
+
+test('a caller auth operation clears dirty notification refresh work', async () => {
+    const host = new FakeAuthHost();
+    const staleRefresh = deferred<unknown>();
+    let accountReads = 0;
+    host.responder = method => {
+        assert.equal(method, 'account/read');
+        return { account: null, requiresOpenaiAuth: true };
+    };
+    const broker = new RideCodexAuthBroker({ host, diagnostics: new RideCodexAppServerDiagnostics() });
+    await broker.activate();
+    host.responder = method => {
+        assert.equal(method, 'account/read');
+        accountReads += 1;
+        return accountReads === 1
+            ? staleRefresh.promise
+            : {
+                account: { type: 'chatgpt', email: null, planType: 'plus' },
+                requiresOpenaiAuth: false
+            };
+    };
+
+    host.notify('account/updated', { authMode: 'apikey', planType: null });
+    host.notify('account/updated', { authMode: 'chatgpt', planType: 'plus' });
+    await eventually(() => accountReads > 0);
+    await broker.readAccount();
+    staleRefresh.resolve({ account: { type: 'apiKey' }, requiresOpenaiAuth: false });
+    await tick();
+
+    assert.equal(accountReads, 2);
+    assert.deepEqual(broker.snapshot().account, { type: 'chatgpt', plan: 'plus' });
+});
+
+test('a new host generation clears dirty notification refresh work', async () => {
+    const host = new FakeAuthHost();
+    const staleRefresh = deferred<unknown>();
+    let accountReads = 0;
+    host.responder = method => {
+        assert.equal(method, 'account/read');
+        return { account: null, requiresOpenaiAuth: true };
+    };
+    const broker = new RideCodexAuthBroker({ host, diagnostics: new RideCodexAppServerDiagnostics() });
+    await broker.activate();
+    host.responder = method => {
+        assert.equal(method, 'account/read');
+        accountReads += 1;
+        return staleRefresh.promise;
+    };
+
+    host.notify('account/updated', { authMode: 'apikey', planType: null });
+    host.notify('account/updated', { authMode: 'chatgpt', planType: 'plus' });
+    await eventually(() => accountReads > 0);
+    host.changeState('starting', 2);
+    staleRefresh.resolve({ account: { type: 'apiKey' }, requiresOpenaiAuth: false });
+    await tick();
+
+    assert.equal(accountReads, 1);
+    assert.equal(broker.snapshot().account?.type, 'chatgpt');
+});
+
+test('dispose clears dirty notification refresh work', async () => {
+    const host = new FakeAuthHost();
+    const staleRefresh = deferred<unknown>();
+    let accountReads = 0;
+    host.responder = method => {
+        assert.equal(method, 'account/read');
+        return { account: null, requiresOpenaiAuth: true };
+    };
+    const broker = new RideCodexAuthBroker({ host, diagnostics: new RideCodexAppServerDiagnostics() });
+    await broker.activate();
+    host.responder = method => {
+        assert.equal(method, 'account/read');
+        accountReads += 1;
+        return staleRefresh.promise;
+    };
+
+    host.notify('account/updated', { authMode: 'apikey', planType: null });
+    host.notify('account/updated', { authMode: 'chatgpt', planType: 'plus' });
+    await eventually(() => accountReads > 0);
+    broker.dispose();
+    staleRefresh.resolve({ account: { type: 'apiKey' }, requiresOpenaiAuth: false });
+    await tick();
+
+    assert.equal(accountReads, 1);
 });
 
 test('a newer account notification prevents an older caller read from replacing account state', async () => {
