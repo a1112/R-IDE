@@ -212,7 +212,7 @@ describe('RideCodexEventReducer minimal frame contract', () => {
                 frames.push(callback);
                 return { dispose: () => undefined };
             },
-            maxItemBytes: 12,
+            maxItemBytes: 36,
             maxRetainedBytes: 128
         });
         reducer.notifyMany(batchWire({
@@ -242,7 +242,7 @@ describe('RideCodexEventReducer minimal frame contract', () => {
                 frames.push(callback);
                 return { dispose: () => undefined };
             },
-            maxItemBytes: 8,
+            maxItemBytes: (1_025 + 1_025) * RETAINED_ARRAY_SLOT_BYTES + 1,
             maxRetainedBytes: 64 * 1024
         });
         reducer.notifyMany(batchWire({
@@ -295,7 +295,7 @@ describe('RideCodexEventReducer minimal frame contract', () => {
                 frames.push(callback);
                 return { dispose: () => undefined };
             },
-            maxItemBytes: 12,
+            maxItemBytes: 28,
             maxRetainedBytes: 1_024
         });
         reducer.notifyMany(batchWire({
@@ -313,10 +313,11 @@ describe('RideCodexEventReducer minimal frame contract', () => {
 
         const snapshot = reducer.snapshot();
         const item = snapshot.items[0];
-        const payloadBytes = Buffer.byteLength(item.text, 'utf8')
+        const payloadBytes = (item.summaries.length + item.reasoning.length) * RETAINED_ARRAY_SLOT_BYTES
+            + Buffer.byteLength(item.text, 'utf8')
             + item.summaries.reduce((sum, value) => sum + Buffer.byteLength(value, 'utf8'), 0)
             + item.reasoning.reduce((sum, value) => sum + Buffer.byteLength(value, 'utf8'), 0);
-        assert.equal(payloadBytes, 12);
+        assert.equal(payloadBytes, 28);
         assert.equal(item.text, 'abc');
         assert.deepEqual(item.summaries, ['你你']);
         assert.deepEqual(item.reasoning, ['界']);
@@ -330,7 +331,7 @@ describe('RideCodexEventReducer minimal frame contract', () => {
                 frames.push(callback);
                 return { dispose: () => undefined };
             },
-            maxItemBytes: 18,
+            maxItemBytes: 26,
             maxRetainedBytes: 1_024
         });
         reducer.notifyMany(batchWire({
@@ -351,12 +352,13 @@ describe('RideCodexEventReducer minimal frame contract', () => {
 
         const snapshot = reducer.snapshot();
         const item = snapshot.items[0];
-        const payloadBytes = Buffer.byteLength(item.text, 'utf8') + item.changes.reduce((sum, change) =>
+        const payloadBytes = item.changes.length * RETAINED_ARRAY_SLOT_BYTES
+            + Buffer.byteLength(item.text, 'utf8') + item.changes.reduce((sum, change) =>
             sum + Buffer.byteLength(change.path, 'utf8')
             + Buffer.byteLength(change.diff, 'utf8')
             + (change.kind === 'update' && typeof change.movePath === 'string'
                 ? Buffer.byteLength(change.movePath, 'utf8') : 0), 0);
-        assert.equal(payloadBytes, 18);
+        assert.equal(payloadBytes, 26);
         assert.deepEqual(item.changes, [
             { path: '你.t', kind: 'update', diff: '+界界', movePath: '新' }
         ]);
@@ -1121,5 +1123,93 @@ describe('RideCodexEventReducer minimal frame contract', () => {
 
         assert.equal(reducer.snapshot().turnId, 'turn-current');
         assert.equal(reducer.snapshot().status, 'in-progress');
+    });
+
+    it('counts sparse summary and reasoning slots against maxItemBytes before allocating', () => {
+        const frames: Array<() => void> = [];
+        const reducer = new RideCodexEventReducer({
+            scheduleFrame: callback => {
+                frames.push(callback);
+                return { dispose: () => undefined };
+            },
+            maxItemBytes: 8,
+            maxRetainedBytes: 256
+        });
+        reducer.notifyMany(batchWire({
+            generation: 1,
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            events: [
+                { type: 'turn-started' },
+                { type: 'item-started', itemId: 'reasoning-1', itemKind: 'reasoning' },
+                { type: 'reasoning-summary-part', itemId: 'reasoning-1', summaryIndex: 1_024 },
+                { type: 'reasoning-summary-delta', itemId: 'reasoning-1', summaryIndex: 1_024, delta: 'x' },
+                { type: 'reasoning-delta', itemId: 'reasoning-1', contentIndex: 1_024, delta: '你' }
+            ]
+        }));
+        frames.shift()?.();
+
+        const snapshot = reducer.snapshot();
+        assert.equal(snapshot.items[0].summaries.length, 0);
+        assert.equal(snapshot.items[0].reasoning.length, 0);
+        assert.equal(independentlyRetainedBytes(snapshot), snapshot.retainedBytes);
+        assert.equal(snapshot.warnings.filter(warning => warning.code === 'data-truncated').length, 1);
+    });
+
+    it('uses exact slot and UTF-8 boundaries for ordinary reasoning indexes', () => {
+        const frames: Array<() => void> = [];
+        const reducer = new RideCodexEventReducer({
+            scheduleFrame: callback => {
+                frames.push(callback);
+                return { dispose: () => undefined };
+            },
+            maxItemBytes: RETAINED_ARRAY_SLOT_BYTES + Buffer.byteLength('你', 'utf8'),
+            maxRetainedBytes: 256
+        });
+        reducer.notifyMany(batchWire({
+            generation: 1,
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            events: [
+                { type: 'turn-started' },
+                { type: 'item-started', itemId: 'reasoning-1', itemKind: 'reasoning' },
+                { type: 'reasoning-summary-delta', itemId: 'reasoning-1', summaryIndex: 0, delta: '你' },
+                { type: 'reasoning-delta', itemId: 'reasoning-1', contentIndex: 0, delta: '界' }
+            ]
+        }));
+        frames.shift()?.();
+
+        const snapshot = reducer.snapshot();
+        assert.deepEqual(snapshot.items[0].summaries, ['你']);
+        assert.deepEqual(snapshot.items[0].reasoning, []);
+        assert.equal(independentlyRetainedBytes(snapshot), snapshot.retainedBytes);
+        assert.equal(snapshot.warnings.filter(warning => warning.code === 'data-truncated').length, 1);
+    });
+
+    it('accepts empty server identities and paths that have no schema minLength', () => {
+        const frames: Array<() => void> = [];
+        const reducer = new RideCodexEventReducer({
+            scheduleFrame: callback => {
+                frames.push(callback);
+                return { dispose: () => undefined };
+            }
+        });
+        reducer.notifyMany(batchWire({
+            generation: 1,
+            threadId: '',
+            turnId: '',
+            events: [
+                { type: 'turn-started' },
+                { type: 'item-started', itemId: '', itemKind: 'file-change' },
+                { type: 'file-patch', itemId: '', changes: [{ path: '', kind: 'add', diff: '' }] }
+            ]
+        }));
+        frames.shift()?.();
+
+        const snapshot = reducer.snapshot();
+        assert.equal(snapshot.threadId, '');
+        assert.equal(snapshot.turnId, '');
+        assert.equal(snapshot.items[0].id, '');
+        assert.deepEqual(snapshot.items[0].changes, [{ path: '', kind: 'add', diff: '' }]);
     });
 });

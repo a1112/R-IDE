@@ -627,7 +627,7 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         const base = { threadId: 'thread-1', turnId: 'turn-1', itemId: 'item-1' };
         host.emit('turn/started', { threadId: 'thread-1', turn: { id: 'turn-1', status: 'inProgress', items: [] } });
         host.emit('item/started', {
-            ...base, startedAtMs: 1,
+            threadId: base.threadId, turnId: base.turnId, startedAtMs: 1,
             item: { type: 'reasoning', id: 'item-1', summary: [], content: [] }
         });
         host.emit('item/reasoning/summaryTextDelta', { ...base, summaryIndex: 0, delta: 'why' });
@@ -652,7 +652,11 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         host.emit('turn/diff/updated', { threadId: 'thread-1', turnId: 'turn-1', diff: '+line' });
         host.emit('thread/tokenUsage/updated', {
             threadId: 'thread-1', turnId: 'turn-1',
-            tokenUsage: { total: { totalTokens: 10, inputTokens: 4, cachedInputTokens: 1, outputTokens: 6, reasoningOutputTokens: 2 }, last: null, modelContextWindow: 100 }
+            tokenUsage: {
+                total: { totalTokens: 10, inputTokens: 4, cachedInputTokens: 1, outputTokens: 6, reasoningOutputTokens: 2 },
+                last: { totalTokens: 3, inputTokens: 1, cachedInputTokens: 0, outputTokens: 2, reasoningOutputTokens: 1 },
+                modelContextWindow: 100
+            }
         });
         host.emit('warning', { threadId: 'thread-1', message: 'bounded warning' });
         host.emit('error', {
@@ -660,7 +664,7 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
             error: { message: 'safe failure', codexErrorInfo: null, additionalDetails: null }
         });
         host.emit('item/completed', {
-            ...base, completedAtMs: 2,
+            threadId: base.threadId, turnId: base.turnId, completedAtMs: 2,
             item: { type: 'reasoning', id: 'item-1', summary: ['why'], content: [] }
         });
         scheduler.flushOne();
@@ -696,7 +700,7 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'one' }] });
         const base = { threadId: 'thread-1', turnId: 'turn-1', itemId: 'reasoning-1' };
         host.emit('item/started', {
-            ...base, startedAtMs: 1,
+            threadId: base.threadId, turnId: base.turnId, startedAtMs: 1,
             item: { type: 'reasoning', id: 'reasoning-1', summary: [], content: [] }
         });
         host.emit('item/reasoning/summaryTextDelta', { ...base, summaryIndex: 0, delta: '你你你' });
@@ -1277,7 +1281,7 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         await Promise.resolve();
         host.emit('item/started', {
             threadId: 'thread-1', turnId: 'turn-1', startedAtMs: 1,
-            item: { type: 'fileChange', id: 'item-1' }
+            item: { type: 'fileChange', id: 'item-1', changes: [], status: 'inProgress' }
         });
         scheduler.flushOne();
         await Promise.resolve();
@@ -1771,8 +1775,11 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         };
         host.emit('item/started', params);
         host.emit('item/started', params);
-        host.emit('item/completed', { ...params, completedAtMs: 2 });
-        host.emit('item/completed', { ...params, completedAtMs: 2 });
+        const completedParams = {
+            threadId: params.threadId, turnId: params.turnId, completedAtMs: 2, item: params.item
+        };
+        host.emit('item/completed', completedParams);
+        host.emit('item/completed', completedParams);
         host.emit('item/agentMessage/delta', {
             threadId: 'thread-1', turnId: 'turn-1', itemId: 'item-1', delta: 'late'
         });
@@ -3088,5 +3095,219 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         assert.deepEqual(plans[1], {
             type: 'turn-plan', steps: [{ step: '', status: 'pending' }]
         });
+    });
+
+    it('validates every consumed stable notification family before mapping trusted UI events', async () => {
+        const usage = {
+            total: { totalTokens: 10, inputTokens: 4, cachedInputTokens: 1, outputTokens: 6, reasoningOutputTokens: 2 },
+            last: { totalTokens: 3, inputTokens: 1, cachedInputTokens: 0, outputTokens: 2, reasoningOutputTokens: 1 },
+            modelContextWindow: null
+        };
+        const base = { threadId: 'thread-1', turnId: 'turn-1' };
+        const itemBase = { ...base, itemId: 'item-1' };
+        const fixtures: readonly Readonly<{
+            method: string;
+            params: Record<string, unknown>;
+            expected: RideCodexUiEvent['type'];
+            openItem?: boolean;
+        }>[] = [
+            {
+                method: 'item/started', expected: 'item-started',
+                params: {
+                    ...base, startedAtMs: 0,
+                    item: { type: 'agentMessage', id: 'item-1', text: '' }
+                }
+            },
+            {
+                method: 'item/completed', expected: 'item-completed', openItem: true,
+                params: {
+                    ...base, completedAtMs: 0,
+                    item: { type: 'agentMessage', id: 'item-1', text: '' }
+                }
+            },
+            { method: 'item/agentMessage/delta', expected: 'agent-delta', openItem: true, params: { ...itemBase, delta: '' } },
+            { method: 'item/plan/delta', expected: 'plan-delta', openItem: true, params: { ...itemBase, delta: '' } },
+            {
+                method: 'item/commandExecution/outputDelta', expected: 'command-output', openItem: true,
+                params: { ...itemBase, delta: '' }
+            },
+            {
+                method: 'item/fileChange/outputDelta', expected: 'file-output', openItem: true,
+                params: { ...itemBase, delta: '' }
+            },
+            {
+                method: 'item/reasoning/summaryTextDelta', expected: 'reasoning-summary-delta', openItem: true,
+                params: { ...itemBase, summaryIndex: 0, delta: '' }
+            },
+            {
+                method: 'item/reasoning/summaryPartAdded', expected: 'reasoning-summary-part', openItem: true,
+                params: { ...itemBase, summaryIndex: 0 }
+            },
+            {
+                method: 'item/reasoning/textDelta', expected: 'reasoning-delta', openItem: true,
+                params: { ...itemBase, contentIndex: 0, delta: '' }
+            },
+            {
+                method: 'item/fileChange/patchUpdated', expected: 'file-patch', openItem: true,
+                params: { ...itemBase, changes: [{ path: '', kind: { type: 'add' }, diff: '' }] }
+            },
+            {
+                method: 'turn/plan/updated', expected: 'turn-plan',
+                params: { ...base, plan: [{ step: '', status: 'pending' }] }
+            },
+            { method: 'turn/diff/updated', expected: 'turn-diff', params: { ...base, diff: '' } },
+            {
+                method: 'thread/tokenUsage/updated', expected: 'token-usage',
+                params: { ...base, tokenUsage: usage }
+            },
+            { method: 'warning', expected: 'warning', params: { message: '' } },
+            {
+                method: 'error', expected: 'error',
+                params: { ...base, error: { message: '' }, willRetry: false }
+            },
+            {
+                method: 'turn/completed', expected: 'turn-terminal',
+                params: { threadId: 'thread-1', turn: minimalTurn('turn-1', 'completed') }
+            }
+        ];
+
+        const collect = async (
+            method: string,
+            params: Record<string, unknown>,
+            openItem = false
+        ): Promise<readonly RideCodexUiEvent[]> => {
+            const host = new FakeTurnHost();
+            const scheduler = new FakeScheduler();
+            const events: RideCodexUiEvent[] = [];
+            const coordinator = new RideCodexTurnCoordinator({ host, scheduler });
+            const service = coordinator.connectClient({
+                turnEvents: wire => { events.push(...decodeBatch(wire).events); }
+            });
+            await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'fixture' }] });
+            while (scheduler.callbacks.length > 0) {
+                scheduler.flushOne();
+                await Promise.resolve();
+            }
+            events.length = 0;
+            if (openItem) {
+                host.emit('item/started', {
+                    ...base, startedAtMs: 0,
+                    item: { type: 'reasoning', id: 'item-1' }
+                });
+                while (scheduler.callbacks.length > 0) {
+                    scheduler.flushOne();
+                    await Promise.resolve();
+                }
+                events.length = 0;
+            }
+            host.emit(method, params);
+            while (scheduler.callbacks.length > 0) {
+                scheduler.flushOne();
+                await Promise.resolve();
+            }
+            await coordinator.dispose();
+            return events;
+        };
+
+        for (const fixture of fixtures) {
+            const valid = await collect(fixture.method, fixture.params, fixture.openItem);
+            assert.ok(valid.some(event => event.type === fixture.expected), `${fixture.method}: valid fixture`);
+            const malformed = await collect(
+                fixture.method,
+                { ...fixture.params, unknown: true },
+                fixture.openItem
+            );
+            assert.deepEqual(malformed, [], `${fixture.method}: unknown key must fail closed`);
+        }
+
+        assert.deepEqual(await collect('item/started', {
+            ...base, item: { type: 'agentMessage', id: 'item-1' }
+        }), [], 'item/started requires startedAtMs and a complete ThreadItem');
+        assert.deepEqual(await collect('item/started', {
+            ...base, startedAtMs: 0, item: { type: 'agentMessage', id: 'item-1' }
+        }), [], 'item/started rejects an agentMessage without text');
+        assert.deepEqual(await collect('thread/tokenUsage/updated', {
+            ...base,
+            tokenUsage: { total: { totalTokens: 1, inputTokens: 1, outputTokens: 0 } }
+        }), [], 'token usage requires last and the complete breakdown');
+    });
+
+    it('validates turn/started exactly before establishing a pending turn', async () => {
+        const collectBeforeResponse = async (params: Record<string, unknown>): Promise<readonly RideCodexUiEvent[]> => {
+            const host = new FakeTurnHost();
+            const scheduler = new FakeScheduler();
+            const events: RideCodexUiEvent[] = [];
+            let resolveStart!: (value: unknown) => void;
+            host.startPromise = new Promise(resolve => { resolveStart = resolve; });
+            const coordinator = new RideCodexTurnCoordinator({ host, scheduler });
+            const service = coordinator.connectClient({
+                turnEvents: wire => { events.push(...decodeBatch(wire).events); }
+            });
+            const starting = service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'fixture' }] });
+            await Promise.resolve();
+            await Promise.resolve();
+            host.emit('turn/started', params);
+            while (scheduler.callbacks.length > 0) {
+                scheduler.flushOne();
+                await Promise.resolve();
+            }
+            const beforeResponse = [...events];
+            resolveStart({ turn: minimalTurn('turn-1') });
+            await starting;
+            await coordinator.dispose();
+            return beforeResponse;
+        };
+
+        assert.deepEqual(await collectBeforeResponse({
+            threadId: 'thread-1', turn: minimalTurn('turn-1'), unknown: true
+        }), []);
+        assert.deepEqual(await collectBeforeResponse({
+            threadId: 'thread-1', turn: minimalTurn('turn-1')
+        }), [{ type: 'turn-started' }]);
+    });
+
+    it('accepts schema strings that have no minLength while retaining explicit non-empty constraints', async () => {
+        const host = new FakeTurnHost();
+        host.nextTurnId = '';
+        const scheduler = new FakeScheduler();
+        const batches: RideCodexEventBatch[] = [];
+        const coordinator = new RideCodexTurnCoordinator({ host, scheduler });
+        const service = coordinator.connectClient({
+            turnEvents: wire => { batches.push(decodeBatch(wire)); }
+        });
+        const result = await service.startTurn({
+            threadId: 'thread-1', input: [{ type: 'text', text: 'empty server id' }]
+        });
+        while (scheduler.callbacks.length > 0) {
+            scheduler.flushOne();
+            await Promise.resolve();
+        }
+        assert.equal(result.turnId, '');
+        assert.equal(batches[0]?.turnId, '');
+        assert.deepEqual(batches[0]?.events, [{ type: 'turn-started' }]);
+        await coordinator.dispose();
+
+        assert.equal(await acceptsTurnStartResponse({
+            ...minimalTurn(), items: [{ type: 'agentMessage', id: '', text: '' }]
+        }), true, 'ThreadItem.id has no minLength');
+        assert.equal(await acceptsTurnStartResponse({
+            ...minimalTurn(), items: [{ type: 'imageView', id: 'image-1', path: '' }]
+        }), true, 'ThreadItem path has no minLength');
+        assert.equal(await acceptsTurnStartResponse({
+            ...minimalTurn(),
+            items: [{ type: 'fileChange', id: 'file-1', status: 'inProgress', changes: [
+                { path: '', kind: { type: 'add' }, diff: '' }
+            ] }]
+        }), true, 'FileUpdateChange.path has no minLength');
+        assert.equal(await acceptsResumeResponse({
+            ...minimalResumeResponse(),
+            model: '', modelProvider: '', cwd: '',
+            thread: {
+                ...minimalThread(), sessionId: '', preview: '', modelProvider: '', cwd: '', cliVersion: ''
+            }
+        }), true, 'resume strings without minLength accept empty values');
+        assert.equal(await acceptsResumeResponse({
+            ...minimalResumeResponse(), reasoningEffort: ''
+        }), false, 'ReasoningEffort declares minLength 1');
     });
 });

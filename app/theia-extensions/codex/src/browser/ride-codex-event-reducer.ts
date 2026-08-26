@@ -506,6 +506,10 @@ export class RideCodexEventReducer {
         if (item.summaries[index] !== undefined) {
             return false;
         }
+        const slotBytes = (index + 1 - item.summaries.length) * RETAINED_ARRAY_SLOT_BYTES;
+        if (itemPayloadBytes(item) + slotBytes > this.#maxItemBytes) {
+            return this.#warnItemTruncated(id);
+        }
         while (item.summaries.length <= index) {
             item.summaries.push('');
         }
@@ -514,14 +518,17 @@ export class RideCodexEventReducer {
 
     #appendSummary(id: string, index: number, delta: string): boolean {
         const item = this.#item(id, 'reasoning');
-        this.#ensureSummary(id, index);
+        const allocated = this.#ensureSummary(id, index);
+        if (item.summaries.length <= index) {
+            return allocated;
+        }
         const current = item.summaries[index] ?? '';
         const combined = current + delta;
         const available = this.#availableItemBytes(item, utf8ByteLength(current));
         const next = truncateUtf8(combined, available);
         const warned = next !== combined && this.#warnItemTruncated(id);
         if (next === current) {
-            return warned;
+            return allocated || warned;
         }
         item.summaries[index] = next;
         return true;
@@ -529,8 +536,14 @@ export class RideCodexEventReducer {
 
     #appendReasoning(id: string, index: number, delta: string): boolean {
         const item = this.#item(id, 'reasoning');
+        let allocated = false;
+        const slotBytes = (index + 1 - item.reasoning.length) * RETAINED_ARRAY_SLOT_BYTES;
+        if (slotBytes > 0 && itemPayloadBytes(item) + slotBytes > this.#maxItemBytes) {
+            return this.#warnItemTruncated(id);
+        }
         while (item.reasoning.length <= index) {
             item.reasoning.push('');
+            allocated = true;
         }
         const current = item.reasoning[index] ?? '';
         const combined = current + delta;
@@ -538,7 +551,7 @@ export class RideCodexEventReducer {
         const next = truncateUtf8(combined, available);
         const warned = next !== combined && this.#warnItemTruncated(id);
         if (next === current) {
-            return warned;
+            return allocated || warned;
         }
         item.reasoning[index] = next;
         return true;
@@ -546,7 +559,7 @@ export class RideCodexEventReducer {
 
     #replaceChanges(id: string, changes: readonly RideCodexFileChange[]): boolean {
         const item = this.#item(id, 'file-change');
-        const available = this.#availableItemBytes(item, fileChangeStringBytes(item.changes));
+        const available = this.#availableItemBytes(item, fileChangePayloadBytes(item.changes));
         const bounded = boundFileChanges(changes, available);
         const changed = !sameFileChanges(item.changes, bounded.changes);
         item.changes = bounded.changes;
@@ -945,7 +958,7 @@ function isFileChange(value: unknown): value is RideCodexFileChange {
 }
 
 function isDisplayPath(value: unknown): value is string {
-    return typeof value === 'string' && value.length > 0
+    return typeof value === 'string'
         && utf8ByteLength(value) <= MAX_FILE_PATCH_PATH_BYTES
         && !/[\u0000-\u001f\u007f-\u009f]/u.test(value);
 }
@@ -969,7 +982,7 @@ function hasExactKeys(
 }
 
 function isIdentifier(value: unknown): value is string {
-    return typeof value === 'string' && value.length > 0
+    return typeof value === 'string'
         && utf8ByteLength(value) <= RIDE_CODEX_MAX_IDENTIFIER_BYTES;
 }
 
@@ -1029,9 +1042,14 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
 
 function itemPayloadBytes(item: MutableItem): number {
     return utf8ByteLength(item.text)
+        + (item.summaries.length + item.reasoning.length + item.changes.length) * RETAINED_ARRAY_SLOT_BYTES
         + item.summaries.reduce((sum, value) => sum + utf8ByteLength(value), 0)
         + item.reasoning.reduce((sum, value) => sum + utf8ByteLength(value), 0)
         + fileChangeStringBytes(item.changes);
+}
+
+function fileChangePayloadBytes(changes: readonly RideCodexFileChange[]): number {
+    return changes.length * RETAINED_ARRAY_SLOT_BYTES + fileChangeStringBytes(changes);
 }
 
 function fileChangeStringBytes(changes: readonly RideCodexFileChange[]): number {
@@ -1050,8 +1068,13 @@ function boundFileChanges(
     let remaining = maxBytes;
     let truncated = false;
     for (const change of changes) {
+        if (remaining < RETAINED_ARRAY_SLOT_BYTES) {
+            truncated = true;
+            break;
+        }
+        remaining -= RETAINED_ARRAY_SLOT_BYTES;
         const path = truncateUtf8(change.path, remaining);
-        if (path.length === 0) {
+        if (path.length === 0 && change.path.length > 0) {
             truncated = true;
             break;
         }
@@ -1088,7 +1111,7 @@ function boundFileChanges(
             path,
             kind: 'update',
             diff,
-            ...(movePath.length > 0 ? { movePath } : {})
+            ...(movePath.length > 0 || change.movePath.length === 0 ? { movePath } : {})
         });
     }
     if (bounded.length < changes.length) {

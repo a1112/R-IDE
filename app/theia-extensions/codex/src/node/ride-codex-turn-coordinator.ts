@@ -377,7 +377,7 @@ export class RideCodexTurnCoordinator {
             });
             const raw = await Promise.race([safePromise(lease.request('turn/steer', params)), active.invalidated]);
             const response = requireExactOptions(raw, ['turnId']);
-            const responseTurnId = requireIdentifier(ownValue(response, 'turnId'));
+            const responseTurnId = requireSchemaIdentifier(ownValue(response, 'turnId'));
             if (responseTurnId !== request.expectedTurnId || this.#active !== active || active.terminal) {
                 throw new RideCodexTurnError('operation-superseded');
             }
@@ -689,49 +689,54 @@ export class RideCodexTurnCoordinator {
     }
 
     #onTurnStarted(active: ActiveTurn, raw: unknown): void {
-        const params = requireRecord(raw);
-        if (requireIdentifier(ownValue(params, 'threadId')) !== active.threadId) {
+        const params = requireExactOptions(raw, ['threadId', 'turn']);
+        if (requireSchemaIdentifier(ownValue(params, 'threadId')) !== active.threadId) {
             return;
         }
-        const turn = requireRecord(ownValue(params, 'turn'));
-        this.#establishTurn(active, requireIdentifier(ownValue(turn, 'id')));
+        const turn = requireTurn(ownValue(params, 'turn'));
+        this.#establishTurn(active, turn.id);
     }
 
     #onTurnCompleted(active: ActiveTurn, raw: unknown): void {
-        const params = requireRecord(raw);
-        if (requireIdentifier(ownValue(params, 'threadId')) !== active.threadId) {
+        const params = requireExactOptions(raw, ['threadId', 'turn']);
+        if (requireSchemaIdentifier(ownValue(params, 'threadId')) !== active.threadId) {
             return;
         }
-        const turn = requireRecord(ownValue(params, 'turn'));
-        const turnId = requireIdentifier(ownValue(turn, 'id'));
-        if (active.turnId !== turnId) {
+        const turn = requireTurn(ownValue(params, 'turn'));
+        if (active.turnId !== turn.id) {
             return;
         }
-        const status = normalizeServerTurnStatus(ownValue(turn, 'status'));
-        if (status === 'in-progress') {
+        if (turn.status === 'in-progress') {
             return;
         }
-        this.#finishActive(status, status === 'failed' ? Object.freeze({
+        this.#finishActive(turn.status, turn.status === 'failed' ? Object.freeze({
             code: 'turn-error', message: 'Codex turn failed.'
         }) : undefined, undefined, true, true);
     }
 
     #onWarning(active: ActiveTurn, raw: unknown): void {
-        const params = requireRecord(raw);
-        const target = ownValue(params, 'threadId');
-        if (!isNullish(target) && requireIdentifier(target) !== active.threadId) {
+        const params = requireOptions(raw, ['threadId', 'message']);
+        requireRequiredKeys(params, ['message']);
+        if (hasOwn(params, 'threadId')) {
+            requireNullableIdentifier(ownValue(params, 'threadId'));
+        }
+        const target = hasOwn(params, 'threadId') ? ownValue(params, 'threadId') : undefined;
+        if (!isNullish(target) && requireSchemaIdentifier(target) !== active.threadId) {
             return;
         }
         this.#enqueueDiagnostic(Object.freeze({
             type: 'warning', code: 'server-warning',
-            message: sanitizeMessage(requireString(ownValue(params, 'message'), this.#maxItemBytes))
+            message: sanitizeMessage(requireBoundedText(ownValue(params, 'message'), this.#maxItemBytes))
         }));
     }
 
     #onActiveNotification(active: ActiveTurn, method: string, raw: unknown): void {
-        const params = requireRecord(raw);
-        const threadId = requireIdentifier(ownValue(params, 'threadId'));
-        const turnId = requireIdentifier(ownValue(params, 'turnId'));
+        const params = requireStableActiveNotification(method, raw);
+        if (!params) {
+            return;
+        }
+        const threadId = requireSchemaIdentifier(ownValue(params, 'threadId'));
+        const turnId = requireSchemaIdentifier(ownValue(params, 'turnId'));
         if (threadId !== active.threadId || turnId !== active.turnId) {
             return;
         }
@@ -739,7 +744,7 @@ export class RideCodexTurnCoordinator {
             case 'item/started':
             case 'item/completed': {
                 const item = requireRecord(ownValue(params, 'item'));
-                const itemId = requireIdentifier(ownValue(item, 'id'));
+                const itemId = requireSchemaIdentifier(ownValue(item, 'id'));
                 const itemKind = normalizeItemKind(ownValue(item, 'type'));
                 if (method === 'item/started') {
                     if (this.#retainedItems.has(itemId)) {
@@ -789,7 +794,7 @@ export class RideCodexTurnCoordinator {
                 this.#enqueueDelta('file-output', params);
                 return;
             case 'item/reasoning/summaryTextDelta': {
-                const itemId = requireIdentifier(ownValue(params, 'itemId'));
+                const itemId = requireSchemaIdentifier(ownValue(params, 'itemId'));
                 if (this.#retainedItems.get(itemId)?.state !== 'started') {
                     return;
                 }
@@ -806,12 +811,12 @@ export class RideCodexTurnCoordinator {
                 }
                 this.#enqueue(Object.freeze({
                     type: 'reasoning-summary-part',
-                    itemId: requireIdentifier(ownValue(params, 'itemId')),
+                    itemId: requireSchemaIdentifier(ownValue(params, 'itemId')),
                     summaryIndex: requireIndex(ownValue(params, 'summaryIndex'))
                 }));
                 return;
             case 'item/reasoning/textDelta': {
-                const itemId = requireIdentifier(ownValue(params, 'itemId'));
+                const itemId = requireSchemaIdentifier(ownValue(params, 'itemId'));
                 if (this.#retainedItems.get(itemId)?.state !== 'started') {
                     return;
                 }
@@ -823,30 +828,27 @@ export class RideCodexTurnCoordinator {
                 return;
             }
             case 'item/fileChange/patchUpdated': {
-                const patchParams = requireOptions(params, ['threadId', 'turnId', 'itemId', 'changes']);
-                if (!this.#isItemOpen(patchParams)) {
+                if (!this.#isItemOpen(params)) {
                     return;
                 }
                 this.#enqueue(Object.freeze({
                     type: 'file-patch',
-                    itemId: requireIdentifier(ownValue(patchParams, 'itemId')),
-                    changes: normalizeFileChanges(ownValue(patchParams, 'changes'), this.#maxRetainedItems)
+                    itemId: requireSchemaIdentifier(ownValue(params, 'itemId')),
+                    changes: normalizeFileChanges(ownValue(params, 'changes'), this.#maxRetainedItems)
                 }));
                 return;
             }
             case 'turn/plan/updated': {
-                const planParams = requireExactOptions(params, ['threadId', 'turnId', 'explanation', 'plan']);
                 this.#enqueue(Object.freeze({
                     type: 'turn-plan',
-                    ...normalizeExplanation(planParams, this.#maxItemBytes),
-                    steps: normalizePlan(ownValue(planParams, 'plan'), this.#maxRetainedItems)
+                    ...normalizeExplanation(params, this.#maxItemBytes),
+                    steps: normalizePlan(ownValue(params, 'plan'), this.#maxRetainedItems)
                 }));
                 return;
             }
             case 'turn/diff/updated': {
-                const diffParams = requireExactOptions(params, ['threadId', 'turnId', 'diff']);
                 this.#enqueue(Object.freeze({
-                    type: 'turn-diff', diff: requireBoundedText(ownValue(diffParams, 'diff'), this.#maxItemBytes)
+                    type: 'turn-diff', diff: requireBoundedText(ownValue(params, 'diff'), this.#maxItemBytes)
                 }));
                 return;
             }
@@ -867,13 +869,13 @@ export class RideCodexTurnCoordinator {
     #enqueueDelta(type: 'agent-delta' | 'plan-delta' | 'command-output' | 'file-output', params: Record<string, unknown>): void {
         this.#enqueueCoalesced(Object.freeze({
             type,
-            itemId: requireIdentifier(ownValue(params, 'itemId')),
+            itemId: requireSchemaIdentifier(ownValue(params, 'itemId')),
             delta: this.#boundedStreamText(ownValue(params, 'delta'))
         }));
     }
 
     #boundedStreamText(value: unknown): string {
-        const raw = requireString(value, MAX_INPUT_TEXT_BYTES);
+        const raw = requireBoundedText(value, MAX_INPUT_TEXT_BYTES);
         const bounded = truncateUtf8(raw, this.#maxItemBytes);
         if (bounded !== raw) {
             this.#enqueueDiagnostic(Object.freeze({
@@ -886,7 +888,7 @@ export class RideCodexTurnCoordinator {
     }
 
     #isItemOpen(params: Record<string, unknown>): boolean {
-        const itemId = requireIdentifier(ownValue(params, 'itemId'));
+        const itemId = requireSchemaIdentifier(ownValue(params, 'itemId'));
         return this.#retainedItems.get(itemId)?.state === 'started';
     }
 
@@ -1461,6 +1463,78 @@ function requireExactOptions(value: unknown, keys: readonly string[]): Record<st
     return record;
 }
 
+function requireStableActiveNotification(method: string, value: unknown): Record<string, unknown> | undefined {
+    let params: Record<string, unknown>;
+    switch (method) {
+        case 'item/started':
+            params = requireExactOptions(value, ['item', 'startedAtMs', 'threadId', 'turnId']);
+            requireStableThreadItem(ownValue(params, 'item'));
+            requireJsonInt64(ownValue(params, 'startedAtMs'));
+            break;
+        case 'item/completed':
+            params = requireExactOptions(value, ['completedAtMs', 'item', 'threadId', 'turnId']);
+            requireStableThreadItem(ownValue(params, 'item'));
+            requireJsonInt64(ownValue(params, 'completedAtMs'));
+            break;
+        case 'item/agentMessage/delta':
+        case 'item/plan/delta':
+        case 'item/commandExecution/outputDelta':
+        case 'item/fileChange/outputDelta':
+            params = requireExactOptions(value, ['delta', 'itemId', 'threadId', 'turnId']);
+            requireSchemaIdentifier(ownValue(params, 'itemId'));
+            requireBoundedText(ownValue(params, 'delta'), MAX_INPUT_TEXT_BYTES);
+            break;
+        case 'item/reasoning/summaryTextDelta':
+            params = requireExactOptions(value, ['delta', 'itemId', 'summaryIndex', 'threadId', 'turnId']);
+            requireSchemaIdentifier(ownValue(params, 'itemId'));
+            requireBoundedText(ownValue(params, 'delta'), MAX_INPUT_TEXT_BYTES);
+            requireJsonInt64(ownValue(params, 'summaryIndex'));
+            break;
+        case 'item/reasoning/summaryPartAdded':
+            params = requireExactOptions(value, ['itemId', 'summaryIndex', 'threadId', 'turnId']);
+            requireSchemaIdentifier(ownValue(params, 'itemId'));
+            requireJsonInt64(ownValue(params, 'summaryIndex'));
+            break;
+        case 'item/reasoning/textDelta':
+            params = requireExactOptions(value, ['contentIndex', 'delta', 'itemId', 'threadId', 'turnId']);
+            requireSchemaIdentifier(ownValue(params, 'itemId'));
+            requireBoundedText(ownValue(params, 'delta'), MAX_INPUT_TEXT_BYTES);
+            requireJsonInt64(ownValue(params, 'contentIndex'));
+            break;
+        case 'item/fileChange/patchUpdated':
+            params = requireExactOptions(value, ['changes', 'itemId', 'threadId', 'turnId']);
+            requireSchemaIdentifier(ownValue(params, 'itemId'));
+            normalizeFileChanges(ownValue(params, 'changes'), MAX_RAW_ARRAY);
+            break;
+        case 'turn/plan/updated':
+            params = requireOptions(value, ['explanation', 'plan', 'threadId', 'turnId']);
+            requireRequiredKeys(params, ['plan', 'threadId', 'turnId']);
+            if (hasOwn(params, 'explanation')) {
+                requireNullableText(ownValue(params, 'explanation'), MAX_INPUT_TEXT_BYTES);
+            }
+            normalizePlan(ownValue(params, 'plan'), MAX_RAW_ARRAY);
+            break;
+        case 'turn/diff/updated':
+            params = requireExactOptions(value, ['diff', 'threadId', 'turnId']);
+            requireBoundedText(ownValue(params, 'diff'), MAX_INPUT_TEXT_BYTES);
+            break;
+        case 'thread/tokenUsage/updated':
+            params = requireExactOptions(value, ['threadId', 'tokenUsage', 'turnId']);
+            normalizeTokenUsage(ownValue(params, 'tokenUsage'));
+            break;
+        case 'error':
+            params = requireExactOptions(value, ['error', 'threadId', 'turnId', 'willRetry']);
+            requireTurnError(ownValue(params, 'error'));
+            requireBoolean(ownValue(params, 'willRetry'));
+            break;
+        default:
+            return undefined;
+    }
+    requireSchemaIdentifier(ownValue(params, 'threadId'));
+    requireSchemaIdentifier(ownValue(params, 'turnId'));
+    return params;
+}
+
 function requireTurn(value: unknown): Readonly<{
     id: string;
     status: 'in-progress' | RideCodexTurnTerminalStatus;
@@ -1493,7 +1567,7 @@ function requireTurn(value: unknown): Readonly<{
         requireNullableJsonInt64(ownValue(turn, 'durationMs'));
     }
     return Object.freeze({
-        id: requireIdentifier(ownValue(turn, 'id')),
+        id: requireSchemaIdentifier(ownValue(turn, 'id')),
         status: normalizeServerTurnStatus(ownValue(turn, 'status'))
     });
 }
@@ -1504,13 +1578,13 @@ function requireStableThreadItem(value: unknown): void {
     switch (type) {
         case 'contextCompaction': {
             const item = requireExactOptions(record, ['type', 'id']);
-            requireIdentifier(ownValue(item, 'id'));
+            requireSchemaIdentifier(ownValue(item, 'id'));
             return;
         }
         case 'agentMessage': {
             const item = requireOptions(record, ['type', 'id', 'text', 'phase', 'memoryCitation']);
             requireRequiredKeys(item, ['type', 'id', 'text']);
-            requireIdentifier(ownValue(item, 'id'));
+            requireSchemaIdentifier(ownValue(item, 'id'));
             requireBoundedText(ownValue(item, 'text'), MAX_INPUT_TEXT_BYTES);
             if (hasOwn(item, 'phase')) {
                 requireNullableEnum(ownValue(item, 'phase'), ['commentary', 'final_answer']);
@@ -1522,14 +1596,14 @@ function requireStableThreadItem(value: unknown): void {
         }
         case 'plan': {
             const item = requireExactOptions(record, ['type', 'id', 'text']);
-            requireIdentifier(ownValue(item, 'id'));
+            requireSchemaIdentifier(ownValue(item, 'id'));
             requireBoundedText(ownValue(item, 'text'), MAX_INPUT_TEXT_BYTES);
             return;
         }
         case 'reasoning': {
             const item = requireOptions(record, ['type', 'id', 'summary', 'content']);
             requireRequiredKeys(item, ['type', 'id']);
-            requireIdentifier(ownValue(item, 'id'));
+            requireSchemaIdentifier(ownValue(item, 'id'));
             if (hasOwn(item, 'summary')) {
                 requireStringArray(ownValue(item, 'summary'), MAX_RAW_ARRAY, MAX_INPUT_TEXT_BYTES, true);
             }
@@ -1544,9 +1618,9 @@ function requireStableThreadItem(value: unknown): void {
                 'aggregatedOutput', 'exitCode', 'durationMs'
             ]);
             requireRequiredKeys(item, ['type', 'id', 'command', 'cwd', 'status', 'commandActions']);
-            requireIdentifier(ownValue(item, 'id'));
+            requireSchemaIdentifier(ownValue(item, 'id'));
             requireBoundedText(ownValue(item, 'command'), MAX_INPUT_TEXT_BYTES);
-            requireString(ownValue(item, 'cwd'), MAX_LOCAL_PATH_BYTES);
+            requireBoundedText(ownValue(item, 'cwd'), MAX_LOCAL_PATH_BYTES);
             if (hasOwn(item, 'processId')) {
                 requireNullableIdentifier(ownValue(item, 'processId'));
             }
@@ -1572,7 +1646,7 @@ function requireStableThreadItem(value: unknown): void {
         }
         case 'fileChange': {
             const item = requireExactOptions(record, ['type', 'id', 'changes', 'status']);
-            requireIdentifier(ownValue(item, 'id'));
+            requireSchemaIdentifier(ownValue(item, 'id'));
             normalizeFileChanges(ownValue(item, 'changes'), MAX_RAW_ARRAY);
             if (!['inProgress', 'completed', 'failed', 'declined'].includes(ownValue(item, 'status') as string)) {
                 throw new RideCodexTurnError('invalid-data');
@@ -1582,7 +1656,7 @@ function requireStableThreadItem(value: unknown): void {
         case 'userMessage': {
             const item = requireOptions(record, ['type', 'id', 'clientId', 'content']);
             requireRequiredKeys(item, ['type', 'id', 'content']);
-            requireIdentifier(ownValue(item, 'id'));
+            requireSchemaIdentifier(ownValue(item, 'id'));
             if (hasOwn(item, 'clientId')) {
                 requireNullableIdentifier(ownValue(item, 'clientId'));
             }
@@ -1597,11 +1671,11 @@ function requireStableThreadItem(value: unknown): void {
         }
         case 'hookPrompt': {
             const item = requireExactOptions(record, ['type', 'id', 'fragments']);
-            requireIdentifier(ownValue(item, 'id'));
+            requireSchemaIdentifier(ownValue(item, 'id'));
             for (const fragment of requireBoundedArray(ownValue(item, 'fragments'))) {
                 const stable = requireExactOptions(fragment, ['text', 'hookRunId']);
                 requireBoundedText(ownValue(stable, 'text'), MAX_INPUT_TEXT_BYTES);
-                requireString(ownValue(stable, 'hookRunId'), MAX_IDENTIFIER_BYTES);
+                requireBoundedText(ownValue(stable, 'hookRunId'), MAX_IDENTIFIER_BYTES);
             }
             return;
         }
@@ -1616,11 +1690,11 @@ function requireStableThreadItem(value: unknown): void {
             return;
         case 'subAgentActivity': {
             const item = requireExactOptions(record, ['type', 'id', 'kind', 'agentThreadId', 'agentPath']);
-            requireIdentifier(ownValue(item, 'id'));
+            requireSchemaIdentifier(ownValue(item, 'id'));
             if (!['started', 'interacted', 'interrupted'].includes(ownValue(item, 'kind') as string)) {
                 throw new RideCodexTurnError('invalid-data');
             }
-            requireIdentifier(ownValue(item, 'agentThreadId'));
+            requireSchemaIdentifier(ownValue(item, 'agentThreadId'));
             requireBoundedText(ownValue(item, 'agentPath'), MAX_LOCAL_PATH_BYTES);
             return;
         }
@@ -1629,13 +1703,13 @@ function requireStableThreadItem(value: unknown): void {
             return;
         case 'imageView': {
             const item = requireExactOptions(record, ['type', 'id', 'path']);
-            requireIdentifier(ownValue(item, 'id'));
+            requireSchemaIdentifier(ownValue(item, 'id'));
             requireBoundedText(ownValue(item, 'path'), MAX_LOCAL_PATH_BYTES);
             return;
         }
         case 'sleep': {
             const item = requireExactOptions(record, ['type', 'id', 'durationMs']);
-            requireIdentifier(ownValue(item, 'id'));
+            requireSchemaIdentifier(ownValue(item, 'id'));
             requireJsonUint64(ownValue(item, 'durationMs'));
             return;
         }
@@ -1645,7 +1719,7 @@ function requireStableThreadItem(value: unknown): void {
         case 'enteredReviewMode':
         case 'exitedReviewMode': {
             const item = requireExactOptions(record, ['type', 'id', 'review']);
-            requireIdentifier(ownValue(item, 'id'));
+            requireSchemaIdentifier(ownValue(item, 'id'));
             requireBoundedText(ownValue(item, 'review'), MAX_INPUT_TEXT_BYTES);
             return;
         }
@@ -1671,22 +1745,22 @@ function requireStableUserInput(value: unknown): void {
         case 'image': {
             const image = requireOptions(input, ['type', 'detail', 'url']);
             requireRequiredKeys(image, ['type', 'url']);
-            requireString(ownValue(image, 'url'), MAX_LOCAL_PATH_BYTES);
+            requireBoundedText(ownValue(image, 'url'), MAX_LOCAL_PATH_BYTES);
             requireOptionalImageDetail(image);
             return;
         }
         case 'localImage': {
             const image = requireOptions(input, ['type', 'detail', 'path']);
             requireRequiredKeys(image, ['type', 'path']);
-            requireString(ownValue(image, 'path'), MAX_LOCAL_PATH_BYTES);
+            requireBoundedText(ownValue(image, 'path'), MAX_LOCAL_PATH_BYTES);
             requireOptionalImageDetail(image);
             return;
         }
         case 'skill':
         case 'mention': {
             const reference = requireExactOptions(input, ['type', 'name', 'path']);
-            requireString(ownValue(reference, 'name'), MAX_IDENTIFIER_BYTES);
-            requireString(ownValue(reference, 'path'), MAX_LOCAL_PATH_BYTES);
+            requireBoundedText(ownValue(reference, 'name'), MAX_IDENTIFIER_BYTES);
+            requireBoundedText(ownValue(reference, 'path'), MAX_LOCAL_PATH_BYTES);
             return;
         }
         default:
@@ -1736,7 +1810,7 @@ function requireCommandAction(value: unknown): void {
             const read = requireExactOptions(action, ['type', 'command', 'name', 'path']);
             requireBoundedText(ownValue(read, 'command'), MAX_INPUT_TEXT_BYTES);
             requireBoundedText(ownValue(read, 'name'), MAX_IDENTIFIER_BYTES);
-            requireString(ownValue(read, 'path'), MAX_LOCAL_PATH_BYTES);
+            requireBoundedText(ownValue(read, 'path'), MAX_LOCAL_PATH_BYTES);
             return;
         }
         case 'listFiles': {
@@ -1778,7 +1852,7 @@ function requireMcpToolCall(value: unknown): void {
     requireRequiredKeys(item, [
         'type', 'id', 'server', 'tool', 'status', 'arguments'
     ]);
-    requireIdentifier(ownValue(item, 'id'));
+    requireSchemaIdentifier(ownValue(item, 'id'));
     requireBoundedText(ownValue(item, 'server'), MAX_IDENTIFIER_BYTES);
     requireBoundedText(ownValue(item, 'tool'), MAX_IDENTIFIER_BYTES);
     requireEnum(ownValue(item, 'status'), ['inProgress', 'completed', 'failed']);
@@ -1861,7 +1935,7 @@ function requireDynamicToolCall(value: unknown): void {
         'type', 'id', 'namespace', 'tool', 'arguments', 'status', 'contentItems', 'success', 'durationMs'
     ]);
     requireRequiredKeys(item, ['type', 'id', 'tool', 'arguments', 'status']);
-    requireIdentifier(ownValue(item, 'id'));
+    requireSchemaIdentifier(ownValue(item, 'id'));
     if (hasOwn(item, 'namespace')) {
         requireNullableText(ownValue(item, 'namespace'), MAX_IDENTIFIER_BYTES);
     }
@@ -1906,11 +1980,11 @@ function requireCollabAgentToolCall(value: unknown): void {
     requireRequiredKeys(item, [
         'type', 'id', 'tool', 'status', 'senderThreadId', 'receiverThreadIds', 'agentsStates'
     ]);
-    requireIdentifier(ownValue(item, 'id'));
+    requireSchemaIdentifier(ownValue(item, 'id'));
     requireEnum(ownValue(item, 'tool'), ['spawnAgent', 'sendInput', 'resumeAgent', 'wait', 'closeAgent']);
     requireEnum(ownValue(item, 'status'), ['inProgress', 'completed', 'failed']);
-    requireIdentifier(ownValue(item, 'senderThreadId'));
-    requireStringArray(ownValue(item, 'receiverThreadIds'), MAX_RAW_ARRAY, MAX_IDENTIFIER_BYTES, false);
+    requireSchemaIdentifier(ownValue(item, 'senderThreadId'));
+    requireStringArray(ownValue(item, 'receiverThreadIds'), MAX_RAW_ARRAY, MAX_IDENTIFIER_BYTES, true);
     if (hasOwn(item, 'prompt')) {
         requireNullableText(ownValue(item, 'prompt'), MAX_INPUT_TEXT_BYTES);
     }
@@ -1922,7 +1996,7 @@ function requireCollabAgentToolCall(value: unknown): void {
     }
     const states = requireRecord(ownValue(item, 'agentsStates'));
     for (const [threadId, rawState] of Object.entries(states)) {
-        requireIdentifier(threadId);
+        requireSchemaIdentifier(threadId);
         const state = requireOptions(rawState, ['status', 'message']);
         requireRequiredKeys(state, ['status']);
         requireEnum(ownValue(state, 'status'), [
@@ -1937,7 +2011,7 @@ function requireCollabAgentToolCall(value: unknown): void {
 function requireWebSearchItem(value: unknown): void {
     const item = requireOptions(value, ['type', 'id', 'query', 'action']);
     requireRequiredKeys(item, ['type', 'id', 'query']);
-    requireIdentifier(ownValue(item, 'id'));
+    requireSchemaIdentifier(ownValue(item, 'id'));
     requireBoundedText(ownValue(item, 'query'), MAX_INPUT_TEXT_BYTES);
     const rawAction = ownValue(item, 'action');
     if (!hasOwn(item, 'action')) {
@@ -2000,7 +2074,7 @@ function requireWebSearchItem(value: unknown): void {
 function requireImageGenerationItem(value: unknown): void {
     const item = requireOptions(value, ['type', 'id', 'status', 'revisedPrompt', 'result', 'savedPath']);
     requireRequiredKeys(item, ['type', 'id', 'status', 'result']);
-    requireIdentifier(ownValue(item, 'id'));
+    requireSchemaIdentifier(ownValue(item, 'id'));
     requireBoundedText(ownValue(item, 'status'), MAX_IDENTIFIER_BYTES);
     if (hasOwn(item, 'revisedPrompt')) {
         requireNullableText(ownValue(item, 'revisedPrompt'), MAX_INPUT_TEXT_BYTES);
@@ -2124,12 +2198,12 @@ function requireThreadResumeResponse(value: unknown, expectedThreadId: string): 
     if (threadId !== expectedThreadId) {
         throw new RideCodexTurnError('invalid-data');
     }
-    requireString(ownValue(response, 'model'), MAX_IDENTIFIER_BYTES);
-    requireString(ownValue(response, 'modelProvider'), MAX_IDENTIFIER_BYTES);
+    requireBoundedText(ownValue(response, 'model'), MAX_IDENTIFIER_BYTES);
+    requireBoundedText(ownValue(response, 'modelProvider'), MAX_IDENTIFIER_BYTES);
     if (hasOwn(response, 'serviceTier')) {
         requireNullableText(ownValue(response, 'serviceTier'), MAX_IDENTIFIER_BYTES);
     }
-    requireString(ownValue(response, 'cwd'), MAX_LOCAL_PATH_BYTES);
+    requireBoundedText(ownValue(response, 'cwd'), MAX_LOCAL_PATH_BYTES);
     if (hasOwn(response, 'instructionSources')) {
         requireStringArray(ownValue(response, 'instructionSources'), MAX_RAW_ARRAY, MAX_LOCAL_PATH_BYTES, true);
     }
@@ -2139,7 +2213,7 @@ function requireThreadResumeResponse(value: unknown, expectedThreadId: string): 
     }
     requireSandboxPolicy(ownValue(response, 'sandbox'));
     if (hasOwn(response, 'reasoningEffort')) {
-        requireNullableIdentifier(ownValue(response, 'reasoningEffort'));
+        requireNullableNonEmptyString(ownValue(response, 'reasoningEffort'), MAX_IDENTIFIER_BYTES);
     }
 }
 
@@ -2153,8 +2227,8 @@ function requireThread(value: unknown): string {
         'id', 'sessionId', 'preview', 'ephemeral', 'modelProvider', 'createdAt', 'updatedAt',
         'status', 'cwd', 'cliVersion', 'source', 'turns'
     ]);
-    const id = requireIdentifier(ownValue(thread, 'id'));
-    requireIdentifier(ownValue(thread, 'sessionId'));
+    const id = requireSchemaIdentifier(ownValue(thread, 'id'));
+    requireSchemaIdentifier(ownValue(thread, 'sessionId'));
     if (hasOwn(thread, 'forkedFromId')) {
         requireNullableIdentifier(ownValue(thread, 'forkedFromId'));
     }
@@ -2165,7 +2239,7 @@ function requireThread(value: unknown): string {
     if (typeof ownValue(thread, 'ephemeral') !== 'boolean') {
         throw new RideCodexTurnError('invalid-data');
     }
-    requireString(ownValue(thread, 'modelProvider'), MAX_IDENTIFIER_BYTES);
+    requireBoundedText(ownValue(thread, 'modelProvider'), MAX_IDENTIFIER_BYTES);
     requireJsonInt64(ownValue(thread, 'createdAt'));
     requireJsonInt64(ownValue(thread, 'updatedAt'));
     if (hasOwn(thread, 'recencyAt')) {
@@ -2175,8 +2249,8 @@ function requireThread(value: unknown): string {
     if (hasOwn(thread, 'path')) {
         requireNullableText(ownValue(thread, 'path'), MAX_LOCAL_PATH_BYTES);
     }
-    requireString(ownValue(thread, 'cwd'), MAX_LOCAL_PATH_BYTES);
-    requireString(ownValue(thread, 'cliVersion'), MAX_IDENTIFIER_BYTES);
+    requireBoundedText(ownValue(thread, 'cwd'), MAX_LOCAL_PATH_BYTES);
+    requireBoundedText(ownValue(thread, 'cliVersion'), MAX_IDENTIFIER_BYTES);
     requireSessionSource(ownValue(thread, 'source'));
     if (hasOwn(thread, 'threadSource')) {
         requireNullableText(ownValue(thread, 'threadSource'), MAX_IDENTIFIER_BYTES);
@@ -2261,7 +2335,7 @@ function requireSubAgentSource(value: unknown): void {
         'parent_thread_id', 'depth', 'agent_path', 'agent_nickname', 'agent_role'
     ]);
     requireRequiredKeys(spawn, ['parent_thread_id', 'depth']);
-    requireIdentifier(ownValue(spawn, 'parent_thread_id'));
+    requireSchemaIdentifier(ownValue(spawn, 'parent_thread_id'));
     requireInt32(ownValue(spawn, 'depth'));
     if (hasOwn(spawn, 'agent_path')) {
         requireNullableText(ownValue(spawn, 'agent_path'), MAX_LOCAL_PATH_BYTES);
@@ -2401,7 +2475,17 @@ function requireNullableIdentifier(value: unknown): void {
         }
         return;
     }
-    requireIdentifier(value);
+    requireSchemaIdentifier(value);
+}
+
+function requireNullableNonEmptyString(value: unknown, maxBytes: number): void {
+    if (isNullish(value)) {
+        if (value === undefined) {
+            throw new RideCodexTurnError('invalid-data');
+        }
+        return;
+    }
+    requireString(value, maxBytes);
 }
 
 function requireJsonInt64(value: unknown): number {
@@ -2595,6 +2679,10 @@ function requireIdentifier(value: unknown): string {
     return requireString(value, MAX_IDENTIFIER_BYTES);
 }
 
+function requireSchemaIdentifier(value: unknown): string {
+    return requireBoundedText(value, MAX_IDENTIFIER_BYTES);
+}
+
 function requireString(value: unknown, maxBytes: number): string {
     if (typeof value !== 'string' || value.length === 0 || utf8ByteLength(value) > maxBytes) {
         throw new RideCodexTurnError('invalid-data');
@@ -2671,7 +2759,7 @@ function normalizeFileChanges(value: unknown, limit: number): readonly RideCodex
 }
 
 function requireDisplayPath(value: unknown): string {
-    const path = requireString(value, MAX_LOCAL_PATH_BYTES);
+    const path = requireBoundedText(value, MAX_LOCAL_PATH_BYTES);
     if (/[\u0000-\u001f\u007f-\u009f]/u.test(path)) {
         throw new RideCodexTurnError('invalid-data');
     }
@@ -2707,22 +2795,39 @@ function normalizePlan(value: unknown, limit: number): readonly RideCodexPlanSte
 }
 
 function normalizeExplanation(record: Record<string, unknown>, maxBytes: number): { explanation?: string } {
-    const value = ownValue(record, 'explanation');
-    if (value === undefined) {
-        throw new RideCodexTurnError('invalid-data');
+    if (!hasOwn(record, 'explanation')) {
+        return {};
     }
+    const value = ownValue(record, 'explanation');
     return isNullish(value) ? {} : { explanation: requireBoundedText(value, maxBytes) };
 }
 
 function normalizeTokenUsage(value: unknown): Extract<RideCodexUiEvent, { type: 'token-usage' }> {
-    const usage = requireRecord(value);
-    const total = requireRecord(ownValue(usage, 'total'));
+    const usage = requireOptions(value, ['last', 'modelContextWindow', 'total']);
+    requireRequiredKeys(usage, ['last', 'total']);
+    const total = requireTokenUsageBreakdown(ownValue(usage, 'total'));
+    requireTokenUsageBreakdown(ownValue(usage, 'last'));
+    if (hasOwn(usage, 'modelContextWindow')) {
+        requireNullableJsonInt64(ownValue(usage, 'modelContextWindow'));
+    }
     return Object.freeze({
         type: 'token-usage',
         totalTokens: requireNonNegativeInteger(ownValue(total, 'totalTokens')),
         inputTokens: requireNonNegativeInteger(ownValue(total, 'inputTokens')),
         outputTokens: requireNonNegativeInteger(ownValue(total, 'outputTokens'))
     });
+}
+
+function requireTokenUsageBreakdown(value: unknown): Record<string, unknown> {
+    const breakdown = requireExactOptions(value, [
+        'cachedInputTokens', 'inputTokens', 'outputTokens', 'reasoningOutputTokens', 'totalTokens'
+    ]);
+    for (const key of [
+        'cachedInputTokens', 'inputTokens', 'outputTokens', 'reasoningOutputTokens', 'totalTokens'
+    ] as const) {
+        requireJsonInt64(ownValue(breakdown, key));
+    }
+    return breakdown;
 }
 
 function requireNonNegativeInteger(value: unknown): number {
