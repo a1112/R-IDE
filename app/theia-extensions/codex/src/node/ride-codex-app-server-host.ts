@@ -81,6 +81,11 @@ export interface RideCodexAppServerHostSnapshot {
     readonly diagnostics: RideCodexAppServerDiagnosticSnapshot;
 }
 
+export interface RideCodexAppServerHostStateEvent {
+    readonly state: RideCodexAppServerState;
+    readonly generation: number;
+}
+
 export type RideCodexAppServerHostErrorCode =
     | RideCodexAppServerDiagnosticCode
     | 'disposed'
@@ -174,7 +179,8 @@ export class RideCodexAppServerHost {
     readonly #idleTimeoutMs: number;
     readonly #shutdownGraceMs: number;
     readonly #leases = new Map<number, LeaseRecord>();
-    readonly #notificationListeners = new Set<(notification: RideCodexNotification) => void>();
+    readonly #notificationListeners = new Set<(notification: RideCodexNotification, generation: number) => void>();
+    readonly #stateListeners = new Set<(event: RideCodexAppServerHostStateEvent) => void>();
     readonly #serverRequestListeners = new Set<(request: RideCodexIncomingRequest) => void>();
     #state: RideCodexAppServerState = 'stopped';
     #generation = 0;
@@ -244,22 +250,35 @@ export class RideCodexAppServerHost {
                 await this.#stopConnection(owned, 'retry');
             } catch {
                 if (!this.#disposed) {
-                    this.#state = 'circuit-open';
+                    this.#setState('circuit-open');
                 }
                 throw new RideCodexAppServerHostError('shutdown-timeout');
             }
         }
         this.#restartAttempts = 0;
         if (this.#state === 'circuit-open') {
-            this.#state = 'stopped';
+            this.#setState('stopped');
         }
         if (this.#leases.size > 0) {
             await this.#ensureStarted(false);
         }
     }
 
-    onNotification(listener: (notification: RideCodexNotification) => void): RideCodexDisposable {
-        return addListener(this.#notificationListeners, listener);
+    onNotification(listener: (notification: RideCodexNotification, generation: number) => void): RideCodexDisposable {
+        this.#notificationListeners.add(listener);
+        let disposed = false;
+        return {
+            dispose: () => {
+                if (!disposed) {
+                    disposed = true;
+                    this.#notificationListeners.delete(listener);
+                }
+            }
+        };
+    }
+
+    onStateChange(listener: (event: RideCodexAppServerHostStateEvent) => void): RideCodexDisposable {
+        return addListener(this.#stateListeners, listener);
     }
 
     onServerRequest(listener: (request: RideCodexIncomingRequest) => void): RideCodexDisposable {
@@ -284,7 +303,7 @@ export class RideCodexAppServerHost {
             return this.#disposePromise;
         }
         this.#disposed = true;
-        this.#state = 'disposed';
+        this.#setState('disposed');
         this.#cancelIdleTimer();
         for (const record of this.#leases.values()) {
             record.released = true;
@@ -292,6 +311,7 @@ export class RideCodexAppServerHost {
         this.#leases.clear();
         this.#unsafeApprovalCount = 0;
         this.#notificationListeners.clear();
+        this.#stateListeners.clear();
         this.#serverRequestListeners.clear();
 
         const operation = (async () => {
@@ -307,7 +327,7 @@ export class RideCodexAppServerHost {
             if (connectionAfterStart && connectionAfterStart !== current) {
                 await this.#stopConnectionForDisposal(connectionAfterStart);
             }
-            this.#state = 'disposed';
+            this.#setState('disposed');
         })();
         this.#disposePromise = operation;
         return operation;
@@ -412,13 +432,13 @@ export class RideCodexAppServerHost {
         }
         if (this.#connection && !this.#connection.finalized) {
             if (!this.#disposed) {
-                this.#state = 'circuit-open';
+                this.#setState('circuit-open');
             }
             throw new RideCodexAppServerHostError('circuit-open');
         }
-        this.#state = restarting ? 'restarting' : 'starting';
         const generation = this.#generation + 1;
         this.#generation = generation;
+        this.#setState(restarting ? 'restarting' : 'starting', true);
         const operation = this.#startGeneration(generation);
         let tracked!: Promise<Connection>;
         tracked = operation.then(
@@ -467,7 +487,7 @@ export class RideCodexAppServerHost {
                 throw new RideCodexAppServerHostError(this.#disposed ? 'disposed' : 'early-exit');
             }
             connection.ready = true;
-            this.#state = 'ready';
+            this.#setState('ready');
             return connection;
         } catch (error) {
             const safe = classifyStartupError(error, connection);
@@ -477,7 +497,7 @@ export class RideCodexAppServerHost {
                 await terminateUnpublishedChild(child, this.#shutdownGraceMs);
             }
             if (!this.#disposed && this.#state !== 'circuit-open') {
-                this.#state = 'stopped';
+                this.#setState('stopped');
             }
             if (safe.code !== 'disposed' && safe.code !== 'lease-released') {
                 this.diagnostics.record(safe.code);
@@ -504,7 +524,7 @@ export class RideCodexAppServerHost {
             stderrErrorRegistered = true;
             child.stderr.resume();
             clientListeners.push(
-                client.onNotification(notification => this.#emitSafely(this.#notificationListeners, notification)),
+                client.onNotification(notification => this.#emitNotification(notification, generation)),
                 client.onServerRequest(request => this.#emitSafely(this.#serverRequestListeners, request))
             );
         } catch (error) {
@@ -578,18 +598,18 @@ export class RideCodexAppServerHost {
             }
             this.#connection = undefined;
             if (this.#disposed) {
-                this.#state = 'disposed';
+                this.#setState('disposed');
                 return;
             }
             if (connection.intentionalStop) {
                 if (!this.#connection && this.#state !== 'circuit-open') {
-                    this.#state = 'stopped';
+                    this.#setState('stopped');
                 }
                 return;
             }
             if (!connection.ready) {
                 if (this.#state !== 'circuit-open') {
-                    this.#state = 'stopped';
+                    this.#setState('stopped');
                 }
                 return;
             }
@@ -604,7 +624,7 @@ export class RideCodexAppServerHost {
                 return;
             }
             if (this.#leases.size === 0) {
-                this.#state = 'stopped';
+                this.#setState('stopped');
                 return;
             }
             this.#restartAttempts += 1;
@@ -621,7 +641,7 @@ export class RideCodexAppServerHost {
     }
 
     #openCircuit(code: 'unsafe-approval-exit' | 'circuit-open'): void {
-        this.#state = 'circuit-open';
+        this.#setState('circuit-open');
         this.diagnostics.record(code);
     }
 
@@ -700,7 +720,7 @@ export class RideCodexAppServerHost {
         connection.intentionalStop = true;
         connection.ready = false;
         if (!this.#disposed && this.#state !== 'circuit-open') {
-            this.#state = 'stopping';
+            this.#setState('stopping');
         }
         connection.client.dispose();
         if (!connection.killRequested && await settlesWithin(connection.exitPromise, this.#shutdownGraceMs)) {
@@ -709,7 +729,7 @@ export class RideCodexAppServerHost {
                 this.#connection = undefined;
             }
             if (!this.#disposed) {
-                this.#state = 'stopped';
+                this.#setState('stopped');
             }
             return;
         }
@@ -720,7 +740,7 @@ export class RideCodexAppServerHost {
         if (!await settlesWithin(connection.exitPromise, this.#shutdownGraceMs)) {
             this.diagnostics.record('shutdown-timeout');
             if (this.#disposed) {
-                this.#state = 'disposed';
+                this.#setState('disposed');
                 return;
             }
             this.#openCircuit('circuit-open');
@@ -731,7 +751,7 @@ export class RideCodexAppServerHost {
             this.#connection = undefined;
         }
         if (!this.#disposed) {
-            this.#state = 'stopped';
+            this.#setState('stopped');
         }
     }
 
@@ -773,6 +793,25 @@ export class RideCodexAppServerHost {
                 // Downstream listeners must not own or destabilize the shared process.
             }
         }
+    }
+
+    #emitNotification(notification: RideCodexNotification, generation: number): void {
+        for (const listener of [...this.#notificationListeners]) {
+            try {
+                listener(notification, generation);
+            } catch {
+                // Downstream listeners must not own or destabilize the shared process.
+            }
+        }
+    }
+
+    #setState(state: RideCodexAppServerState, force = false): void {
+        if (!force && this.#state === state) {
+            return;
+        }
+        this.#state = state;
+        const event = Object.freeze({ state, generation: this.#generation });
+        this.#emitSafely(this.#stateListeners, event);
     }
 }
 

@@ -39,11 +39,18 @@ export interface RideCodexAppServerDiagnosticsOptions {
     readonly maxLineBytes?: number;
 }
 
+export interface RideCodexTransientSecretScope {
+    dispose(): void;
+}
+
 const DEFAULT_MAX_ENTRIES = 32;
 const DEFAULT_MAX_ENTRY_BYTES = 160;
 const DEFAULT_MAX_STDERR_LINES = 64;
 const DEFAULT_MAX_STDERR_BYTES = 16 * 1024;
 const DEFAULT_MAX_LINE_BYTES = 512;
+const MAX_TRANSIENT_SECRETS = 32;
+const MAX_TRANSIENT_SECRET_LENGTH = 8 * 1024;
+const MIN_TRANSIENT_SECRET_FRAGMENT_LENGTH = 4;
 
 const DEFAULT_MESSAGE_BY_CODE: Readonly<Record<RideCodexAppServerDiagnosticCode, string>> = Object.freeze({
     'early-exit': 'Codex App Server exited before initialization completed.',
@@ -65,6 +72,7 @@ export class RideCodexAppServerDiagnostics {
     readonly #maxStderrLines: number;
     readonly #maxStderrBytes: number;
     readonly #maxLineBytes: number;
+    readonly #transientSecrets = new Map<symbol, string>();
     #entriesTruncated = false;
     #stderrTruncated = false;
     #stderrBytes = 0;
@@ -79,12 +87,39 @@ export class RideCodexAppServerDiagnostics {
         this.#maxLineBytes = safeLimit(options.maxLineBytes, DEFAULT_MAX_LINE_BYTES, 16, 'stderr line bytes');
     }
 
+    get transientSecretCount(): number {
+        return this.#transientSecrets.size;
+    }
+
+    registerTransientSecret(secret: string): RideCodexTransientSecretScope {
+        if (typeof secret !== 'string' || secret.length < MIN_TRANSIENT_SECRET_FRAGMENT_LENGTH
+            || secret.length > MAX_TRANSIENT_SECRET_LENGTH || /[\u0000-\u001f\u007f]/.test(secret)) {
+            throw new TypeError('Transient diagnostic secret is invalid');
+        }
+        if (this.#transientSecrets.size >= MAX_TRANSIENT_SECRETS) {
+            throw new RangeError('Maximum transient diagnostic secret count reached');
+        }
+        const token = Symbol('transient-secret');
+        this.#transientSecrets.set(token, secret);
+        let disposed = false;
+        return Object.freeze({
+            dispose: () => {
+                if (!disposed) {
+                    disposed = true;
+                    this.#transientSecrets.delete(token);
+                }
+            }
+        });
+    }
+
     record(code: RideCodexAppServerDiagnosticCode, detail?: unknown): void {
         const raw = typeof detail === 'string' && detail.trim().length > 0
             ? detail
             : DEFAULT_MESSAGE_BY_CODE[code];
         const input = boundUtf8(raw, this.#maxEntryBytes);
-        const redacted = input.truncated ? '[truncated] <redacted>' : redactUntrustedText(input.value);
+        const redacted = input.truncated
+            ? '[truncated] <redacted>'
+            : this.#redactTransientSecrets(redactUntrustedText(input.value));
         const bounded = boundUtf8(redacted, this.#maxEntryBytes);
         this.#entries.push(Object.freeze({
             code,
@@ -163,7 +198,7 @@ export class RideCodexAppServerDiagnostics {
         if (raw.length > 0 && raw[raw.length - 1] === 0x0d) {
             raw = raw.subarray(0, raw.length - 1);
         }
-        const redacted = redactUntrustedText(raw.toString('utf8'));
+        const redacted = this.#redactTransientSecrets(redactUntrustedText(raw.toString('utf8')));
         const bounded = boundUtf8(redacted, Math.min(this.#maxLineBytes, this.#maxStderrBytes));
         const prefix = this.#pendingLineTruncated || bounded.truncated ? '[truncated] ' : '';
         const final = boundUtf8(`${prefix}${bounded.value}`, Math.min(this.#maxLineBytes, this.#maxStderrBytes));
@@ -189,6 +224,47 @@ export class RideCodexAppServerDiagnostics {
             this.#stderrTruncated = true;
         }
     }
+
+    #redactTransientSecrets(value: string): string {
+        let redacted = value;
+        for (const secret of this.#transientSecrets.values()) {
+            redacted = redactTransientSecret(redacted, secret);
+        }
+        return redacted;
+    }
+}
+
+function redactTransientSecret(value: string, secret: string): string {
+    if (value.length < MIN_TRANSIENT_SECRET_FRAGMENT_LENGTH) {
+        return value;
+    }
+    let cursor = 0;
+    let scan = 0;
+    let output = '';
+    while (scan <= value.length - MIN_TRANSIENT_SECRET_FRAGMENT_LENGTH) {
+        const probe = value.slice(scan, scan + MIN_TRANSIENT_SECRET_FRAGMENT_LENGTH);
+        const secretIndex = secret.indexOf(probe);
+        if (secretIndex < 0) {
+            scan += 1;
+            continue;
+        }
+        let valueStart = scan;
+        let secretStart = secretIndex;
+        while (valueStart > cursor && secretStart > 0 && value[valueStart - 1] === secret[secretStart - 1]) {
+            valueStart -= 1;
+            secretStart -= 1;
+        }
+        let valueEnd = scan + MIN_TRANSIENT_SECRET_FRAGMENT_LENGTH;
+        let secretEnd = secretIndex + MIN_TRANSIENT_SECRET_FRAGMENT_LENGTH;
+        while (valueEnd < value.length && secretEnd < secret.length && value[valueEnd] === secret[secretEnd]) {
+            valueEnd += 1;
+            secretEnd += 1;
+        }
+        output += `${value.slice(cursor, valueStart)}<redacted>`;
+        cursor = valueEnd;
+        scan = valueEnd;
+    }
+    return cursor === 0 ? value : output + value.slice(cursor);
 }
 
 function safeLimit(value: number | undefined, fallback: number, minimum: number, label: string): number {

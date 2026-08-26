@@ -13,6 +13,8 @@ import { RideCodexActivation } from '../src/browser/ride-codex-activation';
 import * as RideCodexProxyModule from '../src/browser/ride-codex-chat-agent-proxy';
 import { RideCodexChatAgentProxy } from '../src/browser/ride-codex-chat-agent-proxy';
 import rideCodexFrontendModule from '../src/browser/ride-codex-frontend-module';
+import { RideCodexAuthController } from '../src/browser/ride-codex-auth-controller';
+import { RideCodexAuthClient, RideCodexAuthService } from '../src/common/ride-codex-protocol';
 
 function deferred<T>(): { promise: Promise<T>; resolve(value: T): void } {
     let resolve!: (value: T) => void;
@@ -270,6 +272,9 @@ test('frontend bindings expose one inert activation graph to command and shutdow
     const proxy = container.get(RideCodexChatAgentProxy);
 
     assert.equal(activation.state, 'inactive');
+    assert.equal(container.isBound(RideCodexAuthController), true);
+    assert.equal(container.isBound(RideCodexAuthClient), true);
+    assert.equal(container.isBound(RideCodexAuthService), true);
     assert.ok(container.getAll(CommandContribution).includes(proxy));
     assert.equal(container.isBound(FrontendApplicationContribution), true);
     const lifecycle = container.getAll(FrontendApplicationContribution);

@@ -14,6 +14,7 @@ import { PassThrough, Writable } from 'node:stream';
 import { test } from 'node:test';
 import { Container } from '@theia/core/shared/inversify';
 import { BackendApplicationContribution } from '@theia/core/lib/node/backend-application';
+import { ConnectionHandler } from '@theia/core/lib/common/messaging/handler';
 import backendModule from '../src/node/ride-codex-backend-module';
 import {
     RideCodexAppServerDiagnostics,
@@ -27,6 +28,8 @@ import {
 } from '../src/node/ride-codex-app-server-host';
 import { createRideCodexLaunchSpec, RideCodexLaunchSpec } from '../src/node/ride-codex-launch-spec';
 import { RideCodexRuntimeResolver } from '../src/node/ride-codex-runtime-resolver';
+import { RideCodexAuthBroker } from '../src/node/ride-codex-auth-broker';
+import { RideCodexAuthService } from '../src/common/ride-codex-protocol';
 
 const fixture = resolve(__dirname, '../../fixtures/fake-app-server.mjs');
 
@@ -229,6 +232,12 @@ test('constructors and backend singleton bindings stay inert until first acquire
     assert.strictEqual(boundHost, container.get(RideCodexAppServerHost));
     assert.ok(container.getAll(BackendApplicationContribution).includes(boundHost));
     assert.equal(boundHost.snapshot().state, 'stopped');
+    const authBroker = container.get(RideCodexAuthBroker);
+    assert.strictEqual(container.get(RideCodexAuthService), authBroker);
+    assert.equal(authBroker.snapshot().state, 'inactive');
+    assert.equal(boundHost.snapshot().state, 'stopped');
+    assert.ok((container.getAll(ConnectionHandler) as ConnectionHandler[])
+        .some(handler => handler.path === '/services/ride-codex-auth'));
 
     const lease = await direct.host.acquire('foreground-panel');
     assert.equal(direct.resolveCalls(), 1);
@@ -236,6 +245,40 @@ test('constructors and backend singleton bindings stay inert until first acquire
     lease.release();
     await direct.host.dispose();
     await boundHost.dispose();
+});
+
+test('state and notification observers receive immutable generation-tagged events and dispose cleanly', async () => {
+    const harness = createControlledHost({ shutdownGraceMs: 20 });
+    const states: Array<{ state: string; generation: number }> = [];
+    const notifications: Array<{ method: string; generation: number }> = [];
+    const stateListener = harness.host.onStateChange(event => {
+        assert.ok(Object.isFrozen(event));
+        states.push(event);
+    });
+    const notificationListener = harness.host.onNotification((notification, generation) => {
+        notifications.push({ method: notification.method, generation });
+    });
+
+    const lease = await harness.host.acquire('foreground-panel');
+    assert.ok(states.some(event => event.state === 'starting' && event.generation === 1));
+    assert.ok(states.some(event => event.state === 'ready' && event.generation === 1));
+    (harness.children[0].child.stdout as PassThrough).write(`${JSON.stringify({
+        method: 'account/updated', params: { authMode: 'apikey', planType: null }
+    })}\n`);
+    await waitFor(() => notifications.length === 1);
+    assert.deepEqual(notifications, [{ method: 'account/updated', generation: 1 }]);
+
+    stateListener.dispose();
+    notificationListener.dispose();
+    const stateCount = states.length;
+    (harness.children[0].child.stdout as PassThrough).write(`${JSON.stringify({
+        method: 'account/updated', params: { authMode: null, planType: null }
+    })}\n`);
+    await new Promise(resolvePromise => setImmediate(resolvePromise));
+    assert.equal(notifications.length, 1);
+    lease.release();
+    await harness.host.dispose();
+    assert.equal(states.length, stateCount);
 });
 
 test('concurrent panel, thread, and approval acquires share one resolver result, process, and RPC connection', async () => {
