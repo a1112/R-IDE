@@ -7,7 +7,9 @@
 import assert from 'node:assert/strict';
 import { ChildProcessWithoutNullStreams, spawn as nodeSpawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { resolve } from 'node:path';
+import { access, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import { PassThrough, Writable } from 'node:stream';
 import { test } from 'node:test';
 import { Container } from '@theia/core/shared/inversify';
@@ -45,10 +47,14 @@ function launchSpec(): RideCodexLaunchSpec {
     });
 }
 
-function fakeSpawn(modes: readonly string[], records: SpawnRecord[]): RideCodexAppServerSpawn {
+function fakeSpawn(
+    modes: readonly string[],
+    records: SpawnRecord[],
+    barrierDirectory?: string
+): RideCodexAppServerSpawn {
     return (executable, args, options) => {
         const mode = modes[Math.min(records.length, modes.length - 1)] ?? 'normal';
-        const child = nodeSpawn(process.execPath, [fixture], {
+        const child = nodeSpawn(process.execPath, [fixture, ...(barrierDirectory ? [barrierDirectory] : [])], {
             shell: false,
             stdio: ['pipe', 'pipe', 'pipe'],
             env: { ...process.env, RIDE_FAKE_APP_SERVER_MODE: mode }
@@ -152,6 +158,7 @@ function createHost(options: {
     readonly shutdownGraceMs?: number;
     readonly diagnostics?: RideCodexAppServerDiagnostics;
     readonly resolve?: () => Promise<RideCodexLaunchSpec>;
+    readonly barrierDirectory?: string;
 } = {}): { host: RideCodexAppServerHost; records: SpawnRecord[]; resolveCalls: () => number } {
     const records: SpawnRecord[] = [];
     let resolutions = 0;
@@ -164,7 +171,7 @@ function createHost(options: {
     const host = new RideCodexAppServerHost({
         resolver,
         diagnostics: options.diagnostics,
-        spawn: fakeSpawn(options.modes ?? ['normal'], records),
+        spawn: fakeSpawn(options.modes ?? ['normal'], records, options.barrierDirectory),
         handshakeTimeoutMs: options.handshakeTimeoutMs ?? 1_000,
         idleTimeoutMs: options.idleTimeoutMs ?? 10_000,
         shutdownGraceMs: options.shutdownGraceMs ?? 100
@@ -182,30 +189,22 @@ async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<voi
     }
 }
 
-function waitForStderrMarker(
-    child: ChildProcessWithoutNullStreams,
-    marker: string,
-    timeoutMs = 2_000
-): Promise<void> {
-    return new Promise<void>((resolvePromise, rejectPromise) => {
-        let buffered = '';
-        const timeout = setTimeout(() => {
-            dispose();
-            rejectPromise(new Error(`Timed out waiting for fake App Server stderr marker: ${marker}`));
-        }, timeoutMs);
-        const onData = (chunk: Buffer | string): void => {
-            buffered += chunk.toString();
-            if (buffered.includes(marker)) {
-                dispose();
-                resolvePromise();
+async function waitForFile(path: string, timeoutMs = 2_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (true) {
+        try {
+            await access(path);
+            return;
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+                throw error;
             }
-        };
-        const dispose = (): void => {
-            clearTimeout(timeout);
-            child.stderr.off('data', onData);
-        };
-        child.stderr.on('data', onData);
-    });
+        }
+        if (Date.now() >= deadline) {
+            throw new Error(`Timed out waiting for fake App Server barrier: ${path}`);
+        }
+        await new Promise(resolvePromise => setTimeout(resolvePromise, 5));
+    }
 }
 
 function assertSafeDiagnostics(snapshot: RideCodexAppServerDiagnosticSnapshot): void {
@@ -642,66 +641,91 @@ test('leases drive one cancellable idle timer then graceful stdin close and boun
         await harness.host.dispose();
         assert.equal(killCalls, 1);
     });
+});
 
-    await t.test('real child that exits after EOF within grace is never killed', async () => {
-        const harness = createHost({ modes: ['delayed-stdin-close'], shutdownGraceMs: 100 });
-        const lease = await harness.host.acquire('foreground-panel');
-        const child = harness.records[0].child;
-        const eofReceived = waitForStderrMarker(child, 'RIDE_FAKE_STDIN_EOF');
-        const originalKill = child.kill.bind(child);
-        let killCalls = 0;
-        child.kill = ((signal?: NodeJS.Signals | number) => {
-            killCalls += 1;
-            return originalKill(signal);
-        }) as typeof child.kill;
-
-        try {
-            await harness.host.dispose();
-            await eofReceived;
-            assert.equal(killCalls, 0);
-            assert.equal(child.exitCode, 0);
-            assert.equal(child.signalCode, null);
-        } finally {
-            lease.release();
-            if (child.exitCode === null && child.signalCode === null) {
-                originalKill();
-            }
-        }
+test('real child that exits after EOF within grace is never killed', async t => {
+    const barrierDirectory = await mkdtemp(join(tmpdir(), 'ride-codex-app-server-shutdown-'));
+    t.after(() => rm(barrierDirectory, { recursive: true, force: true }));
+    const eofSentinel = join(barrierDirectory, 'stdin-eof');
+    const releaseSentinel = join(barrierDirectory, 'release');
+    const harness = createHost({
+        modes: ['barrier-stdin-close'],
+        shutdownGraceMs: 5_000,
+        barrierDirectory
     });
+    const lease = await harness.host.acquire('foreground-panel');
+    const child = harness.records[0].child;
+    const originalKill = child.kill.bind(child);
+    let killCalls = 0;
+    let disposalSettled = false;
+    child.kill = ((signal?: NodeJS.Signals | number) => {
+        killCalls += 1;
+        return originalKill(signal);
+    }) as typeof child.kill;
 
-    await t.test('real child that remains after EOF is killed only after the grace barrier', async () => {
-        const harness = createHost({ modes: ['ignore-stdin-close'], shutdownGraceMs: 100 });
-        const lease = await harness.host.acquire('foreground-panel');
-        const child = harness.records[0].child;
-        const eofReceived = waitForStderrMarker(child, 'RIDE_FAKE_STDIN_EOF');
-        const beforeGrace = waitForStderrMarker(child, 'RIDE_FAKE_BEFORE_GRACE');
-        const originalKill = child.kill.bind(child);
-        let killCalls = 0;
-        let resolveKilled!: () => void;
-        const killed = new Promise<void>(resolvePromise => {
-            resolveKilled = resolvePromise;
-        });
-        child.kill = ((signal?: NodeJS.Signals | number) => {
-            killCalls += 1;
-            resolveKilled();
-            return originalKill(signal);
-        }) as typeof child.kill;
-
-        try {
-            const disposal = harness.host.dispose();
-            await eofReceived;
-            await beforeGrace;
-            assert.equal(killCalls, 0, 'the child-side pre-grace barrier must precede termination');
-            await killed;
-            assert.equal(killCalls, 1);
-            await disposal;
-        } finally {
-            lease.release();
-            if (child.exitCode === null && child.signalCode === null) {
-                originalKill();
-            }
+    try {
+        const disposal = harness.host.dispose();
+        void disposal.then(
+            () => { disposalSettled = true; },
+            () => { disposalSettled = true; }
+        );
+        await waitForFile(eofSentinel);
+        assert.equal(disposalSettled, false, 'the Host must still be waiting for the exact child');
+        assert.equal(child.exitCode, null);
+        assert.equal(child.signalCode, null);
+        assert.equal(killCalls, 0, 'closing stdin must not force termination before release');
+        await writeFile(releaseSentinel, '', { flag: 'wx' });
+        await disposal;
+        assert.equal(killCalls, 0, 'a child released inside the grace window must not be killed');
+        assert.equal(child.exitCode, 0);
+        assert.equal(child.signalCode, null);
+        assert.equal(harness.records.length, 1, 'intentional shutdown must not restart the App Server');
+        assert.equal(harness.resolveCalls(), 1);
+    } finally {
+        lease.release();
+        if (child.exitCode === null && child.signalCode === null) {
+            originalKill();
         }
+    }
+});
+
+test('real child that remains after EOF is killed only after the grace barrier', async t => {
+    const barrierDirectory = await mkdtemp(join(tmpdir(), 'ride-codex-app-server-timeout-'));
+    t.after(() => rm(barrierDirectory, { recursive: true, force: true }));
+    const eofSentinel = join(barrierDirectory, 'stdin-eof');
+    const harness = createHost({
+        modes: ['barrier-ignore-stdin-close'],
+        shutdownGraceMs: 1_000,
+        barrierDirectory
     });
+    const lease = await harness.host.acquire('foreground-panel');
+    const child = harness.records[0].child;
+    const originalKill = child.kill.bind(child);
+    let killCalls = 0;
+    let resolveKilled!: () => void;
+    const killed = new Promise<void>(resolvePromise => {
+        resolveKilled = resolvePromise;
+    });
+    child.kill = ((signal?: NodeJS.Signals | number) => {
+        killCalls += 1;
+        resolveKilled();
+        return originalKill(signal);
+    }) as typeof child.kill;
+
+    try {
+        const disposal = harness.host.dispose();
+        await waitForFile(eofSentinel);
+        assert.equal(killCalls, 0, 'the EOF barrier must precede forced termination');
+        await killed;
+        assert.equal(killCalls, 1);
+        await disposal;
+        assert.equal(harness.records.length, 1, 'forced intentional shutdown must not restart the App Server');
+    } finally {
+        lease.release();
+        if (child.exitCode === null && child.signalCode === null) {
+            originalKill();
+        }
+    }
 });
 
 test('acquire during irreversible idle stop waits for one fresh generation and ignores the old late exit', async () => {
