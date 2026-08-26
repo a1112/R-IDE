@@ -5,6 +5,7 @@
  ********************************************************************************/
 
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { constants as fsConstants, promises as fsPromises } from 'node:fs';
 import { link, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, symlink, writeFile } from 'node:fs/promises';
@@ -2989,6 +2990,150 @@ test('authorized transaction preserves an undefined callback rejection', async (
     }
 });
 
+test('authorized transaction contains an unawaited mutation rejection in-process', async () => {
+    const trustedRuntimeBase = await mkdtemp(join(tmpdir(), 'ride-codex-transaction-contained-rejection-'));
+    const runtimeRoot = join(trustedRuntimeBase, 'managed');
+    const store = new RideCodexRuntimeStore({ trustedRuntimeBase, runtimeRoot });
+    const consent = new RideCodexInstallConsent();
+    const presentation = presentationFor('0.144.0', runtimeRoot);
+    const consumed = consent.consume(consent.issue(presentation));
+    const operationFailure = new Error('detached operation detail must remain internal');
+    const staged = Object.freeze({
+        get version(): string {
+            throw operationFailure;
+        }
+    }) as unknown as StagedRuntime;
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => { unhandled.push(reason); };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+        await assert.rejects(
+            store.withAuthorizedTransaction(
+                consumed.transactionAuthorization,
+                consumed.presentation,
+                async transaction => {
+                    void store.publish(transaction, staged, presentation);
+                }
+            ),
+            error => error === operationFailure
+        );
+        await new Promise<void>(resolveImmediate => setImmediate(resolveImmediate));
+        assert.deepEqual(unhandled, []);
+    } finally {
+        process.removeListener('unhandledRejection', onUnhandled);
+        await rm(trustedRuntimeBase, { recursive: true, force: true });
+    }
+});
+
+test('strict unhandled-rejection mode contains a detached mutation failure', async () => {
+    const consentModule = require.resolve('../src/node/ride-codex-install-consent');
+    const installationModule = require.resolve('../src/common/ride-codex-installation');
+    const storeModule = require.resolve('../src/node/ride-codex-runtime-store');
+    const script = `
+const { mkdtemp, rm } = require('node:fs/promises');
+const { tmpdir } = require('node:os');
+const { join } = require('node:path');
+const { RideCodexInstallConsent } = require(${JSON.stringify(consentModule)});
+const { createRideCodexInstallPresentation } = require(${JSON.stringify(installationModule)});
+const { RideCodexRuntimeStore } = require(${JSON.stringify(storeModule)});
+(async () => {
+    const trustedRuntimeBase = await mkdtemp(join(tmpdir(), 'ride-codex-strict-detached-'));
+    const runtimeRoot = join(trustedRuntimeBase, 'managed');
+    const presentation = createRideCodexInstallPresentation({
+        source: 'official-npm-registry',
+        version: '0.144.0',
+        target: 'x86_64-pc-windows-msvc',
+        urlOrigin: 'https://registry.npmjs.org',
+        installRoot: runtimeRoot,
+        requiredSpaceBytes: 1024,
+        rollbackPolicy: 'retain-new-and-previous-valid',
+        manifestDigest: 'sha256-${'a'.repeat(64)}'
+    });
+    const consent = new RideCodexInstallConsent();
+    const consumed = consent.consume(consent.issue(presentation));
+    const store = new RideCodexRuntimeStore({ trustedRuntimeBase, runtimeRoot });
+    let rejected = false;
+    try {
+        await store.withAuthorizedTransaction(
+            consumed.transactionAuthorization,
+            consumed.presentation,
+            async transaction => {
+                void store.publish(transaction, Object.freeze({}), presentation);
+            }
+        );
+    } catch {
+        rejected = true;
+    } finally {
+        await new Promise(resolveImmediate => setImmediate(resolveImmediate));
+        await rm(trustedRuntimeBase, { recursive: true, force: true });
+    }
+    if (!rejected) {
+        throw new Error('transaction unexpectedly resolved');
+    }
+})().catch(error => {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 2;
+});
+`;
+    const result = await runNodeScriptStrict(script);
+    assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+    assert.equal(result.signal, null);
+});
+
+test('callback and detached mutation failures produce one bounded transaction error', async () => {
+    const trustedRuntimeBase = await mkdtemp(join(tmpdir(), 'ride-codex-transaction-dual-rejection-'));
+    const runtimeRoot = join(trustedRuntimeBase, 'managed');
+    const store = new RideCodexRuntimeStore({ trustedRuntimeBase, runtimeRoot });
+    const consent = new RideCodexInstallConsent();
+    const presentation = presentationFor('0.144.0', runtimeRoot);
+    const consumed = consent.consume(consent.issue(presentation));
+    const operationFailure = new Error('detached secret detail');
+    const callbackFailure = new Error('callback secret detail');
+    const staged = Object.freeze({
+        get version(): string {
+            throw operationFailure;
+        }
+    }) as unknown as StagedRuntime;
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => { unhandled.push(reason); };
+    let capturedTransaction: RideCodexRuntimeStoreTransaction | undefined;
+    process.on('unhandledRejection', onUnhandled);
+    try {
+        await assert.rejects(
+            store.withAuthorizedTransaction(
+                consumed.transactionAuthorization,
+                consumed.presentation,
+                async transaction => {
+                    capturedTransaction = transaction;
+                    void store.publish(transaction, staged, presentation);
+                    throw callbackFailure;
+                }
+            ),
+            error => {
+                assert.ok(error instanceof RideCodexRuntimeStoreError);
+                assert.equal(error.message, 'Codex install transaction callback and detached mutation both failed.');
+                assert.ok(error.message.length < 160);
+                assert.doesNotMatch(error.message, /secret/i);
+                return true;
+            }
+        );
+        await new Promise<void>(resolveImmediate => setImmediate(resolveImmediate));
+        assert.deepEqual(unhandled, []);
+        assert.ok(capturedTransaction);
+        await assert.rejects(store.recover(capturedTransaction), /transaction|invalid|ended/i);
+
+        const retry = consent.consume(consent.issue(presentation));
+        await store.withAuthorizedTransaction(
+            retry.transactionAuthorization,
+            retry.presentation,
+            async () => undefined
+        );
+    } finally {
+        process.removeListener('unhandledRejection', onUnhandled);
+        await rm(trustedRuntimeBase, { recursive: true, force: true });
+    }
+});
+
 test('an authorized transaction rejects a concurrent mutator and recovery preserves the active runtime', async () => {
     const trustedRuntimeBase = await mkdtemp(join(tmpdir(), 'ride-codex-transaction-concurrent-mutation-'));
     const runtimeRoot = join(trustedRuntimeBase, 'managed');
@@ -3451,6 +3596,25 @@ async function withAuthorizedStoreTransaction<T>(
         consumed.presentation,
         operation
     );
+}
+
+function runNodeScriptStrict(script: string): Promise<{
+    readonly code: number | null;
+    readonly signal: NodeJS.Signals | null;
+    readonly stderr: string;
+}> {
+    return new Promise((resolveRun, rejectRun) => {
+        const child = spawn(
+            process.execPath,
+            ['--unhandled-rejections=strict', '-e', script],
+            { cwd: process.cwd(), stdio: ['ignore', 'ignore', 'pipe'] }
+        );
+        let stderr = '';
+        child.stderr.setEncoding('utf8');
+        child.stderr.on('data', chunk => { stderr += String(chunk); });
+        child.once('error', rejectRun);
+        child.once('close', (code, signal) => resolveRun({ code, signal, stderr }));
+    });
 }
 
 async function rewriteActiveRuntimeMetadata(

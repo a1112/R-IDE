@@ -83,9 +83,17 @@ interface StoreTransactionRecord {
     accepting: boolean;
     mutationInProgress: boolean;
     readonly presentation: InstallPresentation;
-    readonly operations: Set<Promise<unknown>>;
+    readonly operations: Set<StoreTransactionOperation>;
+    operationLimitFailure?: RideCodexRuntimeStoreError;
     published?: PublishedManagedRuntime;
     activated?: ValidatedManagedRuntime;
+}
+
+interface StoreTransactionOperation {
+    observed: boolean;
+    status: 'pending' | 'fulfilled' | 'rejected';
+    reason?: unknown;
+    settlement?: Promise<void>;
 }
 
 interface PublishedRuntimeRecord {
@@ -158,6 +166,57 @@ const PENDING_KEYS = Object.freeze([
 ].sort());
 const ROOT_LOCKS = new Map<string, RootLock>();
 const MAX_TRANSACTION_OPERATIONS = 16;
+const TRANSACTION_OPERATION_OBSERVERS = new WeakMap<object, () => void>();
+
+class TransactionOperationPromise<T> extends Promise<T> {
+    static get [Symbol.species](): PromiseConstructor {
+        return Promise;
+    }
+
+    constructor(
+        executor: (
+            resolvePromise: (value: T | PromiseLike<T>) => void,
+            rejectPromise: (reason?: unknown) => void
+        ) => void,
+        onObserved?: () => void
+    ) {
+        super(executor);
+        if (onObserved) {
+            TRANSACTION_OPERATION_OBSERVERS.set(this, onObserved);
+        }
+    }
+
+    override then<TResult1 = T, TResult2 = never>(
+        onfulfilled?: ((value: T) => TResult1 | PromiseLike<TResult1>) | null,
+        onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null
+    ): Promise<TResult1 | TResult2> {
+        TRANSACTION_OPERATION_OBSERVERS.get(this)?.();
+        return super.then(onfulfilled, onrejected);
+    }
+
+    override catch<TResult = never>(
+        onrejected?: ((reason: unknown) => TResult | PromiseLike<TResult>) | null
+    ): Promise<T | TResult> {
+        TRANSACTION_OPERATION_OBSERVERS.get(this)?.();
+        return super.catch(onrejected);
+    }
+
+    override finally(onfinally?: (() => void) | null): Promise<T> {
+        TRANSACTION_OPERATION_OBSERVERS.get(this)?.();
+        return super.finally(onfinally);
+    }
+}
+
+function containedRejectedPromise<T>(reason: unknown): Promise<T> {
+    const rejected = Promise.reject<T>(reason);
+    const contained = new TransactionOperationPromise<T>(
+        (resolveOperation, rejectOperation) => {
+            rejected.then(resolveOperation, rejectOperation);
+        }
+    );
+    Promise.prototype.then.call(contained, undefined, () => undefined);
+    return contained;
+}
 
 export class RideCodexRuntimeStoreError extends Error {
     constructor(message: string) {
@@ -219,16 +278,32 @@ export class RideCodexRuntimeStore {
                 callbackFailure = error;
             }
             record.accepting = false;
-            const settlements = await Promise.allSettled([...record.operations]);
-            record.active = false;
+            const operations = [...record.operations];
+            try {
+                await Promise.all(operations.map(tracked => tracked.settlement));
+            } finally {
+                record.active = false;
+                record.mutationInProgress = false;
+                record.operations.clear();
+            }
+            const detachedFailures = operations.filter(
+                tracked => tracked.status === 'rejected' && !tracked.observed
+            );
+            const detachedFailureReasons = [
+                ...detachedFailures.map(tracked => tracked.reason),
+                ...(record.operationLimitFailure ? [record.operationLimitFailure] : [])
+            ];
             if (callbackRejected) {
+                if (detachedFailureReasons.some(reason => reason !== callbackFailure)) {
+                    throw new RideCodexRuntimeStoreError(
+                        'Codex install transaction callback and detached mutation both failed.'
+                    );
+                }
                 throw callbackFailure;
             }
-            const operationFailure = settlements.find(
-                (settlement): settlement is PromiseRejectedResult => settlement.status === 'rejected'
-            );
+            const operationFailure = detachedFailureReasons[0];
             if (operationFailure) {
-                throw operationFailure.reason;
+                throw operationFailure;
             }
             return result as T;
         });
@@ -244,7 +319,7 @@ export class RideCodexRuntimeStore {
         return lock.run(operation);
     }
 
-    async recover(transaction?: RideCodexRuntimeStoreTransaction): Promise<void> {
+    recover(transaction?: RideCodexRuntimeStoreTransaction): Promise<void> {
         if (transaction) {
             return this.#trackTransactionOperation(transaction, () => this.#recoverUnlocked());
         }
@@ -432,7 +507,7 @@ export class RideCodexRuntimeStore {
         });
     }
 
-    async publish(
+    publish(
         transaction: RideCodexRuntimeStoreTransaction,
         staged: StagedRuntime,
         presentation: InstallPresentation,
@@ -548,7 +623,7 @@ export class RideCodexRuntimeStore {
         });
     }
 
-    async activate(
+    activate(
         transaction: RideCodexRuntimeStoreTransaction,
         published: PublishedManagedRuntime,
         expectedPrevious?: ValidatedManagedRuntime
@@ -614,7 +689,7 @@ export class RideCodexRuntimeStore {
         });
     }
 
-    async restore(
+    restore(
         transaction: RideCodexRuntimeStoreTransaction,
         previous: ValidatedManagedRuntime | undefined,
         failed: PublishedManagedRuntime
@@ -647,7 +722,7 @@ export class RideCodexRuntimeStore {
         });
     }
 
-    async completeHandshake(
+    completeHandshake(
         transaction: RideCodexRuntimeStoreTransaction,
         runtime: ValidatedManagedRuntime,
         operation: (runtime: ValidatedManagedRuntime) => Promise<void>
@@ -671,7 +746,7 @@ export class RideCodexRuntimeStore {
         });
     }
 
-    async finalizeActivation(
+    finalizeActivation(
         transaction: RideCodexRuntimeStoreTransaction,
         completion: RideCodexHandshakeCompletion
     ): Promise<ValidatedManagedRuntime> {
@@ -995,7 +1070,7 @@ export class RideCodexRuntimeStore {
         return this.#validatePointer(pointer, boundary);
     }
 
-    async discard(
+    discard(
         transaction: RideCodexRuntimeStoreTransaction,
         published: PublishedManagedRuntime
     ): Promise<void> {
@@ -1556,28 +1631,69 @@ export class RideCodexRuntimeStore {
         transaction: RideCodexRuntimeStoreTransaction,
         operation: (record: StoreTransactionRecord) => Promise<T>
     ): Promise<T> {
-        const record = this.#requireTransaction(transaction);
+        let record: StoreTransactionRecord;
+        try {
+            record = this.#requireTransaction(transaction);
+        } catch (error) {
+            return containedRejectedPromise(error);
+        }
         if (record.operations.size >= MAX_TRANSACTION_OPERATIONS) {
-            throw new RideCodexRuntimeStoreError('Codex install transaction exceeded its operation limit.');
+            if (!record.operationLimitFailure) {
+                record.operationLimitFailure = new RideCodexRuntimeStoreError(
+                    'Codex install transaction exceeded its operation limit.'
+                );
+            }
+            return containedRejectedPromise(record.operationLimitFailure);
         }
         if (record.mutationInProgress) {
-            throw new RideCodexRuntimeStoreError(
-                'Codex install transaction already has a mutation in progress.'
+            return this.#recordTransactionOperation(
+                record,
+                Promise.reject(new RideCodexRuntimeStoreError(
+                    'Codex install transaction already has a mutation in progress.'
+                )),
+                false
             );
         }
         record.mutationInProgress = true;
-        const pending = Promise.resolve().then(() => operation(record));
-        record.operations.add(pending);
-        pending.then(
-            () => {
-                record.operations.delete(pending);
-                record.mutationInProgress = false;
-            },
-            () => {
-                record.operations.delete(pending);
-                record.mutationInProgress = false;
-            }
+        return this.#recordTransactionOperation(
+            record,
+            Promise.resolve().then(() => operation(record)),
+            true
         );
+    }
+
+    #recordTransactionOperation<T>(
+        record: StoreTransactionRecord,
+        operationPromise: Promise<T>,
+        releasesMutation: boolean
+    ): Promise<T> {
+        const tracked: StoreTransactionOperation = {
+            observed: false,
+            status: 'pending'
+        };
+        record.operations.add(tracked);
+        const pending = new TransactionOperationPromise<T>(
+            (resolveOperation, rejectOperation) => {
+                operationPromise.then(resolveOperation, rejectOperation);
+            },
+            () => { tracked.observed = true; }
+        );
+        tracked.settlement = Promise.prototype.then.call(
+            pending,
+            () => {
+                tracked.status = 'fulfilled';
+                if (releasesMutation) {
+                    record.mutationInProgress = false;
+                }
+            },
+            (error: unknown) => {
+                tracked.status = 'rejected';
+                tracked.reason = error;
+                if (releasesMutation) {
+                    record.mutationInProgress = false;
+                }
+            }
+        ) as Promise<void>;
         return pending;
     }
 
