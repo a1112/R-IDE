@@ -785,6 +785,97 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         }
     ];
 
+    const failedStartErrorCases: ReadonlyArray<Readonly<{
+        name: string;
+        error?: unknown;
+        code: keyof typeof SAFE_ERROR_MESSAGES;
+    }>> = [
+        {
+            name: 'unauthorized',
+            error: { message: 'raw unauthorized secret', codexErrorInfo: 'unauthorized', additionalDetails: 'apiKey=secret' },
+            code: 'unauthorized'
+        },
+        {
+            name: 'rate-limit',
+            error: { message: 'raw rate-limit secret', codexErrorInfo: 'usageLimitExceeded', additionalDetails: 'apiKey=secret' },
+            code: 'rate-limit'
+        },
+        {
+            name: 'context-limit',
+            error: { message: 'raw context-limit secret', codexErrorInfo: 'contextWindowExceeded', additionalDetails: 'apiKey=secret' },
+            code: 'context-limit'
+        },
+        {
+            name: 'sandbox-denied',
+            error: { message: 'raw sandbox-denied secret', codexErrorInfo: 'sandboxError', additionalDetails: 'apiKey=secret' },
+            code: 'sandbox-denied'
+        },
+        {
+            name: 'transport-error',
+            error: {
+                message: 'raw transport-error secret',
+                codexErrorInfo: { responseStreamDisconnected: { httpStatusCode: null } },
+                additionalDetails: 'apiKey=secret'
+            },
+            code: 'transport-error'
+        },
+        {
+            name: 'generic turn-error',
+            error: { message: 'raw generic secret', codexErrorInfo: 'other', additionalDetails: 'apiKey=secret' },
+            code: 'turn-error'
+        },
+        { name: 'null error fallback', error: null, code: 'turn-error' },
+        { name: 'missing error fallback', code: 'turn-error' }
+    ];
+
+    for (const entry of failedStartErrorCases) {
+        it(`classifies ${entry.name} from a failed turn/start response`, async () => {
+            const host = new FakeTurnHost();
+            const scheduler = new FakeScheduler();
+            const wires: string[] = [];
+            host.startPromise = Promise.resolve({
+                turn: {
+                    ...minimalTurn('turn-1', 'failed'),
+                    ...(entry.error === undefined ? {} : { error: entry.error })
+                }
+            });
+            const coordinator = new RideCodexTurnCoordinator({
+                host, scheduler, maxQueuedBytes: RIDE_CODEX_MIN_QUEUED_BYTES
+            });
+            const service = coordinator.connectClient({ turnEvents: wire => { wires.push(wire); } });
+
+            const result = await service.startTurn({
+                threadId: 'thread-1', input: [{ type: 'text', text: 'failed start' }]
+            });
+            while (scheduler.callbacks.length > 0) {
+                scheduler.flushOne();
+                await Promise.resolve();
+            }
+            host.emit('turn/completed', {
+                threadId: 'thread-1', turn: minimalTurn('turn-1', 'completed')
+            });
+            while (scheduler.callbacks.length > 0) {
+                scheduler.flushOne();
+                await Promise.resolve();
+            }
+
+            assert.deepEqual(result, { threadId: 'thread-1', turnId: 'turn-1', status: 'failed' });
+            assert.deepEqual(wires.flatMap(wire => decodeBatch(wire).events), [
+                { type: 'turn-started' },
+                {
+                    type: 'turn-terminal', status: 'failed',
+                    error: { code: entry.code, message: SAFE_ERROR_MESSAGES[entry.code] }
+                }
+            ]);
+            assert.equal(host.releases, 1);
+            assert.ok(wires.every(wire => Buffer.byteLength(wire, 'utf8') <= RIDE_CODEX_MIN_QUEUED_BYTES));
+            assert.doesNotMatch(JSON.stringify(wires), /raw|secret|apiKey/iu);
+
+            await coordinator.dispose();
+            assert.equal(host.releases, 1);
+        });
+    }
+
     for (const entry of codexErrorCases) {
         it(`classifies ${entry.name} on terminal and notification paths without retaining raw error text`, async () => {
             const raw = {

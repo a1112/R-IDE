@@ -356,7 +356,13 @@ export class RideCodexTurnCoordinator {
             const status = turn.status;
             this.#establishTurn(active, turnId);
             if (status !== 'in-progress') {
-                this.#finishActive(status, status === 'failed' ? SAFE_FAILURE : undefined, undefined, true, true);
+                this.#finishActive(
+                    status,
+                    status === 'failed' ? turn.error ?? safeServerError('turn-error') : undefined,
+                    undefined,
+                    true,
+                    true
+                );
             }
             return Object.freeze({ threadId: request.threadId, turnId, status });
         } catch (error) {
