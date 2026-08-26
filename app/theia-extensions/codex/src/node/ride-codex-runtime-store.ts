@@ -81,6 +81,7 @@ export type RideCodexHandshakeCompletion = Readonly<{
 interface StoreTransactionRecord {
     active: boolean;
     accepting: boolean;
+    mutationInProgress: boolean;
     readonly presentation: InstallPresentation;
     readonly operations: Set<Promise<unknown>>;
     published?: PublishedManagedRuntime;
@@ -203,6 +204,7 @@ export class RideCodexRuntimeStore {
             const record: StoreTransactionRecord = {
                 active: true,
                 accepting: true,
+                mutationInProgress: false,
                 presentation: authorized.presentation,
                 operations: new Set()
             };
@@ -1558,11 +1560,23 @@ export class RideCodexRuntimeStore {
         if (record.operations.size >= MAX_TRANSACTION_OPERATIONS) {
             throw new RideCodexRuntimeStoreError('Codex install transaction exceeded its operation limit.');
         }
+        if (record.mutationInProgress) {
+            throw new RideCodexRuntimeStoreError(
+                'Codex install transaction already has a mutation in progress.'
+            );
+        }
+        record.mutationInProgress = true;
         const pending = Promise.resolve().then(() => operation(record));
         record.operations.add(pending);
         pending.then(
-            () => { record.operations.delete(pending); },
-            () => { record.operations.delete(pending); }
+            () => {
+                record.operations.delete(pending);
+                record.mutationInProgress = false;
+            },
+            () => {
+                record.operations.delete(pending);
+                record.mutationInProgress = false;
+            }
         );
         return pending;
     }

@@ -152,15 +152,35 @@ export class RideCodexManagedInstaller {
                     activatedRuntime = await this.store.activate(transaction, published, previous);
                     this.safeInvalidateResolver();
                 } catch {
+                    let recoveryRequired = false;
                     if (published && !activatedRuntime) {
-                        await this.store.discard(transaction, published).catch(() => undefined);
+                        try {
+                            await this.store.discard(transaction, published);
+                        } catch {
+                            try {
+                                await this.store.recover(transaction);
+                            } catch {
+                                recoveryRequired = true;
+                            }
+                        }
                     } else if (staged && !published) {
-                        await this.store.recover(transaction).catch(() => undefined);
+                        try {
+                            await this.store.recover(transaction);
+                        } catch {
+                            recoveryRequired = true;
+                        }
                     }
                     progress('failed');
-                    throw new RideCodexManagedInstallError([
-                        createRideCodexInstallDiagnostic('activation-failed', 'Codex runtime activation failed safely.')
-                    ]);
+                    const diagnostics = [
+                        createRideCodexInstallDiagnostic('activation-failed', 'Codex runtime activation failed.')
+                    ];
+                    if (recoveryRequired) {
+                        diagnostics.push(createRideCodexInstallDiagnostic(
+                            'recovery-required',
+                            'Codex runtime activation cleanup could not be completed; safe recovery is required.'
+                        ));
+                    }
+                    throw new RideCodexManagedInstallError(diagnostics);
                 }
 
                 let primaryDiagnostic: InstallDiagnostic | undefined;

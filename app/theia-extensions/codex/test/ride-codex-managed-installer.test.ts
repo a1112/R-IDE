@@ -44,6 +44,7 @@ import {
 import {
     RideCodexRuntimeStoreTransaction,
     RideCodexRuntimeStore,
+    RideCodexRuntimeStoreError,
     RideCodexRuntimeStoreTestHooks
 } from '../src/node/ride-codex-runtime-store';
 import { RideCodexRuntimeResolver } from '../src/node/ride-codex-runtime-resolver';
@@ -640,7 +641,7 @@ test('pointer write interruption and rename failure preserve the previous active
         syncFailure = true;
         await assert.rejects(installer.install(consent.issue(presentationFor('0.144.0', runtimeRoot))), /activation/i);
         assert.equal(await store.activeVersion(), '0.143.0');
-        assert.equal((await readdir(runtimeRoot)).some(name => name.startsWith('active.json.tmp-')), true);
+        assert.equal((await readdir(runtimeRoot)).some(name => name.startsWith('active.json.tmp-')), false);
 
         await installer.install(consent.issue(presentationFor('0.144.0', runtimeRoot)));
         assert.equal((await readdir(runtimeRoot)).some(name => name.startsWith('active.json.tmp-')), false);
@@ -744,6 +745,65 @@ test('activation reattests the committed candidate before handshake and restores
         );
         assert.equal(handshakes, 0);
         assert.equal(await store.activeVersion(), '0.143.0');
+    } finally {
+        await rm(trustedRuntimeBase, { recursive: true, force: true });
+    }
+});
+
+test('activation cleanup reports recovery required when discard and recovery both fail', async () => {
+    const trustedRuntimeBase = await mkdtemp(join(tmpdir(), 'ride-codex-activation-recovery-required-'));
+    const runtimeRoot = join(trustedRuntimeBase, 'managed');
+    const store = new RideCodexRuntimeStore({ trustedRuntimeBase, runtimeRoot });
+    const consent = new RideCodexInstallConsent();
+    const realRecover = store.recover.bind(store);
+    const realDiscard = store.discard.bind(store);
+    let recoverCalls = 0;
+    let discardCalls = 0;
+    Object.defineProperties(store, {
+        activate: {
+            configurable: true,
+            value: async (..._args: Parameters<RideCodexRuntimeStore['activate']>): Promise<never> => {
+                throw new Error('C:\\Users\\private activation token=secret');
+            }
+        },
+        discard: {
+            configurable: true,
+            value: async (...args: Parameters<RideCodexRuntimeStore['discard']>): Promise<void> => {
+                discardCalls += 1;
+                return realDiscard(...args);
+            }
+        },
+        recover: {
+            configurable: true,
+            value: async (...args: Parameters<RideCodexRuntimeStore['recover']>): Promise<void> => {
+                recoverCalls += 1;
+                if (recoverCalls === 1) {
+                    return realRecover(...args);
+                }
+                throw new Error('C:\\Users\\private recovery OPENAI_API_KEY=secret');
+            }
+        }
+    });
+    const installer = createInstaller(runtimeRoot, consent, store);
+    try {
+        await assert.rejects(
+            installer.install(consent.issue(presentationFor('0.144.0', runtimeRoot))),
+            error => {
+                assert.ok(error instanceof RideCodexManagedInstallError);
+                assert.deepEqual(error.diagnostics.map(diagnostic => diagnostic.code), [
+                    'activation-failed', 'recovery-required'
+                ]);
+                assert.doesNotMatch(error.message, /failed safely/i);
+                assert.ok(JSON.stringify(error.diagnostics).length < 1024);
+                assert.doesNotMatch(
+                    JSON.stringify(error.diagnostics),
+                    /activation token|recovery OPENAI|secret|Users|OPENAI_API_KEY|private/i
+                );
+                return true;
+            }
+        );
+        assert.equal(discardCalls, 1);
+        assert.equal(recoverCalls, 2);
     } finally {
         await rm(trustedRuntimeBase, { recursive: true, force: true });
     }
@@ -2924,6 +2984,67 @@ test('authorized transaction preserves an undefined callback rejection', async (
             assert.equal(error, undefined);
         }
         assert.equal(rejected, true);
+    } finally {
+        await rm(trustedRuntimeBase, { recursive: true, force: true });
+    }
+});
+
+test('an authorized transaction rejects a concurrent mutator and recovery preserves the active runtime', async () => {
+    const trustedRuntimeBase = await mkdtemp(join(tmpdir(), 'ride-codex-transaction-concurrent-mutation-'));
+    const runtimeRoot = join(trustedRuntimeBase, 'managed');
+    const store = new RideCodexRuntimeStore({ trustedRuntimeBase, runtimeRoot });
+    const consent = new RideCodexInstallConsent();
+    const previousPresentation = presentationFor('0.143.0', runtimeRoot);
+    const candidatePresentation = presentationFor('0.144.0', runtimeRoot);
+    try {
+        await createInstaller(runtimeRoot, consent, store).install(consent.issue(previousPresentation));
+        const previous = await store.readActiveRuntime();
+        assert.ok(previous);
+        const left = await createStagedRuntime(runtimeRoot, candidatePresentation);
+        const right = await createStagedRuntime(runtimeRoot, candidatePresentation);
+
+        const results = await withAuthorizedStoreTransaction(
+            store,
+            candidatePresentation,
+            transaction => Promise.allSettled([
+                Promise.resolve().then(() => store.publish(
+                    transaction,
+                    left,
+                    candidatePresentation,
+                    previous
+                )),
+                Promise.resolve().then(() => store.publish(
+                    transaction,
+                    right,
+                    candidatePresentation,
+                    previous
+                ))
+            ])
+        );
+
+        assert.equal(results.filter(result => result.status === 'fulfilled').length, 1);
+        const rejected = results.filter(
+            (result): result is PromiseRejectedResult => result.status === 'rejected'
+        );
+        assert.equal(rejected.length, 1);
+        assert.ok(rejected[0].reason instanceof RideCodexRuntimeStoreError);
+        assert.equal(
+            rejected[0].reason.message,
+            'Codex install transaction already has a mutation in progress.'
+        );
+        assert.ok(rejected[0].reason.message.length < 160);
+
+        await store.recover();
+        assert.equal(await store.activeVersion(), '0.143.0');
+        assert.deepEqual(await store.versions(), ['0.143.0']);
+        assert.equal(
+            (await readdir(runtimeRoot)).some(name =>
+                name.startsWith('.staging-')
+                || name.startsWith('.pending-activation')
+                || name === 'pending-activation.json'
+            ),
+            false
+        );
     } finally {
         await rm(trustedRuntimeBase, { recursive: true, force: true });
     }
