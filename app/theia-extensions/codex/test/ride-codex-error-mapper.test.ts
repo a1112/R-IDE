@@ -159,6 +159,47 @@ describe('mapRideCodexError', () => {
         assert.equal(getterCalls, 0);
         assert.equal(trapCalls, 0);
     });
+
+    it('maps reducer-produced classified safe codes end to end', () => {
+        const classified = [
+            { code: 'unauthorized', layer: 'auth', action: 'sign-in' },
+            { code: 'rate-limit', layer: 'turn', action: 'retry-later' },
+            { code: 'context-limit', layer: 'turn', action: 'reduce-context' },
+            { code: 'sandbox-denied', layer: 'turn', action: 'review-sandbox' },
+            { code: 'transport-error', layer: 'protocol', action: 'restart' }
+        ] as const;
+        for (const entry of classified) {
+            const frames: Array<() => void> = [];
+            const reducer = new RideCodexEventReducer({
+                scheduleFrame: callback => {
+                    frames.push(callback);
+                    return { dispose: () => undefined };
+                }
+            });
+            reducer.notifyMany(JSON.stringify({
+                generation: 1,
+                turnSequence: 1,
+                threadId: 'thread-1',
+                turnId: 'turn-1',
+                events: [
+                    { type: 'turn-started' },
+                    {
+                        type: 'error', code: entry.code,
+                        message: 'fixed coordinator message', retryable: false
+                    }
+                ]
+            }));
+            frames.shift()?.();
+            const reduced = reducer.snapshot().errors[0];
+            assert.ok(reduced, entry.code);
+
+            const mapped = mapRideCodexError(reduced.code);
+            assert.equal(mapped.code, entry.code);
+            assert.equal(mapped.layer, entry.layer);
+            assert.equal(mapped.action, entry.action);
+            assert.doesNotMatch(JSON.stringify(mapped), /coordinator|server|secret|api.?key/iu);
+        }
+    });
 });
 
 describe('RideCodex approval dialog', () => {

@@ -478,6 +478,54 @@ async function acceptsResumeResponse(response: Record<string, unknown>): Promise
     }
 }
 
+const SAFE_ERROR_MESSAGES = Object.freeze({
+    'turn-error': 'Codex turn failed.',
+    unauthorized: 'Codex authorization is required.',
+    'rate-limit': 'Codex usage limit was reached.',
+    'context-limit': 'Codex context limit was reached.',
+    'sandbox-denied': 'Codex action was denied by the sandbox.',
+    'transport-error': 'Codex connection failed.'
+});
+
+async function collectClassifiedErrorEvents(
+    path: 'terminal' | 'notification',
+    error: unknown,
+    willRetry = true
+): Promise<readonly RideCodexUiEvent[]> {
+    const host = new FakeTurnHost();
+    const scheduler = new FakeScheduler();
+    const events: RideCodexUiEvent[] = [];
+    const coordinator = new RideCodexTurnCoordinator({ host, scheduler });
+    const service = coordinator.connectClient({
+        turnEvents: wire => { events.push(...decodeBatch(wire).events); }
+    });
+    await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'classify' }] });
+    while (scheduler.callbacks.length > 0) {
+        scheduler.flushOne();
+        await Promise.resolve();
+    }
+    events.length = 0;
+    if (path === 'terminal') {
+        host.emit('turn/completed', {
+            threadId: 'thread-1',
+            turn: {
+                ...minimalTurn('turn-1', 'failed'),
+                ...(error === undefined ? {} : { error })
+            }
+        });
+    } else {
+        host.emit('error', {
+            threadId: 'thread-1', turnId: 'turn-1', error, willRetry
+        });
+    }
+    while (scheduler.callbacks.length > 0) {
+        scheduler.flushOne();
+        await Promise.resolve();
+    }
+    await coordinator.dispose();
+    return events;
+}
+
 describe('RideCodexTurnCoordinator minimal streaming contract', () => {
     it('sends exact start, steer expectedTurnId, and interrupt calls', async () => {
         const host = new FakeTurnHost();
@@ -697,6 +745,140 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         assert.deepEqual(normalizedEvents.find(event => event.type === 'reasoning-delta'), {
             type: 'reasoning-delta', itemId: 'item-1', contentIndex: 0, delta: 'details'
         });
+    });
+
+    const codexErrorCases: ReadonlyArray<Readonly<{
+        name: string;
+        info: unknown;
+        code: keyof typeof SAFE_ERROR_MESSAGES;
+    }>> = [
+        { name: 'contextWindowExceeded', info: 'contextWindowExceeded', code: 'context-limit' },
+        { name: 'sessionBudgetExceeded', info: 'sessionBudgetExceeded', code: 'rate-limit' },
+        { name: 'usageLimitExceeded', info: 'usageLimitExceeded', code: 'rate-limit' },
+        { name: 'serverOverloaded', info: 'serverOverloaded', code: 'rate-limit' },
+        { name: 'cyberPolicy', info: 'cyberPolicy', code: 'sandbox-denied' },
+        { name: 'sandboxError', info: 'sandboxError', code: 'sandbox-denied' },
+        { name: 'internalServerError', info: 'internalServerError', code: 'transport-error' },
+        { name: 'unauthorized', info: 'unauthorized', code: 'unauthorized' },
+        { name: 'badRequest', info: 'badRequest', code: 'turn-error' },
+        { name: 'threadRollbackFailed', info: 'threadRollbackFailed', code: 'turn-error' },
+        { name: 'other', info: 'other', code: 'turn-error' },
+        {
+            name: 'httpConnectionFailed',
+            info: { httpConnectionFailed: {} }, code: 'transport-error'
+        },
+        {
+            name: 'responseStreamConnectionFailed',
+            info: { responseStreamConnectionFailed: {} }, code: 'transport-error'
+        },
+        {
+            name: 'responseStreamDisconnected',
+            info: { responseStreamDisconnected: {} }, code: 'transport-error'
+        },
+        {
+            name: 'responseTooManyFailedAttempts',
+            info: { responseTooManyFailedAttempts: {} }, code: 'transport-error'
+        },
+        {
+            name: 'activeTurnNotSteerable',
+            info: { activeTurnNotSteerable: { turnKind: 'review' } }, code: 'turn-error'
+        }
+    ];
+
+    for (const entry of codexErrorCases) {
+        it(`classifies ${entry.name} on terminal and notification paths without retaining raw error text`, async () => {
+            const raw = {
+                message: 'C:\\Users\\alice\\private.txt sk-live-api-key',
+                codexErrorInfo: entry.info,
+                additionalDetails: 'apiKey=additional-secret /Users/alice/private'
+            };
+            const terminal = await collectClassifiedErrorEvents('terminal', raw);
+            const notification = await collectClassifiedErrorEvents('notification', raw, true);
+
+            assert.deepEqual(terminal, [{
+                type: 'turn-terminal',
+                status: 'failed',
+                error: { code: entry.code, message: SAFE_ERROR_MESSAGES[entry.code] }
+            }], entry.name);
+            assert.deepEqual(notification, [{
+                type: 'error',
+                code: entry.code,
+                message: SAFE_ERROR_MESSAGES[entry.code],
+                retryable: true
+            }], entry.name);
+            assert.doesNotMatch(JSON.stringify([terminal, notification]),
+                /alice|private|sk-live|apiKey|additional-secret/iu, entry.name);
+        });
+    }
+
+    for (const tag of [
+        'httpConnectionFailed',
+        'responseStreamConnectionFailed',
+        'responseStreamDisconnected',
+        'responseTooManyFailedAttempts'
+    ] as const) {
+        for (const override of [
+            { status: 401, code: 'unauthorized' },
+            { status: 403, code: 'unauthorized' },
+            { status: 429, code: 'rate-limit' }
+        ] as const) {
+            it(`maps ${tag} HTTP ${override.status} to ${override.code} on both paths`, async () => {
+                const raw = {
+                    message: 'remote server secret',
+                    codexErrorInfo: { [tag]: { httpStatusCode: override.status } },
+                    additionalDetails: null
+                };
+                const terminal = await collectClassifiedErrorEvents('terminal', raw);
+                const notification = await collectClassifiedErrorEvents('notification', raw, false);
+                assert.deepEqual(terminal, [{
+                    type: 'turn-terminal', status: 'failed',
+                    error: {
+                        code: override.code,
+                        message: SAFE_ERROR_MESSAGES[override.code]
+                    }
+                }]);
+                assert.deepEqual(notification, [{
+                    type: 'error', code: override.code,
+                    message: SAFE_ERROR_MESSAGES[override.code], retryable: false
+                }]);
+            });
+        }
+    }
+
+    it('keeps missing and null terminal errors generic and rejects descriptor-unsafe errors without traps', async () => {
+        for (const error of [undefined, null]) {
+            const events = await collectClassifiedErrorEvents('terminal', error);
+            assert.deepEqual(events, [{
+                type: 'turn-terminal', status: 'failed',
+                error: { code: 'turn-error', message: SAFE_ERROR_MESSAGES['turn-error'] }
+            }]);
+        }
+
+        let getterCalls = 0;
+        let trapCalls = 0;
+        const accessor = Object.defineProperty({
+            codexErrorInfo: 'unauthorized', additionalDetails: null
+        }, 'message', {
+            enumerable: true,
+            get: () => { getterCalls += 1; return 'sk-accessor-secret'; }
+        });
+        const proxy = new Proxy({}, {
+            get: () => { trapCalls += 1; return undefined; },
+            ownKeys: () => { trapCalls += 1; return []; },
+            getOwnPropertyDescriptor: () => { trapCalls += 1; return undefined; },
+            getPrototypeOf: () => { trapCalls += 1; return Object.prototype; }
+        });
+        const nestedProxy = {
+            message: 'safe shape',
+            codexErrorInfo: proxy,
+            additionalDetails: null
+        };
+        for (const unsafe of [accessor, proxy, nestedProxy]) {
+            assert.deepEqual(await collectClassifiedErrorEvents('notification', unsafe), []);
+            assert.deepEqual(await collectClassifiedErrorEvents('terminal', unsafe), []);
+        }
+        assert.equal(getterCalls, 0);
+        assert.equal(trapCalls, 0);
     });
 
     it('keeps reasoning summary, part, and text streams distinct at UTF-8 boundaries', async () => {

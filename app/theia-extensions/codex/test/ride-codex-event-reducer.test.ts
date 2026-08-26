@@ -145,6 +145,92 @@ describe('RideCodexEventReducer minimal frame contract', () => {
         assert.ok(Object.isFrozen(snapshot.items[0]));
     });
 
+    const classifiedErrors = Object.freeze([
+        Object.freeze({ code: 'unauthorized', message: 'Codex authorization is required.' }),
+        Object.freeze({ code: 'rate-limit', message: 'Codex usage limit was reached.' }),
+        Object.freeze({ code: 'context-limit', message: 'Codex context limit was reached.' }),
+        Object.freeze({ code: 'sandbox-denied', message: 'Codex action was denied by the sandbox.' }),
+        Object.freeze({ code: 'transport-error', message: 'Codex connection failed.' })
+    ]);
+
+    for (const classified of classifiedErrors) {
+        it(`accepts bounded ${classified.code} terminal and diagnostic events`, () => {
+            for (const path of ['terminal', 'notification'] as const) {
+                const frames: Array<() => void> = [];
+                const reducer = new RideCodexEventReducer({
+                    maxQueuedBytes: MIN_COHERENT_QUEUE_BYTES,
+                    scheduleFrame: callback => {
+                        frames.push(callback);
+                        return { dispose: () => undefined };
+                    }
+                });
+                const events = path === 'terminal'
+                    ? [
+                        { type: 'turn-started' },
+                        {
+                            type: 'turn-terminal', status: 'failed',
+                            error: { code: classified.code, message: classified.message }
+                        }
+                    ]
+                    : [
+                        { type: 'turn-started' },
+                        {
+                            type: 'error', code: classified.code,
+                            message: classified.message, retryable: true
+                        }
+                    ];
+                const wire = batchWire({
+                    generation: 1,
+                    turnSequence: 1,
+                    threadId: WORST_VALID_IDENTIFIER,
+                    turnId: WORST_VALID_IDENTIFIER,
+                    events
+                });
+                assert.ok(Buffer.byteLength(wire, 'utf8') <= MIN_COHERENT_QUEUE_BYTES,
+                    `${classified.code} ${path} boundary`);
+                reducer.notifyMany(wire);
+                frames.shift()?.();
+
+                const snapshot = reducer.snapshot();
+                assert.deepEqual(snapshot.errors.map(error => ({
+                    code: error.code, message: error.message
+                })), [classified], `${classified.code} ${path}`);
+                assert.equal(snapshot.status, path === 'terminal' ? 'failed' : 'in-progress');
+                assert.ok(Object.isFrozen(snapshot.errors[0]));
+            }
+        });
+    }
+
+    it('rejects unreviewed safe-error lookalikes on terminal and diagnostic paths', () => {
+        for (const code of [
+            'Unauthorized', 'unauthorized ', 'http-401', 'serverOverloaded', 'raw-server-error'
+        ]) {
+            for (const event of [
+                {
+                    type: 'turn-terminal', status: 'failed',
+                    error: { code, message: 'must reject' }
+                },
+                { type: 'error', code, message: 'must reject', retryable: false }
+            ]) {
+                const frames: Array<() => void> = [];
+                const reducer = new RideCodexEventReducer({
+                    scheduleFrame: callback => {
+                        frames.push(callback);
+                        return { dispose: () => undefined };
+                    }
+                });
+                reducer.notifyMany(batchWire({
+                    generation: 1,
+                    threadId: 'thread-1',
+                    turnId: 'turn-1',
+                    events: [{ type: 'turn-started' }, event]
+                }));
+                assert.equal(frames.length, 0, `${code} ${event.type}`);
+                assert.equal(reducer.snapshot().status, 'idle', `${code} ${event.type}`);
+            }
+        }
+    });
+
     it('preserves and deeply freezes add, delete, update, and moved file patches', () => {
         const frames: Array<() => void> = [];
         const reducer = new RideCodexEventReducer({

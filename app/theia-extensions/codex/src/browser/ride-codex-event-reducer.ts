@@ -13,6 +13,7 @@ import {
     RideCodexRenderedItem,
     RIDE_CODEX_MAX_IDENTIFIER_BYTES,
     RIDE_CODEX_MIN_QUEUED_BYTES,
+    RIDE_CODEX_SAFE_ERROR_CODES,
     RideCodexTurnSnapshot,
     RideCodexUiEvent,
     truncateUtf8,
@@ -994,7 +995,7 @@ function isUiEvent(value: unknown): value is RideCodexUiEvent {
                 && ['completed', 'failed', 'interrupted', 'interrupt-uncertain'].includes(value.status as string)
                 && (value.error === undefined || (isPlainRecord(value.error)
                     && hasExactKeys(value.error, ['code', 'message'])
-                    && ['turn-error', 'operation-failed', 'interrupt-timeout', 'recovery-failed'].includes(value.error.code as string)
+                    && isSafeErrorCode(value.error.code)
                     && text(value.error.message)));
         case 'item-started':
         case 'item-completed':
@@ -1041,11 +1042,16 @@ function isUiEvent(value: unknown): value is RideCodexUiEvent {
                 && (value.droppedBytes === undefined || nonnegativeInteger(value.droppedBytes));
         case 'error':
             return hasExactKeys(value, ['type', 'code', 'message', 'retryable'])
-                && ['turn-error', 'operation-failed', 'interrupt-timeout', 'recovery-failed'].includes(value.code as string)
+                && isSafeErrorCode(value.code)
                 && text(value.message) && typeof value.retryable === 'boolean';
         default:
             return false;
     }
+}
+
+function isSafeErrorCode(value: unknown): boolean {
+    return typeof value === 'string'
+        && (RIDE_CODEX_SAFE_ERROR_CODES as readonly string[]).includes(value);
 }
 
 function isFileChange(value: unknown): value is RideCodexFileChange {

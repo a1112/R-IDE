@@ -43,6 +43,7 @@ class FakeHost implements RideCodexApprovalHost {
         result: unknown;
     }>> = [];
     readonly failingResponses = new Set<RequestId>();
+    readonly responseDelays = new Map<RequestId, Promise<void>>();
     readonly #requestListeners = new Set<(request: Readonly<{
         id: RequestId;
         method: string;
@@ -63,6 +64,10 @@ class FakeHost implements RideCodexApprovalHost {
 
     async respondServerRequest(generation: number, id: RequestId, result: unknown): Promise<void> {
         this.responses.push(Object.freeze({ generation, id, result }));
+        const delay = this.responseDelays.get(id);
+        if (delay) {
+            await delay;
+        }
         if (this.failingResponses.has(id)) {
             throw new Error('C:\\Users\\alice\\secret.txt sk-live-secret');
         }
@@ -287,6 +292,52 @@ function createFixture(options: Readonly<{
     return { broker, client, clock, host, session };
 }
 
+function trackedChange(
+    path: string,
+    kind: 'add' | 'delete' | 'update',
+    movePath?: string
+): Readonly<Record<string, unknown>> {
+    return Object.freeze({
+        path,
+        kind: Object.freeze(kind === 'update'
+            ? { type: kind, move_path: movePath ?? null }
+            : { type: kind }),
+        diff: 'untrusted patch text'
+    });
+}
+
+function emitTrackedScope(
+    host: FakeHost,
+    changes: readonly Readonly<Record<string, unknown>>[],
+    itemId = 'item-file-1'
+): void {
+    host.emitNotification('item/fileChange/patchUpdated', {
+        threadId: CONTEXT.threadId,
+        turnId: CONTEXT.turnId,
+        itemId,
+        changes
+    });
+}
+
+function createTrackedFixture(resolveRealPath: (path: string) => Promise<string> = async path => path) {
+    const host = new FakeHost();
+    const clock = new FakeClock();
+    const broker = new RideCodexApprovalBroker({
+        host,
+        now: () => clock.now,
+        schedule: clock.schedule,
+        ttlMs: 1_000,
+        pathStyle: 'win32',
+        resolveRealPath
+    });
+    const client = new RecordingClient();
+    const session = broker.connectClient(client);
+    host.emitNotification('thread/started', {
+        thread: { id: CONTEXT.threadId, cwd: 'C:\\workspace' }
+    });
+    return { broker, client, clock, host, session };
+}
+
 function recordsDecline(fixture: ReturnType<typeof createFixture>): boolean {
     const result = fixture.host.responses[0]?.result;
     return fixture.client.latest().length === 0
@@ -380,6 +431,135 @@ describe('RideCodexApprovalBroker ownership', () => {
         await fixture.session.setContext({ ...CONTEXT, generation: 8 });
         await fixture.broker.handleServerRequest(commandRequest({ turnId: 'turn-beta' }), 7);
         assert.equal(fixture.client.latest().length, 0);
+    });
+
+    it('publishes A to B to C context revisions synchronously while older cancellation writes are delayed', async () => {
+        const fixture = createFixture();
+        const contextB = Object.freeze({ ...CONTEXT, turnId: 'turn-beta' });
+        const contextC = Object.freeze({ ...CONTEXT, turnId: 'turn-gamma' });
+        await fixture.session.setContext(CONTEXT);
+        await fixture.broker.handleServerRequest(
+            commandRequest({}, 'context-a'), CONTEXT.generation
+        );
+        const delayA = new Deferred<void>();
+        fixture.host.responseDelays.set('context-a', delayA.promise);
+
+        const switchingToB = fixture.session.setContext(contextB);
+        assert.deepEqual(await fixture.session.approvals(), []);
+        await fixture.broker.handleServerRequest(commandRequest({
+            itemId: 'item-late-context-a'
+        }, 'late-context-a'), CONTEXT.generation);
+        assert.deepEqual(await fixture.session.approvals(), []);
+        await fixture.broker.handleServerRequest(commandRequest({
+            turnId: contextB.turnId,
+            itemId: 'item-context-b'
+        }, 'context-b'), CONTEXT.generation);
+        const cardB = fixture.client.latest()[0];
+        assert.ok(cardB);
+        assert.equal((cardB as { command?: string }).command, 'printf "<unsafe>& exact"');
+
+        const delayB = new Deferred<void>();
+        fixture.host.responseDelays.set('context-b', delayB.promise);
+        const switchingToC = fixture.session.setContext(contextC);
+        assert.deepEqual(await fixture.session.approvals(), []);
+        await fixture.broker.handleServerRequest(commandRequest({
+            turnId: contextC.turnId,
+            itemId: 'item-context-c'
+        }, 'context-c'), CONTEXT.generation);
+        const cardC = fixture.client.latest()[0];
+        assert.ok(cardC);
+
+        delayA.resolve(undefined);
+        await switchingToB;
+        assert.deepEqual(await fixture.session.approvals(), [cardC]);
+        delayB.resolve(undefined);
+        await switchingToC;
+        assert.deepEqual(await fixture.session.approvals(), [cardC]);
+        assert.deepEqual(await fixture.session.decide({
+            token: cardB.token, fingerprint: cardB.fingerprint, decision: 'accept'
+        }), { status: 'rejected', code: 'stale-approval' });
+        assert.deepEqual(await fixture.session.decide({
+            token: cardC.token, fingerprint: cardC.fingerprint, decision: 'accept'
+        }), { status: 'responded' });
+        assert.deepEqual(fixture.host.responses, [
+            { generation: 7, id: 'context-a', result: { decision: 'cancel' } },
+            { generation: 7, id: 'late-context-a', result: { decision: 'cancel' } },
+            { generation: 7, id: 'context-b', result: { decision: 'cancel' } },
+            { generation: 7, id: 'context-c', result: { decision: 'accept' } }
+        ]);
+        assert.ok(fixture.host.leases.every(lease => lease.releases === 1));
+    });
+
+    it('does not revive an old approval after switching away and back to the identical context', async () => {
+        const fixture = createFixture();
+        const contextB = Object.freeze({ ...CONTEXT, turnId: 'turn-beta' });
+        await fixture.session.setContext(CONTEXT);
+        await fixture.broker.handleServerRequest(
+            commandRequest({ itemId: 'item-old-a' }, 'old-context-a'), CONTEXT.generation
+        );
+        const oldCard = fixture.client.latest()[0];
+        const delayed = new Deferred<void>();
+        fixture.host.responseDelays.set('old-context-a', delayed.promise);
+
+        const switchingAway = fixture.session.setContext(contextB);
+        const switchingBack = fixture.session.setContext(CONTEXT);
+        await switchingBack;
+        await fixture.broker.handleServerRequest(
+            commandRequest({ itemId: 'item-new-a' }, 'new-context-a'), CONTEXT.generation
+        );
+        const newCard = fixture.client.latest()[0];
+        assert.ok(newCard);
+        assert.notEqual(newCard.token, oldCard.token);
+
+        delayed.resolve(undefined);
+        await switchingAway;
+        assert.deepEqual(await fixture.session.approvals(), [newCard]);
+        assert.deepEqual(await fixture.session.decide({
+            token: oldCard.token, fingerprint: oldCard.fingerprint, decision: 'accept'
+        }), { status: 'rejected', code: 'stale-approval' });
+        assert.deepEqual(await fixture.session.decide({
+            token: newCard.token, fingerprint: newCard.fingerprint, decision: 'accept'
+        }), { status: 'responded' });
+        assert.deepEqual(fixture.host.responses, [
+            { generation: 7, id: 'old-context-a', result: { decision: 'cancel' } },
+            { generation: 7, id: 'new-context-a', result: { decision: 'accept' } }
+        ]);
+        assert.ok(fixture.host.leases.every(lease => lease.releases === 1));
+    });
+
+    it('clears context synchronously during delayed dispose and disconnect cancellation', async () => {
+        for (const ending of ['dispose-context', 'disconnect'] as const) {
+            const fixture = createFixture();
+            await fixture.session.setContext(CONTEXT);
+            await fixture.broker.handleServerRequest(
+                commandRequest({}, `old-${ending}`), CONTEXT.generation
+            );
+            const delayed = new Deferred<void>();
+            fixture.host.responseDelays.set(`old-${ending}`, delayed.promise);
+
+            let disposing: Promise<void>;
+            if (ending === 'dispose-context') {
+                disposing = fixture.session.disposeContext();
+            } else {
+                fixture.session.dispose();
+                disposing = flushAsync();
+            }
+            assert.deepEqual(await fixture.session.approvals(), []);
+            await fixture.broker.handleServerRequest(
+                commandRequest({ itemId: `transition-${ending}` }, `transition-${ending}`),
+                CONTEXT.generation
+            );
+            assert.deepEqual(await fixture.session.approvals(), []);
+            assert.deepEqual(fixture.host.responses.map(response => response.id), [
+                `old-${ending}`, `transition-${ending}`
+            ], ending);
+
+            delayed.resolve(undefined);
+            await disposing;
+            await flushAsync();
+            assert.ok(fixture.host.leases.every(lease => lease.releases === 1), ending);
+            await fixture.broker.dispose();
+        }
     });
 
     it('shows exact command fields and exposes only policy-approved stable decisions', async () => {
@@ -814,6 +994,244 @@ describe('RideCodexApprovalBroker ownership', () => {
         assert.ok(Object.isFrozen(card));
         assert.ok(Object.isFrozen(card.changes));
         assert.ok(card.changes.every(Object.isFrozen));
+    });
+
+    it('rejects a resolver scope that changes while resolution or realpath is awaiting', async () => {
+        for (const stage of ['resolver', 'realpath'] as const) {
+            const original = resolution([{ path: 'src\\a.ts', kind: 'update' }]);
+            let current: RideCodexApprovalScopeResolution | undefined = original;
+            const deferred = new Deferred<RideCodexApprovalScopeResolution | string>();
+            let firstResolution = true;
+            let entered = false;
+            let realPathCalls = 0;
+            const fixture = createFixture({
+                resolveFileScope: async () => {
+                    if (stage === 'resolver' && firstResolution) {
+                        firstResolution = false;
+                        entered = true;
+                        return deferred.promise as Promise<RideCodexApprovalScopeResolution>;
+                    }
+                    return current;
+                },
+                resolveRealPath: async path => {
+                    realPathCalls += 1;
+                    if (stage === 'realpath' && realPathCalls === 1) {
+                        entered = true;
+                        return deferred.promise as Promise<string>;
+                    }
+                    return path;
+                }
+            });
+            await fixture.session.setContext(CONTEXT);
+            const operation = fixture.broker.handleServerRequest(
+                fileRequest({}, `scope-${stage}`), CONTEXT.generation
+            );
+            await waitForAsync(() => entered);
+
+            current = resolution([
+                { path: 'src\\a.ts', kind: 'update' },
+                { path: 'src\\b.ts', kind: 'add' }
+            ]);
+            deferred.resolve(stage === 'resolver' ? original : 'C:\\workspace');
+            await operation;
+
+            assert.equal(fixture.client.latest().length, 0, stage);
+            assert.deepEqual(fixture.host.responses, [{
+                generation: 7, id: `scope-${stage}`, result: { decision: 'cancel' }
+            }], stage);
+            assert.equal(fixture.host.leases[0].releases, 1, stage);
+            await fixture.broker.dispose();
+        }
+    });
+
+    it('consumes a published token when any exact resolver scope identity field changes', async () => {
+        const original = resolution([
+            { path: 'src\\a.ts', kind: 'update', movePath: 'src\\moved.ts' },
+            { path: 'src\\b.ts', kind: 'add' }
+        ]);
+        const variants: ReadonlyArray<Readonly<{
+            name: string;
+            scope: RideCodexApprovalScopeResolution | undefined;
+        }>> = [
+            {
+                name: 'expanded',
+                scope: resolution([...original.changes, { path: 'src\\c.ts', kind: 'delete' }])
+            },
+            { name: 'shrunk', scope: resolution([original.changes[0]]) },
+            { name: 'reordered', scope: resolution([...original.changes].reverse()) },
+            {
+                name: 'movePath changed',
+                scope: resolution([
+                    { path: 'src\\a.ts', kind: 'update', movePath: 'src\\other.ts' },
+                    original.changes[1]
+                ])
+            },
+            {
+                name: 'kind changed',
+                scope: resolution([
+                    { path: 'src\\a.ts', kind: 'delete' },
+                    original.changes[1]
+                ])
+            },
+            { name: 'removed', scope: undefined }
+        ];
+        for (const variant of variants) {
+            let current = original as RideCodexApprovalScopeResolution | undefined;
+            const fixture = createFixture({ resolveFileScope: async () => current });
+            await fixture.session.setContext(CONTEXT);
+            await fixture.broker.handleServerRequest(
+                fileRequest({}, `published-${variant.name}`), CONTEXT.generation
+            );
+            const card = fixture.client.latest()[0];
+            assert.ok(card, variant.name);
+
+            current = variant.scope;
+            assert.deepEqual(await fixture.session.decide({
+                token: card.token, fingerprint: card.fingerprint, decision: 'accept'
+            }), { status: 'responded' }, variant.name);
+            assert.deepEqual(fixture.host.responses, [{
+                generation: 7,
+                id: `published-${variant.name}`,
+                result: { decision: 'cancel' }
+            }], variant.name);
+            assert.equal(fixture.client.latest().length, 0, variant.name);
+            assert.equal(fixture.host.leases[0].releases, 1, variant.name);
+            assert.deepEqual(await fixture.session.decide({
+                token: card.token, fingerprint: card.fingerprint, decision: 'accept'
+            }), { status: 'rejected', code: 'stale-approval' }, variant.name);
+            await fixture.broker.dispose();
+        }
+    });
+
+    it('keeps an unchanged equivalent canonical resolver scope valid', async () => {
+        let current = resolution([{
+            path: 'src\\folder\\..\\a.ts',
+            kind: 'update',
+            movePath: 'src\\.\\moved.ts',
+            diff: 'first untrusted patch'
+        }]);
+        const fixture = createFixture({ resolveFileScope: async () => current });
+        await fixture.session.setContext(CONTEXT);
+        await fixture.broker.handleServerRequest(fileRequest({}, 'canonical-equivalent'), CONTEXT.generation);
+        const card = fixture.client.latest()[0];
+        assert.ok(card);
+
+        current = Object.freeze({
+            workspaceRoot: 'C:\\workspace\\.',
+            changes: Object.freeze([Object.freeze({
+                path: 'src\\a.ts', kind: 'update' as const,
+                movePath: 'src\\moved.ts', diff: 'different untrusted patch'
+            })])
+        });
+        assert.deepEqual(await fixture.session.decide({
+            token: card.token, fingerprint: card.fingerprint, decision: 'accept'
+        }), { status: 'responded' });
+        assert.deepEqual(fixture.host.responses, [{
+            generation: 7, id: 'canonical-equivalent', result: { decision: 'accept' }
+        }]);
+        assert.equal(fixture.host.leases[0].releases, 1);
+    });
+
+    it('fails scope rechecks closed without executing resolver-owned getters or Proxy traps', async () => {
+        for (const unsafe of ['accessor', 'proxy'] as const) {
+            let getterCalls = 0;
+            let trapCalls = 0;
+            let current: unknown = resolution([{ path: 'src\\a.ts', kind: 'update' }]);
+            const fixture = createFixture({
+                resolveFileScope: async () => current as RideCodexApprovalScopeResolution
+            });
+            await fixture.session.setContext(CONTEXT);
+            await fixture.broker.handleServerRequest(
+                fileRequest({}, `unsafe-recheck-${unsafe}`), CONTEXT.generation
+            );
+            const card = fixture.client.latest()[0];
+            assert.ok(card);
+
+            current = unsafe === 'accessor'
+                ? Object.defineProperty({ changes: [] }, 'workspaceRoot', {
+                    enumerable: true,
+                    get: () => { getterCalls += 1; return 'C:\\workspace'; }
+                })
+                : {
+                    workspaceRoot: 'C:\\workspace',
+                    changes: new Proxy([], {
+                        get: () => { trapCalls += 1; return undefined; },
+                        ownKeys: () => { trapCalls += 1; return []; },
+                        getOwnPropertyDescriptor: () => { trapCalls += 1; return undefined; },
+                        getPrototypeOf: () => { trapCalls += 1; return Array.prototype; }
+                    })
+                };
+            assert.deepEqual(await fixture.session.decide({
+                token: card.token, fingerprint: card.fingerprint, decision: 'accept'
+            }), { status: 'responded' }, unsafe);
+            assert.equal(getterCalls, 0, unsafe);
+            assert.equal(trapCalls, 0, unsafe);
+            assert.deepEqual(fixture.host.responses, [{
+                generation: 7, id: `unsafe-recheck-${unsafe}`, result: { decision: 'cancel' }
+            }], unsafe);
+            assert.equal(fixture.host.leases[0].releases, 1, unsafe);
+            await fixture.broker.dispose();
+        }
+    });
+
+    it('rechecks production tracked scope during realpath and after publication removal or eviction', async () => {
+        const realpathDeferred = new Deferred<string>();
+        let realpathCalls = 0;
+        const duringRealpath = createTrackedFixture(async path => {
+            realpathCalls += 1;
+            return realpathCalls === 1 ? realpathDeferred.promise : path;
+        });
+        await duringRealpath.session.setContext(CONTEXT);
+        emitTrackedScope(duringRealpath.host, [trackedChange('src\\a.ts', 'update')]);
+        const operation = duringRealpath.broker.handleServerRequest(
+            fileRequest({}, 'tracked-during-realpath'), CONTEXT.generation
+        );
+        await waitForAsync(() => realpathCalls === 1);
+        emitTrackedScope(duringRealpath.host, [
+            trackedChange('src\\a.ts', 'update'), trackedChange('src\\b.ts', 'add')
+        ]);
+        realpathDeferred.resolve('C:\\workspace');
+        await operation;
+        assert.equal(duringRealpath.client.latest().length, 0);
+        assert.deepEqual(duringRealpath.host.responses, [{
+            generation: 7, id: 'tracked-during-realpath', result: { decision: 'cancel' }
+        }]);
+        assert.equal(duringRealpath.host.leases[0].releases, 1);
+        await duringRealpath.broker.dispose();
+
+        for (const ending of ['completed', 'evicted'] as const) {
+            const fixture = createTrackedFixture();
+            await fixture.session.setContext(CONTEXT);
+            emitTrackedScope(fixture.host, [trackedChange('src\\a.ts', 'update')]);
+            await fixture.broker.handleServerRequest(
+                fileRequest({}, `tracked-${ending}`), CONTEXT.generation
+            );
+            const card = fixture.client.latest()[0];
+            assert.ok(card, ending);
+            if (ending === 'completed') {
+                fixture.host.emitNotification('item/completed', {
+                    threadId: CONTEXT.threadId,
+                    turnId: CONTEXT.turnId,
+                    item: { id: 'item-file-1' }
+                });
+            } else {
+                for (let index = 0; index < 256; index += 1) {
+                    emitTrackedScope(
+                        fixture.host,
+                        [trackedChange(`src\\eviction-${index}.ts`, 'add')],
+                        `eviction-${index}`
+                    );
+                }
+            }
+            assert.deepEqual(await fixture.session.decide({
+                token: card.token, fingerprint: card.fingerprint, decision: 'accept'
+            }), { status: 'responded' }, ending);
+            assert.deepEqual(fixture.host.responses, [{
+                generation: 7, id: `tracked-${ending}`, result: { decision: 'cancel' }
+            }], ending);
+            assert.equal(fixture.host.leases[0].releases, 1, ending);
+            await fixture.broker.dispose();
+        }
     });
 
     it('rejects workspace escapes, network/device paths, ADS, and realpath link escapes', async () => {

@@ -13,6 +13,7 @@ import {
     RideCodexItemKind,
     RideCodexPlanStep,
     RIDE_CODEX_MIN_QUEUED_BYTES,
+    RIDE_CODEX_SAFE_ERROR_MESSAGES,
     RideCodexSafeError,
     RideCodexTurnClient,
     RideCodexTurnInterruptRequest,
@@ -795,9 +796,13 @@ export class RideCodexTurnCoordinator {
         if (turn.status === 'in-progress') {
             return;
         }
-        this.#finishActive(turn.status, turn.status === 'failed' ? Object.freeze({
-            code: 'turn-error', message: 'Codex turn failed.'
-        }) : undefined, undefined, true, true);
+        this.#finishActive(
+            turn.status,
+            turn.status === 'failed' ? turn.error ?? safeServerError('turn-error') : undefined,
+            undefined,
+            true,
+            true
+        );
     }
 
     #onWarning(active: ActiveTurn, raw: unknown): void {
@@ -943,7 +948,7 @@ export class RideCodexTurnCoordinator {
                 return;
             case 'error':
                 this.#enqueueDiagnostic(Object.freeze({
-                    type: 'error', code: 'turn-error', message: 'Codex turn failed.',
+                    type: 'error', ...requireTurnError(ownValue(params, 'error')),
                     retryable: ownValue(params, 'willRetry') === true
                 }));
                 return;
@@ -1726,6 +1731,7 @@ function requireStableActiveNotification(method: string, value: unknown): Record
 function requireTurn(value: unknown): Readonly<{
     id: string;
     status: 'in-progress' | RideCodexTurnTerminalStatus;
+    error?: RideCodexSafeError;
 }> {
     const turn = requireOptions(value, [
         'id', 'items', 'itemsView', 'status', 'error', 'startedAt', 'completedAt', 'durationMs'
@@ -1742,9 +1748,8 @@ function requireTurn(value: unknown): Readonly<{
         && !['notLoaded', 'summary', 'full'].includes(ownValue(turn, 'itemsView') as string)) {
         throw new RideCodexTurnError('invalid-data');
     }
-    if (hasOwn(turn, 'error')) {
-        requireNullableTurnError(ownValue(turn, 'error'));
-    }
+    const error = hasOwn(turn, 'error')
+        ? requireNullableTurnError(ownValue(turn, 'error')) : undefined;
     if (hasOwn(turn, 'startedAt')) {
         requireNullableJsonInt64(ownValue(turn, 'startedAt'));
     }
@@ -1756,7 +1761,8 @@ function requireTurn(value: unknown): Readonly<{
     }
     return Object.freeze({
         id: requireSchemaIdentifier(ownValue(turn, 'id')),
-        status: normalizeServerTurnStatus(ownValue(turn, 'status'))
+        status: normalizeServerTurnStatus(ownValue(turn, 'status')),
+        ...(error === undefined ? {} : { error })
     });
 }
 
@@ -2315,37 +2321,37 @@ function requireOptionalImageDetail(record: Record<string, unknown>): void {
     requireEnum(detail, ['auto', 'low', 'high', 'original']);
 }
 
-function requireNullableTurnError(value: unknown): void {
+function requireNullableTurnError(value: unknown): RideCodexSafeError | undefined {
     if (isNullish(value)) {
         if (value === undefined) {
             throw new RideCodexTurnError('invalid-data');
         }
-        return;
+        return undefined;
     }
-    requireTurnError(value);
+    return requireTurnError(value);
 }
 
-function requireTurnError(value: unknown): void {
+function requireTurnError(value: unknown): RideCodexSafeError {
     const error = requireOptions(value, ['message', 'codexErrorInfo', 'additionalDetails']);
     requireRequiredKeys(error, ['message']);
     requireBoundedText(ownValue(error, 'message'), MAX_INPUT_TEXT_BYTES);
     if (hasOwn(error, 'additionalDetails')) {
         requireNullableText(ownValue(error, 'additionalDetails'), MAX_INPUT_TEXT_BYTES);
     }
-    const info = ownValue(error, 'codexErrorInfo');
     if (!hasOwn(error, 'codexErrorInfo')) {
-        return;
+        return safeServerError('turn-error');
     }
+    const info = ownValue(error, 'codexErrorInfo');
     if (isNullish(info)) {
         if (info === undefined) {
             throw new RideCodexTurnError('invalid-data');
         }
-        return;
+        return safeServerError('turn-error');
     }
-    requireCodexErrorInfo(info);
+    return safeServerError(requireCodexErrorInfo(info));
 }
 
-function requireCodexErrorInfo(value: unknown): void {
+function requireCodexErrorInfo(value: unknown): RideCodexSafeError['code'] {
     if (typeof value === 'string') {
         if (![
             'contextWindowExceeded', 'sessionBudgetExceeded', 'usageLimitExceeded', 'serverOverloaded',
@@ -2354,7 +2360,23 @@ function requireCodexErrorInfo(value: unknown): void {
         ].includes(value)) {
             throw new RideCodexTurnError('invalid-data');
         }
-        return;
+        switch (value) {
+            case 'contextWindowExceeded':
+                return 'context-limit';
+            case 'sessionBudgetExceeded':
+            case 'usageLimitExceeded':
+            case 'serverOverloaded':
+                return 'rate-limit';
+            case 'unauthorized':
+                return 'unauthorized';
+            case 'cyberPolicy':
+            case 'sandboxError':
+                return 'sandbox-denied';
+            case 'internalServerError':
+                return 'transport-error';
+            default:
+                return 'turn-error';
+        }
     }
     const tagged = requireRecord(value);
     const keys = Object.keys(tagged);
@@ -2370,12 +2392,24 @@ function requireCodexErrorInfo(value: unknown): void {
         if (!['review', 'compact'].includes(ownValue(active, 'turnKind') as string)) {
             throw new RideCodexTurnError('invalid-data');
         }
-        return;
+        return 'turn-error';
     }
     const connection = requireOptions(payload, ['httpStatusCode']);
     if (hasOwn(connection, 'httpStatusCode')) {
-        requireNullableUint16(ownValue(connection, 'httpStatusCode'));
+        const status = ownValue(connection, 'httpStatusCode');
+        requireNullableUint16(status);
+        if (status === 401 || status === 403) {
+            return 'unauthorized';
+        }
+        if (status === 429) {
+            return 'rate-limit';
+        }
     }
+    return 'transport-error';
+}
+
+function safeServerError(code: RideCodexSafeError['code']): RideCodexSafeError {
+    return Object.freeze({ code, message: RIDE_CODEX_SAFE_ERROR_MESSAGES[code] });
 }
 
 function requireThreadResumeResponse(value: unknown, expectedThreadId: string): void {

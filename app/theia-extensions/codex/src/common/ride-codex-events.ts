@@ -7,6 +7,21 @@
 export type RideCodexTurnTerminalStatus = 'completed' | 'failed' | 'interrupted' | 'interrupt-uncertain';
 export type RideCodexTurnStatus = 'idle' | 'in-progress' | RideCodexTurnTerminalStatus;
 export const RIDE_CODEX_MAX_IDENTIFIER_BYTES = 512;
+export const RIDE_CODEX_SAFE_ERROR_MESSAGES = Object.freeze({
+    'turn-error': 'Codex turn failed.',
+    'operation-failed': 'Codex turn operation failed.',
+    'interrupt-timeout': 'Codex turn interrupt could not be confirmed.',
+    'recovery-failed': 'Codex thread recovery failed.',
+    unauthorized: 'Codex authorization is required.',
+    'rate-limit': 'Codex usage limit was reached.',
+    'context-limit': 'Codex context limit was reached.',
+    'sandbox-denied': 'Codex action was denied by the sandbox.',
+    'transport-error': 'Codex connection failed.'
+});
+export type RideCodexSafeErrorCode = keyof typeof RIDE_CODEX_SAFE_ERROR_MESSAGES;
+export const RIDE_CODEX_SAFE_ERROR_CODES = Object.freeze(
+    Object.keys(RIDE_CODEX_SAFE_ERROR_MESSAGES) as RideCodexSafeErrorCode[]
+);
 const RIDE_CODEX_BOUNDARY_IDENTITY = Object.freeze({
     generation: Number.MAX_SAFE_INTEGER,
     turnSequence: Number.MAX_SAFE_INTEGER,
@@ -16,16 +31,11 @@ const RIDE_CODEX_BOUNDARY_IDENTITY = Object.freeze({
 const RIDE_CODEX_TERMINAL_BOUNDARIES = Object.freeze([
     Object.freeze({ type: 'turn-terminal', status: 'completed' }),
     Object.freeze({ type: 'turn-terminal', status: 'interrupted' }),
-    Object.freeze({
+    ...RIDE_CODEX_SAFE_ERROR_CODES.map(code => Object.freeze({
         type: 'turn-terminal',
         status: 'failed',
-        error: Object.freeze({ code: 'turn-error', message: 'Codex turn failed.' })
-    }),
-    Object.freeze({
-        type: 'turn-terminal',
-        status: 'failed',
-        error: Object.freeze({ code: 'operation-failed', message: 'Codex turn operation failed.' })
-    }),
+        error: Object.freeze({ code, message: RIDE_CODEX_SAFE_ERROR_MESSAGES[code] })
+    })),
     Object.freeze({
         type: 'turn-terminal',
         status: 'interrupt-uncertain',
@@ -94,7 +104,7 @@ export interface RideCodexTurnResult {
 }
 
 export interface RideCodexSafeError {
-    readonly code: 'turn-error' | 'operation-failed' | 'interrupt-timeout' | 'recovery-failed';
+    readonly code: RideCodexSafeErrorCode;
     readonly message: string;
 }
 
@@ -133,7 +143,7 @@ export type RideCodexUiEvent =
     }>
     | Readonly<{
         type: 'error';
-        code: 'turn-error' | 'operation-failed' | 'interrupt-timeout' | 'recovery-failed';
+        code: RideCodexSafeErrorCode;
         message: string;
         retryable: boolean;
     }>;

@@ -94,7 +94,9 @@ interface PendingApproval {
     readonly threadId: string;
     readonly turnId: string;
     readonly itemId: string;
+    readonly fileScopeFingerprint?: string;
     readonly ownerId: number;
+    readonly ownerContextRevision: number;
     readonly issuedAt: number;
     readonly expiresAt: number;
     readonly allowedDecisions: readonly RideCodexApprovalDecision[];
@@ -109,6 +111,7 @@ interface AuthorizingApproval {
     readonly threadId: string;
     readonly turnId: string;
     readonly ownerId: number;
+    readonly ownerContextRevision: number;
     readonly lease: RideCodexApprovalHostLease;
 }
 
@@ -151,6 +154,20 @@ interface TrackedThreadRoot {
 
 interface TrackedFileScope extends RideCodexApprovalScopeIdentity {
     readonly changes: readonly RideCodexApprovalScopeChange[];
+}
+
+interface CanonicalFileScope {
+    readonly workspace: string;
+    readonly changes: readonly Readonly<{
+        path: string;
+        kind: 'add' | 'delete' | 'update';
+        movePath?: string;
+    }>[];
+}
+
+interface CapturedFileScope {
+    readonly scope: CanonicalFileScope;
+    readonly fingerprint: string;
 }
 
 const DEFAULT_TTL_MS = 2 * 60 * 1_000;
@@ -197,6 +214,7 @@ export class RideCodexApprovalBroker {
     readonly #resolveFileScope: (
         identity: RideCodexApprovalScopeIdentity
     ) => Promise<RideCodexApprovalScopeResolution | undefined>;
+    readonly #usesTrackedFileScope: boolean;
     readonly #resolveRealPath: (path: string) => Promise<string>;
     readonly #instanceKey = randomBytes(32);
     readonly #sessions = new Map<number, SessionRecord>();
@@ -222,6 +240,7 @@ export class RideCodexApprovalBroker {
         this.#maxClients = boundedInteger(options.maxClients ?? 8, 1, 64, 'approval client count');
         this.#pathStyle = options.pathStyle ?? (process.platform === 'win32' ? 'win32' : 'posix');
         this.#allowAcceptForSession = options.allowAcceptForSession ?? (() => false);
+        this.#usesTrackedFileScope = options.resolveFileScope === undefined;
         this.#resolveFileScope = options.resolveFileScope ?? (async identity => this.#trackedFileScope(identity));
         this.#resolveRealPath = options.resolveRealPath ?? (path => resolveNearestRealPath(path, this.#pathStyle));
         this.#hostListener = this.#host.onServerRequest?.((request, generation) => {
@@ -297,11 +316,13 @@ export class RideCodexApprovalBroker {
             threadId: validated.threadId,
             turnId: validated.turnId,
             ownerId: owner.id,
+            ownerContextRevision,
             lease
         };
         this.#authorizing.add(authorizing);
         let scope: Record<string, unknown>;
         let ownershipScope: Record<string, unknown>;
+        let fileScopeFingerprint: string | undefined;
         if (kind === 'command') {
             const command = validated as ValidatedCommandRequest;
             scope = {
@@ -315,16 +336,33 @@ export class RideCodexApprovalBroker {
                 ...(command.cwd === undefined ? {} : { cwd: command.cwd.normalized })
             };
         } else {
-            let resolved: RideCodexApprovalScopeResolution | undefined;
-            try {
-                resolved = await this.#resolveFileScope(Object.freeze({
-                    generation,
-                    threadId: validated.threadId,
-                    turnId: validated.turnId,
-                    itemId: validated.itemId
-                }));
-            } catch {
-                resolved = undefined;
+            const identity = Object.freeze({
+                generation,
+                threadId: validated.threadId,
+                turnId: validated.turnId,
+                itemId: validated.itemId
+            });
+            const trackedFingerprintBeforeResolve = this.#usesTrackedFileScope
+                ? this.#currentTrackedFileScopeFingerprint(identity) : undefined;
+            const captured = await this.#captureFileScope(identity);
+            if (!this.#isStillAuthorized(
+                owner, ownerContextRevision, validated, generation, lease, authorizing
+            )) {
+                await this.#settleAuthorizing(authorizing, 'cancel');
+                return;
+            }
+            if (this.#usesTrackedFileScope
+                && trackedFingerprintBeforeResolve !== captured?.fingerprint) {
+                await this.#settleAuthorizing(authorizing, 'cancel');
+                return;
+            }
+            if (!captured) {
+                await this.#settleAuthorizing(authorizing, 'decline');
+                return;
+            }
+            if (!await this.#isFileScopeCurrent(identity, captured.fingerprint)) {
+                await this.#settleAuthorizing(authorizing, 'cancel');
+                return;
             }
             if (!this.#isStillAuthorized(
                 owner, ownerContextRevision, validated, generation, lease, authorizing
@@ -332,9 +370,22 @@ export class RideCodexApprovalBroker {
                 await this.#settleAuthorizing(authorizing, 'cancel');
                 return;
             }
-            const fileScope = resolved && await normalizeFileScope(
-                resolved, this.#pathStyle, this.#resolveRealPath
+            const fileScope = await normalizeFileScope(
+                captured.scope,
+                this.#pathStyle,
+                this.#resolveRealPath,
+                () => this.#isFileScopeCurrent(identity, captured.fingerprint)
             );
+            if (!this.#isStillAuthorized(
+                owner, ownerContextRevision, validated, generation, lease, authorizing
+            )) {
+                await this.#settleAuthorizing(authorizing, 'cancel');
+                return;
+            }
+            if (!await this.#isFileScopeCurrent(identity, captured.fingerprint)) {
+                await this.#settleAuthorizing(authorizing, 'cancel');
+                return;
+            }
             if (!this.#isStillAuthorized(
                 owner, ownerContextRevision, validated, generation, lease, authorizing
             )) {
@@ -353,6 +404,7 @@ export class RideCodexApprovalBroker {
                 workspace: fileScope.workspace,
                 ...scope
             };
+            fileScopeFingerprint = captured.fingerprint;
         }
 
         if (!this.#isStillAuthorized(
@@ -519,6 +571,23 @@ export class RideCodexApprovalBroker {
             await this.#settleAuthorizing(authorizing, 'cancel');
             return;
         }
+        if (kind === 'file-change') {
+            const identity = Object.freeze({
+                generation,
+                threadId: validated.threadId,
+                turnId: validated.turnId,
+                itemId: validated.itemId
+            });
+            if (!fileScopeFingerprint
+                || !await this.#isFileScopeCurrent(identity, fileScopeFingerprint)
+                || !this.#isStillAuthorized(
+                    owner, ownerContextRevision, validated, generation, lease, authorizing
+                )) {
+                timer.dispose();
+                await this.#settleAuthorizing(authorizing, 'cancel');
+                return;
+            }
+        }
         const pending: PendingApproval = {
             token,
             fingerprint,
@@ -527,7 +596,9 @@ export class RideCodexApprovalBroker {
             threadId: validated.threadId,
             turnId: validated.turnId,
             itemId: validated.itemId,
+            ...(fileScopeFingerprint === undefined ? {} : { fileScopeFingerprint }),
             ownerId: owner.id,
+            ownerContextRevision,
             issuedAt,
             expiresAt,
             allowedDecisions,
@@ -603,37 +674,41 @@ export class RideCodexApprovalBroker {
             await this.#disposeContext(record);
             return;
         }
-        if (record.context && !sameContext(record.context, safe)) {
-            await this.#cancelOwned(record);
-        }
-        record.contextRevision += 1;
+        const previousContextRevision = record.contextRevision;
+        record.contextRevision = previousContextRevision + 1;
         record.context = safe;
         this.#publish(record);
+        await this.#cancelOwned(record, previousContextRevision);
     }
 
     async #disposeContext(record: SessionRecord): Promise<void> {
         if (record.disposed) {
             return;
         }
-        await this.#cancelOwned(record);
-        record.contextRevision += 1;
+        const previousContextRevision = record.contextRevision;
+        record.contextRevision = previousContextRevision + 1;
         record.context = undefined;
         this.#publish(record);
+        await this.#cancelOwned(record, previousContextRevision);
     }
 
     async #disconnect(record: SessionRecord): Promise<void> {
         if (record.disposed) {
             return;
         }
+        const previousContextRevision = record.contextRevision;
         record.disposed = true;
-        record.contextRevision += 1;
+        record.contextRevision = previousContextRevision + 1;
+        record.context = undefined;
         this.#sessions.delete(record.id);
-        await this.#cancelOwned(record);
+        await this.#cancelOwned(record, previousContextRevision);
     }
 
-    async #cancelOwned(record: SessionRecord): Promise<void> {
-        const owned = [...this.#pending.values()].filter(pending => pending.ownerId === record.id);
-        const authorizing = [...this.#authorizing].filter(entry => entry.ownerId === record.id);
+    async #cancelOwned(record: SessionRecord, ownerContextRevision: number): Promise<void> {
+        const owned = [...this.#pending.values()].filter(pending =>
+            pending.ownerId === record.id && pending.ownerContextRevision === ownerContextRevision);
+        const authorizing = [...this.#authorizing].filter(entry =>
+            entry.ownerId === record.id && entry.ownerContextRevision === ownerContextRevision);
         await Promise.all([
             ...owned.map(pending => this.#settle(pending, 'cancel')),
             ...authorizing.map(entry => this.#settleAuthorizing(entry, 'cancel'))
@@ -653,6 +728,7 @@ export class RideCodexApprovalBroker {
             return STALE_RESULT;
         }
         if (record.disposed || pending.ownerId !== record.id
+            || pending.ownerContextRevision !== record.contextRevision
             || !constantTimeEqual(pending.fingerprint, safe.fingerprint)) {
             return OWNERSHIP_RESULT;
         }
@@ -664,6 +740,27 @@ export class RideCodexApprovalBroker {
         }
         if (!pending.allowedDecisions.includes(safe.decision)) {
             return INVALID_RESULT;
+        }
+        if (pending.fileScopeFingerprint !== undefined) {
+            const scopeMatches = await this.#isFileScopeCurrent(Object.freeze({
+                generation: pending.generation,
+                threadId: pending.threadId,
+                turnId: pending.turnId,
+                itemId: pending.itemId
+            }), pending.fileScopeFingerprint);
+            if (this.#pending.get(pending.token) !== pending) {
+                return STALE_RESULT;
+            }
+            if (!scopeMatches) {
+                return this.#settle(pending, 'cancel');
+            }
+            if (record.disposed || pending.ownerId !== record.id
+                || pending.ownerContextRevision !== record.contextRevision || !record.context
+                || record.context.generation !== pending.generation
+                || record.context.threadId !== pending.threadId
+                || record.context.turnId !== pending.turnId) {
+                return this.#settle(pending, 'cancel');
+            }
         }
         let decisionTime: number;
         try {
@@ -690,6 +787,7 @@ export class RideCodexApprovalBroker {
     ): boolean {
         if (this.#disposed || owner.disposed || this.#sessions.get(owner.id) !== owner
             || !this.#authorizing.has(authorizing)
+            || authorizing.ownerContextRevision !== contextRevision
             || owner.contextRevision !== contextRevision || lease.generation !== generation
             || !owner.context || owner.context.generation !== generation
             || owner.context.threadId !== request.threadId || owner.context.turnId !== request.turnId) {
@@ -885,6 +983,56 @@ export class RideCodexApprovalBroker {
         return deepFreezeRideCodex({ workspaceRoot: root.root, changes: scope.changes });
     }
 
+    async #captureFileScope(identity: RideCodexApprovalScopeIdentity): Promise<CapturedFileScope | undefined> {
+        let resolved: RideCodexApprovalScopeResolution | undefined;
+        try {
+            resolved = await this.#resolveFileScope(identity);
+        } catch {
+            return undefined;
+        }
+        const scope = canonicalFileScope(resolved, this.#pathStyle);
+        if (!scope) {
+            return undefined;
+        }
+        return Object.freeze({
+            scope,
+            fingerprint: this.#fileScopeFingerprint(identity, scope)
+        });
+    }
+
+    async #isFileScopeCurrent(
+        identity: RideCodexApprovalScopeIdentity,
+        fingerprint: string
+    ): Promise<boolean> {
+        const current = await this.#captureFileScope(identity);
+        return current !== undefined && constantTimeEqual(current.fingerprint, fingerprint);
+    }
+
+    #currentTrackedFileScopeFingerprint(identity: RideCodexApprovalScopeIdentity): string | undefined {
+        const scope = canonicalFileScope(this.#trackedFileScope(identity), this.#pathStyle);
+        return scope && this.#fileScopeFingerprint(identity, scope);
+    }
+
+    #fileScopeFingerprint(identity: RideCodexApprovalScopeIdentity, scope: CanonicalFileScope): string {
+        const canonical = this.#pathStyle === 'win32'
+            ? {
+                workspace: scope.workspace.toLowerCase(),
+                changes: scope.changes.map(change => ({
+                    path: change.path.toLowerCase(),
+                    kind: change.kind,
+                    ...(change.movePath === undefined ? {} : { movePath: change.movePath.toLowerCase() })
+                }))
+            }
+            : scope;
+        return this.#fingerprint({
+            generation: identity.generation,
+            threadId: identity.threadId,
+            turnId: identity.turnId,
+            itemId: identity.itemId,
+            scope: canonical
+        });
+    }
+
     #abandon(pending: PendingApproval): void {
         if (this.#pending.get(pending.token) !== pending) {
             return;
@@ -927,7 +1075,8 @@ export class RideCodexApprovalBroker {
 
     #cardsFor(record: SessionRecord): readonly RideCodexApprovalCard[] {
         return deepFreezeRideCodex([...this.#pending.values()]
-            .filter(pending => pending.ownerId === record.id)
+            .filter(pending => pending.ownerId === record.id
+                && pending.ownerContextRevision === record.contextRevision)
             .map(pending => pending.card)) as readonly RideCodexApprovalCard[];
     }
 
@@ -1286,18 +1435,10 @@ function validateCommandCwd(
         : undefined;
 }
 
-async function normalizeFileScope(
+function canonicalFileScope(
     value: unknown,
-    style: 'posix' | 'win32',
-    resolveRealPath: (path: string) => Promise<string>
-): Promise<Readonly<{
-    workspace: string;
-    changes: readonly Readonly<{
-        path: string;
-        kind: 'add' | 'delete' | 'update';
-        movePath?: string;
-    }>[];
-}> | undefined> {
+    style: 'posix' | 'win32'
+): CanonicalFileScope | undefined {
     const scope = exactDataRecord(value, ['workspaceRoot', 'changes']);
     const workspaceRoot = scope && boundedString(scope.workspaceRoot, MAX_PATH_BYTES);
     const rawChanges = scope && safeArray(scope.changes, MAX_FILE_CHANGES);
@@ -1309,20 +1450,7 @@ async function normalizeFileScope(
         return undefined;
     }
     const workspace = paths.normalize(workspaceRoot);
-    let realWorkspace: string;
-    try {
-        realWorkspace = paths.normalize(await resolveRealPath(workspace));
-    } catch {
-        return undefined;
-    }
-    if (!isSafeLocalPath(realWorkspace, style) || !paths.isAbsolute(realWorkspace)) {
-        return undefined;
-    }
-    const changes: Array<Readonly<{
-        path: string;
-        kind: 'add' | 'delete' | 'update';
-        movePath?: string;
-    }>> = [];
+    const changes: CanonicalFileScope['changes'][number][] = [];
     for (const raw of rawChanges) {
         const change = exactDataRecord(raw, ['path', 'kind'], ['path', 'kind', 'movePath', 'diff']);
         const rawPath = change && boundedString(change.path, MAX_PATH_BYTES);
@@ -1333,17 +1461,13 @@ async function normalizeFileScope(
                 && boundedString(change.movePath, MAX_PATH_BYTES) === undefined)) {
             return undefined;
         }
-        const normalizedPath = await normalizeScopedPath(
-            rawPath, workspace, realWorkspace, style, resolveRealPath
-        );
+        const normalizedPath = canonicalScopedPath(rawPath, workspace, style);
         if (!normalizedPath) {
             return undefined;
         }
         let movePath: string | undefined;
         if (typeof change.movePath === 'string') {
-            movePath = await normalizeScopedPath(
-                change.movePath, workspace, realWorkspace, style, resolveRealPath
-            );
+            movePath = canonicalScopedPath(change.movePath, workspace, style);
             if (!movePath) {
                 return undefined;
             }
@@ -1360,12 +1484,73 @@ async function normalizeFileScope(
     return deepFreezeRideCodex({ workspace, changes });
 }
 
+function canonicalScopedPath(
+    rawPath: string,
+    workspace: string,
+    style: 'posix' | 'win32'
+): string | undefined {
+    const paths = style === 'win32' ? win32 : posix;
+    if (!isSafeLocalPath(rawPath, style)) {
+        return undefined;
+    }
+    const target = paths.normalize(paths.isAbsolute(rawPath) ? rawPath : paths.resolve(workspace, rawPath));
+    if (!isWithin(workspace, target, paths)) {
+        return undefined;
+    }
+    const relative = paths.relative(workspace, target);
+    return relative.length > 0 && utf8ByteLength(relative) <= MAX_PATH_BYTES ? relative : undefined;
+}
+
+async function normalizeFileScope(
+    value: CanonicalFileScope,
+    style: 'posix' | 'win32',
+    resolveRealPath: (path: string) => Promise<string>,
+    isScopeCurrent: () => Promise<boolean>
+): Promise<CanonicalFileScope | undefined> {
+    const paths = style === 'win32' ? win32 : posix;
+    let realWorkspace: string;
+    try {
+        realWorkspace = paths.normalize(await resolveRealPath(value.workspace));
+    } catch {
+        return undefined;
+    }
+    if (!await isScopeCurrent()
+        || !isSafeLocalPath(realWorkspace, style) || !paths.isAbsolute(realWorkspace)) {
+        return undefined;
+    }
+    const changes: CanonicalFileScope['changes'][number][] = [];
+    for (const change of value.changes) {
+        const normalizedPath = await normalizeScopedPath(
+            change.path, value.workspace, realWorkspace, style, resolveRealPath, isScopeCurrent
+        );
+        if (!normalizedPath) {
+            return undefined;
+        }
+        let movePath: string | undefined;
+        if (change.movePath !== undefined) {
+            movePath = await normalizeScopedPath(
+                change.movePath, value.workspace, realWorkspace, style, resolveRealPath, isScopeCurrent
+            );
+            if (!movePath) {
+                return undefined;
+            }
+        }
+        changes.push(Object.freeze({
+            path: normalizedPath,
+            kind: change.kind,
+            ...(movePath === undefined ? {} : { movePath })
+        }));
+    }
+    return deepFreezeRideCodex({ workspace: value.workspace, changes });
+}
+
 async function normalizeScopedPath(
     rawPath: string,
     workspace: string,
     realWorkspace: string,
     style: 'posix' | 'win32',
-    resolveRealPath: (path: string) => Promise<string>
+    resolveRealPath: (path: string) => Promise<string>,
+    isScopeCurrent: () => Promise<boolean>
 ): Promise<string | undefined> {
     const paths = style === 'win32' ? win32 : posix;
     if (!isSafeLocalPath(rawPath, style)) {
@@ -1381,7 +1566,8 @@ async function normalizeScopedPath(
     } catch {
         return undefined;
     }
-    if (!isSafeLocalPath(realTarget, style) || !paths.isAbsolute(realTarget)
+    if (!await isScopeCurrent()
+        || !isSafeLocalPath(realTarget, style) || !paths.isAbsolute(realTarget)
         || !isWithin(realWorkspace, realTarget, paths)) {
         return undefined;
     }
@@ -1444,12 +1630,6 @@ async function resolveNearestRealPath(path: string, style: 'posix' | 'win32'): P
             candidate = parent;
         }
     }
-}
-
-function sameContext(left: RideCodexApprovalContext, right: RideCodexApprovalContext): boolean {
-    return left.generation === right.generation
-        && left.threadId === right.threadId
-        && left.turnId === right.turnId;
 }
 
 function constantTimeEqual(left: string, right: string): boolean {
