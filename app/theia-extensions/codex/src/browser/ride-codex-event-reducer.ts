@@ -154,21 +154,23 @@ export class RideCodexEventReducer {
         if (!safeBatch || !this.#isAuthorizedForPending(safeBatch)) {
             return;
         }
-        const sourceEvents = safeBatch.events;
-        const selected = selectPriorityEvents(sourceEvents, this.#maxBatchEvents);
-        const fitted = fitBatchEvents(safeBatch, selected, this.#maxBatchEvents, this.#maxQueuedBytes);
-        if (fitted.events.length === 0) {
-            return;
+        let deferredDropped = 0;
+        let firstChunk = true;
+        for (const sourceEvents of chunkEventsInOrder(safeBatch.events, this.#maxBatchEvents)) {
+            const fitted = fitBatchEvents(safeBatch, sourceEvents, this.#maxBatchEvents, this.#maxQueuedBytes);
+            deferredDropped = saturatingAdd(deferredDropped, fitted.dropped);
+            if (fitted.events.length === 0) {
+                continue;
+            }
+            const pending = freezePendingBatch(safeBatch, fitted.events);
+            this.#enqueuePending(pending, deferredDropped, firstChunk);
+            deferredDropped = 0;
+            firstChunk = false;
         }
-        const pending = deepFreezeRideCodex({
-            generation: safeBatch.generation,
-            turnSequence: safeBatch.turnSequence,
-            threadId: safeBatch.threadId,
-            turnId: safeBatch.turnId,
-            events: fitted.events
-        }) as RideCodexEventBatch;
-        this.#enqueuePending(pending, sourceEvents.length - selected.length + fitted.dropped);
-        if (!this.#frame) {
+        if (deferredDropped > 0) {
+            this.#enqueueDropWarning(safeBatch, deferredDropped);
+        }
+        if (this.#pending.length > 0 && !this.#frame) {
             this.#frame = this.#scheduleFrame(() => this.#flushFrame());
         }
     }
@@ -347,7 +349,7 @@ export class RideCodexEventReducer {
         this.#finalizedIdentities.add(identityKey);
     }
 
-    #enqueuePending(incoming: RideCodexEventBatch, initialDropped: number): void {
+    #enqueuePending(incoming: RideCodexEventBatch, initialDropped: number, mergeMatching = true): void {
         let dropped = initialDropped;
         const events: RideCodexUiEvent[] = [];
         const matching: number[] = [];
@@ -357,7 +359,7 @@ export class RideCodexEventReducer {
         )) {
             return;
         }
-        for (let index = 0; index < this.#pending.length; index += 1) {
+        for (let index = 0; mergeMatching && index < this.#pending.length; index += 1) {
             const pending = this.#pending[index];
             if (!sameBatchIdentity(pending, incoming) || reservedRecovery
                 || pending.events.some(isReservedRecoveryDiagnostic)) {
@@ -417,7 +419,27 @@ export class RideCodexEventReducer {
         this.#queuedBytes += candidateBytes;
     }
 
-    #makePendingRoom(requiredBytes: number, incoming: RideCodexEventBatch): number {
+    #enqueueDropWarning(
+        incoming: Pick<RideCodexEventBatch, 'generation' | 'turnSequence' | 'threadId' | 'turnId'>,
+        initialDropped: number
+    ): void {
+        let dropped = initialDropped;
+        const reserved = freezePendingBatch(incoming, [dropWarning(Number.MAX_SAFE_INTEGER)]);
+        dropped = saturatingAdd(dropped, this.#makePendingRoom(pendingBatchBytes(reserved), incoming));
+        const candidate = freezePendingBatch(incoming, [dropWarning(dropped)]);
+        const candidateBytes = pendingBatchBytes(candidate);
+        if (candidateBytes > this.#maxQueuedBytes
+            || this.#queuedBytes + candidateBytes > this.#maxQueuedBytes) {
+            return;
+        }
+        this.#pending.push(candidate);
+        this.#queuedBytes += candidateBytes;
+    }
+
+    #makePendingRoom(
+        requiredBytes: number,
+        incoming: Pick<RideCodexEventBatch, 'generation' | 'turnSequence' | 'threadId' | 'turnId'>
+    ): number {
         let dropped = 0;
         while (this.#queuedBytes + requiredBytes > this.#maxQueuedBytes) {
             let removed = false;
@@ -1402,6 +1424,17 @@ function selectPriorityEvents(
     }
     selected.sort((left, right) => left.index - right.index);
     return selected.map(entry => entry.event);
+}
+
+function chunkEventsInOrder(
+    events: readonly RideCodexUiEvent[],
+    limit: number
+): readonly (readonly RideCodexUiEvent[])[] {
+    const chunks: RideCodexUiEvent[][] = [];
+    for (let offset = 0; offset < events.length; offset += limit) {
+        chunks.push(events.slice(offset, offset + limit));
+    }
+    return chunks;
 }
 
 function isReservedRecoveryDiagnostic(event: RideCodexUiEvent): boolean {

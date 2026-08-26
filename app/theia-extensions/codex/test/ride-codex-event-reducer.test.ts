@@ -982,20 +982,22 @@ describe('RideCodexEventReducer minimal frame contract', () => {
         assert.equal(frames.length, 0);
         assert.equal(reducer.snapshot().status, 'idle');
 
-        reducer.notifyMany(batchWire({
+        const boundedPressureWire = batchWire({
             generation: 1,
             turnSequence: 1,
-            threadId: 'thread-1',
-            turnId: 'turn-1',
+            threadId: 't'.repeat(512),
+            turnId: 'u'.repeat(512),
             events: [
                 { type: 'turn-started' },
-                ...Array.from({ length: 20 }, (_, index) => ({
+                ...Array.from({ length: 40 }, (_, index) => ({
                     type: 'warning' as const,
                     code: 'server-warning' as const,
                     message: `warning ${index}`
                 }))
             ]
-        }));
+        });
+        assert.ok(Buffer.byteLength(boundedPressureWire, 'utf8') <= 4_096);
+        reducer.notifyMany(boundedPressureWire);
         assert.equal(frames.length, 1);
         frames.shift()?.();
 
@@ -1541,6 +1543,99 @@ describe('RideCodexEventReducer minimal frame contract', () => {
                 'interrupt-timeout', 'recovery-failed'
             ]);
         }
+    });
+
+    it('chunks same-wire and separate-wire recovery boundaries at the exact queue minimum', () => {
+        for (const delivery of ['same-wire', 'separate-wire'] as const) {
+            for (const maxBatchEvents of [2, 8]) {
+                const frames: Array<() => void> = [];
+                const reducer = new RideCodexEventReducer({
+                    scheduleFrame: callback => {
+                        frames.push(callback);
+                        return { dispose: () => undefined };
+                    },
+                    maxQueuedBytes: MIN_COHERENT_QUEUE_BYTES,
+                    maxBatchEvents
+                });
+                const identity = {
+                    generation: Number.MAX_SAFE_INTEGER,
+                    turnSequence: Number.MAX_SAFE_INTEGER,
+                    threadId: WORST_VALID_IDENTIFIER,
+                    turnId: WORST_VALID_IDENTIFIER
+                };
+                const events: RideCodexEventBatch['events'] = [
+                    { type: 'turn-started' },
+                    {
+                        type: 'turn-terminal',
+                        status: 'interrupt-uncertain',
+                        error: {
+                            code: 'interrupt-timeout',
+                            message: 'Codex turn interrupt could not be confirmed.'
+                        }
+                    },
+                    {
+                        type: 'error',
+                        code: 'recovery-failed',
+                        message: 'Codex thread recovery failed.',
+                        retryable: false
+                    }
+                ];
+                const pendingChunks = maxBatchEvents === 2 ? [events.slice(0, 2), events.slice(2)] : [events];
+                const pendingBytes = pendingChunks.reduce((total, chunk) => total + Buffer.byteLength(batchWire({
+                    ...identity,
+                    events: chunk
+                }), 'utf8'), 0);
+                assert.ok(pendingBytes <= MIN_COHERENT_QUEUE_BYTES);
+
+                if (delivery === 'same-wire') {
+                    reducer.notifyMany(batchWire({ ...identity, events }));
+                } else {
+                    reducer.notifyMany(batchWire({ ...identity, events: events.slice(0, 2) }));
+                    reducer.notifyMany(batchWire({ ...identity, events: events.slice(2) }));
+                }
+                assert.equal(frames.length, 1);
+                frames.shift()?.();
+
+                const snapshot = reducer.snapshot();
+                assert.equal(snapshot.generation, identity.generation);
+                assert.equal(snapshot.threadId, identity.threadId);
+                assert.equal(snapshot.turnId, identity.turnId);
+                assert.equal(snapshot.status, 'interrupt-uncertain');
+                assert.deepEqual(snapshot.errors.map(error => error.code), [
+                    'interrupt-timeout', 'recovery-failed'
+                ], `${delivery}, maxBatchEvents=${maxBatchEvents}`);
+            }
+        }
+    });
+
+    it('reports trailing ordinary events dropped from a later same-wire chunk', () => {
+        const frames: Array<() => void> = [];
+        const reducer = new RideCodexEventReducer({
+            scheduleFrame: callback => {
+                frames.push(callback);
+                return { dispose: () => undefined };
+            },
+            maxWireBytes: 32 * 1024,
+            maxQueuedBytes: MIN_COHERENT_QUEUE_BYTES,
+            maxBatchEvents: 2
+        });
+        reducer.notifyMany(batchWire({
+            generation: 1,
+            turnSequence: 1,
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            events: [
+                { type: 'turn-started' },
+                { type: 'turn-terminal', status: 'completed' },
+                { type: 'agent-delta', itemId: 'item-1', delta: 'x'.repeat(MIN_COHERENT_QUEUE_BYTES) }
+            ]
+        }));
+        frames.shift()?.();
+
+        assert.equal(reducer.snapshot().status, 'completed');
+        assert.ok(reducer.snapshot().warnings.some(warning =>
+            warning.code === 'events-dropped' && warning.droppedEvents === 1
+        ));
     });
 
     it('accepts bounded deduplicated diagnostics for only the current finalized identity', () => {
