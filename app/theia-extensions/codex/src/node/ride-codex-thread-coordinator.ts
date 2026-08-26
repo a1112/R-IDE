@@ -67,6 +67,7 @@ const ERROR_MESSAGES: Readonly<Record<RideCodexConversationsErrorCode, string>> 
 const MAX_PAGE_SIZE = 100;
 const MAX_CACHED_THREADS = 500;
 const MAX_ARCHIVE_TOMBSTONES = 512;
+const MAX_PENDING_STATUSES = 512;
 const MAX_CURSOR_LENGTH = 4_096;
 const MAX_ID_LENGTH = 256;
 const MAX_MODEL_LENGTH = 256;
@@ -93,13 +94,27 @@ interface ThreadOperationContext {
     readonly selectionRevision: number;
 }
 
+interface PendingThreadStatus {
+    readonly status: RideCodexThreadStatus;
+    readonly revision: number;
+}
+
+interface ActiveThreadRequest {
+    readonly invalidated: Promise<never>;
+    invalidate(error: RideCodexConversationsError): void;
+    release(): void;
+}
+
 export class RideCodexThreadCoordinator {
     readonly #host: RideCodexThreadHost;
     readonly #pathStyle: 'win32' | 'posix';
     readonly #listeners: RideCodexDisposable[] = [];
     readonly #clients = new Set<RideCodexConversationsClient>();
+    readonly #activeRequests = new Set<ActiveThreadRequest>();
     readonly #threads = new Map<string, RideCodexThreadSummary>();
+    readonly #threadRevisions = new Map<string, number>();
     readonly #statusRevisions = new Map<string, number>();
+    readonly #pendingStatuses = new Map<string, PendingThreadStatus>();
     readonly #archiveRevisions = new Map<string, number>();
     #generation: number;
     #stateRevision = 0;
@@ -192,11 +207,13 @@ export class RideCodexThreadCoordinator {
         const operation = ++this.#threadListRevision;
         const context = this.#operationContext();
         const page = normalizeThreadPage(await this.#request('thread/list', params, context.lifecycle));
-        if (archived !== true && operation === this.#threadListRevision && !this.#disposed) {
+        if (archived !== true && operation === this.#threadListRevision
+            && context.selectionRevision === this.#selectionRevision && !this.#disposed) {
             let changed = false;
             if (cursor === undefined && context.stateRevision === this.#stateRevision) {
                 changed = this.#threads.size > 0;
                 this.#threads.clear();
+                this.#threadRevisions.clear();
                 this.#statusRevisions.clear();
             }
             for (const thread of page.data) {
@@ -283,9 +300,10 @@ export class RideCodexThreadCoordinator {
     async selectThread(threadId: string | null): Promise<void> {
         this.#requireUsable();
         if (threadId === null) {
-            if (this.#selectedThreadId !== undefined) {
-                this.#selectedThreadId = undefined;
-                this.#selectionRevision += 1;
+            const changed = this.#selectedThreadId !== undefined;
+            this.#selectedThreadId = undefined;
+            this.#selectionRevision += 1;
+            if (changed) {
                 this.#publish();
             }
             return;
@@ -300,9 +318,10 @@ export class RideCodexThreadCoordinator {
             }
             throw new RideCodexConversationsError('thread-unavailable');
         }
-        if (this.#selectedThreadId !== id) {
-            this.#selectedThreadId = id;
-            this.#selectionRevision += 1;
+        const changed = this.#selectedThreadId !== id;
+        this.#selectedThreadId = id;
+        this.#selectionRevision += 1;
+        if (changed) {
             this.#publish();
         }
     }
@@ -314,6 +333,10 @@ export class RideCodexThreadCoordinator {
         this.#disposed = true;
         this.#lifecycle += 1;
         this.#threadListRevision += 1;
+        for (const active of [...this.#activeRequests]) {
+            active.invalidate(new RideCodexConversationsError('disposed'));
+            active.release();
+        }
         for (const listener of this.#listeners.splice(0)) {
             disposeSafely(listener);
         }
@@ -360,6 +383,7 @@ export class RideCodexThreadCoordinator {
         lifecycle: number
     ): Promise<unknown> {
         let lease: RideCodexThreadHostLease;
+        let active: ActiveThreadRequest | undefined;
         try {
             lease = await this.#host.acquire('foreground-panel');
         } catch {
@@ -367,12 +391,13 @@ export class RideCodexThreadCoordinator {
         }
         try {
             const generation = requireGeneration(lease.generation);
+            active = this.#trackRequest(lease);
             this.#requireOperation(lifecycle, generation);
             const pending = lease.request(method, params);
             if (typeof pending === 'object' && pending !== null && utilTypes.isProxy(pending)) {
                 throw new RideCodexConversationsError('invalid-data');
             }
-            const result = await pending;
+            const result = await Promise.race([Promise.resolve(pending), active.invalidated]);
             this.#requireOperation(lifecycle, generation);
             return result;
         } catch (error) {
@@ -381,12 +406,49 @@ export class RideCodexThreadCoordinator {
             }
             throw new RideCodexConversationsError('operation-failed');
         } finally {
-            try {
-                lease.release();
-            } catch {
-                // The host owns idempotent lease cleanup.
+            if (active) {
+                active.release();
+                this.#activeRequests.delete(active);
+            } else {
+                try {
+                    lease.release();
+                } catch {
+                    // The host owns idempotent lease cleanup.
+                }
             }
         }
+    }
+
+    #trackRequest(lease: RideCodexThreadHostLease): ActiveThreadRequest {
+        let invalidated = false;
+        let released = false;
+        let rejectInvalidated!: (error: RideCodexConversationsError) => void;
+        const invalidation = new Promise<never>((_resolve, reject) => {
+            rejectInvalidated = reject;
+        });
+        void invalidation.catch(() => undefined);
+        const active: ActiveThreadRequest = {
+            invalidated: invalidation,
+            invalidate: error => {
+                if (!invalidated) {
+                    invalidated = true;
+                    rejectInvalidated(error);
+                }
+            },
+            release: () => {
+                if (released) {
+                    return;
+                }
+                released = true;
+                try {
+                    lease.release();
+                } catch {
+                    // The host owns idempotent lease cleanup.
+                }
+            }
+        };
+        this.#activeRequests.add(active);
+        return active;
     }
 
     #operationContext(): ThreadOperationContext {
@@ -402,30 +464,96 @@ export class RideCodexThreadCoordinator {
         if (archivedAt !== undefined && archivedAt > operationStateRevision) {
             return false;
         }
+        const threadChangedAt = this.#threadRevisions.get(summary.id);
+        if (threadChangedAt !== undefined && threadChangedAt > operationStateRevision) {
+            return false;
+        }
         const existing = this.#threads.get(summary.id);
         if (existing && existing.updatedAt > summary.updatedAt) {
             return false;
         }
-        const statusChangedAt = this.#statusRevisions.get(summary.id);
-        const candidate = existing && statusChangedAt !== undefined && statusChangedAt > operationStateRevision
-            ? freezeThreadSummary({ ...summary, status: existing.status })
+        const pendingStatus = this.#pendingStatuses.get(summary.id);
+        const candidate = pendingStatus !== undefined && pendingStatus.revision > operationStateRevision
+            ? freezeThreadSummary({ ...summary, status: pendingStatus.status })
             : summary;
-        if (existing && threadEquals(existing, candidate)) {
+        const changed = !existing || !threadEquals(existing, candidate);
+        if (changed) {
+            this.#threads.set(candidate.id, candidate);
+        }
+        const revision = this.#nextStateRevision();
+        this.#threadRevisions.set(candidate.id, revision);
+        if (pendingStatus !== undefined && pendingStatus.revision > operationStateRevision) {
+            this.#pendingStatuses.delete(candidate.id);
+            this.#statusRevisions.set(candidate.id, revision);
+        }
+        return this.#trimThreads() || changed;
+    }
+
+    #mergeStartedNotification(summary: RideCodexThreadSummary): boolean {
+        if (this.#archiveRevisions.has(summary.id)) {
             return false;
         }
-        this.#threads.set(candidate.id, candidate);
-        return true;
+        const existing = this.#threads.get(summary.id);
+        const pendingStatus = this.#pendingStatuses.get(summary.id);
+        if (existing && existing.updatedAt > summary.updatedAt && pendingStatus === undefined) {
+            return false;
+        }
+        const base = existing && existing.updatedAt > summary.updatedAt ? existing : summary;
+        const statusChangedAt = this.#statusRevisions.get(summary.id);
+        const status = pendingStatus?.status
+            ?? (existing && statusChangedAt !== undefined ? existing.status : base.status);
+        const candidate = status === base.status ? base : freezeThreadSummary({ ...base, status });
+        const changed = !existing || !threadEquals(existing, candidate);
+        if (changed) {
+            this.#threads.set(candidate.id, candidate);
+        }
+        const revision = this.#nextStateRevision();
+        this.#threadRevisions.set(candidate.id, revision);
+        if (pendingStatus !== undefined) {
+            this.#pendingStatuses.delete(candidate.id);
+            this.#statusRevisions.set(candidate.id, revision);
+        }
+        return this.#trimThreads() || changed;
+    }
+
+    #mergeStatusNotification(threadId: string, status: RideCodexThreadStatus): boolean {
+        if (this.#archiveRevisions.has(threadId)) {
+            return false;
+        }
+        const revision = this.#nextStateRevision();
+        const existing = this.#threads.get(threadId);
+        if (existing) {
+            this.#threadRevisions.set(threadId, revision);
+            this.#statusRevisions.set(threadId, revision);
+            if (statusEquals(existing.status, status)) {
+                return false;
+            }
+            this.#threads.set(threadId, freezeThreadSummary({ ...existing, status }));
+            return true;
+        }
+        this.#pendingStatuses.delete(threadId);
+        this.#pendingStatuses.set(threadId, Object.freeze({ status, revision }));
+        while (this.#pendingStatuses.size > MAX_PENDING_STATUSES) {
+            const oldest = this.#pendingStatuses.keys().next().value;
+            if (oldest === undefined) {
+                break;
+            }
+            this.#pendingStatuses.delete(oldest);
+        }
+        return false;
+    }
+
+    #nextStateRevision(): number {
+        this.#stateRevision += 1;
+        return this.#stateRevision;
     }
 
     #archiveThread(threadId: string): boolean {
         const removed = this.#threads.has(threadId);
         const selected = this.#selectedThreadId === threadId;
-        if (!removed && !selected && this.#archiveRevisions.has(threadId)) {
-            return false;
-        }
-        this.#stateRevision += 1;
+        const revision = this.#nextStateRevision();
         this.#archiveRevisions.delete(threadId);
-        this.#archiveRevisions.set(threadId, this.#stateRevision);
+        this.#archiveRevisions.set(threadId, revision);
         while (this.#archiveRevisions.size > MAX_ARCHIVE_TOMBSTONES) {
             const oldest = this.#archiveRevisions.keys().next().value;
             if (oldest === undefined) {
@@ -433,6 +561,8 @@ export class RideCodexThreadCoordinator {
             }
             this.#archiveRevisions.delete(oldest);
         }
+        this.#pendingStatuses.delete(threadId);
+        this.#threadRevisions.delete(threadId);
         this.#statusRevisions.delete(threadId);
         this.#threads.delete(threadId);
         if (selected) {
@@ -450,6 +580,7 @@ export class RideCodexThreadCoordinator {
                 break;
             }
             this.#threads.delete(removable);
+            this.#threadRevisions.delete(removable);
             this.#statusRevisions.delete(removable);
             this.#archiveRevisions.delete(removable);
             changed = true;
@@ -466,11 +597,7 @@ export class RideCodexThreadCoordinator {
                 case 'thread/started': {
                     const params = requireValidatedRecord(notification.params);
                     const summary = normalizeThread(ownValue(params, 'thread'));
-                    // A status notification is a more specific and later state source than
-                    // a repeated thread/started summary in the same host generation.
-                    const changed = this.#mergeThread(summary, -1);
-                    if (changed) {
-                        this.#stateRevision += 1;
+                    if (this.#mergeStartedNotification(summary)) {
                         this.#publish();
                     }
                     break;
@@ -479,14 +606,9 @@ export class RideCodexThreadCoordinator {
                     const params = requireValidatedRecord(notification.params);
                     const threadId = requiredIdentifier(params, 'threadId', MAX_ID_LENGTH);
                     const status = normalizeThreadStatus(ownValue(params, 'status'));
-                    const existing = this.#threads.get(threadId);
-                    if (!existing || statusEquals(existing.status, status)) {
-                        break;
+                    if (this.#mergeStatusNotification(threadId, status)) {
+                        this.#publish();
                     }
-                    this.#stateRevision += 1;
-                    this.#statusRevisions.set(threadId, this.#stateRevision);
-                    this.#threads.set(threadId, freezeThreadSummary({ ...existing, status }));
-                    this.#publish();
                     break;
                 }
                 case 'thread/archived': {
@@ -511,8 +633,10 @@ export class RideCodexThreadCoordinator {
         }
         if (event.generation > this.#generation) {
             this.#generation = event.generation;
-            this.#stateRevision += 1;
+            this.#nextStateRevision();
+            this.#threadRevisions.clear();
             this.#statusRevisions.clear();
+            this.#pendingStatuses.clear();
             this.#archiveRevisions.clear();
             this.#restartRefreshGeneration = 0;
             this.#publish();
@@ -920,7 +1044,7 @@ function normalizeWorkspaceCwd(record: Record<string, unknown>, style: 'win32' |
     const cwd = optionalString(record, 'cwd', MAX_PATH_LENGTH) ?? root;
     const paths = style === 'win32' ? win32 : posix;
     if (isNetworkPath(root, style) || isNetworkPath(cwd, style)
-        || !paths.isAbsolute(root) || !paths.isAbsolute(cwd)) {
+        || !isFullyQualifiedLocalPath(root, style) || !isFullyQualifiedLocalPath(cwd, style)) {
         throw new TypeError('Codex workspace path is invalid.');
     }
     const normalizedRoot = paths.normalize(root);
@@ -933,6 +1057,14 @@ function normalizeWorkspaceCwd(record: Record<string, unknown>, style: 'win32' |
         throw new TypeError('Codex cwd must remain inside the workspace.');
     }
     return normalizedCwd;
+}
+
+function isFullyQualifiedLocalPath(value: string, style: 'win32' | 'posix'): boolean {
+    if (style === 'posix') {
+        return posix.isAbsolute(value);
+    }
+    const normalized = value.replace(/\//g, '\\');
+    return /^[A-Za-z]:\\$/.test(win32.parse(normalized).root);
 }
 
 function isNetworkPath(value: string, style: 'win32' | 'posix'): boolean {

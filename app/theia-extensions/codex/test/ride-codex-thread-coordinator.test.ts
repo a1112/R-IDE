@@ -244,6 +244,59 @@ test('passes bounded thread pagination cursors and merges only the latest concur
     await coordinator.dispose();
 });
 
+test('does not let an older list response clear a newer explicit selection', async () => {
+    const host = new FakeThreadHost();
+    host.responder = () => ({
+        data: [rawThread('a'), rawThread('b')], nextCursor: null, backwardsCursor: null
+    });
+    const coordinator = new RideCodexThreadCoordinator({ host });
+    await coordinator.listThreads();
+    await coordinator.selectThread('b');
+
+    const delayed = deferred<unknown>();
+    host.responder = () => delayed.promise;
+    const oldList = coordinator.listThreads();
+    await tick();
+    await coordinator.selectThread('a');
+    delayed.resolve({ data: [], nextCursor: null, backwardsCursor: null });
+    await oldList;
+
+    assert.equal(coordinator.snapshot().selectedThreadId, 'a');
+    assert.deepEqual(coordinator.snapshot().threads.map(thread => thread.id), ['a', 'b']);
+    assert.equal(host.acquireCount, host.releaseCount);
+    await coordinator.dispose();
+});
+
+test('treats repeated and empty explicit selections as newer user intent', async () => {
+    const host = new FakeThreadHost();
+    host.responder = () => ({
+        data: [rawThread('selected')], nextCursor: null, backwardsCursor: null
+    });
+    const coordinator = new RideCodexThreadCoordinator({ host, pathStyle: 'posix' });
+    await coordinator.listThreads();
+    await coordinator.selectThread('selected');
+
+    const delayedList = deferred<unknown>();
+    host.responder = () => delayedList.promise;
+    const listing = coordinator.listThreads();
+    await tick();
+    await coordinator.selectThread('selected');
+    delayedList.resolve({ data: [], nextCursor: null, backwardsCursor: null });
+    await listing;
+    assert.equal(coordinator.snapshot().selectedThreadId, 'selected');
+
+    await coordinator.selectThread(null);
+    const delayedStart = deferred<unknown>();
+    host.responder = () => delayedStart.promise;
+    const starting = coordinator.startThread({ workspaceRoot: '/workspace' });
+    await tick();
+    await coordinator.selectThread(null);
+    delayedStart.resolve({ thread: rawThread('late', { cwd: '/workspace' }) });
+    await starting;
+    assert.equal(coordinator.snapshot().selectedThreadId, undefined);
+    await coordinator.dispose();
+});
+
 test('normalizes workspace cwd with platform semantics and rejects escapes and network shares', async () => {
     const windowsHost = new FakeThreadHost();
     windowsHost.responder = () => ({ thread: rawThread('win', { cwd: 'c:\\repo\\pkg' }) });
@@ -255,6 +308,14 @@ test('normalizes workspace cwd with platform semantics and rejects escapes and n
     await assert.rejects(windows.startThread({ workspaceRoot: 'C:\\Repo', cwd: 'C:\\escape' }), /workspace/i);
     await assert.rejects(windows.startThread({ workspaceRoot: '\\\\server\\share', cwd: '\\\\server\\share\\repo' }), /workspace/i);
     await assert.rejects(windows.startThread({ workspaceRoot: 'repo' }), /workspace/i);
+    await assert.rejects(windows.startThread({ workspaceRoot: '/Work/Repo' }), /workspace/i);
+    await assert.rejects(windows.startThread({ workspaceRoot: '\\Work\\Repo' }), /workspace/i);
+    await assert.rejects(windows.startThread({ workspaceRoot: 'C:\\Work\\Repo', cwd: '/Work/Repo' }), /workspace/i);
+    await assert.rejects(windows.startThread({ workspaceRoot: 'C:\\Work\\Repo', cwd: '\\Work\\Repo' }), /workspace/i);
+    await assert.rejects(windows.startThread({ workspaceRoot: 'C:Work\\Repo' }), /workspace/i);
+    await assert.rejects(windows.startThread({ workspaceRoot: '\\\\?\\C:\\Work\\Repo' }), /workspace/i);
+    await assert.rejects(windows.startThread({ workspaceRoot: 'C:\\' }), /workspace/i);
+    await assert.rejects(windows.startThread({ workspaceRoot: 'C:\\Work\0Repo' }), /invalid|workspace/i);
 
     const posixHost = new FakeThreadHost();
     posixHost.responder = () => ({ thread: rawThread('posix', { cwd: '/workspace/repo/pkg' }) });
@@ -331,6 +392,96 @@ test('reconciles duplicate and out-of-order thread notifications by generation',
     assert.deepEqual(coordinator.snapshot().threads.find(thread => thread.id === 'two')?.status, {
         kind: 'active', activeFlags: ['waiting-on-user-input']
     });
+    await coordinator.dispose();
+});
+
+test('keeps a newer started notification over an older list response with the same timestamp', async () => {
+    const host = new FakeThreadHost();
+    const delayed = deferred<unknown>();
+    host.responder = () => delayed.promise;
+    const coordinator = new RideCodexThreadCoordinator({ host });
+    const listing = coordinator.listThreads();
+    await tick();
+
+    host.notify('thread/started', {
+        thread: rawThread('same', {
+            updatedAt: 7, preview: 'notification preview', name: 'notification name', status: { type: 'idle' }
+        })
+    });
+    delayed.resolve({
+        data: [rawThread('same', {
+            updatedAt: 7, preview: 'stale list preview', name: 'stale list name', status: { type: 'systemError' }
+        })],
+        nextCursor: null,
+        backwardsCursor: null
+    });
+    await listing;
+
+    const summary = coordinator.snapshot().threads[0];
+    assert.equal(summary.preview, 'notification preview');
+    assert.equal(summary.name, 'notification name');
+    assert.deepEqual(summary.status, { kind: 'idle', activeFlags: [] });
+    await coordinator.dispose();
+});
+
+test('applies the latest status that arrives before thread started and clears it across generations', async () => {
+    const host = new FakeThreadHost();
+    const coordinator = new RideCodexThreadCoordinator({ host });
+    host.notify('thread/status/changed', {
+        threadId: 'pending', status: { type: 'active', activeFlags: ['waitingOnApproval'] }
+    });
+    host.notify('thread/status/changed', {
+        threadId: 'pending', status: { type: 'active', activeFlags: ['waitingOnUserInput'] }
+    });
+    host.notify('thread/started', { thread: rawThread('pending', { status: { type: 'idle' } }) });
+    host.notify('thread/started', { thread: rawThread('pending', { status: { type: 'systemError' } }) });
+
+    assert.deepEqual(coordinator.snapshot().threads[0].status, {
+        kind: 'active', activeFlags: ['waiting-on-user-input']
+    });
+
+    host.notify('thread/status/changed', {
+        threadId: 'next-generation', status: { type: 'active', activeFlags: ['waitingOnApproval'] }
+    });
+    host.changeState('restarting', 2);
+    host.notify('thread/started', { thread: rawThread('next-generation', { status: { type: 'idle' } }) }, 2);
+    assert.deepEqual(coordinator.snapshot().threads.find(thread => thread.id === 'next-generation')?.status, {
+        kind: 'idle', activeFlags: []
+    });
+    await coordinator.dispose();
+});
+
+test('bounds pending statuses during a multi-thread notification storm', async () => {
+    const host = new FakeThreadHost();
+    const coordinator = new RideCodexThreadCoordinator({ host });
+    for (let index = 0; index < 513; index += 1) {
+        host.notify('thread/status/changed', {
+            threadId: `pending-${index}`,
+            status: { type: 'active', activeFlags: ['waitingOnApproval'] }
+        });
+    }
+    host.notify('thread/started', { thread: rawThread('pending-0', { status: { type: 'idle' } }) });
+    host.notify('thread/started', { thread: rawThread('pending-512', { status: { type: 'idle' } }) });
+
+    assert.deepEqual(coordinator.snapshot().threads.find(thread => thread.id === 'pending-0')?.status, {
+        kind: 'idle', activeFlags: []
+    });
+    assert.deepEqual(coordinator.snapshot().threads.find(thread => thread.id === 'pending-512')?.status, {
+        kind: 'active', activeFlags: ['waiting-on-approval']
+    });
+    await coordinator.dispose();
+});
+
+test('bounds cached thread revisions during a started notification storm', async () => {
+    const host = new FakeThreadHost();
+    const coordinator = new RideCodexThreadCoordinator({ host });
+    for (let index = 0; index < 501; index += 1) {
+        host.notify('thread/started', { thread: rawThread(`started-${index}`) });
+    }
+
+    assert.equal(coordinator.snapshot().threads.length, 500);
+    assert.equal(coordinator.snapshot().threads.some(thread => thread.id === 'started-0'), false);
+    assert.equal(coordinator.snapshot().threads.some(thread => thread.id === 'started-500'), true);
     await coordinator.dispose();
 });
 
@@ -439,6 +590,33 @@ test('releases leases on failures and invalidates pending work on dispose', asyn
     assert.equal(host.acquireCount, host.releaseCount);
     assert.equal(host.notificationListeners.size, 0);
     assert.equal(host.stateListeners.size, 0);
+});
+
+test('dispose immediately rejects a hung request and releases only its own lease', async () => {
+    const host = new FakeThreadHost();
+    const pending = deferred<unknown>();
+    host.responder = () => pending.promise;
+    const coordinator = new RideCodexThreadCoordinator({ host });
+    const operation = coordinator.listThreads().catch(error => error as Error);
+    await waitFor(() => host.activeLeases === 1);
+
+    await coordinator.dispose();
+    const immediate = await Promise.race([
+        operation,
+        tick().then(() => 'still-pending' as const)
+    ]);
+    const releasedAtDispose = host.releaseCount;
+    const activeAtDispose = host.activeLeases;
+
+    pending.reject(new Error('late request failure'));
+    await operation;
+    await tick();
+
+    assert.ok(immediate instanceof Error);
+    assert.match(immediate.message, /disposed|superseded/i);
+    assert.equal(releasedAtDispose, 1);
+    assert.equal(activeAtDispose, 0);
+    assert.equal(host.acquireCount, host.releaseCount);
 });
 
 test('a newer explicit selection wins over an older start response and clients receive immutable state', async () => {
