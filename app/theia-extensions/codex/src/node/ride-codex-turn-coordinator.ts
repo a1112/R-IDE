@@ -58,6 +58,7 @@ export interface RideCodexTurnScheduler {
 export interface RideCodexTurnTimers {
     setTimeout(callback: () => void, milliseconds: number): unknown;
     clearTimeout(handle: unknown): void;
+    now?(): number;
 }
 
 export interface RideCodexTurnCoordinatorOptions {
@@ -500,10 +501,22 @@ export class RideCodexTurnCoordinator {
 
     async #recoverPersistentThread(threadId: string, expectedGeneration: number): Promise<void> {
         const lifecycle = this.#lifecycle;
+        const startedAt = recoveryNow(this.#timers);
+        let timer: unknown;
+        let acquiring: Promise<RideCodexTurnHostLease> | undefined;
+        let lease: RideCodexTurnHostLease | undefined;
+        const deadline = new Promise<never>((_resolve, reject) => {
+            timer = this.#timers.setTimeout(() => {
+                reject(new RideCodexRecoveryTimeout());
+            }, this.#recoveryTimeoutMs);
+        });
+        deadline.catch(() => undefined);
+        const stopped = Promise.race([deadline, this.#disposedSignal]);
+        stopped.catch(() => undefined);
         try {
             const restarting = Promise.resolve(this.#host.restartForRecovery(expectedGeneration));
             restarting.catch(() => undefined);
-            const generation = requireGeneration(await Promise.race([restarting, this.#disposedSignal]));
+            const generation = requireGeneration(await Promise.race([restarting, stopped]));
             if (this.#disposed || lifecycle !== this.#lifecycle) {
                 throw new RideCodexTurnError(this.#disposed ? 'disposed' : 'operation-superseded');
             }
@@ -512,27 +525,21 @@ export class RideCodexTurnCoordinator {
                 throw new RideCodexTurnError('operation-superseded');
             }
             this.#generation = generation;
-            const acquiring = Promise.resolve(this.#host.acquire('foreground-panel'));
-            acquiring.then(acquiredLease => {
-                if (this.#disposed || lifecycle !== this.#lifecycle) {
-                    this.#releaseLease(acquiredLease);
-                }
-            }, () => undefined);
-            const lease = await Promise.race([acquiring, this.#disposedSignal]);
-            try {
-                if (lease.generation !== generation || this.#disposed || lifecycle !== this.#lifecycle) {
-                    throw new RideCodexTurnError('operation-superseded');
-                }
-                const raw = await Promise.race([
-                    safePromise(lease.request('thread/resume', Object.freeze({
-                        threadId
-                    }), this.#recoveryTimeoutMs)),
-                    this.#disposedSignal
-                ]);
-                requireThreadResumeResponse(raw, threadId);
-            } finally {
-                this.#releaseLease(lease);
+            acquiring = Promise.resolve(this.#host.acquire('foreground-panel'));
+            acquiring.catch(() => undefined);
+            lease = await Promise.race([acquiring, stopped]);
+            if (lease.generation !== generation || this.#disposed || lifecycle !== this.#lifecycle) {
+                throw new RideCodexTurnError('operation-superseded');
             }
+            const requestTimeoutMs = remainingRecoveryTimeout(
+                this.#timers, startedAt, this.#recoveryTimeoutMs
+            );
+            const resuming = safePromise(lease.request('thread/resume', Object.freeze({
+                threadId
+            }), requestTimeoutMs));
+            resuming.catch(() => undefined);
+            const raw = await Promise.race([resuming, stopped]);
+            requireThreadResumeResponse(raw, threadId);
         } catch (error) {
             if (!this.#disposed) {
                 this.#enqueueDiagnostic(Object.freeze({
@@ -543,6 +550,16 @@ export class RideCodexTurnCoordinator {
             if (error instanceof RideCodexTurnError && error.code === 'disposed') {
                 throw error;
             }
+        } finally {
+            if (timer !== undefined) {
+                this.#timers.clearTimeout(timer);
+            }
+            if (lease) {
+                this.#releaseLease(lease);
+            }
+            acquiring?.then(acquiredLease => {
+                this.#releaseLease(acquiredLease);
+            }, () => undefined);
         }
     }
 
@@ -1500,6 +1517,7 @@ export class RideCodexTurnCoordinator {
 }
 
 class RideCodexInterruptTimeout extends Error { }
+class RideCodexRecoveryTimeout extends Error { }
 
 function normalizeStartRequest(value: RideCodexTurnStartRequest): RideCodexTurnStartRequest {
     const record = requireOptions(value, ['threadId', 'clientMessageId', 'input']);
@@ -3304,6 +3322,24 @@ function releaseSafely(lease: RideCodexTurnHostLease): void {
     }
 }
 
+function recoveryNow(timers: RideCodexTurnTimers): number {
+    try {
+        const value = timers.now?.() ?? Date.now();
+        return Number.isFinite(value) ? value : 0;
+    } catch {
+        return 0;
+    }
+}
+
+function remainingRecoveryTimeout(
+    timers: RideCodexTurnTimers,
+    startedAt: number,
+    timeoutMs: number
+): number {
+    const elapsed = Math.max(0, recoveryNow(timers) - startedAt);
+    return Math.max(1, Math.min(timeoutMs, Math.ceil(timeoutMs - elapsed)));
+}
+
 function disposeSafely(disposable: RideCodexDisposable): void {
     try {
         disposable.dispose();
@@ -3326,5 +3362,6 @@ const defaultTimers: RideCodexTurnTimers = Object.freeze({
         handle.unref?.();
         return handle;
     },
-    clearTimeout: (handle: unknown) => clearTimeout(handle as ReturnType<typeof setTimeout>)
+    clearTimeout: (handle: unknown) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+    now: () => Date.now()
 });
