@@ -75,7 +75,10 @@ export class RideCodexAuthBroker {
     readonly #host: RideCodexAuthHost;
     readonly #diagnostics: RideCodexAppServerDiagnostics;
     readonly #clients = new Set<RideCodexAuthClient>();
-    readonly #knownLogins = new Map<string, 'active' | 'canceled' | 'completed'>();
+    readonly #knownLogins = new Map<string, Readonly<{
+        status: 'active' | 'canceled' | 'completed';
+        operation: number;
+    }>>();
     readonly #listeners: RideCodexDisposable[] = [];
     readonly #notificationSignatures = new Map<string, string>();
     #snapshot: RideCodexAuthSnapshot = createRideCodexAuthSnapshot({ state: 'inactive' });
@@ -83,7 +86,9 @@ export class RideCodexAuthBroker {
     #leasePromise: Promise<RideCodexAuthHostLease> | undefined;
     #activationPromise: Promise<RideCodexAuthSnapshot> | undefined;
     #activeGeneration = 0;
-    #authOperation = 0;
+    #callerAuthOperation = 0;
+    #notificationAccountRefresh = 0;
+    #accountRevision = 0;
     #rateOperation = 0;
     #rateVersion = 0;
     #disposed = false;
@@ -130,7 +135,7 @@ export class RideCodexAuthBroker {
         }
         const operation = (async () => {
             await this.#ensureLease();
-            const token = ++this.#authOperation;
+            const token = ++this.#callerAuthOperation;
             return this.#readAccountForToken(token, false);
         })();
         let tracked!: Promise<RideCodexAuthSnapshot>;
@@ -152,7 +157,7 @@ export class RideCodexAuthBroker {
             throw new TypeError('Codex refresh-token option must be boolean');
         }
         await this.#ensureLease();
-        const token = ++this.#authOperation;
+        const token = ++this.#callerAuthOperation;
         return this.#readAccountForToken(token, refreshToken);
     }
 
@@ -160,9 +165,9 @@ export class RideCodexAuthBroker {
         this.#requireUsable();
         let normalized: RideCodexLoginRequest | undefined = normalizeRideCodexLoginRequest(request);
         await this.#ensureLease();
-        const token = ++this.#authOperation;
+        const token = ++this.#callerAuthOperation;
         const previousSnapshot = this.#snapshot;
-        const authenticatingSnapshot = this.#setSnapshot({
+        const authenticatingSnapshot = this.#setAuthSnapshot({
             state: 'authenticating',
             account: this.#snapshot.account,
             rateLimits: this.#snapshot.rateLimits,
@@ -191,8 +196,8 @@ export class RideCodexAuthBroker {
             if (result.type !== interactiveLogin.type) {
                 throw new TypeError('Mismatched Codex login response');
             }
-            this.#rememberLogin(result.loginId, 'active');
-            this.#setSnapshot({
+            this.#rememberLogin(result.loginId, 'active', token);
+            this.#setAuthSnapshot({
                 state: 'authenticating',
                 account: this.#snapshot.account,
                 rateLimits: this.#snapshot.rateLimits,
@@ -213,19 +218,19 @@ export class RideCodexAuthBroker {
             || !this.#knownLogins.has(loginId)) {
             throw new RideCodexAuthError('unknown-login');
         }
-        if (this.#knownLogins.get(loginId) !== 'active') {
+        if (this.#knownLogins.get(loginId)?.status !== 'active') {
             return;
         }
         await this.#ensureLease();
-        const token = ++this.#authOperation;
+        const token = ++this.#callerAuthOperation;
         try {
             const pending = rejectProxyBeforeAwait(this.#lease!.request('account/login/cancel', { loginId }));
             const raw = await pending;
             this.#requireCurrentOperation(token);
             normalizeRideCodexCancelResult(raw);
-            this.#rememberLogin(loginId, 'canceled');
+            this.#rememberLogin(loginId, 'canceled', token);
             if (this.#snapshot.pendingLogin?.loginId === loginId) {
-                this.#setSnapshot({
+                this.#setAuthSnapshot({
                     state: this.#snapshot.account ? 'authenticated' : 'unauthenticated',
                     account: this.#snapshot.account,
                     rateLimits: this.#snapshot.rateLimits
@@ -239,13 +244,13 @@ export class RideCodexAuthBroker {
     async logout(): Promise<RideCodexAuthSnapshot> {
         this.#requireUsable();
         await this.#ensureLease();
-        const token = ++this.#authOperation;
+        const token = ++this.#callerAuthOperation;
         this.#invalidateRateReads();
         try {
             await this.#lease!.request('account/logout', {});
             this.#requireCurrentOperation(token);
             this.#knownLogins.clear();
-            return this.#setSnapshot({ state: 'unauthenticated' });
+            return this.#setAuthSnapshot({ state: 'unauthenticated' });
         } catch (error) {
             throw this.#failOperation(error, token);
         }
@@ -280,7 +285,8 @@ export class RideCodexAuthBroker {
             return;
         }
         this.#disposed = true;
-        ++this.#authOperation;
+        ++this.#callerAuthOperation;
+        ++this.#notificationAccountRefresh;
         this.#invalidateRateReads();
         for (const listener of this.#listeners.splice(0)) {
             disposeSafely(listener);
@@ -322,9 +328,13 @@ export class RideCodexAuthBroker {
             if (result.type !== 'apiKey') {
                 throw new TypeError('Mismatched Codex API key login response');
             }
-            await this.#readAccountForToken(token, false, rollback);
-            if (this.#snapshot.state !== 'authenticated' || this.#snapshot.account?.type !== 'apiKey') {
+            const confirmation = await this.#readAccountForToken(token, false, rollback, true);
+            this.#requireCurrentOperation(token);
+            if (confirmation.state !== 'authenticated' || confirmation.account?.type !== 'apiKey') {
                 throw new TypeError('Codex API key login was not confirmed');
+            }
+            if (confirmation !== this.#snapshot) {
+                this.#setAuthSnapshot(confirmation);
             }
             return result;
         } catch (error) {
@@ -371,26 +381,89 @@ export class RideCodexAuthBroker {
     async #readAccountForToken(
         token: number,
         refreshToken: boolean,
-        rollback?: Readonly<{ current: RideCodexAuthSnapshot; previous: RideCodexAuthSnapshot }>
+        rollback?: Readonly<{ current: RideCodexAuthSnapshot; previous: RideCodexAuthSnapshot }>,
+        requireFreshResponse = false
     ): Promise<RideCodexAuthSnapshot> {
+        const accountRevision = this.#accountRevision;
         try {
             const pending = rejectProxyBeforeAwait(this.#lease!.request('account/read', { refreshToken }));
             const raw = await pending;
-            if (token !== this.#authOperation) {
+            if (token !== this.#callerAuthOperation) {
+                return this.#snapshot;
+            }
+            if (!requireFreshResponse && accountRevision !== this.#accountRevision) {
                 return this.#snapshot;
             }
             const response = normalizeRideCodexAccountReadResult(raw);
-            return this.#setSnapshot({
+            const snapshot = createRideCodexAuthSnapshot({
+                state: response.account ? 'authenticated' : 'unauthenticated',
+                account: response.account,
+                rateLimits: response.account ? this.#snapshot.rateLimits : undefined
+            });
+            if (accountRevision !== this.#accountRevision) {
+                return snapshot;
+            }
+            return this.#setAuthSnapshot(snapshot);
+        } catch (error) {
+            if (token !== this.#callerAuthOperation
+                || (!requireFreshResponse && accountRevision !== this.#accountRevision)) {
+                return this.#snapshot;
+            }
+            throw this.#failOperation(error, token, rollback);
+        }
+    }
+
+    #scheduleNotificationAccountRefresh(generation: number): void {
+        const refresh = ++this.#notificationAccountRefresh;
+        const callerOperation = this.#callerAuthOperation;
+        const accountRevision = this.#accountRevision;
+        void this.#readAccountForNotification({
+            refresh,
+            callerOperation,
+            accountRevision,
+            generation
+        }).catch(() => undefined);
+    }
+
+    async #readAccountForNotification(context: Readonly<{
+        refresh: number;
+        callerOperation: number;
+        accountRevision: number;
+        generation: number;
+    }>): Promise<void> {
+        try {
+            const pending = rejectProxyBeforeAwait(this.#lease!.request('account/read', { refreshToken: false }));
+            const raw = await pending;
+            if (!this.#isCurrentNotificationAccountRefresh(context)) {
+                return;
+            }
+            const response = normalizeRideCodexAccountReadResult(raw);
+            if (!this.#isCurrentNotificationAccountRefresh(context)) {
+                return;
+            }
+            this.#setAuthSnapshot({
                 state: response.account ? 'authenticated' : 'unauthenticated',
                 account: response.account,
                 rateLimits: response.account ? this.#snapshot.rateLimits : undefined
             });
         } catch (error) {
-            if (token !== this.#authOperation) {
-                return this.#snapshot;
+            if (this.#isCurrentNotificationAccountRefresh(context)) {
+                this.#failOperation(error, context.callerOperation);
             }
-            throw this.#failOperation(error, token, rollback);
         }
+    }
+
+    #isCurrentNotificationAccountRefresh(context: Readonly<{
+        refresh: number;
+        callerOperation: number;
+        accountRevision: number;
+        generation: number;
+    }>): boolean {
+        return !this.#disposed
+            && context.generation === this.#activeGeneration
+            && context.callerOperation === this.#callerAuthOperation
+            && context.refresh === this.#notificationAccountRefresh
+            && context.accountRevision === this.#accountRevision;
     }
 
     #onNotification(notification: RideCodexNotification, generation: number): void {
@@ -404,13 +477,12 @@ export class RideCodexAuthBroker {
                     if (this.#isDuplicateNotification(notification.method, account ?? null)) {
                         return;
                     }
-                    const token = ++this.#authOperation;
-                    this.#setSnapshot({
+                    this.#setAuthSnapshot({
                         state: account ? 'authenticated' : 'unauthenticated',
                         account,
                         rateLimits: account ? this.#snapshot.rateLimits : undefined
                     });
-                    void this.#readAccountForToken(token, false).catch(() => undefined);
+                    this.#scheduleNotificationAccountRefresh(generation);
                     return;
                 }
                 case 'account/login/completed': {
@@ -448,16 +520,23 @@ export class RideCodexAuthBroker {
     }
 
     #onLoginCompleted(completion: ReturnType<typeof normalizeRideCodexLoginCompletion>): void {
-        if (!completion.loginId || this.#knownLogins.get(completion.loginId) !== 'active') {
+        if (!completion.loginId) {
             return;
         }
-        this.#rememberLogin(completion.loginId, 'completed');
-        const token = ++this.#authOperation;
+        const login = this.#knownLogins.get(completion.loginId);
+        if (!login || login.status !== 'active') {
+            return;
+        }
+        this.#rememberLogin(completion.loginId, 'completed', login.operation);
+        if (login.operation !== this.#callerAuthOperation) {
+            return;
+        }
         if (!completion.success) {
+            ++this.#notificationAccountRefresh;
             this.#setGenericError('operation-failed');
             return;
         }
-        void this.#readAccountForToken(token, false).catch(() => undefined);
+        this.#scheduleNotificationAccountRefresh(this.#activeGeneration);
     }
 
     #isDuplicateNotification(method: string, safeValue: unknown): boolean {
@@ -473,21 +552,29 @@ export class RideCodexAuthBroker {
         if (this.#disposed || !this.#lease || event.generation < this.#activeGeneration) {
             return;
         }
+        let invalidated = false;
         if (event.generation !== this.#activeGeneration) {
             this.#activeGeneration = event.generation;
+            ++this.#callerAuthOperation;
+            ++this.#notificationAccountRefresh;
+            this.#knownLogins.clear();
             this.#notificationSignatures.clear();
             this.#invalidateRateReads();
+            invalidated = true;
         }
         if (event.state === 'ready') {
-            const token = ++this.#authOperation;
+            const token = invalidated ? this.#callerAuthOperation : ++this.#callerAuthOperation;
             void this.#readAccountForToken(token, false).catch(() => undefined);
             return;
         }
         if (event.state === 'restarting' || event.state === 'stopped'
             || event.state === 'circuit-open' || event.state === 'disposed') {
-            ++this.#authOperation;
-            this.#invalidateRateReads();
-            this.#setSnapshot({ state: 'disconnected' });
+            if (!invalidated) {
+                ++this.#callerAuthOperation;
+                ++this.#notificationAccountRefresh;
+                this.#invalidateRateReads();
+            }
+            this.#setAuthSnapshot({ state: 'disconnected' });
         }
     }
 
@@ -499,7 +586,7 @@ export class RideCodexAuthBroker {
         if (error instanceof RideCodexAuthError) {
             return error;
         }
-        if (token !== this.#authOperation) {
+        if (token !== this.#callerAuthOperation) {
             return new RideCodexAuthError('operation-superseded');
         }
         if (error instanceof RideCodexUnsafeAuthPayloadError) {
@@ -529,7 +616,7 @@ export class RideCodexAuthBroker {
     }
 
     #setGenericError(code: 'invalid-data' | 'operation-failed'): void {
-        this.#setSnapshot({
+        this.#setAuthSnapshot({
             state: 'error',
             account: this.#snapshot.account,
             rateLimits: this.#snapshot.rateLimits,
@@ -538,7 +625,7 @@ export class RideCodexAuthBroker {
     }
 
     #requireCurrentOperation(token: number): void {
-        if (token !== this.#authOperation) {
+        if (token !== this.#callerAuthOperation) {
             throw new RideCodexAuthError('operation-superseded');
         }
     }
@@ -548,9 +635,13 @@ export class RideCodexAuthBroker {
         ++this.#rateVersion;
     }
 
-    #rememberLogin(loginId: string, status: 'active' | 'canceled' | 'completed'): void {
+    #rememberLogin(
+        loginId: string,
+        status: 'active' | 'canceled' | 'completed',
+        operation: number
+    ): void {
         this.#knownLogins.delete(loginId);
-        this.#knownLogins.set(loginId, status);
+        this.#knownLogins.set(loginId, Object.freeze({ status, operation }));
         while (this.#knownLogins.size > MAX_KNOWN_LOGINS) {
             this.#knownLogins.delete(this.#knownLogins.keys().next().value as string);
         }
@@ -564,7 +655,13 @@ export class RideCodexAuthBroker {
         return this.#snapshot;
     }
 
+    #setAuthSnapshot(value: RideCodexAuthSnapshot): RideCodexAuthSnapshot {
+        ++this.#accountRevision;
+        return this.#setSnapshot(value);
+    }
+
     #restoreSnapshot(snapshot: RideCodexAuthSnapshot): void {
+        ++this.#accountRevision;
         this.#snapshot = snapshot;
         for (const client of [...this.#clients]) {
             this.#emitClient(client, snapshot);

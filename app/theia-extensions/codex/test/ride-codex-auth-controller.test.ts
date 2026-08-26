@@ -19,6 +19,14 @@ import {
     RideCodexLegacyPreferenceAccess,
     RideCodexMigrationPrompt
 } from '../src/browser/ride-codex-auth-controller';
+import {
+    RideCodexAuthBroker,
+    RideCodexAuthHost,
+    RideCodexAuthHostLease,
+    RideCodexAuthHostStateEvent
+} from '../src/node/ride-codex-auth-broker';
+import { RideCodexAppServerDiagnostics } from '../src/node/ride-codex-diagnostics';
+import type { RideCodexNotification } from '../src/node/ride-codex-jsonl-client';
 
 type Deferred<T> = { promise: Promise<T>; resolve(value: T): void; reject(reason: unknown): void };
 
@@ -139,6 +147,41 @@ test('accepted migration logs in ephemerally, verifies authenticated state, and 
     assert.deepEqual(auth.loginCalls[0], { type: 'apiKey', apiKey: key });
     assert.deepEqual(preferences.removals, [LEGACY_CODEX_API_KEY_PREFERENCES[0], LEGACY_CODEX_API_KEY_PREFERENCES[1]]);
     assert.equal(JSON.stringify(result).includes(key), false);
+});
+
+test('account update before broker login response still confirms migration before deleting plaintext', async () => {
+    const preferences = new FakePreferences();
+    const prompt = new FakePrompt();
+    const host = new MigrationAuthHost();
+    const diagnostics = new RideCodexAppServerDiagnostics();
+    const broker = new RideCodexAuthBroker({ host, diagnostics });
+    const controller = new RideCodexAuthController({
+        preferences,
+        prompt,
+        auth: broker,
+        relay: new RideCodexAuthClientRelay()
+    });
+    const key = 'sk-migration-notification-order-AAAABBBB';
+    const loginStart = deferred<unknown>();
+    preferences.values.set(LEGACY_CODEX_API_KEY_PREFERENCES[0], key);
+    host.responder = async method => method === 'account/login/start'
+        ? loginStart.promise
+        : { account: { type: 'apiKey' }, requiresOpenaiAuth: false };
+    preferences.beforeRemove = () => {
+        assert.equal(broker.snapshot().state, 'authenticated');
+        assert.equal(host.requests.filter(request => request.method === 'account/read').length > 0, true);
+    };
+
+    const activation = controller.activate();
+    await eventually(() => host.requests.some(request => request.method === 'account/login/start'));
+    host.notify('account/updated', { authMode: 'apikey', planType: null });
+    loginStart.resolve({ type: 'apiKey' });
+
+    const result = await activation;
+    assert.equal(result.state, 'migrated');
+    assert.deepEqual(preferences.removals, [LEGACY_CODEX_API_KEY_PREFERENCES[0]]);
+    assert.equal(preferences.values.has(LEGACY_CODEX_API_KEY_PREFERENCES[0]), false);
+    assert.equal(JSON.stringify({ result, auth: broker.snapshot(), diagnostics: diagnostics.snapshot() }).includes(key), false);
 });
 
 test('declined migration prompts once and leaves Codex and all legacy values untouched', async () => {
@@ -398,6 +441,43 @@ function harness(): {
         prompt,
         auth
     };
+}
+
+class MigrationAuthHost implements RideCodexAuthHost {
+    readonly requests: Array<{ method: string; params: unknown }> = [];
+    readonly notificationListeners = new Set<(notification: RideCodexNotification, generation: number) => void>();
+    readonly stateListeners = new Set<(event: RideCodexAuthHostStateEvent) => void>();
+    responder: (method: string, params: unknown) => unknown | Promise<unknown> = () => ({});
+
+    async acquire(): Promise<RideCodexAuthHostLease> {
+        return {
+            request: (method, params) => {
+                this.requests.push({ method, params });
+                return this.responder(method, params);
+            },
+            release: () => undefined
+        };
+    }
+
+    onNotification(listener: (notification: RideCodexNotification, generation: number) => void): { dispose(): void } {
+        this.notificationListeners.add(listener);
+        return { dispose: () => this.notificationListeners.delete(listener) };
+    }
+
+    onStateChange(listener: (event: RideCodexAuthHostStateEvent) => void): { dispose(): void } {
+        this.stateListeners.add(listener);
+        return { dispose: () => this.stateListeners.delete(listener) };
+    }
+
+    snapshot(): { state: 'ready'; generation: number } {
+        return { state: 'ready', generation: 1 };
+    }
+
+    notify(method: string, params: unknown): void {
+        for (const listener of [...this.notificationListeners]) {
+            listener({ method, params }, 1);
+        }
+    }
 }
 
 function deferred<T>(): Deferred<T> {

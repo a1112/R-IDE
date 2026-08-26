@@ -387,6 +387,204 @@ test('API key login is ephemeral, redacted, and authenticated only after account
     assert.equal(serialized.includes(key.slice(-12)), false);
 });
 
+test('account update before API key login/start response does not supersede the matching login', async () => {
+    const host = new FakeAuthHost();
+    const loginStart = deferred<unknown>();
+    host.responder = async method => {
+        if (method === 'account/login/start') {
+            return loginStart.promise;
+        }
+        if (method === 'account/read') {
+            return { account: { type: 'apiKey' }, requiresOpenaiAuth: false };
+        }
+        throw new Error('unexpected request');
+    };
+    const broker = new RideCodexAuthBroker({ host, diagnostics: new RideCodexAppServerDiagnostics() });
+
+    const login = broker.login({ type: 'apiKey', apiKey: 'sk-notify-before-login-response-AAAABBBB' });
+    await eventually(() => host.requests.some(request => request.method === 'account/login/start'));
+    host.notify('account/updated', { authMode: 'apikey', planType: null });
+    loginStart.resolve({ type: 'apiKey' });
+
+    assert.deepEqual(await login, { type: 'apiKey' });
+    assert.equal(broker.snapshot().state, 'authenticated');
+    assert.deepEqual(broker.snapshot().account, { type: 'apiKey' });
+});
+
+test('account update during API key confirmation read preserves the matching login', async () => {
+    const host = new FakeAuthHost();
+    const confirmationRead = deferred<unknown>();
+    const notificationRead = deferred<unknown>();
+    let accountReads = 0;
+    host.responder = async method => {
+        if (method === 'account/login/start') {
+            return { type: 'apiKey' };
+        }
+        if (method === 'account/read') {
+            accountReads += 1;
+            return accountReads === 1 ? confirmationRead.promise : notificationRead.promise;
+        }
+        throw new Error('unexpected request');
+    };
+    const broker = new RideCodexAuthBroker({ host, diagnostics: new RideCodexAppServerDiagnostics() });
+
+    const login = broker.login({ type: 'apiKey', apiKey: 'sk-notify-during-confirmation-AAAABBBB' });
+    await eventually(() => accountReads === 1);
+    host.notify('account/updated', { authMode: 'apikey', planType: null });
+    await eventually(() => accountReads === 2);
+    confirmationRead.resolve({ account: { type: 'apiKey' }, requiresOpenaiAuth: false });
+    notificationRead.resolve({ account: null, requiresOpenaiAuth: true });
+
+    assert.deepEqual(await login, { type: 'apiKey' });
+    assert.deepEqual(broker.snapshot().account, { type: 'apiKey' });
+    assert.equal(broker.snapshot().state, 'authenticated');
+});
+
+test('later account notifications and caller commits reject older notification refresh responses', async () => {
+    const host = new FakeAuthHost();
+    const firstRefresh = deferred<unknown>();
+    const secondRefresh = deferred<unknown>();
+    let accountReads = 0;
+    host.responder = method => {
+        assert.equal(method, 'account/read');
+        return { account: null, requiresOpenaiAuth: true };
+    };
+    const broker = new RideCodexAuthBroker({ host, diagnostics: new RideCodexAppServerDiagnostics() });
+    await broker.activate();
+    host.responder = method => {
+        assert.equal(method, 'account/read');
+        accountReads += 1;
+        return accountReads === 1 ? firstRefresh.promise : secondRefresh.promise;
+    };
+
+    host.notify('account/updated', { authMode: 'apikey', planType: null });
+    host.notify('account/updated', { authMode: 'chatgpt', planType: 'plus' });
+    await eventually(() => accountReads === 2);
+    secondRefresh.resolve({
+        account: { type: 'chatgpt', email: null, planType: 'plus' },
+        requiresOpenaiAuth: false
+    });
+    firstRefresh.resolve({ account: { type: 'apiKey' }, requiresOpenaiAuth: false });
+    await tick();
+
+    assert.deepEqual(broker.snapshot().account, { type: 'chatgpt', plan: 'plus' });
+});
+
+test('a newer account notification prevents an older caller read from replacing account state', async () => {
+    const host = new FakeAuthHost();
+    const callerRead = deferred<unknown>();
+    const notificationRead = deferred<unknown>();
+    let accountReads = 0;
+    host.responder = method => {
+        assert.equal(method, 'account/read');
+        accountReads += 1;
+        return accountReads === 1 ? callerRead.promise : notificationRead.promise;
+    };
+    const broker = new RideCodexAuthBroker({ host, diagnostics: new RideCodexAppServerDiagnostics() });
+
+    const pendingCaller = broker.readAccount();
+    await eventually(() => accountReads === 1);
+    host.notify('account/updated', { authMode: 'chatgpt', planType: 'plus' });
+    await eventually(() => accountReads === 2);
+    notificationRead.resolve({
+        account: { type: 'chatgpt', email: null, planType: 'plus' },
+        requiresOpenaiAuth: false
+    });
+    await eventually(() => broker.snapshot().account?.type === 'chatgpt');
+    callerRead.resolve({ account: null, requiresOpenaiAuth: true });
+    await pendingCaller;
+
+    assert.deepEqual(broker.snapshot().account, { type: 'chatgpt', plan: 'plus' });
+});
+
+test('duplicate account notifications coalesce to one confirmation refresh', async () => {
+    const host = new FakeAuthHost();
+    const refresh = deferred<unknown>();
+    let accountReads = 0;
+    host.responder = method => {
+        assert.equal(method, 'account/read');
+        return { account: null, requiresOpenaiAuth: true };
+    };
+    const broker = new RideCodexAuthBroker({ host, diagnostics: new RideCodexAppServerDiagnostics() });
+    await broker.activate();
+    host.responder = method => {
+        assert.equal(method, 'account/read');
+        accountReads += 1;
+        return refresh.promise;
+    };
+    host.notify('account/updated', { authMode: 'apikey', planType: null });
+    host.notify('account/updated', { authMode: 'apikey', planType: null });
+    await eventually(() => accountReads === 1);
+    assert.equal(accountReads, 1);
+    refresh.resolve({ account: { type: 'apiKey' }, requiresOpenaiAuth: false });
+    await eventually(() => broker.snapshot().state === 'authenticated');
+});
+
+test('dispose invalidates a pending API key login before confirmation without leaking the secret', async () => {
+    const host = new FakeAuthHost();
+    const diagnostics = new RideCodexAppServerDiagnostics();
+    const loginStart = deferred<unknown>();
+    const key = 'sk-dispose-pending-login-AAAABBBBCCCC';
+    host.responder = method => method === 'account/login/start'
+        ? loginStart.promise
+        : { account: { type: 'apiKey' }, requiresOpenaiAuth: false };
+    const broker = new RideCodexAuthBroker({ host, diagnostics });
+
+    const login = broker.login({ type: 'apiKey', apiKey: key }).catch(error => error as Error);
+    await eventually(() => host.requests.some(request => request.method === 'account/login/start'));
+    broker.dispose();
+    loginStart.resolve({ type: 'apiKey' });
+
+    assert.match(String(await login), /superseded|disposed/i);
+    assert.equal(host.requests.some(request => request.method === 'account/read'), false);
+    assert.equal(diagnostics.transientSecretCount, 0);
+    assert.equal(JSON.stringify({ snapshot: broker.snapshot(), diagnostics: diagnostics.snapshot() }).includes(key), false);
+});
+
+test('an older login completion cannot replace a newer API key login operation', async () => {
+    const host = new FakeAuthHost();
+    const apiKeyStart = deferred<unknown>();
+    host.responder = (method, params) => {
+        if (method === 'account/login/start' && (params as { type: string }).type === 'chatgpt') {
+            return { type: 'chatgpt', loginId: 'older-login', authUrl: 'https://auth.openai.com/' };
+        }
+        if (method === 'account/login/start') {
+            return apiKeyStart.promise;
+        }
+        return { account: { type: 'apiKey' }, requiresOpenaiAuth: false };
+    };
+    const broker = new RideCodexAuthBroker({ host, diagnostics: new RideCodexAppServerDiagnostics() });
+    await broker.login({ type: 'chatgpt' });
+
+    const newerLogin = broker.login({ type: 'apiKey', apiKey: 'sk-newer-login-AAAABBBBCCCC' });
+    await eventually(() => host.requests.filter(request => request.method === 'account/login/start').length === 2);
+    host.notify('account/login/completed', { loginId: 'older-login', success: false, error: 'stale failure' });
+    assert.equal(broker.snapshot().state, 'authenticating');
+    host.notify('account/updated', { authMode: 'apikey', planType: null });
+    apiKeyStart.resolve({ type: 'apiKey' });
+
+    assert.deepEqual(await newerLogin, { type: 'apiKey' });
+    assert.equal(broker.snapshot().state, 'authenticated');
+});
+
+test('a new host generation invalidates an older login as soon as it starts', async () => {
+    const host = new FakeAuthHost();
+    const loginStart = deferred<unknown>();
+    host.responder = method => method === 'account/login/start'
+        ? loginStart.promise
+        : { account: { type: 'apiKey' }, requiresOpenaiAuth: false };
+    const broker = new RideCodexAuthBroker({ host, diagnostics: new RideCodexAppServerDiagnostics() });
+
+    const login = broker.login({ type: 'apiKey', apiKey: 'sk-stale-generation-AAAABBBBCCCC' })
+        .catch(error => error as Error);
+    await eventually(() => host.requests.some(request => request.method === 'account/login/start'));
+    host.changeState('starting', 2);
+    loginStart.resolve({ type: 'apiKey' });
+
+    assert.match(String(await login), /superseded/i);
+    assert.equal(host.requests.some(request => request.method === 'account/read'), false);
+});
+
 test('concurrent API key redaction scopes are isolated and always removed', async () => {
     const host = new FakeAuthHost();
     const diagnostics = new RideCodexAppServerDiagnostics();
@@ -488,6 +686,43 @@ test('login completion refreshes the account and maps remote failure to a generi
     assert.equal(JSON.stringify(broker.snapshot()).includes(secretRemoteError), false);
     assert.ok((broker.snapshot().error?.message.length ?? 0) <= 160);
     assert.ok(client.snapshots.every(snapshot => Object.isFrozen(snapshot)));
+});
+
+test('an older login completion cannot supersede a newer pending login', async () => {
+    const host = new FakeAuthHost();
+    const newerLogin = deferred<unknown>();
+    let loginStarts = 0;
+    let accountReads = 0;
+    host.responder = async method => {
+        if (method === 'account/login/start') {
+            loginStarts += 1;
+            return loginStarts === 1
+                ? { type: 'chatgpt', loginId: 'older-login', authUrl: 'https://auth.openai.com/older' }
+                : newerLogin.promise;
+        }
+        if (method === 'account/read') {
+            accountReads += 1;
+            return { account: { type: 'chatgpt', email: null, planType: 'plus' }, requiresOpenaiAuth: false };
+        }
+        throw new Error('unexpected request');
+    };
+    const broker = new RideCodexAuthBroker({ host, diagnostics: new RideCodexAppServerDiagnostics() });
+    await broker.login({ type: 'chatgpt' });
+
+    const current = broker.login({ type: 'chatgptDeviceCode' });
+    await eventually(() => loginStarts === 2);
+    host.notify('account/login/completed', { loginId: 'older-login', success: true, error: null });
+    newerLogin.resolve({
+        type: 'chatgptDeviceCode', loginId: 'newer-login',
+        verificationUrl: 'https://auth.openai.com/device', userCode: 'ABCD-EFGH'
+    });
+
+    assert.deepEqual(await current, {
+        type: 'chatgptDeviceCode', loginId: 'newer-login',
+        verificationUrl: 'https://auth.openai.com/device', userCode: 'ABCD-EFGH'
+    });
+    assert.equal(accountReads, 0);
+    assert.equal(broker.snapshot().pendingLogin?.loginId, 'newer-login');
 });
 
 test('strictly maps rate limits and merges sparse notifications', async () => {
