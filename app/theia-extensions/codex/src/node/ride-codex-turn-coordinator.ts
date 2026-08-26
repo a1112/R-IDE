@@ -542,6 +542,7 @@ export class RideCodexTurnCoordinator {
             const raw = await Promise.race([resuming, stopped]);
             remainingRecoveryTimeout(this.#timers, startedAt, this.#recoveryTimeoutMs);
             requireThreadResumeResponse(raw, threadId);
+            remainingRecoveryTimeout(this.#timers, startedAt, this.#recoveryTimeoutMs);
         } catch (error) {
             if (!this.#disposed) {
                 this.#enqueueDiagnostic(Object.freeze({
