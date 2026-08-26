@@ -1465,9 +1465,10 @@ function requireTurn(value: unknown): Readonly<{
     id: string;
     status: 'in-progress' | RideCodexTurnTerminalStatus;
 }> {
-    const turn = requireExactOptions(value, [
+    const turn = requireOptions(value, [
         'id', 'items', 'itemsView', 'status', 'error', 'startedAt', 'completedAt', 'durationMs'
     ]);
+    requireRequiredKeys(turn, ['id', 'items', 'status']);
     const items = ownValue(turn, 'items');
     if (!Array.isArray(items) || utilTypes.isProxy(items) || items.length > MAX_RAW_ARRAY) {
         throw new RideCodexTurnError('invalid-data');
@@ -1475,13 +1476,22 @@ function requireTurn(value: unknown): Readonly<{
     for (const item of items) {
         requireStableThreadItem(item);
     }
-    if (!['notLoaded', 'summary', 'full'].includes(ownValue(turn, 'itemsView') as string)) {
+    if (hasOwn(turn, 'itemsView')
+        && !['notLoaded', 'summary', 'full'].includes(ownValue(turn, 'itemsView') as string)) {
         throw new RideCodexTurnError('invalid-data');
     }
-    requireTurnError(ownValue(turn, 'error'));
-    requireNullableJsonInt64(ownValue(turn, 'startedAt'));
-    requireNullableJsonInt64(ownValue(turn, 'completedAt'));
-    requireNullableJsonInt64(ownValue(turn, 'durationMs'));
+    if (hasOwn(turn, 'error')) {
+        requireTurnError(ownValue(turn, 'error'));
+    }
+    if (hasOwn(turn, 'startedAt')) {
+        requireNullableJsonInt64(ownValue(turn, 'startedAt'));
+    }
+    if (hasOwn(turn, 'completedAt')) {
+        requireNullableJsonInt64(ownValue(turn, 'completedAt'));
+    }
+    if (hasOwn(turn, 'durationMs')) {
+        requireNullableJsonInt64(ownValue(turn, 'durationMs'));
+    }
     return Object.freeze({
         id: requireIdentifier(ownValue(turn, 'id')),
         status: normalizeServerTurnStatus(ownValue(turn, 'status'))
@@ -1498,11 +1508,16 @@ function requireStableThreadItem(value: unknown): void {
             return;
         }
         case 'agentMessage': {
-            const item = requireExactOptions(record, ['type', 'id', 'text', 'phase', 'memoryCitation']);
+            const item = requireOptions(record, ['type', 'id', 'text', 'phase', 'memoryCitation']);
+            requireRequiredKeys(item, ['type', 'id', 'text']);
             requireIdentifier(ownValue(item, 'id'));
             requireBoundedText(ownValue(item, 'text'), MAX_INPUT_TEXT_BYTES);
-            requireNullableEnum(ownValue(item, 'phase'), ['commentary', 'final_answer']);
-            requireNullableMemoryCitation(ownValue(item, 'memoryCitation'));
+            if (hasOwn(item, 'phase')) {
+                requireNullableEnum(ownValue(item, 'phase'), ['commentary', 'final_answer']);
+            }
+            if (hasOwn(item, 'memoryCitation')) {
+                requireNullableMemoryCitation(ownValue(item, 'memoryCitation'));
+            }
             return;
         }
         case 'plan': {
@@ -1512,23 +1527,31 @@ function requireStableThreadItem(value: unknown): void {
             return;
         }
         case 'reasoning': {
-            const item = requireExactOptions(record, ['type', 'id', 'summary', 'content']);
+            const item = requireOptions(record, ['type', 'id', 'summary', 'content']);
+            requireRequiredKeys(item, ['type', 'id']);
             requireIdentifier(ownValue(item, 'id'));
-            requireStringArray(ownValue(item, 'summary'), MAX_RAW_ARRAY, MAX_INPUT_TEXT_BYTES, true);
-            requireStringArray(ownValue(item, 'content'), MAX_RAW_ARRAY, MAX_INPUT_TEXT_BYTES, true);
+            if (hasOwn(item, 'summary')) {
+                requireStringArray(ownValue(item, 'summary'), MAX_RAW_ARRAY, MAX_INPUT_TEXT_BYTES, true);
+            }
+            if (hasOwn(item, 'content')) {
+                requireStringArray(ownValue(item, 'content'), MAX_RAW_ARRAY, MAX_INPUT_TEXT_BYTES, true);
+            }
             return;
         }
         case 'commandExecution': {
-            const item = requireExactOptions(record, [
+            const item = requireOptions(record, [
                 'type', 'id', 'command', 'cwd', 'processId', 'source', 'status', 'commandActions',
                 'aggregatedOutput', 'exitCode', 'durationMs'
             ]);
+            requireRequiredKeys(item, ['type', 'id', 'command', 'cwd', 'status', 'commandActions']);
             requireIdentifier(ownValue(item, 'id'));
             requireBoundedText(ownValue(item, 'command'), MAX_INPUT_TEXT_BYTES);
             requireString(ownValue(item, 'cwd'), MAX_LOCAL_PATH_BYTES);
-            requireNullableIdentifier(ownValue(item, 'processId'));
-            if (!['agent', 'userShell', 'unifiedExecStartup', 'unifiedExecInteraction']
-                .includes(ownValue(item, 'source') as string)
+            if (hasOwn(item, 'processId')) {
+                requireNullableIdentifier(ownValue(item, 'processId'));
+            }
+            if ((hasOwn(item, 'source') && !['agent', 'userShell', 'unifiedExecStartup', 'unifiedExecInteraction']
+                .includes(ownValue(item, 'source') as string))
                 || !['inProgress', 'completed', 'failed', 'declined']
                     .includes(ownValue(item, 'status') as string)) {
                 throw new RideCodexTurnError('invalid-data');
@@ -1536,9 +1559,15 @@ function requireStableThreadItem(value: unknown): void {
             for (const action of requireBoundedArray(ownValue(item, 'commandActions'))) {
                 requireCommandAction(action);
             }
-            requireNullableText(ownValue(item, 'aggregatedOutput'), MAX_INPUT_TEXT_BYTES);
-            requireNullableInt32(ownValue(item, 'exitCode'));
-            requireNullableJsonInt64(ownValue(item, 'durationMs'));
+            if (hasOwn(item, 'aggregatedOutput')) {
+                requireNullableText(ownValue(item, 'aggregatedOutput'), MAX_INPUT_TEXT_BYTES);
+            }
+            if (hasOwn(item, 'exitCode')) {
+                requireNullableInt32(ownValue(item, 'exitCode'));
+            }
+            if (hasOwn(item, 'durationMs')) {
+                requireNullableJsonInt64(ownValue(item, 'durationMs'));
+            }
             return;
         }
         case 'fileChange': {
@@ -1551,9 +1580,12 @@ function requireStableThreadItem(value: unknown): void {
             return;
         }
         case 'userMessage': {
-            const item = requireExactOptions(record, ['type', 'id', 'clientId', 'content']);
+            const item = requireOptions(record, ['type', 'id', 'clientId', 'content']);
+            requireRequiredKeys(item, ['type', 'id', 'content']);
             requireIdentifier(ownValue(item, 'id'));
-            requireNullableIdentifier(ownValue(item, 'clientId'));
+            if (hasOwn(item, 'clientId')) {
+                requireNullableIdentifier(ownValue(item, 'clientId'));
+            }
             const content = ownValue(item, 'content');
             if (!Array.isArray(content) || utilTypes.isProxy(content) || content.length > MAX_INPUT_ITEMS) {
                 throw new RideCodexTurnError('invalid-data');
@@ -1626,10 +1658,13 @@ function requireStableUserInput(value: unknown): void {
     const input = requireRecord(value);
     switch (ownValue(input, 'type')) {
         case 'text': {
-            const textInput = requireExactOptions(input, ['type', 'text', 'text_elements']);
+            const textInput = requireOptions(input, ['type', 'text', 'text_elements']);
+            requireRequiredKeys(textInput, ['type', 'text']);
             requireBoundedText(ownValue(textInput, 'text'), MAX_INPUT_TEXT_BYTES);
-            for (const element of requireBoundedArray(ownValue(textInput, 'text_elements'))) {
-                requireTextElement(element);
+            if (hasOwn(textInput, 'text_elements')) {
+                for (const element of requireBoundedArray(ownValue(textInput, 'text_elements'))) {
+                    requireTextElement(element);
+                }
             }
             return;
         }
@@ -1660,14 +1695,17 @@ function requireStableUserInput(value: unknown): void {
 }
 
 function requireTextElement(value: unknown): void {
-    const element = requireExactOptions(value, ['byteRange', 'placeholder']);
+    const element = requireOptions(value, ['byteRange', 'placeholder']);
+    requireRequiredKeys(element, ['byteRange']);
     const range = requireExactOptions(ownValue(element, 'byteRange'), ['start', 'end']);
     const start = requireJsonUint(ownValue(range, 'start'));
     const end = requireJsonUint(ownValue(range, 'end'));
     if (end < start) {
         throw new RideCodexTurnError('invalid-data');
     }
-    requireNullableText(ownValue(element, 'placeholder'), MAX_INPUT_TEXT_BYTES);
+    if (hasOwn(element, 'placeholder')) {
+        requireNullableText(ownValue(element, 'placeholder'), MAX_INPUT_TEXT_BYTES);
+    }
 }
 
 function requireNullableMemoryCitation(value: unknown): void {
@@ -1702,16 +1740,24 @@ function requireCommandAction(value: unknown): void {
             return;
         }
         case 'listFiles': {
-            const list = requireExactOptions(action, ['type', 'command', 'path']);
+            const list = requireOptions(action, ['type', 'command', 'path']);
+            requireRequiredKeys(list, ['type', 'command']);
             requireBoundedText(ownValue(list, 'command'), MAX_INPUT_TEXT_BYTES);
-            requireNullableText(ownValue(list, 'path'), MAX_LOCAL_PATH_BYTES);
+            if (hasOwn(list, 'path')) {
+                requireNullableText(ownValue(list, 'path'), MAX_LOCAL_PATH_BYTES);
+            }
             return;
         }
         case 'search': {
-            const search = requireExactOptions(action, ['type', 'command', 'query', 'path']);
+            const search = requireOptions(action, ['type', 'command', 'query', 'path']);
+            requireRequiredKeys(search, ['type', 'command']);
             requireBoundedText(ownValue(search, 'command'), MAX_INPUT_TEXT_BYTES);
-            requireNullableText(ownValue(search, 'query'), MAX_INPUT_TEXT_BYTES);
-            requireNullableText(ownValue(search, 'path'), MAX_LOCAL_PATH_BYTES);
+            if (hasOwn(search, 'query')) {
+                requireNullableText(ownValue(search, 'query'), MAX_INPUT_TEXT_BYTES);
+            }
+            if (hasOwn(search, 'path')) {
+                requireNullableText(ownValue(search, 'path'), MAX_LOCAL_PATH_BYTES);
+            }
             return;
         }
         case 'unknown': {
@@ -1730,22 +1776,31 @@ function requireMcpToolCall(value: unknown): void {
         'pluginId', 'result', 'error', 'durationMs'
     ]);
     requireRequiredKeys(item, [
-        'type', 'id', 'server', 'tool', 'status', 'arguments', 'appContext',
-        'pluginId', 'result', 'error', 'durationMs'
+        'type', 'id', 'server', 'tool', 'status', 'arguments'
     ]);
     requireIdentifier(ownValue(item, 'id'));
     requireBoundedText(ownValue(item, 'server'), MAX_IDENTIFIER_BYTES);
     requireBoundedText(ownValue(item, 'tool'), MAX_IDENTIFIER_BYTES);
     requireEnum(ownValue(item, 'status'), ['inProgress', 'completed', 'failed']);
     requireJsonValue(ownValue(item, 'arguments'));
-    requireNullableMcpAppContext(ownValue(item, 'appContext'));
-    if (Object.prototype.hasOwnProperty.call(item, 'mcpAppResourceUri')) {
-        requireBoundedText(ownValue(item, 'mcpAppResourceUri'), MAX_LOCAL_PATH_BYTES);
+    if (hasOwn(item, 'appContext')) {
+        requireNullableMcpAppContext(ownValue(item, 'appContext'));
     }
-    requireNullableText(ownValue(item, 'pluginId'), MAX_IDENTIFIER_BYTES);
-    requireNullableMcpResult(ownValue(item, 'result'));
-    requireNullableMcpError(ownValue(item, 'error'));
-    requireNullableJsonInt64(ownValue(item, 'durationMs'));
+    if (hasOwn(item, 'mcpAppResourceUri')) {
+        requireNullableText(ownValue(item, 'mcpAppResourceUri'), MAX_LOCAL_PATH_BYTES);
+    }
+    if (hasOwn(item, 'pluginId')) {
+        requireNullableText(ownValue(item, 'pluginId'), MAX_IDENTIFIER_BYTES);
+    }
+    if (hasOwn(item, 'result')) {
+        requireNullableMcpResult(ownValue(item, 'result'));
+    }
+    if (hasOwn(item, 'error')) {
+        requireNullableMcpError(ownValue(item, 'error'));
+    }
+    if (hasOwn(item, 'durationMs')) {
+        requireNullableJsonInt64(ownValue(item, 'durationMs'));
+    }
 }
 
 function requireNullableMcpAppContext(value: unknown): void {
@@ -1755,15 +1810,19 @@ function requireNullableMcpAppContext(value: unknown): void {
         }
         return;
     }
-    const context = requireExactOptions(value, [
+    const context = requireOptions(value, [
         'connectorId', 'linkId', 'resourceUri', 'appName', 'templateId', 'actionName'
     ]);
+    requireRequiredKeys(context, ['connectorId']);
     requireBoundedText(ownValue(context, 'connectorId'), MAX_IDENTIFIER_BYTES);
-    requireNullableText(ownValue(context, 'linkId'), MAX_IDENTIFIER_BYTES);
-    requireNullableText(ownValue(context, 'resourceUri'), MAX_LOCAL_PATH_BYTES);
-    requireNullableText(ownValue(context, 'appName'), MAX_IDENTIFIER_BYTES);
-    requireNullableText(ownValue(context, 'templateId'), MAX_IDENTIFIER_BYTES);
-    requireNullableText(ownValue(context, 'actionName'), MAX_IDENTIFIER_BYTES);
+    for (const key of ['linkId', 'resourceUri', 'appName', 'templateId', 'actionName'] as const) {
+        if (hasOwn(context, key)) {
+            requireNullableText(
+                ownValue(context, key),
+                key === 'resourceUri' ? MAX_LOCAL_PATH_BYTES : MAX_IDENTIFIER_BYTES
+            );
+        }
+    }
 }
 
 function requireNullableMcpResult(value: unknown): void {
@@ -1773,12 +1832,17 @@ function requireNullableMcpResult(value: unknown): void {
         }
         return;
     }
-    const result = requireExactOptions(value, ['content', 'structuredContent', '_meta']);
+    const result = requireOptions(value, ['content', 'structuredContent', '_meta']);
+    requireRequiredKeys(result, ['content']);
     for (const content of requireBoundedArray(ownValue(result, 'content'))) {
         requireJsonValue(content);
     }
-    requireJsonValue(ownValue(result, 'structuredContent'));
-    requireJsonValue(ownValue(result, '_meta'));
+    if (hasOwn(result, 'structuredContent')) {
+        requireJsonValue(ownValue(result, 'structuredContent'));
+    }
+    if (hasOwn(result, '_meta')) {
+        requireJsonValue(ownValue(result, '_meta'));
+    }
 }
 
 function requireNullableMcpError(value: unknown): void {
@@ -1793,21 +1857,19 @@ function requireNullableMcpError(value: unknown): void {
 }
 
 function requireDynamicToolCall(value: unknown): void {
-    const item = requireExactOptions(value, [
+    const item = requireOptions(value, [
         'type', 'id', 'namespace', 'tool', 'arguments', 'status', 'contentItems', 'success', 'durationMs'
     ]);
+    requireRequiredKeys(item, ['type', 'id', 'tool', 'arguments', 'status']);
     requireIdentifier(ownValue(item, 'id'));
-    requireNullableText(ownValue(item, 'namespace'), MAX_IDENTIFIER_BYTES);
+    if (hasOwn(item, 'namespace')) {
+        requireNullableText(ownValue(item, 'namespace'), MAX_IDENTIFIER_BYTES);
+    }
     requireBoundedText(ownValue(item, 'tool'), MAX_IDENTIFIER_BYTES);
     requireJsonValue(ownValue(item, 'arguments'));
     requireEnum(ownValue(item, 'status'), ['inProgress', 'completed', 'failed']);
     const contentItems = ownValue(item, 'contentItems');
-    if (isNullish(contentItems)) {
-        if (contentItems === undefined) {
-            throw new RideCodexTurnError('invalid-data');
-        }
-        // Stable schema permits null while the tool is still running.
-    } else {
+    if (hasOwn(item, 'contentItems') && !isNullish(contentItems)) {
         for (const rawContent of requireBoundedArray(contentItems)) {
             const content = requireRecord(rawContent);
             switch (ownValue(content, 'type')) {
@@ -1825,40 +1887,62 @@ function requireDynamicToolCall(value: unknown): void {
                     throw new RideCodexTurnError('invalid-data');
             }
         }
+    } else if (hasOwn(item, 'contentItems') && contentItems === undefined) {
+        throw new RideCodexTurnError('invalid-data');
     }
-    requireNullableBoolean(ownValue(item, 'success'));
-    requireNullableJsonInt64(ownValue(item, 'durationMs'));
+    if (hasOwn(item, 'success')) {
+        requireNullableBoolean(ownValue(item, 'success'));
+    }
+    if (hasOwn(item, 'durationMs')) {
+        requireNullableJsonInt64(ownValue(item, 'durationMs'));
+    }
 }
 
 function requireCollabAgentToolCall(value: unknown): void {
-    const item = requireExactOptions(value, [
+    const item = requireOptions(value, [
         'type', 'id', 'tool', 'status', 'senderThreadId', 'receiverThreadIds', 'prompt',
         'model', 'reasoningEffort', 'agentsStates'
+    ]);
+    requireRequiredKeys(item, [
+        'type', 'id', 'tool', 'status', 'senderThreadId', 'receiverThreadIds', 'agentsStates'
     ]);
     requireIdentifier(ownValue(item, 'id'));
     requireEnum(ownValue(item, 'tool'), ['spawnAgent', 'sendInput', 'resumeAgent', 'wait', 'closeAgent']);
     requireEnum(ownValue(item, 'status'), ['inProgress', 'completed', 'failed']);
     requireIdentifier(ownValue(item, 'senderThreadId'));
     requireStringArray(ownValue(item, 'receiverThreadIds'), MAX_RAW_ARRAY, MAX_IDENTIFIER_BYTES, false);
-    requireNullableText(ownValue(item, 'prompt'), MAX_INPUT_TEXT_BYTES);
-    requireNullableText(ownValue(item, 'model'), MAX_IDENTIFIER_BYTES);
-    requireNullableText(ownValue(item, 'reasoningEffort'), MAX_IDENTIFIER_BYTES);
+    if (hasOwn(item, 'prompt')) {
+        requireNullableText(ownValue(item, 'prompt'), MAX_INPUT_TEXT_BYTES);
+    }
+    if (hasOwn(item, 'model')) {
+        requireNullableText(ownValue(item, 'model'), MAX_IDENTIFIER_BYTES);
+    }
+    if (hasOwn(item, 'reasoningEffort')) {
+        requireNullableIdentifier(ownValue(item, 'reasoningEffort'));
+    }
     const states = requireRecord(ownValue(item, 'agentsStates'));
     for (const [threadId, rawState] of Object.entries(states)) {
         requireIdentifier(threadId);
-        const state = requireExactOptions(rawState, ['status', 'message']);
+        const state = requireOptions(rawState, ['status', 'message']);
+        requireRequiredKeys(state, ['status']);
         requireEnum(ownValue(state, 'status'), [
             'pendingInit', 'running', 'interrupted', 'completed', 'errored', 'shutdown', 'notFound'
         ]);
-        requireNullableText(ownValue(state, 'message'), MAX_INPUT_TEXT_BYTES);
+        if (hasOwn(state, 'message')) {
+            requireNullableText(ownValue(state, 'message'), MAX_INPUT_TEXT_BYTES);
+        }
     }
 }
 
 function requireWebSearchItem(value: unknown): void {
-    const item = requireExactOptions(value, ['type', 'id', 'query', 'action']);
+    const item = requireOptions(value, ['type', 'id', 'query', 'action']);
+    requireRequiredKeys(item, ['type', 'id', 'query']);
     requireIdentifier(ownValue(item, 'id'));
     requireBoundedText(ownValue(item, 'query'), MAX_INPUT_TEXT_BYTES);
     const rawAction = ownValue(item, 'action');
+    if (!hasOwn(item, 'action')) {
+        return;
+    }
     if (isNullish(rawAction)) {
         if (rawAction === undefined) {
             throw new RideCodexTurnError('invalid-data');
@@ -1868,9 +1952,15 @@ function requireWebSearchItem(value: unknown): void {
     const action = requireRecord(rawAction);
     switch (ownValue(action, 'type')) {
         case 'search': {
-            const search = requireExactOptions(action, ['type', 'query', 'queries']);
-            requireNullableText(ownValue(search, 'query'), MAX_INPUT_TEXT_BYTES);
+            const search = requireOptions(action, ['type', 'query', 'queries']);
+            requireRequiredKeys(search, ['type']);
+            if (hasOwn(search, 'query')) {
+                requireNullableText(ownValue(search, 'query'), MAX_INPUT_TEXT_BYTES);
+            }
             const queries = ownValue(search, 'queries');
+            if (!hasOwn(search, 'queries')) {
+                return;
+            }
             if (isNullish(queries)) {
                 if (queries === undefined) {
                     throw new RideCodexTurnError('invalid-data');
@@ -1881,14 +1971,22 @@ function requireWebSearchItem(value: unknown): void {
             return;
         }
         case 'openPage': {
-            const open = requireExactOptions(action, ['type', 'url']);
-            requireNullableText(ownValue(open, 'url'), MAX_LOCAL_PATH_BYTES);
+            const open = requireOptions(action, ['type', 'url']);
+            requireRequiredKeys(open, ['type']);
+            if (hasOwn(open, 'url')) {
+                requireNullableText(ownValue(open, 'url'), MAX_LOCAL_PATH_BYTES);
+            }
             return;
         }
         case 'findInPage': {
-            const find = requireExactOptions(action, ['type', 'url', 'pattern']);
-            requireNullableText(ownValue(find, 'url'), MAX_LOCAL_PATH_BYTES);
-            requireNullableText(ownValue(find, 'pattern'), MAX_INPUT_TEXT_BYTES);
+            const find = requireOptions(action, ['type', 'url', 'pattern']);
+            requireRequiredKeys(find, ['type']);
+            if (hasOwn(find, 'url')) {
+                requireNullableText(ownValue(find, 'url'), MAX_LOCAL_PATH_BYTES);
+            }
+            if (hasOwn(find, 'pattern')) {
+                requireNullableText(ownValue(find, 'pattern'), MAX_INPUT_TEXT_BYTES);
+            }
             return;
         }
         case 'other':
@@ -1901,13 +1999,15 @@ function requireWebSearchItem(value: unknown): void {
 
 function requireImageGenerationItem(value: unknown): void {
     const item = requireOptions(value, ['type', 'id', 'status', 'revisedPrompt', 'result', 'savedPath']);
-    requireRequiredKeys(item, ['type', 'id', 'status', 'revisedPrompt', 'result']);
+    requireRequiredKeys(item, ['type', 'id', 'status', 'result']);
     requireIdentifier(ownValue(item, 'id'));
     requireBoundedText(ownValue(item, 'status'), MAX_IDENTIFIER_BYTES);
-    requireNullableText(ownValue(item, 'revisedPrompt'), MAX_INPUT_TEXT_BYTES);
+    if (hasOwn(item, 'revisedPrompt')) {
+        requireNullableText(ownValue(item, 'revisedPrompt'), MAX_INPUT_TEXT_BYTES);
+    }
     requireBoundedText(ownValue(item, 'result'), MAX_INPUT_TEXT_BYTES);
-    if (Object.prototype.hasOwnProperty.call(item, 'savedPath')) {
-        requireString(ownValue(item, 'savedPath'), MAX_LOCAL_PATH_BYTES);
+    if (hasOwn(item, 'savedPath')) {
+        requireNullableText(ownValue(item, 'savedPath'), MAX_LOCAL_PATH_BYTES);
     }
 }
 
@@ -1940,10 +2040,17 @@ function requireJsonValue(value: unknown): void {
 }
 
 function requireOptionalImageDetail(record: Record<string, unknown>): void {
-    if (!Object.prototype.hasOwnProperty.call(record, 'detail')) {
+    if (!hasOwn(record, 'detail')) {
         return;
     }
-    requireEnum(ownValue(record, 'detail'), ['auto', 'low', 'high', 'original']);
+    const detail = ownValue(record, 'detail');
+    if (isNullish(detail)) {
+        if (detail === undefined) {
+            throw new RideCodexTurnError('invalid-data');
+        }
+        return;
+    }
+    requireEnum(detail, ['auto', 'low', 'high', 'original']);
 }
 
 function requireTurnError(value: unknown): void {
@@ -1953,10 +2060,16 @@ function requireTurnError(value: unknown): void {
         }
         return;
     }
-    const error = requireExactOptions(value, ['message', 'codexErrorInfo', 'additionalDetails']);
+    const error = requireOptions(value, ['message', 'codexErrorInfo', 'additionalDetails']);
+    requireRequiredKeys(error, ['message']);
     requireBoundedText(ownValue(error, 'message'), MAX_INPUT_TEXT_BYTES);
-    requireNullableText(ownValue(error, 'additionalDetails'), MAX_INPUT_TEXT_BYTES);
+    if (hasOwn(error, 'additionalDetails')) {
+        requireNullableText(ownValue(error, 'additionalDetails'), MAX_INPUT_TEXT_BYTES);
+    }
     const info = ownValue(error, 'codexErrorInfo');
+    if (!hasOwn(error, 'codexErrorInfo')) {
+        return;
+    }
     if (isNullish(info)) {
         if (info === undefined) {
             throw new RideCodexTurnError('invalid-data');
@@ -1993,14 +2106,19 @@ function requireCodexErrorInfo(value: unknown): void {
         }
         return;
     }
-    const connection = requireExactOptions(payload, ['httpStatusCode']);
-    requireNullableUint16(ownValue(connection, 'httpStatusCode'));
+    const connection = requireOptions(payload, ['httpStatusCode']);
+    if (hasOwn(connection, 'httpStatusCode')) {
+        requireNullableUint16(ownValue(connection, 'httpStatusCode'));
+    }
 }
 
 function requireThreadResumeResponse(value: unknown, expectedThreadId: string): void {
-    const response = requireExactOptions(value, [
+    const response = requireOptions(value, [
         'thread', 'model', 'modelProvider', 'serviceTier', 'cwd', 'instructionSources',
         'approvalPolicy', 'approvalsReviewer', 'sandbox', 'reasoningEffort'
+    ]);
+    requireRequiredKeys(response, [
+        'thread', 'model', 'modelProvider', 'cwd', 'approvalPolicy', 'approvalsReviewer', 'sandbox'
     ]);
     const threadId = requireThread(ownValue(response, 'thread'));
     if (threadId !== expectedThreadId) {
@@ -2008,27 +2126,41 @@ function requireThreadResumeResponse(value: unknown, expectedThreadId: string): 
     }
     requireString(ownValue(response, 'model'), MAX_IDENTIFIER_BYTES);
     requireString(ownValue(response, 'modelProvider'), MAX_IDENTIFIER_BYTES);
-    requireNullableText(ownValue(response, 'serviceTier'), MAX_IDENTIFIER_BYTES);
+    if (hasOwn(response, 'serviceTier')) {
+        requireNullableText(ownValue(response, 'serviceTier'), MAX_IDENTIFIER_BYTES);
+    }
     requireString(ownValue(response, 'cwd'), MAX_LOCAL_PATH_BYTES);
-    requireStringArray(ownValue(response, 'instructionSources'), MAX_RAW_ARRAY, MAX_LOCAL_PATH_BYTES, true);
+    if (hasOwn(response, 'instructionSources')) {
+        requireStringArray(ownValue(response, 'instructionSources'), MAX_RAW_ARRAY, MAX_LOCAL_PATH_BYTES, true);
+    }
     requireApprovalPolicy(ownValue(response, 'approvalPolicy'));
     if (!['user', 'auto_review', 'guardian_subagent'].includes(ownValue(response, 'approvalsReviewer') as string)) {
         throw new RideCodexTurnError('invalid-data');
     }
     requireSandboxPolicy(ownValue(response, 'sandbox'));
-    requireNullableText(ownValue(response, 'reasoningEffort'), MAX_IDENTIFIER_BYTES);
+    if (hasOwn(response, 'reasoningEffort')) {
+        requireNullableIdentifier(ownValue(response, 'reasoningEffort'));
+    }
 }
 
 function requireThread(value: unknown): string {
-    const thread = requireExactOptions(value, [
+    const thread = requireOptions(value, [
         'id', 'sessionId', 'forkedFromId', 'parentThreadId', 'preview', 'ephemeral', 'modelProvider',
         'createdAt', 'updatedAt', 'recencyAt', 'status', 'path', 'cwd', 'cliVersion', 'source',
         'threadSource', 'agentNickname', 'agentRole', 'gitInfo', 'name', 'turns'
     ]);
+    requireRequiredKeys(thread, [
+        'id', 'sessionId', 'preview', 'ephemeral', 'modelProvider', 'createdAt', 'updatedAt',
+        'status', 'cwd', 'cliVersion', 'source', 'turns'
+    ]);
     const id = requireIdentifier(ownValue(thread, 'id'));
     requireIdentifier(ownValue(thread, 'sessionId'));
-    requireNullableIdentifier(ownValue(thread, 'forkedFromId'));
-    requireNullableIdentifier(ownValue(thread, 'parentThreadId'));
+    if (hasOwn(thread, 'forkedFromId')) {
+        requireNullableIdentifier(ownValue(thread, 'forkedFromId'));
+    }
+    if (hasOwn(thread, 'parentThreadId')) {
+        requireNullableIdentifier(ownValue(thread, 'parentThreadId'));
+    }
     requireBoundedText(ownValue(thread, 'preview'), MAX_INPUT_TEXT_BYTES);
     if (typeof ownValue(thread, 'ephemeral') !== 'boolean') {
         throw new RideCodexTurnError('invalid-data');
@@ -2036,17 +2168,31 @@ function requireThread(value: unknown): string {
     requireString(ownValue(thread, 'modelProvider'), MAX_IDENTIFIER_BYTES);
     requireJsonInt64(ownValue(thread, 'createdAt'));
     requireJsonInt64(ownValue(thread, 'updatedAt'));
-    requireNullableJsonInt64(ownValue(thread, 'recencyAt'));
+    if (hasOwn(thread, 'recencyAt')) {
+        requireNullableJsonInt64(ownValue(thread, 'recencyAt'));
+    }
     requireThreadStatus(ownValue(thread, 'status'));
-    requireNullableText(ownValue(thread, 'path'), MAX_LOCAL_PATH_BYTES);
+    if (hasOwn(thread, 'path')) {
+        requireNullableText(ownValue(thread, 'path'), MAX_LOCAL_PATH_BYTES);
+    }
     requireString(ownValue(thread, 'cwd'), MAX_LOCAL_PATH_BYTES);
     requireString(ownValue(thread, 'cliVersion'), MAX_IDENTIFIER_BYTES);
     requireSessionSource(ownValue(thread, 'source'));
-    requireNullableText(ownValue(thread, 'threadSource'), MAX_IDENTIFIER_BYTES);
-    requireNullableText(ownValue(thread, 'agentNickname'), MAX_IDENTIFIER_BYTES);
-    requireNullableText(ownValue(thread, 'agentRole'), MAX_IDENTIFIER_BYTES);
-    requireGitInfo(ownValue(thread, 'gitInfo'));
-    requireNullableText(ownValue(thread, 'name'), MAX_INPUT_TEXT_BYTES);
+    if (hasOwn(thread, 'threadSource')) {
+        requireNullableText(ownValue(thread, 'threadSource'), MAX_IDENTIFIER_BYTES);
+    }
+    if (hasOwn(thread, 'agentNickname')) {
+        requireNullableText(ownValue(thread, 'agentNickname'), MAX_IDENTIFIER_BYTES);
+    }
+    if (hasOwn(thread, 'agentRole')) {
+        requireNullableText(ownValue(thread, 'agentRole'), MAX_IDENTIFIER_BYTES);
+    }
+    if (hasOwn(thread, 'gitInfo')) {
+        requireGitInfo(ownValue(thread, 'gitInfo'));
+    }
+    if (hasOwn(thread, 'name')) {
+        requireNullableText(ownValue(thread, 'name'), MAX_INPUT_TEXT_BYTES);
+    }
     const turns = ownValue(thread, 'turns');
     if (!Array.isArray(turns) || utilTypes.isProxy(turns) || turns.length > MAX_RAW_ARRAY) {
         throw new RideCodexTurnError('invalid-data');
@@ -2111,14 +2257,21 @@ function requireSubAgentSource(value: unknown): void {
     if (keys[0] !== 'thread_spawn') {
         throw new RideCodexTurnError('invalid-data');
     }
-    const spawn = requireExactOptions(ownValue(source, 'thread_spawn'), [
+    const spawn = requireOptions(ownValue(source, 'thread_spawn'), [
         'parent_thread_id', 'depth', 'agent_path', 'agent_nickname', 'agent_role'
     ]);
+    requireRequiredKeys(spawn, ['parent_thread_id', 'depth']);
     requireIdentifier(ownValue(spawn, 'parent_thread_id'));
     requireInt32(ownValue(spawn, 'depth'));
-    requireNullableText(ownValue(spawn, 'agent_path'), MAX_LOCAL_PATH_BYTES);
-    requireNullableText(ownValue(spawn, 'agent_nickname'), MAX_IDENTIFIER_BYTES);
-    requireNullableText(ownValue(spawn, 'agent_role'), MAX_IDENTIFIER_BYTES);
+    if (hasOwn(spawn, 'agent_path')) {
+        requireNullableText(ownValue(spawn, 'agent_path'), MAX_LOCAL_PATH_BYTES);
+    }
+    if (hasOwn(spawn, 'agent_nickname')) {
+        requireNullableText(ownValue(spawn, 'agent_nickname'), MAX_IDENTIFIER_BYTES);
+    }
+    if (hasOwn(spawn, 'agent_role')) {
+        requireNullableText(ownValue(spawn, 'agent_role'), MAX_IDENTIFIER_BYTES);
+    }
 }
 
 function requireGitInfo(value: unknown): void {
@@ -2128,10 +2281,16 @@ function requireGitInfo(value: unknown): void {
         }
         return;
     }
-    const git = requireExactOptions(value, ['sha', 'branch', 'originUrl']);
-    requireNullableText(ownValue(git, 'sha'), MAX_IDENTIFIER_BYTES);
-    requireNullableText(ownValue(git, 'branch'), MAX_IDENTIFIER_BYTES);
-    requireNullableText(ownValue(git, 'originUrl'), MAX_LOCAL_PATH_BYTES);
+    const git = requireOptions(value, ['sha', 'branch', 'originUrl']);
+    if (hasOwn(git, 'sha')) {
+        requireNullableText(ownValue(git, 'sha'), MAX_IDENTIFIER_BYTES);
+    }
+    if (hasOwn(git, 'branch')) {
+        requireNullableText(ownValue(git, 'branch'), MAX_IDENTIFIER_BYTES);
+    }
+    if (hasOwn(git, 'originUrl')) {
+        requireNullableText(ownValue(git, 'originUrl'), MAX_LOCAL_PATH_BYTES);
+    }
 }
 
 function requireApprovalPolicy(value: unknown): void {
@@ -2139,9 +2298,10 @@ function requireApprovalPolicy(value: unknown): void {
         return;
     }
     const policy = requireExactOptions(value, ['granular']);
-    const granular = requireExactOptions(ownValue(policy, 'granular'), [
+    const granular = requireOptions(ownValue(policy, 'granular'), [
         'sandbox_approval', 'rules', 'skill_approval', 'request_permissions', 'mcp_elicitations'
     ]);
+    requireRequiredKeys(granular, ['sandbox_approval', 'rules', 'mcp_elicitations']);
     for (const key of Object.keys(granular)) {
         if (typeof ownValue(granular, key) !== 'boolean') {
             throw new RideCodexTurnError('invalid-data');
@@ -2156,25 +2316,35 @@ function requireSandboxPolicy(value: unknown): void {
             requireExactOptions(policy, ['type']);
             return;
         case 'readOnly': {
-            const readOnly = requireExactOptions(policy, ['type', 'networkAccess']);
-            requireBoolean(ownValue(readOnly, 'networkAccess'));
+            const readOnly = requireOptions(policy, ['type', 'networkAccess']);
+            requireRequiredKeys(readOnly, ['type']);
+            if (hasOwn(readOnly, 'networkAccess')) {
+                requireBoolean(ownValue(readOnly, 'networkAccess'));
+            }
             return;
         }
         case 'externalSandbox': {
-            const external = requireExactOptions(policy, ['type', 'networkAccess']);
-            if (!['restricted', 'enabled'].includes(ownValue(external, 'networkAccess') as string)) {
+            const external = requireOptions(policy, ['type', 'networkAccess']);
+            requireRequiredKeys(external, ['type']);
+            if (hasOwn(external, 'networkAccess')
+                && !['restricted', 'enabled'].includes(ownValue(external, 'networkAccess') as string)) {
                 throw new RideCodexTurnError('invalid-data');
             }
             return;
         }
         case 'workspaceWrite': {
-            const workspace = requireExactOptions(policy, [
+            const workspace = requireOptions(policy, [
                 'type', 'writableRoots', 'networkAccess', 'excludeTmpdirEnvVar', 'excludeSlashTmp'
             ]);
-            requireStringArray(ownValue(workspace, 'writableRoots'), MAX_RAW_ARRAY, MAX_LOCAL_PATH_BYTES, true);
-            requireBoolean(ownValue(workspace, 'networkAccess'));
-            requireBoolean(ownValue(workspace, 'excludeTmpdirEnvVar'));
-            requireBoolean(ownValue(workspace, 'excludeSlashTmp'));
+            requireRequiredKeys(workspace, ['type']);
+            if (hasOwn(workspace, 'writableRoots')) {
+                requireStringArray(ownValue(workspace, 'writableRoots'), MAX_RAW_ARRAY, MAX_LOCAL_PATH_BYTES, true);
+            }
+            for (const key of ['networkAccess', 'excludeTmpdirEnvVar', 'excludeSlashTmp'] as const) {
+                if (hasOwn(workspace, key)) {
+                    requireBoolean(ownValue(workspace, key));
+                }
+            }
             return;
         }
         default:
@@ -2417,6 +2587,10 @@ function ownValue(record: Record<string, unknown>, key: string): unknown {
     return Object.getOwnPropertyDescriptor(record, key)?.value;
 }
 
+function hasOwn(record: Record<string, unknown>, key: string): boolean {
+    return Object.prototype.hasOwnProperty.call(record, key);
+}
+
 function requireIdentifier(value: unknown): string {
     return requireString(value, MAX_IDENTIFIER_BYTES);
 }
@@ -2484,7 +2658,7 @@ function normalizeFileChanges(value: unknown, limit: number): readonly RideCodex
         requireOptions(kindRecord, ['type', 'move_path']);
         const moveDescriptor = Object.getOwnPropertyDescriptor(kindRecord, 'move_path');
         if (!moveDescriptor) {
-            throw new RideCodexTurnError('invalid-data');
+            return Object.freeze({ path, kind, diff });
         }
         if (moveDescriptor.value === undefined) {
             throw new RideCodexTurnError('invalid-data');

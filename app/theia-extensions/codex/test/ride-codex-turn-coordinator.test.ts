@@ -36,6 +36,10 @@ function validTurn(id = 'turn-1', status = 'inProgress'): Record<string, unknown
     };
 }
 
+function minimalTurn(id = 'turn-1', status = 'inProgress'): Record<string, unknown> {
+    return { id, items: [], status };
+}
+
 function validThread(id = 'thread-1'): Record<string, unknown> {
     return {
         id,
@@ -62,6 +66,23 @@ function validThread(id = 'thread-1'): Record<string, unknown> {
     };
 }
 
+function minimalThread(id = 'thread-1'): Record<string, unknown> {
+    return {
+        id,
+        sessionId: 'session-1',
+        preview: '',
+        ephemeral: false,
+        modelProvider: 'openai',
+        createdAt: 1,
+        updatedAt: 1,
+        status: { type: 'idle' },
+        cwd: 'C:\\workspace',
+        cliVersion: '0.144.0',
+        source: 'appServer',
+        turns: []
+    };
+}
+
 function validResumeResponse(threadId = 'thread-1'): Record<string, unknown> {
     return {
         thread: validThread(threadId),
@@ -82,6 +103,69 @@ function validResumeResponse(threadId = 'thread-1'): Record<string, unknown> {
         reasoningEffort: null
     };
 }
+
+function minimalResumeResponse(threadId = 'thread-1'): Record<string, unknown> {
+    return {
+        thread: minimalThread(threadId),
+        model: 'gpt-5.4',
+        modelProvider: 'openai',
+        cwd: 'C:\\workspace',
+        approvalPolicy: 'on-request',
+        approvalsReviewer: 'user',
+        sandbox: { type: 'workspaceWrite' }
+    };
+}
+
+const MINIMAL_THREAD_ITEM_FIXTURES: readonly Readonly<{
+    name: string;
+    item: Record<string, unknown>;
+}>[] = [
+    { name: 'userMessage', item: { type: 'userMessage', id: 'user-1', content: [] } },
+    { name: 'hookPrompt', item: { type: 'hookPrompt', id: 'hook-1', fragments: [] } },
+    { name: 'agentMessage', item: { type: 'agentMessage', id: 'agent-1', text: 'ok' } },
+    { name: 'plan', item: { type: 'plan', id: 'plan-1', text: '' } },
+    { name: 'reasoning', item: { type: 'reasoning', id: 'reason-1' } },
+    {
+        name: 'commandExecution',
+        item: {
+            type: 'commandExecution', id: 'command-1', command: 'pwd', cwd: 'C:\\workspace',
+            status: 'inProgress', commandActions: []
+        }
+    },
+    { name: 'fileChange', item: { type: 'fileChange', id: 'file-1', changes: [], status: 'inProgress' } },
+    {
+        name: 'mcpToolCall',
+        item: { type: 'mcpToolCall', id: 'mcp-1', server: 'server', tool: 'tool', status: 'inProgress', arguments: {} }
+    },
+    {
+        name: 'dynamicToolCall',
+        item: { type: 'dynamicToolCall', id: 'dynamic-1', tool: 'tool', status: 'inProgress', arguments: {} }
+    },
+    {
+        name: 'collabAgentToolCall',
+        item: {
+            type: 'collabAgentToolCall', id: 'collab-1', tool: 'wait', status: 'inProgress',
+            senderThreadId: 'thread-1', receiverThreadIds: [], agentsStates: {}
+        }
+    },
+    {
+        name: 'subAgentActivity',
+        item: {
+            type: 'subAgentActivity', id: 'sub-1', kind: 'started',
+            agentThreadId: 'thread-2', agentPath: 'agent/path'
+        }
+    },
+    { name: 'webSearch', item: { type: 'webSearch', id: 'web-1', query: '' } },
+    { name: 'imageView', item: { type: 'imageView', id: 'view-1', path: 'C:\\workspace\\image.png' } },
+    { name: 'sleep', item: { type: 'sleep', id: 'sleep-1', durationMs: 0 } },
+    {
+        name: 'imageGeneration',
+        item: { type: 'imageGeneration', id: 'image-1', status: 'completed', result: '' }
+    },
+    { name: 'enteredReviewMode', item: { type: 'enteredReviewMode', id: 'review-in', review: '' } },
+    { name: 'exitedReviewMode', item: { type: 'exitedReviewMode', id: 'review-out', review: '' } },
+    { name: 'contextCompaction', item: { type: 'contextCompaction', id: 'compact-1' } }
+];
 
 function validThreadItems(): Record<string, unknown>[] {
     return [
@@ -347,12 +431,16 @@ async function acceptsTurnStartResponse(turn: Record<string, unknown>): Promise<
 }
 
 async function acceptsThreadResumeResponse(thread: Record<string, unknown>): Promise<boolean> {
+    return acceptsResumeResponse({ ...validResumeResponse(), thread });
+}
+
+async function acceptsResumeResponse(response: Record<string, unknown>): Promise<boolean> {
     const host = new FakeTurnHost();
     const scheduler = new FakeScheduler();
     const timeoutCallbacks: Array<() => void> = [];
     const events: RideCodexUiEvent[] = [];
     host.interruptPromise = Promise.resolve({});
-    host.resumeResponse = { ...validResumeResponse(), thread };
+    host.resumeResponse = response;
     const coordinator = new RideCodexTurnCoordinator({
         host,
         scheduler,
@@ -1209,7 +1297,6 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
             { path: 'src/a.ts', kind: { type: 'unknown' }, diff: 'safe diff' },
             { path: 'src/a.ts', kind: { type: 'add', move_path: null }, diff: 'safe diff' },
             { path: 'src/a.ts', kind: { type: 'delete', extra: true }, diff: 'safe diff' },
-            { path: 'src/a.ts', kind: { type: 'update' }, diff: 'safe diff' },
             { path: 'src/a.ts', kind: { type: 'update', move_path: 1 }, diff: 'safe diff' },
             { path: 'src/a.ts', kind: { type: 'update', move_path: '你'.repeat(11_000) }, diff: 'safe diff' },
             { path: 'src/\u001bunsafe.ts', kind: { type: 'add' }, diff: 'safe diff' },
@@ -2204,6 +2291,217 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         await coordinator.dispose();
     });
 
+    it('accepts the minimal Codex 0.144 TurnStartResponse and all 18 minimal ThreadItem variants', async () => {
+        assert.equal(await acceptsTurnStartResponse(minimalTurn()), true, 'minimal TurnStartResponse');
+
+        for (const fixture of MINIMAL_THREAD_ITEM_FIXTURES) {
+            assert.equal(
+                await acceptsTurnStartResponse({ ...minimalTurn(), items: [fixture.item] }),
+                true,
+                fixture.name
+            );
+        }
+    });
+
+    it('accepts minimal and nullable Codex 0.144 ThreadItem nested unions', async () => {
+        const nestedFixtures: readonly Readonly<{ name: string; item: Record<string, unknown> }>[] = [
+            {
+                name: 'UserInput variants and TextElement defaults',
+                item: {
+                    type: 'userMessage', id: 'user-inputs', content: [
+                        { type: 'text', text: 'x' },
+                        { type: 'text', text: 'x', text_elements: [{ byteRange: { start: 0, end: 1 } }] },
+                        { type: 'image', url: 'https://example.test/image.png' },
+                        { type: 'image', url: 'https://example.test/image-null.png', detail: null },
+                        { type: 'localImage', path: 'C:\\workspace\\image.png' },
+                        { type: 'localImage', path: 'C:\\workspace\\image-null.png', detail: null },
+                        { type: 'skill', name: 'review', path: 'C:\\skills\\review' },
+                        { type: 'mention', name: 'README', path: 'C:\\workspace\\README.md' }
+                    ]
+                }
+            },
+            {
+                name: 'CommandAction optional paths and query',
+                item: {
+                    type: 'commandExecution', id: 'command-actions', command: 'run', cwd: 'C:\\workspace',
+                    status: 'completed', commandActions: [
+                        { type: 'read', command: 'read', name: 'file', path: 'C:\\workspace\\file' },
+                        { type: 'listFiles', command: 'list' },
+                        { type: 'search', command: 'search' },
+                        { type: 'unknown', command: 'custom' }
+                    ], processId: null, aggregatedOutput: null, exitCode: null, durationMs: null
+                }
+            },
+            {
+                name: 'PatchChangeKind optional and nullable move path',
+                item: {
+                    type: 'fileChange', id: 'patch-kinds', status: 'completed', changes: [
+                        { path: 'add', kind: { type: 'add' }, diff: '' },
+                        { path: 'delete', kind: { type: 'delete' }, diff: '' },
+                        { path: 'update', kind: { type: 'update' }, diff: '' },
+                        { path: 'update-null', kind: { type: 'update', move_path: null }, diff: '' }
+                    ]
+                }
+            },
+            {
+                name: 'minimal MCP nested objects',
+                item: {
+                    type: 'mcpToolCall', id: 'mcp-nested', server: 'server', tool: 'tool',
+                    status: 'completed', arguments: null,
+                    appContext: { connectorId: 'connector' },
+                    result: { content: [] }
+                }
+            },
+            {
+                name: 'nullable MCP fields',
+                item: {
+                    type: 'mcpToolCall', id: 'mcp-nullable', server: 'server', tool: 'tool',
+                    status: 'failed', arguments: {}, appContext: null, mcpAppResourceUri: null,
+                    pluginId: null, result: null, error: null, durationMs: null
+                }
+            },
+            {
+                name: 'DynamicToolCall output variants and nullable fields',
+                item: {
+                    type: 'dynamicToolCall', id: 'dynamic-output', tool: 'tool', status: 'completed',
+                    arguments: {}, namespace: null, success: null, durationMs: null,
+                    contentItems: [
+                        { type: 'inputText', text: '' },
+                        { type: 'inputImage', imageUrl: '' }
+                    ]
+                }
+            },
+            {
+                name: 'CollabAgentState optional message',
+                item: {
+                    type: 'collabAgentToolCall', id: 'collab-state', tool: 'wait', status: 'completed',
+                    senderThreadId: 'thread-1', receiverThreadIds: ['thread-2'],
+                    agentsStates: { 'thread-2': { status: 'completed' } }
+                }
+            },
+            { name: 'WebSearchAction search defaults', item: { type: 'webSearch', id: 'web-search', query: '', action: { type: 'search' } } },
+            { name: 'WebSearchAction openPage defaults', item: { type: 'webSearch', id: 'web-open', query: '', action: { type: 'openPage' } } },
+            { name: 'WebSearchAction findInPage defaults', item: { type: 'webSearch', id: 'web-find', query: '', action: { type: 'findInPage' } } },
+            { name: 'WebSearchAction other', item: { type: 'webSearch', id: 'web-other', query: '', action: { type: 'other' } } },
+            { name: 'WebSearchAction nullable', item: { type: 'webSearch', id: 'web-null', query: '', action: null } },
+            {
+                name: 'AgentMessage nullable defaults',
+                item: { type: 'agentMessage', id: 'agent-nullable', text: '', phase: null, memoryCitation: null }
+            },
+            {
+                name: 'ImageGeneration nullable paths',
+                item: {
+                    type: 'imageGeneration', id: 'image-nullable', status: 'completed', result: '',
+                    revisedPrompt: null, savedPath: null
+                }
+            }
+        ];
+
+        for (const fixture of nestedFixtures) {
+            assert.equal(
+                await acceptsTurnStartResponse({ ...minimalTurn(), items: [fixture.item] }),
+                true,
+                fixture.name
+            );
+        }
+    });
+
+    it('accepts omitted and nullable Turn fields and minimal CodexErrorInfo payloads', async () => {
+        const turns: readonly Readonly<{ name: string; turn: Record<string, unknown> }>[] = [
+            { name: 'all optional Turn fields omitted', turn: minimalTurn() },
+            {
+                name: 'nullable Turn fields',
+                turn: {
+                    ...minimalTurn(), itemsView: 'full', error: null,
+                    startedAt: null, completedAt: null, durationMs: null
+                }
+            },
+            {
+                name: 'minimal TurnError',
+                turn: { ...minimalTurn('turn-failed', 'failed'), error: { message: 'failed' } }
+            },
+            ...[
+                'httpConnectionFailed',
+                'responseStreamConnectionFailed',
+                'responseStreamDisconnected',
+                'responseTooManyFailedAttempts'
+            ].map(name => ({
+                name: `minimal ${name}`,
+                turn: {
+                    ...minimalTurn(`turn-${name}`, 'failed'),
+                    error: { message: 'failed', codexErrorInfo: { [name]: {} } }
+                }
+            }))
+        ];
+
+        for (const fixture of turns) {
+            assert.equal(await acceptsTurnStartResponse(fixture.turn), true, fixture.name);
+        }
+    });
+
+    it('accepts minimal ThreadResumeResponse, Thread, and nested defaulted unions', async () => {
+        assert.equal(await acceptsResumeResponse(minimalResumeResponse()), true, 'minimal resume response and thread');
+
+        const threadFixtures: readonly Readonly<{ name: string; thread: Record<string, unknown> }>[] = [
+            { name: 'empty GitInfo', thread: { ...minimalThread(), gitInfo: {} } },
+            { name: 'custom SessionSource', thread: { ...minimalThread(), source: { custom: 'integration' } } },
+            { name: 'review SubAgentSource', thread: { ...minimalThread(), source: { subAgent: 'review' } } },
+            { name: 'compact SubAgentSource', thread: { ...minimalThread(), source: { subAgent: 'compact' } } },
+            { name: 'memory SubAgentSource', thread: { ...minimalThread(), source: { subAgent: 'memory_consolidation' } } },
+            {
+                name: 'minimal thread_spawn SubAgentSource',
+                thread: {
+                    ...minimalThread(),
+                    source: { subAgent: { thread_spawn: { parent_thread_id: 'parent', depth: 1 } } }
+                }
+            },
+            { name: 'other SubAgentSource', thread: { ...minimalThread(), source: { subAgent: { other: 'extension' } } } },
+            { name: 'notLoaded ThreadStatus', thread: { ...minimalThread(), status: { type: 'notLoaded' } } },
+            { name: 'systemError ThreadStatus', thread: { ...minimalThread(), status: { type: 'systemError' } } },
+            {
+                name: 'active ThreadStatus',
+                thread: { ...minimalThread(), status: { type: 'active', activeFlags: ['waitingOnApproval'] } }
+            },
+            {
+                name: 'explicit nullable Thread fields',
+                thread: {
+                    ...minimalThread(), agentNickname: null, agentRole: null, forkedFromId: null,
+                    gitInfo: null, name: null, parentThreadId: null, path: null,
+                    recencyAt: null, threadSource: null
+                }
+            }
+        ];
+        for (const fixture of threadFixtures) {
+            assert.equal(await acceptsThreadResumeResponse(fixture.thread), true, fixture.name);
+        }
+
+        const responseFixtures: readonly Readonly<{ name: string; response: Record<string, unknown> }>[] = [
+            {
+                name: 'granular approval defaults',
+                response: {
+                    ...minimalResumeResponse(),
+                    approvalPolicy: { granular: { sandbox_approval: true, rules: true, mcp_elicitations: true } }
+                }
+            },
+            { name: 'readOnly sandbox defaults', response: { ...minimalResumeResponse(), sandbox: { type: 'readOnly' } } },
+            {
+                name: 'externalSandbox defaults',
+                response: { ...minimalResumeResponse(), sandbox: { type: 'externalSandbox' } }
+            },
+            {
+                name: 'workspaceWrite defaults',
+                response: { ...minimalResumeResponse(), sandbox: { type: 'workspaceWrite' } }
+            },
+            {
+                name: 'nullable response fields',
+                response: { ...minimalResumeResponse(), serviceTier: null, reasoningEffort: null }
+            }
+        ];
+        for (const fixture of responseFixtures) {
+            assert.equal(await acceptsResumeResponse(fixture.response), true, fixture.name);
+        }
+    });
+
     it('rejects malformed memoryCitation and text_elements nested objects', async () => {
         const malformedItems: unknown[] = [
             {
@@ -2330,7 +2628,6 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
 
     it('strictly validates complete turn/start and exact turn/steer responses', async () => {
         const malformedStarts: unknown[] = [
-            { turn: { id: 'turn-1', status: 'inProgress', items: [] } },
             { turn: { ...validTurn(), itemsView: 'unknown' } },
             { turn: { ...validTurn(), items: [{ type: 'contextCompaction' }] } },
             { turn: { ...validTurn(), startedAt: Number.POSITIVE_INFINITY } },
