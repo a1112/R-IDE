@@ -105,6 +105,8 @@ describe('mapRideCodexError', () => {
         { signal: 'rate-limit', layer: 'turn', code: 'rate-limit', retryable: true, action: 'retry-later' },
         { signal: 'context-limit', layer: 'turn', code: 'context-limit', retryable: true, action: 'reduce-context' },
         { signal: 'sandbox-denied', layer: 'turn', code: 'sandbox-denied', retryable: false, action: 'review-sandbox' },
+        { signal: 'service-error', layer: 'turn', code: 'service-error', retryable: true, action: 'retry-later' },
+        { signal: 'stream-error', layer: 'turn', code: 'stream-error', retryable: true, action: 'retry' },
         { signal: 'transport-error', layer: 'protocol', code: 'transport-error', retryable: true, action: 'restart' },
         { signal: 'interrupted', layer: 'turn', code: 'interrupted', retryable: true, action: 'retry' }
     ];
@@ -166,6 +168,8 @@ describe('mapRideCodexError', () => {
             { code: 'rate-limit', layer: 'turn', action: 'retry-later' },
             { code: 'context-limit', layer: 'turn', action: 'reduce-context' },
             { code: 'sandbox-denied', layer: 'turn', action: 'review-sandbox' },
+            { code: 'service-error', layer: 'turn', action: 'retry-later' },
+            { code: 'stream-error', layer: 'turn', action: 'retry' },
             { code: 'transport-error', layer: 'protocol', action: 'restart' }
         ] as const;
         for (const entry of classified) {

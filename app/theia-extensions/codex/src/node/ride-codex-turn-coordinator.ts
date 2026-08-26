@@ -2371,15 +2371,15 @@ function requireCodexErrorInfo(value: unknown): RideCodexSafeError['code'] {
                 return 'context-limit';
             case 'sessionBudgetExceeded':
             case 'usageLimitExceeded':
-            case 'serverOverloaded':
                 return 'rate-limit';
+            case 'serverOverloaded':
+            case 'internalServerError':
+                return 'service-error';
             case 'unauthorized':
                 return 'unauthorized';
             case 'cyberPolicy':
             case 'sandboxError':
                 return 'sandbox-denied';
-            case 'internalServerError':
-                return 'transport-error';
             default:
                 return 'turn-error';
         }
@@ -2407,11 +2407,8 @@ function requireCodexErrorInfo(value: unknown): RideCodexSafeError['code'] {
         if (status === 401 || status === 403) {
             return 'unauthorized';
         }
-        if (status === 429) {
-            return 'rate-limit';
-        }
     }
-    return 'transport-error';
+    return keys[0] === 'httpConnectionFailed' ? 'service-error' : 'stream-error';
 }
 
 function safeServerError(code: RideCodexSafeError['code']): RideCodexSafeError {

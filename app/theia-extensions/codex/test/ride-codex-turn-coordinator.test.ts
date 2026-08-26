@@ -484,6 +484,8 @@ const SAFE_ERROR_MESSAGES = Object.freeze({
     'rate-limit': 'Codex usage limit was reached.',
     'context-limit': 'Codex context limit was reached.',
     'sandbox-denied': 'Codex action was denied by the sandbox.',
+    'service-error': 'Codex service is temporarily unavailable.',
+    'stream-error': 'Codex response stream failed.',
     'transport-error': 'Codex connection failed.'
 });
 
@@ -755,29 +757,29 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         { name: 'contextWindowExceeded', info: 'contextWindowExceeded', code: 'context-limit' },
         { name: 'sessionBudgetExceeded', info: 'sessionBudgetExceeded', code: 'rate-limit' },
         { name: 'usageLimitExceeded', info: 'usageLimitExceeded', code: 'rate-limit' },
-        { name: 'serverOverloaded', info: 'serverOverloaded', code: 'rate-limit' },
+        { name: 'serverOverloaded', info: 'serverOverloaded', code: 'service-error' },
         { name: 'cyberPolicy', info: 'cyberPolicy', code: 'sandbox-denied' },
         { name: 'sandboxError', info: 'sandboxError', code: 'sandbox-denied' },
-        { name: 'internalServerError', info: 'internalServerError', code: 'transport-error' },
+        { name: 'internalServerError', info: 'internalServerError', code: 'service-error' },
         { name: 'unauthorized', info: 'unauthorized', code: 'unauthorized' },
         { name: 'badRequest', info: 'badRequest', code: 'turn-error' },
         { name: 'threadRollbackFailed', info: 'threadRollbackFailed', code: 'turn-error' },
         { name: 'other', info: 'other', code: 'turn-error' },
         {
             name: 'httpConnectionFailed',
-            info: { httpConnectionFailed: {} }, code: 'transport-error'
+            info: { httpConnectionFailed: {} }, code: 'service-error'
         },
         {
             name: 'responseStreamConnectionFailed',
-            info: { responseStreamConnectionFailed: {} }, code: 'transport-error'
+            info: { responseStreamConnectionFailed: {} }, code: 'stream-error'
         },
         {
             name: 'responseStreamDisconnected',
-            info: { responseStreamDisconnected: {} }, code: 'transport-error'
+            info: { responseStreamDisconnected: {} }, code: 'stream-error'
         },
         {
             name: 'responseTooManyFailedAttempts',
-            info: { responseTooManyFailedAttempts: {} }, code: 'transport-error'
+            info: { responseTooManyFailedAttempts: {} }, code: 'stream-error'
         },
         {
             name: 'activeTurnNotSteerable',
@@ -811,13 +813,13 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
             code: 'sandbox-denied'
         },
         {
-            name: 'transport-error',
+            name: 'stream-error',
             error: {
                 message: 'raw transport-error secret',
                 codexErrorInfo: { responseStreamDisconnected: { httpStatusCode: null } },
                 additionalDetails: 'apiKey=secret'
             },
-            code: 'transport-error'
+            code: 'stream-error'
         },
         {
             name: 'generic turn-error',
@@ -911,7 +913,10 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         for (const override of [
             { status: 401, code: 'unauthorized' },
             { status: 403, code: 'unauthorized' },
-            { status: 429, code: 'rate-limit' }
+            {
+                status: 429,
+                code: tag === 'httpConnectionFailed' ? 'service-error' : 'stream-error'
+            }
         ] as const) {
             it(`maps ${tag} HTTP ${override.status} to ${override.code} on both paths`, async () => {
                 const raw = {

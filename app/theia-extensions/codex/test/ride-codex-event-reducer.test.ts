@@ -150,6 +150,8 @@ describe('RideCodexEventReducer minimal frame contract', () => {
         Object.freeze({ code: 'rate-limit', message: 'Codex usage limit was reached.' }),
         Object.freeze({ code: 'context-limit', message: 'Codex context limit was reached.' }),
         Object.freeze({ code: 'sandbox-denied', message: 'Codex action was denied by the sandbox.' }),
+        Object.freeze({ code: 'service-error', message: 'Codex service is temporarily unavailable.' }),
+        Object.freeze({ code: 'stream-error', message: 'Codex response stream failed.' }),
         Object.freeze({ code: 'transport-error', message: 'Codex connection failed.' })
     ]);
 

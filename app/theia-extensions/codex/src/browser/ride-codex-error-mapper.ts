@@ -85,6 +85,22 @@ const KNOWN_ERRORS: Readonly<Record<string, RideCodexMappedError>> = deepFreezeR
         retryable: false,
         action: 'review-sandbox'
     },
+    'service-error': {
+        layer: 'turn',
+        title: 'Codex service unavailable',
+        message: 'The Codex service is temporarily unavailable. Try again later.',
+        code: 'service-error',
+        retryable: true,
+        action: 'retry-later'
+    },
+    'stream-error': {
+        layer: 'turn',
+        title: 'Codex response interrupted',
+        message: 'The Codex response stream ended unexpectedly.',
+        code: 'stream-error',
+        retryable: true,
+        action: 'retry'
+    },
     'transport-error': {
         layer: 'protocol',
         title: 'Codex connection lost',

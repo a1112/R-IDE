@@ -195,6 +195,7 @@ const MAX_FILE_CHANGES = 256;
 const MAX_DIFF_BYTES = 64 * 1024;
 const MAX_TRACKED_THREADS = 256;
 const MAX_TRACKED_FILE_SCOPES = 256;
+const OPAQUE_SHA256_PATTERN = /^[A-Za-z0-9_-]{43}$/u;
 const NULL_PROTOTYPE = Reflect.getPrototypeOf(Object.prototype);
 const STALE_RESULT = Object.freeze({ status: 'rejected', code: 'stale-approval' } as const);
 const OWNERSHIP_RESULT = Object.freeze({ status: 'rejected', code: 'ownership-mismatch' } as const);
@@ -742,7 +743,7 @@ export class RideCodexApprovalBroker {
             return INVALID_RESULT;
         }
         if (pending.fileScopeFingerprint !== undefined) {
-            const scopeMatches = await this.#isFileScopeCurrent(Object.freeze({
+            const scopeMatches = await this.#isFileScopeDecisionSafe(Object.freeze({
                 generation: pending.generation,
                 threadId: pending.threadId,
                 turnId: pending.turnId,
@@ -1008,6 +1009,23 @@ export class RideCodexApprovalBroker {
         return current !== undefined && constantTimeEqual(current.fingerprint, fingerprint);
     }
 
+    async #isFileScopeDecisionSafe(
+        identity: RideCodexApprovalScopeIdentity,
+        fingerprint: string
+    ): Promise<boolean> {
+        const current = await this.#captureFileScope(identity);
+        if (!current || !constantTimeEqual(current.fingerprint, fingerprint)) {
+            return false;
+        }
+        const normalized = await normalizeFileScope(
+            current.scope,
+            this.#pathStyle,
+            this.#resolveRealPath,
+            () => this.#isFileScopeCurrent(identity, fingerprint)
+        );
+        return normalized !== undefined && this.#isFileScopeCurrent(identity, fingerprint);
+    }
+
     #currentTrackedFileScopeFingerprint(identity: RideCodexApprovalScopeIdentity): string | undefined {
         const scope = canonicalFileScope(this.#trackedFileScope(identity), this.#pathStyle);
         return scope && this.#fileScopeFingerprint(identity, scope);
@@ -1195,6 +1213,7 @@ function validateContext(value: unknown): RideCodexApprovalContext | undefined {
 function validateDecisionRequest(value: unknown): RideCodexApprovalDecisionRequest | undefined {
     const record = exactDataRecord(value, ['token', 'fingerprint', 'decision']);
     if (!record || typeof record.token !== 'string' || typeof record.fingerprint !== 'string'
+        || !isOpaqueSha256(record.token) || !isOpaqueSha256(record.fingerprint)
         || !['accept', 'acceptForSession', 'decline', 'cancel'].includes(record.decision as string)) {
         return undefined;
     }
@@ -1633,9 +1652,16 @@ async function resolveNearestRealPath(path: string, style: 'posix' | 'win32'): P
 }
 
 function constantTimeEqual(left: string, right: string): boolean {
+    if (!isOpaqueSha256(left) || !isOpaqueSha256(right)) {
+        return false;
+    }
     const leftBytes = Buffer.from(left);
     const rightBytes = Buffer.from(right);
     return leftBytes.length === rightBytes.length && timingSafeEqual(leftBytes, rightBytes);
+}
+
+function isOpaqueSha256(value: string): boolean {
+    return value.length === 43 && OPAQUE_SHA256_PATTERN.test(value);
 }
 
 function boundedInteger(value: number, minimum: number, maximum: number, label: string): number {

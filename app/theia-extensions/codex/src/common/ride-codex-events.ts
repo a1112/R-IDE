@@ -16,6 +16,8 @@ export const RIDE_CODEX_SAFE_ERROR_MESSAGES = Object.freeze({
     'rate-limit': 'Codex usage limit was reached.',
     'context-limit': 'Codex context limit was reached.',
     'sandbox-denied': 'Codex action was denied by the sandbox.',
+    'service-error': 'Codex service is temporarily unavailable.',
+    'stream-error': 'Codex response stream failed.',
     'transport-error': 'Codex connection failed.'
 });
 export type RideCodexSafeErrorCode = keyof typeof RIDE_CODEX_SAFE_ERROR_MESSAGES;

@@ -397,6 +397,43 @@ describe('RideCodexApprovalBroker ownership', () => {
         assert.equal(fixture.host.leases[0].releases, 1);
     });
 
+    it('rejects malformed decision credentials before lookup or oversized Buffer allocation', async () => {
+        const fixture = createFixture();
+        await fixture.session.setContext(CONTEXT);
+        await fixture.broker.handleServerRequest(commandRequest(), CONTEXT.generation);
+        const card = fixture.client.latest()[0];
+        assert.match(card.token, /^[A-Za-z0-9_-]{43}$/u);
+        assert.match(card.fingerprint, /^[A-Za-z0-9_-]{43}$/u);
+
+        const mutableBuffer = Buffer as unknown as { from(value: string): Buffer };
+        const originalFrom = mutableBuffer.from;
+        let oversizedAllocations = 0;
+        mutableBuffer.from = (value: string): Buffer => {
+            if (typeof value === 'string' && value.length > 43) {
+                oversizedAllocations += 1;
+                throw new Error('oversized Buffer allocation');
+            }
+            return originalFrom(value);
+        };
+        try {
+            for (const request of [
+                { token: card.token, fingerprint: 'A'.repeat(4 * 1024 * 1024), decision: 'accept' as const },
+                { token: 'A'.repeat(42), fingerprint: card.fingerprint, decision: 'accept' as const },
+                { token: 'A'.repeat(44), fingerprint: card.fingerprint, decision: 'accept' as const },
+                { token: `${'A'.repeat(42)}=`, fingerprint: card.fingerprint, decision: 'accept' as const },
+                { token: card.token, fingerprint: `${'A'.repeat(42)}=`, decision: 'accept' as const }
+            ]) {
+                assert.deepEqual(await fixture.session.decide(request), {
+                    status: 'rejected', code: 'invalid-decision'
+                });
+            }
+        } finally {
+            mutableBuffer.from = originalFrom;
+        }
+        assert.equal(oversizedAllocations, 0);
+        assert.equal(fixture.host.responses.length, 0);
+    });
+
     it('rejects forged, cross-client, cross-turn, and cross-generation ownership', async () => {
         const fixture = createFixture();
         await fixture.session.setContext(CONTEXT);
@@ -409,7 +446,7 @@ describe('RideCodexApprovalBroker ownership', () => {
             token: card.token,
             fingerprint: `${card.fingerprint}forged`,
             decision: 'accept'
-        }), { status: 'rejected', code: 'ownership-mismatch' });
+        }), { status: 'rejected', code: 'invalid-decision' });
         assert.deepEqual(await attacker.decide({
             token: card.token,
             fingerprint: card.fingerprint,
@@ -1266,6 +1303,30 @@ describe('RideCodexApprovalBroker ownership', () => {
             }]);
             assert.equal(fixture.host.leases[0].releases, 1);
         }
+    });
+
+    it('cancels a published file approval when a symlink retargets outside the workspace before decision', async () => {
+        let linkEscapesWorkspace = false;
+        const fixture = createFixture({
+            resolveFileScope: async () => resolution([
+                { path: 'link\\file.txt', kind: 'update' }
+            ]),
+            resolveRealPath: async path => linkEscapesWorkspace && path.toLowerCase().includes('link')
+                ? 'C:\\outside\\file.txt' : path
+        });
+        await fixture.session.setContext(CONTEXT);
+        await fixture.broker.handleServerRequest(fileRequest({}, 'retargeted-link'), CONTEXT.generation);
+        const card = fixture.client.latest()[0];
+        assert.ok(card);
+
+        linkEscapesWorkspace = true;
+        assert.deepEqual(await fixture.session.decide({
+            token: card.token, fingerprint: card.fingerprint, decision: 'accept'
+        }), { status: 'responded' });
+        assert.deepEqual(fixture.host.responses, [{
+            generation: 7, id: 'retargeted-link', result: { decision: 'cancel' }
+        }]);
+        assert.equal(fixture.host.leases[0].releases, 1);
     });
 
     it('cancels and releases exactly once on panel, context, turn, and backend disposal', async () => {
