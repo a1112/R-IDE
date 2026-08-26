@@ -122,6 +122,13 @@ interface ActiveTurn {
     controlPending: boolean;
 }
 
+interface RecoveryBarrier {
+    readonly threadId: string;
+    readonly expectedGeneration: number;
+    readonly lifecycle: number;
+    promise: Promise<void>;
+}
+
 interface QueueIdentity {
     readonly generation: number;
     readonly threadId: string;
@@ -198,6 +205,7 @@ export class RideCodexTurnCoordinator {
     #queueIdentity: QueueIdentity | undefined;
     #flushHandle: RideCodexDisposable | undefined;
     #active: ActiveTurn | undefined;
+    #recovery: RecoveryBarrier | undefined;
     #generation: number;
     #lifecycle = 0;
     #nextClientId = 1;
@@ -242,6 +250,7 @@ export class RideCodexTurnCoordinator {
 
     connectClient(client: RideCodexTurnClient): RideCodexTurnsService {
         this.#requireUsable();
+        this.#requireNoRecovery();
         if (!client || typeof client.turnEvents !== 'function') {
             throw new RideCodexTurnError('invalid-data');
         }
@@ -256,7 +265,10 @@ export class RideCodexTurnCoordinator {
         this.#clients.add(record);
         let disposed = false;
         return Object.freeze({
-            setClient: () => undefined,
+            setClient: () => {
+                this.#requireClient(record);
+                this.#requireNoRecovery();
+            },
             startTurn: (request: RideCodexTurnStartRequest) => this.#startTurn(record, request),
             steerTurn: (request: RideCodexTurnSteerRequest) => this.#steerTurn(record, request),
             interruptTurn: (request: RideCodexTurnInterruptRequest) => this.#interruptTurn(record, request),
@@ -283,6 +295,7 @@ export class RideCodexTurnCoordinator {
         }
         this.#disposed = true;
         this.#lifecycle += 1;
+        this.#recovery = undefined;
         this.#rejectDisposed(new RideCodexTurnError('disposed'));
         this.#finishActive('failed', SAFE_FAILURE, new RideCodexTurnError('disposed'), false);
         this.#flushHandle?.dispose();
@@ -305,6 +318,7 @@ export class RideCodexTurnCoordinator {
 
     async #startTurn(owner: ClientRecord, input: RideCodexTurnStartRequest): Promise<RideCodexTurnResult> {
         this.#requireClient(owner);
+        this.#requireNoRecovery();
         if (this.#active) {
             throw new RideCodexTurnError('turn-active');
         }
@@ -343,6 +357,7 @@ export class RideCodexTurnCoordinator {
 
     async #steerTurn(owner: ClientRecord, input: RideCodexTurnSteerRequest): Promise<RideCodexTurnResult> {
         this.#requireClient(owner);
+        this.#requireNoRecovery();
         const request = normalizeSteerRequest(input);
         const active = this.#requireActive(owner, request.threadId, request.expectedTurnId);
         if (active.controlPending) {
@@ -384,6 +399,7 @@ export class RideCodexTurnCoordinator {
 
     async #interruptTurn(owner: ClientRecord, input: RideCodexTurnInterruptRequest): Promise<RideCodexTurnResult> {
         this.#requireClient(owner);
+        this.#requireNoRecovery();
         const request = normalizeInterruptRequest(input);
         const active = this.#requireActive(owner, request.threadId, request.turnId);
         if (active.controlPending) {
@@ -397,10 +413,12 @@ export class RideCodexTurnCoordinator {
         const expectedGeneration = active.generation;
         let timer: unknown;
         let timedOut = false;
+        let recovery: Promise<void> | undefined;
         const timeout = new Promise<never>((_resolve, reject) => {
             timer = this.#timers.setTimeout(() => {
                 if (this.#active === active && !active.terminal) {
                     timedOut = true;
+                    recovery = this.#beginRecovery(request.threadId, expectedGeneration);
                     this.#finishActive('interrupt-uncertain', Object.freeze({
                         code: 'interrupt-timeout', message: 'Codex turn interrupt could not be confirmed.'
                     }), undefined, true, true);
@@ -423,7 +441,7 @@ export class RideCodexTurnCoordinator {
             throw new RideCodexTurnError('operation-superseded');
         } catch (error) {
             if (timedOut) {
-                await this.#recoverPersistentThread(request.threadId, expectedGeneration);
+                await (recovery ?? this.#beginRecovery(request.threadId, expectedGeneration));
                 return active.terminalResult ?? Object.freeze({
                     threadId: request.threadId,
                     turnId: request.turnId,
@@ -450,6 +468,31 @@ export class RideCodexTurnCoordinator {
         }
     }
 
+    #beginRecovery(threadId: string, expectedGeneration: number): Promise<void> {
+        const existing = this.#recovery;
+        if (existing) {
+            if (existing.threadId === threadId && existing.expectedGeneration === expectedGeneration) {
+                return existing.promise;
+            }
+            return Promise.reject(new RideCodexTurnError('operation-superseded'));
+        }
+        const barrier: RecoveryBarrier = {
+            threadId,
+            expectedGeneration,
+            lifecycle: this.#lifecycle,
+            promise: Promise.resolve()
+        };
+        const running = Promise.resolve().then(() => this.#recoverPersistentThread(threadId, expectedGeneration));
+        barrier.promise = running.finally(() => {
+            if (this.#recovery === barrier) {
+                this.#recovery = undefined;
+            }
+        });
+        barrier.promise.catch(() => undefined);
+        this.#recovery = barrier;
+        return barrier.promise;
+    }
+
     async #recoverPersistentThread(threadId: string, expectedGeneration: number): Promise<void> {
         const lifecycle = this.#lifecycle;
         try {
@@ -459,6 +502,11 @@ export class RideCodexTurnCoordinator {
             if (this.#disposed || lifecycle !== this.#lifecycle) {
                 throw new RideCodexTurnError(this.#disposed ? 'disposed' : 'operation-superseded');
             }
+            const snapshot = this.#host.snapshot();
+            if (snapshot.state !== 'ready' || requireGeneration(snapshot.generation) !== generation) {
+                throw new RideCodexTurnError('operation-superseded');
+            }
+            this.#generation = generation;
             const acquiring = Promise.resolve(this.#host.acquire('foreground-panel'));
             acquiring.then(acquiredLease => {
                 if (this.#disposed || lifecycle !== this.#lifecycle) {
@@ -1305,6 +1353,12 @@ export class RideCodexTurnCoordinator {
         }
     }
 
+    #requireNoRecovery(): void {
+        if (this.#recovery) {
+            throw new RideCodexTurnError('operation-superseded');
+        }
+    }
+
     #requireUsable(): void {
         if (this.#disposed) {
             throw new RideCodexTurnError('disposed');
@@ -1430,14 +1484,8 @@ function requireStableThreadItem(value: unknown): void {
             const item = requireExactOptions(record, ['type', 'id', 'text', 'phase', 'memoryCitation']);
             requireIdentifier(ownValue(item, 'id'));
             requireBoundedText(ownValue(item, 'text'), MAX_INPUT_TEXT_BYTES);
-            const phase = ownValue(item, 'phase');
-            if (!isNullish(phase) && phase !== 'commentary' && phase !== 'final_answer') {
-                throw new RideCodexTurnError('invalid-data');
-            }
-            const citation = ownValue(item, 'memoryCitation');
-            if (!isNullish(citation)) {
-                requireRecord(citation);
-            }
+            requireNullableEnum(ownValue(item, 'phase'), ['commentary', 'final_answer']);
+            requireNullableMemoryCitation(ownValue(item, 'memoryCitation'));
             return;
         }
         case 'plan': {
@@ -1468,7 +1516,9 @@ function requireStableThreadItem(value: unknown): void {
                     .includes(ownValue(item, 'status') as string)) {
                 throw new RideCodexTurnError('invalid-data');
             }
-            requireBoundedArray(ownValue(item, 'commandActions'));
+            for (const action of requireBoundedArray(ownValue(item, 'commandActions'))) {
+                requireCommandAction(action);
+            }
             requireNullableText(ownValue(item, 'aggregatedOutput'), MAX_INPUT_TEXT_BYTES);
             requireNullableSafeInteger(ownValue(item, 'exitCode'));
             requireNullableNonNegativeNumber(ownValue(item, 'durationMs'));
@@ -1496,6 +1546,60 @@ function requireStableThreadItem(value: unknown): void {
             }
             return;
         }
+        case 'hookPrompt': {
+            const item = requireExactOptions(record, ['type', 'id', 'fragments']);
+            requireIdentifier(ownValue(item, 'id'));
+            for (const fragment of requireBoundedArray(ownValue(item, 'fragments'))) {
+                const stable = requireExactOptions(fragment, ['text', 'hookRunId']);
+                requireBoundedText(ownValue(stable, 'text'), MAX_INPUT_TEXT_BYTES);
+                requireString(ownValue(stable, 'hookRunId'), MAX_IDENTIFIER_BYTES);
+            }
+            return;
+        }
+        case 'mcpToolCall':
+            requireMcpToolCall(record);
+            return;
+        case 'dynamicToolCall':
+            requireDynamicToolCall(record);
+            return;
+        case 'collabAgentToolCall':
+            requireCollabAgentToolCall(record);
+            return;
+        case 'subAgentActivity': {
+            const item = requireExactOptions(record, ['type', 'id', 'kind', 'agentThreadId', 'agentPath']);
+            requireIdentifier(ownValue(item, 'id'));
+            if (!['started', 'interacted', 'interrupted'].includes(ownValue(item, 'kind') as string)) {
+                throw new RideCodexTurnError('invalid-data');
+            }
+            requireIdentifier(ownValue(item, 'agentThreadId'));
+            requireBoundedText(ownValue(item, 'agentPath'), MAX_LOCAL_PATH_BYTES);
+            return;
+        }
+        case 'webSearch':
+            requireWebSearchItem(record);
+            return;
+        case 'imageView': {
+            const item = requireExactOptions(record, ['type', 'id', 'path']);
+            requireIdentifier(ownValue(item, 'id'));
+            requireBoundedText(ownValue(item, 'path'), MAX_LOCAL_PATH_BYTES);
+            return;
+        }
+        case 'sleep': {
+            const item = requireExactOptions(record, ['type', 'id', 'durationMs']);
+            requireIdentifier(ownValue(item, 'id'));
+            requireNonNegativeFiniteNumber(ownValue(item, 'durationMs'));
+            return;
+        }
+        case 'imageGeneration':
+            requireImageGenerationItem(record);
+            return;
+        case 'enteredReviewMode':
+        case 'exitedReviewMode': {
+            const item = requireExactOptions(record, ['type', 'id', 'review']);
+            requireIdentifier(ownValue(item, 'id'));
+            requireBoundedText(ownValue(item, 'review'), MAX_INPUT_TEXT_BYTES);
+            return;
+        }
         default:
             throw new RideCodexTurnError('invalid-data');
     }
@@ -1507,7 +1611,9 @@ function requireStableUserInput(value: unknown): void {
         case 'text': {
             const textInput = requireExactOptions(input, ['type', 'text', 'text_elements']);
             requireBoundedText(ownValue(textInput, 'text'), MAX_INPUT_TEXT_BYTES);
-            requireBoundedArray(ownValue(textInput, 'text_elements'));
+            for (const element of requireBoundedArray(ownValue(textInput, 'text_elements'))) {
+                requireTextElement(element);
+            }
             return;
         }
         case 'image': {
@@ -1536,13 +1642,291 @@ function requireStableUserInput(value: unknown): void {
     }
 }
 
+function requireTextElement(value: unknown): void {
+    const element = requireExactOptions(value, ['byteRange', 'placeholder']);
+    const range = requireExactOptions(ownValue(element, 'byteRange'), ['start', 'end']);
+    const start = requireNonNegativeSafeInteger(ownValue(range, 'start'));
+    const end = requireNonNegativeSafeInteger(ownValue(range, 'end'));
+    if (end < start) {
+        throw new RideCodexTurnError('invalid-data');
+    }
+    requireNullableText(ownValue(element, 'placeholder'), MAX_INPUT_TEXT_BYTES);
+}
+
+function requireNullableMemoryCitation(value: unknown): void {
+    if (isNullish(value)) {
+        if (value === undefined) {
+            throw new RideCodexTurnError('invalid-data');
+        }
+        return;
+    }
+    const citation = requireExactOptions(value, ['entries', 'threadIds']);
+    for (const rawEntry of requireBoundedArray(ownValue(citation, 'entries'))) {
+        const entry = requireExactOptions(rawEntry, ['path', 'lineStart', 'lineEnd', 'note']);
+        requireBoundedText(ownValue(entry, 'path'), MAX_LOCAL_PATH_BYTES);
+        const lineStart = requireNonNegativeSafeInteger(ownValue(entry, 'lineStart'));
+        const lineEnd = requireNonNegativeSafeInteger(ownValue(entry, 'lineEnd'));
+        if (lineEnd < lineStart) {
+            throw new RideCodexTurnError('invalid-data');
+        }
+        requireBoundedText(ownValue(entry, 'note'), MAX_INPUT_TEXT_BYTES);
+    }
+    requireStringArray(ownValue(citation, 'threadIds'), MAX_RAW_ARRAY, MAX_IDENTIFIER_BYTES, true);
+}
+
+function requireCommandAction(value: unknown): void {
+    const action = requireRecord(value);
+    switch (ownValue(action, 'type')) {
+        case 'read': {
+            const read = requireExactOptions(action, ['type', 'command', 'name', 'path']);
+            requireBoundedText(ownValue(read, 'command'), MAX_INPUT_TEXT_BYTES);
+            requireBoundedText(ownValue(read, 'name'), MAX_IDENTIFIER_BYTES);
+            requireString(ownValue(read, 'path'), MAX_LOCAL_PATH_BYTES);
+            return;
+        }
+        case 'listFiles': {
+            const list = requireExactOptions(action, ['type', 'command', 'path']);
+            requireBoundedText(ownValue(list, 'command'), MAX_INPUT_TEXT_BYTES);
+            requireNullableText(ownValue(list, 'path'), MAX_LOCAL_PATH_BYTES);
+            return;
+        }
+        case 'search': {
+            const search = requireExactOptions(action, ['type', 'command', 'query', 'path']);
+            requireBoundedText(ownValue(search, 'command'), MAX_INPUT_TEXT_BYTES);
+            requireNullableText(ownValue(search, 'query'), MAX_INPUT_TEXT_BYTES);
+            requireNullableText(ownValue(search, 'path'), MAX_LOCAL_PATH_BYTES);
+            return;
+        }
+        case 'unknown': {
+            const unknown = requireExactOptions(action, ['type', 'command']);
+            requireBoundedText(ownValue(unknown, 'command'), MAX_INPUT_TEXT_BYTES);
+            return;
+        }
+        default:
+            throw new RideCodexTurnError('invalid-data');
+    }
+}
+
+function requireMcpToolCall(value: unknown): void {
+    const item = requireOptions(value, [
+        'type', 'id', 'server', 'tool', 'status', 'arguments', 'appContext', 'mcpAppResourceUri',
+        'pluginId', 'result', 'error', 'durationMs'
+    ]);
+    requireRequiredKeys(item, [
+        'type', 'id', 'server', 'tool', 'status', 'arguments', 'appContext',
+        'pluginId', 'result', 'error', 'durationMs'
+    ]);
+    requireIdentifier(ownValue(item, 'id'));
+    requireBoundedText(ownValue(item, 'server'), MAX_IDENTIFIER_BYTES);
+    requireBoundedText(ownValue(item, 'tool'), MAX_IDENTIFIER_BYTES);
+    requireEnum(ownValue(item, 'status'), ['inProgress', 'completed', 'failed']);
+    requireJsonValue(ownValue(item, 'arguments'));
+    requireNullableMcpAppContext(ownValue(item, 'appContext'));
+    if (Object.prototype.hasOwnProperty.call(item, 'mcpAppResourceUri')) {
+        requireBoundedText(ownValue(item, 'mcpAppResourceUri'), MAX_LOCAL_PATH_BYTES);
+    }
+    requireNullableText(ownValue(item, 'pluginId'), MAX_IDENTIFIER_BYTES);
+    requireNullableMcpResult(ownValue(item, 'result'));
+    requireNullableMcpError(ownValue(item, 'error'));
+    requireNullableNonNegativeNumber(ownValue(item, 'durationMs'));
+}
+
+function requireNullableMcpAppContext(value: unknown): void {
+    if (isNullish(value)) {
+        if (value === undefined) {
+            throw new RideCodexTurnError('invalid-data');
+        }
+        return;
+    }
+    const context = requireExactOptions(value, [
+        'connectorId', 'linkId', 'resourceUri', 'appName', 'templateId', 'actionName'
+    ]);
+    requireBoundedText(ownValue(context, 'connectorId'), MAX_IDENTIFIER_BYTES);
+    requireNullableText(ownValue(context, 'linkId'), MAX_IDENTIFIER_BYTES);
+    requireNullableText(ownValue(context, 'resourceUri'), MAX_LOCAL_PATH_BYTES);
+    requireNullableText(ownValue(context, 'appName'), MAX_IDENTIFIER_BYTES);
+    requireNullableText(ownValue(context, 'templateId'), MAX_IDENTIFIER_BYTES);
+    requireNullableText(ownValue(context, 'actionName'), MAX_IDENTIFIER_BYTES);
+}
+
+function requireNullableMcpResult(value: unknown): void {
+    if (isNullish(value)) {
+        if (value === undefined) {
+            throw new RideCodexTurnError('invalid-data');
+        }
+        return;
+    }
+    const result = requireExactOptions(value, ['content', 'structuredContent', '_meta']);
+    for (const content of requireBoundedArray(ownValue(result, 'content'))) {
+        requireJsonValue(content);
+    }
+    requireJsonValue(ownValue(result, 'structuredContent'));
+    requireJsonValue(ownValue(result, '_meta'));
+}
+
+function requireNullableMcpError(value: unknown): void {
+    if (isNullish(value)) {
+        if (value === undefined) {
+            throw new RideCodexTurnError('invalid-data');
+        }
+        return;
+    }
+    const error = requireExactOptions(value, ['message']);
+    requireBoundedText(ownValue(error, 'message'), MAX_INPUT_TEXT_BYTES);
+}
+
+function requireDynamicToolCall(value: unknown): void {
+    const item = requireExactOptions(value, [
+        'type', 'id', 'namespace', 'tool', 'arguments', 'status', 'contentItems', 'success', 'durationMs'
+    ]);
+    requireIdentifier(ownValue(item, 'id'));
+    requireNullableText(ownValue(item, 'namespace'), MAX_IDENTIFIER_BYTES);
+    requireBoundedText(ownValue(item, 'tool'), MAX_IDENTIFIER_BYTES);
+    requireJsonValue(ownValue(item, 'arguments'));
+    requireEnum(ownValue(item, 'status'), ['inProgress', 'completed', 'failed']);
+    const contentItems = ownValue(item, 'contentItems');
+    if (isNullish(contentItems)) {
+        if (contentItems === undefined) {
+            throw new RideCodexTurnError('invalid-data');
+        }
+        // Stable schema permits null while the tool is still running.
+    } else {
+        for (const rawContent of requireBoundedArray(contentItems)) {
+            const content = requireRecord(rawContent);
+            switch (ownValue(content, 'type')) {
+                case 'inputText': {
+                    const text = requireExactOptions(content, ['type', 'text']);
+                    requireBoundedText(ownValue(text, 'text'), MAX_INPUT_TEXT_BYTES);
+                    break;
+                }
+                case 'inputImage': {
+                    const image = requireExactOptions(content, ['type', 'imageUrl']);
+                    requireBoundedText(ownValue(image, 'imageUrl'), MAX_LOCAL_PATH_BYTES);
+                    break;
+                }
+                default:
+                    throw new RideCodexTurnError('invalid-data');
+            }
+        }
+    }
+    requireNullableBoolean(ownValue(item, 'success'));
+    requireNullableNonNegativeNumber(ownValue(item, 'durationMs'));
+}
+
+function requireCollabAgentToolCall(value: unknown): void {
+    const item = requireExactOptions(value, [
+        'type', 'id', 'tool', 'status', 'senderThreadId', 'receiverThreadIds', 'prompt',
+        'model', 'reasoningEffort', 'agentsStates'
+    ]);
+    requireIdentifier(ownValue(item, 'id'));
+    requireEnum(ownValue(item, 'tool'), ['spawnAgent', 'sendInput', 'resumeAgent', 'wait', 'closeAgent']);
+    requireEnum(ownValue(item, 'status'), ['inProgress', 'completed', 'failed']);
+    requireIdentifier(ownValue(item, 'senderThreadId'));
+    requireStringArray(ownValue(item, 'receiverThreadIds'), MAX_RAW_ARRAY, MAX_IDENTIFIER_BYTES, false);
+    requireNullableText(ownValue(item, 'prompt'), MAX_INPUT_TEXT_BYTES);
+    requireNullableText(ownValue(item, 'model'), MAX_IDENTIFIER_BYTES);
+    requireNullableText(ownValue(item, 'reasoningEffort'), MAX_IDENTIFIER_BYTES);
+    const states = requireRecord(ownValue(item, 'agentsStates'));
+    for (const [threadId, rawState] of Object.entries(states)) {
+        requireIdentifier(threadId);
+        const state = requireExactOptions(rawState, ['status', 'message']);
+        requireEnum(ownValue(state, 'status'), [
+            'pendingInit', 'running', 'interrupted', 'completed', 'errored', 'shutdown', 'notFound'
+        ]);
+        requireNullableText(ownValue(state, 'message'), MAX_INPUT_TEXT_BYTES);
+    }
+}
+
+function requireWebSearchItem(value: unknown): void {
+    const item = requireExactOptions(value, ['type', 'id', 'query', 'action']);
+    requireIdentifier(ownValue(item, 'id'));
+    requireBoundedText(ownValue(item, 'query'), MAX_INPUT_TEXT_BYTES);
+    const rawAction = ownValue(item, 'action');
+    if (isNullish(rawAction)) {
+        if (rawAction === undefined) {
+            throw new RideCodexTurnError('invalid-data');
+        }
+        return;
+    }
+    const action = requireRecord(rawAction);
+    switch (ownValue(action, 'type')) {
+        case 'search': {
+            const search = requireExactOptions(action, ['type', 'query', 'queries']);
+            requireNullableText(ownValue(search, 'query'), MAX_INPUT_TEXT_BYTES);
+            const queries = ownValue(search, 'queries');
+            if (isNullish(queries)) {
+                if (queries === undefined) {
+                    throw new RideCodexTurnError('invalid-data');
+                }
+                return;
+            }
+            requireStringArray(queries, MAX_RAW_ARRAY, MAX_INPUT_TEXT_BYTES, true);
+            return;
+        }
+        case 'openPage': {
+            const open = requireExactOptions(action, ['type', 'url']);
+            requireNullableText(ownValue(open, 'url'), MAX_LOCAL_PATH_BYTES);
+            return;
+        }
+        case 'findInPage': {
+            const find = requireExactOptions(action, ['type', 'url', 'pattern']);
+            requireNullableText(ownValue(find, 'url'), MAX_LOCAL_PATH_BYTES);
+            requireNullableText(ownValue(find, 'pattern'), MAX_INPUT_TEXT_BYTES);
+            return;
+        }
+        case 'other':
+            requireExactOptions(action, ['type']);
+            return;
+        default:
+            throw new RideCodexTurnError('invalid-data');
+    }
+}
+
+function requireImageGenerationItem(value: unknown): void {
+    const item = requireOptions(value, ['type', 'id', 'status', 'revisedPrompt', 'result', 'savedPath']);
+    requireRequiredKeys(item, ['type', 'id', 'status', 'revisedPrompt', 'result']);
+    requireIdentifier(ownValue(item, 'id'));
+    requireBoundedText(ownValue(item, 'status'), MAX_IDENTIFIER_BYTES);
+    requireNullableText(ownValue(item, 'revisedPrompt'), MAX_INPUT_TEXT_BYTES);
+    requireBoundedText(ownValue(item, 'result'), MAX_INPUT_TEXT_BYTES);
+    if (Object.prototype.hasOwnProperty.call(item, 'savedPath')) {
+        requireString(ownValue(item, 'savedPath'), MAX_LOCAL_PATH_BYTES);
+    }
+}
+
+function requireJsonValue(value: unknown): void {
+    if (isNullish(value)) {
+        if (value === undefined) {
+            throw new RideCodexTurnError('invalid-data');
+        }
+        return;
+    }
+    if (typeof value === 'string' || typeof value === 'boolean') {
+        return;
+    }
+    if (typeof value === 'number') {
+        if (!Number.isFinite(value)) {
+            throw new RideCodexTurnError('invalid-data');
+        }
+        return;
+    }
+    if (Array.isArray(value)) {
+        for (const entry of requireBoundedArray(value)) {
+            requireJsonValue(entry);
+        }
+        return;
+    }
+    const record = requireRecord(value);
+    for (const entry of Object.values(record)) {
+        requireJsonValue(entry);
+    }
+}
+
 function requireOptionalImageDetail(record: Record<string, unknown>): void {
     if (!Object.prototype.hasOwnProperty.call(record, 'detail')) {
         return;
     }
-    if (!['auto', 'low', 'high', 'original'].includes(ownValue(record, 'detail') as string)) {
-        throw new RideCodexTurnError('invalid-data');
-    }
+    requireEnum(ownValue(record, 'detail'), ['auto', 'low', 'high', 'original']);
 }
 
 function requireTurnError(value: unknown): void {
@@ -1556,9 +1940,13 @@ function requireTurnError(value: unknown): void {
     requireBoundedText(ownValue(error, 'message'), MAX_INPUT_TEXT_BYTES);
     requireNullableText(ownValue(error, 'additionalDetails'), MAX_INPUT_TEXT_BYTES);
     const info = ownValue(error, 'codexErrorInfo');
-    if (!isNullish(info)) {
-        requireCodexErrorInfo(info);
+    if (isNullish(info)) {
+        if (info === undefined) {
+            throw new RideCodexTurnError('invalid-data');
+        }
+        return;
     }
+    requireCodexErrorInfo(info);
 }
 
 function requireCodexErrorInfo(value: unknown): void {
@@ -1667,7 +2055,7 @@ function requireThreadStatus(value: unknown): void {
     if (type === 'active') {
         const active = requireExactOptions(status, ['type', 'activeFlags']);
         const flags = ownValue(active, 'activeFlags');
-        if (!Array.isArray(flags) || utilTypes.isProxy(flags) || flags.length > 2
+        if (!Array.isArray(flags) || utilTypes.isProxy(flags) || flags.length > MAX_RAW_ARRAY
             || flags.some(flag => flag !== 'waitingOnApproval' && flag !== 'waitingOnUserInput')) {
             throw new RideCodexTurnError('invalid-data');
         }
@@ -1692,10 +2080,37 @@ function requireSessionSource(value: unknown): void {
         throw new RideCodexTurnError('invalid-data');
     }
     if (keys[0] === 'custom') {
-        requireString(ownValue(source, 'custom'), MAX_IDENTIFIER_BYTES);
+        requireBoundedText(ownValue(source, 'custom'), MAX_IDENTIFIER_BYTES);
     } else {
-        requireRecord(ownValue(source, 'subAgent'));
+        requireSubAgentSource(ownValue(source, 'subAgent'));
     }
+}
+
+function requireSubAgentSource(value: unknown): void {
+    if (typeof value === 'string') {
+        requireEnum(value, ['review', 'compact', 'memory_consolidation']);
+        return;
+    }
+    const source = requireRecord(value);
+    const keys = Object.keys(source);
+    if (keys.length !== 1) {
+        throw new RideCodexTurnError('invalid-data');
+    }
+    if (keys[0] === 'other') {
+        requireBoundedText(ownValue(source, 'other'), MAX_IDENTIFIER_BYTES);
+        return;
+    }
+    if (keys[0] !== 'thread_spawn') {
+        throw new RideCodexTurnError('invalid-data');
+    }
+    const spawn = requireExactOptions(ownValue(source, 'thread_spawn'), [
+        'parent_thread_id', 'depth', 'agent_path', 'agent_nickname', 'agent_role'
+    ]);
+    requireIdentifier(ownValue(spawn, 'parent_thread_id'));
+    requireNonNegativeSafeInteger(ownValue(spawn, 'depth'));
+    requireNullableText(ownValue(spawn, 'agent_path'), MAX_LOCAL_PATH_BYTES);
+    requireNullableText(ownValue(spawn, 'agent_nickname'), MAX_IDENTIFIER_BYTES);
+    requireNullableText(ownValue(spawn, 'agent_role'), MAX_IDENTIFIER_BYTES);
 }
 
 function requireGitInfo(value: unknown): void {
@@ -1843,6 +2258,40 @@ function requireBoolean(value: unknown): void {
     if (typeof value !== 'boolean') {
         throw new RideCodexTurnError('invalid-data');
     }
+}
+
+function requireNullableBoolean(value: unknown): void {
+    if (isNullish(value)) {
+        if (value === undefined) {
+            throw new RideCodexTurnError('invalid-data');
+        }
+        return;
+    }
+    requireBoolean(value);
+}
+
+function requireEnum(value: unknown, allowed: readonly string[]): string {
+    if (typeof value !== 'string' || !allowed.includes(value)) {
+        throw new RideCodexTurnError('invalid-data');
+    }
+    return value;
+}
+
+function requireNullableEnum(value: unknown, allowed: readonly string[]): void {
+    if (isNullish(value)) {
+        if (value === undefined) {
+            throw new RideCodexTurnError('invalid-data');
+        }
+        return;
+    }
+    requireEnum(value, allowed);
+}
+
+function requireNonNegativeSafeInteger(value: unknown): number {
+    if (!Number.isSafeInteger(value) || (value as number) < 0) {
+        throw new RideCodexTurnError('invalid-data');
+    }
+    return value as number;
 }
 
 function requireRecord(value: unknown): Record<string, unknown> {

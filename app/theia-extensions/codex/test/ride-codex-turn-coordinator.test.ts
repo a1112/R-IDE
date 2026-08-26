@@ -82,6 +82,144 @@ function validResumeResponse(threadId = 'thread-1'): Record<string, unknown> {
     };
 }
 
+function validThreadItems(): Record<string, unknown>[] {
+    return [
+        {
+            type: 'userMessage', id: 'user-1', clientId: null,
+            content: [
+                {
+                    type: 'text', text: 'hello',
+                    text_elements: [
+                        { byteRange: { start: 0, end: 5 }, placeholder: null },
+                        { byteRange: { start: 5, end: 5 }, placeholder: 'cursor' }
+                    ]
+                },
+                { type: 'image', detail: 'original', url: 'https://example.test/image.png' },
+                { type: 'image', detail: 'auto', url: 'https://example.test/auto.png' },
+                { type: 'image', detail: 'low', url: 'https://example.test/low.png' },
+                { type: 'image', detail: 'high', url: 'https://example.test/high.png' },
+                { type: 'localImage', path: 'C:\\workspace\\image.png' },
+                { type: 'skill', name: 'review', path: 'C:\\skills\\review' },
+                { type: 'mention', name: 'README', path: 'C:\\workspace\\README.md' }
+            ]
+        },
+        {
+            type: 'hookPrompt', id: 'hook-1',
+            fragments: [{ text: 'review', hookRunId: 'run-1' }]
+        },
+        {
+            type: 'agentMessage', id: 'agent-1', text: 'done', phase: 'final_answer',
+            memoryCitation: {
+                entries: [{ path: 'memory.md', lineStart: 1, lineEnd: 2, note: 'context' }],
+                threadIds: ['thread-memory']
+            }
+        },
+        { type: 'plan', id: 'plan-1', text: 'step' },
+        { type: 'reasoning', id: 'reasoning-1', summary: ['summary'], content: ['detail'] },
+        {
+            type: 'commandExecution', id: 'command-1', command: 'Get-ChildItem', cwd: 'C:\\workspace',
+            processId: null, source: 'agent', status: 'completed',
+            commandActions: [
+                { type: 'read', command: 'Get-Content README.md', name: 'README', path: 'C:\\workspace\\README.md' },
+                { type: 'listFiles', command: 'Get-ChildItem', path: null },
+                { type: 'search', command: 'rg Codex', query: 'Codex', path: 'C:\\workspace' },
+                { type: 'unknown', command: 'custom-tool' }
+            ],
+            aggregatedOutput: 'README.md', exitCode: 0, durationMs: 1
+        },
+        {
+            type: 'fileChange', id: 'file-1', status: 'completed',
+            changes: [
+                { path: 'added.txt', kind: { type: 'add' }, diff: '+added' },
+                { path: 'deleted.txt', kind: { type: 'delete' }, diff: '-deleted' },
+                { path: 'old.txt', kind: { type: 'update', move_path: 'new.txt' }, diff: 'renamed' },
+                { path: 'same.txt', kind: { type: 'update', move_path: null }, diff: 'changed' }
+            ]
+        },
+        {
+            type: 'mcpToolCall', id: 'mcp-1', server: 'server', tool: 'tool', status: 'completed',
+            arguments: { query: 'value', nested: [1, true, null] },
+            appContext: {
+                connectorId: 'connector', linkId: null, resourceUri: 'resource://one',
+                appName: 'App', templateId: null, actionName: 'Run'
+            },
+            mcpAppResourceUri: 'resource://legacy', pluginId: 'plugin',
+            result: {
+                content: [{ type: 'text', text: 'result' }],
+                structuredContent: { ok: true }, _meta: { trace: 'one' }
+            },
+            error: null, durationMs: 2
+        },
+        {
+            type: 'mcpToolCall', id: 'mcp-2', server: '', tool: '', status: 'failed',
+            arguments: null, appContext: null, pluginId: null, result: null,
+            error: { message: 'failed' }, durationMs: null
+        },
+        {
+            type: 'dynamicToolCall', id: 'dynamic-1', namespace: 'tools', tool: 'run',
+            arguments: { value: 1 }, status: 'completed',
+            contentItems: [
+                { type: 'inputText', text: 'output' },
+                { type: 'inputImage', imageUrl: 'https://example.test/result.png' }
+            ],
+            success: true, durationMs: 3
+        },
+        {
+            type: 'dynamicToolCall', id: 'dynamic-2', namespace: null, tool: '',
+            arguments: [], status: 'inProgress', contentItems: null, success: null, durationMs: null
+        },
+        {
+            type: 'collabAgentToolCall', id: 'collab-1', tool: 'spawnAgent', status: 'completed',
+            senderThreadId: 'thread-1', receiverThreadIds: ['thread-2'], prompt: 'review',
+            model: 'gpt-5.4', reasoningEffort: 'high',
+            agentsStates: { 'thread-2': { status: 'running', message: null } }
+        },
+        {
+            type: 'collabAgentToolCall', id: 'collab-2', tool: 'closeAgent', status: 'failed',
+            senderThreadId: 'thread-1', receiverThreadIds: [], prompt: null,
+            model: null, reasoningEffort: null,
+            agentsStates: {
+                pending: { status: 'pendingInit', message: null },
+                interrupted: { status: 'interrupted', message: '' },
+                completed: { status: 'completed', message: null },
+                errored: { status: 'errored', message: 'failed' },
+                shutdown: { status: 'shutdown', message: null },
+                missing: { status: 'notFound', message: null }
+            }
+        },
+        {
+            type: 'subAgentActivity', id: 'sub-1', kind: 'interacted',
+            agentThreadId: 'thread-2', agentPath: 'agent/path'
+        },
+        {
+            type: 'webSearch', id: 'web-1', query: 'Codex',
+            action: { type: 'search', query: 'Codex', queries: ['Codex 0.144'] }
+        },
+        {
+            type: 'webSearch', id: 'web-2', query: 'page',
+            action: { type: 'openPage', url: 'https://example.test' }
+        },
+        {
+            type: 'webSearch', id: 'web-3', query: 'find',
+            action: { type: 'findInPage', url: null, pattern: 'Codex' }
+        },
+        { type: 'webSearch', id: 'web-4', query: '', action: { type: 'other' } },
+        { type: 'webSearch', id: 'web-5', query: '', action: null },
+        { type: 'imageView', id: 'view-1', path: 'C:\\workspace\\image.png' },
+        { type: 'sleep', id: 'sleep-1', durationMs: 1 },
+        {
+            type: 'imageGeneration', id: 'image-1', status: 'completed', revisedPrompt: null,
+            result: 'generated', savedPath: 'C:\\workspace\\generated.png'
+        },
+        {
+            type: 'imageGeneration', id: 'image-2', status: '', revisedPrompt: 'prompt', result: ''
+        },
+        { type: 'enteredReviewMode', id: 'review-in', review: 'Review changes' },
+        { type: 'exitedReviewMode', id: 'review-out', review: '' },
+        { type: 'contextCompaction', id: 'compact-1' }
+    ];
+}
+
 function decodeBatch(wire: string): RideCodexEventBatch {
     return JSON.parse(wire) as RideCodexEventBatch;
 }
@@ -519,6 +657,202 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         assert.equal(clearedTimers, 1);
     });
 
+    it('rejects turn/start while interrupt recovery restart is pending', async () => {
+        const host = new FakeTurnHost();
+        const timeoutCallbacks: Array<() => void> = [];
+        let resolveRestart!: (generation: number) => void;
+        host.interruptPromise = Promise.resolve({});
+        host.restartPromise = new Promise(resolve => { resolveRestart = resolve; });
+        const coordinator = new RideCodexTurnCoordinator({
+            host,
+            interruptTimeoutMs: 10,
+            timers: {
+                setTimeout: callback => { timeoutCallbacks.push(callback); return callback; },
+                clearTimeout: () => undefined
+            }
+        });
+        const service = coordinator.connectClient({ turnEvents: () => undefined });
+        await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'one' }] });
+        const interrupting = service.interruptTurn({ threadId: 'thread-1', turnId: 'turn-1' });
+        await Promise.resolve();
+        timeoutCallbacks.shift()?.();
+        await Promise.resolve();
+
+        await assert.rejects(
+            service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'two' }] }),
+            error => (error as { code?: string }).code === 'operation-superseded'
+        );
+        assert.equal(host.calls.filter(call => call.method === 'turn/start').length, 1);
+
+        host.generation = 2;
+        resolveRestart(2);
+        await interrupting;
+        await coordinator.dispose();
+    });
+
+    it('linearizes interrupt-uncertain before synchronous recovery host state changes', async () => {
+        const host = new FakeTurnHost();
+        const scheduler = new FakeScheduler();
+        const timeoutCallbacks: Array<() => void> = [];
+        const events: RideCodexUiEvent[] = [];
+        host.interruptPromise = Promise.resolve({});
+        const restart = host.restartForRecovery.bind(host);
+        host.restartForRecovery = expectedGeneration => {
+            host.emitState('restarting', expectedGeneration);
+            return restart(expectedGeneration);
+        };
+        const coordinator = new RideCodexTurnCoordinator({
+            host, scheduler, interruptTimeoutMs: 10,
+            timers: {
+                setTimeout: callback => { timeoutCallbacks.push(callback); return callback; },
+                clearTimeout: () => undefined
+            }
+        });
+        const service = coordinator.connectClient({
+            turnEvents: wire => { events.push(...decodeBatch(wire).events); }
+        });
+        await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'one' }] });
+        const interrupting = service.interruptTurn({ threadId: 'thread-1', turnId: 'turn-1' });
+        timeoutCallbacks.shift()?.();
+        assert.equal((await interrupting).status, 'interrupt-uncertain');
+        while (scheduler.callbacks.length > 0) {
+            scheduler.flushOne();
+            await Promise.resolve();
+        }
+
+        assert.deepEqual(
+            events.filter(event => event.type === 'turn-terminal').map(event => event.status),
+            ['interrupt-uncertain']
+        );
+        await coordinator.dispose();
+    });
+
+    it('adopts the recovered generation before the next turn receives notifications', async () => {
+        const host = new FakeTurnHost();
+        const timeoutCallbacks: Array<() => void> = [];
+        host.interruptPromise = Promise.resolve({});
+        const coordinator = new RideCodexTurnCoordinator({
+            host,
+            interruptTimeoutMs: 10,
+            timers: {
+                setTimeout: callback => { timeoutCallbacks.push(callback); return callback; },
+                clearTimeout: () => undefined
+            }
+        });
+        const service = coordinator.connectClient({ turnEvents: () => undefined });
+        await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'one' }] });
+        const interrupting = service.interruptTurn({ threadId: 'thread-1', turnId: 'turn-1' });
+        timeoutCallbacks.shift()?.();
+        await interrupting;
+
+        host.nextTurnId = 'turn-2';
+        await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'two' }] });
+        host.emit('turn/completed', {
+            threadId: 'thread-1', turn: { id: 'turn-2', status: 'completed', items: [] }
+        });
+        host.nextTurnId = 'turn-3';
+        assert.equal((await service.startTurn({
+            threadId: 'thread-1', input: [{ type: 'text', text: 'three' }]
+        })).turnId, 'turn-3');
+        await coordinator.dispose();
+    });
+
+    it('blocks host-overlapping operations and client rebinding until one recovery completes', async () => {
+        const host = new FakeTurnHost();
+        const timeoutCallbacks: Array<() => void> = [];
+        let resolveRestart!: (generation: number) => void;
+        host.interruptPromise = Promise.resolve({});
+        host.restartPromise = new Promise(resolve => { resolveRestart = resolve; });
+        const coordinator = new RideCodexTurnCoordinator({
+            host,
+            interruptTimeoutMs: 10,
+            timers: {
+                setTimeout: callback => { timeoutCallbacks.push(callback); return callback; },
+                clearTimeout: () => undefined
+            }
+        });
+        const client = { turnEvents: () => undefined };
+        const service = coordinator.connectClient(client);
+        await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'one' }] });
+        const interrupting = service.interruptTurn({ threadId: 'thread-1', turnId: 'turn-1' });
+        await Promise.resolve();
+        const fireTimeout = timeoutCallbacks.shift();
+        fireTimeout?.();
+        fireTimeout?.();
+        await Promise.resolve();
+
+        await assert.rejects(
+            service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'two' }] }),
+            error => (error as { code?: string }).code === 'operation-superseded'
+        );
+        await assert.rejects(
+            service.steerTurn({
+                threadId: 'thread-1', expectedTurnId: 'turn-1', input: [{ type: 'text', text: 'more' }]
+            }),
+            error => (error as { code?: string }).code === 'operation-superseded'
+        );
+        await assert.rejects(
+            service.interruptTurn({ threadId: 'thread-1', turnId: 'turn-1' }),
+            error => (error as { code?: string }).code === 'operation-superseded'
+        );
+        assert.throws(
+            () => service.setClient(client),
+            error => (error as { code?: string }).code === 'operation-superseded'
+        );
+        assert.throws(
+            () => coordinator.connectClient({ turnEvents: () => undefined }),
+            error => (error as { code?: string }).code === 'operation-superseded'
+        );
+        assert.equal(host.calls.filter(call => call.method === 'turn/start').length, 1);
+        assert.deepEqual(host.restartCalls, [1]);
+
+        host.generation = 2;
+        resolveRestart(2);
+        assert.equal((await interrupting).status, 'interrupt-uncertain');
+        host.nextTurnId = 'turn-2';
+        assert.equal((await service.startTurn({
+            threadId: 'thread-1', input: [{ type: 'text', text: 'after recovery' }]
+        })).turnId, 'turn-2');
+        assert.equal(host.calls.filter(call => call.method === 'turn/start').length, 2);
+        assert.equal(host.releases, 2);
+        await coordinator.dispose();
+        assert.equal(host.releases, 3);
+    });
+
+    it('clears a failed recovery barrier without duplicate recovery or lease leaks', async () => {
+        const host = new FakeTurnHost();
+        const timeoutCallbacks: Array<() => void> = [];
+        host.interruptPromise = Promise.resolve({});
+        host.restartPromise = Promise.reject(new Error('restart failed'));
+        void host.restartPromise.catch(() => undefined);
+        const coordinator = new RideCodexTurnCoordinator({
+            host,
+            interruptTimeoutMs: 10,
+            timers: {
+                setTimeout: callback => { timeoutCallbacks.push(callback); return callback; },
+                clearTimeout: () => undefined
+            }
+        });
+        const service = coordinator.connectClient({ turnEvents: () => undefined });
+        await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'one' }] });
+        const interrupting = service.interruptTurn({ threadId: 'thread-1', turnId: 'turn-1' });
+        await Promise.resolve();
+        const fireTimeout = timeoutCallbacks.shift();
+        fireTimeout?.();
+        fireTimeout?.();
+        assert.equal((await interrupting).status, 'interrupt-uncertain');
+        assert.deepEqual(host.restartCalls, [1]);
+        assert.equal(host.releases, 1);
+
+        host.restartPromise = undefined;
+        host.nextTurnId = 'turn-2';
+        assert.equal((await service.startTurn({
+            threadId: 'thread-1', input: [{ type: 'text', text: 'after failure' }]
+        })).turnId, 'turn-2');
+        await coordinator.dispose();
+        assert.equal(host.releases, 2);
+    });
+
     it('fails malformed interrupt ACKs closed and releases the active lease without recovery', async () => {
         const host = new FakeTurnHost();
         host.interruptPromise = Promise.resolve({ unexpected: true });
@@ -570,6 +904,34 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
                 ...validResumeResponse(),
                 thread: { ...validThread(), createdAt: Number.NaN }
             },
+            {
+                ...validResumeResponse(),
+                thread: { ...validThread(), source: { subAgent: { bogus: true } } }
+            },
+            {
+                ...validResumeResponse(),
+                thread: {
+                    ...validThread(),
+                    source: {
+                        subAgent: {
+                            thread_spawn: {
+                                parent_thread_id: 'parent', depth: 1, agent_path: null,
+                                agent_nickname: null, agent_role: null, extra: true
+                            }
+                        }
+                    }
+                }
+            },
+            {
+                ...validResumeResponse(),
+                thread: {
+                    ...validThread(),
+                    turns: [{ ...validTurn('resumed-turn'), items: [{
+                        type: 'userMessage', id: 'user-1', clientId: null,
+                        content: [{ type: 'text', text: 'x', text_elements: [{ bad: true }] }]
+                    }] }]
+                }
+            },
             proxied,
             accessor
         ]) {
@@ -603,6 +965,95 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
             await coordinator.dispose();
         }
         assert.equal(traps, 0);
+    });
+
+    it('accepts all stable Codex 0.144 recovery source, status, policy, sandbox and transcript variants', async () => {
+        const sources: unknown[] = [
+            'cli', 'vscode', 'exec', 'appServer', 'unknown',
+            { custom: 'integration' },
+            { subAgent: 'review' },
+            { subAgent: 'compact' },
+            { subAgent: 'memory_consolidation' },
+            { subAgent: { other: 'future-stable-source' } },
+            {
+                subAgent: {
+                    thread_spawn: {
+                        parent_thread_id: 'parent-thread', depth: 1, agent_path: null,
+                        agent_nickname: 'worker', agent_role: 'reviewer'
+                    }
+                }
+            }
+        ];
+        const statuses: unknown[] = [
+            { type: 'notLoaded' }, { type: 'idle' }, { type: 'systemError' },
+            { type: 'active', activeFlags: ['waitingOnApproval', 'waitingOnUserInput'] }
+        ];
+        const approvalPolicies: unknown[] = [
+            'untrusted', 'on-request', 'never',
+            {
+                granular: {
+                    sandbox_approval: true, rules: false, skill_approval: true,
+                    request_permissions: false, mcp_elicitations: true
+                }
+            }
+        ];
+        const sandboxes: unknown[] = [
+            { type: 'dangerFullAccess' },
+            { type: 'readOnly', networkAccess: false },
+            { type: 'externalSandbox', networkAccess: 'restricted' },
+            {
+                type: 'workspaceWrite', writableRoots: ['C:\\workspace'], networkAccess: true,
+                excludeTmpdirEnvVar: false, excludeSlashTmp: true
+            }
+        ];
+        const reviewers = ['user', 'auto_review', 'guardian_subagent'];
+
+        for (let index = 0; index < sources.length; index += 1) {
+            const host = new FakeTurnHost();
+            const scheduler = new FakeScheduler();
+            const timeoutCallbacks: Array<() => void> = [];
+            const events: RideCodexUiEvent[] = [];
+            host.interruptPromise = Promise.resolve({});
+            host.resumeResponse = {
+                ...validResumeResponse(),
+                thread: {
+                    ...validThread(),
+                    source: sources[index],
+                    status: statuses[index % statuses.length],
+                    threadSource: index % 2 === 0 ? null : 'desktop',
+                    gitInfo: index % 2 === 0 ? null : {
+                        sha: 'abc123', branch: 'main', originUrl: 'https://example.test/repo.git'
+                    },
+                    turns: index === sources.length - 1
+                        ? [{ ...validTurn('resumed-turn', 'completed'), items: validThreadItems() }]
+                        : []
+                },
+                approvalPolicy: approvalPolicies[index % approvalPolicies.length],
+                approvalsReviewer: reviewers[index % reviewers.length],
+                sandbox: sandboxes[index % sandboxes.length],
+                reasoningEffort: index % 2 === 0 ? null : 'high'
+            };
+            const coordinator = new RideCodexTurnCoordinator({
+                host, scheduler, interruptTimeoutMs: 10,
+                timers: {
+                    setTimeout: callback => { timeoutCallbacks.push(callback); return callback; },
+                    clearTimeout: () => undefined
+                }
+            });
+            const service = coordinator.connectClient({
+                turnEvents: wire => { events.push(...decodeBatch(wire).events); }
+            });
+            await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'one' }] });
+            const interrupting = service.interruptTurn({ threadId: 'thread-1', turnId: 'turn-1' });
+            timeoutCallbacks.shift()?.();
+            assert.equal((await interrupting).status, 'interrupt-uncertain');
+            while (scheduler.callbacks.length > 0) {
+                scheduler.flushOne();
+                await Promise.resolve();
+            }
+            assert.equal(events.some(event => event.type === 'error' && event.code === 'recovery-failed'), false);
+            await coordinator.dispose();
+        }
     });
 
     it('releases the active lease on owner disconnect and host restart, and rejects hung acquire on dispose', async () => {
@@ -1565,6 +2016,147 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
             () => new RideCodexTurnCoordinator({ host: new FakeTurnHost(), maxBatchEvents: 1 }),
             error => (error as { code?: string }).code === 'invalid-data'
         );
+    });
+
+    it('accepts a schema-valid Codex 0.144 hookPrompt item', async () => {
+        const host = new FakeTurnHost();
+        host.startPromise = Promise.resolve({
+            turn: {
+                ...validTurn(),
+                items: [{ type: 'hookPrompt', id: 'hook-1', fragments: [{ text: 'review', hookRunId: 'run-1' }] }]
+            }
+        });
+        const coordinator = new RideCodexTurnCoordinator({ host });
+        const service = coordinator.connectClient({ turnEvents: () => undefined });
+
+        assert.equal((await service.startTurn({
+            threadId: 'thread-1', input: [{ type: 'text', text: 'one' }]
+        })).status, 'in-progress');
+        await coordinator.dispose();
+    });
+
+    it('rejects malformed memoryCitation and text_elements nested objects', async () => {
+        const malformedItems: unknown[] = [
+            {
+                type: 'agentMessage', id: 'agent-1', text: 'done', phase: null,
+                memoryCitation: { bad: true }
+            },
+            {
+                type: 'userMessage', id: 'user-1', clientId: null,
+                content: [{ type: 'text', text: 'hello', text_elements: [{ bad: true }] }]
+            }
+        ];
+        for (const item of malformedItems) {
+            const host = new FakeTurnHost();
+            host.startPromise = Promise.resolve({ turn: { ...validTurn(), items: [item] } });
+            const coordinator = new RideCodexTurnCoordinator({ host });
+            const service = coordinator.connectClient({ turnEvents: () => undefined });
+            await assert.rejects(
+                service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'one' }] }),
+                error => (error as { code?: string }).code === 'invalid-data'
+            );
+            await coordinator.dispose();
+        }
+    });
+
+    it('reports recovery-failed for a malformed subAgent source', async () => {
+        const host = new FakeTurnHost();
+        const scheduler = new FakeScheduler();
+        const timeoutCallbacks: Array<() => void> = [];
+        const events: RideCodexUiEvent[] = [];
+        host.interruptPromise = Promise.resolve({});
+        host.resumeResponse = {
+            ...validResumeResponse(),
+            thread: { ...validThread(), source: { subAgent: { bogus: true } } }
+        };
+        const coordinator = new RideCodexTurnCoordinator({
+            host, scheduler, interruptTimeoutMs: 10,
+            timers: {
+                setTimeout: callback => { timeoutCallbacks.push(callback); return callback; },
+                clearTimeout: () => undefined
+            }
+        });
+        const service = coordinator.connectClient({
+            turnEvents: wire => { events.push(...decodeBatch(wire).events); }
+        });
+        await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'one' }] });
+        const interrupting = service.interruptTurn({ threadId: 'thread-1', turnId: 'turn-1' });
+        timeoutCallbacks.shift()?.();
+        await interrupting;
+        while (scheduler.callbacks.length > 0) {
+            scheduler.flushOne();
+            await Promise.resolve();
+        }
+
+        assert.ok(events.some(event => event.type === 'error' && event.code === 'recovery-failed'));
+        await coordinator.dispose();
+    });
+
+    it('accepts every Codex 0.144 ThreadItem variant and all directly nested stable variants', async () => {
+        const host = new FakeTurnHost();
+        host.startPromise = Promise.resolve({
+            turn: { ...validTurn(), items: validThreadItems() }
+        });
+        const coordinator = new RideCodexTurnCoordinator({ host });
+        const service = coordinator.connectClient({ turnEvents: () => undefined });
+
+        assert.equal((await service.startTurn({
+            threadId: 'thread-1', input: [{ type: 'text', text: 'one' }]
+        })).status, 'in-progress');
+        await coordinator.dispose();
+    });
+
+    it('rejects malformed nested ThreadItem data that previously passed shallow validation', async () => {
+        const malformedItems: unknown[] = [
+            {
+                type: 'agentMessage', id: 'agent-1', text: 'done', phase: null,
+                memoryCitation: { bad: true }
+            },
+            {
+                type: 'userMessage', id: 'user-1', clientId: null,
+                content: [{ type: 'text', text: 'hello', text_elements: [{ bad: true }] }]
+            },
+            {
+                type: 'commandExecution', id: 'command-1', command: 'run', cwd: 'C:\\workspace',
+                processId: null, source: 'agent', status: 'completed',
+                commandActions: [{ bad: true }], aggregatedOutput: null, exitCode: 0, durationMs: 1
+            },
+            {
+                type: 'mcpToolCall', id: 'mcp-1', server: 'server', tool: 'tool', status: 'completed',
+                arguments: { nested: undefined }, appContext: null, pluginId: null,
+                result: null, error: null, durationMs: null
+            },
+            {
+                type: 'dynamicToolCall', id: 'dynamic-1', namespace: null, tool: 'run',
+                arguments: {}, status: 'completed',
+                contentItems: [{ type: 'inputText', text: 'ok', extra: true }],
+                success: true, durationMs: 1
+            },
+            {
+                type: 'collabAgentToolCall', id: 'collab-1', tool: 'wait', status: 'completed',
+                senderThreadId: 'thread-1', receiverThreadIds: [], prompt: null, model: null,
+                reasoningEffort: null, agentsStates: { child: { status: 'running', message: null, extra: true } }
+            },
+            {
+                type: 'webSearch', id: 'web-1', query: 'query',
+                action: { type: 'other', extra: true }
+            },
+            { type: 'sleep', id: 'sleep-1', durationMs: Number.POSITIVE_INFINITY },
+            { type: 'hookPrompt', id: 'hook-1', fragments: [{ text: 'x'.repeat(65_537), hookRunId: 'run' }] },
+            Object.assign(Object.create({ inherited: true }), { type: 'contextCompaction', id: 'compact-1' })
+        ];
+
+        for (const item of malformedItems) {
+            const host = new FakeTurnHost();
+            host.startPromise = Promise.resolve({ turn: { ...validTurn(), items: [item] } });
+            const coordinator = new RideCodexTurnCoordinator({ host });
+            const service = coordinator.connectClient({ turnEvents: () => undefined });
+            await assert.rejects(
+                service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'one' }] }),
+                error => (error as { code?: string }).code === 'invalid-data'
+            );
+            await coordinator.dispose();
+        }
     });
 
     it('strictly validates complete turn/start and exact turn/steer responses', async () => {
