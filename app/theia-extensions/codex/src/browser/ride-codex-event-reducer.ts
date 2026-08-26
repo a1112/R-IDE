@@ -52,10 +52,21 @@ const DEFAULT_MAX_DIAGNOSTIC_HISTORY = 64;
 const MAX_FILE_PATCH_PATH_BYTES = 32 * 1024;
 const MAX_FILE_PATCH_DIFF_BYTES = 64 * 1024;
 const MAX_IDENTIFIER_BYTES = 512;
+const MAX_REASONING_INDEX = 1_024;
+const RETAINED_ARRAY_SLOT_BYTES = 8;
 const MAX_WIRE_DEPTH = 16;
 const MAX_WIRE_NODES = 8_192;
 const MAX_WIRE_ARRAY_ITEMS = 8_192;
 const MAX_WIRE_OBJECT_KEYS = 128;
+const MIN_COHERENT_BOUNDARY_BYTES = pendingBatchBytes({
+    generation: 0,
+    threadId: 'x',
+    turnId: 'x',
+    events: [
+        { type: 'turn-started' },
+        { type: 'turn-terminal', status: 'completed' }
+    ]
+});
 
 const EMPTY_SNAPSHOT: RideCodexTurnSnapshot = deepFreezeRideCodex({
     generation: 0,
@@ -96,7 +107,10 @@ export class RideCodexEventReducer {
     constructor(options: RideCodexEventReducerOptions = {}) {
         this.#scheduleFrame = options.scheduleFrame ?? defaultScheduleFrame;
         this.#maxWireBytes = positiveLimit(options.maxWireBytes, DEFAULT_MAX_WIRE_BYTES);
-        this.#maxQueuedBytes = positiveLimit(options.maxQueuedBytes, DEFAULT_MAX_QUEUED_BYTES);
+        this.#maxQueuedBytes = Math.max(
+            MIN_COHERENT_BOUNDARY_BYTES,
+            positiveLimit(options.maxQueuedBytes, DEFAULT_MAX_QUEUED_BYTES)
+        );
         this.#maxBatchEvents = Math.max(2, positiveLimit(options.maxBatchEvents, DEFAULT_MAX_BATCH_EVENTS));
         this.#maxItemBytes = positiveLimit(options.maxItemBytes, DEFAULT_MAX_ITEM_BYTES);
         this.#maxRetainedItems = positiveLimit(options.maxRetainedItems, DEFAULT_MAX_RETAINED_ITEMS);
@@ -134,70 +148,17 @@ export class RideCodexEventReducer {
         }
         const sourceEvents = safeBatch.events;
         const selected = selectPriorityEvents(sourceEvents, this.#maxBatchEvents);
-        let dropped = sourceEvents.length - selected.length;
-        const identityBytes = utf8ByteLength(safeBatch.threadId) + utf8ByteLength(safeBatch.turnId);
-        let bytes = identityBytes;
-        const accepted: RideCodexUiEvent[] = [];
-        for (const event of selected) {
-            const eventBytes = estimateEventBytes(event);
-            if (isTurnBoundary(event)) {
-                while (this.#queuedBytes + bytes + eventBytes > this.#maxQueuedBytes) {
-                    const removable = findLastOrdinaryEvent(accepted);
-                    if (removable < 0) {
-                        break;
-                    }
-                    bytes -= estimateEventBytes(accepted[removable]);
-                    accepted.splice(removable, 1);
-                    dropped += 1;
-                }
-                dropped += this.#makePendingRoom(bytes + eventBytes, safeBatch);
-            }
-            if (bytes + eventBytes > this.#maxQueuedBytes || this.#queuedBytes + bytes + eventBytes > this.#maxQueuedBytes) {
-                dropped += 1;
-                continue;
-            }
-            accepted.push(event);
-            bytes += eventBytes;
-        }
-        if (dropped > 0) {
-            const warning: RideCodexUiEvent = {
-                type: 'warning',
-                code: 'events-dropped',
-                message: 'Codex UI events were dropped.',
-                droppedEvents: dropped
-            };
-            const warningBytes = estimateEventBytes(warning);
-            while (accepted.length >= this.#maxBatchEvents || bytes + warningBytes > this.#maxQueuedBytes) {
-                const removable = findLastOrdinaryEvent(accepted);
-                if (removable < 0) {
-                    break;
-                }
-                const [removed] = accepted.splice(removable, 1);
-                bytes -= estimateEventBytes(removed);
-                dropped += 1;
-            }
-            dropped += this.#makePendingRoom(bytes + warningBytes, safeBatch);
-            if (accepted.length < this.#maxBatchEvents && bytes + warningBytes <= this.#maxQueuedBytes
-                && this.#queuedBytes + bytes + warningBytes <= this.#maxQueuedBytes) {
-                const terminalIndex = accepted.findIndex(event => event.type === 'turn-terminal');
-                accepted.splice(terminalIndex < 0 ? accepted.length : terminalIndex, 0, {
-                    ...warning,
-                    droppedEvents: dropped
-                });
-                bytes += warningBytes;
-            }
-        }
-        if (accepted.length === 0) {
+        const fitted = fitBatchEvents(safeBatch, selected, this.#maxBatchEvents, this.#maxQueuedBytes);
+        if (fitted.events.length === 0) {
             return;
         }
         const pending = deepFreezeRideCodex({
             generation: safeBatch.generation,
             threadId: safeBatch.threadId,
             turnId: safeBatch.turnId,
-            events: accepted
+            events: fitted.events
         }) as RideCodexEventBatch;
-        this.#pending.push(pending);
-        this.#queuedBytes += pendingBatchBytes(pending);
+        this.#enqueuePending(pending, sourceEvents.length - selected.length + fitted.dropped);
         if (!this.#frame) {
             this.#frame = this.#scheduleFrame(() => this.#flushFrame());
         }
@@ -273,6 +234,69 @@ export class RideCodexEventReducer {
             changed = this.#applyEvent(event) || changed;
         }
         return changed;
+    }
+
+    #enqueuePending(incoming: RideCodexEventBatch, initialDropped: number): void {
+        let dropped = initialDropped;
+        const events: RideCodexUiEvent[] = [];
+        const matching: number[] = [];
+        for (let index = 0; index < this.#pending.length; index += 1) {
+            const pending = this.#pending[index];
+            if (!sameBatchIdentity(pending, incoming)) {
+                continue;
+            }
+            matching.push(index);
+            for (const event of pending.events) {
+                if (event.type === 'warning' && event.code === 'events-dropped') {
+                    dropped = saturatingAdd(dropped, event.droppedEvents ?? 1);
+                } else {
+                    events.push(event);
+                }
+            }
+        }
+        for (const event of incoming.events) {
+            if (event.type === 'warning' && event.code === 'events-dropped') {
+                dropped = saturatingAdd(dropped, event.droppedEvents ?? 1);
+            } else {
+                events.push(event);
+            }
+        }
+        const fitted = fitBatchEvents(incoming, events, this.#maxBatchEvents, this.#maxQueuedBytes);
+        if (fitted.events.length === 0) {
+            return;
+        }
+        dropped = saturatingAdd(dropped, fitted.dropped);
+
+        for (let position = matching.length - 1; position >= 0; position -= 1) {
+            const index = matching[position];
+            const [removed] = this.#pending.splice(index, 1);
+            this.#queuedBytes -= pendingBatchBytes(removed);
+        }
+
+        let accepted = [...fitted.events];
+        let candidate = freezePendingBatch(incoming, accepted);
+        dropped = saturatingAdd(dropped, this.#makePendingRoom(pendingBatchBytes(candidate), incoming));
+        if (dropped > 0) {
+            const warned = addDropWarning(
+                incoming, accepted, dropped, this.#maxBatchEvents, this.#maxQueuedBytes
+            );
+            accepted = [...warned.events];
+            dropped = warned.dropped;
+            candidate = freezePendingBatch(incoming, accepted);
+            const reserved = reserveDropWarningCount(candidate);
+            const pressureDropped = this.#makePendingRoom(pendingBatchBytes(reserved), incoming);
+            if (pressureDropped > 0) {
+                dropped = saturatingAdd(dropped, pressureDropped);
+                candidate = freezePendingBatch(incoming, replaceDropWarningCount(accepted, dropped));
+            }
+        }
+        const candidateBytes = pendingBatchBytes(candidate);
+        if (candidate.events.length === 0 || candidateBytes > this.#maxQueuedBytes
+            || this.#queuedBytes + candidateBytes > this.#maxQueuedBytes) {
+            return;
+        }
+        this.#pending.push(candidate);
+        this.#queuedBytes += candidateBytes;
     }
 
     #makePendingRoom(requiredBytes: number, incoming: RideCodexEventBatch): number {
@@ -367,11 +391,8 @@ export class RideCodexEventReducer {
                 return this.#appendSummary(event.itemId, event.summaryIndex, event.delta);
             case 'reasoning-delta':
                 return this.#appendReasoning(event.itemId, event.contentIndex, event.delta);
-            case 'file-patch': {
-                const item = this.#item(event.itemId, 'file-change');
-                item.changes = event.changes.map(change => ({ ...change }));
-                return true;
-            }
+            case 'file-patch':
+                return this.#replaceChanges(event.itemId, event.changes);
             case 'turn-plan':
                 this.#plan = deepFreezeRideCodex({
                     ...(event.explanation === undefined ? {} : { explanation: event.explanation }),
@@ -428,16 +449,9 @@ export class RideCodexEventReducer {
     #append(id: string, kind: RideCodexItemKind, delta: string): boolean {
         const item = this.#item(id, kind);
         const combined = item.text + delta;
-        const next = truncateUtf8(combined, this.#maxItemBytes);
-        let warned = false;
-        if (next !== combined && !this.#truncatedItems.has(id)) {
-            this.#truncatedItems.add(id);
-            this.#pushWarning({
-                type: 'warning', code: 'data-truncated',
-                message: 'A Codex UI item was truncated to preserve responsiveness.'
-            });
-            warned = true;
-        }
+        const available = this.#availableItemBytes(item, utf8ByteLength(item.text));
+        const next = truncateUtf8(combined, available);
+        const warned = next !== combined && this.#warnItemTruncated(id);
         if (next === item.text) {
             return warned;
         }
@@ -460,11 +474,12 @@ export class RideCodexEventReducer {
         const item = this.#item(id, 'reasoning');
         this.#ensureSummary(id, index);
         const current = item.summaries[index] ?? '';
-        const otherBytes = utf8ByteLength(item.text)
-            + item.summaries.reduce((sum, value, position) => position === index ? sum : sum + utf8ByteLength(value), 0);
-        const next = truncateUtf8(current + delta, Math.max(0, this.#maxItemBytes - otherBytes));
+        const combined = current + delta;
+        const available = this.#availableItemBytes(item, utf8ByteLength(current));
+        const next = truncateUtf8(combined, available);
+        const warned = next !== combined && this.#warnItemTruncated(id);
         if (next === current) {
-            return false;
+            return warned;
         }
         item.summaries[index] = next;
         return true;
@@ -476,14 +491,40 @@ export class RideCodexEventReducer {
             item.reasoning.push('');
         }
         const current = item.reasoning[index] ?? '';
-        const otherBytes = item.reasoning.reduce(
-            (sum, value, position) => position === index ? sum : sum + utf8ByteLength(value), 0
-        );
-        const next = truncateUtf8(current + delta, Math.max(0, this.#maxItemBytes - otherBytes));
+        const combined = current + delta;
+        const available = this.#availableItemBytes(item, utf8ByteLength(current));
+        const next = truncateUtf8(combined, available);
+        const warned = next !== combined && this.#warnItemTruncated(id);
         if (next === current) {
-            return false;
+            return warned;
         }
         item.reasoning[index] = next;
+        return true;
+    }
+
+    #replaceChanges(id: string, changes: readonly RideCodexFileChange[]): boolean {
+        const item = this.#item(id, 'file-change');
+        const available = this.#availableItemBytes(item, fileChangeStringBytes(item.changes));
+        const bounded = boundFileChanges(changes, available);
+        const changed = !sameFileChanges(item.changes, bounded.changes);
+        item.changes = bounded.changes;
+        const warned = bounded.truncated && this.#warnItemTruncated(id);
+        return warned || changed;
+    }
+
+    #availableItemBytes(item: MutableItem, replacedBytes: number): number {
+        return Math.max(0, this.#maxItemBytes - (itemPayloadBytes(item) - replacedBytes));
+    }
+
+    #warnItemTruncated(id: string): boolean {
+        if (this.#truncatedItems.has(id)) {
+            return false;
+        }
+        this.#truncatedItems.add(id);
+        this.#pushWarning({
+            type: 'warning', code: 'data-truncated',
+            message: 'A Codex UI item was truncated to preserve responsiveness.'
+        });
         return true;
     }
 
@@ -531,9 +572,12 @@ export class RideCodexEventReducer {
             bytes += utf8ByteLength(item.id) + utf8ByteLength(item.text);
             bytes += item.summaries.reduce((sum, summary) => sum + utf8ByteLength(summary), 0);
             bytes += item.reasoning.reduce((sum, reasoning) => sum + utf8ByteLength(reasoning), 0);
+            bytes += (item.summaries.length + item.reasoning.length) * RETAINED_ARRAY_SLOT_BYTES;
             bytes += item.changes.reduce((sum, change) =>
                 sum + utf8ByteLength(change.path) + utf8ByteLength(change.kind)
-                + (change.diff === undefined ? 0 : utf8ByteLength(change.diff)), 0);
+                + utf8ByteLength(change.diff)
+                + (change.kind === 'update' && typeof change.movePath === 'string'
+                    ? utf8ByteLength(change.movePath) : 0), 0);
         }
         return bytes;
     }
@@ -624,8 +668,10 @@ function isUiEvent(value: unknown): value is RideCodexUiEvent {
     }
     const identifier = isIdentifier;
     const text = (candidate: unknown): candidate is string => typeof candidate === 'string';
-    const index = (candidate: unknown): candidate is number =>
+    const nonnegativeInteger = (candidate: unknown): candidate is number =>
         Number.isSafeInteger(candidate) && (candidate as number) >= 0;
+    const reasoningIndex = (candidate: unknown): candidate is number =>
+        nonnegativeInteger(candidate) && candidate <= MAX_REASONING_INDEX;
     switch (value.type) {
         case 'turn-started':
             return hasExactKeys(value, ['type']);
@@ -649,13 +695,13 @@ function isUiEvent(value: unknown): value is RideCodexUiEvent {
                 && identifier(value.itemId) && text(value.delta);
         case 'reasoning-summary-delta':
             return hasExactKeys(value, ['type', 'itemId', 'summaryIndex', 'delta'])
-                && identifier(value.itemId) && index(value.summaryIndex) && text(value.delta);
+                && identifier(value.itemId) && reasoningIndex(value.summaryIndex) && text(value.delta);
         case 'reasoning-delta':
             return hasExactKeys(value, ['type', 'itemId', 'contentIndex', 'delta'])
-                && identifier(value.itemId) && index(value.contentIndex) && text(value.delta);
+                && identifier(value.itemId) && reasoningIndex(value.contentIndex) && text(value.delta);
         case 'reasoning-summary-part':
             return hasExactKeys(value, ['type', 'itemId', 'summaryIndex'])
-                && identifier(value.itemId) && index(value.summaryIndex);
+                && identifier(value.itemId) && reasoningIndex(value.summaryIndex);
         case 'file-patch':
             return hasOnlyKeys(value, ['type', 'itemId', 'changes'])
                 && identifier(value.itemId) && Array.isArray(value.changes)
@@ -671,13 +717,14 @@ function isUiEvent(value: unknown): value is RideCodexUiEvent {
             return hasExactKeys(value, ['type', 'diff']) && text(value.diff);
         case 'token-usage':
             return hasExactKeys(value, ['type', 'totalTokens', 'inputTokens', 'outputTokens'])
-                && index(value.totalTokens) && index(value.inputTokens) && index(value.outputTokens);
+                && nonnegativeInteger(value.totalTokens) && nonnegativeInteger(value.inputTokens)
+                && nonnegativeInteger(value.outputTokens);
         case 'warning':
             return hasExactKeys(value, ['type', 'code', 'message'], ['droppedEvents', 'droppedBytes'])
                 && ['server-warning', 'events-dropped', 'data-truncated'].includes(value.code as string)
                 && text(value.message)
-                && (value.droppedEvents === undefined || index(value.droppedEvents))
-                && (value.droppedBytes === undefined || index(value.droppedBytes));
+                && (value.droppedEvents === undefined || nonnegativeInteger(value.droppedEvents))
+                && (value.droppedBytes === undefined || nonnegativeInteger(value.droppedBytes));
         case 'error':
             return hasExactKeys(value, ['type', 'code', 'message', 'retryable'])
                 && ['turn-error', 'operation-failed', 'interrupt-timeout', 'recovery-failed'].includes(value.code as string)
@@ -785,12 +832,175 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
     return prototype === Object.prototype || !prototype;
 }
 
-function estimateEventBytes(event: RideCodexUiEvent): number {
-    try {
-        return utf8ByteLength(JSON.stringify(event));
-    } catch {
-        return Number.MAX_SAFE_INTEGER;
+function itemPayloadBytes(item: MutableItem): number {
+    return utf8ByteLength(item.text)
+        + item.summaries.reduce((sum, value) => sum + utf8ByteLength(value), 0)
+        + item.reasoning.reduce((sum, value) => sum + utf8ByteLength(value), 0)
+        + fileChangeStringBytes(item.changes);
+}
+
+function fileChangeStringBytes(changes: readonly RideCodexFileChange[]): number {
+    return changes.reduce((sum, change) => sum
+        + utf8ByteLength(change.path)
+        + utf8ByteLength(change.diff)
+        + (change.kind === 'update' && typeof change.movePath === 'string'
+            ? utf8ByteLength(change.movePath) : 0), 0);
+}
+
+function boundFileChanges(
+    changes: readonly RideCodexFileChange[],
+    maxBytes: number
+): { readonly changes: RideCodexFileChange[]; readonly truncated: boolean } {
+    const bounded: RideCodexFileChange[] = [];
+    let remaining = maxBytes;
+    let truncated = false;
+    for (const change of changes) {
+        const path = truncateUtf8(change.path, remaining);
+        if (path.length === 0) {
+            truncated = true;
+            break;
+        }
+        if (path !== change.path) {
+            truncated = true;
+        }
+        remaining -= utf8ByteLength(path);
+
+        const diff = truncateUtf8(change.diff, remaining);
+        if (diff !== change.diff) {
+            truncated = true;
+        }
+        remaining -= utf8ByteLength(diff);
+
+        if (change.kind !== 'update') {
+            bounded.push({ path, kind: change.kind, diff });
+            continue;
+        }
+        if (typeof change.movePath !== 'string') {
+            bounded.push({
+                path,
+                kind: 'update',
+                diff,
+                ...(change.movePath === undefined ? {} : { movePath: change.movePath })
+            });
+            continue;
+        }
+        const movePath = truncateUtf8(change.movePath, remaining);
+        if (movePath !== change.movePath) {
+            truncated = true;
+        }
+        remaining -= utf8ByteLength(movePath);
+        bounded.push({
+            path,
+            kind: 'update',
+            diff,
+            ...(movePath.length > 0 ? { movePath } : {})
+        });
     }
+    if (bounded.length < changes.length) {
+        truncated = true;
+    }
+    return { changes: bounded, truncated };
+}
+
+function sameFileChanges(
+    left: readonly RideCodexFileChange[],
+    right: readonly RideCodexFileChange[]
+): boolean {
+    return left.length === right.length && left.every((change, index) => {
+        const other = right[index];
+        return change.path === other.path && change.kind === other.kind && change.diff === other.diff
+            && (change.kind !== 'update' || other.kind !== 'update' || change.movePath === other.movePath);
+    });
+}
+
+function fitBatchEvents(
+    batch: Pick<RideCodexEventBatch, 'generation' | 'threadId' | 'turnId'>,
+    sourceEvents: readonly RideCodexUiEvent[],
+    maxEvents: number,
+    maxBytes: number
+): { readonly events: readonly RideCodexUiEvent[]; readonly dropped: number } {
+    const events = [...selectPriorityEvents(sourceEvents, maxEvents)];
+    let dropped = sourceEvents.length - events.length;
+    while (events.length > 0 && pendingBatchBytes({ ...batch, events }) > maxBytes) {
+        const removable = findLastOrdinaryEvent(events);
+        if (removable < 0) {
+            return { events: [], dropped: saturatingAdd(dropped, events.length) };
+        }
+        events.splice(removable, 1);
+        dropped = saturatingAdd(dropped, 1);
+    }
+    return { events, dropped };
+}
+
+function addDropWarning(
+    batch: Pick<RideCodexEventBatch, 'generation' | 'threadId' | 'turnId'>,
+    sourceEvents: readonly RideCodexUiEvent[],
+    initialDropped: number,
+    maxEvents: number,
+    maxBytes: number
+): { readonly events: readonly RideCodexUiEvent[]; readonly dropped: number } {
+    const events = [...sourceEvents];
+    let dropped = initialDropped;
+    while (events.length > 0) {
+        const warning = dropWarning(dropped);
+        const terminalIndex = events.findIndex(event => event.type === 'turn-terminal');
+        const insertionIndex = terminalIndex < 0 ? events.length : terminalIndex;
+        const candidate = [...events];
+        candidate.splice(insertionIndex, 0, warning);
+        const reserved = replaceDropWarningCount(candidate, Number.MAX_SAFE_INTEGER);
+        if (candidate.length <= maxEvents && pendingBatchBytes({ ...batch, events: reserved }) <= maxBytes) {
+            return { events: candidate, dropped };
+        }
+        const removable = findLastOrdinaryEvent(events);
+        if (removable < 0) {
+            break;
+        }
+        events.splice(removable, 1);
+        dropped = saturatingAdd(dropped, 1);
+    }
+    return { events, dropped };
+}
+
+function dropWarning(droppedEvents: number): Extract<RideCodexUiEvent, { type: 'warning' }> {
+    return {
+        type: 'warning',
+        code: 'events-dropped',
+        message: 'Codex UI events were dropped.',
+        droppedEvents
+    };
+}
+
+function replaceDropWarningCount(
+    events: readonly RideCodexUiEvent[],
+    droppedEvents: number
+): readonly RideCodexUiEvent[] {
+    return events.map(event => event.type === 'warning' && event.code === 'events-dropped'
+        ? dropWarning(droppedEvents) : event);
+}
+
+function reserveDropWarningCount(batch: RideCodexEventBatch): RideCodexEventBatch {
+    return freezePendingBatch(batch, replaceDropWarningCount(batch.events, Number.MAX_SAFE_INTEGER));
+}
+
+function freezePendingBatch(
+    identity: Pick<RideCodexEventBatch, 'generation' | 'threadId' | 'turnId'>,
+    events: readonly RideCodexUiEvent[]
+): RideCodexEventBatch {
+    return deepFreezeRideCodex({
+        generation: identity.generation,
+        threadId: identity.threadId,
+        turnId: identity.turnId,
+        events
+    }) as RideCodexEventBatch;
+}
+
+function sameBatchIdentity(left: RideCodexEventBatch, right: RideCodexEventBatch): boolean {
+    return left.generation === right.generation
+        && left.threadId === right.threadId && left.turnId === right.turnId;
+}
+
+function saturatingAdd(left: number, right: number): number {
+    return Math.min(Number.MAX_SAFE_INTEGER, left + right);
 }
 
 function pendingBatchBytes(batch: RideCodexEventBatch): number {
