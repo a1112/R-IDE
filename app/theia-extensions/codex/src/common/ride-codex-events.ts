@@ -9,6 +9,7 @@ export type RideCodexTurnStatus = 'idle' | 'in-progress' | RideCodexTurnTerminal
 export const RIDE_CODEX_MAX_IDENTIFIER_BYTES = 512;
 const RIDE_CODEX_BOUNDARY_IDENTITY = Object.freeze({
     generation: Number.MAX_SAFE_INTEGER,
+    turnSequence: Number.MAX_SAFE_INTEGER,
     threadId: '\u0000'.repeat(RIDE_CODEX_MAX_IDENTIFIER_BYTES),
     turnId: '\u0000'.repeat(RIDE_CODEX_MAX_IDENTIFIER_BYTES)
 });
@@ -127,6 +128,7 @@ export type RideCodexUiEvent =
 
 export interface RideCodexEventBatch {
     readonly generation: number;
+    readonly turnSequence: number;
     readonly threadId: string;
     readonly turnId: string;
     readonly events: readonly RideCodexUiEvent[];
@@ -207,6 +209,7 @@ export function deepFreezeRideCodex<T>(value: T): Readonly<T> {
 export function freezeRideCodexEventBatch(batch: RideCodexEventBatch): RideCodexEventBatch {
     return deepFreezeRideCodex({
         generation: batch.generation,
+        turnSequence: batch.turnSequence,
         threadId: batch.threadId,
         turnId: batch.turnId,
         events: batch.events.map(event => deepFreezeRideCodex({ ...event }))

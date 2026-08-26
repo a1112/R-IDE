@@ -600,6 +600,7 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         assert.ok(Buffer.byteLength(wire, 'utf8') <= 4_096);
         assert.deepEqual(JSON.parse(wire), {
             generation: 1,
+            turnSequence: 1,
             threadId: 'thread-1',
             turnId: 'turn-1',
             events: [
@@ -1389,6 +1390,49 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         ]);
     });
 
+    it('assigns strictly increasing turn sequences before response and notification races', async () => {
+        const host = new FakeTurnHost();
+        const scheduler = new FakeScheduler();
+        const delivered: Array<Readonly<{ turnId: string; turnSequence: unknown; types: string[] }>> = [];
+        const coordinator = new RideCodexTurnCoordinator({ host, scheduler });
+        const service = coordinator.connectClient({
+            turnEvents: wire => {
+                const batch = JSON.parse(wire) as Record<string, unknown>;
+                delivered.push({
+                    turnId: batch.turnId as string,
+                    turnSequence: batch.turnSequence,
+                    types: (batch.events as Array<{ type: string }>).map(event => event.type)
+                });
+            }
+        });
+
+        let resolveFirst!: (value: unknown) => void;
+        host.startPromise = new Promise(resolve => { resolveFirst = resolve; });
+        const first = service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'one' }] });
+        await Promise.resolve();
+        await Promise.resolve();
+        host.emit('turn/started', { threadId: 'thread-1', turn: minimalTurn('turn-1') });
+        scheduler.flushOne();
+        resolveFirst({ turn: minimalTurn('turn-1') });
+        await first;
+        host.emit('turn/completed', {
+            threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', items: [] }
+        });
+        scheduler.flushOne();
+
+        host.startPromise = undefined;
+        host.nextTurnId = 'turn-2';
+        await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'two' }] });
+        scheduler.flushOne();
+
+        assert.deepEqual(delivered.map(batch => [batch.turnId, batch.turnSequence, batch.types]), [
+            ['turn-1', 1, ['turn-started']],
+            ['turn-1', 1, ['turn-terminal']],
+            ['turn-2', 2, ['turn-started']]
+        ]);
+        await coordinator.dispose();
+    });
+
     it('preserves a terminal event when notification pressure fills maxQueuedBytes', async () => {
         const host = new FakeTurnHost();
         const scheduler = new FakeScheduler();
@@ -1451,13 +1495,17 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         const scheduler = new FakeScheduler();
         let resolveFirst!: () => void;
         const firstDelivery = new Promise<void>(resolve => { resolveFirst = resolve; });
-        const deliveries: Array<{ turnId: string; types: string[] }> = [];
+        const deliveries: Array<{ turnId: string; turnSequence: number; types: string[] }> = [];
         const coordinator = new RideCodexTurnCoordinator({ host, scheduler });
         let call = 0;
         const service = coordinator.connectClient({
             turnEvents: wire => {
                 const batch = decodeBatch(wire);
-                deliveries.push({ turnId: batch.turnId, types: batch.events.map(event => event.type) });
+                deliveries.push({
+                    turnId: batch.turnId,
+                    turnSequence: batch.turnSequence,
+                    types: batch.events.map(event => event.type)
+                });
                 call += 1;
                 return call === 1 ? firstDelivery : undefined;
             }
@@ -1477,9 +1525,9 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         await Promise.resolve();
 
         assert.deepEqual(deliveries, [
-            { turnId: 'turn-1', types: ['turn-started'] },
-            { turnId: 'turn-1', types: ['turn-terminal'] },
-            { turnId: 'turn-2', types: ['turn-started'] }
+            { turnId: 'turn-1', turnSequence: 1, types: ['turn-started'] },
+            { turnId: 'turn-1', turnSequence: 1, types: ['turn-terminal'] },
+            { turnId: 'turn-2', turnSequence: 2, types: ['turn-started'] }
         ]);
     });
 
@@ -1526,6 +1574,9 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
             byTurn.set(batch.turnId, types);
             assert.ok(Buffer.byteLength(JSON.stringify(batch), 'utf8') <= MIN_COHERENT_QUEUE_BYTES);
         }
+        assert.ok(delivered.every((batch, index) => index === 0
+            || batch.turnSequence >= delivered[index - 1].turnSequence));
+        assert.equal(delivered[delivered.length - 1]?.turnSequence, 7);
         for (const [turnId, types] of byTurn) {
             assert.ok(types.includes('turn-started'), `missing start for ${turnId}`);
             assert.ok(types.includes('turn-terminal'), `missing terminal for ${turnId}`);
@@ -1535,6 +1586,49 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         assert.ok(delivered.flatMap(batch => batch.events).some(event =>
             event.type === 'warning' && event.code === 'events-dropped'
         ));
+    });
+
+    it('keeps reused empty server identities distinct for a slow client', async () => {
+        const host = new FakeTurnHost();
+        const scheduler = new FakeScheduler();
+        host.nextTurnId = '';
+        let unblock!: () => void;
+        const blocked = new Promise<void>(resolve => { unblock = resolve; });
+        const delivered: RideCodexEventBatch[] = [];
+        let calls = 0;
+        const coordinator = new RideCodexTurnCoordinator({ host, scheduler });
+        const service = coordinator.connectClient({
+            turnEvents: wire => {
+                delivered.push(decodeBatch(wire));
+                calls += 1;
+                return calls === 1 ? blocked : undefined;
+            }
+        });
+
+        await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'one' }] });
+        scheduler.flushOne();
+        host.emit('turn/completed', {
+            threadId: 'thread-1', turn: { id: '', status: 'completed', items: [] }
+        });
+        scheduler.flushOne();
+        await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'two' }] });
+        scheduler.flushOne();
+        host.emit('turn/completed', {
+            threadId: 'thread-1', turn: { id: '', status: 'completed', items: [] }
+        });
+        scheduler.flushOne();
+
+        unblock();
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+
+        assert.deepEqual(delivered.map(batch => [batch.turnSequence, batch.events.map(event => event.type)]), [
+            [1, ['turn-started']],
+            [1, ['turn-terminal']],
+            [2, ['turn-started', 'turn-terminal']]
+        ]);
+        await coordinator.dispose();
     });
 
     it('preserves the unique terminal for one slow-client turn across a delta storm', async () => {

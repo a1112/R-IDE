@@ -110,6 +110,7 @@ interface ClientRecord {
 interface ActiveTurn {
     readonly owner: ClientRecord;
     readonly threadId: string;
+    readonly turnSequence: number;
     readonly lifecycle: number;
     readonly invalidated: Promise<never>;
     readonly invalidate: (error: RideCodexTurnError) => void;
@@ -131,6 +132,7 @@ interface RecoveryBarrier {
 
 interface QueueIdentity {
     readonly generation: number;
+    readonly turnSequence: number;
     readonly threadId: string;
     readonly turnId: string;
 }
@@ -207,6 +209,7 @@ export class RideCodexTurnCoordinator {
     #active: ActiveTurn | undefined;
     #recovery: RecoveryBarrier | undefined;
     #generation: number;
+    #lastTurnSequence = 0;
     #lifecycle = 0;
     #nextClientId = 1;
     #disposed = false;
@@ -542,6 +545,12 @@ export class RideCodexTurnCoordinator {
     }
 
     #newActive(owner: ClientRecord, threadId: string): ActiveTurn {
+        if (!Number.isSafeInteger(this.#lastTurnSequence)
+            || this.#lastTurnSequence >= Number.MAX_SAFE_INTEGER) {
+            throw new RideCodexTurnError('operation-failed');
+        }
+        this.#lastTurnSequence += 1;
+        const turnSequence = this.#lastTurnSequence;
         let invalidated = false;
         let rejectInvalidated!: (error: RideCodexTurnError) => void;
         const invalidation = new Promise<never>((_resolve, reject) => {
@@ -549,7 +558,7 @@ export class RideCodexTurnCoordinator {
         });
         invalidation.catch(() => undefined);
         return {
-            owner, threadId, lifecycle: this.#lifecycle, invalidated: invalidation,
+            owner, threadId, turnSequence, lifecycle: this.#lifecycle, invalidated: invalidation,
             invalidate: error => {
                 if (!invalidated) {
                     invalidated = true;
@@ -596,6 +605,7 @@ export class RideCodexTurnCoordinator {
             active.turnId = turnId;
             this.#queueIdentity = Object.freeze({
                 generation: active.generation,
+                turnSequence: active.turnSequence,
                 threadId: active.threadId,
                 turnId
             });
@@ -634,6 +644,7 @@ export class RideCodexTurnCoordinator {
         if (emit && active.turnId !== undefined) {
             this.#queueIdentity = Object.freeze({
                 generation: active.generation ?? this.#generation,
+                turnSequence: active.turnSequence,
                 threadId: active.threadId,
                 turnId: active.turnId
             });
@@ -1167,7 +1178,8 @@ export class RideCodexTurnCoordinator {
         }
         let delivery: void | Promise<void>;
         client.inFlightIdentity = Object.freeze({
-            generation: batch.generation, threadId: batch.threadId, turnId: batch.turnId
+            generation: batch.generation, turnSequence: batch.turnSequence,
+            threadId: batch.threadId, turnId: batch.turnId
         });
         try {
             delivery = client.client.turnEvents(wire);
@@ -1224,6 +1236,7 @@ export class RideCodexTurnCoordinator {
     #queueClientDelivery(client: ClientRecord, batch: RideCodexEventBatch): void {
         const previous = client.pending[client.pending.length - 1];
         if (previous && previous.generation === batch.generation
+            && previous.turnSequence === batch.turnSequence
             && previous.threadId === batch.threadId && previous.turnId === batch.turnId) {
             const merged = mergeBatches(previous, batch, this.#maxBatchEvents, this.#maxQueuedBytes);
             client.pendingBytes -= batchBytes(previous);
@@ -1245,6 +1258,7 @@ export class RideCodexTurnCoordinator {
             for (let index = client.pending.length - 1; index >= 0; index -= 1) {
                 const candidate = client.pending[index];
                 if (candidate.generation !== identity.generation
+                    || candidate.turnSequence !== identity.turnSequence
                     || candidate.threadId !== identity.threadId || candidate.turnId !== identity.turnId) {
                     continue;
                 }
@@ -2902,6 +2916,7 @@ function mergeBatches(
     maxBytes: number
 ): RideCodexEventBatch {
     if (!current || current.generation !== incoming.generation
+        || current.turnSequence !== incoming.turnSequence
         || current.threadId !== incoming.threadId || current.turnId !== incoming.turnId) {
         return incoming;
     }
@@ -2918,6 +2933,7 @@ function mergeBatches(
     const events: RideCodexUiEvent[] = [];
     const identity = {
         generation: incoming.generation,
+        turnSequence: incoming.turnSequence,
         threadId: incoming.threadId,
         turnId: incoming.turnId
     };
@@ -2986,22 +3002,27 @@ function findLastIndex<T>(values: readonly T[], predicate: (value: T) => boolean
 
 function sameIdentity(left: QueueIdentity, right: QueueIdentity): boolean {
     return left.generation === right.generation
+        && left.turnSequence === right.turnSequence
         && left.threadId === right.threadId && left.turnId === right.turnId;
 }
 
 function sameBatchIdentity(batch: RideCodexEventBatch, identity: QueueIdentity): boolean {
     return batch.generation === identity.generation
+        && batch.turnSequence === identity.turnSequence
         && batch.threadId === identity.threadId && batch.turnId === identity.turnId;
 }
 
 function queueIdentityKey(identity: QueueIdentity): string {
-    return JSON.stringify([identity.generation, identity.threadId, identity.turnId]);
+    return JSON.stringify([
+        identity.generation, identity.turnSequence, identity.threadId, identity.turnId
+    ]);
 }
 
 function batchBytes(batch: RideCodexEventBatch): number {
     try {
         const emptyBatchBytes = utf8ByteLength(JSON.stringify({
             generation: batch.generation,
+            turnSequence: batch.turnSequence,
             threadId: batch.threadId,
             turnId: batch.turnId,
             events: []

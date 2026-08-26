@@ -90,6 +90,7 @@ export class RideCodexEventReducer {
     #frame: RideCodexFrameDisposable | undefined;
     #queuedBytes = 0;
     #generation = 0;
+    #highestTurnSequence: number | undefined;
     #threadId: string | undefined;
     #turnId: string | undefined;
     #status: RideCodexTurnSnapshot['status'] = 'idle';
@@ -152,6 +153,7 @@ export class RideCodexEventReducer {
         }
         const pending = deepFreezeRideCodex({
             generation: safeBatch.generation,
+            turnSequence: safeBatch.turnSequence,
             threadId: safeBatch.threadId,
             turnId: safeBatch.turnId,
             events: fitted.events
@@ -174,6 +176,7 @@ export class RideCodexEventReducer {
         this.#items.clear();
         this.#truncatedItems.clear();
         this.#finalizedIdentities.clear();
+        this.#highestTurnSequence = undefined;
         this.#listeners.clear();
         this.#snapshot = EMPTY_SNAPSHOT;
     }
@@ -218,6 +221,22 @@ export class RideCodexEventReducer {
                 return false;
             }
             this.#finalizedIdentities.clear();
+            this.#resetFor(batch);
+        } else if (this.#highestTurnSequence !== undefined
+            && batch.turnSequence < this.#highestTurnSequence) {
+            return false;
+        } else if (this.#highestTurnSequence !== undefined
+            && batch.turnSequence === this.#highestTurnSequence
+            && (batch.threadId !== this.#threadId || batch.turnId !== this.#turnId)) {
+            return false;
+        } else if (this.#highestTurnSequence !== undefined
+            && batch.turnSequence > this.#highestTurnSequence) {
+            if (this.#status === 'in-progress' || (!startsTurn && this.#turnId !== undefined)) {
+                return false;
+            }
+            if (!startsTurn && !terminatesTurn) {
+                return false;
+            }
             this.#resetFor(batch);
         } else if (this.#turnId !== undefined
             && (batch.threadId !== this.#threadId || batch.turnId !== this.#turnId)) {
@@ -351,6 +370,7 @@ export class RideCodexEventReducer {
             }
             const identityIndex = this.#pending.findIndex(pendingBatch =>
                 pendingBatch.generation !== incoming.generation
+                || pendingBatch.turnSequence !== incoming.turnSequence
                 || pendingBatch.threadId !== incoming.threadId || pendingBatch.turnId !== incoming.turnId
             );
             if (identityIndex < 0) {
@@ -365,6 +385,7 @@ export class RideCodexEventReducer {
 
     #resetFor(batch: RideCodexEventBatch): void {
         this.#generation = batch.generation;
+        this.#highestTurnSequence = batch.turnSequence;
         this.#threadId = batch.threadId;
         this.#turnId = batch.turnId;
         this.#status = 'idle';
@@ -847,14 +868,16 @@ function parseSafeBatch(wire: RideCodexEventBatchWire, maxWireBytes: number): Ri
     if (!validateJsonGraph(parsed, 0, { nodes: 0, bytes: 0, maxBytes: maxWireBytes })
         || JSON.stringify(parsed) !== wire
         || !isPlainRecord(parsed)
-        || !hasExactKeys(parsed, ['generation', 'threadId', 'turnId', 'events'])) {
+        || !hasExactKeys(parsed, ['generation', 'turnSequence', 'threadId', 'turnId', 'events'])) {
         return undefined;
     }
     const generation = parsed.generation;
+    const turnSequence = parsed.turnSequence;
     const threadId = parsed.threadId;
     const turnId = parsed.turnId;
     const events = parsed.events;
     if (!Number.isSafeInteger(generation) || (generation as number) < 0
+        || !Number.isSafeInteger(turnSequence) || (turnSequence as number) <= 0
         || !isIdentifier(threadId) || !isIdentifier(turnId)
         || !Array.isArray(events) || events.length === 0 || events.length > 8_192) {
         return undefined;
@@ -864,6 +887,7 @@ function parseSafeBatch(wire: RideCodexEventBatchWire, maxWireBytes: number): Ri
     }
     return deepFreezeRideCodex({
         generation: generation as number,
+        turnSequence: turnSequence as number,
         threadId,
         turnId,
         events: events as RideCodexUiEvent[]
@@ -1139,7 +1163,7 @@ function diagnosticEventBytes(
 }
 
 function fitBatchEvents(
-    batch: Pick<RideCodexEventBatch, 'generation' | 'threadId' | 'turnId'>,
+    batch: Pick<RideCodexEventBatch, 'generation' | 'turnSequence' | 'threadId' | 'turnId'>,
     sourceEvents: readonly RideCodexUiEvent[],
     maxEvents: number,
     maxBytes: number
@@ -1158,7 +1182,7 @@ function fitBatchEvents(
 }
 
 function addDropWarning(
-    batch: Pick<RideCodexEventBatch, 'generation' | 'threadId' | 'turnId'>,
+    batch: Pick<RideCodexEventBatch, 'generation' | 'turnSequence' | 'threadId' | 'turnId'>,
     sourceEvents: readonly RideCodexUiEvent[],
     initialDropped: number,
     maxEvents: number,
@@ -1208,11 +1232,12 @@ function reserveDropWarningCount(batch: RideCodexEventBatch): RideCodexEventBatc
 }
 
 function freezePendingBatch(
-    identity: Pick<RideCodexEventBatch, 'generation' | 'threadId' | 'turnId'>,
+    identity: Pick<RideCodexEventBatch, 'generation' | 'turnSequence' | 'threadId' | 'turnId'>,
     events: readonly RideCodexUiEvent[]
 ): RideCodexEventBatch {
     return deepFreezeRideCodex({
         generation: identity.generation,
+        turnSequence: identity.turnSequence,
         threadId: identity.threadId,
         turnId: identity.turnId,
         events
@@ -1221,13 +1246,16 @@ function freezePendingBatch(
 
 function sameBatchIdentity(left: RideCodexEventBatch, right: RideCodexEventBatch): boolean {
     return left.generation === right.generation
+        && left.turnSequence === right.turnSequence
         && left.threadId === right.threadId && left.turnId === right.turnId;
 }
 
 function finalizedIdentityKey(
-    identity: Pick<RideCodexEventBatch, 'generation' | 'threadId' | 'turnId'>
+    identity: Pick<RideCodexEventBatch, 'generation' | 'turnSequence' | 'threadId' | 'turnId'>
 ): string {
-    return JSON.stringify([identity.generation, identity.threadId, identity.turnId]);
+    return JSON.stringify([
+        identity.generation, identity.turnSequence, identity.threadId, identity.turnId
+    ]);
 }
 
 function saturatingAdd(left: number, right: number): number {
