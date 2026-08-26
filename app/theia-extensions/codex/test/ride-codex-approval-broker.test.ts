@@ -183,6 +183,11 @@ const CONTEXT: RideCodexApprovalContext = Object.freeze({
     threadId: 'thread-alpha',
     turnId: 'turn-alpha'
 });
+const SUPERSCRIPT_DOS_DEVICE_ALIASES = Object.freeze(
+    ['COM¹', 'COM²', 'COM³', 'LPT¹', 'LPT²', 'LPT³'].flatMap(alias => [
+        alias, `${alias.toLowerCase()}.txt`, `${alias}.`, `${alias.toLowerCase()} `
+    ])
+);
 
 function commandRequest(overrides: Record<string, unknown> = {}, id: RequestId = 'rpc-command-1'): Readonly<{
     id: RequestId;
@@ -280,6 +285,16 @@ function createFixture(options: Readonly<{
     const client = new RecordingClient();
     const session = broker.connectClient(client);
     return { broker, client, clock, host, session };
+}
+
+function recordsDecline(fixture: ReturnType<typeof createFixture>): boolean {
+    const result = fixture.host.responses[0]?.result;
+    return fixture.client.latest().length === 0
+        && typeof result === 'object'
+        && result !== null
+        && Object.keys(result).length === 1
+        && (result as { decision?: unknown }).decision === 'decline'
+        && fixture.host.leases[0]?.releases === 1;
 }
 
 async function flushAsync(): Promise<void> {
@@ -670,30 +685,82 @@ describe('RideCodexApprovalBroker ownership', () => {
         }
     });
 
+    it('rejects superscript Windows DOS device aliases in cwd', async () => {
+        const notDeclined: string[] = [];
+        for (const [index, alias] of SUPERSCRIPT_DOS_DEVICE_ALIASES.entries()) {
+            const fixture = createFixture();
+            await fixture.session.setContext(CONTEXT);
+            await fixture.broker.handleServerRequest(
+                minimalCommandRequest({ cwd: `C:\\workspace\\src\\${alias}` }, `superscript-cwd-${index}`),
+                CONTEXT.generation
+            );
+            if (!recordsDecline(fixture)) {
+                notDeclined.push(alias);
+            }
+            await fixture.broker.dispose();
+        }
+        assert.deepEqual(notDeclined, []);
+    });
+
+    for (const { scopeKind, resolveScope } of [
+        {
+            scopeKind: 'relative file scope paths',
+            resolveScope: (alias: string) => resolution([{ path: `src\\${alias}\\file.ts`, kind: 'update' }])
+        },
+        {
+            scopeKind: 'absolute file scope paths',
+            resolveScope: (alias: string) => resolution([{ path: `C:\\workspace\\${alias}`, kind: 'update' }])
+        },
+        {
+            scopeKind: 'movePath',
+            resolveScope: (alias: string) => resolution([
+                { path: 'src\\safe.ts', kind: 'update', movePath: `src\\${alias}` }
+            ])
+        }
+    ]) {
+        it(`rejects superscript Windows DOS device aliases in ${scopeKind}`, async () => {
+            const notDeclined: string[] = [];
+            for (const [index, alias] of SUPERSCRIPT_DOS_DEVICE_ALIASES.entries()) {
+                const fixture = createFixture({ resolveFileScope: async () => resolveScope(alias) });
+                await fixture.session.setContext(CONTEXT);
+                await fixture.broker.handleServerRequest(
+                    fileRequest({}, `superscript-scope-${index}`), CONTEXT.generation
+                );
+                if (!recordsDecline(fixture)) {
+                    notDeclined.push(alias);
+                }
+                await fixture.broker.dispose();
+            }
+            assert.deepEqual(notDeclined, []);
+        });
+    }
+
     it('keeps DOS device spellings valid for POSIX cwd and file scopes', async () => {
+        const superscriptPath = SUPERSCRIPT_DOS_DEVICE_ALIASES.join('/');
+        const cwd = `CON/PRN.txt/${superscriptPath}`;
+        const path = `CON/prn.txt/${superscriptPath}`;
+        const movePath = `AUX/NUL.log/${superscriptPath}`;
         const fixture = createFixture({
             pathStyle: 'posix',
             resolveFileScope: async () => Object.freeze({
                 workspaceRoot: '/workspace',
                 changes: Object.freeze([
-                    { path: 'CON/prn.txt', kind: 'update' as const, movePath: 'AUX/NUL.log' }
+                    { path, kind: 'update' as const, movePath }
                 ])
             })
         });
         await fixture.session.setContext(CONTEXT);
         await fixture.broker.handleServerRequest(
-            minimalCommandRequest({ command: 'pwd', cwd: 'CON/PRN.txt' }, 'posix-command'),
+            minimalCommandRequest({ command: 'pwd', cwd }, 'posix-command'),
             CONTEXT.generation
         );
-        assert.equal((fixture.client.latest()[0] as { cwd?: string }).cwd, 'CON/PRN.txt');
+        assert.equal((fixture.client.latest()[0] as { cwd?: string }).cwd, cwd);
         await fixture.session.disposeContext();
         await fixture.session.setContext(CONTEXT);
         await fixture.broker.handleServerRequest(fileRequest({}, 'posix-file'), CONTEXT.generation);
         const card = fixture.client.latest()[0];
         assert.equal(card.kind, 'file-change');
-        assert.deepEqual(card.changes, [{
-            path: 'CON/prn.txt', kind: 'update', movePath: 'AUX/NUL.log'
-        }]);
+        assert.deepEqual(card.changes, [{ path, kind: 'update', movePath }]);
         await fixture.broker.dispose();
     });
 

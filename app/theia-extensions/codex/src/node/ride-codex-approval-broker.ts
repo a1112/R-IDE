@@ -1412,7 +1412,7 @@ function hasWindowsDeviceSegment(value: string): boolean {
             return false;
         }
         const stem = (segment.split('.', 1)[0] ?? '').replace(/ +$/u, '').toUpperCase();
-        return /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/u.test(stem);
+        return /^(?:CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])$/u.test(stem);
     });
 }
 
