@@ -51,11 +51,14 @@ export interface RideCodexSafeError {
     readonly message: string;
 }
 
-export interface RideCodexFileChange {
+interface RideCodexFileChangeBase {
     readonly path: string;
-    readonly kind: string;
-    readonly diff?: string;
+    readonly diff: string;
 }
+
+export type RideCodexFileChange =
+    | Readonly<RideCodexFileChangeBase & { kind: 'add' | 'delete' }>
+    | Readonly<RideCodexFileChangeBase & { kind: 'update'; movePath?: string | null }>;
 
 export interface RideCodexPlanStep {
     readonly step: string;

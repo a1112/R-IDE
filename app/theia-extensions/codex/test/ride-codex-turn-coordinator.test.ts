@@ -242,7 +242,12 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         host.emit('item/fileChange/outputDelta', { ...base, delta: 'patch output' });
         host.emit('item/fileChange/patchUpdated', {
             ...base,
-            changes: [{ path: 'src/a.ts', kind: 'update', diff: '@@ -1 +1 @@' }]
+            changes: [
+                { path: 'src/added.ts', kind: { type: 'add' }, diff: '+added' },
+                { path: 'src/deleted.ts', kind: { type: 'delete' }, diff: '-deleted' },
+                { path: 'src/updated.ts', kind: { type: 'update', move_path: null }, diff: '' },
+                { path: 'src/old-name.ts', kind: { type: 'update', move_path: 'src/new-name.ts' }, diff: 'renamed' }
+            ]
         });
         host.emit('turn/plan/updated', {
             threadId: 'thread-1', turnId: 'turn-1', explanation: 'next',
@@ -275,7 +280,12 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         const patchEvent = normalizedEvents.find(
             (event): event is Extract<RideCodexUiEvent, { type: 'file-patch' }> => event.type === 'file-patch'
         );
-        assert.equal(patchEvent?.changes[0].diff, '@@ -1 +1 @@');
+        assert.deepEqual(patchEvent?.changes, [
+            { path: 'src/added.ts', kind: 'add', diff: '+added' },
+            { path: 'src/deleted.ts', kind: 'delete', diff: '-deleted' },
+            { path: 'src/updated.ts', kind: 'update', diff: '', movePath: null },
+            { path: 'src/old-name.ts', kind: 'update', diff: 'renamed', movePath: 'src/new-name.ts' }
+        ]);
         assert.deepEqual(normalizedEvents.find(event => event.type === 'reasoning-delta'), {
             type: 'reasoning-delta', itemId: 'item-1', contentIndex: 0, delta: 'details'
         });
@@ -497,6 +507,61 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         assert.equal(traps, 0);
         assert.equal(batches.length, 0);
         assert.equal(host.releases, 0);
+    });
+
+    it('fails malformed file patch kinds closed without invoking nested Proxy or accessor traps', async () => {
+        const host = new FakeTurnHost();
+        const scheduler = new FakeScheduler();
+        const batches: RideCodexEventBatch[] = [];
+        const coordinator = new RideCodexTurnCoordinator({ host, scheduler });
+        const service = coordinator.connectClient({ turnEvents: batch => { batches.push(batch); } });
+        await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'hello' }] });
+        scheduler.flushOne();
+        await Promise.resolve();
+        host.emit('item/started', {
+            threadId: 'thread-1', turnId: 'turn-1', startedAtMs: 1,
+            item: { type: 'fileChange', id: 'item-1' }
+        });
+        scheduler.flushOne();
+        await Promise.resolve();
+        batches.length = 0;
+        let traps = 0;
+        const proxiedKind = new Proxy({ type: 'add' }, {
+            ownKeys: () => { traps += 1; return []; },
+            getOwnPropertyDescriptor: () => { traps += 1; return undefined; },
+            get: () => { traps += 1; return undefined; }
+        });
+        const accessorKind = Object.defineProperty({ type: 'update' }, 'move_path', {
+            enumerable: true,
+            get: () => { traps += 1; return 'src/unsafe.ts'; }
+        });
+        const invalidChanges: unknown[] = [
+            { path: 'src/a.ts', kind: 'add', diff: 'safe diff' },
+            { path: 'src/a.ts', kind: { type: 'unknown' }, diff: 'safe diff' },
+            { path: 'src/a.ts', kind: { type: 'add', move_path: null }, diff: 'safe diff' },
+            { path: 'src/a.ts', kind: { type: 'delete', extra: true }, diff: 'safe diff' },
+            { path: 'src/a.ts', kind: { type: 'update' }, diff: 'safe diff' },
+            { path: 'src/a.ts', kind: { type: 'update', move_path: 1 }, diff: 'safe diff' },
+            { path: 'src/a.ts', kind: { type: 'update', move_path: '你'.repeat(11_000) }, diff: 'safe diff' },
+            { path: 'src/\u001bunsafe.ts', kind: { type: 'add' }, diff: 'safe diff' },
+            { path: '你'.repeat(11_000), kind: { type: 'add' }, diff: 'safe diff' },
+            { path: 'src/a.ts', kind: { type: 'add' }, diff: '你'.repeat(22_000) },
+            { path: 'src/a.ts', kind: proxiedKind, diff: 'safe diff' },
+            { path: 'src/a.ts', kind: accessorKind, diff: 'safe diff' },
+            { path: 'src/a.ts', kind: { type: 'add' }, diff: 'safe diff', extra: true },
+            { path: 'src/a.ts', kind: { type: 'add' } }
+        ];
+        for (const change of invalidChanges) {
+            host.emit('item/fileChange/patchUpdated', {
+                threadId: 'thread-1', turnId: 'turn-1', itemId: 'item-1',
+                changes: [change]
+            });
+        }
+        scheduler.flushOne();
+        await Promise.resolve();
+
+        assert.equal(traps, 0);
+        assert.equal(batches.length, 0);
     });
 
     it('retains truncation metadata for each rapid turn identity before a flush', async () => {

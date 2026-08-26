@@ -70,7 +70,7 @@ describe('RideCodexEventReducer minimal frame contract', () => {
             { type: 'plan-delta', itemId: 'item-1', delta: 'step' },
             { type: 'command-output', itemId: 'command-1', delta: 'stdout' },
             { type: 'file-output', itemId: 'file-1', delta: 'patch' },
-            { type: 'file-patch', itemId: 'file-1', changes: [{ path: 'src/a.ts', kind: 'update' }] },
+            { type: 'file-patch', itemId: 'file-1', changes: [{ path: 'src/a.ts', kind: 'update', diff: 'updated' }] },
             { type: 'turn-plan', explanation: 'next', steps: [{ step: 'build', status: 'in-progress' }] },
             { type: 'turn-diff', diff: '+line' },
             { type: 'token-usage', totalTokens: 10, inputTokens: 4, outputTokens: 6 },
@@ -97,6 +97,71 @@ describe('RideCodexEventReducer minimal frame contract', () => {
         assert.ok(Object.isFrozen(snapshot));
         assert.ok(Object.isFrozen(snapshot.items));
         assert.ok(Object.isFrozen(snapshot.items[0]));
+    });
+
+    it('preserves and deeply freezes add, delete, update, and moved file patches', () => {
+        const frames: Array<() => void> = [];
+        const reducer = new RideCodexEventReducer({
+            scheduleFrame: callback => {
+                frames.push(callback);
+                return { dispose: () => undefined };
+            }
+        });
+        reducer.notifyMany({
+            generation: 1,
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            events: [
+                { type: 'turn-started' },
+                {
+                    type: 'file-patch', itemId: 'file-1', changes: [
+                        { path: 'src/added.ts', kind: 'add', diff: '' },
+                        { path: 'src/deleted.ts', kind: 'delete', diff: '-deleted' },
+                        { path: 'src/updated.ts', kind: 'update', diff: 'updated', movePath: null },
+                        { path: 'src/old.ts', kind: 'update', diff: 'moved', movePath: 'src/new.ts' }
+                    ]
+                }
+            ]
+        } as RideCodexEventBatch);
+        frames.shift()?.();
+
+        const changes = reducer.snapshot().items[0].changes;
+        assert.deepEqual(changes, [
+            { path: 'src/added.ts', kind: 'add', diff: '' },
+            { path: 'src/deleted.ts', kind: 'delete', diff: '-deleted' },
+            { path: 'src/updated.ts', kind: 'update', diff: 'updated', movePath: null },
+            { path: 'src/old.ts', kind: 'update', diff: 'moved', movePath: 'src/new.ts' }
+        ]);
+        assert.ok(Object.isFrozen(changes));
+        assert.ok(changes.every(change => Object.isFrozen(change)));
+    });
+
+    it('rejects file patch changes with unknown fields or malformed movePath', () => {
+        const frames: Array<() => void> = [];
+        const reducer = new RideCodexEventReducer({
+            scheduleFrame: callback => {
+                frames.push(callback);
+                return { dispose: () => undefined };
+            }
+        });
+        for (const change of [
+            { path: 'src/a.ts', kind: 'add', diff: '+a', unknown: true },
+            { path: 'src/a.ts', kind: 'delete', diff: '-a', movePath: null },
+            { path: 'src/a.ts', kind: 'update', diff: 'x', movePath: 1 },
+            { path: 'src/\u001bunsafe.ts', kind: 'add', diff: '+a' },
+            { path: '你'.repeat(11_000), kind: 'add', diff: '+a' },
+            { path: 'src/a.ts', kind: 'add', diff: '你'.repeat(22_000) },
+            { path: 'src/a.ts', kind: 'update', diff: 'x', movePath: '你'.repeat(11_000) },
+            { path: 'src/a.ts', kind: 'unknown', diff: 'x' }
+        ]) {
+            reducer.notifyMany({
+                generation: 1, threadId: 'thread-1', turnId: 'turn-1',
+                events: [{ type: 'turn-started' }, { type: 'file-patch', itemId: 'file-1', changes: [change] }]
+            } as RideCodexEventBatch);
+        }
+
+        assert.equal(frames.length, 0);
+        assert.equal(reducer.snapshot().status, 'idle');
     });
 
     it('renders reasoning summary parts and reasoning text into separate UTF-8 bounded fields', () => {

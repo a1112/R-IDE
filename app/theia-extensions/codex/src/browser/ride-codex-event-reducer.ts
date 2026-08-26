@@ -46,6 +46,8 @@ const DEFAULT_MAX_ITEM_BYTES = 64 * 1024;
 const DEFAULT_MAX_RETAINED_ITEMS = 256;
 const DEFAULT_MAX_RETAINED_BYTES = 2 * 1024 * 1024;
 const DEFAULT_MAX_DIAGNOSTIC_HISTORY = 64;
+const MAX_FILE_PATCH_PATH_BYTES = 32 * 1024;
+const MAX_FILE_PATCH_DIFF_BYTES = 64 * 1024;
 
 const EMPTY_SNAPSHOT: RideCodexTurnSnapshot = deepFreezeRideCodex({
     generation: 0,
@@ -642,10 +644,9 @@ function isUiEvent(value: unknown): value is RideCodexUiEvent {
         case 'reasoning-summary-part':
             return identifier(value.itemId) && index(value.summaryIndex);
         case 'file-patch':
-            return identifier(value.itemId) && Array.isArray(value.changes)
-                && value.changes.every(change => isPlainRecord(change)
-                    && text(change.path) && text(change.kind)
-                    && (change.diff === undefined || text(change.diff)));
+            return hasOnlyKeys(value, ['type', 'itemId', 'changes'])
+                && identifier(value.itemId) && Array.isArray(value.changes)
+                && value.changes.every(isFileChange);
         case 'turn-plan':
             return (value.explanation === undefined || text(value.explanation))
                 && Array.isArray(value.steps) && value.steps.every(step =>
@@ -667,6 +668,35 @@ function isUiEvent(value: unknown): value is RideCodexUiEvent {
         default:
             return false;
     }
+}
+
+function isFileChange(value: unknown): value is RideCodexFileChange {
+    if (!isPlainRecord(value) || !isDisplayPath(value.path)
+        || typeof value.diff !== 'string'
+        || utf8ByteLength(value.diff) > MAX_FILE_PATCH_DIFF_BYTES) {
+        return false;
+    }
+    if (value.kind === 'add' || value.kind === 'delete') {
+        return hasOnlyKeys(value, ['path', 'kind', 'diff']);
+    }
+    if (value.kind !== 'update' || !hasOnlyKeys(value, ['path', 'kind', 'diff', 'movePath'])) {
+        return false;
+    }
+    return isOptionalDisplayPath(value.movePath);
+}
+
+function isDisplayPath(value: unknown): value is string {
+    return typeof value === 'string' && value.length > 0
+        && utf8ByteLength(value) <= MAX_FILE_PATCH_PATH_BYTES
+        && !/[\u0000-\u001f\u007f-\u009f]/u.test(value);
+}
+
+function isOptionalDisplayPath(value: unknown): value is string | null | undefined {
+    return value === undefined || (!value && typeof value === 'object') || isDisplayPath(value);
+}
+
+function hasOnlyKeys(value: Record<string, unknown>, allowed: readonly string[]): boolean {
+    return Object.keys(value).every(key => allowed.includes(key));
 }
 
 interface CopyBudget {

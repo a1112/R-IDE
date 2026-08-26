@@ -780,16 +780,18 @@ export class RideCodexTurnCoordinator {
                 }));
                 return;
             }
-            case 'item/fileChange/patchUpdated':
-                if (!this.#isItemOpen(params)) {
+            case 'item/fileChange/patchUpdated': {
+                const patchParams = requireOptions(params, ['threadId', 'turnId', 'itemId', 'changes']);
+                if (!this.#isItemOpen(patchParams)) {
                     return;
                 }
                 this.#enqueue(Object.freeze({
                     type: 'file-patch',
-                    itemId: requireIdentifier(ownValue(params, 'itemId')),
-                    changes: normalizeFileChanges(ownValue(params, 'changes'), this.#maxRetainedItems)
+                    itemId: requireIdentifier(ownValue(patchParams, 'itemId')),
+                    changes: normalizeFileChanges(ownValue(patchParams, 'changes'), this.#maxRetainedItems)
                 }));
                 return;
+            }
             case 'turn/plan/updated':
                 this.#enqueue(Object.freeze({
                     type: 'turn-plan',
@@ -1385,6 +1387,13 @@ function requireString(value: unknown, maxBytes: number): string {
     return value;
 }
 
+function requireBoundedText(value: unknown, maxBytes: number): string {
+    if (typeof value !== 'string' || utf8ByteLength(value) > maxBytes) {
+        throw new RideCodexTurnError('invalid-data');
+    }
+    return value;
+}
+
 function requireIndex(value: unknown): number {
     if (!Number.isSafeInteger(value) || (value as number) < 0 || (value as number) > 1_024) {
         throw new RideCodexTurnError('invalid-data');
@@ -1419,17 +1428,39 @@ function normalizeFileChanges(value: unknown, limit: number): readonly RideCodex
         throw new RideCodexTurnError('invalid-data');
     }
     return Object.freeze(value.map(raw => {
-        const record = requireRecord(raw);
-        const path = requireString(ownValue(record, 'path'), MAX_LOCAL_PATH_BYTES);
-        const rawKind = ownValue(record, 'kind') ?? ownValue(record, 'type');
-        const kind = typeof rawKind === 'string' ? truncateUtf8(rawKind, 64) : 'update';
-        const rawDiff = ownValue(record, 'diff');
-        return Object.freeze({
-            path,
-            kind,
-            ...(rawDiff === undefined ? {} : { diff: requireString(rawDiff, MAX_INPUT_TEXT_BYTES) })
-        });
+        const record = requireOptions(raw, ['path', 'kind', 'diff']);
+        const path = requireDisplayPath(ownValue(record, 'path'));
+        const diff = requireBoundedText(ownValue(record, 'diff'), MAX_INPUT_TEXT_BYTES);
+        const kindRecord = requireRecord(ownValue(record, 'kind'));
+        const kind = ownValue(kindRecord, 'type');
+        if (kind === 'add' || kind === 'delete') {
+            requireOptions(kindRecord, ['type']);
+            return Object.freeze({ path, kind, diff });
+        }
+        if (kind !== 'update') {
+            throw new RideCodexTurnError('invalid-data');
+        }
+        requireOptions(kindRecord, ['type', 'move_path']);
+        const moveDescriptor = Object.getOwnPropertyDescriptor(kindRecord, 'move_path');
+        if (!moveDescriptor) {
+            throw new RideCodexTurnError('invalid-data');
+        }
+        if (moveDescriptor.value === undefined) {
+            throw new RideCodexTurnError('invalid-data');
+        }
+        const movePath = isNullish(moveDescriptor.value)
+            ? moveDescriptor.value
+            : requireDisplayPath(moveDescriptor.value);
+        return Object.freeze({ path, kind, diff, movePath });
     }));
+}
+
+function requireDisplayPath(value: unknown): string {
+    const path = requireString(value, MAX_LOCAL_PATH_BYTES);
+    if (/[\u0000-\u001f\u007f-\u009f]/u.test(path)) {
+        throw new RideCodexTurnError('invalid-data');
+    }
+    return path;
 }
 
 function normalizePlan(value: unknown, limit: number): readonly RideCodexPlanStep[] {
@@ -1495,8 +1526,11 @@ function boundEvent(event: RideCodexUiEvent, maxBytes: number, maxItems: number)
                 ...event,
                 changes: event.changes.slice(0, maxItems).map(change => ({
                     path: truncateUtf8(change.path, maxBytes),
-                    kind: truncateUtf8(change.kind, 64),
-                    ...(change.diff === undefined ? {} : { diff: truncateUtf8(change.diff, maxBytes) })
+                    kind: change.kind,
+                    diff: truncateUtf8(change.diff, maxBytes),
+                    ...(change.kind === 'update' && change.movePath !== undefined
+                        ? { movePath: isNullish(change.movePath) ? change.movePath : truncateUtf8(change.movePath, maxBytes) }
+                        : {})
                 }))
             }) as RideCodexUiEvent;
         case 'warning':
@@ -1660,7 +1694,7 @@ function safePromise(value: unknown): Promise<unknown> {
     return Promise.resolve(value);
 }
 
-function isNullish(value: unknown): boolean {
+function isNullish(value: unknown): value is null | undefined {
     return value === undefined || (!value && typeof value === 'object');
 }
 
