@@ -713,6 +713,62 @@ test('diagnostics redact quoted and spaced secrets, arbitrary local paths, and U
     assert.equal(streamSnapshot.stderr.truncated, false);
 });
 
+test('diagnostics redact compound credential fields without matching ordinary words', () => {
+    const sensitiveCases = [
+        '{"client_secret":"AUDIT_ALPHA"}',
+        "{'private_key':'AUDIT_BRAVO'}",
+        'client-secret=AUDIT_CHARLIE',
+        'dbPassword: AUDIT_DELTA',
+        'oauth_token=AUDIT_ECHO',
+        'refreshToken: AUDIT_FOXTROT',
+        'access_token=AUDIT_GOLF',
+        'signingKey: AUDIT_HOTEL',
+        'apiKey=AUDIT_INDIA',
+        'x-api-key: AUDIT_JULIET',
+        'X-Client-Secret: AUDIT_KILO',
+        'ACCESS_KEY=AUDIT_LIMA',
+        'credentialId=AUDIT_MIKE',
+        'credentialValue: AUDIT_NOVEMBER'
+    ];
+    const sensitiveValues = /AUDIT_(?:ALPHA|BRAVO|CHARLIE|DELTA|ECHO|FOXTROT|GOLF|HOTEL|INDIA|JULIET|KILO|LIMA|MIKE|NOVEMBER)/;
+    const ordinary = 'keyboard=ansi monkey=capuchin tokenizer=bpe';
+    const recordDiagnostics = new RideCodexAppServerDiagnostics({
+        maxEntries: sensitiveCases.length + 1,
+        maxEntryBytes: 256
+    });
+    for (const detail of sensitiveCases) {
+        recordDiagnostics.record('protocol-error', detail);
+    }
+    recordDiagnostics.record('protocol-error', ordinary);
+
+    const recordSnapshot = recordDiagnostics.snapshot();
+    const serializedRecords = JSON.stringify(recordSnapshot);
+    assert.doesNotMatch(serializedRecords, sensitiveValues);
+    assert.match(serializedRecords, /keyboard=ansi monkey=capuchin tokenizer=bpe/);
+
+    const streamDiagnostics = new RideCodexAppServerDiagnostics({
+        maxStderrLines: sensitiveCases.length,
+        maxStderrBytes: 4_096,
+        maxLineBytes: 256
+    });
+    streamDiagnostics.appendStderr(Buffer.from(`${sensitiveCases.join('\n')}\n`));
+    streamDiagnostics.flushStderr();
+    const streamSnapshot = streamDiagnostics.snapshot();
+    assert.doesNotMatch(JSON.stringify(streamSnapshot), sensitiveValues);
+
+    const chunkedDiagnostics = new RideCodexAppServerDiagnostics({
+        maxStderrLines: 2,
+        maxStderrBytes: 512,
+        maxLineBytes: 256
+    });
+    chunkedDiagnostics.appendStderr(Buffer.from('{"client_sec'));
+    chunkedDiagnostics.appendStderr(Buffer.from('ret":"AUDIT_ALPHA","private_key":"AUDIT_BR'));
+    chunkedDiagnostics.appendStderr(Buffer.from('AVO"}\ncredentialVal'));
+    chunkedDiagnostics.appendStderr(Buffer.from('ue: AUDIT_NOVEMBER\n'));
+    chunkedDiagnostics.flushStderr();
+    assert.doesNotMatch(JSON.stringify(chunkedDiagnostics.snapshot()), sensitiveValues);
+});
+
 test('stderr redaction survives chunk boundaries and bounds an overlong unterminated line', () => {
     const diagnostics = new RideCodexAppServerDiagnostics({
         maxEntries: 2,

@@ -200,19 +200,12 @@ function safeLimit(value: number | undefined, fallback: number, minimum: number,
 }
 
 function redactUntrustedText(value: string): string {
-    return value
+    const sanitized = value
         .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '')
         .replace(/\b(https?:\/\/)[^/\s:@]+:[^/\s@]+@/gi, '$1<redacted>@')
         .replace(/\bauthorization\s*[:=]\s*(?:bearer\s+)?[^\s,;&]+/gi, 'authorization=<redacted>')
-        .replace(/\bbearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer <redacted>')
-        .replace(
-            /(["'])((?:openai[\s_-]*)?api[\s_-]*key|access[\s_-]*token|refresh[\s_-]*token|credential|password|key|token|secret)\1\s*[:=]\s*(?:"(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|[^\r\n,;&}]+)/gi,
-            '$1$2$1=<redacted>'
-        )
-        .replace(
-            /\b((?:openai[\s_-]*)?api[\s_-]*key|access[\s_-]*token|refresh[\s_-]*token|credential|password|key|token|secret)\b\s*(?:[:=]\s*|\s+)(?:"(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|[^\r\n,;&}]+)/gi,
-            '$1=<redacted>'
-        )
+        .replace(/\bbearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer <redacted>');
+    return redactCredentialAssignments(sanitized)
         .replace(/\bsk-[A-Za-z0-9_-]+\b/gi, '<redacted>')
         .replace(/(["'])(?:file:\/{2,3}|[A-Za-z]:[\\/]|\\\\|\/)[^"'\r\n]*\1/gi, '<path>')
         .replace(/\bfile:\/{2,3}[^\r\n,;)"'\]}]*/gi, '<path>')
@@ -221,6 +214,157 @@ function redactUntrustedText(value: string): string {
         .replace(/(^|[\s=:(\[,])\/(?!\/)[^\r\n,;)"'\]}]*/g, '$1<path>')
         .replace(/\b[A-Za-z0-9._-]*secret[A-Za-z0-9._-]*\b/gi, '<redacted>')
         .replace(/\b[A-Za-z0-9+/_=-]{64,}\b/g, '<redacted>');
+}
+
+interface CredentialAssignment {
+    readonly valueStart: number;
+    readonly end: number;
+}
+
+function redactCredentialAssignments(value: string): string {
+    let cursor = 0;
+    let scan = 0;
+    let redacted = '';
+    while (scan < value.length) {
+        const assignment = readCredentialAssignment(value, scan);
+        if (assignment === undefined) {
+            scan += 1;
+            continue;
+        }
+        redacted += value.slice(cursor, assignment.valueStart);
+        redacted += '<redacted>';
+        cursor = assignment.end;
+        scan = assignment.end;
+    }
+    return cursor === 0 ? value : redacted + value.slice(cursor);
+}
+
+function readCredentialAssignment(value: string, start: number): CredentialAssignment | undefined {
+    const quote = value[start] === '"' || value[start] === "'" ? value[start] : undefined;
+    let fieldStart = start;
+    let fieldEnd: number;
+    if (quote !== undefined) {
+        fieldStart += 1;
+        fieldEnd = fieldStart;
+        while (fieldEnd < value.length && isCredentialFieldCharacter(value[fieldEnd]) && fieldEnd - fieldStart < 128) {
+            fieldEnd += 1;
+        }
+        if (fieldEnd === fieldStart || value[fieldEnd] !== quote) {
+            return undefined;
+        }
+    } else {
+        if (!isAsciiLetter(value[start]) || (start > 0 && isCredentialFieldCharacter(value[start - 1]))) {
+            return undefined;
+        }
+        fieldEnd = start + 1;
+        while (fieldEnd < value.length && isCredentialFieldCharacter(value[fieldEnd]) && fieldEnd - start < 128) {
+            fieldEnd += 1;
+        }
+    }
+
+    const fieldName = value.slice(fieldStart, fieldEnd);
+    if (!isSensitiveCredentialField(fieldName)) {
+        return undefined;
+    }
+
+    let separator = quote === undefined ? fieldEnd : fieldEnd + 1;
+    const whitespaceStart = separator;
+    while (separator < value.length && isHorizontalWhitespace(value[separator])) {
+        separator += 1;
+    }
+    if (value[separator] === ':' || value[separator] === '=') {
+        separator += 1;
+        while (separator < value.length && isHorizontalWhitespace(value[separator])) {
+            separator += 1;
+        }
+    } else if (quote !== undefined || separator === whitespaceStart) {
+        return undefined;
+    }
+    if (separator >= value.length || value[separator] === '\r' || value[separator] === '\n') {
+        return undefined;
+    }
+
+    return {
+        valueStart: separator,
+        end: readCredentialValueEnd(value, separator)
+    };
+}
+
+function readCredentialValueEnd(value: string, start: number): number {
+    const quote = value[start] === '"' || value[start] === "'" ? value[start] : undefined;
+    if (quote !== undefined) {
+        let index = start + 1;
+        while (index < value.length) {
+            if (value[index] === '\\') {
+                index = Math.min(value.length, index + 2);
+            } else if (value[index] === quote) {
+                return index + 1;
+            } else {
+                index += 1;
+            }
+        }
+        return value.length;
+    }
+    let index = start;
+    while (index < value.length && !isCredentialValueDelimiter(value[index])) {
+        index += 1;
+    }
+    return index;
+}
+
+function isSensitiveCredentialField(fieldName: string): boolean {
+    const segments = fieldName
+        .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+        .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+        .split(/[^A-Za-z0-9]+/)
+        .filter(segment => segment.length > 0)
+        .map(segment => segment.toLowerCase());
+    if (segments.length === 0) {
+        return false;
+    }
+    const sensitiveSegments = new Set(['secret', 'password', 'passwd', 'token', 'credential']);
+    if (segments.some(segment => sensitiveSegments.has(segment))) {
+        return true;
+    }
+    if (segments.length === 1 && segments[0] === 'key') {
+        return true;
+    }
+    const sensitiveKeyQualifiers = new Set(['private', 'api', 'signing', 'access']);
+    for (let index = 1; index < segments.length; index += 1) {
+        if (segments[index] === 'key' && sensitiveKeyQualifiers.has(segments[index - 1])) {
+            return true;
+        }
+    }
+    const collapsed = segments.join('');
+    return ['secret', 'password', 'passwd', 'token', 'credential', 'privatekey', 'apikey', 'signingkey', 'accesskey']
+        .some(suffix => collapsed === suffix || collapsed.endsWith(suffix));
+}
+
+function isAsciiLetter(value: string): boolean {
+    const code = value.charCodeAt(0);
+    return (code >= 0x41 && code <= 0x5a) || (code >= 0x61 && code <= 0x7a);
+}
+
+function isCredentialFieldCharacter(value: string): boolean {
+    const code = value.charCodeAt(0);
+    return isAsciiLetter(value)
+        || (code >= 0x30 && code <= 0x39)
+        || value === '_'
+        || value === '-'
+        || value === '.';
+}
+
+function isHorizontalWhitespace(value: string): boolean {
+    return value === ' ' || value === '\t';
+}
+
+function isCredentialValueDelimiter(value: string): boolean {
+    return value === '\r'
+        || value === '\n'
+        || value === ','
+        || value === ';'
+        || value === '&'
+        || value === '}';
 }
 
 function boundUtf8(value: string, maxBytes: number): { readonly value: string; readonly truncated: boolean } {
