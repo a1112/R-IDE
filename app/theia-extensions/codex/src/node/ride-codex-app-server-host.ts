@@ -65,6 +65,7 @@ export interface RideCodexAppServerHostOptions {
 
 export interface RideCodexAppServerLease {
     readonly kind: RideCodexAppServerLeaseKind;
+    readonly generation: number;
     request(method: StableClientMethod, params: unknown, timeoutMs?: number): Promise<unknown>;
     notify(method: RideCodexClientNotificationMethod, params: unknown): Promise<void>;
     release(): void;
@@ -227,9 +228,9 @@ export class RideCodexAppServerHost {
             this.#unsafeApprovalCount += 1;
         }
         try {
-            await this.#ensureStarted(false);
+            const connection = await this.#ensureStarted(false);
             this.#requireUsable();
-            return this.#createLease(record);
+            return this.#createLease(record, connection.generation);
         } catch (error) {
             this.#releaseRecord(record);
             throw error;
@@ -337,9 +338,10 @@ export class RideCodexAppServerHost {
         return this.dispose();
     }
 
-    #createLease(record: LeaseRecord): RideCodexAppServerLease {
+    #createLease(record: LeaseRecord, generation: number): RideCodexAppServerLease {
         return Object.freeze({
             kind: record.kind,
+            generation,
             request: (method: StableClientMethod, params: unknown, timeoutMs?: number) =>
                 this.#request(record, method, params, timeoutMs),
             notify: (method: RideCodexClientNotificationMethod, params: unknown) =>

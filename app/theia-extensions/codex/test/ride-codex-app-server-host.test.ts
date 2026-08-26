@@ -29,7 +29,11 @@ import {
 import { createRideCodexLaunchSpec, RideCodexLaunchSpec } from '../src/node/ride-codex-launch-spec';
 import { RideCodexRuntimeResolver } from '../src/node/ride-codex-runtime-resolver';
 import { RideCodexAuthBroker } from '../src/node/ride-codex-auth-broker';
-import { RideCodexAuthService } from '../src/common/ride-codex-protocol';
+import { RideCodexThreadCoordinator } from '../src/node/ride-codex-thread-coordinator';
+import {
+    RideCodexAuthService,
+    RideCodexConversationsService
+} from '../src/common/ride-codex-protocol';
 
 const fixture = resolve(__dirname, '../../fixtures/fake-app-server.mjs');
 
@@ -234,12 +238,18 @@ test('constructors and backend singleton bindings stay inert until first acquire
     assert.equal(boundHost.snapshot().state, 'stopped');
     const authBroker = container.get(RideCodexAuthBroker);
     assert.strictEqual(container.get(RideCodexAuthService), authBroker);
+    const conversations = container.get(RideCodexThreadCoordinator);
+    assert.strictEqual(container.get(RideCodexConversationsService), conversations);
+    assert.ok(container.getAll(BackendApplicationContribution).includes(conversations));
     assert.equal(authBroker.snapshot().state, 'inactive');
     assert.equal(boundHost.snapshot().state, 'stopped');
     assert.ok((container.getAll(ConnectionHandler) as ConnectionHandler[])
         .some(handler => handler.path === '/services/ride-codex-auth'));
+    assert.ok((container.getAll(ConnectionHandler) as ConnectionHandler[])
+        .some(handler => handler.path === '/services/ride-codex-conversations'));
 
     const lease = await direct.host.acquire('foreground-panel');
+    assert.equal(lease.generation, 1);
     assert.equal(direct.resolveCalls(), 1);
     assert.equal(direct.records.length, 1);
     lease.release();
