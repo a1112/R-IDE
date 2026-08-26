@@ -329,6 +329,59 @@ class FakeTurnHost implements RideCodexTurnHost {
     }
 }
 
+async function acceptsTurnStartResponse(turn: Record<string, unknown>): Promise<boolean> {
+    const host = new FakeTurnHost();
+    host.startPromise = Promise.resolve({ turn });
+    const coordinator = new RideCodexTurnCoordinator({ host });
+    const service = coordinator.connectClient({ turnEvents: () => undefined });
+    try {
+        await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'numeric' }] });
+        return true;
+    } catch (error) {
+        assert.equal((error as { code?: string }).code, 'invalid-data');
+        return false;
+    } finally {
+        await coordinator.dispose();
+    }
+}
+
+async function acceptsThreadResumeResponse(thread: Record<string, unknown>): Promise<boolean> {
+    const host = new FakeTurnHost();
+    const scheduler = new FakeScheduler();
+    const timeoutCallbacks: Array<() => void> = [];
+    const events: RideCodexUiEvent[] = [];
+    host.interruptPromise = Promise.resolve({});
+    host.resumeResponse = { ...validResumeResponse(), thread };
+    const coordinator = new RideCodexTurnCoordinator({
+        host,
+        scheduler,
+        interruptTimeoutMs: 10,
+        timers: {
+            setTimeout: callback => { timeoutCallbacks.push(callback); return callback; },
+            clearTimeout: () => undefined
+        }
+    });
+    const service = coordinator.connectClient({
+        turnEvents: wire => { events.push(...decodeBatch(wire).events); }
+    });
+    try {
+        await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'numeric' }] });
+        const interrupting = service.interruptTurn({ threadId: 'thread-1', turnId: 'turn-1' });
+        await Promise.resolve();
+        const timeout = timeoutCallbacks.shift();
+        assert.ok(timeout, 'interrupt timeout must be installed before recovery validation');
+        timeout();
+        assert.equal((await interrupting).status, 'interrupt-uncertain');
+        while (scheduler.callbacks.length > 0) {
+            scheduler.flushOne();
+            await Promise.resolve();
+        }
+        return !events.some(event => event.type === 'error' && event.code === 'recovery-failed');
+    } finally {
+        await coordinator.dispose();
+    }
+}
+
 describe('RideCodexTurnCoordinator minimal streaming contract', () => {
     it('sends exact start, steer expectedTurnId, and interrupt calls', async () => {
         const host = new FakeTurnHost();
@@ -2246,6 +2299,337 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
                 }),
                 error => (error as { code?: string }).code === 'invalid-data'
             );
+        }
+    });
+
+    it('rejects the reviewed fractional int64, overflowing uint32, and overflowing int32 responses', async context => {
+        const cases = [
+            {
+                name: 'fractional Turn.startedAt',
+                turn: { ...validTurn(), startedAt: 0.5 }
+            },
+            {
+                name: 'overflowing MemoryCitation lines',
+                turn: {
+                    ...validTurn(),
+                    items: [{
+                        type: 'agentMessage', id: 'agent-1', text: 'done', phase: null,
+                        memoryCitation: {
+                            entries: [{
+                                path: 'memory.md', lineStart: 4_294_967_296,
+                                lineEnd: 4_294_967_296, note: ''
+                            }],
+                            threadIds: []
+                        }
+                    }]
+                }
+            },
+            {
+                name: 'overflowing CommandExecution.exitCode',
+                turn: {
+                    ...validTurn(),
+                    items: [{
+                        type: 'commandExecution', id: 'command-1', command: 'run', cwd: 'C:\\workspace',
+                        processId: null, source: 'agent', status: 'completed', commandActions: [],
+                        aggregatedOutput: null, exitCode: 1_099_511_627_776, durationMs: 1
+                    }]
+                }
+            }
+        ];
+        for (const numericCase of cases) {
+            await context.test(numericCase.name, async () => {
+                assert.equal(await acceptsTurnStartResponse(numericCase.turn), false);
+            });
+        }
+    });
+
+    it('enforces every Codex 0.144 turn numeric format at its exact JSON-safe boundaries', async () => {
+        type NumericFormat = 'int64' | 'int32' | 'uint32' | 'uint' | 'uint16' | 'uint64';
+        type NumericBoundary = Readonly<{ label: string; value: number; accepted: boolean }>;
+        type TurnNumericField = Readonly<{
+            name: string;
+            format: NumericFormat;
+            nullable?: boolean;
+            turn: (value: number | null) => Record<string, unknown>;
+        }>;
+        const boundaries: Readonly<Record<NumericFormat, readonly NumericBoundary[]>> = {
+            int64: [
+                { label: 'safe-min', value: Number.MIN_SAFE_INTEGER, accepted: true },
+                { label: 'safe-max', value: Number.MAX_SAFE_INTEGER, accepted: true },
+                { label: 'below-safe-min', value: Number.MIN_SAFE_INTEGER - 1, accepted: false },
+                { label: 'above-safe-max', value: Number.MAX_SAFE_INTEGER + 1, accepted: false },
+                { label: 'fraction', value: 0.5, accepted: false },
+                { label: 'infinity', value: Number.POSITIVE_INFINITY, accepted: false }
+            ],
+            int32: [
+                { label: 'min', value: -2_147_483_648, accepted: true },
+                { label: 'max', value: 2_147_483_647, accepted: true },
+                { label: 'below-min', value: -2_147_483_649, accepted: false },
+                { label: 'above-max', value: 2_147_483_648, accepted: false },
+                { label: 'fraction', value: 0.5, accepted: false },
+                { label: 'infinity', value: Number.POSITIVE_INFINITY, accepted: false }
+            ],
+            uint32: [
+                { label: 'min', value: 0, accepted: true },
+                { label: 'max', value: 4_294_967_295, accepted: true },
+                { label: 'below-min', value: -1, accepted: false },
+                { label: 'above-max', value: 4_294_967_296, accepted: false },
+                { label: 'fraction', value: 0.5, accepted: false },
+                { label: 'infinity', value: Number.POSITIVE_INFINITY, accepted: false }
+            ],
+            uint: [
+                { label: 'min', value: 0, accepted: true },
+                { label: 'safe-max', value: Number.MAX_SAFE_INTEGER, accepted: true },
+                { label: 'below-min', value: -1, accepted: false },
+                { label: 'above-safe-max', value: Number.MAX_SAFE_INTEGER + 1, accepted: false },
+                { label: 'fraction', value: 0.5, accepted: false },
+                { label: 'infinity', value: Number.POSITIVE_INFINITY, accepted: false }
+            ],
+            uint16: [
+                { label: 'min', value: 0, accepted: true },
+                { label: 'max', value: 65_535, accepted: true },
+                { label: 'below-min', value: -1, accepted: false },
+                { label: 'above-max', value: 65_536, accepted: false },
+                { label: 'fraction', value: 0.5, accepted: false },
+                { label: 'infinity', value: Number.POSITIVE_INFINITY, accepted: false }
+            ],
+            uint64: [
+                { label: 'min', value: 0, accepted: true },
+                { label: 'safe-max', value: Number.MAX_SAFE_INTEGER, accepted: true },
+                { label: 'below-min', value: -1, accepted: false },
+                { label: 'above-safe-max', value: Number.MAX_SAFE_INTEGER + 1, accepted: false },
+                { label: 'fraction', value: 0.5, accepted: false },
+                { label: 'infinity', value: Number.POSITIVE_INFINITY, accepted: false }
+            ]
+        };
+        const command = (exitCode: number | null, durationMs: number | null): Record<string, unknown> => ({
+            type: 'commandExecution', id: 'command-1', command: 'run', cwd: 'C:\\workspace',
+            processId: null, source: 'agent', status: 'completed', commandActions: [],
+            aggregatedOutput: null, exitCode, durationMs
+        });
+        const fields: readonly TurnNumericField[] = [
+            {
+                name: 'Turn.startedAt', format: 'int64', nullable: true,
+                turn: value => ({ ...validTurn(), startedAt: value })
+            },
+            {
+                name: 'Turn.completedAt', format: 'int64', nullable: true,
+                turn: value => ({ ...validTurn(), completedAt: value })
+            },
+            {
+                name: 'Turn.durationMs', format: 'int64', nullable: true,
+                turn: value => ({ ...validTurn(), durationMs: value })
+            },
+            {
+                name: 'CommandExecution.exitCode', format: 'int32', nullable: true,
+                turn: value => ({ ...validTurn(), items: [command(value, 0)] })
+            },
+            {
+                name: 'CommandExecution.durationMs', format: 'int64', nullable: true,
+                turn: value => ({ ...validTurn(), items: [command(0, value)] })
+            },
+            {
+                name: 'McpToolCall.durationMs', format: 'int64', nullable: true,
+                turn: value => ({
+                    ...validTurn(),
+                    items: [{
+                        type: 'mcpToolCall', id: 'mcp-1', server: 'server', tool: 'tool', status: 'completed',
+                        arguments: null, appContext: null, pluginId: null, result: null, error: null,
+                        durationMs: value
+                    }]
+                })
+            },
+            {
+                name: 'DynamicToolCall.durationMs', format: 'int64', nullable: true,
+                turn: value => ({
+                    ...validTurn(),
+                    items: [{
+                        type: 'dynamicToolCall', id: 'dynamic-1', namespace: null, tool: 'run',
+                        arguments: null, status: 'completed', contentItems: null, success: true,
+                        durationMs: value
+                    }]
+                })
+            },
+            {
+                name: 'MemoryCitation.lineStart', format: 'uint32',
+                turn: value => ({
+                    ...validTurn(),
+                    items: [{
+                        type: 'agentMessage', id: 'agent-1', text: 'done', phase: null,
+                        memoryCitation: {
+                            entries: [{ path: 'memory.md', lineStart: value, lineEnd: 4_294_967_295, note: '' }],
+                            threadIds: []
+                        }
+                    }]
+                })
+            },
+            {
+                name: 'MemoryCitation.lineEnd', format: 'uint32',
+                turn: value => ({
+                    ...validTurn(),
+                    items: [{
+                        type: 'agentMessage', id: 'agent-1', text: 'done', phase: null,
+                        memoryCitation: {
+                            entries: [{ path: 'memory.md', lineStart: 0, lineEnd: value, note: '' }],
+                            threadIds: []
+                        }
+                    }]
+                })
+            },
+            {
+                name: 'ByteRange.start', format: 'uint',
+                turn: value => ({
+                    ...validTurn(),
+                    items: [{
+                        type: 'userMessage', id: 'user-1', clientId: null,
+                        content: [{
+                            type: 'text', text: 'x',
+                            text_elements: [{
+                                byteRange: { start: value, end: Number.MAX_SAFE_INTEGER }, placeholder: null
+                            }]
+                        }]
+                    }]
+                })
+            },
+            {
+                name: 'ByteRange.end', format: 'uint',
+                turn: value => ({
+                    ...validTurn(),
+                    items: [{
+                        type: 'userMessage', id: 'user-1', clientId: null,
+                        content: [{
+                            type: 'text', text: 'x',
+                            text_elements: [{ byteRange: { start: 0, end: value }, placeholder: null }]
+                        }]
+                    }]
+                })
+            },
+            {
+                name: 'Sleep.durationMs', format: 'uint64',
+                turn: value => ({
+                    ...validTurn(), items: [{ type: 'sleep', id: 'sleep-1', durationMs: value }]
+                })
+            },
+            {
+                name: 'CodexErrorInfo.httpStatusCode', format: 'uint16', nullable: true,
+                turn: value => ({
+                    ...validTurn('turn-1', 'failed'),
+                    error: {
+                        message: 'failed',
+                        codexErrorInfo: { httpConnectionFailed: { httpStatusCode: value } },
+                        additionalDetails: null
+                    }
+                })
+            }
+        ];
+
+        for (const field of fields) {
+            if (field.nullable) {
+                assert.equal(await acceptsTurnStartResponse(field.turn(null)), true, `${field.name}: null`);
+            }
+            for (const boundary of boundaries[field.format]) {
+                assert.equal(
+                    await acceptsTurnStartResponse(field.turn(boundary.value)),
+                    boundary.accepted,
+                    `${field.name}: ${boundary.label}`
+                );
+            }
+        }
+    });
+
+    it('enforces ThreadResumeResponse int64 and int32 fields at exact JSON-safe boundaries', async () => {
+        type ThreadNumericField = Readonly<{
+            name: string;
+            nullable?: boolean;
+            values: readonly Readonly<{ label: string; value: number; accepted: boolean }>[];
+            thread: (value: number | null) => Record<string, unknown>;
+        }>;
+        const int64 = [
+            { label: 'safe-min', value: Number.MIN_SAFE_INTEGER, accepted: true },
+            { label: 'safe-max', value: Number.MAX_SAFE_INTEGER, accepted: true },
+            { label: 'below-safe-min', value: Number.MIN_SAFE_INTEGER - 1, accepted: false },
+            { label: 'above-safe-max', value: Number.MAX_SAFE_INTEGER + 1, accepted: false },
+            { label: 'fraction', value: 0.5, accepted: false },
+            { label: 'infinity', value: Number.POSITIVE_INFINITY, accepted: false }
+        ] as const;
+        const int32 = [
+            { label: 'min', value: -2_147_483_648, accepted: true },
+            { label: 'max', value: 2_147_483_647, accepted: true },
+            { label: 'below-min', value: -2_147_483_649, accepted: false },
+            { label: 'above-max', value: 2_147_483_648, accepted: false },
+            { label: 'fraction', value: 0.5, accepted: false },
+            { label: 'infinity', value: Number.POSITIVE_INFINITY, accepted: false }
+        ] as const;
+        const fields: readonly ThreadNumericField[] = [
+            {
+                name: 'Thread.createdAt', values: int64,
+                thread: value => ({ ...validThread(), createdAt: value })
+            },
+            {
+                name: 'Thread.updatedAt', values: int64,
+                thread: value => ({ ...validThread(), updatedAt: value })
+            },
+            {
+                name: 'Thread.recencyAt', nullable: true, values: int64,
+                thread: value => ({ ...validThread(), recencyAt: value })
+            },
+            {
+                name: 'SubAgentSource.thread_spawn.depth', values: int32,
+                thread: value => ({
+                    ...validThread(),
+                    source: {
+                        subAgent: {
+                            thread_spawn: {
+                                parent_thread_id: 'parent', depth: value,
+                                agent_path: null, agent_nickname: null, agent_role: null
+                            }
+                        }
+                    }
+                })
+            }
+        ];
+
+        for (const field of fields) {
+            if (field.nullable) {
+                assert.equal(await acceptsThreadResumeResponse(field.thread(null)), true, `${field.name}: null`);
+            }
+            for (const boundary of field.values) {
+                assert.equal(
+                    await acceptsThreadResumeResponse(field.thread(boundary.value)),
+                    boundary.accepted,
+                    `${field.name}: ${boundary.label}`
+                );
+            }
+        }
+    });
+
+    it('accepts finite fractional JSON numbers while rejecting non-finite MCP and dynamic values', async () => {
+        const finite = {
+            ...validTurn(),
+            items: [
+                {
+                    type: 'mcpToolCall', id: 'mcp-1', server: 'server', tool: 'tool', status: 'completed',
+                    arguments: { ratio: -1.5 }, appContext: null, pluginId: null,
+                    result: null, error: null, durationMs: null
+                },
+                {
+                    type: 'dynamicToolCall', id: 'dynamic-1', namespace: null, tool: 'run',
+                    arguments: { ratio: 0.25 }, status: 'completed', contentItems: null,
+                    success: true, durationMs: null
+                }
+            ]
+        };
+        assert.equal(await acceptsTurnStartResponse(finite), true);
+        for (const value of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+            const invalid = {
+                ...validTurn(),
+                items: [{
+                    type: 'dynamicToolCall', id: 'dynamic-1', namespace: null, tool: 'run',
+                    arguments: { value }, status: 'completed', contentItems: null,
+                    success: true, durationMs: null
+                }]
+            };
+            assert.equal(await acceptsTurnStartResponse(invalid), false);
         }
     });
 

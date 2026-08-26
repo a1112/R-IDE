@@ -221,7 +221,10 @@ export class RideCodexEventReducer {
             this.#resetFor(batch);
         } else if (this.#turnId !== undefined
             && (batch.threadId !== this.#threadId || batch.turnId !== this.#turnId)) {
-            if ((startsTurn && this.#isTerminal()) || terminatesTurn) {
+            if (this.#status === 'in-progress') {
+                return false;
+            }
+            if (startsTurn && this.#isTerminal()) {
                 this.#resetFor(batch);
             } else {
                 return false;

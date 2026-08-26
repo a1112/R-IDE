@@ -1462,9 +1462,9 @@ function requireTurn(value: unknown): Readonly<{
         throw new RideCodexTurnError('invalid-data');
     }
     requireTurnError(ownValue(turn, 'error'));
-    requireNullableNonNegativeNumber(ownValue(turn, 'startedAt'));
-    requireNullableNonNegativeNumber(ownValue(turn, 'completedAt'));
-    requireNullableNonNegativeNumber(ownValue(turn, 'durationMs'));
+    requireNullableJsonInt64(ownValue(turn, 'startedAt'));
+    requireNullableJsonInt64(ownValue(turn, 'completedAt'));
+    requireNullableJsonInt64(ownValue(turn, 'durationMs'));
     return Object.freeze({
         id: requireIdentifier(ownValue(turn, 'id')),
         status: normalizeServerTurnStatus(ownValue(turn, 'status'))
@@ -1520,8 +1520,8 @@ function requireStableThreadItem(value: unknown): void {
                 requireCommandAction(action);
             }
             requireNullableText(ownValue(item, 'aggregatedOutput'), MAX_INPUT_TEXT_BYTES);
-            requireNullableSafeInteger(ownValue(item, 'exitCode'));
-            requireNullableNonNegativeNumber(ownValue(item, 'durationMs'));
+            requireNullableInt32(ownValue(item, 'exitCode'));
+            requireNullableJsonInt64(ownValue(item, 'durationMs'));
             return;
         }
         case 'fileChange': {
@@ -1587,7 +1587,7 @@ function requireStableThreadItem(value: unknown): void {
         case 'sleep': {
             const item = requireExactOptions(record, ['type', 'id', 'durationMs']);
             requireIdentifier(ownValue(item, 'id'));
-            requireNonNegativeFiniteNumber(ownValue(item, 'durationMs'));
+            requireJsonUint64(ownValue(item, 'durationMs'));
             return;
         }
         case 'imageGeneration':
@@ -1645,8 +1645,8 @@ function requireStableUserInput(value: unknown): void {
 function requireTextElement(value: unknown): void {
     const element = requireExactOptions(value, ['byteRange', 'placeholder']);
     const range = requireExactOptions(ownValue(element, 'byteRange'), ['start', 'end']);
-    const start = requireNonNegativeSafeInteger(ownValue(range, 'start'));
-    const end = requireNonNegativeSafeInteger(ownValue(range, 'end'));
+    const start = requireJsonUint(ownValue(range, 'start'));
+    const end = requireJsonUint(ownValue(range, 'end'));
     if (end < start) {
         throw new RideCodexTurnError('invalid-data');
     }
@@ -1664,8 +1664,8 @@ function requireNullableMemoryCitation(value: unknown): void {
     for (const rawEntry of requireBoundedArray(ownValue(citation, 'entries'))) {
         const entry = requireExactOptions(rawEntry, ['path', 'lineStart', 'lineEnd', 'note']);
         requireBoundedText(ownValue(entry, 'path'), MAX_LOCAL_PATH_BYTES);
-        const lineStart = requireNonNegativeSafeInteger(ownValue(entry, 'lineStart'));
-        const lineEnd = requireNonNegativeSafeInteger(ownValue(entry, 'lineEnd'));
+        const lineStart = requireUint32(ownValue(entry, 'lineStart'));
+        const lineEnd = requireUint32(ownValue(entry, 'lineEnd'));
         if (lineEnd < lineStart) {
             throw new RideCodexTurnError('invalid-data');
         }
@@ -1728,7 +1728,7 @@ function requireMcpToolCall(value: unknown): void {
     requireNullableText(ownValue(item, 'pluginId'), MAX_IDENTIFIER_BYTES);
     requireNullableMcpResult(ownValue(item, 'result'));
     requireNullableMcpError(ownValue(item, 'error'));
-    requireNullableNonNegativeNumber(ownValue(item, 'durationMs'));
+    requireNullableJsonInt64(ownValue(item, 'durationMs'));
 }
 
 function requireNullableMcpAppContext(value: unknown): void {
@@ -1810,7 +1810,7 @@ function requireDynamicToolCall(value: unknown): void {
         }
     }
     requireNullableBoolean(ownValue(item, 'success'));
-    requireNullableNonNegativeNumber(ownValue(item, 'durationMs'));
+    requireNullableJsonInt64(ownValue(item, 'durationMs'));
 }
 
 function requireCollabAgentToolCall(value: unknown): void {
@@ -1977,16 +1977,7 @@ function requireCodexErrorInfo(value: unknown): void {
         return;
     }
     const connection = requireExactOptions(payload, ['httpStatusCode']);
-    const httpStatusCode = ownValue(connection, 'httpStatusCode');
-    if (isNullish(httpStatusCode)) {
-        if (httpStatusCode === undefined) {
-            throw new RideCodexTurnError('invalid-data');
-        }
-        return;
-    }
-    if (!Number.isSafeInteger(httpStatusCode) || (httpStatusCode as number) < 0) {
-        throw new RideCodexTurnError('invalid-data');
-    }
+    requireNullableUint16(ownValue(connection, 'httpStatusCode'));
 }
 
 function requireThreadResumeResponse(value: unknown, expectedThreadId: string): void {
@@ -2026,9 +2017,9 @@ function requireThread(value: unknown): string {
         throw new RideCodexTurnError('invalid-data');
     }
     requireString(ownValue(thread, 'modelProvider'), MAX_IDENTIFIER_BYTES);
-    requireNonNegativeFiniteNumber(ownValue(thread, 'createdAt'));
-    requireNonNegativeFiniteNumber(ownValue(thread, 'updatedAt'));
-    requireNullableNonNegativeNumber(ownValue(thread, 'recencyAt'));
+    requireJsonInt64(ownValue(thread, 'createdAt'));
+    requireJsonInt64(ownValue(thread, 'updatedAt'));
+    requireNullableJsonInt64(ownValue(thread, 'recencyAt'));
     requireThreadStatus(ownValue(thread, 'status'));
     requireNullableText(ownValue(thread, 'path'), MAX_LOCAL_PATH_BYTES);
     requireString(ownValue(thread, 'cwd'), MAX_LOCAL_PATH_BYTES);
@@ -2107,7 +2098,7 @@ function requireSubAgentSource(value: unknown): void {
         'parent_thread_id', 'depth', 'agent_path', 'agent_nickname', 'agent_role'
     ]);
     requireIdentifier(ownValue(spawn, 'parent_thread_id'));
-    requireNonNegativeSafeInteger(ownValue(spawn, 'depth'));
+    requireInt32(ownValue(spawn, 'depth'));
     requireNullableText(ownValue(spawn, 'agent_path'), MAX_LOCAL_PATH_BYTES);
     requireNullableText(ownValue(spawn, 'agent_nickname'), MAX_IDENTIFIER_BYTES);
     requireNullableText(ownValue(spawn, 'agent_role'), MAX_IDENTIFIER_BYTES);
@@ -2226,32 +2217,72 @@ function requireNullableIdentifier(value: unknown): void {
     requireIdentifier(value);
 }
 
-function requireNullableSafeInteger(value: unknown): void {
-    if (isNullish(value)) {
-        if (value === undefined) {
-            throw new RideCodexTurnError('invalid-data');
-        }
-        return;
-    }
+function requireJsonInt64(value: unknown): number {
     if (!Number.isSafeInteger(value)) {
         throw new RideCodexTurnError('invalid-data');
     }
+    return value as number;
 }
 
-function requireNonNegativeFiniteNumber(value: unknown): void {
-    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
-        throw new RideCodexTurnError('invalid-data');
-    }
-}
-
-function requireNullableNonNegativeNumber(value: unknown): void {
+function requireNullableJsonInt64(value: unknown): void {
     if (isNullish(value)) {
         if (value === undefined) {
             throw new RideCodexTurnError('invalid-data');
         }
         return;
     }
-    requireNonNegativeFiniteNumber(value);
+    requireJsonInt64(value);
+}
+
+function requireInt32(value: unknown): number {
+    const integer = requireJsonInt64(value);
+    if (integer < -2_147_483_648 || integer > 2_147_483_647) {
+        throw new RideCodexTurnError('invalid-data');
+    }
+    return integer;
+}
+
+function requireNullableInt32(value: unknown): void {
+    if (isNullish(value)) {
+        if (value === undefined) {
+            throw new RideCodexTurnError('invalid-data');
+        }
+        return;
+    }
+    requireInt32(value);
+}
+
+function requireUint32(value: unknown): number {
+    const integer = requireJsonInt64(value);
+    if (integer < 0 || integer > 4_294_967_295) {
+        throw new RideCodexTurnError('invalid-data');
+    }
+    return integer;
+}
+
+function requireJsonUint(value: unknown): number {
+    const integer = requireJsonInt64(value);
+    if (integer < 0) {
+        throw new RideCodexTurnError('invalid-data');
+    }
+    return integer;
+}
+
+function requireJsonUint64(value: unknown): number {
+    return requireJsonUint(value);
+}
+
+function requireNullableUint16(value: unknown): void {
+    if (isNullish(value)) {
+        if (value === undefined) {
+            throw new RideCodexTurnError('invalid-data');
+        }
+        return;
+    }
+    const integer = requireJsonInt64(value);
+    if (integer < 0 || integer > 65_535) {
+        throw new RideCodexTurnError('invalid-data');
+    }
 }
 
 function requireBoolean(value: unknown): void {
@@ -2285,13 +2316,6 @@ function requireNullableEnum(value: unknown, allowed: readonly string[]): void {
         return;
     }
     requireEnum(value, allowed);
-}
-
-function requireNonNegativeSafeInteger(value: unknown): number {
-    if (!Number.isSafeInteger(value) || (value as number) < 0) {
-        throw new RideCodexTurnError('invalid-data');
-    }
-    return value as number;
 }
 
 function requireRecord(value: unknown): Record<string, unknown> {

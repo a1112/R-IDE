@@ -905,7 +905,7 @@ describe('RideCodexEventReducer minimal frame contract', () => {
         assert.equal(reducer.snapshot().turnId, WORST_VALID_IDENTIFIER);
     });
 
-    it('uses an exact terminal batch as an identity boundary when its start was compacted upstream', () => {
+    it('uses an exact terminal batch as an identity boundary when there is no current turn', () => {
         const frames: Array<() => void> = [];
         const reducer = new RideCodexEventReducer({
             scheduleFrame: callback => {
@@ -913,10 +913,6 @@ describe('RideCodexEventReducer minimal frame contract', () => {
                 return { dispose: () => undefined };
             }
         });
-        reducer.notifyMany(batchWire({
-            generation: 1, threadId: 'thread-1', turnId: 'turn-1',
-            events: [{ type: 'turn-started' }]
-        }));
         reducer.notifyMany(batchWire({
             generation: 1, threadId: 'thread-1', turnId: 'turn-2',
             events: [{ type: 'turn-terminal', status: 'completed' }]
@@ -1054,6 +1050,43 @@ describe('RideCodexEventReducer minimal frame contract', () => {
         assert.equal(reducer.snapshot().status, 'in-progress');
     });
 
+    it('rejects every different identity while the current turn is in progress', () => {
+        const frames: Array<() => void> = [];
+        const reducer = new RideCodexEventReducer({
+            scheduleFrame: callback => {
+                frames.push(callback);
+                return { dispose: () => undefined };
+            }
+        });
+        reducer.notifyMany(batchWire({
+            generation: 1,
+            threadId: 'thread-current',
+            turnId: 'turn-current',
+            events: [{ type: 'turn-started' }]
+        }));
+        frames.shift()?.();
+
+        for (const batch of [
+            {
+                generation: 1, threadId: 'thread-current', turnId: 'turn-unseen-old',
+                events: [{ type: 'turn-terminal' as const, status: 'completed' as const }]
+            },
+            {
+                generation: 1, threadId: 'thread-other', turnId: 'turn-other',
+                events: [
+                    { type: 'turn-started' as const },
+                    { type: 'turn-terminal' as const, status: 'failed' as const, error: 'late failure' }
+                ]
+            }
+        ]) {
+            reducer.notifyMany(batchWire(batch));
+            frames.shift()?.();
+            assert.equal(reducer.snapshot().threadId, 'thread-current');
+            assert.equal(reducer.snapshot().turnId, 'turn-current');
+            assert.equal(reducer.snapshot().status, 'in-progress');
+        }
+    });
+
     it('keeps finalized identity history bounded while recent duplicates remain idempotent', () => {
         const frames: Array<() => void> = [];
         const reducer = new RideCodexEventReducer({
@@ -1081,7 +1114,7 @@ describe('RideCodexEventReducer minimal frame contract', () => {
         reducer.notifyMany(batchWire({
             generation: 1,
             threadId: 'thread-1',
-            turnId: 'turn-299',
+            turnId: 'turn-0',
             events: [{ type: 'turn-terminal', status: 'completed' }]
         }));
         frames.shift()?.();
