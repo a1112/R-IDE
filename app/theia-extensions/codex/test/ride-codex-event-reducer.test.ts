@@ -1207,6 +1207,98 @@ describe('RideCodexEventReducer minimal frame contract', () => {
         assert.equal(reducer.snapshot().status, 'completed');
     });
 
+    it('lets a newer started boundary replace a stale in-progress turn after reconnect', () => {
+        const frames: Array<() => void> = [];
+        const reducer = new RideCodexEventReducer({
+            scheduleFrame: callback => {
+                frames.push(callback);
+                return { dispose: () => undefined };
+            }
+        });
+        reducer.notifyMany(batchWire({
+            generation: 1,
+            turnSequence: 1,
+            threadId: 'thread-1',
+            turnId: 'turn-stale',
+            events: [{ type: 'turn-started' }]
+        }));
+        frames.shift()?.();
+
+        reducer.notifyMany(batchWire({
+            generation: 1,
+            turnSequence: 2,
+            threadId: 'thread-1',
+            turnId: 'turn-current',
+            events: [{ type: 'turn-started' }]
+        }));
+        frames.shift()?.();
+
+        assert.equal(reducer.snapshot().turnId, 'turn-current');
+        assert.equal(reducer.snapshot().status, 'in-progress');
+    });
+
+    it('lets a newer terminal-only boundary replace a completed turn', () => {
+        const frames: Array<() => void> = [];
+        const reducer = new RideCodexEventReducer({
+            scheduleFrame: callback => {
+                frames.push(callback);
+                return { dispose: () => undefined };
+            }
+        });
+        reducer.notifyMany(batchWire({
+            generation: 1,
+            turnSequence: 1,
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            events: [{ type: 'turn-started' }, { type: 'turn-terminal', status: 'completed' }]
+        }));
+        frames.shift()?.();
+
+        reducer.notifyMany(batchWire({
+            generation: 1,
+            turnSequence: 2,
+            threadId: 'thread-1',
+            turnId: 'turn-2',
+            events: [{ type: 'turn-terminal', status: 'interrupted' }]
+        }));
+        frames.shift()?.();
+
+        assert.equal(reducer.snapshot().turnId, 'turn-2');
+        assert.equal(reducer.snapshot().status, 'interrupted');
+    });
+
+    it('does not let a newer sequence without a turn boundary take ownership', () => {
+        const frames: Array<() => void> = [];
+        const reducer = new RideCodexEventReducer({
+            scheduleFrame: callback => {
+                frames.push(callback);
+                return { dispose: () => undefined };
+            }
+        });
+        reducer.notifyMany(batchWire({
+            generation: 1,
+            turnSequence: 1,
+            threadId: '',
+            turnId: '',
+            events: [{ type: 'turn-started' }]
+        }));
+        frames.shift()?.();
+
+        reducer.notifyMany(batchWire({
+            generation: 1,
+            turnSequence: 2,
+            threadId: 'thread-other',
+            turnId: 'turn-other',
+            events: [{ type: 'warning', message: 'untrusted takeover' }]
+        }));
+        frames.shift()?.();
+
+        assert.equal(reducer.snapshot().threadId, '');
+        assert.equal(reducer.snapshot().turnId, '');
+        assert.equal(reducer.snapshot().status, 'in-progress');
+        assert.deepEqual(reducer.snapshot().warnings, []);
+    });
+
     it('initializes at a high sequence and rejects equal cross-identity and lower batches', () => {
         const frames: Array<() => void> = [];
         const reducer = new RideCodexEventReducer({

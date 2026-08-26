@@ -231,9 +231,6 @@ export class RideCodexEventReducer {
             return false;
         } else if (this.#highestTurnSequence !== undefined
             && batch.turnSequence > this.#highestTurnSequence) {
-            if (this.#status === 'in-progress' || (!startsTurn && this.#turnId !== undefined)) {
-                return false;
-            }
             if (!startsTurn && !terminatesTurn) {
                 return false;
             }
