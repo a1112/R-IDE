@@ -344,6 +344,37 @@ test('server requests carry their process generation and responses cannot cross 
     await harness.host.dispose();
 });
 
+test('response abort is generation-bound, idempotent, and never restarts the connection', async () => {
+    const harness = createControlledHost({ exitAfterKill: 'after-grace-tick', shutdownGraceMs: 4 });
+    const states: string[] = [];
+    harness.host.onStateChange(event => states.push(event.state));
+    const lease = await harness.host.acquire('approval');
+    const abortGeneration = (generation: number): void => {
+        (harness.host as RideCodexAppServerHost & {
+            abortServerRequestGeneration(value: number): void;
+        }).abortServerRequestGeneration(generation);
+    };
+
+    abortGeneration(2);
+    assert.equal(harness.host.snapshot().state, 'ready');
+    assert.equal(harness.children[0].killCalls(), 0);
+
+    abortGeneration(1);
+    abortGeneration(1);
+    assert.equal(harness.host.snapshot().state, 'stopping');
+    await waitFor(() => harness.host.snapshot().state === 'circuit-open');
+    await waitFor(() => harness.host.snapshot().pid === undefined);
+
+    assert.equal(harness.children[0].killCalls(), 1);
+    assert.equal(harness.children.length, 1);
+    assert.equal(harness.host.snapshot().generation, 1);
+    assert.ok(states.includes('stopping'));
+    assert.ok(states.includes('circuit-open'));
+    assert.equal(states.includes('restarting'), false);
+    lease.release();
+    await harness.host.dispose();
+});
+
 test('a replacement connection cannot consume an old inbound request with the same ID', async () => {
     const harness = createControlledHost({ shutdownGraceMs: 20 });
     const requests: Array<Readonly<{ id: string | number; generation: number }>> = [];

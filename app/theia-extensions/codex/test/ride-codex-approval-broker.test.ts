@@ -44,6 +44,7 @@ class FakeHost implements RideCodexApprovalHost {
     }>> = [];
     readonly failingResponses = new Set<RequestId>();
     readonly responseDelays = new Map<RequestId, Promise<void>>();
+    readonly abortedGenerations: number[] = [];
     readonly #requestListeners = new Set<(request: Readonly<{
         id: RequestId;
         method: string;
@@ -75,6 +76,15 @@ class FakeHost implements RideCodexApprovalHost {
 
     ownsServerRequest(generation: number, _id: RequestId): boolean {
         return this.requestOwnership && this.state === 'ready' && this.generation === generation;
+    }
+
+    abortServerRequestGeneration(generation: number): void {
+        if (this.state !== 'ready' || this.generation !== generation) {
+            return;
+        }
+        this.abortedGenerations.push(generation);
+        this.requestOwnership = false;
+        this.emitState('stopping', generation);
     }
 
     onStateChange(listener: (event: Readonly<{ state: string; generation: number }>) => void): { dispose(): void } {
@@ -268,15 +278,17 @@ function createFixture(options: Readonly<{
     now?: () => number;
     pathStyle?: 'posix' | 'win32';
     schedule?: (callback: () => void, delayMs: number) => { dispose(): void };
+    responseTimeoutMs?: number;
 }> = {}) {
     const host = new FakeHost();
     const clock = new FakeClock();
-    const broker = new RideCodexApprovalBroker({
+    const brokerOptions = {
         host,
         now: options.now ?? (() => clock.now),
         schedule: options.schedule ?? clock.schedule,
         ttlMs: 1_000,
         maxPending: options.maxPending ?? 8,
+        responseTimeoutMs: options.responseTimeoutMs ?? 100,
         pathStyle: options.pathStyle ?? 'win32',
         allowAcceptForSession: typeof options.allowAcceptForSession === 'function'
             ? options.allowAcceptForSession
@@ -286,7 +298,8 @@ function createFixture(options: Readonly<{
             { path: 'src\\new.ts', kind: 'add', diff: '<script>unsafe</script>' }
         ])),
         resolveRealPath: options.resolveRealPath ?? (async path => path)
-    });
+    };
+    const broker = new RideCodexApprovalBroker(brokerOptions);
     const client = new RecordingClient();
     const session = broker.connectClient(client);
     return { broker, client, clock, host, session };
@@ -1535,6 +1548,176 @@ describe('RideCodexApprovalBroker ownership', () => {
         assert.equal(fixture.client.latest().length, 0);
     });
 
+    it('shares maxPending with responding writes and aborts instead of accumulating hung settlements', async () => {
+        const fixture = createFixture({ maxPending: 1, responseTimeoutMs: 100 });
+        const delayedResponse = new Deferred<void>();
+        const unhandled: unknown[] = [];
+        const onUnhandled = (reason: unknown): void => { unhandled.push(reason); };
+        process.on('unhandledRejection', onUnhandled);
+        try {
+            await fixture.session.setContext(CONTEXT);
+            await fixture.broker.handleServerRequest(
+                commandRequest({ itemId: 'capacity-item-1' }, 'capacity-response-1'),
+                CONTEXT.generation
+            );
+            fixture.host.responseDelays.set('capacity-response-1', delayedResponse.promise);
+
+            let secondSettled = false;
+            const second = fixture.broker.handleServerRequest(
+                commandRequest({ itemId: 'capacity-item-2' }, 'capacity-response-2'),
+                CONTEXT.generation
+            ).then(() => { secondSettled = true; });
+            await waitForAsync(() => fixture.host.responses.length === 1);
+            assert.equal(secondSettled, false);
+            assert.equal(fixture.client.latest().length, 0);
+
+            const third = fixture.broker.handleServerRequest(
+                commandRequest({ itemId: 'capacity-item-3' }, 'capacity-response-3'),
+                CONTEXT.generation
+            );
+            await Promise.all([second, third]);
+
+            assert.deepEqual(fixture.host.abortedGenerations, [CONTEXT.generation]);
+            assert.deepEqual(fixture.host.responses, [{
+                generation: CONTEXT.generation,
+                id: 'capacity-response-1',
+                result: { decision: 'cancel' }
+            }]);
+            assert.equal(fixture.client.latest().length, 0);
+            assert.equal(fixture.clock.timers.size, 0);
+            assert.equal(fixture.host.leases.length, 3);
+            assert.ok(fixture.host.leases.every(lease => lease.releases === 1));
+
+            delayedResponse.reject(new Error('late response failure'));
+            await flushAsync();
+            assert.deepEqual(unhandled, []);
+            await fixture.broker.dispose();
+        } finally {
+            process.off('unhandledRejection', onUnhandled);
+        }
+    });
+
+    it('atomically reserves maxPending across concurrent request admission', async () => {
+        const fixture = createFixture({ maxPending: 1 });
+        await fixture.session.setContext(CONTEXT);
+
+        await Promise.all([
+            fixture.broker.handleServerRequest(
+                commandRequest({ itemId: 'concurrent-item-1' }, 'concurrent-admission-1'),
+                CONTEXT.generation
+            ),
+            fixture.broker.handleServerRequest(
+                commandRequest({ itemId: 'concurrent-item-2' }, 'concurrent-admission-2'),
+                CONTEXT.generation
+            )
+        ]);
+
+        assert.equal(fixture.client.latest().length, 1);
+        assert.equal(fixture.host.responses.length, 1);
+        assert.equal((fixture.host.responses[0].result as { decision: string }).decision, 'cancel');
+        assert.deepEqual(fixture.host.leases.map(lease => lease.releases).sort(), [0, 1]);
+        await fixture.broker.dispose();
+        assert.ok(fixture.host.leases.every(lease => lease.releases === 1));
+    });
+
+    it('hard-times out a response write, closes its exact generation, and bounds dispose', async () => {
+        const fixture = createFixture({ responseTimeoutMs: 100 });
+        const delayedResponse = new Deferred<void>();
+        const unhandled: unknown[] = [];
+        const onUnhandled = (reason: unknown): void => { unhandled.push(reason); };
+        process.on('unhandledRejection', onUnhandled);
+        try {
+            await fixture.session.setContext(CONTEXT);
+            await fixture.broker.handleServerRequest(commandRequest(), CONTEXT.generation);
+            const card = fixture.client.latest()[0];
+            fixture.host.responseDelays.set('rpc-command-1', delayedResponse.promise);
+
+            let decisionSettled = false;
+            const decision = fixture.session.decide({
+                token: card.token,
+                fingerprint: card.fingerprint,
+                decision: 'accept'
+            }).then(result => {
+                decisionSettled = true;
+                return result;
+            });
+            await waitForAsync(() => fixture.host.responses.length === 1);
+            assert.equal(decisionSettled, false);
+            assert.equal(fixture.host.leases[0].releases, 0);
+
+            fixture.clock.advance(100);
+            assert.deepEqual(await decision, { status: 'rejected', code: 'response-failed' });
+            assert.deepEqual(fixture.host.abortedGenerations, [CONTEXT.generation]);
+            assert.equal(fixture.host.leases[0].releases, 1);
+            assert.equal(fixture.clock.timers.size, 0);
+            await fixture.broker.dispose();
+
+            delayedResponse.reject(new Error('late response rejection'));
+            await flushAsync();
+            assert.deepEqual(unhandled, []);
+            assert.equal(fixture.host.leases[0].releases, 1);
+            assert.deepEqual(fixture.host.abortedGenerations, [CONTEXT.generation]);
+        } finally {
+            process.off('unhandledRejection', onUnhandled);
+        }
+    });
+
+    it('settles hung response lifecycle races once without awaiting the underlying write', async () => {
+        for (const ending of ['context-timeout', 'process-exit', 'dispose'] as const) {
+            const fixture = createFixture({ responseTimeoutMs: 100 });
+            const delayedResponse = new Deferred<void>();
+            const unhandled: unknown[] = [];
+            const onUnhandled = (reason: unknown): void => { unhandled.push(reason); };
+            process.on('unhandledRejection', onUnhandled);
+            try {
+                await fixture.session.setContext(CONTEXT);
+                await fixture.broker.handleServerRequest(
+                    commandRequest({}, `hung-lifecycle-${ending}`), CONTEXT.generation
+                );
+                const card = fixture.client.latest()[0];
+                fixture.host.responseDelays.set(`hung-lifecycle-${ending}`, delayedResponse.promise);
+                const decision = fixture.session.decide({
+                    token: card.token,
+                    fingerprint: card.fingerprint,
+                    decision: 'decline'
+                });
+                await waitForAsync(() => fixture.host.responses.length === 1);
+
+                if (ending === 'context-timeout') {
+                    await fixture.session.disposeContext();
+                    fixture.clock.advance(100);
+                } else if (ending === 'process-exit') {
+                    fixture.host.emitState('circuit-open', CONTEXT.generation);
+                } else {
+                    await fixture.broker.dispose();
+                }
+
+                assert.deepEqual(await decision, { status: 'rejected', code: 'response-failed' }, ending);
+                assert.equal(fixture.host.leases[0].releases, 1, ending);
+                assert.equal(fixture.clock.timers.size, 0, ending);
+                if (ending === 'context-timeout') {
+                    assert.deepEqual(fixture.host.abortedGenerations, [CONTEXT.generation]);
+                }
+
+                delayedResponse.reject(new Error(`late ${ending} response rejection`));
+                await flushAsync();
+                assert.deepEqual(unhandled, [], ending);
+                assert.equal(fixture.host.leases[0].releases, 1, ending);
+                await fixture.broker.dispose();
+            } finally {
+                process.off('unhandledRejection', onUnhandled);
+            }
+        }
+    });
+
+    it('strictly bounds the backend-only response timeout option', () => {
+        const host = new FakeHost();
+        for (const responseTimeoutMs of [0, 30_001, Number.NaN]) {
+            const options = { host, responseTimeoutMs };
+            assert.throws(() => new RideCodexApprovalBroker(options), /response timeout/i);
+        }
+    });
+
     it('bounds authorizing and pending together and times out unresolved authorization', async () => {
         const scopes = [
             new Deferred<RideCodexApprovalScopeResolution>(),
@@ -1558,21 +1741,22 @@ describe('RideCodexApprovalBroker ownership', () => {
         const second = fixture.broker.handleServerRequest(
             fileRequest({ itemId: 'item-file-2' }, 'authorizing-capacity-2'), CONTEXT.generation
         ).then(() => { secondSettled = true; });
-        await waitForAsync(() => secondSettled);
-        assert.equal(resolverCalls, 1);
+        await waitForAsync(() => resolverCalls === 2);
+        assert.equal(firstSettled, true);
+        assert.equal(secondSettled, false);
         assert.deepEqual(fixture.host.responses, [{
-            generation: 7, id: 'authorizing-capacity-2', result: { decision: 'cancel' }
+            generation: 7, id: 'authorizing-capacity-1', result: { decision: 'cancel' }
         }]);
-        assert.equal(fixture.host.leases[0].releases, 0);
-        assert.equal(fixture.host.leases[1].releases, 1);
+        assert.equal(fixture.host.leases[0].releases, 1);
+        assert.equal(fixture.host.leases[1].releases, 0);
         assert.equal(fixture.client.latest().length, 0);
 
         fixture.clock.advance(1_000);
-        await waitForAsync(() => firstSettled);
+        await waitForAsync(() => secondSettled);
         assert.deepEqual(fixture.host.responses[1], {
-            generation: 7, id: 'authorizing-capacity-1', result: { decision: 'cancel' }
+            generation: 7, id: 'authorizing-capacity-2', result: { decision: 'cancel' }
         });
-        assert.equal(fixture.host.leases[0].releases, 1);
+        assert.equal(fixture.host.leases[1].releases, 1);
         assert.equal(fixture.client.latest().length, 0);
 
         scopes[0].resolve(resolution([{ path: 'src\\late-a.ts', kind: 'update' }]));
@@ -1775,8 +1959,8 @@ describe('RideCodexApprovalBroker ownership', () => {
         callbacks[0]();
         await flushAsync();
 
-        assert.deepEqual(delays, [1_000, 1]);
-        assert.equal(disposals, 1);
+        assert.deepEqual(delays, [1_000, 1, 100]);
+        assert.equal(disposals, 2);
         assert.deepEqual(fixture.host.responses, [{
             generation: 7, id: 'rpc-command-1', result: { decision: 'decline' }
         }]);
@@ -2178,9 +2362,10 @@ describe('RideCodexApprovalBroker ownership', () => {
             await session.setContext(CONTEXT);
 
             await assert.doesNotReject(broker.handleServerRequest(commandRequest(), CONTEXT.generation));
-            assert.deepEqual(host.responses, [{
+            assert.deepEqual(host.responses, failure === 'policy' ? [{
                 generation: 7, id: 'rpc-command-1', result: { decision: 'decline' }
-            }], failure);
+            }] : [], failure);
+            assert.deepEqual(host.abortedGenerations, failure === 'scheduler' ? [7] : [], failure);
             assert.equal(host.leases[0].releases, 1, failure);
             assert.equal(client.latest().length, 0, failure);
             await broker.dispose();

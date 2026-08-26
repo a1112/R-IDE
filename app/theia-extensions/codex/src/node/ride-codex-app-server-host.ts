@@ -357,6 +357,18 @@ export class RideCodexAppServerHost {
         return connection.client.respondConfirmed(id, result);
     }
 
+    abortServerRequestGeneration(generation: number): void {
+        const connection = this.#connection;
+        if (!Number.isSafeInteger(generation) || generation < 1
+            || this.#state !== 'ready' || generation !== this.#generation
+            || !connection || connection.generation !== generation
+            || !connection.ready || connection.finalized || connection.intentionalStop) {
+            return;
+        }
+        this.#cancelIdleTimer();
+        this.#stopConnection(connection, 'approval-response-timeout').catch(() => undefined);
+    }
+
     ownsServerRequest(generation: number, id: string | number): boolean {
         const connection = this.#connection;
         return Number.isSafeInteger(generation) && generation >= 1
@@ -750,7 +762,7 @@ export class RideCodexAppServerHost {
 
     #stopConnection(
         connection: Connection,
-        reason: 'idle' | 'dispose' | 'startup-failure' | 'retry' | 'recovery'
+        reason: 'idle' | 'dispose' | 'startup-failure' | 'retry' | 'recovery' | 'approval-response-timeout'
     ): Promise<void> {
         if (this.#stopPromise) {
             if (this.#stoppingConnection === connection) {

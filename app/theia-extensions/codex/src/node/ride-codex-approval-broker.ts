@@ -30,6 +30,7 @@ export interface RideCodexApprovalHostLease {
 export interface RideCodexApprovalHost {
     acquire(kind: 'approval'): Promise<RideCodexApprovalHostLease>;
     respondServerRequest(generation: number, id: RequestId, result: unknown): Promise<void>;
+    abortServerRequestGeneration(generation: number): void;
     ownsServerRequest(generation: number, id: RequestId): boolean;
     onServerRequest?(listener: (request: Readonly<{
         id: RequestId;
@@ -68,6 +69,7 @@ export interface RideCodexApprovalBrokerOptions {
     readonly now?: () => number;
     readonly schedule?: (callback: () => void, delayMs: number) => { dispose(): void };
     readonly ttlMs?: number;
+    readonly responseTimeoutMs?: number;
     readonly maxPending?: number;
     readonly maxClients?: number;
     readonly pathStyle?: 'posix' | 'win32';
@@ -119,6 +121,21 @@ interface AuthorizingApproval {
     readonly timer: { dispose(): void };
     readonly cancelled: Promise<void>;
     readonly signalCancelled: () => void;
+}
+
+interface AdmittingApproval {
+    readonly generation: number;
+    readonly requestId: RequestId;
+    readonly lease: RideCodexApprovalHostLease;
+    readonly completed: Promise<void>;
+    readonly signalCompleted: () => void;
+}
+
+interface RespondingApproval {
+    readonly generation: number;
+    readonly lease: RideCodexApprovalHostLease;
+    readonly complete: (responded: boolean) => void;
+    timer?: { dispose(): void };
 }
 
 interface ValidatedCommandRequest {
@@ -189,6 +206,8 @@ interface NormalizedFileScope {
 }
 
 const DEFAULT_TTL_MS = 2 * 60 * 1_000;
+const DEFAULT_RESPONSE_TIMEOUT_MS = 2_000;
+const MAX_RESPONSE_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_PENDING = 32;
 const MAX_TIMER_MS = 0x7fffffff;
 const MAX_IDENTIFIER_BYTES = 512;
@@ -227,6 +246,7 @@ export class RideCodexApprovalBroker {
     readonly #now: () => number;
     readonly #schedule: (callback: () => void, delayMs: number) => { dispose(): void };
     readonly #ttlMs: number;
+    readonly #responseTimeoutMs: number;
     readonly #maxPending: number;
     readonly #maxClients: number;
     readonly #pathStyle: 'posix' | 'win32';
@@ -238,8 +258,10 @@ export class RideCodexApprovalBroker {
     readonly #resolveRealPath: (path: string) => Promise<string>;
     readonly #instanceKey = randomBytes(32);
     readonly #sessions = new Map<number, SessionRecord>();
+    readonly #admitting = new Set<AdmittingApproval>();
     readonly #authorizing = new Set<AuthorizingApproval>();
     readonly #pending = new Map<string, PendingApproval>();
+    readonly #responding = new Set<RespondingApproval>();
     readonly #threadRoots = new Map<string, TrackedThreadRoot>();
     readonly #fileScopes = new Map<string, TrackedFileScope>();
     readonly #hostListener?: { dispose(): void };
@@ -256,6 +278,12 @@ export class RideCodexApprovalBroker {
             return { dispose: () => clearTimeout(handle) };
         });
         this.#ttlMs = boundedInteger(options.ttlMs ?? DEFAULT_TTL_MS, 1, MAX_TIMER_MS, 'approval TTL');
+        this.#responseTimeoutMs = boundedInteger(
+            options.responseTimeoutMs ?? DEFAULT_RESPONSE_TIMEOUT_MS,
+            1,
+            MAX_RESPONSE_TIMEOUT_MS,
+            'approval response timeout'
+        );
         this.#maxPending = boundedInteger(options.maxPending ?? DEFAULT_MAX_PENDING, 1, 256, 'pending approval count');
         this.#maxClients = boundedInteger(options.maxClients ?? 8, 1, 64, 'approval client count');
         this.#pathStyle = options.pathStyle ?? (process.platform === 'win32' ? 'win32' : 'posix');
@@ -309,11 +337,31 @@ export class RideCodexApprovalBroker {
             releaseOnce(lease);
             return;
         }
+        let signalCompleted!: () => void;
+        let completionSignalled = false;
+        const completed = new Promise<void>(resolve => {
+            signalCompleted = () => {
+                if (!completionSignalled) {
+                    completionSignalled = true;
+                    resolve();
+                }
+            };
+        });
+        const admission: AdmittingApproval = Object.freeze({
+            generation,
+            requestId: envelope.id,
+            lease,
+            completed,
+            signalCompleted
+        });
+        if (!await this.#makeCapacityAvailable(admission) || !this.#admitting.has(admission)) {
+            return;
+        }
         const validated = envelope.method === 'item/commandExecution/requestApproval'
             ? validateCommandRequest(envelope, this.#pathStyle)
             : validateFileRequest(envelope);
         if (!validated) {
-            await this.#respondAndRelease(lease, generation, envelope.id, 'decline');
+            await this.#respondAdmission(admission, 'decline');
             return;
         }
         const owner = [...this.#sessions.values()].find(candidate =>
@@ -323,26 +371,13 @@ export class RideCodexApprovalBroker {
             && candidate.context.turnId === validated.turnId
         );
         if (!owner) {
-            await this.#respondAndRelease(lease, generation, validated.id, 'cancel');
+            await this.#respondAdmission(admission, 'cancel');
             return;
         }
         const ownerContextRevision = owner.contextRevision;
 
         const kind = envelope.method === 'item/commandExecution/requestApproval'
             ? 'command' as const : 'file-change' as const;
-        while (this.#authorizing.size + this.#pending.size >= this.#maxPending) {
-            const oldestPending = this.#pending.values().next().value as PendingApproval | undefined;
-            if (oldestPending) {
-                this.#settle(oldestPending, 'cancel').catch(() => undefined);
-                continue;
-            }
-            const oldestAuthorizing = this.#authorizing.values().next().value as AuthorizingApproval | undefined;
-            if (!oldestAuthorizing) {
-                break;
-            }
-            await this.#respondAndRelease(lease, generation, validated.id, 'cancel');
-            return;
-        }
         let sessionDecisionAllowed = false;
         let issuedAt: number;
         let expiresAt: number;
@@ -355,7 +390,7 @@ export class RideCodexApprovalBroker {
             }
             expiresAt = issuedAt + this.#ttlMs;
         } catch {
-            await this.#respondAndRelease(lease, generation, validated.id, 'decline');
+            await this.#respondAdmission(admission, 'decline');
             return;
         }
         const allowedDecisions = Object.freeze([
@@ -495,6 +530,10 @@ export class RideCodexApprovalBroker {
             signalCancelled
         };
         authorizingHolder.value = authorizing;
+        if (!this.#completeAdmissionTransition(admission)) {
+            timer.dispose();
+            return;
+        }
         this.#authorizing.add(authorizing);
         if (!scheduleTimer(this.#ttlMs)) {
             timer.dispose();
@@ -745,6 +784,21 @@ export class RideCodexApprovalBroker {
         this.#hostListener?.dispose();
         this.#hostStateListener?.dispose();
         this.#hostNotificationListener?.dispose();
+        const admitting = [...this.#admitting];
+        const responding = [...this.#responding];
+        const unsafeGenerations = new Set([
+            ...admitting.map(entry => entry.generation),
+            ...responding.map(entry => entry.generation)
+        ]);
+        for (const entry of admitting) {
+            this.#finishAdmission(entry);
+        }
+        for (const entry of responding) {
+            this.#finishResponding(entry, false);
+        }
+        for (const generation of unsafeGenerations) {
+            this.#abortResponseGeneration(generation);
+        }
         const pending = [...this.#pending.values()];
         const authorizing = [...this.#authorizing];
         await Promise.all([
@@ -873,6 +927,73 @@ export class RideCodexApprovalBroker {
         return this.#settle(pending, safe.decision);
     }
 
+    async #makeCapacityAvailable(
+        admission: AdmittingApproval
+    ): Promise<boolean> {
+        while (this.#activeApprovalCount() >= this.#maxPending) {
+            const admitting = this.#admitting.values().next().value as AdmittingApproval | undefined;
+            if (admitting) {
+                await admitting.completed;
+                continue;
+            }
+            const responding = this.#responding.values().next().value as RespondingApproval | undefined;
+            if (responding) {
+                if (responding.generation !== admission.generation) {
+                    this.#finishResponding(responding, false);
+                    continue;
+                }
+                this.#abortResponseGeneration(admission.generation);
+                releaseOnce(admission.lease);
+                return false;
+            }
+            const oldestPending = this.#pending.values().next().value as PendingApproval | undefined;
+            if (oldestPending) {
+                await this.#settle(oldestPending, 'cancel');
+            } else {
+                const oldestAuthorizing = this.#authorizing.values().next().value as AuthorizingApproval | undefined;
+                if (!oldestAuthorizing) {
+                    break;
+                }
+                await this.#settleAuthorizing(oldestAuthorizing, 'cancel');
+            }
+            if (!this.#canRespondToRequest(
+                admission.lease, admission.generation, admission.requestId
+            )) {
+                releaseOnce(admission.lease);
+                return false;
+            }
+        }
+        if (this.#canRespondToRequest(
+            admission.lease, admission.generation, admission.requestId
+        )) {
+            this.#admitting.add(admission);
+            return true;
+        }
+        releaseOnce(admission.lease);
+        return false;
+    }
+
+    #activeApprovalCount(): number {
+        return this.#admitting.size + this.#authorizing.size + this.#pending.size + this.#responding.size;
+    }
+
+    #canRespondToRequest(
+        lease: RideCodexApprovalHostLease,
+        generation: number,
+        rpcRequestId: RequestId
+    ): boolean {
+        if (this.#disposed || lease.generation !== generation) {
+            return false;
+        }
+        try {
+            const snapshot = dataRecord(this.#host.snapshot());
+            return snapshot?.state === 'ready' && snapshot.generation === generation
+                && this.#host.ownsServerRequest(generation, rpcRequestId);
+        } catch {
+            return false;
+        }
+    }
+
     #isStillAuthorized(
         owner: SessionRecord,
         contextRevision: number,
@@ -942,23 +1063,108 @@ export class RideCodexApprovalBroker {
         }
     }
 
+    #respondAdmission(
+        admission: AdmittingApproval,
+        decision: 'decline' | 'cancel'
+    ): Promise<boolean> {
+        if (!this.#completeAdmissionTransition(admission)) {
+            return Promise.resolve(false);
+        }
+        return this.#respondAndRelease(
+            admission.lease,
+            admission.generation,
+            admission.requestId,
+            decision
+        );
+    }
+
     async #respondAndRelease(
         lease: RideCodexApprovalHostLease,
         generation: number,
         rpcRequestId: RequestId,
-        decision: 'decline' | 'cancel'
-    ): Promise<void> {
+        decision: RideCodexApprovalDecision
+    ): Promise<boolean> {
+        let complete!: (responded: boolean) => void;
+        const outcome = new Promise<boolean>(resolve => { complete = resolve; });
+        const responding: RespondingApproval = {
+            generation,
+            lease,
+            complete
+        };
+        this.#responding.add(responding);
         try {
-            await this.#host.respondServerRequest(
+            const scheduled = this.#schedule(
+                () => this.#timeoutResponding(responding),
+                this.#responseTimeoutMs
+            );
+            if (!this.#responding.has(responding)) {
+                disposeSafely(scheduled);
+                return outcome;
+            }
+            responding.timer = scheduled;
+        } catch {
+            this.#finishResponding(responding, false);
+            this.#abortResponseGeneration(generation);
+            return outcome;
+        }
+        let response: Promise<void>;
+        try {
+            response = this.#host.respondServerRequest(
                 generation,
                 rpcRequestId,
                 deepFreezeRideCodex({ decision })
             );
         } catch {
-            // A failed generation-bound responder is terminal and must never be retried.
-        } finally {
-            releaseOnce(lease);
+            this.#finishResponding(responding, false);
+            return outcome;
         }
+        Promise.resolve(response).then(
+            () => this.#finishResponding(responding, true),
+            () => this.#finishResponding(responding, false)
+        );
+        return outcome;
+    }
+
+    #timeoutResponding(responding: RespondingApproval): void {
+        if (!this.#finishResponding(responding, false)) {
+            return;
+        }
+        this.#abortResponseGeneration(responding.generation);
+    }
+
+    #finishResponding(responding: RespondingApproval, responded: boolean): boolean {
+        if (!this.#responding.delete(responding)) {
+            return false;
+        }
+        disposeSafely(responding.timer);
+        releaseOnce(responding.lease);
+        responding.complete(responded);
+        return true;
+    }
+
+    #abortResponseGeneration(generation: number): void {
+        try {
+            this.#host.abortServerRequestGeneration(generation);
+        } catch {
+            // The timed-out response is already abandoned and cannot be retried safely.
+        }
+    }
+
+    #finishAdmission(admission: AdmittingApproval): boolean {
+        if (!this.#admitting.delete(admission)) {
+            return false;
+        }
+        admission.signalCompleted();
+        releaseOnce(admission.lease);
+        return true;
+    }
+
+    #completeAdmissionTransition(admission: AdmittingApproval): boolean {
+        if (!this.#admitting.delete(admission)) {
+            return false;
+        }
+        admission.signalCompleted();
+        return true;
     }
 
     #onHostStateChange(event: Readonly<{ state: string; generation: number }>): void {
@@ -976,6 +1182,11 @@ export class RideCodexApprovalBroker {
                     this.#fileScopes.delete(key);
                 }
             }
+            for (const admission of [...this.#admitting]) {
+                if (admission.generation !== event.generation) {
+                    this.#finishAdmission(admission);
+                }
+            }
             for (const pending of [...this.#pending.values()]) {
                 if (pending.generation !== event.generation) {
                     this.#abandon(pending);
@@ -986,13 +1197,24 @@ export class RideCodexApprovalBroker {
                     this.#abandonAuthorizing(authorizing);
                 }
             }
+            for (const responding of [...this.#responding]) {
+                if (responding.generation !== event.generation) {
+                    this.#finishResponding(responding, false);
+                }
+            }
             return;
+        }
+        for (const admission of [...this.#admitting]) {
+            this.#finishAdmission(admission);
         }
         for (const pending of [...this.#pending.values()]) {
             this.#abandon(pending);
         }
         for (const authorizing of [...this.#authorizing]) {
             this.#abandonAuthorizing(authorizing);
+        }
+        for (const responding of [...this.#responding]) {
+            this.#finishResponding(responding, false);
         }
         this.#threadRoots.clear();
         this.#fileScopes.clear();
@@ -1218,18 +1440,13 @@ export class RideCodexApprovalBroker {
         if (owner) {
             this.#publish(owner);
         }
-        try {
-            await this.#host.respondServerRequest(
-                pending.generation,
-                pending.requestId,
-                deepFreezeRideCodex({ decision: decision as 'accept' | 'acceptForSession' | 'decline' | 'cancel' })
-            );
-            return RESPONDED_RESULT;
-        } catch {
-            return RESPONSE_FAILED_RESULT;
-        } finally {
-            releaseOnce(pending.lease);
-        }
+        const responded = await this.#respondAndRelease(
+            pending.lease,
+            pending.generation,
+            pending.requestId,
+            decision as 'accept' | 'acceptForSession' | 'decline' | 'cancel'
+        );
+        return responded ? RESPONDED_RESULT : RESPONSE_FAILED_RESULT;
     }
 
     #cardsFor(record: SessionRecord): readonly RideCodexApprovalCard[] {
@@ -1827,5 +2044,13 @@ function releaseOnce(lease: RideCodexApprovalHostLease): void {
         lease.release();
     } catch {
         // Lease cleanup is idempotent and must not destabilize approval settlement.
+    }
+}
+
+function disposeSafely(disposable: { dispose(): void } | undefined): void {
+    try {
+        disposable?.dispose();
+    } catch {
+        // Timer cleanup cannot reopen or destabilize a completed response.
     }
 }
