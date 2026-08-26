@@ -203,7 +203,6 @@ function redactUntrustedText(value: string): string {
     const sanitized = value
         .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '')
         .replace(/\b(https?:\/\/)[^/\s:@]+:[^/\s@]+@/gi, '$1<redacted>@')
-        .replace(/\bauthorization\s*[:=]\s*(?:bearer\s+)?[^\s,;&]+/gi, 'authorization=<redacted>')
         .replace(/\bbearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer <redacted>');
     return redactCredentialAssignments(sanitized)
         .replace(/\bsk-[A-Za-z0-9_-]+\b/gi, '<redacted>')
@@ -266,6 +265,7 @@ function readCredentialAssignment(value: string, start: number): CredentialAssig
     if (!isSensitiveCredentialField(fieldName)) {
         return undefined;
     }
+    const authorizationField = isAuthorizationCredentialField(fieldName);
 
     let separator = quote === undefined ? fieldEnd : fieldEnd + 1;
     const whitespaceStart = separator;
@@ -286,11 +286,11 @@ function readCredentialAssignment(value: string, start: number): CredentialAssig
 
     return {
         valueStart: separator,
-        end: readCredentialValueEnd(value, separator)
+        end: readCredentialValueEnd(value, separator, authorizationField)
     };
 }
 
-function readCredentialValueEnd(value: string, start: number): number {
+function readCredentialValueEnd(value: string, start: number, authorizationField: boolean): number {
     const quote = value[start] === '"' || value[start] === "'" ? value[start] : undefined;
     if (quote !== undefined) {
         let index = start + 1;
@@ -305,6 +305,13 @@ function readCredentialValueEnd(value: string, start: number): number {
         }
         return value.length;
     }
+    if (authorizationField) {
+        let index = start;
+        while (index < value.length && value[index] !== '\r' && value[index] !== '\n') {
+            index += 1;
+        }
+        return index;
+    }
     let index = start;
     while (index < value.length && !isCredentialValueDelimiter(value[index])) {
         index += 1;
@@ -313,14 +320,12 @@ function readCredentialValueEnd(value: string, start: number): number {
 }
 
 function isSensitiveCredentialField(fieldName: string): boolean {
-    const segments = fieldName
-        .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
-        .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
-        .split(/[^A-Za-z0-9]+/)
-        .filter(segment => segment.length > 0)
-        .map(segment => segment.toLowerCase());
+    const segments = credentialFieldSegments(fieldName);
     if (segments.length === 0) {
         return false;
+    }
+    if (isAuthorizationCredentialSegments(segments)) {
+        return true;
     }
     const sensitiveSegments = new Set(['secret', 'password', 'passwd', 'token', 'credential']);
     if (segments.some(segment => sensitiveSegments.has(segment))) {
@@ -338,6 +343,27 @@ function isSensitiveCredentialField(fieldName: string): boolean {
     const collapsed = segments.join('');
     return ['secret', 'password', 'passwd', 'token', 'credential', 'privatekey', 'apikey', 'signingkey', 'accesskey']
         .some(suffix => collapsed === suffix || collapsed.endsWith(suffix));
+}
+
+function isAuthorizationCredentialField(fieldName: string): boolean {
+    return isAuthorizationCredentialSegments(credentialFieldSegments(fieldName));
+}
+
+function isAuthorizationCredentialSegments(segments: readonly string[]): boolean {
+    const collapsed = segments.join('');
+    return collapsed === 'authorization'
+        || collapsed === 'proxyauthorization'
+        || collapsed === 'wwwauthenticate'
+        || collapsed === 'proxyauthenticate';
+}
+
+function credentialFieldSegments(fieldName: string): string[] {
+    return fieldName
+        .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+        .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+        .split(/[^A-Za-z0-9]+/)
+        .filter(segment => segment.length > 0)
+        .map(segment => segment.toLowerCase());
 }
 
 function isAsciiLetter(value: string): boolean {

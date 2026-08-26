@@ -218,6 +218,108 @@ test('App Server spawn receives only a bounded platform allowlist and cannot inh
     }
 });
 
+test('App Server environment uses exact XDG and locale allowlists with compound secret denial', async t => {
+    const secretKeys = [
+        'XDG_PRIVATE_KEY',
+        'LC_SIGNING_KEY',
+        'XDG_OAUTH_TOKEN',
+        'LC_DB_PASSWORD'
+    ] as const;
+    const unreviewedWildcardKeys = ['XDG_AUDIT_UNREVIEWED', 'LC_AUDIT_UNREVIEWED'] as const;
+    const allowedEnvironment = Object.freeze({
+        XDG_CONFIG_HOME: 'audit-config-home',
+        XDG_CACHE_HOME: 'audit-cache-home',
+        XDG_DATA_HOME: 'audit-data-home',
+        XDG_STATE_HOME: 'audit-state-home',
+        XDG_RUNTIME_DIR: 'audit-runtime-dir',
+        LANG: 'audit-lang',
+        LANGUAGE: 'audit-language',
+        LC_ALL: 'audit-lc-all',
+        LC_CTYPE: 'audit-lc-ctype',
+        LC_NUMERIC: 'audit-lc-numeric',
+        LC_TIME: 'audit-lc-time',
+        LC_COLLATE: 'audit-lc-collate',
+        LC_MONETARY: 'audit-lc-monetary',
+        LC_MESSAGES: 'audit-lc-messages',
+        LC_PAPER: 'audit-lc-paper',
+        LC_NAME: 'audit-lc-name',
+        LC_ADDRESS: 'audit-lc-address',
+        LC_TELEPHONE: 'audit-lc-telephone',
+        LC_MEASUREMENT: 'audit-lc-measurement',
+        LC_IDENTIFICATION: 'audit-lc-identification'
+    });
+
+    await t.test('inherited compound secret keys are removed while exact safe keys remain', async () => {
+        const previous = new Map<string, string | undefined>();
+        for (const [key, value] of Object.entries({
+            ...allowedEnvironment,
+            ...Object.fromEntries(secretKeys.map(key => [key, `host-${key}`])),
+            ...Object.fromEntries(unreviewedWildcardKeys.map(key => [key, `host-${key}`]))
+        })) {
+            previous.set(key, process.env[key]);
+            process.env[key] = value;
+        }
+        const harness = createHost();
+        try {
+            const lease = await harness.host.acquire('foreground-panel');
+            const environment = harness.records[0].options.env;
+            for (const key of secretKeys) {
+                assert.equal(environment[key], undefined);
+            }
+            for (const key of unreviewedWildcardKeys) {
+                assert.equal(environment[key], undefined);
+            }
+            for (const [key, value] of Object.entries(allowedEnvironment)) {
+                assert.equal(environment[key], value);
+            }
+            lease.release();
+        } finally {
+            await harness.host.dispose();
+            for (const [key, value] of previous) {
+                if (value === undefined) {
+                    delete process.env[key];
+                } else {
+                    process.env[key] = value;
+                }
+            }
+        }
+    });
+
+    await t.test('overlay compound secret keys are removed and Windows safe keys normalize casing', async () => {
+        const overlay: Record<string, string> = {
+            ...allowedEnvironment,
+            ...Object.fromEntries(secretKeys.map(key => [key, `overlay-${key}`])),
+            ...Object.fromEntries(unreviewedWildcardKeys.map(key => [key, `overlay-${key}`]))
+        };
+        if (process.platform === 'win32') {
+            delete overlay.XDG_CONFIG_HOME;
+            delete overlay.LC_CTYPE;
+            overlay.xdg_config_home = allowedEnvironment.XDG_CONFIG_HOME;
+            overlay.lc_ctype = allowedEnvironment.LC_CTYPE;
+        }
+        const spec = Object.freeze({ ...launchSpec(), environment: Object.freeze(overlay) });
+        const harness = createHost({ resolve: async () => spec });
+        try {
+            const lease = await harness.host.acquire('foreground-panel');
+            const environment = harness.records[0].options.env;
+            for (const key of secretKeys) {
+                assert.equal(environment[key], undefined);
+            }
+            for (const key of unreviewedWildcardKeys) {
+                assert.equal(environment[key], undefined);
+            }
+            for (const [key, value] of Object.entries(allowedEnvironment)) {
+                assert.equal(environment[key], value);
+            }
+            assert.ok(Object.keys(environment).length <= 32);
+            assert.ok(Buffer.byteLength(JSON.stringify(environment)) <= 16 * 1024);
+            lease.release();
+        } finally {
+            await harness.host.dispose();
+        }
+    });
+});
+
 test('App Server environment overlay validation is descriptor-safe and fails closed on invalid values', async t => {
     await t.test('accessors are rejected without executing them', async () => {
         let getterCalls = 0;
@@ -767,6 +869,49 @@ test('diagnostics redact compound credential fields without matching ordinary wo
     chunkedDiagnostics.appendStderr(Buffer.from('ue: AUDIT_NOVEMBER\n'));
     chunkedDiagnostics.flushStderr();
     assert.doesNotMatch(JSON.stringify(chunkedDiagnostics.snapshot()), sensitiveValues);
+});
+
+test('diagnostics redact Basic and Digest authorization values across records and stderr chunks', () => {
+    const credentialFragments = /QVVESVRfQkFTSUM=|AUDIT_USER|AUDIT_RESPONSE|AUDIT_PROXY|AUDIT_JSON|AUDIT_CHUNKED/i;
+    const authorizationCases = [
+        'Authorization: Basic QVVESVRfQkFTSUM=',
+        'authorization=Digest username="AUDIT_USER", response="AUDIT_RESPONSE"',
+        'Proxy-Authorization: Basic AUDIT_PROXY',
+        'WWW-Authenticate: Digest username="AUDIT_USER", response="AUDIT_RESPONSE"',
+        '{"Authorization":"Basic AUDIT_JSON"}',
+        '{"proxyAuthorization":"Digest username=\'AUDIT_USER\', response=\'AUDIT_RESPONSE\'"}'
+    ];
+    const recordDiagnostics = new RideCodexAppServerDiagnostics({
+        maxEntries: authorizationCases.length + 1,
+        maxEntryBytes: 512
+    });
+    for (const detail of authorizationCases) {
+        recordDiagnostics.record('protocol-error', detail);
+    }
+    recordDiagnostics.record('protocol-error', 'basic mode remains available');
+    const recordSnapshot = recordDiagnostics.snapshot();
+    assert.doesNotMatch(JSON.stringify(recordSnapshot), credentialFragments);
+    assert.match(JSON.stringify(recordSnapshot), /basic mode remains available/);
+
+    const stderrDiagnostics = new RideCodexAppServerDiagnostics({
+        maxStderrLines: authorizationCases.length + 1,
+        maxStderrBytes: 4_096,
+        maxLineBytes: 512
+    });
+    stderrDiagnostics.appendStderr(Buffer.from(`${authorizationCases.join('\n')}\n`));
+    stderrDiagnostics.flushStderr();
+    assert.doesNotMatch(JSON.stringify(stderrDiagnostics.snapshot()), credentialFragments);
+
+    const chunkedDiagnostics = new RideCodexAppServerDiagnostics({
+        maxStderrLines: 2,
+        maxStderrBytes: 1_024,
+        maxLineBytes: 512
+    });
+    chunkedDiagnostics.appendStderr(Buffer.from('Proxy-Author'));
+    chunkedDiagnostics.appendStderr(Buffer.from('ization: Digest username="AUDIT_'));
+    chunkedDiagnostics.appendStderr(Buffer.from('CHUNKED", response="AUDIT_RESPONSE"\n'));
+    chunkedDiagnostics.flushStderr();
+    assert.doesNotMatch(JSON.stringify(chunkedDiagnostics.snapshot()), credentialFragments);
 });
 
 test('stderr redaction survives chunk boundaries and bounds an overlong unterminated line', () => {

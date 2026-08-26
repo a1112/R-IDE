@@ -146,13 +146,24 @@ const MAX_APP_SERVER_ENVIRONMENT_SOURCE_ENTRIES = 1_024;
 const MAX_APP_SERVER_ENVIRONMENT_KEY_BYTES = 64;
 const MAX_APP_SERVER_ENVIRONMENT_VALUE_BYTES = 8 * 1024;
 const MAX_APP_SERVER_ENVIRONMENT_BYTES = 16 * 1024;
-const SECRET_ENVIRONMENT_KEY = /(?:API.?KEY|TOKEN|AUTHORIZATION|BEARER|SECRET|PASSWORD|CREDENTIAL)/i;
+const XDG_APP_SERVER_ENVIRONMENT_KEYS = [
+    'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME', 'XDG_RUNTIME_DIR'
+] as const;
+const LOCALE_APP_SERVER_ENVIRONMENT_KEYS = [
+    'LANG', 'LANGUAGE', 'LC_ALL', 'LC_CTYPE', 'LC_NUMERIC', 'LC_TIME', 'LC_COLLATE',
+    'LC_MONETARY', 'LC_MESSAGES', 'LC_PAPER', 'LC_NAME', 'LC_ADDRESS', 'LC_TELEPHONE',
+    'LC_MEASUREMENT', 'LC_IDENTIFICATION'
+] as const;
 const WINDOWS_APP_SERVER_ENVIRONMENT_KEYS = new Map([
     'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATH', 'PATHEXT', 'USERPROFILE',
-    'HOMEDRIVE', 'HOMEPATH', 'APPDATA', 'LOCALAPPDATA', 'TEMP', 'TMP', 'LANG', 'TZ'
+    'HOMEDRIVE', 'HOMEPATH', 'APPDATA', 'LOCALAPPDATA', 'TEMP', 'TMP', 'TZ',
+    ...XDG_APP_SERVER_ENVIRONMENT_KEYS,
+    ...LOCALE_APP_SERVER_ENVIRONMENT_KEYS
 ].map(key => [key, key]));
 const POSIX_APP_SERVER_ENVIRONMENT_KEYS = new Set([
-    'HOME', 'USER', 'LOGNAME', 'PATH', 'TMPDIR', 'LANG', 'TZ'
+    'HOME', 'USER', 'LOGNAME', 'PATH', 'TMPDIR', 'TZ',
+    ...XDG_APP_SERVER_ENVIRONMENT_KEYS,
+    ...LOCALE_APP_SERVER_ENVIRONMENT_KEYS
 ]);
 
 export class RideCodexAppServerHost {
@@ -936,7 +947,7 @@ function collectAllowedEnvironment(
             || key.includes('\0') || key.includes('=')) {
             throw new Error('Codex App Server environment is invalid');
         }
-        if (SECRET_ENVIRONMENT_KEY.test(key)) {
+        if (isSecretEnvironmentKey(key)) {
             continue;
         }
         const canonicalKey = canonicalAppServerEnvironmentKey(key, platform);
@@ -971,12 +982,38 @@ function canonicalAppServerEnvironmentKey(key: string, platform: NodeJS.Platform
     }
     const upper = key.toUpperCase();
     if (platform === 'win32') {
-        return WINDOWS_APP_SERVER_ENVIRONMENT_KEYS.get(upper)
-            ?? (/^LC_[A-Z0-9_]+$/.test(upper) ? upper : undefined);
+        return WINDOWS_APP_SERVER_ENVIRONMENT_KEYS.get(upper);
     }
-    return POSIX_APP_SERVER_ENVIRONMENT_KEYS.has(key)
-        ? key
-        : /^(?:XDG|LC)_[A-Z0-9_]+$/.test(key) ? key : undefined;
+    return POSIX_APP_SERVER_ENVIRONMENT_KEYS.has(key) ? key : undefined;
+}
+
+function isSecretEnvironmentKey(key: string): boolean {
+    const segments = key
+        .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+        .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+        .split(/[^A-Za-z0-9]+/)
+        .filter(segment => segment.length > 0)
+        .map(segment => segment.toLowerCase());
+    const sensitiveSegments = new Set([
+        'authorization', 'bearer', 'secret', 'password', 'passwd', 'token', 'credential'
+    ]);
+    if (segments.some(segment => sensitiveSegments.has(segment))) {
+        return true;
+    }
+    if (segments.length === 1 && segments[0] === 'key') {
+        return true;
+    }
+    const sensitiveKeyQualifiers = new Set(['private', 'api', 'signing', 'access']);
+    for (let index = 1; index < segments.length; index += 1) {
+        if (segments[index] === 'key' && sensitiveKeyQualifiers.has(segments[index - 1])) {
+            return true;
+        }
+    }
+    const collapsed = segments.join('');
+    return [
+        'authorization', 'bearer', 'secret', 'password', 'passwd', 'token', 'credential',
+        'privatekey', 'apikey', 'signingkey', 'accesskey'
+    ].some(suffix => collapsed === suffix || collapsed.endsWith(suffix));
 }
 
 function requirePipedChild(child: ChildProcessWithoutNullStreams): void {
