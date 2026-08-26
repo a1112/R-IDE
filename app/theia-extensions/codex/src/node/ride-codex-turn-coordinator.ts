@@ -517,6 +517,7 @@ export class RideCodexTurnCoordinator {
             const restarting = Promise.resolve(this.#host.restartForRecovery(expectedGeneration));
             restarting.catch(() => undefined);
             const generation = requireGeneration(await Promise.race([restarting, stopped]));
+            remainingRecoveryTimeout(this.#timers, startedAt, this.#recoveryTimeoutMs);
             if (this.#disposed || lifecycle !== this.#lifecycle) {
                 throw new RideCodexTurnError(this.#disposed ? 'disposed' : 'operation-superseded');
             }
@@ -3337,6 +3338,9 @@ function remainingRecoveryTimeout(
     timeoutMs: number
 ): number {
     const elapsed = Math.max(0, recoveryNow(timers) - startedAt);
+    if (elapsed >= timeoutMs) {
+        throw new RideCodexRecoveryTimeout();
+    }
     return Math.max(1, Math.min(timeoutMs, Math.ceil(timeoutMs - elapsed)));
 }
 

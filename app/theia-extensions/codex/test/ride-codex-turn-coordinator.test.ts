@@ -1220,6 +1220,154 @@ describe('RideCodexTurnCoordinator minimal streaming contract', () => {
         await coordinator.dispose();
     });
 
+    it('synchronously stops recovery after restart at or beyond a delayed deadline', async () => {
+        for (const elapsed of [20, 21]) {
+            const host = new FakeTurnHost();
+            const scheduler = new FakeScheduler();
+            const timeoutCallbacks: Array<() => void> = [];
+            const events: RideCodexUiEvent[] = [];
+            let now = 0;
+            let clearedTimers = 0;
+            let foregroundAcquireCalls = 0;
+            let resumeCalls = 0;
+            let resolveRestart!: (generation: number) => void;
+            const acquire = host.acquire.bind(host);
+            host.interruptPromise = Promise.resolve({});
+            host.restartPromise = new Promise(resolve => { resolveRestart = resolve; });
+            host.acquire = async kind => {
+                if (kind !== 'foreground-panel') {
+                    return acquire(kind);
+                }
+                foregroundAcquireCalls += 1;
+                const lease = await acquire(kind);
+                return {
+                    generation: lease.generation,
+                    request: (method, params, timeoutMs) => {
+                        if (method === 'thread/resume') {
+                            resumeCalls += 1;
+                        }
+                        return lease.request(method, params, timeoutMs);
+                    },
+                    release: () => lease.release()
+                };
+            };
+            const coordinator = new RideCodexTurnCoordinator({
+                host,
+                scheduler,
+                interruptTimeoutMs: 10,
+                recoveryTimeoutMs: 20,
+                timers: {
+                    setTimeout: callback => { timeoutCallbacks.push(callback); return callback; },
+                    clearTimeout: () => { clearedTimers += 1; },
+                    now: () => now
+                }
+            });
+            const service = coordinator.connectClient({
+                turnEvents: wire => { events.push(...decodeBatch(wire).events); }
+            });
+            await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'one' }] });
+            const interrupting = service.interruptTurn({ threadId: 'thread-1', turnId: 'turn-1' });
+            timeoutCallbacks[0]?.();
+            await settleTurnMicrotasks();
+
+            assert.ok(timeoutCallbacks[1], 'one recovery timer is installed but deliberately not fired');
+            now = elapsed;
+            host.generation = 2;
+            resolveRestart(2);
+            assert.equal((await interrupting).status, 'interrupt-uncertain');
+            while (scheduler.callbacks.length > 0) {
+                scheduler.flushOne();
+                await Promise.resolve();
+            }
+
+            assert.equal(foregroundAcquireCalls, 0, `elapsed=${elapsed} must not begin acquire`);
+            assert.equal(resumeCalls, 0, `elapsed=${elapsed} must not resume`);
+            assert.equal(events.filter(event => event.type === 'error' && event.code === 'recovery-failed').length, 1);
+            assert.equal(clearedTimers, 2, 'interrupt and recovery timers are both cleared');
+
+            timeoutCallbacks[1]();
+            await settleTurnMicrotasks();
+            assert.equal(events.filter(event => event.type === 'error' && event.code === 'recovery-failed').length, 1,
+                'a late timer callback must not duplicate diagnostics');
+
+            host.restartPromise = undefined;
+            host.nextTurnId = 'turn-2';
+            assert.equal((await service.startTurn({
+                threadId: 'thread-1', input: [{ type: 'text', text: 'after delayed recovery deadline' }]
+            })).turnId, 'turn-2');
+            await coordinator.dispose();
+        }
+    });
+
+    it('synchronously stops recovery after acquire and releases its lease once when the timer callback is delayed', async () => {
+        const host = new FakeTurnHost();
+        const scheduler = new FakeScheduler();
+        const timeoutCallbacks: Array<() => void> = [];
+        const events: RideCodexUiEvent[] = [];
+        let now = 0;
+        let resumeCalls = 0;
+        let recoveryReleases = 0;
+        let resolveAcquire!: (lease: RideCodexTurnHostLease) => void;
+        const acquire = host.acquire.bind(host);
+        host.interruptPromise = Promise.resolve({});
+        host.acquire = kind => kind === 'foreground-panel'
+            ? new Promise(resolve => { resolveAcquire = resolve; })
+            : acquire(kind);
+        const coordinator = new RideCodexTurnCoordinator({
+            host,
+            scheduler,
+            interruptTimeoutMs: 10,
+            recoveryTimeoutMs: 20,
+            timers: {
+                setTimeout: callback => { timeoutCallbacks.push(callback); return callback; },
+                clearTimeout: () => undefined,
+                now: () => now
+            }
+        });
+        const service = coordinator.connectClient({
+            turnEvents: wire => { events.push(...decodeBatch(wire).events); }
+        });
+        await service.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'one' }] });
+        const interrupting = service.interruptTurn({ threadId: 'thread-1', turnId: 'turn-1' });
+        timeoutCallbacks[0]?.();
+        await settleTurnMicrotasks();
+
+        assert.ok(timeoutCallbacks[1], 'one recovery timer is installed but deliberately not fired');
+        now = 21;
+        resolveAcquire({
+            generation: 2,
+            request: async method => {
+                if (method === 'thread/resume') {
+                    resumeCalls += 1;
+                }
+                return validResumeResponse();
+            },
+            release: () => { recoveryReleases += 1; }
+        });
+        assert.equal((await interrupting).status, 'interrupt-uncertain');
+        while (scheduler.callbacks.length > 0) {
+            scheduler.flushOne();
+            await Promise.resolve();
+        }
+
+        assert.equal(resumeCalls, 0);
+        assert.equal(recoveryReleases, 1);
+        assert.equal(events.filter(event => event.type === 'error' && event.code === 'recovery-failed').length, 1);
+
+        timeoutCallbacks[1]();
+        await settleTurnMicrotasks();
+        assert.equal(recoveryReleases, 1, 'late deadline callback must not release the lease twice');
+        assert.equal(events.filter(event => event.type === 'error' && event.code === 'recovery-failed').length, 1,
+            'late deadline callback must not duplicate diagnostics');
+
+        host.nextTurnId = 'turn-2';
+        assert.equal((await service.startTurn({
+            threadId: 'thread-1', input: [{ type: 'text', text: 'after delayed acquire deadline' }]
+        })).turnId, 'turn-2');
+        await coordinator.dispose();
+        assert.equal(recoveryReleases, 1);
+    });
+
     it('fails malformed interrupt ACKs closed and releases the active lease without recovery', async () => {
         const host = new FakeTurnHost();
         host.interruptPromise = Promise.resolve({ unexpected: true });
