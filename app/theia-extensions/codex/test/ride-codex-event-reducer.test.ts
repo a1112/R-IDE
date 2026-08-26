@@ -1299,6 +1299,215 @@ describe('RideCodexEventReducer minimal frame contract', () => {
         assert.deepEqual(reducer.snapshot().warnings, []);
     });
 
+    it('rejects unauthorized pending batches before they can evict an unflushed terminal boundary', () => {
+        const protectedSequence = Number.MAX_SAFE_INTEGER - 1;
+        const protectedWire = batchWire({
+            generation: Number.MAX_SAFE_INTEGER,
+            turnSequence: protectedSequence,
+            threadId: WORST_VALID_IDENTIFIER,
+            turnId: WORST_VALID_IDENTIFIER,
+            events: [
+                { type: 'turn-started' },
+                {
+                    type: 'turn-terminal',
+                    status: 'failed',
+                    error: { code: 'operation-failed', message: 'Codex turn operation failed.' }
+                }
+            ]
+        });
+        assert.ok(Buffer.byteLength(protectedWire, 'utf8') <= MIN_COHERENT_QUEUE_BYTES);
+
+        for (const unauthorized of [
+            {
+                generation: Number.MAX_SAFE_INTEGER,
+                turnSequence: protectedSequence - 1,
+                threadId: 'thread-lower',
+                turnId: 'turn-lower'
+            },
+            {
+                generation: Number.MAX_SAFE_INTEGER,
+                turnSequence: protectedSequence,
+                threadId: 'thread-equal-other',
+                turnId: 'turn-equal-other'
+            },
+            {
+                generation: Number.MAX_SAFE_INTEGER,
+                turnSequence: Number.MAX_SAFE_INTEGER,
+                threadId: 'thread-higher-no-boundary',
+                turnId: 'turn-higher-no-boundary'
+            }
+        ]) {
+            const frames: Array<() => void> = [];
+            const reducer = new RideCodexEventReducer({
+                scheduleFrame: callback => {
+                    frames.push(callback);
+                    return { dispose: () => undefined };
+                },
+                maxQueuedBytes: MIN_COHERENT_QUEUE_BYTES,
+                maxBatchEvents: 8
+            });
+            const unauthorizedWire = batchWire({
+                ...unauthorized,
+                events: [{
+                    type: 'warning',
+                    code: 'server-warning',
+                    message: 'unauthorized'
+                }]
+            });
+            assert.ok(Buffer.byteLength(protectedWire, 'utf8')
+                + Buffer.byteLength(unauthorizedWire, 'utf8') > MIN_COHERENT_QUEUE_BYTES);
+            reducer.notifyMany(protectedWire);
+            reducer.notifyMany(unauthorizedWire);
+            assert.equal(frames.length, 1);
+            frames.shift()?.();
+
+            const snapshot = reducer.snapshot();
+            assert.equal(snapshot.turnId, WORST_VALID_IDENTIFIER);
+            assert.equal(snapshot.status, 'failed');
+            assert.ok(snapshot.errors.some(error => error.code === 'operation-failed'));
+            assert.deepEqual(snapshot.warnings, []);
+        }
+    });
+
+    it('allows only a higher pending turn boundary to supersede the current pending authority', () => {
+        const frames: Array<() => void> = [];
+        const reducer = new RideCodexEventReducer({
+            scheduleFrame: callback => {
+                frames.push(callback);
+                return { dispose: () => undefined };
+            },
+            maxQueuedBytes: MIN_COHERENT_QUEUE_BYTES,
+            maxBatchEvents: 8
+        });
+        reducer.notifyMany(batchWire({
+            generation: 1,
+            turnSequence: 10,
+            threadId: WORST_VALID_IDENTIFIER,
+            turnId: WORST_VALID_IDENTIFIER,
+            events: [{ type: 'turn-started' }, { type: 'turn-terminal', status: 'completed' }]
+        }));
+        reducer.notifyMany(batchWire({
+            generation: 1,
+            turnSequence: 11,
+            threadId: 'thread-new',
+            turnId: 'turn-new',
+            events: [
+                { type: 'turn-started' },
+                {
+                    type: 'turn-terminal',
+                    status: 'failed',
+                    error: { code: 'turn-error', message: 'new authority' }
+                }
+            ]
+        }));
+        frames.shift()?.();
+
+        const snapshot = reducer.snapshot();
+        assert.equal(snapshot.turnId, 'turn-new');
+        assert.equal(snapshot.status, 'failed');
+        assert.deepEqual(snapshot.errors.map(error => error.message), ['new authority']);
+    });
+
+    it('keeps recovery failure diagnostics that follow a terminal in the same batch', () => {
+        const frames: Array<() => void> = [];
+        const reducer = new RideCodexEventReducer({
+            scheduleFrame: callback => {
+                frames.push(callback);
+                return { dispose: () => undefined };
+            }
+        });
+        reducer.notifyMany(batchWire({
+            generation: 3,
+            turnSequence: 7,
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            events: [
+                { type: 'turn-started' },
+                {
+                    type: 'turn-terminal',
+                    status: 'interrupt-uncertain',
+                    error: { code: 'interrupt-timeout', message: 'interrupt uncertain' }
+                },
+                {
+                    type: 'error',
+                    code: 'recovery-failed',
+                    message: 'resume failed',
+                    retryable: true
+                }
+            ]
+        }));
+        frames.shift()?.();
+
+        const snapshot = reducer.snapshot();
+        assert.equal(snapshot.status, 'interrupt-uncertain');
+        assert.deepEqual(snapshot.errors.map(error => error.code), ['interrupt-timeout', 'recovery-failed']);
+    });
+
+    it('accepts bounded deduplicated diagnostics for only the current finalized identity', () => {
+        const frames: Array<() => void> = [];
+        const reducer = new RideCodexEventReducer({
+            scheduleFrame: callback => {
+                frames.push(callback);
+                return { dispose: () => undefined };
+            }
+        });
+        reducer.notifyMany(batchWire({
+            generation: 5,
+            turnSequence: 9,
+            threadId: 'thread-current',
+            turnId: 'turn-current',
+            events: [
+                { type: 'turn-started' },
+                { type: 'item-started', itemId: 'item-1', itemKind: 'agent-message' },
+                { type: 'agent-delta', itemId: 'item-1', delta: 'kept content' },
+                {
+                    type: 'turn-terminal',
+                    status: 'interrupt-uncertain',
+                    error: { code: 'interrupt-timeout', message: 'interrupt uncertain' }
+                }
+            ]
+        }));
+        frames.shift()?.();
+
+        const recoveryDiagnostic = {
+            generation: 5,
+            turnSequence: 9,
+            threadId: 'thread-current',
+            turnId: 'turn-current',
+            events: [{
+                type: 'error',
+                code: 'recovery-failed',
+                message: 'resume failed',
+                retryable: true
+            }]
+        };
+        reducer.notifyMany(batchWire(recoveryDiagnostic));
+        reducer.notifyMany(batchWire(recoveryDiagnostic));
+        reducer.notifyMany(batchWire({
+            ...recoveryDiagnostic,
+            events: [{ type: 'agent-delta', itemId: 'item-1', delta: 'must not mutate terminal content' }]
+        }));
+        reducer.notifyMany(batchWire({
+            generation: 5,
+            turnSequence: 8,
+            threadId: 'thread-old',
+            turnId: 'turn-old',
+            events: [{
+                type: 'error',
+                code: 'recovery-failed',
+                message: 'old recovery failure',
+                retryable: true
+            }]
+        }));
+        frames.shift()?.();
+
+        const snapshot = reducer.snapshot();
+        assert.equal(snapshot.status, 'interrupt-uncertain');
+        assert.equal(snapshot.items[0].text, 'kept content');
+        assert.deepEqual(snapshot.errors.map(error => error.code), ['interrupt-timeout', 'recovery-failed']);
+        assert.deepEqual(snapshot.errors.map(error => error.message), ['interrupt uncertain', 'resume failed']);
+    });
+
     it('initializes at a high sequence and rejects equal cross-identity and lower batches', () => {
         const frames: Array<() => void> = [];
         const reducer = new RideCodexEventReducer({

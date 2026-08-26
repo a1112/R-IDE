@@ -44,6 +44,14 @@ interface MutableItem {
     changes: RideCodexFileChange[];
 }
 
+interface TurnAuthority {
+    readonly generation: number;
+    readonly turnSequence: number;
+    readonly threadId: string;
+    readonly turnId: string;
+    readonly terminal: boolean;
+}
+
 const DEFAULT_MAX_QUEUED_BYTES = 256 * 1024;
 const DEFAULT_MAX_WIRE_BYTES = 4 * 1024 * 1024;
 const DEFAULT_MAX_BATCH_EVENTS = 4_096;
@@ -142,7 +150,7 @@ export class RideCodexEventReducer {
             return;
         }
         const safeBatch = parseSafeBatch(wire, this.#maxWireBytes);
-        if (!safeBatch) {
+        if (!safeBatch || !this.#isAuthorizedForPending(safeBatch)) {
             return;
         }
         const sourceEvents = safeBatch.events;
@@ -211,7 +219,14 @@ export class RideCodexEventReducer {
             return false;
         }
         const identityKey = finalizedIdentityKey(batch);
-        if (batch.generation === this.#generation && this.#finalizedIdentities.has(identityKey)) {
+        const currentFinalizedDiagnostic = this.#isTerminal()
+            && isDiagnosticOnly(batch.events)
+            && batch.generation === this.#generation
+            && batch.turnSequence === this.#highestTurnSequence
+            && batch.threadId === this.#threadId
+            && batch.turnId === this.#turnId;
+        if (batch.generation === this.#generation && this.#finalizedIdentities.has(identityKey)
+            && !currentFinalizedDiagnostic) {
             return false;
         }
         const startsTurn = batch.events.some(event => event.type === 'turn-started');
@@ -260,6 +275,61 @@ export class RideCodexEventReducer {
             this.#rememberFinalized(identityKey);
         }
         return changed;
+    }
+
+    #isAuthorizedForPending(incoming: RideCodexEventBatch): boolean {
+        const boundary = hasTurnBoundary(incoming.events);
+        const authority = this.#highestPendingAuthority();
+        if (!authority) {
+            return boundary;
+        }
+        if (incoming.generation !== authority.generation) {
+            return incoming.generation > authority.generation && boundary;
+        }
+        if (incoming.turnSequence !== authority.turnSequence) {
+            return incoming.turnSequence > authority.turnSequence && boundary;
+        }
+        if (incoming.threadId !== authority.threadId || incoming.turnId !== authority.turnId) {
+            return false;
+        }
+        return !authority.terminal || isDiagnosticOnly(incoming.events);
+    }
+
+    #highestPendingAuthority(): TurnAuthority | undefined {
+        let authority: TurnAuthority | undefined;
+        if (this.#highestTurnSequence !== undefined
+            && this.#threadId !== undefined && this.#turnId !== undefined) {
+            authority = {
+                generation: this.#generation,
+                turnSequence: this.#highestTurnSequence,
+                threadId: this.#threadId,
+                turnId: this.#turnId,
+                terminal: this.#isTerminal()
+            };
+        }
+        for (const batch of this.#pending) {
+            if (!hasTurnBoundary(batch.events)) {
+                continue;
+            }
+            const terminal = batch.events.some(event => event.type === 'turn-terminal');
+            if (!authority || batch.generation > authority.generation
+                || (batch.generation === authority.generation
+                    && batch.turnSequence > authority.turnSequence)) {
+                authority = {
+                    generation: batch.generation,
+                    turnSequence: batch.turnSequence,
+                    threadId: batch.threadId,
+                    turnId: batch.turnId,
+                    terminal
+                };
+            } else if (batch.generation === authority.generation
+                && batch.turnSequence === authority.turnSequence
+                && batch.threadId === authority.threadId && batch.turnId === authority.turnId
+                && terminal && !authority.terminal) {
+                authority = { ...authority, terminal: true };
+            }
+        }
+        return authority;
     }
 
     #rememberFinalized(identityKey: string): void {
@@ -399,6 +469,14 @@ export class RideCodexEventReducer {
 
     #applyEvent(event: RideCodexUiEvent): boolean {
         if (this.#isTerminal()) {
+            if (event.type === 'warning') {
+                this.#pushWarning(event);
+                return true;
+            }
+            if (event.type === 'error') {
+                this.#pushError(event);
+                return true;
+            }
             return false;
         }
         switch (event.type) {
@@ -1265,6 +1343,14 @@ function pendingBatchBytes(batch: RideCodexEventBatch): number {
 
 function isTurnBoundary(event: RideCodexUiEvent): boolean {
     return event.type === 'turn-started' || event.type === 'turn-terminal';
+}
+
+function hasTurnBoundary(events: readonly RideCodexUiEvent[]): boolean {
+    return events.some(isTurnBoundary);
+}
+
+function isDiagnosticOnly(events: readonly RideCodexUiEvent[]): boolean {
+    return events.length > 0 && events.every(event => event.type === 'warning' || event.type === 'error');
 }
 
 function findLastOrdinaryEvent(events: readonly RideCodexUiEvent[]): number {
