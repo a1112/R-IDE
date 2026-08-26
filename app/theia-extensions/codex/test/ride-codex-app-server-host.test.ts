@@ -6,7 +6,9 @@
 
 import assert from 'node:assert/strict';
 import { ChildProcessWithoutNullStreams, spawn as nodeSpawn } from 'node:child_process';
+import { EventEmitter } from 'node:events';
 import { resolve } from 'node:path';
+import { PassThrough, Writable } from 'node:stream';
 import { test } from 'node:test';
 import { Container } from '@theia/core/shared/inversify';
 import { BackendApplicationContribution } from '@theia/core/lib/node/backend-application';
@@ -54,6 +56,93 @@ function fakeSpawn(modes: readonly string[], records: SpawnRecord[]): RideCodexA
         records.push({ executable, args: [...args], options, child, mode });
         return child;
     };
+}
+
+interface ControlledChild {
+    readonly child: ChildProcessWithoutNullStreams;
+    readonly killCalls: () => number;
+    readonly emitExit: () => void;
+}
+
+let nextControlledPid = 50_000;
+
+function createControlledChild(options: {
+    readonly exitAfterKill?: 'after-grace-tick' | 'never';
+    readonly shutdownGraceMs: number;
+}): ControlledChild {
+    const events = new EventEmitter();
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    let input = '';
+    const stdin = new Writable({
+        autoDestroy: false,
+        write(chunk, _encoding, callback) {
+            input += chunk.toString();
+            let newline = input.indexOf('\n');
+            while (newline >= 0) {
+                const line = input.slice(0, newline);
+                input = input.slice(newline + 1);
+                if (line) {
+                    const message = JSON.parse(line) as { id?: number; method?: string; params?: unknown };
+                    if (message.method === 'initialize') {
+                        stdout.write(`${JSON.stringify({ id: message.id, result: { initializeParams: message.params } })}\n`);
+                    }
+                }
+                newline = input.indexOf('\n');
+            }
+            callback();
+        }
+    });
+    const child = events as unknown as ChildProcessWithoutNullStreams;
+    Object.assign(child, {
+        stdin,
+        stdout,
+        stderr,
+        pid: nextControlledPid,
+        exitCode: null,
+        signalCode: null
+    });
+    nextControlledPid += 1;
+
+    let exited = false;
+    let kills = 0;
+    const emitExit = (): void => {
+        if (exited) {
+            return;
+        }
+        exited = true;
+        Object.assign(child, { signalCode: 'SIGTERM' });
+        child.emit('exit', null, 'SIGTERM');
+        setImmediate(() => child.emit('close', null, 'SIGTERM'));
+    };
+    child.kill = (() => {
+        kills += 1;
+        if (options.exitAfterKill === 'never') {
+            return false;
+        }
+        setTimeout(() => setImmediate(emitExit), options.shutdownGraceMs + 1);
+        return true;
+    }) as typeof child.kill;
+    return { child, killCalls: () => kills, emitExit };
+}
+
+function createControlledHost(options: {
+    readonly exitAfterKill?: 'after-grace-tick' | 'never';
+    readonly shutdownGraceMs: number;
+}): { host: RideCodexAppServerHost; children: ControlledChild[] } {
+    const children: ControlledChild[] = [];
+    const host = new RideCodexAppServerHost({
+        resolver: { resolve: async () => launchSpec() },
+        spawn: () => {
+            const controlled = createControlledChild(options);
+            children.push(controlled);
+            return controlled.child;
+        },
+        handshakeTimeoutMs: 100,
+        idleTimeoutMs: 10_000,
+        shutdownGraceMs: options.shutdownGraceMs
+    });
+    return { host, children };
 }
 
 function createHost(options: {
@@ -716,6 +805,73 @@ test('release, crash, restart, and dispose races are idempotent and generation-i
     await assert.rejects(harness.host.acquire('foreground-panel'), /disposed/i);
     await assert.rejects(harness.host.retry(), /disposed/i);
     assert.ok(harness.records.every(record => record.child.exitCode !== null || record.child.signalCode !== null));
+});
+
+test('final disposal resolves across late exit races and never starts another generation', async () => {
+    const rounds = 25;
+    for (let round = 0; round < rounds; round += 1) {
+        const harness = createControlledHost({ exitAfterKill: 'after-grace-tick', shutdownGraceMs: 4 });
+        const lease = await harness.host.acquire('active-turn');
+        assert.equal(harness.children.length, 1);
+
+        const first = harness.host.dispose();
+        const second = harness.host.dispose();
+        const third = harness.host.dispose();
+        assert.strictEqual(second, first);
+        assert.strictEqual(third, first);
+        await Promise.all([first, second, third]);
+
+        assert.equal(harness.host.snapshot().state, 'disposed');
+        assert.equal(harness.children.length, 1, `round ${round + 1} must not spawn a replacement`);
+        assert.equal(harness.children[0].killCalls(), 1);
+        await assert.rejects(harness.host.acquire('foreground-panel'), error => {
+            assert.equal((error as RideCodexAppServerHostError).code, 'disposed');
+            return true;
+        });
+        await assert.rejects(harness.host.retry(), error => {
+            assert.equal((error as RideCodexAppServerHostError).code, 'disposed');
+            return true;
+        });
+
+        harness.children[0].emitExit();
+        harness.children[0].child.emit('close', null, 'SIGTERM');
+        harness.children[0].child.emit('exit', null, 'SIGTERM');
+        await waitFor(() => harness.host.snapshot().pid === undefined);
+        assert.equal(harness.children[0].child.listenerCount('exit'), 0);
+        assert.equal(harness.children[0].child.listenerCount('close'), 0);
+        assert.equal(harness.host.snapshot().state, 'disposed');
+        lease.release();
+    }
+});
+
+test('final disposal bounds an unconfirmed child without dropping its late-exit authority', async () => {
+    const harness = createControlledHost({ exitAfterKill: 'never', shutdownGraceMs: 5 });
+    const lease = await harness.host.acquire('active-turn');
+    const child = harness.children[0];
+    const startedAt = Date.now();
+
+    await assert.doesNotReject(harness.host.dispose());
+
+    assert.ok(Date.now() - startedAt < 250, 'final disposal must remain bounded');
+    assert.equal(harness.host.snapshot().state, 'disposed');
+    assert.equal(harness.host.snapshot().pid, child.child.pid, 'host must retain unconfirmed child authority');
+    assert.equal(child.killCalls(), 1);
+    assert.ok(child.child.listenerCount('exit') > 0);
+    assert.ok(child.child.listenerCount('close') > 0);
+    assert.equal(harness.children.length, 1);
+    const entries = harness.host.snapshot().diagnostics.entries;
+    assert.equal(entries[entries.length - 1]?.code, 'shutdown-timeout');
+    assertSafeDiagnostics(harness.host.snapshot().diagnostics);
+    await assert.rejects(harness.host.acquire('foreground-panel'), /disposed/i);
+    await assert.rejects(harness.host.retry(), /disposed/i);
+    assert.equal(harness.children.length, 1);
+
+    child.emitExit();
+    await waitFor(() => harness.host.snapshot().pid === undefined);
+    assert.equal(child.child.listenerCount('exit'), 0);
+    assert.equal(child.child.listenerCount('close'), 0);
+    assert.equal(harness.host.snapshot().state, 'disposed');
+    lease.release();
 });
 
 test('diagnostic ring independently redacts secrets and paths while retaining recent bounded categories', () => {

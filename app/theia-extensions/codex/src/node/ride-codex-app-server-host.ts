@@ -298,13 +298,14 @@ export class RideCodexAppServerHost {
             const starting = this.#startPromise;
             const current = this.#connection;
             if (current) {
-                await this.#stopConnection(current, 'dispose');
+                await this.#stopConnectionForDisposal(current);
             }
             if (starting) {
                 await starting.catch(() => undefined);
             }
-            if (this.#connection) {
-                await this.#stopConnection(this.#connection, 'dispose');
+            const connectionAfterStart = this.#connection;
+            if (connectionAfterStart && connectionAfterStart !== current) {
+                await this.#stopConnectionForDisposal(connectionAfterStart);
             }
             this.#state = 'disposed';
         })();
@@ -681,6 +682,17 @@ export class RideCodexAppServerHost {
         return stopPromise;
     }
 
+    async #stopConnectionForDisposal(connection: Connection): Promise<void> {
+        try {
+            await this.#stopConnection(connection, 'dispose');
+        } catch (error) {
+            if (error instanceof RideCodexAppServerHostError && error.code === 'shutdown-timeout') {
+                return;
+            }
+            throw error;
+        }
+    }
+
     async #performStopConnection(connection: Connection, retryTermination: boolean): Promise<void> {
         if (connection.finalized) {
             return;
@@ -707,9 +719,11 @@ export class RideCodexAppServerHost {
         this.#killExactChild(connection, retryTermination);
         if (!await settlesWithin(connection.exitPromise, this.#shutdownGraceMs)) {
             this.diagnostics.record('shutdown-timeout');
-            if (!this.#disposed) {
-                this.#openCircuit('circuit-open');
+            if (this.#disposed) {
+                this.#state = 'disposed';
+                return;
             }
+            this.#openCircuit('circuit-open');
             throw new RideCodexAppServerHostError('shutdown-timeout');
         }
         this.#finalizeConnection(connection);
