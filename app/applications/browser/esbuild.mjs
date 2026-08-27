@@ -202,8 +202,11 @@ function patchBuiltParcelWatcherLoad() {
 // Prevent Inversify service identifiers from being split across duplicate
 // @theia package copies in the mixed-version workspace. createRequire resolves
 // upward from an isolated profile target on every supported platform.
-browserOptions.plugins.push(createTheiaModuleDedupePlugin(__dirname));
-nodeOptions.plugins.push(createTheiaModuleDedupePlugin(__dirname));
+// Resolve shared Theia requests before the generated Theia plugins. Those
+// plugins can otherwise resolve through the physical dependency junction and
+// reintroduce a second copy of @theia/core into the bundle.
+browserOptions.plugins.unshift(createTheiaModuleDedupePlugin(__dirname));
+nodeOptions.plugins.unshift(createTheiaModuleDedupePlugin(__dirname));
 nodeOptions.plugins.unshift(createWindowsCaCertsFallbackPlugin({ applicationRoot: __dirname }));
 nodeOptions.plugins.push({
     name: 'ride-tauri-backend-patches',

@@ -205,6 +205,8 @@ test('removes string and prefix filtering while retaining build safety fixes', (
   assert.doesNotMatch(esbuildSource, /leanTauri|startsWith\(prefix\)|split\(['"]\\n['"]\)\.filter/);
   assert.doesNotMatch(esbuildSource, /src-gen.*writeFileSync|patchGeneratedFilesForLeanTauri/s);
   assert.match(esbuildSource, /createTheiaModuleDedupePlugin/);
+  assert.match(esbuildSource, /browserOptions\.plugins\.unshift\(createTheiaModuleDedupePlugin/);
+  assert.match(esbuildSource, /nodeOptions\.plugins\.unshift\(createTheiaModuleDedupePlugin/);
   assert.match(esbuildSource, /loadTauriProfileManifest/);
   assert.match(esbuildSource, /createTauriProfileAuditPlugin/);
   assert.match(esbuildSource, /browserOptions\.metafile\s*=\s*true/);
