@@ -1074,6 +1074,47 @@ test('records multiple runtime identities while retaining Theia extensions below
     ]);
 });
 
+test('resolves package dependencies from the logical path after canonicalizing junction identities', async () => {
+    const browserDirectory = path.resolve('browser-app');
+    const logicalProductDirectory = path.resolve('logical-packages', 'product');
+    const canonicalProductDirectory = path.resolve('canonical-packages', 'product');
+    const logicalDependencyDirectory = path.resolve('logical-packages', 'dependency');
+    const canonicalDependencyDirectory = path.resolve('canonical-packages', 'dependency');
+    const graph = await resolveInstalledPackageGraph({
+        browserManifest: { dependencies: { product: '^1.0.0' } },
+        roots: ['product'],
+        browserDirectory,
+        canonicalizePackageDirectory: async directory => directory === logicalProductDirectory
+            ? canonicalProductDirectory
+            : canonicalDependencyDirectory,
+        resolver: async (requestName, fromDirectory) => {
+            if (requestName === 'product') {
+                return {
+                    requestName,
+                    packageDirectory: logicalProductDirectory,
+                    manifest: manifest('product', { dependency: '^1.0.0' }),
+                };
+            }
+            assert.equal(requestName, 'dependency');
+            assert.equal(fromDirectory, logicalProductDirectory);
+            return {
+                requestName,
+                packageDirectory: logicalDependencyDirectory,
+                manifest: manifest('dependency'),
+            };
+        },
+    });
+
+    assert.equal(
+        [...graph.records.values()].find(record => record.requestName === 'product').packageDirectory,
+        canonicalProductDirectory,
+    );
+    assert.equal(
+        [...graph.records.values()].find(record => record.requestName === 'dependency').packageDirectory,
+        canonicalDependencyDirectory,
+    );
+});
+
 test('traverses same-version packages at different installation locations and unions their extension closures', async t => {
     const installedRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-install-context-'));
     t.after(() => fs.promises.rm(installedRoot, { recursive: true, force: true }));

@@ -1151,7 +1151,13 @@ export async function resolveInstalledPackageGraph({
                 'browser manifest',
             );
         }
-        const packageDirectory = await canonicalizePackageDirectory(installed.packageDirectory);
+        // Keep the package-manager's logical path for resolving nested
+        // dependencies. Workspace dependency setups may expose packages
+        // through junctions; using only the canonical path would make Node
+        // walk into a different hoisted dependency tree. The canonical path
+        // remains the stable identity used for graph records and linking.
+        const resolutionDirectory = installed.packageDirectory;
+        const packageDirectory = await canonicalizePackageDirectory(resolutionDirectory);
         if (typeof packageDirectory !== 'string' || !path.isAbsolute(packageDirectory)) {
             throw new Error(`${dependencyPath.join(' -> ')}: installed dependency has no canonical package directory.`);
         }
@@ -1188,6 +1194,7 @@ export async function resolveInstalledPackageGraph({
             nodeId,
             requestName,
             packageDirectory,
+            resolutionDirectory,
             contextIdentity,
             contextSortKey: dependencyPath.join('\0'),
             manifest: installed.manifest,
@@ -1202,7 +1209,7 @@ export async function resolveInstalledPackageGraph({
             const dependencyNode = await load(
                 dependencyName,
                 dependency.spec,
-                record.packageDirectory,
+                record.resolutionDirectory,
                 [...dependencyPath, dependencyName],
                 dependency.optional,
             );
