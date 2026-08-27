@@ -4,13 +4,26 @@ import { createRequire } from 'node:module';
 
 const THEIA_PACKAGE_PREFIX = '@theia/';
 
-function logicalPackagePath(applicationRoot, request) {
-  const segments = request.split('/');
-  if (segments.length < 2 || segments.some(segment => !segment || segment === '.' || segment === '..')) {
-    return undefined;
-  }
-  const candidate = path.join(applicationRoot, 'node_modules', ...segments);
-  return fs.existsSync(candidate) ? candidate : undefined;
+function logicalResolvedPackagePath(applicationRoot, request, resolvedPath) {
+    const segments = request.split('/');
+    if (segments.length < 2 || segments.some(segment => !segment || segment === '.' || segment === '..')) {
+        return undefined;
+    }
+    const logicalPackage = path.join(applicationRoot, 'node_modules', segments[0], segments[1]);
+    if (!fs.existsSync(logicalPackage)) {
+        return undefined;
+    }
+    let physicalPackage;
+    try {
+        physicalPackage = fs.realpathSync(logicalPackage);
+    } catch {
+        return undefined;
+    }
+    const relative = path.relative(physicalPackage, resolvedPath);
+    if (relative === '' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+        return undefined;
+    }
+    return path.join(logicalPackage, relative);
 }
 
 /**
@@ -35,12 +48,10 @@ export function createTheiaModuleDedupePlugin(applicationRoot) {
           // junction. Returning the logical path lets esbuild keep resolving
           // peers from the profile's node_modules directory; browserRequire
           // canonicalizes the junction and can select another workspace tree.
-          const logicalPath = logicalPackagePath(applicationRoot, request);
-          if (logicalPath) {
-            return { path: logicalPath };
-          }
           try {
-            return { path: browserRequire.resolve(request) };
+            const resolvedPath = browserRequire.resolve(request);
+            const logicalPath = logicalResolvedPackagePath(applicationRoot, request, resolvedPath);
+            return { path: logicalPath ?? resolvedPath };
           } catch (error) {
             if (request.split('/').length === 2) {
               const packageName = request.slice(THEIA_PACKAGE_PREFIX.length);
