@@ -123,9 +123,22 @@ interface AuthorizingApproval {
     readonly signalCancelled: () => void;
 }
 
+interface AcquiringApproval {
+    readonly generation: number;
+    readonly requestId: RequestId;
+    readonly cancelled: Promise<void>;
+    readonly signalCancelled: () => void;
+}
+
+interface AcquiredApproval {
+    readonly acquiring: AcquiringApproval;
+    readonly lease: RideCodexApprovalHostLease;
+}
+
 interface AdmittingApproval {
     readonly generation: number;
     readonly requestId: RequestId;
+    readonly acquiring: AcquiringApproval;
     readonly lease: RideCodexApprovalHostLease;
     readonly completed: Promise<void>;
     readonly signalCompleted: () => void;
@@ -240,6 +253,8 @@ const INVALID_RESULT = Object.freeze({ status: 'rejected', code: 'invalid-decisi
 const RESPONSE_FAILED_RESULT = Object.freeze({ status: 'rejected', code: 'response-failed' } as const);
 const RESPONDED_RESULT = Object.freeze({ status: 'responded' } as const);
 const AUTHORIZATION_CANCELLED = Symbol('authorization-cancelled');
+const ACQUISITION_CANCELLED = Symbol('acquisition-cancelled');
+const ACQUISITION_FAILED = Symbol('acquisition-failed');
 
 export class RideCodexApprovalBroker {
     readonly #host: RideCodexApprovalHost;
@@ -258,6 +273,7 @@ export class RideCodexApprovalBroker {
     readonly #resolveRealPath: (path: string) => Promise<string>;
     readonly #instanceKey = randomBytes(32);
     readonly #sessions = new Map<number, SessionRecord>();
+    readonly #acquiring = new Set<AcquiringApproval>();
     readonly #admitting = new Set<AdmittingApproval>();
     readonly #authorizing = new Set<AuthorizingApproval>();
     readonly #pending = new Map<string, PendingApproval>();
@@ -332,8 +348,17 @@ export class RideCodexApprovalBroker {
         if (!envelope) {
             return;
         }
-        const lease = await this.#host.acquire('approval');
+        const acquiring = this.#reserveAcquisition(generation, envelope.id);
+        if (!acquiring) {
+            return;
+        }
+        const acquired = await this.#acquireApprovalLease(acquiring);
+        if (!acquired) {
+            return;
+        }
+        const { lease } = acquired;
         if (this.#disposed || lease.generation !== generation) {
+            this.#finishAcquiring(acquiring);
             releaseOnce(lease);
             return;
         }
@@ -350,6 +375,7 @@ export class RideCodexApprovalBroker {
         const admission: AdmittingApproval = Object.freeze({
             generation,
             requestId: envelope.id,
+            acquiring,
             lease,
             completed,
             signalCompleted
@@ -784,12 +810,17 @@ export class RideCodexApprovalBroker {
         this.#hostListener?.dispose();
         this.#hostStateListener?.dispose();
         this.#hostNotificationListener?.dispose();
+        const acquiring = [...this.#acquiring];
         const admitting = [...this.#admitting];
         const responding = [...this.#responding];
         const unsafeGenerations = new Set([
+            ...acquiring.map(entry => entry.generation),
             ...admitting.map(entry => entry.generation),
             ...responding.map(entry => entry.generation)
         ]);
+        for (const entry of acquiring) {
+            this.#finishAcquiring(entry);
+        }
         for (const entry of admitting) {
             this.#finishAdmission(entry);
         }
@@ -927,6 +958,102 @@ export class RideCodexApprovalBroker {
         return this.#settle(pending, safe.decision);
     }
 
+    #reserveAcquisition(
+        generation: number,
+        rpcRequestId: RequestId
+    ): AcquiringApproval | undefined {
+        if (!this.#canAcquireRequest(generation, rpcRequestId)) {
+            return undefined;
+        }
+        if (this.#activeApprovalCount() >= this.#maxPending) {
+            this.#abortResponseGeneration(generation);
+            this.#abandonGeneration(generation);
+            return undefined;
+        }
+        let signalCancelled!: () => void;
+        let cancellationSignalled = false;
+        const cancelled = new Promise<void>(resolve => {
+            signalCancelled = () => {
+                if (!cancellationSignalled) {
+                    cancellationSignalled = true;
+                    resolve();
+                }
+            };
+        });
+        const acquiring = Object.freeze({
+            generation,
+            requestId: rpcRequestId,
+            cancelled,
+            signalCancelled
+        });
+        this.#acquiring.add(acquiring);
+        if (!this.#canAcquireRequest(generation, rpcRequestId)) {
+            this.#finishAcquiring(acquiring);
+            return undefined;
+        }
+        return acquiring;
+    }
+
+    async #acquireApprovalLease(
+        acquiring: AcquiringApproval
+    ): Promise<AcquiredApproval | undefined> {
+        let acquirePromise: Promise<RideCodexApprovalHostLease>;
+        try {
+            acquirePromise = Promise.resolve(this.#host.acquire('approval'));
+        } catch {
+            this.#finishAcquiring(acquiring);
+            return undefined;
+        }
+        const acquired: Promise<
+            Readonly<{ lease: RideCodexApprovalHostLease }> | typeof ACQUISITION_FAILED
+        > = acquirePromise.then(
+            lease => Object.freeze({ lease }),
+            () => ACQUISITION_FAILED
+        );
+        const outcome = await Promise.race([
+            acquired,
+            acquiring.cancelled.then<typeof ACQUISITION_CANCELLED>(() => ACQUISITION_CANCELLED)
+        ]);
+        if (outcome === ACQUISITION_CANCELLED) {
+            acquired.then(late => {
+                if (late !== ACQUISITION_FAILED) {
+                    releaseOnce(late.lease);
+                }
+            });
+            return undefined;
+        }
+        if (outcome === ACQUISITION_FAILED) {
+            this.#finishAcquiring(acquiring);
+            return undefined;
+        }
+        if (!this.#acquiring.has(acquiring)) {
+            releaseOnce(outcome.lease);
+            return undefined;
+        }
+        return Object.freeze({ acquiring, lease: outcome.lease });
+    }
+
+    #finishAcquiring(acquiring: AcquiringApproval): boolean {
+        if (!this.#acquiring.delete(acquiring)) {
+            return false;
+        }
+        acquiring.signalCancelled();
+        return true;
+    }
+
+    #canAcquireRequest(generation: number, rpcRequestId: RequestId): boolean {
+        if (this.#disposed) {
+            return false;
+        }
+        try {
+            const snapshot = dataRecord(this.#host.snapshot());
+            return snapshot?.state === 'ready' && snapshot.generation === generation
+                && this.#host.ownsServerRequest(generation, rpcRequestId);
+        } catch {
+            return false;
+        }
+    }
+
     async #makeCapacityAvailable(
         admission: AdmittingApproval
     ): Promise<boolean> {
@@ -967,14 +1094,22 @@ export class RideCodexApprovalBroker {
             admission.lease, admission.generation, admission.requestId
         )) {
             this.#admitting.add(admission);
+            if (!this.#finishAcquiring(admission.acquiring)) {
+                this.#admitting.delete(admission);
+                admission.signalCompleted();
+                releaseOnce(admission.lease);
+                return false;
+            }
             return true;
         }
+        this.#finishAcquiring(admission.acquiring);
         releaseOnce(admission.lease);
         return false;
     }
 
     #activeApprovalCount(): number {
-        return this.#admitting.size + this.#authorizing.size + this.#pending.size + this.#responding.size;
+        return this.#acquiring.size + this.#admitting.size + this.#authorizing.size
+            + this.#pending.size + this.#responding.size;
     }
 
     #canRespondToRequest(
@@ -1150,6 +1285,34 @@ export class RideCodexApprovalBroker {
         }
     }
 
+    #abandonGeneration(generation: number): void {
+        for (const acquiring of [...this.#acquiring]) {
+            if (acquiring.generation === generation) {
+                this.#finishAcquiring(acquiring);
+            }
+        }
+        for (const admission of [...this.#admitting]) {
+            if (admission.generation === generation) {
+                this.#finishAdmission(admission);
+            }
+        }
+        for (const pending of [...this.#pending.values()]) {
+            if (pending.generation === generation) {
+                this.#abandon(pending);
+            }
+        }
+        for (const authorizing of [...this.#authorizing]) {
+            if (authorizing.generation === generation) {
+                this.#abandonAuthorizing(authorizing);
+            }
+        }
+        for (const responding of [...this.#responding]) {
+            if (responding.generation === generation) {
+                this.#finishResponding(responding, false);
+            }
+        }
+    }
+
     #finishAdmission(admission: AdmittingApproval): boolean {
         if (!this.#admitting.delete(admission)) {
             return false;
@@ -1182,6 +1345,11 @@ export class RideCodexApprovalBroker {
                     this.#fileScopes.delete(key);
                 }
             }
+            for (const acquiring of [...this.#acquiring]) {
+                if (acquiring.generation !== event.generation) {
+                    this.#finishAcquiring(acquiring);
+                }
+            }
             for (const admission of [...this.#admitting]) {
                 if (admission.generation !== event.generation) {
                     this.#finishAdmission(admission);
@@ -1203,6 +1371,9 @@ export class RideCodexApprovalBroker {
                 }
             }
             return;
+        }
+        for (const acquiring of [...this.#acquiring]) {
+            this.#finishAcquiring(acquiring);
         }
         for (const admission of [...this.#admitting]) {
             this.#finishAdmission(admission);

@@ -36,6 +36,9 @@ class FakeHost implements RideCodexApprovalHost {
     generation = 7;
     state = 'ready';
     requestOwnership = true;
+    acquireCalls = 0;
+    acquireImplementation?: (call: number) => Promise<RideCodexApprovalHostLease>;
+    beforeOwnsServerRequest?: () => void;
     readonly leases: FakeLease[] = [];
     readonly responses: Array<Readonly<{
         generation: number;
@@ -56,11 +59,15 @@ class FakeHost implements RideCodexApprovalHost {
         params: unknown;
     }>, generation: number) => void>();
 
-    async acquire(kind: 'approval'): Promise<RideCodexApprovalHostLease> {
+    acquire(kind: 'approval'): Promise<RideCodexApprovalHostLease> {
         assert.equal(kind, 'approval');
+        this.acquireCalls += 1;
+        if (this.acquireImplementation) {
+            return this.acquireImplementation(this.acquireCalls);
+        }
         const lease = new FakeLease(this.generation);
         this.leases.push(lease);
-        return lease;
+        return Promise.resolve(lease);
     }
 
     async respondServerRequest(generation: number, id: RequestId, result: unknown): Promise<void> {
@@ -75,6 +82,9 @@ class FakeHost implements RideCodexApprovalHost {
     }
 
     ownsServerRequest(generation: number, _id: RequestId): boolean {
+        const beforeOwnsServerRequest = this.beforeOwnsServerRequest;
+        this.beforeOwnsServerRequest = undefined;
+        beforeOwnsServerRequest?.();
         return this.requestOwnership && this.state === 'ready' && this.generation === generation;
     }
 
@@ -1524,7 +1534,7 @@ describe('RideCodexApprovalBroker ownership', () => {
         }), { status: 'rejected', code: 'stale-approval' });
     });
 
-    it('evicts by capacity and TTL with one cancellation and release per approval', async () => {
+    it('aborts the exact generation without acquiring or responding when pending capacity is full', async () => {
         const fixture = createFixture({ maxPending: 1 });
         await fixture.session.setContext(CONTEXT);
         await fixture.broker.handleServerRequest(commandRequest(), CONTEXT.generation);
@@ -1533,19 +1543,14 @@ describe('RideCodexApprovalBroker ownership', () => {
             CONTEXT.generation
         );
 
-        assert.deepEqual(fixture.host.responses, [{
-            generation: 7, id: 'rpc-command-1', result: { decision: 'cancel' }
-        }]);
+        assert.deepEqual(fixture.host.responses, []);
+        assert.deepEqual(fixture.host.abortedGenerations, [CONTEXT.generation]);
+        assert.equal(fixture.host.acquireCalls, 1);
+        assert.equal(fixture.host.leases.length, 1);
         assert.equal(fixture.host.leases[0].releases, 1);
-        assert.equal(fixture.client.latest().length, 1);
-
-        fixture.clock.advance(1_001);
-        await flushAsync();
-        assert.deepEqual(fixture.host.responses[1], {
-            generation: 7, id: 'rpc-command-2', result: { decision: 'cancel' }
-        });
-        assert.equal(fixture.host.leases[1].releases, 1);
         assert.equal(fixture.client.latest().length, 0);
+        assert.equal(fixture.clock.timers.size, 0);
+        await fixture.broker.dispose();
     });
 
     it('shares maxPending with responding writes and aborts instead of accumulating hung settlements', async () => {
@@ -1561,22 +1566,25 @@ describe('RideCodexApprovalBroker ownership', () => {
                 CONTEXT.generation
             );
             fixture.host.responseDelays.set('capacity-response-1', delayedResponse.promise);
+            const card = fixture.client.latest()[0];
+            const settlement = fixture.session.decide({
+                token: card.token,
+                fingerprint: card.fingerprint,
+                decision: 'cancel'
+            });
+            await waitForAsync(() => fixture.host.responses.length === 1);
 
-            let secondSettled = false;
             const second = fixture.broker.handleServerRequest(
                 commandRequest({ itemId: 'capacity-item-2' }, 'capacity-response-2'),
                 CONTEXT.generation
-            ).then(() => { secondSettled = true; });
-            await waitForAsync(() => fixture.host.responses.length === 1);
-            assert.equal(secondSettled, false);
-            assert.equal(fixture.client.latest().length, 0);
-
+            );
             const third = fixture.broker.handleServerRequest(
                 commandRequest({ itemId: 'capacity-item-3' }, 'capacity-response-3'),
                 CONTEXT.generation
             );
             await Promise.all([second, third]);
 
+            assert.deepEqual(await settlement, { status: 'rejected', code: 'response-failed' });
             assert.deepEqual(fixture.host.abortedGenerations, [CONTEXT.generation]);
             assert.deepEqual(fixture.host.responses, [{
                 generation: CONTEXT.generation,
@@ -1585,7 +1593,8 @@ describe('RideCodexApprovalBroker ownership', () => {
             }]);
             assert.equal(fixture.client.latest().length, 0);
             assert.equal(fixture.clock.timers.size, 0);
-            assert.equal(fixture.host.leases.length, 3);
+            assert.equal(fixture.host.acquireCalls, 1);
+            assert.equal(fixture.host.leases.length, 1);
             assert.ok(fixture.host.leases.every(lease => lease.releases === 1));
 
             delayedResponse.reject(new Error('late response failure'));
@@ -1612,12 +1621,166 @@ describe('RideCodexApprovalBroker ownership', () => {
             )
         ]);
 
-        assert.equal(fixture.client.latest().length, 1);
-        assert.equal(fixture.host.responses.length, 1);
-        assert.equal((fixture.host.responses[0].result as { decision: string }).decision, 'cancel');
-        assert.deepEqual(fixture.host.leases.map(lease => lease.releases).sort(), [0, 1]);
+        assert.equal(fixture.client.latest().length, 0);
+        assert.deepEqual(fixture.host.responses, []);
+        assert.deepEqual(fixture.host.abortedGenerations, [CONTEXT.generation]);
+        assert.equal(fixture.host.acquireCalls, 1);
+        assert.deepEqual(fixture.host.leases.map(lease => lease.releases), [1]);
         await fixture.broker.dispose();
         assert.ok(fixture.host.leases.every(lease => lease.releases === 1));
+    });
+
+    it('reserves maxPending before acquire and bounds an acquire flood to one slot', async () => {
+        const fixture = createFixture({ maxPending: 1 });
+        const delayedAcquire = new Deferred<RideCodexApprovalHostLease>();
+        const lateLease = new FakeLease(CONTEXT.generation);
+        fixture.host.acquireImplementation = () => delayedAcquire.promise;
+        await fixture.session.setContext(CONTEXT);
+
+        const operations = Array.from({ length: 128 }, (_, index) =>
+            fixture.broker.handleServerRequest(commandRequest({
+                itemId: `acquire-flood-item-${index}`
+            }, `acquire-flood-${index}`), CONTEXT.generation)
+        );
+        const allOperations = Promise.all(operations);
+        try {
+            await waitForAsync(() => fixture.host.acquireCalls > 0);
+            await flushAsync();
+
+            assert.equal(fixture.host.acquireCalls, 1);
+            assert.deepEqual(fixture.host.abortedGenerations, [CONTEXT.generation]);
+            let settled = false;
+            allOperations.then(() => { settled = true; }, () => { settled = true; });
+            await waitForAsync(() => settled);
+            assert.equal(fixture.host.leases.length, 0);
+            assert.equal(fixture.clock.timers.size, 0);
+        } finally {
+            delayedAcquire.resolve(lateLease);
+            await Promise.allSettled(operations);
+            await fixture.broker.dispose();
+        }
+
+        await flushAsync();
+        assert.equal(lateLease.releases, 1);
+    });
+
+    it('keeps the acquisition reservation through the admitting transition', async () => {
+        const fixture = createFixture({ maxPending: 1 });
+        let reentrantRequest: Promise<void> | undefined;
+        fixture.host.acquireImplementation = () => {
+            const lease = new FakeLease(CONTEXT.generation);
+            fixture.host.leases.push(lease);
+            fixture.host.beforeOwnsServerRequest = () => {
+                reentrantRequest ??= fixture.broker.handleServerRequest(
+                    commandRequest({}, 'reentrant-transition-request'), CONTEXT.generation
+                );
+            };
+            return Promise.resolve(lease);
+        };
+        await fixture.session.setContext(CONTEXT);
+
+        await fixture.broker.handleServerRequest(
+            commandRequest({}, 'transition-request'), CONTEXT.generation
+        );
+        await reentrantRequest;
+
+        assert.equal(fixture.host.acquireCalls, 1);
+        assert.deepEqual(fixture.host.abortedGenerations, [CONTEXT.generation]);
+        assert.deepEqual(fixture.host.responses, []);
+        assert.ok(fixture.host.leases.every(lease => lease.releases === 1));
+        assert.equal(fixture.client.latest().length, 0);
+        await fixture.broker.dispose();
+    });
+
+    it('cancels acquiring slots across lifecycle changes and contains late acquire settlement', async () => {
+        for (const ending of ['dispose', 'nonready', 'restart'] as const) {
+            for (const outcome of ['resolve', 'reject'] as const) {
+                const fixture = createFixture({ maxPending: 1 });
+                const delayedAcquire = new Deferred<RideCodexApprovalHostLease>();
+                const lateLease = new FakeLease(CONTEXT.generation);
+                fixture.host.acquireImplementation = () => delayedAcquire.promise;
+                const unhandled: unknown[] = [];
+                const onUnhandled = (reason: unknown): void => { unhandled.push(reason); };
+                process.on('unhandledRejection', onUnhandled);
+                try {
+                    await fixture.session.setContext(CONTEXT);
+                    let operationSettled = false;
+                    const operation = fixture.broker.handleServerRequest(
+                        commandRequest({}, `acquire-${ending}-${outcome}`), CONTEXT.generation
+                    ).then(() => { operationSettled = true; });
+                    await waitForAsync(() => fixture.host.acquireCalls === 1);
+
+                    let disposal: Promise<void> | undefined;
+                    if (ending === 'dispose') {
+                        disposal = fixture.broker.dispose();
+                    } else if (ending === 'nonready') {
+                        fixture.host.emitState('circuit-open', CONTEXT.generation);
+                    } else {
+                        fixture.host.emitState('ready', CONTEXT.generation + 1);
+                    }
+
+                    await waitForAsync(() => operationSettled);
+                    await disposal;
+                    assert.equal(fixture.clock.timers.size, 0, `${ending}-${outcome}`);
+                    if (ending === 'restart') {
+                        fixture.host.acquireImplementation = undefined;
+                        await fixture.session.setContext({ ...CONTEXT, generation: CONTEXT.generation + 1 });
+                        await fixture.broker.handleServerRequest(commandRequest({
+                            itemId: `new-generation-${outcome}`
+                        }, `new-generation-${outcome}`), CONTEXT.generation + 1);
+                        assert.equal(fixture.host.acquireCalls, 2, `${ending}-${outcome}`);
+                        assert.equal(fixture.client.latest().length, 1, `${ending}-${outcome}`);
+                        assert.deepEqual(fixture.host.abortedGenerations, [], `${ending}-${outcome}`);
+                    }
+
+                    if (outcome === 'resolve') {
+                        delayedAcquire.resolve(lateLease);
+                    } else {
+                        delayedAcquire.reject(new Error(`late acquire ${ending}`));
+                    }
+                    await operation;
+                    await flushAsync();
+
+                    assert.equal(lateLease.releases, outcome === 'resolve' ? 1 : 0, `${ending}-${outcome}`);
+                    assert.deepEqual(unhandled, [], `${ending}-${outcome}`);
+                    if (ending === 'restart') {
+                        assert.deepEqual(fixture.host.abortedGenerations, [], `${ending}-${outcome}`);
+                    }
+                } finally {
+                    process.off('unhandledRejection', onUnhandled);
+                    delayedAcquire.resolve(lateLease);
+                    await Promise.allSettled([delayedAcquire.promise]);
+                    await fixture.broker.dispose();
+                }
+            }
+        }
+    });
+
+    it('contains synchronous acquire throws and asynchronous acquire rejection', async () => {
+        for (const failure of ['throw', 'reject'] as const) {
+            const fixture = createFixture({ maxPending: 1 });
+            fixture.host.acquireImplementation = () => {
+                if (failure === 'throw') {
+                    throw new Error('synchronous acquire failure');
+                }
+                return Promise.reject(new Error('asynchronous acquire failure'));
+            };
+            await fixture.session.setContext(CONTEXT);
+
+            await assert.doesNotReject(fixture.broker.handleServerRequest(
+                commandRequest({}, `acquire-${failure}`), CONTEXT.generation
+            ), failure);
+            assert.equal(fixture.host.acquireCalls, 1, failure);
+            assert.deepEqual(fixture.host.abortedGenerations, [], failure);
+
+            fixture.host.acquireImplementation = undefined;
+            await fixture.broker.handleServerRequest(
+                commandRequest({}, `acquire-after-${failure}`), CONTEXT.generation
+            );
+            assert.equal(fixture.host.acquireCalls, 2, failure);
+            assert.equal(fixture.client.latest().length, 1, failure);
+            await fixture.broker.dispose();
+        }
     });
 
     it('hard-times out a response write, closes its exact generation, and bounds dispose', async () => {
@@ -1718,7 +1881,7 @@ describe('RideCodexApprovalBroker ownership', () => {
         }
     });
 
-    it('bounds authorizing and pending together and times out unresolved authorization', async () => {
+    it('aborts without acquiring or responding when authorizing capacity is full', async () => {
         const scopes = [
             new Deferred<RideCodexApprovalScopeResolution>(),
             new Deferred<RideCodexApprovalScopeResolution>()
@@ -1737,36 +1900,33 @@ describe('RideCodexApprovalBroker ownership', () => {
         await waitForAsync(() => resolverCalls === 1);
         assert.equal(fixture.host.leases[0].releases, 0);
 
-        let secondSettled = false;
         const second = fixture.broker.handleServerRequest(
             fileRequest({ itemId: 'item-file-2' }, 'authorizing-capacity-2'), CONTEXT.generation
-        ).then(() => { secondSettled = true; });
-        await waitForAsync(() => resolverCalls === 2);
-        assert.equal(firstSettled, true);
-        assert.equal(secondSettled, false);
-        assert.deepEqual(fixture.host.responses, [{
-            generation: 7, id: 'authorizing-capacity-1', result: { decision: 'cancel' }
-        }]);
-        assert.equal(fixture.host.leases[0].releases, 1);
-        assert.equal(fixture.host.leases[1].releases, 0);
-        assert.equal(fixture.client.latest().length, 0);
-
-        fixture.clock.advance(1_000);
-        await waitForAsync(() => secondSettled);
-        assert.deepEqual(fixture.host.responses[1], {
-            generation: 7, id: 'authorizing-capacity-2', result: { decision: 'cancel' }
-        });
-        assert.equal(fixture.host.leases[1].releases, 1);
-        assert.equal(fixture.client.latest().length, 0);
-
-        scopes[0].resolve(resolution([{ path: 'src\\late-a.ts', kind: 'update' }]));
-        scopes[1].resolve(resolution([{ path: 'src\\late-b.ts', kind: 'update' }]));
-        await Promise.all([first, second]);
+        );
+        try {
+            await waitForAsync(() => fixture.host.acquireCalls > 1
+                || fixture.host.abortedGenerations.length > 0);
+            await second;
+            await waitForAsync(() => firstSettled);
+            assert.equal(firstSettled, true);
+            assert.equal(resolverCalls, 1);
+            assert.deepEqual(fixture.host.responses, []);
+            assert.deepEqual(fixture.host.abortedGenerations, [CONTEXT.generation]);
+            assert.equal(fixture.host.acquireCalls, 1);
+            assert.equal(fixture.host.leases.length, 1);
+            assert.equal(fixture.host.leases[0].releases, 1);
+            assert.equal(fixture.client.latest().length, 0);
+            assert.equal(fixture.clock.timers.size, 0);
+        } finally {
+            scopes[0].resolve(resolution([{ path: 'src\\late-a.ts', kind: 'update' }]));
+            scopes[1].resolve(resolution([{ path: 'src\\late-b.ts', kind: 'update' }]));
+            await Promise.allSettled([first, second]);
+            await fixture.broker.dispose();
+        }
         await flushAsync();
-        assert.equal(fixture.host.responses.length, 2);
+        assert.equal(fixture.host.responses.length, 0);
         assert.ok(fixture.host.leases.every(lease => lease.releases === 1));
         assert.equal(fixture.client.latest().length, 0);
-        await fixture.broker.dispose();
     });
 
     it('returns from unresolved authorization immediately after lifecycle cancellation', async () => {
@@ -2321,7 +2481,7 @@ describe('RideCodexApprovalBroker ownership', () => {
         const fixture = createFixture();
         await fixture.session.setContext(CONTEXT);
         fixture.host.emitRequest(commandRequest());
-        await flushAsync();
+        await waitForAsync(() => fixture.client.latest().length === 1);
         assert.equal(fixture.client.latest().length, 1);
 
         fixture.host.emitNotification('turn/completed', {
