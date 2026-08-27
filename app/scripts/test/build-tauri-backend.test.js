@@ -7,6 +7,7 @@ const helperPath = path.resolve(__dirname, '..', 'build-tauri-backend.js');
 const browserDirectory = path.resolve(__dirname, '..', '..', 'applications', 'browser');
 const profileDirectory = path.join(browserDirectory, '.ride-tauri-profile');
 const testBuildDirectory = path.join(profileDirectory, 'builds', 'unit-build');
+const preserveSymlinkArgs = ['--preserve-symlinks', '--preserve-symlinks-main'];
 
 test('defaults to an isolated tauri-critical build and publishes it atomically', () => {
   const { createBuildPlan } = require(helperPath);
@@ -14,16 +15,20 @@ test('defaults to an isolated tauri-critical build and publishes it atomically',
 
   assert.equal(plan.length, 4);
   assert.equal(plan[0].command, process.execPath);
+  assert.deepEqual(plan[0].args.slice(0, 2), preserveSymlinkArgs);
   assert.deepEqual(plan[0].args.slice(-5), ['prepare', '--profile', 'tauri-critical', '--build-id', 'unit-build']);
   assert.equal(plan[0].cwd, browserDirectory);
   assert.equal(plan[1].command, process.execPath);
-  assert.match(plan[1].args[0], /@theia[\\/]cli[\\/]bin[\\/]theia\.js$/);
-  assert.deepEqual(plan[1].args.slice(1), ['rebuild:browser', '--cacheRoot', path.resolve(browserDirectory, '..', '..')]);
+  assert.match(plan[1].args[2], /@theia[\\/]cli[\\/]bin[\\/]theia\.js$/);
+  assert.deepEqual(plan[1].args.slice(0, 2), preserveSymlinkArgs);
+  assert.deepEqual(plan[1].args.slice(3), ['rebuild:browser', '--cacheRoot', path.resolve(browserDirectory, '..', '..')]);
   assert.equal(plan[1].cwd, testBuildDirectory);
   assert.equal(plan[2].command, process.execPath);
-  assert.deepEqual(plan[2].args.slice(1), ['build', '--app-target=browser']);
+  assert.deepEqual(plan[2].args.slice(0, 2), preserveSymlinkArgs);
+  assert.deepEqual(plan[2].args.slice(3), ['build', '--app-target=browser']);
   assert.equal(plan[2].cwd, testBuildDirectory);
   assert.equal(plan[3].command, process.execPath);
+  assert.deepEqual(plan[3].args.slice(0, 2), preserveSymlinkArgs);
   assert.deepEqual(plan[3].args.slice(-7), [
     'publish', '--profile', 'tauri-critical', '--build-id', 'unit-build', '--source-dir', testBuildDirectory,
   ]);
@@ -94,9 +99,11 @@ test('invokes the workspace Theia CLI through Node without shell-specific wrappe
   assert.equal(calls.length, 4);
   assert.equal(calls[0].command, process.execPath);
   assert.equal(calls[1].command, process.execPath);
-  assert.deepEqual(calls[1].args.slice(1), ['rebuild:browser', '--cacheRoot', path.resolve(browserDirectory, '..', '..')]);
+  assert.deepEqual(calls[1].args.slice(0, 2), preserveSymlinkArgs);
+  assert.deepEqual(calls[1].args.slice(3), ['rebuild:browser', '--cacheRoot', path.resolve(browserDirectory, '..', '..')]);
   assert.equal(calls[2].command, process.execPath);
-  assert.deepEqual(calls[2].args.slice(1), ['build', '--app-target=browser']);
+  assert.deepEqual(calls[2].args.slice(0, 2), preserveSymlinkArgs);
+  assert.deepEqual(calls[2].args.slice(3), ['build', '--app-target=browser']);
   assert.equal(calls[3].command, process.execPath);
   assert.equal(calls[2].options.shell, false);
   assert.equal(calls[2].options.env.RIDE_TAURI_FRONTEND_PROFILE, 'tauri-critical');

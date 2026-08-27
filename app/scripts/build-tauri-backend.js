@@ -14,6 +14,11 @@ const profileDirectory = path.join(browserDirectory, '.ride-tauri-profile');
 const profileScript = path.resolve(__dirname, 'tauri-frontend-profile.mjs');
 const theiaCli = require.resolve('@theia/cli/bin/theia.js', { paths: [browserDirectory] });
 const supportedProfiles = new Set(['tauri-critical', 'full']);
+const nodeResolutionArgs = ['--preserve-symlinks', '--preserve-symlinks-main'];
+
+function createNodeArgs(...args) {
+  return [...nodeResolutionArgs, ...args];
+}
 
 function resolveProfileName(profile, environment) {
   const selected = profile ?? environment.RIDE_TAURI_FRONTEND_PROFILE ?? 'tauri-critical';
@@ -42,34 +47,34 @@ function createBuildPlan(platform = process.platform, profile, environment = pro
   return [
     {
       command: process.execPath,
-      args: [profileScript, 'prepare', '--profile', selectedProfile, '--build-id', buildId],
+      args: createNodeArgs(profileScript, 'prepare', '--profile', selectedProfile, '--build-id', buildId),
       cwd: browserDirectory,
       env: buildEnvironment,
       shell: false,
     },
     {
       command: process.execPath,
-      args: [theiaCli, 'rebuild:browser', '--cacheRoot', appDirectory],
+      args: createNodeArgs(theiaCli, 'rebuild:browser', '--cacheRoot', appDirectory),
       cwd: buildDirectory,
       env: buildEnvironment,
       shell: false,
     },
     {
       command: process.execPath,
-      args: [theiaCli, 'build', '--app-target=browser'],
+      args: createNodeArgs(theiaCli, 'build', '--app-target=browser'),
       cwd: buildDirectory,
       env: buildEnvironment,
       shell: false,
     },
     {
       command: process.execPath,
-      args: [
+      args: createNodeArgs(
         profileScript,
         'publish',
         '--profile', selectedProfile,
         '--build-id', buildId,
         '--source-dir', buildDirectory,
-      ],
+      ),
       cwd: browserDirectory,
       env: buildEnvironment,
       shell: false,

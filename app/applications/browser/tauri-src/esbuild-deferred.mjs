@@ -66,6 +66,7 @@ export function createTauriBrowserBuildPlans(browserOptions, profileManifest, ba
     const aliases = deferredFrontendAliases(profileManifest, baseDirectory);
     const main = {
         ...browserOptions,
+        preserveSymlinks: true,
         entryPoints: { bundle: entryPoints.bundle },
         format: 'esm',
         splitting: true,
@@ -78,6 +79,7 @@ export function createTauriBrowserBuildPlans(browserOptions, profileManifest, ba
     };
     const classic = CLASSIC_ENTRY_NAMES.map(name => ({
         ...browserOptions,
+        preserveSymlinks: true,
         entryPoints: { [name]: entryPoints[name] },
         format: 'iife',
         splitting: false,

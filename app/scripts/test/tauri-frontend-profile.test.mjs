@@ -522,16 +522,18 @@ test('Tauri browser build splits only the ESM main entry and keeps classic worke
     assert.equal(plans.main.format, 'esm');
     assert.equal(plans.main.splitting, true);
     assert.equal(plans.main.chunkNames, 'chunks/[name]-[hash]');
+    assert.equal(plans.main.preserveSymlinks, true);
     assert.equal(plans.main.plugins[0].name, 'ride-tauri-deferred-frontend-alias');
     assert.equal(plans.main.alias, undefined);
     assert.deepEqual(plans.classic.map(plan => ({
         entries: Object.keys(plan.entryPoints),
         format: plan.format,
         splitting: plan.splitting,
+        preserveSymlinks: plan.preserveSymlinks,
     })), [
-        { entries: ['secondary-window'], format: 'iife', splitting: false },
-        { entries: ['editor.worker'], format: 'iife', splitting: false },
-        { entries: ['plugin-worker'], format: 'iife', splitting: false },
+        { entries: ['secondary-window'], format: 'iife', splitting: false, preserveSymlinks: true },
+        { entries: ['editor.worker'], format: 'iife', splitting: false, preserveSymlinks: true },
+        { entries: ['plugin-worker'], format: 'iife', splitting: false, preserveSymlinks: true },
     ]);
 
     const full = createTauriBrowserBuildPlans(options, { ...criticalManifest, profile: 'full' }, path.resolve('full-target'));

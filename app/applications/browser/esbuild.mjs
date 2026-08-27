@@ -24,6 +24,11 @@ import esbuild from 'esbuild';
 const profileManifest = await loadTauriProfileManifest(__dirname);
 if (profileManifest) {
     const allowedPackages = buildAllowedTheiaPackageSet(profileManifest);
+    // Tauri profile packages are linked from an external dependency store. Keep
+    // the logical node_modules path so esbuild can resolve the matching peer
+    // and runtime dependency tree instead of crossing into another workspace.
+    browserOptions.preserveSymlinks = true;
+    nodeOptions.preserveSymlinks = true;
     browserOptions.metafile = true;
     nodeOptions.metafile = true;
     browserOptions.plugins.unshift(createTauriProfileAuditPlugin({
