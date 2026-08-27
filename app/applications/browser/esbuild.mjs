@@ -50,6 +50,111 @@ function withProfileMetadata(options, target) {
     };
 }
 
+const codexSdkRuntimeFilename = 'codex-sdk-runtime.mjs';
+
+function codexSdkRuntimeEntry() {
+    const candidates = [
+        path.join(
+            __dirname,
+            'node_modules',
+            'theia-ide-codex-ext',
+            'lib',
+            'node',
+            'ride-codex-sdk-runtime-entry.js',
+        ),
+        path.resolve(
+            __dirname,
+            '..',
+            '..',
+            'theia-extensions',
+            'codex',
+            'lib',
+            'node',
+            'ride-codex-sdk-runtime-entry.js',
+        ),
+    ];
+    const entry = candidates.find(candidate => fs.existsSync(candidate));
+    if (!entry) {
+        throw new Error(`Codex SDK runtime entry is missing: ${candidates.join(', ')}. Build the Codex extension before bundling the browser backend.`);
+    }
+    return entry;
+}
+
+function normalizeBuildPath(candidate) {
+    return candidate.replaceAll('\\', '/');
+}
+
+function isForbiddenCodexSdkPayload(candidate) {
+    const parts = normalizeBuildPath(candidate).toLowerCase().split('/');
+    const basename = parts[parts.length - 1];
+    return parts.includes('vendor')
+        || basename === 'codex'
+        || basename === 'codex.exe'
+        || parts.includes('codex-x64')
+        || parts.includes('codex-arm64');
+}
+
+function isForbiddenCodexSdkInput(candidate) {
+    const parts = normalizeBuildPath(candidate).toLowerCase().split('/');
+    const packageIndex = parts.lastIndexOf('@openai');
+    return parts[packageIndex + 1] === 'codex-sdk'
+        && (parts.includes('vendor') || parts.includes('resource') || parts.includes('resources'));
+}
+
+function createCodexSdkRuntimeGuardPlugin(outputFile) {
+    const expectedOutput = normalizeBuildPath(path.relative(__dirname, outputFile));
+    return {
+        name: 'ride-codex-sdk-runtime-guard',
+        setup(build) {
+            build.onEnd(result => {
+                if (result.errors.length > 0) {
+                    return;
+                }
+                const outputs = Object.keys(result.metafile?.outputs ?? {});
+                const normalizedOutputs = outputs.map(output => normalizeBuildPath(path.relative(
+                    __dirname,
+                    path.resolve(__dirname, output),
+                )));
+                if (!normalizedOutputs.includes(expectedOutput)) {
+                    throw new Error('Codex SDK runtime bundle is missing its expected output: ' + expectedOutput + '.');
+                }
+                const forbiddenOutput = normalizedOutputs.find(isForbiddenCodexSdkPayload);
+                if (forbiddenOutput) {
+                    throw new Error('Codex SDK runtime bundle attempted to emit a native/vendor payload: ' + forbiddenOutput + '.');
+                }
+                const forbiddenInput = Object.keys(result.metafile?.inputs ?? {}).find(isForbiddenCodexSdkInput);
+                if (forbiddenInput) {
+                    throw new Error('Codex SDK runtime bundle resolved a forbidden native/resource input: ' + forbiddenInput + '.');
+                }
+            });
+        },
+    };
+}
+
+
+function createCodexSdkRuntimeOptions() {
+    const outputFile = path.join(__dirname, 'lib', 'backend', codexSdkRuntimeFilename);
+    const {
+        entryPoints: _entryPoints,
+        outdir: _outdir,
+        outfile: _outfile,
+        plugins: _plugins,
+        ...sharedNodeOptions
+    } = nodeOptions;
+    return {
+        ...sharedNodeOptions,
+        entryPoints: { 'codex-sdk-runtime': codexSdkRuntimeEntry() },
+        outfile: outputFile,
+        bundle: true,
+        format: 'esm',
+        platform: 'node',
+        mainFields: ['node', 'module', 'main'],
+        conditions: ['import'],
+        metafile: true,
+        plugins: [createCodexSdkRuntimeGuardPlugin(outputFile)],
+    };
+}
+
 function patchBuiltRpcNotificationTarget() {
     const backendBundle = path.join(__dirname, 'lib', 'backend', 'main.js');
     if (!fs.existsSync(backendBundle)) {
@@ -145,11 +250,13 @@ for (const { target, options } of browserTargets) {
     browserContexts.push(await esbuild.context(withProfileMetadata(options, target)));
 }
 const nodeContext = await esbuild.context(withProfileMetadata(nodeOptions, 'backend'));
+const codexSdkRuntimeContext = await esbuild.context(createCodexSdkRuntimeOptions());
 
 if (watch) {
     await Promise.all([
         ...browserContexts.map(context => context.watch()),
         nodeContext.watch(),
+        codexSdkRuntimeContext.watch(),
     ]);
 } else {
     try {
@@ -159,6 +266,8 @@ if (watch) {
         }
         await nodeContext.rebuild();
         await nodeContext.dispose();
+        await codexSdkRuntimeContext.rebuild();
+        await codexSdkRuntimeContext.dispose();
     } catch (error) {
         console.error(error);
         process.exit(1);
