@@ -20,11 +20,31 @@ export type RideSmokeAction =
     | 'packaged-plugin-command'
     | 'secondary-window'
     | 'second-file-forwarding'
-    | 'backend-retry';
+    | 'backend-retry'
+    | 'codex-inactive'
+    | 'codex-activate'
+    | 'codex-stream'
+    | 'codex-command-approval'
+    | 'codex-file-approval'
+    | 'codex-interrupt'
+    | 'codex-recover'
+    | 'codex-idle-exit';
+
+export const RIDE_CODEX_SMOKE_ACTIONS: readonly RideSmokeAction[] = Object.freeze([
+    'codex-inactive',
+    'codex-activate',
+    'codex-stream',
+    'codex-command-approval',
+    'codex-file-approval',
+    'codex-interrupt',
+    'codex-recover',
+    'codex-idle-exit'
+]);
+export type RideCodexSmokeAction = Extract<RideSmokeAction, `codex-${string}`>;
 
 export interface RideSmokePlan {
     readonly specSha256: string;
-    readonly scenario: 'critical-file' | 'critical-empty' | 'full-file' | 'backend-retry';
+    readonly scenario: 'critical-file' | 'critical-empty' | 'full-file' | 'backend-retry' | 'codex';
     readonly profile: 'tauri-critical' | 'full';
     readonly workspace: string;
     readonly files: readonly string[];
@@ -52,6 +72,10 @@ export interface RideSmokeCompleteRequest {
 }
 
 export const RidePackagedSmokeActions = Symbol('RidePackagedSmokeActions');
+export const RideCodexPackagedSmokeDriver = Symbol('RideCodexPackagedSmokeDriver');
+export interface RideCodexPackagedSmokeDriverLike {
+    run(action: RideCodexSmokeAction, plan: RideSmokePlan): Promise<void>;
+}
 export class RidePackagedSmokeActionTimeout extends Error {
     constructor() {
         super('Smoke action timed out.');
@@ -67,6 +91,14 @@ export interface RidePackagedSmokeActions {
     packagedPluginCommand(plan: RideSmokePlan): Promise<void>;
     secondaryWindow(plan: RideSmokePlan): Promise<void>;
     backendRetry(plan: RideSmokePlan): Promise<void>;
+    readonly codexInactive?: (plan: RideSmokePlan) => Promise<void>;
+    readonly codexActivate?: (plan: RideSmokePlan) => Promise<void>;
+    readonly codexStream?: (plan: RideSmokePlan) => Promise<void>;
+    readonly codexCommandApproval?: (plan: RideSmokePlan) => Promise<void>;
+    readonly codexFileApproval?: (plan: RideSmokePlan) => Promise<void>;
+    readonly codexInterrupt?: (plan: RideSmokePlan) => Promise<void>;
+    readonly codexRecover?: (plan: RideSmokePlan) => Promise<void>;
+    readonly codexIdleExit?: (plan: RideSmokePlan) => Promise<void>;
     prepareSecondFile(plan: RideSmokePlan): Disposable;
     waitForSecondFile(plan: RideSmokePlan): Promise<void>;
 }
@@ -141,12 +173,17 @@ const FILE_ACTIONS: readonly RideSmokeAction[] = [
     'secondary-window',
     'second-file-forwarding'
 ];
-const ACTIONS: readonly RideSmokeAction[] = [...FILE_ACTIONS, 'backend-retry'];
+const ACTIONS: readonly RideSmokeAction[] = [
+    ...FILE_ACTIONS,
+    'backend-retry',
+    ...RIDE_CODEX_SMOKE_ACTIONS
+];
 const CRITICAL_EMPTY_ACTIONS: readonly RideSmokeAction[] = [
     'terminal-sentinel',
     'packaged-plugin-command'
 ];
 const BACKEND_RETRY_ACTIONS: readonly RideSmokeAction[] = ['backend-retry'];
+const CODEX_ACTIONS: readonly RideSmokeAction[] = RIDE_CODEX_SMOKE_ACTIONS;
 const SCENARIO_REQUIREMENTS: Readonly<Record<RideSmokePlan['scenario'], {
     readonly profile: RideSmokePlan['profile'];
     readonly fileCount: number;
@@ -155,7 +192,8 @@ const SCENARIO_REQUIREMENTS: Readonly<Record<RideSmokePlan['scenario'], {
     'critical-file': Object.freeze({ profile: 'tauri-critical', fileCount: 2, actions: FILE_ACTIONS }),
     'critical-empty': Object.freeze({ profile: 'tauri-critical', fileCount: 0, actions: CRITICAL_EMPTY_ACTIONS }),
     'full-file': Object.freeze({ profile: 'full', fileCount: 2, actions: FILE_ACTIONS }),
-    'backend-retry': Object.freeze({ profile: 'tauri-critical', fileCount: 0, actions: BACKEND_RETRY_ACTIONS })
+    'backend-retry': Object.freeze({ profile: 'tauri-critical', fileCount: 0, actions: BACKEND_RETRY_ACTIONS }),
+    codex: Object.freeze({ profile: 'tauri-critical', fileCount: 0, actions: CODEX_ACTIONS })
 });
 const PLAN_RESPONSE_KEYS = ['mode', 'plan', 'sessionProof', 'diagnostic'] as const;
 const PLAN_KEYS = [
@@ -340,7 +378,24 @@ export class RidePackagedSmokeContribution implements FrontendApplicationContrib
             case 'secondary-window': return smokeActions.secondaryWindow(plan);
             case 'second-file-forwarding': return smokeActions.waitForSecondFile(plan);
             case 'backend-retry': return smokeActions.backendRetry(plan);
+            case 'codex-inactive': return this.executeCodexAction(smokeActions.codexInactive, plan);
+            case 'codex-activate': return this.executeCodexAction(smokeActions.codexActivate, plan);
+            case 'codex-stream': return this.executeCodexAction(smokeActions.codexStream, plan);
+            case 'codex-command-approval': return this.executeCodexAction(smokeActions.codexCommandApproval, plan);
+            case 'codex-file-approval': return this.executeCodexAction(smokeActions.codexFileApproval, plan);
+            case 'codex-interrupt': return this.executeCodexAction(smokeActions.codexInterrupt, plan);
+            case 'codex-recover': return this.executeCodexAction(smokeActions.codexRecover, plan);
+            case 'codex-idle-exit': return this.executeCodexAction(smokeActions.codexIdleExit, plan);
         }
+    }
+
+    protected executeCodexAction(
+        operation: ((plan: RideSmokePlan) => Promise<void>) | undefined,
+        plan: RideSmokePlan
+    ): Promise<void> {
+        return operation === undefined
+            ? Promise.reject(new Error('Codex smoke action unavailable.'))
+            : operation(plan);
     }
 
     protected releaseActionPreparation(preparation: Disposable | undefined): void {
@@ -553,7 +608,7 @@ function parseActivePlan(value: unknown): RideSmokePlan | undefined {
 
 function isScenario(value: unknown): value is RideSmokePlan['scenario'] {
     return value === 'critical-file' || value === 'critical-empty' || value === 'full-file'
-        || value === 'backend-retry';
+        || value === 'backend-retry' || value === 'codex';
 }
 
 function isProfile(value: unknown): value is RideSmokePlan['profile'] {

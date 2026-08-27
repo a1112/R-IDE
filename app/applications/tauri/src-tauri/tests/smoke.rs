@@ -696,6 +696,7 @@ fn smoke_protocol_matches_node_contract_constants_and_rejects_non_parity_fixture
             SmokeScenario::CriticalEmpty,
             SmokeScenario::FullFile,
             SmokeScenario::BackendRetry,
+            SmokeScenario::Codex,
         ]
     );
     assert_eq!(
@@ -751,6 +752,21 @@ fn smoke_protocol_matches_node_contract_constants_and_rejects_non_parity_fixture
             "tauri-critical",
             json!([]),
             json!(["backend-retry"]),
+        ),
+        (
+            "codex",
+            "tauri-critical",
+            json!([]),
+            json!([
+                "codex-inactive",
+                "codex-activate",
+                "codex-stream",
+                "codex-command-approval",
+                "codex-file-approval",
+                "codex-interrupt",
+                "codex-recover",
+                "codex-idle-exit"
+            ]),
         ),
     ] {
         let fixture = Fixture::new();

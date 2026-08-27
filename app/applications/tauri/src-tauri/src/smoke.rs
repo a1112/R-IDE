@@ -23,6 +23,7 @@ use std::time::Duration;
 const SPEC_ENV: &str = "RIDE_TAURI_SMOKE_SPEC";
 const REPORT_ENV: &str = "RIDE_TAURI_SMOKE_REPORT";
 const TOKEN_ENV: &str = "RIDE_TAURI_SMOKE_TOKEN";
+pub(crate) const CODEX_SMOKE_NONCE_ENV: &str = "RIDE_CODEX_PACKAGED_SMOKE_NONCE";
 pub(crate) const SMOKE_ENV_NAMES: [&str; 3] = [SPEC_ENV, REPORT_ENV, TOKEN_ENV];
 const SPEC_SCHEMA: &str = "ride.tauri-packaged-smoke-spec";
 const PROGRESS_SCHEMA: &str = "ride.tauri-packaged-smoke-progress";
@@ -46,14 +47,16 @@ pub enum SmokeScenario {
     CriticalEmpty,
     FullFile,
     BackendRetry,
+    Codex,
 }
 
 impl SmokeScenario {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::CriticalFile,
         Self::CriticalEmpty,
         Self::FullFile,
         Self::BackendRetry,
+        Self::Codex,
     ];
 }
 
@@ -75,6 +78,14 @@ pub enum SmokeAction {
     SecondaryWindow,
     SecondFileForwarding,
     BackendRetry,
+    CodexInactive,
+    CodexActivate,
+    CodexStream,
+    CodexCommandApproval,
+    CodexFileApproval,
+    CodexInterrupt,
+    CodexRecover,
+    CodexIdleExit,
 }
 
 impl SmokeAction {
@@ -88,13 +99,33 @@ impl SmokeAction {
         Self::SecondFileForwarding,
     ];
 
+    pub const CODEX_ALL: [Self; 8] = [
+        Self::CodexInactive,
+        Self::CodexActivate,
+        Self::CodexStream,
+        Self::CodexCommandApproval,
+        Self::CodexFileApproval,
+        Self::CodexInterrupt,
+        Self::CodexRecover,
+        Self::CodexIdleExit,
+    ];
+
     fn index(self) -> usize {
         match self {
             Self::BackendRetry => Self::ALL.len(),
             action => Self::ALL
                 .iter()
                 .position(|candidate| *candidate == action)
-                .expect("all smoke actions have a canonical index"),
+                .map_or_else(
+                    || {
+                        Self::CODEX_ALL
+                            .iter()
+                            .position(|candidate| *candidate == action)
+                            .map(|index| Self::ALL.len() + 1 + index)
+                            .expect("all smoke actions have a canonical index")
+                    },
+                    |index| index,
+                ),
         }
     }
 }
@@ -112,6 +143,7 @@ impl SmokeScenario {
             SmokeAction::PackagedPluginCommand,
         ];
         const BACKEND_RETRY_ACTIONS: [SmokeAction; 1] = [SmokeAction::BackendRetry];
+        const CODEX_ACTIONS: [SmokeAction; 8] = SmokeAction::CODEX_ALL;
         match self {
             Self::CriticalFile => SmokeScenarioRequirements {
                 profile: SmokeProfile::TauriCritical,
@@ -132,6 +164,11 @@ impl SmokeScenario {
                 profile: SmokeProfile::TauriCritical,
                 file_count: 0,
                 actions: &BACKEND_RETRY_ACTIONS,
+            },
+            Self::Codex => SmokeScenarioRequirements {
+                profile: SmokeProfile::TauriCritical,
+                file_count: 0,
+                actions: &CODEX_ACTIONS,
             },
         }
     }
@@ -516,6 +553,18 @@ impl SmokeProtocol {
         match &*state {
             ProtocolState::Active(active) => Some(active.workspace_root.clone()),
             ProtocolState::Disabled | ProtocolState::Rejected => None,
+        }
+    }
+
+    pub(crate) fn codex_smoke_nonce(&self) -> Option<String> {
+        let state = self.state.lock().ok()?;
+        match &*state {
+            ProtocolState::Active(active)
+                if active.plan.scenario == SmokeScenario::Codex && !active.terminal =>
+            {
+                Some(active.session_proof.clone())
+            }
+            ProtocolState::Disabled | ProtocolState::Rejected | ProtocolState::Active(_) => None,
         }
     }
 
@@ -2971,6 +3020,69 @@ mod tests {
     }
 
     #[test]
+    fn codex_smoke_nonce_is_only_available_for_a_live_codex_session() {
+        let fixture = TestFixture::new();
+        let protocol = SmokeProtocol::from_environment(
+            &fixture.codex_environment("codex-nonce-token"),
+            &fixture.root,
+        );
+        let nonce = protocol
+            .codex_smoke_nonce()
+            .expect("live Codex smoke session nonce");
+        assert_eq!(nonce.len(), 64);
+        assert!(nonce
+            .chars()
+            .all(|character| character.is_ascii_digit() || ('a'..='f').contains(&character)));
+        assert_eq!(protocol.plan().session_proof, Some(nonce.clone()));
+
+        let ordinary = SmokeProtocol::from_environment(
+            &fixture.environment("ordinary-nonce-token"),
+            &fixture.root,
+        );
+        assert_eq!(ordinary.codex_smoke_nonce(), None);
+
+        let mut duration_ms = 0;
+        for action in SmokeAction::CODEX_ALL {
+            protocol
+                .record_step(
+                    &nonce,
+                    RecordStepRequest {
+                        action,
+                        state: SmokeStepState::Started,
+                        duration_ms,
+                        diagnostic: None,
+                    },
+                )
+                .expect("start Codex smoke action");
+            duration_ms += 1;
+            protocol
+                .record_step(
+                    &nonce,
+                    RecordStepRequest {
+                        action,
+                        state: SmokeStepState::Passed,
+                        duration_ms,
+                        diagnostic: None,
+                    },
+                )
+                .expect("pass Codex smoke action");
+            duration_ms += 1;
+        }
+        protocol
+            .complete(
+                &nonce,
+                CompleteRequest {
+                    status: SmokeTerminalStatus::Passed,
+                    failure_phase: None,
+                    duration_ms,
+                    diagnostic: None,
+                },
+            )
+            .expect("complete Codex smoke session");
+        assert_eq!(protocol.codex_smoke_nonce(), None);
+    }
+
+    #[test]
     fn smoke_rejects_spec_report_and_parent_reparse_points() {
         for role in [
             CapabilityRole::Spec,
@@ -3436,6 +3548,39 @@ mod tests {
                     OsString::from(SPEC_ENV),
                     dunce::canonicalize(spec_path)
                         .expect("canonical unit spec")
+                        .into_os_string(),
+                ),
+                (
+                    OsString::from(REPORT_ENV),
+                    self.report_path().into_os_string(),
+                ),
+                (OsString::from(TOKEN_ENV), OsString::from(token)),
+            ])
+        }
+
+        fn codex_environment(&self, token: &str) -> BTreeMap<OsString, OsString> {
+            let spec_path = self.root.join("codex-spec.json");
+            let spec = json!({
+                "schema": SPEC_SCHEMA,
+                "version": PROTOCOL_VERSION,
+                "scenario": "codex",
+                "profile": "tauri-critical",
+                "workspace": ".",
+                "files": [],
+                "actions": SmokeAction::CODEX_ALL,
+                "tokenSha256": sha256(token.as_bytes()),
+                "actionTimeoutMs": 30_000
+            });
+            fs::write(
+                &spec_path,
+                serde_json::to_vec(&spec).expect("serialize Codex unit spec"),
+            )
+            .expect("write Codex unit spec");
+            BTreeMap::from([
+                (
+                    OsString::from(SPEC_ENV),
+                    dunce::canonicalize(spec_path)
+                        .expect("canonical Codex unit spec")
                         .into_os_string(),
                 ),
                 (

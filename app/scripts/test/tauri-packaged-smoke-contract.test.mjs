@@ -31,6 +31,16 @@ const FILE_ACTIONS = [
 ];
 const EMPTY_ACTIONS = ['terminal-sentinel', 'packaged-plugin-command'];
 const BACKEND_RETRY_ACTIONS = ['backend-retry'];
+const CODEX_ACTIONS = [
+  'codex-inactive',
+  'codex-activate',
+  'codex-stream',
+  'codex-command-approval',
+  'codex-file-approval',
+  'codex-interrupt',
+  'codex-recover',
+  'codex-idle-exit',
+];
 
 const NATIVE_OBSERVATIONS = Object.freeze({
   startupMode: 'rust-gateway',
@@ -174,6 +184,7 @@ test('exports immutable canonical schemas, scenarios, and ordered actions', () =
     'critical-empty',
     'full-file',
     'backend-retry',
+    'codex',
   ]);
   assert.deepEqual(SMOKE_ACTIONS, FILE_ACTIONS);
 
@@ -204,6 +215,11 @@ test('exports immutable exact requirements for every packaged smoke scenario', (
       profile: 'tauri-critical',
       fileCount: 0,
       actions: BACKEND_RETRY_ACTIONS,
+    },
+    codex: {
+      profile: 'tauri-critical',
+      fileCount: 0,
+      actions: CODEX_ACTIONS,
     },
   });
   assert.equal(Object.isFrozen(SMOKE_SCENARIO_REQUIREMENTS), true);

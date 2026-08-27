@@ -119,6 +119,9 @@ jobs:
       - name: Prepare Tauri resources
         run: npm --workspace applications/tauri run copy:all
 
+      - name: Verify packaged Codex artifact inventory
+        run: node scripts/verify-codex-packaging.mjs --root applications/tauri/resources/backend
+
       - name: Verify Rust formatting
         run: cargo fmt --manifest-path applications/tauri/src-tauri/Cargo.toml --all -- --check
 
@@ -177,6 +180,8 @@ jobs:
         run: yarn build:tauri
       - name: Verify the packaged full-profile Tauri application
         run: npm --workspace applications/tauri run verify
+      - name: Verify packaged Codex artifact inventory
+        run: node scripts/verify-codex-packaging.mjs --root applications/tauri/resources/backend
       - name: Verify full-profile inventory
         run: npm run verify:tauri-profile -- --expected-profile full
       - name: Run full-profile packaged Tauri interaction smoke

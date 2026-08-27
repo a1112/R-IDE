@@ -52,6 +52,8 @@
     "generate:codex-app-server-schema": "node scripts/generate-codex-app-server-schema.mjs --codex codex --version 0.144.0 --write",
     "check:codex-app-server-schema": "node scripts/generate-codex-app-server-schema.mjs --check --version 0.144.0",
     "test:codex-app-server-schema": "node --test scripts/test/generate-codex-app-server-schema.test.mjs",
+    "test:codex-packaged-smoke": "node --test scripts/test/verify-codex-packaging.test.mjs scripts/test/codex-packaged-smoke.test.mjs scripts/test/codex-warm-activation.test.mjs",
+    "verify:codex-packaging": "node scripts/verify-codex-packaging.mjs --root applications/browser/lib",
     "package:applications": "lerna run --scope=\"theia-ide*app\" --ignore=\"theia-ide-next*\" package --concurrency 1",
     "package:applications:preview": "lerna run --scope=\"theia-ide*app\" --ignore=\"theia-ide-next*\" package:preview --concurrency 1",
     "package:applications:prod": "lerna run --scope=\"theia-ide*app\" --ignore=\"theia-ide-next*\" package:prod --concurrency 1",

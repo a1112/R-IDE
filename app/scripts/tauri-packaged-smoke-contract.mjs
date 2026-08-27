@@ -20,6 +20,7 @@ export const SMOKE_SCENARIOS = Object.freeze([
   'critical-empty',
   'full-file',
   'backend-retry',
+  'codex',
 ]);
 
 export const SMOKE_ACTIONS = Object.freeze([
@@ -32,9 +33,21 @@ export const SMOKE_ACTIONS = Object.freeze([
   'second-file-forwarding',
 ]);
 
+export const CODEX_SMOKE_ACTIONS = Object.freeze([
+  'codex-inactive',
+  'codex-activate',
+  'codex-stream',
+  'codex-command-approval',
+  'codex-file-approval',
+  'codex-interrupt',
+  'codex-recover',
+  'codex-idle-exit',
+]);
+
 const CANONICAL_SMOKE_ACTIONS = Object.freeze([
   ...SMOKE_ACTIONS,
   'backend-retry',
+  ...CODEX_SMOKE_ACTIONS,
 ]);
 
 export const SMOKE_SCENARIO_REQUIREMENTS = deepFreeze({
@@ -57,6 +70,11 @@ export const SMOKE_SCENARIO_REQUIREMENTS = deepFreeze({
     profile: 'tauri-critical',
     fileCount: 0,
     actions: ['backend-retry'],
+  },
+  codex: {
+    profile: 'tauri-critical',
+    fileCount: 0,
+    actions: [...CODEX_SMOKE_ACTIONS],
   },
 });
 

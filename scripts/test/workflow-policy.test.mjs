@@ -75,6 +75,10 @@ test('quality CI continuously exercises packaged smoke lifecycle safety', () => 
     'app/scripts/test/generate-packaged-smoke-plugin.test.mjs',
     'app/scripts/test/measure-tauri-startup.test.mjs',
     'app/scripts/test/run-tauri-packaged-smoke.test.mjs',
+    'app/scripts/test/tauri-packaged-smoke-contract.test.mjs',
+    'app/scripts/test/verify-codex-packaging.test.mjs',
+    'app/scripts/test/codex-packaged-smoke.test.mjs',
+    'app/scripts/test/codex-warm-activation.test.mjs',
   ]) {
     assert.match(policyStep, new RegExp(testFile.replaceAll('.', '\\.').replaceAll('/', '\\/')));
   }
@@ -215,6 +219,8 @@ test('Windows critical packaged smoke is an explicit manual interaction after pa
   assert.match(smokeBlock, /if:\s*runner\.os\s*==\s*['"]Windows['"]\s*&&\s*github\.event_name\s*==\s*['"]workflow_dispatch['"]\s*&&\s*inputs\.run_windows_packaged_smoke/);
   assert.match(smokeBlock, /npm run smoke:tauri-packaged -- --scenario critical-file/);
   assert.match(smokeBlock, /smoke-diagnostics\/critical-file\.json/);
+  assert.match(smokeBlock, /npm run smoke:tauri-packaged -- --scenario codex/);
+  assert.match(smokeBlock, /smoke-diagnostics\/codex\.json/);
 
   const diagnosticsBlock = packageJob.text.slice(diagnosticsIndex);
   assert.match(diagnosticsBlock, /if:\s*failure\(\)[^\n]*runner\.os\s*==\s*['"]Windows['"]/);

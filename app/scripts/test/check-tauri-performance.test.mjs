@@ -15,6 +15,8 @@ import path from 'node:path';
 import test from 'node:test';
 
 import {
+  CODEX_WARM_ACTIVATION_SCHEMA,
+  compareCodexWarmActivation,
   compareTauriPerformance,
   HISTORICAL_BASELINE_MIGRATION,
 } from '../check-tauri-performance.mjs';
@@ -164,6 +166,27 @@ function measurement({
 function fixtureMedian(values) {
   const sorted = [...values].sort((left, right) => left - right);
   return sorted[Math.floor(sorted.length / 2)];
+}
+
+function codexWarmMeasurement(initializedMs = [620, 700, 760, 810, 900]) {
+  return {
+    schema: CODEX_WARM_ACTIVATION_SCHEMA,
+    version: 1,
+    platform: 'win32',
+    arch: 'x64',
+    build: {
+      commit: '0123456789abcdef0123456789abcdef01234567',
+      profile: 'tauri-critical',
+    },
+    samples: initializedMs.map((initialized, index) => ({
+      panelShellMs: 80 + index,
+      runtimeResolvedMs: 140 + index,
+      processSpawnedMs: 360 + index,
+      initializedMs: initialized,
+      handshakeMs: 260 + index,
+      idleRssBytes: 50_000 + index,
+    })),
+  };
 }
 
 function rustGatewayMeasurementV4({
@@ -414,6 +437,28 @@ test('rust-gateway CLI accepts absolute gate options and emits policy diagnostic
     const output = JSON.parse(result.stdout);
     assert.equal(output.policy, 'rust-gateway');
     assert.equal(output.diagnostics.frontendBackendOverlapMs.median, 440);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('Codex warm activation CLI enforces p95 budgets without entering the legacy baseline path', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ride-codex-performance-'));
+  const measurementPath = path.join(directory, 'warm-activation.json');
+  try {
+    fs.writeFileSync(measurementPath, JSON.stringify(codexWarmMeasurement()));
+    const result = spawnSync(process.execPath, [
+      path.resolve(import.meta.dirname, '..', 'check-tauri-performance.mjs'),
+      '--codex-warm-activation', measurementPath,
+      '--max-codex-warm-p95-ms', '1500',
+      '--max-codex-handshake-p95-ms', '5000',
+    ], { encoding: 'utf8' });
+
+    assert.equal(result.status, 0, result.stderr);
+    const output = JSON.parse(result.stdout);
+    assert.equal(output.schema, CODEX_WARM_ACTIVATION_SCHEMA);
+    assert.equal(output.p95.initializedMs, 900);
+    assert.equal(compareCodexWarmActivation(codexWarmMeasurement()).samples, 5);
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }

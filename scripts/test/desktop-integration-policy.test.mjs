@@ -192,19 +192,26 @@ test('the main Tauri window uses custom borderless chrome while remaining resiza
   assert.equal(mainWindow.minHeight, 768);
 });
 
-test('hosted packaged interaction is Windows-only, manually opted in, and never implied by static checks', () => {
+test('hosted packaged interactions are Windows-only, manually opted in, and never implied by static checks', () => {
   const ciWorkflow = readRequiredText(ciWorkflowPath, 'CI workflow');
   const tauriWorkflow = readRequiredText(tauriWorkflowPath, 'Tauri workflow');
   const interactionCommands = [...`${ciWorkflow}\n${tauriWorkflow}`.matchAll(
-    /npm run smoke:tauri-packaged -- --scenario (critical-file|full-file)/g,
+    /npm run smoke:tauri-packaged -- --scenario (critical-file|codex|full-file)/g,
   )];
-  assert.equal(interactionCommands.length, 2, 'critical and full packaged interactions must both be explicit');
+  assert.equal(interactionCommands.length, 3, 'critical, Codex, and full packaged interactions must be explicit');
 
   const criticalCommandIndex = ciWorkflow.indexOf(interactionCommands[0][0]);
   const criticalGuard = ciWorkflow.slice(Math.max(0, criticalCommandIndex - 500), criticalCommandIndex);
   assert.match(criticalGuard, /runner\.os\s*==\s*['"]Windows['"]/);
   assert.match(criticalGuard, /github\.event_name\s*==\s*['"]workflow_dispatch['"]/);
   assert.match(criticalGuard, /inputs\.run_windows_packaged_smoke/);
+
+  const codexCommandIndex = ciWorkflow.indexOf('npm run smoke:tauri-packaged -- --scenario codex');
+  assert.ok(codexCommandIndex > criticalCommandIndex, 'Codex smoke must follow critical smoke');
+  const codexGuard = ciWorkflow.slice(Math.max(0, codexCommandIndex - 500), codexCommandIndex);
+  assert.match(codexGuard, /runner\.os\s*==\s*['"]Windows['"]/);
+  assert.match(codexGuard, /github\.event_name\s*==\s*['"]workflow_dispatch['"]/);
+  assert.match(codexGuard, /inputs\.run_windows_packaged_smoke/);
 
   const fullCommandIndex = tauriWorkflow.indexOf('npm run smoke:tauri-packaged -- --scenario full-file');
   const fullJobPrefix = tauriWorkflow.slice(tauriWorkflow.lastIndexOf('\n  windows-full-packaged-smoke:', fullCommandIndex), fullCommandIndex);

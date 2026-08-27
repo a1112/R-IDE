@@ -72,6 +72,13 @@ test('packaged smoke binding is installed by the product frontend module', async
     assert.match(moduleSource, /bindRidePackagedSmokeContribution\(bind,/);
     assert.match(moduleSource, /applicationState:\s*FrontendApplicationStateService/);
     assert.match(moduleSource, /contribution:\s*FrontendApplicationContribution/);
+
+    const bindingSource = await readFile(
+        resolve(process.cwd(), 'src/browser/ride-packaged-smoke-bindings.ts'),
+        'utf8'
+    );
+    assert.match(bindingSource, /codexSmoke\?:/);
+    assert.match(bindingSource, /context\.container\.isBound\(identifiers\.codexSmoke\)/);
 });
 
 test('packaged smoke shutdown keeps late default action resolution lightweight and disposed', async () => {

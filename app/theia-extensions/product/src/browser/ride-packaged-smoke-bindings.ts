@@ -18,6 +18,7 @@ import type { TerminalService } from '@theia/terminal/lib/browser/base/terminal-
 import type { HostedPluginSupport } from '@theia/plugin-ext/lib/hosted/browser/hosted-plugin';
 import type { WorkspaceService } from '@theia/workspace/lib/browser';
 import {
+    type RideCodexPackagedSmokeDriverLike,
     RidePackagedSmokeActions,
     RidePackagedSmokeContribution,
     RidePackagedSmokeProtocol,
@@ -57,6 +58,7 @@ export interface RidePackagedSmokeBindingIdentifiers {
     readonly commandRegistry?: interfaces.ServiceIdentifier<CommandRegistry>;
     readonly applicationShell?: interfaces.ServiceIdentifier<ApplicationShell>;
     readonly openRequests?: interfaces.ServiceIdentifier<RideOpenRequestContribution>;
+    readonly codexSmoke?: interfaces.ServiceIdentifier<RideCodexPackagedSmokeDriverLike>;
 }
 
 export function bindRidePackagedSmokeContribution(
@@ -105,7 +107,11 @@ export function bindRidePackagedSmokeContribution(
                 commandRegistry: context.container.get(commandRegistry) as CommandRegistry,
                 applicationShell: context.container.get(applicationShell) as ApplicationShell,
                 openRequests: context.container.get(openRequests) as RideOpenRequestContribution,
-                backendIsWindows: OS.backend.isWindows
+                backendIsWindows: OS.backend.isWindows,
+                codexSmoke: identifiers.codexSmoke !== undefined
+                    && context.container.isBound(identifiers.codexSmoke)
+                    ? context.container.get(identifiers.codexSmoke)
+                    : undefined
             });
             resolvedActions = actions;
             return actions;

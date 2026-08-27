@@ -212,11 +212,16 @@ impl BackendReadinessPublisher {
 
 trait BackendChildEnvironment {
     fn remove_environment(&mut self, name: &str);
+    fn set_environment(&mut self, name: &str, value: &str);
 }
 
 impl BackendChildEnvironment for CommandBuilder {
     fn remove_environment(&mut self, name: &str) {
         self.env_remove(name);
+    }
+
+    fn set_environment(&mut self, name: &str, value: &str) {
+        self.env(name, value);
     }
 }
 
@@ -224,11 +229,27 @@ impl BackendChildEnvironment for Command {
     fn remove_environment(&mut self, name: &str) {
         self.env_remove(name);
     }
+
+    fn set_environment(&mut self, name: &str, value: &str) {
+        self.env(name, value);
+    }
 }
 
 fn remove_smoke_environment(command: &mut impl BackendChildEnvironment) {
     for name in crate::smoke::SMOKE_ENV_NAMES {
         command.remove_environment(name);
+    }
+    command.remove_environment(crate::smoke::CODEX_SMOKE_NONCE_ENV);
+}
+
+fn configure_smoke_environment(command: &mut impl BackendChildEnvironment, app_handle: &AppHandle) {
+    remove_smoke_environment(command);
+    if let Some(nonce) = app_handle
+        .state::<crate::AppState>()
+        .smoke
+        .codex_smoke_nonce()
+    {
+        command.set_environment(crate::smoke::CODEX_SMOKE_NONCE_ENV, &nonce);
     }
 }
 
@@ -1372,7 +1393,7 @@ async fn start_node_backend_process(
         .map_err(|error| format!("Failed to create backend PTY: {error}"))?;
 
     let mut command = CommandBuilder::new(&config.node_exe);
-    remove_smoke_environment(&mut command);
+    configure_smoke_environment(&mut command, app_handle);
     command.arg(&script_path);
     command.arg("--log-level=info");
     command.arg(format!("--port={BACKEND_PORT}"));
@@ -1637,7 +1658,7 @@ async fn start_node_backend_process(
         .map_err(|e| format!("Failed to create backend PTY: {}", e))?;
 
     let mut command = CommandBuilder::new(&config.node_exe);
-    remove_smoke_environment(&mut command);
+    configure_smoke_environment(&mut command, app_handle);
     command.arg(&script_path);
     command.arg("--log-level=info");
     command.arg(format!("--port={BACKEND_PORT}"));
@@ -2237,7 +2258,7 @@ async fn start_backend_direct_process(
     let config_dir = node_runtime_path(&config_dir);
     let frontend_dir = frontend_dir.map(|path| node_runtime_path(&path));
     let mut command = Command::new(&config.node_exe);
-    remove_smoke_environment(&mut command);
+    configure_smoke_environment(&mut command, app_handle);
     if config.use_node {
         command.arg(&script_path);
     }

@@ -27,6 +27,11 @@ import { RideCodexRuntimeResolver } from './ride-codex-runtime-resolver';
 import { RideCodexThreadCoordinator } from './ride-codex-thread-coordinator';
 import { RideCodexTurnCoordinator } from './ride-codex-turn-coordinator';
 import { RideCodexApprovalBroker } from './ride-codex-approval-broker';
+import {
+    createRideCodexPackagedSmokeResolver,
+    createRideCodexPackagedSmokeSpawn,
+    isRideCodexPackagedSmokeEnvironment
+} from './ride-codex-packaged-smoke';
 
 export function RIDE_CODEX_0_144_APPROVAL_POLICY(kind: 'command' | 'file-change'): boolean {
     return kind === 'command' || kind === 'file-change';
@@ -35,10 +40,19 @@ export function RIDE_CODEX_0_144_APPROVAL_POLICY(kind: 'command' | 'file-change'
 export default new ContainerModule(bind => {
     bind(RideCodexRuntimeResolver).toSelf().inSingletonScope();
     bind(RideCodexAppServerDiagnostics).toSelf().inSingletonScope();
-    bind(RideCodexAppServerHost).toDynamicValue(context => new RideCodexAppServerHost({
-        resolver: context.container.get(RideCodexRuntimeResolver),
-        diagnostics: context.container.get(RideCodexAppServerDiagnostics)
-    })).inSingletonScope();
+    bind(RideCodexAppServerHost).toDynamicValue(context => {
+        const environment = process.env;
+        const packagedSmoke = isRideCodexPackagedSmokeEnvironment(environment);
+        return new RideCodexAppServerHost({
+            resolver: createRideCodexPackagedSmokeResolver(
+                context.container.get(RideCodexRuntimeResolver),
+                environment
+            ),
+            spawn: createRideCodexPackagedSmokeSpawn(environment),
+            diagnostics: context.container.get(RideCodexAppServerDiagnostics),
+            ...(packagedSmoke ? { idleTimeoutMs: 250, shutdownGraceMs: 500 } : {})
+        });
+    }).inSingletonScope();
     bind(BackendApplicationContribution).toService(RideCodexAppServerHost);
     bind(RideCodexAuthBroker).toDynamicValue(context => new RideCodexAuthBroker({
         host: context.container.get(RideCodexAppServerHost),

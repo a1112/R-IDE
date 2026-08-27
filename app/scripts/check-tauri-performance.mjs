@@ -14,6 +14,8 @@ import process from 'node:process';
 import { pathToFileURL } from 'node:url';
 
 const MEASUREMENT_SCHEMA = 'ride.startup-measurement';
+export const CODEX_WARM_ACTIVATION_SCHEMA = 'ride.codex-warm-activation';
+export const CODEX_WARM_ACTIVATION_VERSION = 1;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const COMMIT_PATTERN = /^[0-9a-f]{40}$/;
 const PROFILE_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
@@ -199,6 +201,117 @@ function median(values) {
   return sorted.length % 2 === 1
     ? sorted[middle]
     : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+function nearestRank(values, percentile, label) {
+  if (!Array.isArray(values) || values.length === 0) {
+    fail(`${label} requires at least one sample`);
+  }
+  const sorted = values.map((value, index) => (
+    nonNegativeInteger(value, `${label} sample ${index + 1}`)
+  )).sort((left, right) => left - right);
+  const rank = Math.max(1, Math.ceil(sorted.length * percentile));
+  return sorted[rank - 1];
+}
+
+const CODEX_WARM_BUILD_KEYS = Object.freeze(['commit', 'profile']);
+const CODEX_WARM_SAMPLE_KEYS = Object.freeze([
+  'panelShellMs',
+  'runtimeResolvedMs',
+  'processSpawnedMs',
+  'initializedMs',
+  'handshakeMs',
+  'idleRssBytes',
+]);
+
+export function validateCodexWarmActivation(value) {
+  exactKeys(value, [
+    'schema',
+    'version',
+    'platform',
+    'arch',
+    'build',
+    'samples',
+  ], 'Codex warm activation measurement');
+  if (value.schema !== CODEX_WARM_ACTIVATION_SCHEMA
+      || value.version !== CODEX_WARM_ACTIVATION_VERSION) {
+    fail(`Codex warm activation must use ${CODEX_WARM_ACTIVATION_SCHEMA}@${CODEX_WARM_ACTIVATION_VERSION}`);
+  }
+  nonEmptyString(value.platform, 'Codex warm activation platform');
+  nonEmptyString(value.arch, 'Codex warm activation architecture');
+  exactKeys(value.build, CODEX_WARM_BUILD_KEYS, 'Codex warm activation build');
+  if (!COMMIT_PATTERN.test(value.build.commit)) {
+    fail('Codex warm activation build commit must be a canonical 40-character SHA-1');
+  }
+  if (!PROFILE_PATTERN.test(value.build.profile)) {
+    fail('Codex warm activation build profile must be canonical');
+  }
+  if (!Array.isArray(value.samples) || value.samples.length < 5 || value.samples.length > 100) {
+    fail('Codex warm activation samples must contain between 5 and 100 runs');
+  }
+  const samples = value.samples.map((sample, index) => {
+    exactKeys(sample, CODEX_WARM_SAMPLE_KEYS, `Codex warm activation sample ${index + 1}`);
+    const timings = Object.fromEntries(CODEX_WARM_SAMPLE_KEYS.map(field => [
+      field,
+      nonNegativeInteger(sample[field], `Codex warm activation sample ${index + 1} ${field}`),
+    ]));
+    if (timings.panelShellMs > timings.runtimeResolvedMs
+        || timings.runtimeResolvedMs > timings.processSpawnedMs
+        || timings.processSpawnedMs > timings.initializedMs
+        || timings.handshakeMs > timings.initializedMs) {
+      fail(`Codex warm activation sample ${index + 1} has a non-monotonic stage order`);
+    }
+    return Object.freeze(timings);
+  });
+  const percentiles = Object.freeze({
+    initializedMs: nearestRank(samples.map(sample => sample.initializedMs), 0.95, 'Codex warm activation initializedMs'),
+    handshakeMs: nearestRank(samples.map(sample => sample.handshakeMs), 0.95, 'Codex warm activation handshakeMs'),
+  });
+  return Object.freeze({
+    schema: value.schema,
+    version: value.version,
+    platform: value.platform,
+    arch: value.arch,
+    build: Object.freeze({ ...value.build }),
+    samples: Object.freeze(samples),
+    percentiles,
+  });
+}
+
+export function compareCodexWarmActivation(
+  measurement,
+  { maxP95Ms = 1_500, maxHandshakeP95Ms = 5_000 } = {},
+) {
+  const validated = validateCodexWarmActivation(measurement);
+  const initializedTarget = nonNegativeInteger(maxP95Ms, 'maximum Codex warm activation p95');
+  const handshakeTarget = nonNegativeInteger(
+    maxHandshakeP95Ms,
+    'maximum Codex App Server handshake p95',
+  );
+  const failures = [];
+  if (validated.percentiles.initializedMs > initializedTarget) {
+    failures.push(
+      `Codex warm activation initializedMs p95 ${validated.percentiles.initializedMs}ms exceeds ${initializedTarget}ms`,
+    );
+  }
+  if (validated.percentiles.handshakeMs > handshakeTarget) {
+    failures.push(
+      `Codex warm activation handshakeMs p95 ${validated.percentiles.handshakeMs}ms exceeds ${handshakeTarget}ms`,
+    );
+  }
+  if (failures.length > 0) {
+    fail(failures.join('; '));
+  }
+  return {
+    schema: validated.schema,
+    version: validated.version,
+    samples: validated.samples.length,
+    p95: validated.percentiles,
+    targets: {
+      initializedMs: initializedTarget,
+      handshakeMs: handshakeTarget,
+    },
+  };
 }
 
 function validateBuild(build, label) {
@@ -894,6 +1007,8 @@ function parseArguments(argv) {
     maxStartupSlowestMs: 3_000,
     maxWindowMedianMs: 800,
     maxMemoryRegressionPercent: 3,
+    maxCodexWarmP95Ms: 1_500,
+    maxCodexHandshakeP95Ms: 5_000,
   };
   for (let index = 0; index < argv.length; index++) {
     const argument = argv[index];
@@ -906,6 +1021,8 @@ function parseArguments(argv) {
       options.baseline = value;
     } else if (argument === '--candidate') {
       options.candidate = value;
+    } else if (argument === '--codex-warm-activation') {
+      options.codexWarmActivation = value;
     } else if (argument === '--min-startup-gain') {
       options.minStartupGain = Number(value);
     } else if (argument === '--min-memory-gain') {
@@ -920,9 +1037,19 @@ function parseArguments(argv) {
       options.maxWindowMedianMs = Number(value);
     } else if (argument === '--max-memory-regression-percent') {
       options.maxMemoryRegressionPercent = Number(value);
+    } else if (argument === '--max-codex-warm-p95-ms') {
+      options.maxCodexWarmP95Ms = Number(value);
+    } else if (argument === '--max-codex-handshake-p95-ms') {
+      options.maxCodexHandshakeP95Ms = Number(value);
     } else {
       fail(`unsupported option ${argument}`);
     }
+  }
+  if (options.codexWarmActivation !== undefined) {
+    if (options.baseline !== undefined || options.candidate !== undefined) {
+      fail('--codex-warm-activation cannot be combined with baseline/candidate');
+    }
+    return options;
   }
   if (!options.baseline || !options.candidate) {
     fail('--baseline and --candidate are required');
@@ -932,6 +1059,17 @@ function parseArguments(argv) {
 
 function main(argv) {
   const options = parseArguments(argv);
+  if (options.codexWarmActivation !== undefined) {
+    const result = compareCodexWarmActivation(
+      readMeasurement(options.codexWarmActivation, 'Codex warm activation measurement'),
+      {
+        maxP95Ms: options.maxCodexWarmP95Ms,
+        maxHandshakeP95Ms: options.maxCodexHandshakeP95Ms,
+      },
+    );
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    return;
+  }
   const result = compareTauriPerformance(
     readMeasurement(options.baseline, 'baseline'),
     readMeasurement(options.candidate, 'candidate'),
