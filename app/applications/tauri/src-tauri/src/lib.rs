@@ -1434,6 +1434,10 @@ mod tests {
                 main: performance::UsageGroup::default(),
                 backend: performance::UsageGroup::default(),
                 plugin_host: performance::UsageGroup::default(),
+                codex_agent: performance::UsageGroup::default(),
+                codex_app_server: performance::UsageGroup::default(),
+                codex_sdk: performance::UsageGroup::default(),
+                codex_commands: performance::UsageGroup::default(),
                 other: performance::UsageGroup::default(),
             })
         })

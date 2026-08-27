@@ -49,6 +49,10 @@ const validSnapshot: RidePerformanceSnapshot = {
     main: { cpuPercent: 2.5, memoryBytes: 262_144, processCount: 1 },
     backend: { cpuPercent: 4, memoryBytes: 393_216, processCount: 1 },
     pluginHost: { cpuPercent: 3, memoryBytes: 196_608, processCount: 2 },
+    codexAgent: { cpuPercent: 0, memoryBytes: 0, processCount: 0 },
+    codexAppServer: { cpuPercent: 0, memoryBytes: 0, processCount: 0 },
+    codexSdk: { cpuPercent: 0, memoryBytes: 0, processCount: 0 },
+    codexCommands: { cpuPercent: 0, memoryBytes: 0, processCount: 0 },
     other: { cpuPercent: 3, memoryBytes: 196_608, processCount: 1 }
 };
 

@@ -373,6 +373,10 @@ function isPerformanceSnapshot(value: unknown): value is RidePerformanceSnapshot
         && isUsageGroup(value.main)
         && isUsageGroup(value.backend)
         && isUsageGroup(value.pluginHost)
+        && isUsageGroup(value.codexAgent)
+        && isUsageGroup(value.codexAppServer)
+        && isUsageGroup(value.codexSdk)
+        && isUsageGroup(value.codexCommands)
         && isUsageGroup(value.other);
 }
 

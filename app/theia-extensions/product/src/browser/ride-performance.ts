@@ -19,6 +19,10 @@ export interface RidePerformanceSnapshot {
     main: RideUsageGroup;
     backend: RideUsageGroup;
     pluginHost: RideUsageGroup;
+    codexAgent: RideUsageGroup;
+    codexAppServer: RideUsageGroup;
+    codexSdk: RideUsageGroup;
+    codexCommands: RideUsageGroup;
     other: RideUsageGroup;
 }
 
@@ -99,6 +103,12 @@ export function formatPerformanceSnapshot(
         ? (count: number): string => `${count} 个进程`
         : (count: number): string => `${count} ${count === 1 ? 'process' : 'processes'}`;
     const groups = [snapshot.total, snapshot.main, snapshot.backend, snapshot.pluginHost, snapshot.other];
+    if (snapshot.codexAgent.processCount > 0) {
+        labels.push(...(chinese
+            ? ['Codex Agent', 'App Server', 'SDK', '命令子进程']
+            : ['Codex Agent', 'App Server', 'SDK', 'Command children']));
+        groups.push(snapshot.codexAgent, snapshot.codexAppServer, snapshot.codexSdk, snapshot.codexCommands);
+    }
 
     return {
         available: true,

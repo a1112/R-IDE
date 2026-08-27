@@ -29,6 +29,10 @@ function snapshot(overrides: Partial<RidePerformanceSnapshot> = {}): RidePerform
         main: usage(),
         backend: usage(),
         pluginHost: usage(),
+        codexAgent: usage(),
+        codexAppServer: usage(),
+        codexSdk: usage(),
+        codexCommands: usage(),
         other: usage(),
         ...overrides
     };
@@ -160,6 +164,27 @@ test('keeps zero-process groups visible in the tooltip', () => {
     assert.match(view.tooltip, /后端.*0 个进程/);
     assert.match(view.tooltip, /插件宿主.*0 个进程/);
     assert.match(view.tooltip, /其他.*0 个进程/);
+    assert.doesNotMatch(view.tooltip, /Codex Agent|App Server|SDK|命令子进程/);
+});
+
+test('Codex hover shows agent and channel breakdown in Chinese', () => {
+    const view = formatPerformanceSnapshot(snapshot({
+        total: usage(6, 600, 9),
+        main: usage(1, 100, 1),
+        backend: usage(1, 100, 1),
+        pluginHost: usage(1, 100, 1),
+        other: usage(1, 50, 1),
+        codexAgent: usage(2, 250, 5),
+        codexAppServer: usage(0.8, 100, 2),
+        codexSdk: usage(0.7, 80, 1),
+        codexCommands: usage(0.5, 70, 2)
+    }), 'zh-CN');
+
+    assert.equal(view.text, '$(pulse) CPU 6.0%  内存 600 B');
+    assert.match(view.tooltip, /Codex Agent/);
+    assert.match(view.tooltip, /App Server/);
+    assert.match(view.tooltip, /SDK/);
+    assert.match(view.tooltip, /命令子进程/);
 });
 
 test('starts one immediate request and installs one 2000 ms interval', async () => {
