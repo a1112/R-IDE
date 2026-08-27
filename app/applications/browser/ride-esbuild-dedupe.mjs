@@ -9,9 +9,19 @@ function logicalResolvedPackagePath(applicationRoot, request, resolvedPath) {
     if (segments.length < 2 || segments.some(segment => !segment || segment === '.' || segment === '..')) {
         return undefined;
     }
-    const logicalPackage = path.join(applicationRoot, 'node_modules', segments[0], segments[1]);
-    if (!fs.existsSync(logicalPackage)) {
-        return undefined;
+    let logicalPackage;
+    let directory = path.resolve(applicationRoot);
+    while (true) {
+        const candidate = path.join(directory, 'node_modules', segments[0], segments[1]);
+        if (fs.existsSync(candidate)) {
+            logicalPackage = candidate;
+            break;
+        }
+        const parent = path.dirname(directory);
+        if (parent === directory) {
+            return undefined;
+        }
+        directory = parent;
     }
     let physicalPackage;
     try {

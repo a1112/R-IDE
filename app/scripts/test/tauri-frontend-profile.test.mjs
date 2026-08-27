@@ -545,11 +545,14 @@ test('Tauri browser build splits only the ESM main entry and keeps classic worke
 test('dedupe keeps a logical Theia package path when the profile uses a junction', async t => {
     const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-dedupe-junction-'));
     t.after(() => fs.promises.rm(directory, { recursive: true, force: true }));
+    const profileRoot = path.join(directory, 'profile', 'build');
     const storePackage = path.join(directory, 'store', '@theia', 'junction-fixture');
     const logicalPackage = path.join(directory, 'node_modules', '@theia', 'junction-fixture');
     await fs.promises.mkdir(path.join(storePackage, 'lib'), { recursive: true });
+    await fs.promises.mkdir(profileRoot, { recursive: true });
     await fs.promises.mkdir(path.dirname(logicalPackage), { recursive: true });
     await fs.promises.writeFile(path.join(directory, 'package.json'), '{}\n');
+    await fs.promises.writeFile(path.join(profileRoot, 'package.json'), '{}\n');
     await fs.promises.writeFile(path.join(storePackage, 'package.json'), JSON.stringify({
         name: '@theia/junction-fixture',
         version: '1.0.0',
@@ -558,7 +561,7 @@ test('dedupe keeps a logical Theia package path when the profile uses a junction
     await fs.promises.writeFile(path.join(storePackage, 'lib', 'index.js'), 'export {};\n');
     await fs.promises.symlink(storePackage, logicalPackage, process.platform === 'win32' ? 'junction' : 'dir');
 
-    const plugin = createTheiaModuleDedupePlugin(directory);
+    const plugin = createTheiaModuleDedupePlugin(profileRoot);
     let resolver;
     plugin.setup({
         onResolve(_options, callback) {
