@@ -33,6 +33,7 @@ import {
     createTauriBrowserBuildPlans,
     ensureModuleScript
 } from '../../applications/browser/tauri-src/esbuild-deferred.mjs';
+import { createTheiaModuleDedupePlugin } from '../../applications/browser/ride-esbuild-dedupe.mjs';
 
 const require = createRequire(import.meta.url);
 const esbuild = require('esbuild');
@@ -538,6 +539,34 @@ test('Tauri browser build splits only the ESM main entry and keeps classic worke
 
     const full = createTauriBrowserBuildPlans(options, { ...criticalManifest, profile: 'full' }, path.resolve('full-target'));
     assert.deepEqual(full.main.alias ?? {}, {});
+});
+
+test('dedupe keeps a logical Theia package path when the profile uses a junction', async t => {
+    const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-dedupe-junction-'));
+    t.after(() => fs.promises.rm(directory, { recursive: true, force: true }));
+    const storePackage = path.join(directory, 'store', '@theia', 'junction-fixture');
+    const logicalPackage = path.join(directory, 'node_modules', '@theia', 'junction-fixture');
+    await fs.promises.mkdir(path.join(storePackage, 'lib'), { recursive: true });
+    await fs.promises.mkdir(path.dirname(logicalPackage), { recursive: true });
+    await fs.promises.writeFile(path.join(directory, 'package.json'), '{}\n');
+    await fs.promises.writeFile(path.join(storePackage, 'package.json'), JSON.stringify({
+        name: '@theia/junction-fixture',
+        version: '1.0.0',
+        main: 'lib/index.js',
+    }));
+    await fs.promises.writeFile(path.join(storePackage, 'lib', 'index.js'), 'export {};\n');
+    await fs.promises.symlink(storePackage, logicalPackage, process.platform === 'win32' ? 'junction' : 'dir');
+
+    const plugin = createTheiaModuleDedupePlugin(directory);
+    let resolver;
+    plugin.setup({
+        onResolve(_options, callback) {
+            resolver = callback;
+        },
+    });
+    const request = '@theia/junction-fixture/lib/index.js';
+    const result = resolver({ path: request });
+    assert.equal(result.path, path.join(logicalPackage, 'lib', 'index.js'));
 });
 
 test('generated frontend HTML uses one external module script in build and watch mode', async t => {

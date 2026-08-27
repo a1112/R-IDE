@@ -1,7 +1,17 @@
+import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 
 const THEIA_PACKAGE_PREFIX = '@theia/';
+
+function logicalPackagePath(applicationRoot, request) {
+  const segments = request.split('/');
+  if (segments.length < 2 || segments.some(segment => !segment || segment === '.' || segment === '..')) {
+    return undefined;
+  }
+  const candidate = path.join(applicationRoot, 'node_modules', ...segments);
+  return fs.existsSync(candidate) ? candidate : undefined;
+}
 
 /**
  * Keep shared Theia service class identities stable.
@@ -21,6 +31,14 @@ export function createTheiaModuleDedupePlugin(applicationRoot) {
       build.onResolve(
         { filter: /^@theia\/[^/]+(?:\/.*)?$/ },
         ({ path: request }) => {
+          // A profile may link packages from an external store with a Windows
+          // junction. Returning the logical path lets esbuild keep resolving
+          // peers from the profile's node_modules directory; browserRequire
+          // canonicalizes the junction and can select another workspace tree.
+          const logicalPath = logicalPackagePath(applicationRoot, request);
+          if (logicalPath) {
+            return { path: logicalPath };
+          }
           try {
             return { path: browserRequire.resolve(request) };
           } catch (error) {
