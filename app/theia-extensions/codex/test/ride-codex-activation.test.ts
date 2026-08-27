@@ -10,6 +10,7 @@ import { FrontendApplicationContribution } from '@theia/core/lib/browser/fronten
 import { MessageService } from '@theia/core/lib/common/message-service';
 import { PreferenceService } from '@theia/core/lib/common/preferences/preference-service';
 import { CommandContribution, CommandRegistry } from '@theia/core/lib/common/command';
+import { ChatAgent } from '@theia/ai-chat';
 import { Container } from '@theia/core/shared/inversify';
 import { RideCodexActivation } from '../src/browser/ride-codex-activation';
 import * as RideCodexProxyModule from '../src/browser/ride-codex-chat-agent-proxy';
@@ -267,6 +268,25 @@ test('registering the Codex command is inert and execution delegates to the perm
     assert.equal(activations, 1);
 });
 
+test('the permanent proxy keeps one ChatAgent identity and delegates after activation', async () => {
+    let invocations = 0;
+    const activation = new RideCodexActivation(async () => ({
+        activate: async () => undefined,
+        agent: {
+            invoke: async () => { invocations += 1; }
+        }
+    }));
+    const proxy = new RideCodexChatAgentProxy(activation);
+
+    assert.equal(proxy.id, 'Codex');
+    assert.equal(proxy.name, 'Codex');
+    assert.equal(proxy.locations.length, 4);
+    await proxy.invoke({} as never);
+
+    assert.equal(invocations, 1);
+    assert.equal(activation.state, 'ready');
+});
+
 test('frontend bindings expose one inert activation graph to command and shutdown contributions', async () => {
     const container = new Container();
     container.load(rideCodexFrontendModule);
@@ -286,8 +306,10 @@ test('frontend bindings expose one inert activation graph to command and shutdow
     const activation = container.get(RideCodexActivation);
     const proxy = container.get(RideCodexChatAgentProxy);
     const authController = container.get(RideCodexAuthController);
+    const agents = container.getAll<typeof proxy>(ChatAgent);
 
     assert.equal(activation.state, 'inactive');
+    assert.equal(agents.filter(agent => agent.id === 'Codex').length, 1);
     assert.equal(container.isBound(RideCodexAuthController), true);
     assert.equal(container.isBound(RideCodexAuthClient), true);
     assert.equal(container.isBound(RideCodexAuthService), true);

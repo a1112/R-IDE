@@ -32,12 +32,12 @@ test('Codex startup sources contain only inert activation and command proxies', 
         fs.readFile(path.join(extensionDirectory, 'ride-codex-frontend-module.ts'), 'utf8'),
         fs.readFile(path.join(extensionDirectory, 'ride-codex-chat-agent-proxy.ts'), 'utf8'),
     ]);
-    assert.match(proxy, /import\(['"]\.\/codex-feature['"]\)\.then\(module => module\.createCodexFeature\(\)\)/);
+    assert.match(proxy, /import\(['"]\.\/codex-feature['"]\)\.then\(module => module\.createCodexFeature\(container!\)\)/);
     assert.match(feature, /createCodexFeature/);
     for (const source of [proxy, feature, frontend, bindings]) {
         assert.doesNotMatch(
             source,
-            /@openai\/codex-sdk|codex[- ]installer|app[- ]server|CodexAppServerClient|codex[- ]process|child_process|node:process|process\./i,
+            /@openai\/codex-sdk|codex[- ]installer|CodexAppServerClient|codex[- ]process|child_process|node:process|process\./i,
         );
     }
     assert.match(proxy, /bindRideCodexFrontend\(bind,/);

@@ -5,11 +5,18 @@
  ********************************************************************************/
 
 import type { FrontendApplicationContribution } from '@theia/core/lib/browser/frontend-application-contribution';
+import type { ChatAgent, ChatAgentService, MutableChatRequestModel } from '@theia/ai-chat';
 
 export type RideCodexActivationState = 'inactive' | 'activating' | 'ready' | 'error';
 
+export interface RideCodexFeatureAgent extends Pick<ChatAgent, 'invoke'> {
+    invoke(request: MutableChatRequestModel, chatAgentService?: ChatAgentService): Promise<void>;
+}
+
 export interface RideCodexFeature {
     activate(): Promise<void>;
+    readonly agent?: RideCodexFeatureAgent;
+    open?(): Promise<void> | void;
     dispose?(): void;
 }
 
@@ -26,6 +33,10 @@ export class RideCodexActivation implements FrontendApplicationContribution {
 
     get state(): RideCodexActivationState {
         return this.stateValue;
+    }
+
+    get loadedFeature(): RideCodexFeature | undefined {
+        return this.feature;
     }
 
     activate(): Promise<void> {

@@ -9,6 +9,6 @@ import { bindRideCodexFrontend } from 'theia-ide-codex-ext/lib/browser/ride-code
 
 export default new ContainerModule(bind => {
     bindRideCodexFrontend(bind,
-        () => import('./codex-feature').then(module => module.createCodexFeature())
+        container => import('./codex-feature').then(module => module.createCodexFeature(container!))
     );
 });
