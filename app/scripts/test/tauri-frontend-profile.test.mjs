@@ -34,6 +34,7 @@ import {
     ensureModuleScript
 } from '../../applications/browser/tauri-src/esbuild-deferred.mjs';
 import { createTheiaModuleDedupePlugin } from '../../applications/browser/ride-esbuild-dedupe.mjs';
+import { createWindowsCaCertsFallbackPlugin } from '../../applications/browser/tauri-src/windows-ca-certs-fallback.mjs';
 
 const require = createRequire(import.meta.url);
 const esbuild = require('esbuild');
@@ -567,6 +568,51 @@ test('dedupe keeps a logical Theia package path when the profile uses a junction
     const request = '@theia/junction-fixture/lib/index.js';
     const result = resolver({ path: request });
     assert.equal(result.path, path.join(logicalPackage, 'lib', 'index.js'));
+});
+
+test('Windows CA fallback only intercepts a missing native binding', async t => {
+    const plugin = createWindowsCaCertsFallbackPlugin({
+        applicationRoot: path.resolve('generated-target'),
+        platform: 'win32',
+        nativePath: path.resolve('generated-target', 'missing', 'crypt32.node'),
+    });
+    let resolve;
+    let load;
+    plugin.setup({
+        onResolve(_options, callback) {
+            resolve = callback;
+        },
+        onLoad(_options, callback) {
+            load = callback;
+        },
+    });
+    assert.deepEqual(resolve({ path: '@vscode/windows-ca-certs' }), {
+        path: 'ride-windows-ca-certs-fallback',
+        namespace: 'ride-windows-ca-certs-fallback',
+    });
+    const loaded = await load({ path: 'ride-windows-ca-certs-fallback' });
+    assert.equal(loaded.loader, 'js');
+    assert.match(loaded.contents, /class Crypt32/);
+    assert.match(loaded.contents, /next\(\)\s*\{\s*return undefined/);
+
+    const nativePath = path.join(await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-native-binding-')), 'crypt32.node');
+    t.after(() => fs.promises.rm(path.dirname(nativePath), { recursive: true, force: true }));
+    await fs.promises.writeFile(nativePath, 'native fixture');
+    const nativePlugin = createWindowsCaCertsFallbackPlugin({
+        applicationRoot: path.resolve('generated-target'),
+        platform: 'win32',
+        nativePath,
+    });
+    let registered = false;
+    nativePlugin.setup({
+        onResolve() {
+            registered = true;
+        },
+        onLoad() {
+            registered = true;
+        },
+    });
+    assert.equal(registered, false);
 });
 
 test('generated frontend HTML uses one external module script in build and watch mode', async t => {

@@ -18,6 +18,7 @@ import {
     createTauriBrowserBuildPlans,
 } from './tauri-src/esbuild-deferred.mjs';
 import { createProfileMetadataPlugin } from './tauri-src/esbuild-metadata.mjs';
+import { createWindowsCaCertsFallbackPlugin } from './tauri-src/windows-ca-certs-fallback.mjs';
 
 import esbuild from 'esbuild';
 
@@ -203,6 +204,7 @@ function patchBuiltParcelWatcherLoad() {
 // upward from an isolated profile target on every supported platform.
 browserOptions.plugins.push(createTheiaModuleDedupePlugin(__dirname));
 nodeOptions.plugins.push(createTheiaModuleDedupePlugin(__dirname));
+nodeOptions.plugins.unshift(createWindowsCaCertsFallbackPlugin({ applicationRoot: __dirname }));
 nodeOptions.plugins.push({
     name: 'ride-tauri-backend-patches',
     setup(build) {
