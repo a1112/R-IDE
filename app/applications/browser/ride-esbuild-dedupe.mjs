@@ -6,6 +6,9 @@ const THEIA_PACKAGE_PREFIX = '@theia/';
 
 function logicalResolvedPackagePath(applicationRoot, request, resolvedPath) {
     const segments = request.split('/');
+    while (segments.at(-1) === '') {
+        segments.pop();
+    }
     if (segments.length < 2 || segments.some(segment => !segment || segment === '.' || segment === '..')) {
         return undefined;
     }
