@@ -574,6 +574,9 @@ test('dedupe keeps a logical Theia package path when the profile uses a junction
 
     const trailingSlashResult = resolver({ path: '@theia/junction-fixture/lib/' });
     assert.equal(trailingSlashResult.path, path.join(logicalPackage, 'lib', 'index.js'));
+
+    const repeatedSlashResult = resolver({ path: '@theia/junction-fixture/lib//index.js' });
+    assert.equal(repeatedSlashResult.path, path.join(logicalPackage, 'lib', 'index.js'));
 });
 
 test('Windows CA fallback only intercepts a missing native binding', async t => {

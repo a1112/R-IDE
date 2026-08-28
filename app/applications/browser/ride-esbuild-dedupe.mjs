@@ -5,7 +5,8 @@ import { createRequire } from 'node:module';
 const THEIA_PACKAGE_PREFIX = '@theia/';
 
 function logicalResolvedPackagePath(applicationRoot, request, resolvedPath) {
-    const segments = request.split('/');
+    const normalizedRequest = request.replaceAll(/\/{2,}/g, '/');
+    const segments = normalizedRequest.split('/');
     while (segments.at(-1) === '') {
         segments.pop();
     }
@@ -62,8 +63,9 @@ export function createTheiaModuleDedupePlugin(applicationRoot) {
           // peers from the profile's node_modules directory; browserRequire
           // canonicalizes the junction and can select another workspace tree.
           try {
-            const resolvedPath = browserRequire.resolve(request);
-            const logicalPath = logicalResolvedPackagePath(applicationRoot, request, resolvedPath);
+            const normalizedRequest = request.replaceAll(/\/{2,}/g, '/');
+            const resolvedPath = browserRequire.resolve(normalizedRequest);
+            const logicalPath = logicalResolvedPackagePath(applicationRoot, normalizedRequest, resolvedPath);
             return { path: logicalPath ?? resolvedPath };
           } catch (error) {
             if (request.split('/').length === 2) {
