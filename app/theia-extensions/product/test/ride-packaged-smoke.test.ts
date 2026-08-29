@@ -510,6 +510,29 @@ test('packaged smoke executes the Codex scenario through the explicit eight-step
     assert.equal(protocol.calls.filter(call => call.method === 'recordStep').length, CODEX_ACTIONS.length * 2);
 });
 
+test('packaged smoke preserves the Codex action service receiver', async () => {
+    const plan = codexPlan();
+    const protocol = new FakeProtocol(true, {
+        mode: 'active', plan, sessionProof: PROOF, diagnostic: null
+    });
+    let observedReceiver: RidePackagedSmokeActions | undefined;
+    const smokeActions = actions([], {
+        async codexInactive(this: RidePackagedSmokeActions): Promise<void> {
+            observedReceiver = this;
+        }
+    });
+
+    new RidePackagedSmokeContribution(
+        immediateState(),
+        protocol,
+        () => smokeActions
+    ).onStart();
+    await waitUntil(() => protocol.calls.some(call => call.method === 'complete'),
+        'Codex smoke did not complete');
+
+    assert.equal(observedReceiver, smokeActions);
+});
+
 test('packaged smoke arms second-file observation before started becomes externally visible', async () => {
     const listeners = new Set<(event: { source: 'singleInstance'; relativePath: string }) => void>();
     const actionTimers: Array<{ callback: () => void; cleared: boolean }> = [];

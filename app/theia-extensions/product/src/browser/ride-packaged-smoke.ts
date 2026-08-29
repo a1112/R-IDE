@@ -378,24 +378,25 @@ export class RidePackagedSmokeContribution implements FrontendApplicationContrib
             case 'secondary-window': return smokeActions.secondaryWindow(plan);
             case 'second-file-forwarding': return smokeActions.waitForSecondFile(plan);
             case 'backend-retry': return smokeActions.backendRetry(plan);
-            case 'codex-inactive': return this.executeCodexAction(smokeActions.codexInactive, plan);
-            case 'codex-activate': return this.executeCodexAction(smokeActions.codexActivate, plan);
-            case 'codex-stream': return this.executeCodexAction(smokeActions.codexStream, plan);
-            case 'codex-command-approval': return this.executeCodexAction(smokeActions.codexCommandApproval, plan);
-            case 'codex-file-approval': return this.executeCodexAction(smokeActions.codexFileApproval, plan);
-            case 'codex-interrupt': return this.executeCodexAction(smokeActions.codexInterrupt, plan);
-            case 'codex-recover': return this.executeCodexAction(smokeActions.codexRecover, plan);
-            case 'codex-idle-exit': return this.executeCodexAction(smokeActions.codexIdleExit, plan);
+            case 'codex-inactive': return this.executeCodexAction(smokeActions, smokeActions.codexInactive, plan);
+            case 'codex-activate': return this.executeCodexAction(smokeActions, smokeActions.codexActivate, plan);
+            case 'codex-stream': return this.executeCodexAction(smokeActions, smokeActions.codexStream, plan);
+            case 'codex-command-approval': return this.executeCodexAction(smokeActions, smokeActions.codexCommandApproval, plan);
+            case 'codex-file-approval': return this.executeCodexAction(smokeActions, smokeActions.codexFileApproval, plan);
+            case 'codex-interrupt': return this.executeCodexAction(smokeActions, smokeActions.codexInterrupt, plan);
+            case 'codex-recover': return this.executeCodexAction(smokeActions, smokeActions.codexRecover, plan);
+            case 'codex-idle-exit': return this.executeCodexAction(smokeActions, smokeActions.codexIdleExit, plan);
         }
     }
 
     protected executeCodexAction(
+        receiver: RidePackagedSmokeActions,
         operation: ((plan: RideSmokePlan) => Promise<void>) | undefined,
         plan: RideSmokePlan
     ): Promise<void> {
         return operation === undefined
             ? Promise.reject(new Error('Codex smoke action unavailable.'))
-            : operation(plan);
+            : operation.call(receiver, plan);
     }
 
     protected releaseActionPreparation(preparation: Disposable | undefined): void {
