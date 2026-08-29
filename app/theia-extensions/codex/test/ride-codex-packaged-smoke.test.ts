@@ -10,9 +10,17 @@ import {
     RideCodexAppServerHost,
     type RideCodexAppServerResolver
 } from '../src/node/ride-codex-app-server-host';
+import { RideCodexAuthBroker } from '../src/node/ride-codex-auth-broker';
+import { RideCodexApprovalBroker } from '../src/node/ride-codex-approval-broker';
+import { RideCodexAppServerDiagnostics } from '../src/node/ride-codex-diagnostics';
 import type { RideCodexIncomingRequest, RideCodexNotification } from '../src/node/ride-codex-jsonl-client';
 import { createRideCodexPackagedSmokeResolver, createRideCodexPackagedSmokeSpawn, RIDE_CODEX_PACKAGED_SMOKE_NONCE } from '../src/node/ride-codex-packaged-smoke';
 import { createRideCodexLaunchSpec } from '../src/node/ride-codex-launch-spec';
+import { RideCodexThreadCoordinator } from '../src/node/ride-codex-thread-coordinator';
+import { RideCodexTurnCoordinator } from '../src/node/ride-codex-turn-coordinator';
+import { RideCodexControlModel } from '../src/browser/ride-codex-control-model';
+import type { RideCodexAuthSnapshot } from '../src/common/ride-codex-auth';
+import type { RideCodexConversationsSnapshot } from '../src/common/ride-codex-conversations';
 
 const NONCE = 'a'.repeat(64);
 
@@ -136,6 +144,69 @@ test('the nonce-guarded packaged App Server completes streaming, approvals, and 
     } finally {
         notificationListener.dispose();
         requestListener.dispose();
+    }
+});
+
+test('the packaged App Server drives the complete control model to ready', async () => {
+    const environment = Object.freeze({
+        [RIDE_CODEX_PACKAGED_SMOKE_NONCE]: NONCE
+    });
+    const resolver = createRideCodexPackagedSmokeResolver({
+        resolve: async () => createRideCodexLaunchSpec({
+            executable: process.execPath,
+            version: '0.144.0',
+            target: 'unreachable',
+            source: 'system'
+        })
+    }, environment);
+    const diagnostics = new RideCodexAppServerDiagnostics();
+    const host = new RideCodexAppServerHost({
+        resolver,
+        spawn: createRideCodexPackagedSmokeSpawn(environment),
+        diagnostics,
+        handshakeTimeoutMs: 2_000,
+        idleTimeoutMs: 0,
+        shutdownGraceMs: 1_000
+    });
+    const auth = new RideCodexAuthBroker({ host, diagnostics });
+    const conversations = new RideCodexThreadCoordinator({ host });
+    const turns = new RideCodexTurnCoordinator({ host });
+    const approvals = new RideCodexApprovalBroker({ host });
+    let model: RideCodexControlModel | undefined;
+    const turnService = turns.connectClient({
+        turnEvents: wire => model?.notifyTurnEvents(wire)
+    });
+    const approvalService = approvals.connectClient({
+        approvalsChanged: cards => model?.approvalsChanged(cards)
+    });
+    model = new RideCodexControlModel({
+        services: { auth, conversations, turns: turnService, approvals: approvalService },
+        workspaceRoot: process.cwd()
+    });
+    const authClient = { authStateChanged: (snapshot: RideCodexAuthSnapshot) => model?.authStateChanged(snapshot) };
+    const conversationsClient = {
+        conversationsChanged: (snapshot: RideCodexConversationsSnapshot) => model?.conversationsChanged(snapshot)
+    };
+    auth.setClient(authClient);
+    conversations.setClient(conversationsClient);
+
+    try {
+        await model.initialize();
+        assert.equal(model.snapshot().phase, 'ready', JSON.stringify({
+            snapshot: model.snapshot(),
+            diagnostics: diagnostics.snapshot()
+        }));
+        assert.equal(model.snapshot().models.length, 1);
+    } finally {
+        auth.disconnectClient(authClient);
+        conversations.disconnectClient(conversationsClient);
+        await model.dispose();
+        approvalService.dispose();
+        await approvals.dispose();
+        await turns.dispose();
+        await conversations.dispose();
+        auth.onStop();
+        await host.dispose();
     }
 });
 

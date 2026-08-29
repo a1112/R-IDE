@@ -68,6 +68,7 @@ test('initializes once, keeps model/thread controls bounded, and streams a turn 
     let turnEvents!: (wire: RideCodexEventBatchWire) => void;
     let approvalContext: unknown;
     const authCalls: string[] = [];
+    const threadListRequests: unknown[] = [];
     const services: RideCodexControlServices = {
         auth: {
             activate: async () => { authCalls.push('activate'); return AUTHENTICATED; },
@@ -82,9 +83,12 @@ test('initializes once, keeps model/thread controls bounded, and streams a turn 
         conversations: {
             status: async () => conversationSnapshot(),
             listModels: async () => Object.freeze({ data: Object.freeze([MODEL]), nextCursor: null }) as RideCodexModelPage,
-            listThreads: async () => Object.freeze({
-                data: Object.freeze([THREAD]), nextCursor: null, backwardsCursor: null
-            }) as RideCodexThreadPage,
+            listThreads: async options => {
+                threadListRequests.push(options);
+                return Object.freeze({
+                    data: Object.freeze([THREAD]), nextCursor: null, backwardsCursor: null
+                }) as RideCodexThreadPage;
+            },
             startThread: async () => THREAD,
             resumeThread: async () => THREAD,
             readThread: async () => THREAD,
@@ -117,6 +121,7 @@ test('initializes once, keeps model/thread controls bounded, and streams a turn 
     await model.initialize();
     await model.initialize();
     assert.deepEqual(authCalls, ['activate']);
+    assert.deepEqual(threadListRequests, [{ limit: 100 }]);
     assert.equal(model.snapshot().phase, 'ready');
     assert.equal(model.snapshot().selectedThreadId, THREAD.id);
     assert.equal(model.snapshot().selectedModelId, MODEL.id);

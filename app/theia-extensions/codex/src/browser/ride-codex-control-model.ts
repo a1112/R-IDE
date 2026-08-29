@@ -130,6 +130,7 @@ const EMPTY_TURN: RideCodexTurnSnapshot = Object.freeze({
     retainedBytes: 0
 });
 const MAX_MODELS = 100;
+const THREAD_PAGE_SIZE = 100;
 const MAX_THREADS = 500;
 const MAX_APPROVALS = 128;
 const MAX_PROMPT_LENGTH = 64 * 1024;
@@ -568,7 +569,7 @@ export class RideCodexControlModel {
             const [conversationStatus, modelPage, threadPage, approvals] = await Promise.all([
                 this.#services.conversations.status(),
                 this.#services.conversations.listModels({ limit: MAX_MODELS }),
-                this.#services.conversations.listThreads({ limit: MAX_THREADS }),
+                this.#services.conversations.listThreads({ limit: THREAD_PAGE_SIZE }),
                 this.#services.approvals.approvals()
             ]);
             this.conversationsChanged(Object.freeze({
@@ -601,7 +602,7 @@ export class RideCodexControlModel {
         const [conversationStatus, modelPage, threadPage, approvals] = await Promise.all([
             this.#services.conversations.status(),
             this.#services.conversations.listModels({ limit: MAX_MODELS }),
-            this.#services.conversations.listThreads({ limit: MAX_THREADS }),
+            this.#services.conversations.listThreads({ limit: THREAD_PAGE_SIZE }),
             this.#services.approvals.approvals()
         ]);
         this.conversationsChanged(Object.freeze({
