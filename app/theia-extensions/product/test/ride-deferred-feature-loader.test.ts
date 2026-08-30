@@ -495,6 +495,100 @@ test('compiled ScanOSS proxy converts child construction failure to the fixed re
     assert.equal(singletonScope, true);
 });
 
+test('compiled ScanOSS proxy sanitizes real child resolution failure and retries with a fresh child', async () => {
+    const compiled = compileScanOSSModules();
+    const feature = compiled.loadFeatureModule();
+    const rootContainer = new Container();
+    const sourceSecret = 'PRIVATE_RESOLUTION_SOURCE_8a0a9a';
+    const apiKeySecret = 'PRIVATE_RESOLUTION_KEY_9b1b0b';
+    const environmentSecret = 'PRIVATE_RESOLUTION_ENV_0c2c1c';
+    const pathSecret = 'D:\\private-build\\scanoss-resolution.cjs';
+    const previousEnvironment = process.env.R_IDE_SCANOSS_RESOLUTION_TEST;
+    process.env.R_IDE_SCANOSS_RESOLUTION_TEST = environmentSecret;
+    const consoleMethods = ['error', 'warn', 'log', 'debug'] as const;
+    type ConsoleMethod = typeof consoleMethods[number];
+    const mutableConsole = console as unknown as Record<ConsoleMethod, (...args: unknown[]) => void>;
+    const originals = {} as Record<ConsoleMethod, (...args: unknown[]) => void>;
+    const logs: string[] = [];
+    for (const method of consoleMethods) {
+        originals[method] = mutableConsole[method];
+        mutableConsole[method] = (...args: unknown[]) => logs.push(args.map(String).join(' '));
+    }
+    let childAttempts = 0;
+    let bindAttempts = 0;
+    let singletonScopeAttempts = 0;
+    let resolutionAttempts = 0;
+    let delegateCalls = 0;
+    const success: ScanOSSTestResult = { type: 'clean' };
+    const delegate = scanOSSDelegate(async (content, apiKey) => {
+        delegateCalls++;
+        assert.equal(content, 'retry resolution source');
+        assert.equal(apiKey, 'retry resolution key');
+        return success;
+    });
+    const { proxy } = createScanOSSProxy(compiled.Proxy, async () => feature, rootContainer);
+    (rootContainer as unknown as { createChild(): Container }).createChild = () => {
+        childAttempts++;
+        let bound: unknown;
+        const attempt = childAttempts;
+        return {
+            bind: (identifier: unknown) => {
+                bindAttempts++;
+                bound = identifier;
+                return {
+                    toSelf: () => ({
+                        inSingletonScope: () => {
+                            singletonScopeAttempts++;
+                        }
+                    })
+                };
+            },
+            get: (identifier: unknown) => {
+                resolutionAttempts++;
+                assert.strictEqual(identifier, bound);
+                if (attempt === 1) {
+                    const error = new Error(
+                        `${sourceSecret} ${apiKeySecret} ${environmentSecret} ${pathSecret}`
+                    );
+                    error.stack = `Error: private resolution failure\n    at ${pathSecret}:51:9`;
+                    throw error;
+                }
+                return delegate;
+            }
+        } as unknown as Container;
+    };
+
+    try {
+        const first = await proxy.scanContent(sourceSecret, apiKeySecret);
+        assert.deepEqual(first, scanOSSUnavailableResult);
+        assert.equal((proxy as unknown as { activation: unknown }).activation, undefined);
+        assert.deepEqual(logs, []);
+        const publicOutput = JSON.stringify(first) + logs.join('\n');
+        for (const secret of [sourceSecret, apiKeySecret, environmentSecret, pathSecret]) {
+            assert.equal(publicOutput.includes(secret), false);
+        }
+
+        assert.strictEqual(
+            await proxy.scanContent('retry resolution source', 'retry resolution key'),
+            success
+        );
+        assert.equal(childAttempts, 2);
+        assert.equal(bindAttempts, 2);
+        assert.equal(singletonScopeAttempts, 2);
+        assert.equal(resolutionAttempts, 2);
+        assert.equal(delegateCalls, 1);
+    } finally {
+        for (const method of consoleMethods) {
+            mutableConsole[method] = originals[method];
+        }
+        if (previousEnvironment === undefined) {
+            delete process.env.R_IDE_SCANOSS_RESOLUTION_TEST;
+        } else {
+            process.env.R_IDE_SCANOSS_RESOLUTION_TEST = previousEnvironment;
+        }
+    }
+});
+
 test('compiled ScanOSS proxy shares a private failed activation and exposes no diagnostics', async () => {
     const { Proxy } = compileScanOSSModules();
     const sourceSecret = 'PRIVATE_SOURCE_5f7f6f';
@@ -624,6 +718,106 @@ test('compiled ScanOSS proxy checks disposal before child creation and delegate 
 
     assert.deepEqual(await beforeConstruction.proxy.scanContent('dispose before construction'), scanOSSUnavailableResult);
     assert.equal(delegateConstructions, 0);
+});
+
+test('compiled ScanOSS proxy stops after singleton binding when disposal precedes child resolution', async () => {
+    const compiled = compileScanOSSModules();
+    const feature = compiled.loadFeatureModule();
+    const rootContainer = new Container();
+    let loads = 0;
+    let childCreations = 0;
+    let bindingScopes = 0;
+    let resolutionCalls = 0;
+    let delegateCalls = 0;
+    const candidate = scanOSSDelegate(async () => {
+        delegateCalls++;
+        return { type: 'clean' };
+    });
+    let created!: ReturnType<typeof createScanOSSProxy>;
+    created = createScanOSSProxy(compiled.Proxy, async () => {
+        loads++;
+        return feature;
+    }, rootContainer);
+    (rootContainer as unknown as { createChild(): Container }).createChild = () => {
+        childCreations++;
+        return {
+            bind: () => ({
+                toSelf: () => ({
+                    inSingletonScope: () => {
+                        bindingScopes++;
+                        created.proxy.dispose();
+                    }
+                })
+            }),
+            get: () => {
+                resolutionCalls++;
+                return candidate;
+            }
+        } as unknown as Container;
+    };
+
+    assert.deepEqual(await created.proxy.scanContent('dispose after binding'), scanOSSUnavailableResult);
+    assert.equal(childCreations, 1);
+    assert.equal(bindingScopes, 1);
+    assert.equal(resolutionCalls, 0);
+    assert.equal(delegateCalls, 0);
+    assert.equal((created.proxy as unknown as { delegate: unknown }).delegate, undefined);
+
+    assert.deepEqual(await created.proxy.scanContent('must not restart after binding'), scanOSSUnavailableResult);
+    assert.equal(loads, 1);
+    assert.equal(childCreations, 1);
+    assert.equal(resolutionCalls, 0);
+    assert.equal(delegateCalls, 0);
+});
+
+test('compiled ScanOSS proxy rejects a candidate when disposal occurs inside child resolution', async () => {
+    const compiled = compileScanOSSModules();
+    const feature = compiled.loadFeatureModule();
+    const rootContainer = new Container();
+    let loads = 0;
+    let childCreations = 0;
+    let bindingScopes = 0;
+    let resolutionCalls = 0;
+    let candidateCalls = 0;
+    const candidate = scanOSSDelegate(async () => {
+        candidateCalls++;
+        return { type: 'clean' };
+    });
+    let created!: ReturnType<typeof createScanOSSProxy>;
+    created = createScanOSSProxy(compiled.Proxy, async () => {
+        loads++;
+        return feature;
+    }, rootContainer);
+    (rootContainer as unknown as { createChild(): Container }).createChild = () => {
+        childCreations++;
+        return {
+            bind: () => ({
+                toSelf: () => ({
+                    inSingletonScope: () => {
+                        bindingScopes++;
+                    }
+                })
+            }),
+            get: () => {
+                resolutionCalls++;
+                created.proxy.dispose();
+                return candidate;
+            }
+        } as unknown as Container;
+    };
+
+    assert.deepEqual(await created.proxy.scanContent('dispose during resolution'), scanOSSUnavailableResult);
+    assert.equal(childCreations, 1);
+    assert.equal(bindingScopes, 1);
+    assert.equal(resolutionCalls, 1);
+    assert.equal(candidateCalls, 0);
+    assert.equal((created.proxy as unknown as { delegate: unknown }).delegate, undefined);
+
+    assert.deepEqual(await created.proxy.scanContent('must not publish candidate'), scanOSSUnavailableResult);
+    assert.equal(loads, 1);
+    assert.equal(childCreations, 1);
+    assert.equal(resolutionCalls, 1);
+    assert.equal(candidateCalls, 0);
 });
 
 test('compiled ScanOSS proxy disposal is idempotent, drops its delegate, and calls no invented disposal hook', async () => {
