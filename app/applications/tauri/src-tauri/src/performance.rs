@@ -445,10 +445,7 @@ fn normalize_cpu(group: &mut UsageGroup, logical_cpu_count: usize) {
 }
 
 fn executable_basename(value: &str) -> &str {
-    value
-        .rsplit(|character| character == '\\' || character == '/')
-        .next()
-        .unwrap_or(value)
+    value.rsplit(['\\', '/']).next().unwrap_or(value)
 }
 
 fn has_exact_executable_name(sample: &ProcessSample, expected: &str) -> bool {
