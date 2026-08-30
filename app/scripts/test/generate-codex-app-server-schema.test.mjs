@@ -9,6 +9,7 @@ import test from 'node:test';
 import ts from 'typescript';
 
 const appRoot = resolve(import.meta.dirname, '..', '..');
+const attributesPath = join(appRoot, '..', '.gitattributes');
 const generator = join(appRoot, 'scripts', 'generate-codex-app-server-schema.mjs');
 const generatedRoot = join(appRoot, 'theia-extensions', 'codex', 'src', 'common', 'generated', 'app-server', '0.144.0');
 const schemaPath = join(generatedRoot, 'schema.json');
@@ -126,6 +127,12 @@ test('pins stable initialization capabilities and excludes unsafe client methods
     const clientMethods = readQuotedArray(source, 'CLIENT_METHODS');
     assert.ok(!clientMethods.includes('thread/shellCommand'));
     assert.ok(!clientMethods.includes('process/exec'));
+});
+
+test('keeps byte-attested Codex fixtures LF-normalized on every platform', () => {
+    const attributes = readFileSync(attributesPath, 'utf8').replaceAll('\r\n', '\n');
+    assert.match(attributes, /^app\/theia-extensions\/codex\/src\/common\/generated\/app-server\/\*\* text eol=lf$/m);
+    assert.match(attributes, /^app\/theia-extensions\/codex\/src\/common\/codex-app-server-compatibility\.json text eol=lf$/m);
 });
 
 test('keeps generated schema, compatibility matrix, and allowlists in sync', () => {

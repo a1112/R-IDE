@@ -1,1 +1,5 @@
 *.patch -whitespace
+
+# Codex App Server fixtures are byte-attested by their compatibility metadata.
+app/theia-extensions/codex/src/common/generated/app-server/** text eol=lf
+app/theia-extensions/codex/src/common/codex-app-server-compatibility.json text eol=lf
