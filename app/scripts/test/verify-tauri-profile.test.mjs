@@ -39,6 +39,19 @@ const SCANOSS_BACKEND_DESCRIPTOR = Object.freeze({
   exclusiveInputCount: 318,
 });
 
+const CODEX_BACKEND_DESCRIPTOR = Object.freeze({
+  package: 'theia-ide-codex-ext',
+  importer: 'src-gen/backend/server',
+  request: 'theia-ide-codex-ext/lib/node/ride-codex-backend-module',
+  module: 'theia-ide-codex-ext/lib/node/ride-codex-backend-module',
+  proxy: 'tauri-src/backend/codex-backend-proxy.ts',
+  entry: 'tauri-src/backend/codex-backend-feature.ts',
+  output: 'lib/backend/codex-backend-feature.cjs',
+  action: 'codex-backend',
+  runtimePackages: Object.freeze(['theia-ide-codex-ext']),
+  exclusiveInputCount: 1,
+});
+
 test('repository Tauri profile declares the exact deferred Markdown preview descriptor', () => {
   const appDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
   const profile = JSON.parse(fs.readFileSync(path.join(appDirectory, 'applications', 'browser', 'tauri-profile.json'), 'utf8'));
@@ -53,10 +66,13 @@ test('repository Tauri profile declares the exact deferred Markdown preview desc
   assert.match(preview.deferBlockedReason, /markdown/i);
 });
 
-test('repository Tauri profile declares the exact deferred ScanOSS backend edge', () => {
+test('repository Tauri profile declares the exact deferred ScanOSS and Codex backend edges', () => {
   const appDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
   const profile = JSON.parse(fs.readFileSync(path.join(appDirectory, 'applications', 'browser', 'tauri-profile.json'), 'utf8'));
-  assert.deepEqual(profile.featureGroups.ai.deferredBackendModules, [SCANOSS_BACKEND_DESCRIPTOR]);
+  assert.deepEqual(profile.featureGroups.ai.deferredBackendModules, [
+    SCANOSS_BACKEND_DESCRIPTOR,
+    CODEX_BACKEND_DESCRIPTOR,
+  ]);
 });
 
 function canonicalJson(value) {
