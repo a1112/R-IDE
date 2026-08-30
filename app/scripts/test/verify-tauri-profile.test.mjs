@@ -31,6 +31,19 @@ test('repository Tauri profile declares the exact deferred Markdown preview desc
   assert.match(preview.deferBlockedReason, /markdown/i);
 });
 
+test('repository Tauri profile declares the exact deferred BrowserAutomation backend descriptor', () => {
+  const appDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+  const profile = JSON.parse(fs.readFileSync(path.join(appDirectory, 'applications', 'browser', 'tauri-profile.json'), 'utf8'));
+  assert.deepEqual(profile.featureGroups.ai.deferredBackendModules, [{
+    package: '@theia/ai-ide',
+    module: '@theia/ai-ide/lib/node/app-tester-agent/browser-automation-impl',
+    proxy: 'tauri-src/backend/ai-ide-browser-automation-proxy.ts',
+    entry: 'tauri-src/backend/ai-ide-browser-automation-feature.ts',
+    output: 'lib/backend/ai-ide-browser-automation-feature.cjs',
+    action: 'browser-automation',
+  }]);
+});
+
 function canonicalJson(value) {
   if (value === null || typeof value === 'boolean' || typeof value === 'string' || typeof value === 'number') {
     return JSON.stringify(value);
@@ -231,6 +244,89 @@ test('verifies critical profile inventory, workers, plugin hosts, VS Code init, 
   }
 });
 
+test('verifies an attested deferred backend feature and rejects main-graph leakage', () => {
+  const fixture = createFixture();
+  const descriptor = {
+    package: '@theia/ai-ide',
+    module: '@theia/ai-ide/lib/node/app-tester-agent/browser-automation-impl',
+    proxy: 'tauri-src/backend/ai-ide-browser-automation-proxy.ts',
+    entry: 'tauri-src/backend/ai-ide-browser-automation-feature.ts',
+    output: 'lib/backend/ai-ide-browser-automation-feature.cjs',
+    action: 'browser-automation',
+  };
+  const realImplementationInput = `node_modules/${descriptor.module}.js`;
+  const featureInputs = [
+    descriptor.entry,
+    realImplementationInput,
+    'node_modules/@theia/ai-ide/node_modules/puppeteer-core/index.js',
+    'node_modules/@theia/ai-ide/node_modules/chromium-bidi/index.js',
+    'node_modules/@tootallnate/quickjs-emscripten/index.js',
+    'node_modules/esprima/index.js',
+  ];
+  try {
+    fixture.manifest.featureGroups.deferred.deferredBackendModules = [descriptor];
+    const backendMain = fixture.records.backend.metafile.outputs['lib/backend/main.js'];
+    fixture.records.backend.metafile.inputs[descriptor.proxy] = { bytes: 1, imports: [] };
+    backendMain.inputs[descriptor.proxy] = { bytesInOutput: 1 };
+    fixture.records['backend-browser-automation'] = metadata(
+      fixture.manifest,
+      'backend-browser-automation',
+      featureInputs,
+      [{
+        path: descriptor.output,
+        entryPoint: descriptor.entry,
+        additionalInputs: featureInputs.slice(1),
+      }],
+    );
+    const featureOutput = path.join(fixture.browserDirectory, descriptor.output);
+    fs.mkdirSync(path.dirname(featureOutput), { recursive: true });
+    fs.writeFileSync(featureOutput, 'feature');
+    fixture.records['backend-browser-automation'].outputHashes[descriptor.output] = crypto
+      .createHash('sha256')
+      .update('feature')
+      .digest('hex');
+    publishManifest(fixture);
+
+    const report = verifyTauriProfileInventory(fixture);
+    assert.deepEqual(report.metadataTargets, [
+      'frontend-main',
+      'frontend-secondary-window',
+      'frontend-editor.worker',
+      'frontend-plugin-worker',
+      'backend',
+      'backend-browser-automation',
+    ]);
+    assert.deepEqual(report.deferredBackendFeatures, [{
+      action: descriptor.action,
+      output: descriptor.output,
+    }]);
+
+    fixture.records.backend.metafile.inputs[realImplementationInput] = { bytes: 1, imports: [] };
+    backendMain.inputs[realImplementationInput] = { bytesInOutput: 1 };
+    writeJson(path.join(fixture.browserDirectory, 'lib', 'metadata', 'backend.json'), fixture.records.backend);
+    assert.throws(
+      () => verifyTauriProfileInventory(fixture),
+      /deferred backend implementation.*backend main/i,
+    );
+
+    delete fixture.records.backend.metafile.inputs[realImplementationInput];
+    delete backendMain.inputs[realImplementationInput];
+    writeJson(path.join(fixture.browserDirectory, 'lib', 'metadata', 'backend.json'), fixture.records.backend);
+    delete fixture.records['backend-browser-automation'].metafile.inputs[realImplementationInput];
+    delete fixture.records['backend-browser-automation'].metafile.outputs[descriptor.output].inputs[realImplementationInput];
+    writeJson(
+      path.join(fixture.browserDirectory, 'lib', 'metadata', 'backend-browser-automation.json'),
+      fixture.records['backend-browser-automation'],
+    );
+    assert.throws(
+      () => verifyTauriProfileInventory(fixture),
+      /deferred backend feature.*real implementation/i,
+    );
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test('rejects a missing deferred chunk and a deferred-only backend package', () => {
   const fixture = createFixture();
   try {
@@ -392,7 +488,8 @@ test('profile builds emit named esbuild metadata and expose the verifier command
   assert.match(metadataSource, /schema:\s*'ride\.esbuild-metafile@1'/);
   assert.match(esbuildSource, /target:\s*'frontend-main'/);
   assert.match(esbuildSource, /`frontend-\$\{targetName\}`/);
-  assert.match(esbuildSource, /withProfileMetadata\(nodeOptions, 'backend'\)/);
+  assert.match(esbuildSource, /withProfileMetadata\(backendBuildPlans\.main, 'backend'\)/);
+  assert.match(esbuildSource, /withProfileMetadata\(options, `backend-\$\{action\}`\)/);
   assert.match(metadataSource, /lib', 'metadata'/);
   assert.match(metadataSource, /metafile:\s*result\.metafile/);
   const bundlerGeneratorSource = fs.readFileSync(
