@@ -27,14 +27,14 @@ The unchanged strict checker failed only these limits:
 - target-file median: `+595` ms over the 2,200 ms limit;
 - native-window median: `+61` ms over the 800 ms limit.
 
-The backend main output is `16,425,994` bytes. Its optional `@theia/ai-ide` browser-automation path owns at least these main-output bytes:
+The backend main output is `16,425,994` bytes. These heavy packages are reachable through its optional `@theia/ai-ide` browser-automation path:
 
 - `@tootallnate/quickjs-emscripten`: `665,090`;
 - `puppeteer-core`: `490,087`;
 - `chromium-bidi`: `177,454`;
 - `esprima`: `138,686`.
 
-This is at least `1,471,317` bytes for a service used only when App Tester launches browser automation. It is a safer first backend candidate than pruning i18n or deduplicating incompatible `iconv-lite` versions.
+The reachable total is `1,471,317` bytes, but it is not all exclusive ownership: ScanOSS also reaches QuickJS and esprima. The committed edge-cut analyzer removes only the exact `@theia/ai-ide/lib/node/backend-module -> browser-automation-impl` edge and reports `852,417` exclusive bytes across 298 inputs. The exclusive runtime portion includes `puppeteer-core` (`490,087` bytes), Chromium BiDi (`177,454` bytes), and their browser-launch support graph; QuickJS plus esprima remain `803,776` shared runtime bytes in the main bundle. This corrected slice is still safer than pruning i18n or deduplicating incompatible `iconv-lite` versions, but all build and retention assertions must use edge-cut ownership rather than reachable-package totals.
 
 Do not push this branch until all of the following hold in one fresh release campaign:
 
@@ -90,7 +90,7 @@ node --test scripts/test/analyze-tauri-backend-initial-bundle.test.mjs
 npm run analyze:tauri-backend-bundle
 ```
 
-Expected: tests pass; the production report identifies the `@theia/ai-ide` browser-automation chain as optional evidence.
+Expected: tests pass; the production report identifies `852,417` edge-cut-exclusive bytes and separately reports the ScanOSS-shared QuickJS/esprima runtime.
 
 **Step 4: Commit**
 
@@ -135,8 +135,9 @@ Require that:
 - the node main plan aliases only the exact implementation request;
 - the separate feature plan does not inherit that alias recursively;
 - the main output cannot statically reach the feature output;
-- the feature output owns `puppeteer-core`, QuickJS, Chromium BiDi, and their real implementation;
-- the backend main output owns none of those inputs;
+- the feature output owns `puppeteer-core`, QuickJS, Chromium BiDi, esprima, and the real browser-automation implementation needed by its isolated graph;
+- the backend main output owns neither the real browser-automation implementation nor any input classified as edge-cut-exclusive by the committed analyzer;
+- the backend main output may retain only analyzer-proven shared QuickJS/esprima inputs reached independently through ScanOSS; tests must not treat those shared copies as BrowserAutomation ownership;
 - both outputs receive profile metadata and output hashes;
 - watch and one-shot builds create and dispose both contexts.
 
@@ -163,7 +164,7 @@ npm run analyze:tauri-backend-bundle
 node scripts/verify-codex-packaging.mjs --root applications/browser/lib
 ```
 
-Expected: the optional chain is absent from `lib/backend/main.js`, present in exactly one attested feature output, and packaging remains `forbidden: []`, `missing: []`.
+Expected: the exact implementation and all `852,417` previously edge-cut-exclusive bytes are absent from `lib/backend/main.js`; the isolated feature output is attested and contains its complete runtime graph; analyzer-proven ScanOSS-shared inputs may remain in main; packaging remains `forbidden: []`, `missing: []`.
 
 **Step 5: Commit**
 
@@ -321,4 +322,3 @@ node scripts/check-tauri-performance.mjs --baseline applications/tauri/perf/base
 Restore generated Tauri schemas, run `git diff --check`, and require a clean worktree.
 
 If any absolute limit remains red, stop and do not push. Use the backend analyzer's next importer-chain owner rather than relaxing thresholds or stacking an unmeasured optimization.
-
