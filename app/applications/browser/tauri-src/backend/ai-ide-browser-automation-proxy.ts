@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import type { BrowserAutomation, BrowserAutomationClient, LaunchResult } from '@theia/ai-ide/lib/common/browser-automation-protocol';
-import { Container, injectable, preDestroy } from '@theia/core/shared/inversify';
+import { Container, injectable } from '@theia/core/shared/inversify';
 
 interface BrowserAutomationDelegate extends BrowserAutomation {
     dispose(): void;
@@ -28,21 +28,17 @@ class BrowserAutomationDisposedError extends Error {
 }
 
 function disposedError(): Error {
-    return pathFreeError(new BrowserAutomationDisposedError());
-}
-
-function pathFreeError<T extends Error>(error: T): T {
-    error.stack = `${error.name}: ${error.message}`;
-    return error;
+    return new BrowserAutomationDisposedError();
 }
 
 function activationError(): Error {
     // Build paths from dynamic import or construction failures are deliberately
     // omitted. Operation errors from the real upstream delegate are forwarded
     // unchanged after activation succeeds.
-    return pathFreeError(new Error('Failed to activate browser automation runtime.'));
+    return new Error('Failed to activate browser automation runtime.');
 }
 
+@injectable()
 export class BrowserAutomationImpl implements BrowserAutomationDelegate {
     protected readonly loadFeature = loadBrowserAutomationFeature;
     protected readonly parentContainer = new Container();
@@ -162,9 +158,3 @@ export class BrowserAutomationImpl implements BrowserAutomationDelegate {
         return this.client;
     }
 }
-
-// The generated backend build intentionally avoids decorator syntax entirely.
-// Register metadata through Inversify's decorator functions so the emitted CJS
-// stays executable and unbindAllAsync() cancels pending activation.
-injectable()(BrowserAutomationImpl);
-preDestroy()(BrowserAutomationImpl.prototype, 'dispose');

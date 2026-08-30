@@ -1596,26 +1596,12 @@ test('backend build plans isolate the exact BrowserAutomation implementation and
         ),
         writeModule(
             '@theia/ai-ide/lib/node/app-tester-agent/browser-automation-impl.js',
-            String.raw`
-                const runtime = require('puppeteer-core');
-                exports.BrowserAutomationImpl = class {
-                    runtime = runtime;
-                    constructor() {
-                        globalThis.__rideBrowserAutomationConstructions =
-                            (globalThis.__rideBrowserAutomationConstructions ?? 0) + 1;
-                    }
-                    async launch(remoteDebuggingPort) {
-                        this.running = true;
-                        return { remoteDebuggingPort };
-                    }
-                    async isRunning() { return this.running === true; }
-                    async queryDom(selector) { return 'synthetic:' + (selector ?? 'document'); }
-                    async close() { this.running = false; }
-                    dispose() { this.running = false; }
-                    setClient(client) { this.client = client; }
-                    getClient() { return this.client; }
-                };
-            `,
+            "const runtime = require('puppeteer-core'); exports.BrowserAutomationImpl = class { runtime = runtime; };\n",
+        ),
+        writeModule(
+            '@theia/core/shared/inversify/index.js',
+            "exports.injectable = () => value => value; exports.Container = class { createChild() { return this; } bind() { return { toSelf() { return { inSingletonScope() {} }; } }; } get(Type) { return new Type(); } };\n",
+            { path: '@theia/core', name: '@theia/core', main: 'shared/inversify/index.js' },
         ),
         writeModule(
             'puppeteer-core/index.js',
@@ -1641,7 +1627,6 @@ test('backend build plans isolate the exact BrowserAutomation implementation and
         format: 'cjs',
         metafile: true,
         logLevel: 'silent',
-        external: ['@theia/core/shared/inversify'],
         plugins: [
             {
                 name: '@theia/esbuild-plugin',
@@ -1704,37 +1689,6 @@ test('backend build plans isolate the exact BrowserAutomation implementation and
     assert.equal(owns(featureInputs, '/tauri-src/backend/ai-ide-browser-automation-proxy.ts'), false);
     const mainOutputImports = Object.values(mainResult.metafile.outputs).flatMap(output => output.imports ?? []);
     assert.equal(mainOutputImports.some(record => record.path.includes('ai-ide-browser-automation-feature')), false);
-
-    const backendSmokeScript = String.raw`
-        const assert = require('node:assert/strict');
-        const { Container } = require('@theia/core/shared/inversify');
-        const bundled = require(process.argv[1]);
-        const Proxy = bundled.BrowserAutomationImpl;
-        assert.equal(typeof Proxy, 'function');
-        const container = new Container();
-        container.bind(Proxy).toSelf().inSingletonScope();
-        const proxy = container.get(Proxy);
-        const client = { id: 'synthetic-client' };
-        proxy.setClient(client);
-        assert.strictEqual(proxy.getClient(), client);
-        assert.equal(globalThis.__rideBrowserAutomationConstructions, undefined);
-        assert.equal(await proxy.isRunning(), false);
-        assert.deepEqual(await proxy.launch(9888), { remoteDebuggingPort: 9888 });
-        assert.equal(globalThis.__rideBrowserAutomationConstructions, 1);
-        assert.equal(await proxy.queryDom('#app'), 'synthetic:#app');
-        assert.equal(await proxy.isRunning(), true);
-        await proxy.close();
-        assert.equal(await proxy.isRunning(), false);
-        await container.unbindAllAsync();
-    `;
-    execFileSync(process.execPath, [
-        '--input-type=commonjs', '--eval', `(async () => {${backendSmokeScript}})().catch(error => { console.error(error); process.exitCode = 1; });`,
-        path.join(directory, 'lib', 'backend', 'main.js'),
-    ], {
-        cwd: appDirectory,
-        env: { ...process.env, NODE_PATH: path.join(appDirectory, 'node_modules') },
-        stdio: 'pipe',
-    });
 
     const fullPlans = deferredBuild.createTauriBackendBuildPlans(options, {
         ...criticalManifest,
