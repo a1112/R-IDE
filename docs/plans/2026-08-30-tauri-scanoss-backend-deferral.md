@@ -98,8 +98,10 @@ This commit is retained even if the implementation experiment later fails.
 - Create: `app/applications/browser/tauri-src/backend/esbuild-backend-deferred.mjs`
 - Create: `app/applications/browser/tauri-src/backend/scanoss-service-proxy.ts`
 - Create: `app/applications/browser/tauri-src/backend/scanoss-service-feature.ts`
+- Modify: `app/applications/browser/tauri-src/esbuild-metadata.mjs`
 - Modify: `app/applications/browser/esbuild.mjs`
 - Modify: `app/applications/browser/tauri-profile.json`
+- Create: `app/scripts/tauri-backend-feature-attestation.mjs`
 - Modify: `app/scripts/tauri-frontend-profile.mjs`
 - Modify: `app/scripts/verify-tauri-profile.mjs`
 - Modify: `app/scripts/test/tauri-frontend-profile.test.mjs`
@@ -112,15 +114,26 @@ Add this `tauri-critical` backend descriptor under the ScanOSS-owning feature gr
 ```json
 {
   "package": "@theia/scanoss",
+  "importer": "@theia/scanoss/lib/node/scanoss-backend-module",
   "module": "@theia/scanoss/lib/node/scanoss-service-impl",
   "proxy": "tauri-src/backend/scanoss-service-proxy.ts",
   "entry": "tauri-src/backend/scanoss-service-feature.ts",
   "output": "lib/backend/scanoss-service-feature.cjs",
-  "action": "scanoss"
+  "action": "scanoss",
+  "runtimePackages": [
+    "@grpc/grpc-js",
+    "adm-zip",
+    "iconv-lite",
+    "protobufjs",
+    "scanoss",
+    "tar",
+    "tr46"
+  ],
+  "exclusiveInputCount": 318
 }
 ```
 
-The tests must reject duplicate package/module/output/action values, unsafe paths, non-CJS backend outputs, missing proxy/entry files, and any descriptor installed in `full`.
+The tests must reject duplicate package/importer-edge/module/proxy/entry/output/action values, physical proxy/entry aliases, unsafe paths, non-CJS backend outputs, invalid runtime inventories or input counts, missing proxy/entry files, and any descriptor installed in `full`.
 
 Run:
 
@@ -143,7 +156,9 @@ Use a temporary synthetic package graph and actually execute esbuild. Require th
 - the proxy's variable runtime import does not create a static main-to-feature edge;
 - main and feature outputs share one build ID and each receive metadata and output hashes;
 - watch and one-shot paths create, rebuild/watch, and dispose every context exactly once;
-- loading the emitted CommonJS proxy with Node does not produce decorator syntax errors.
+- loading the emitted CommonJS proxy with Node does not produce decorator syntax errors;
+- an actual no-network `scanContent` call dynamically loads the sibling feature and invokes its factory;
+- generated metafiles contain logical graph paths only and preserve every rewritten graph reference.
 
 Expected: RED before backend build-plan support exists.
 
@@ -164,7 +179,9 @@ The proxy and feature may initially expose the minimal compilable class/factory 
 
 **Step 4: Extend publication and inventory verification**
 
-Teach profile preparation/publication and verification to treat `lib/backend/scanoss-service-feature.cjs` as a required `backend-scanoss` output for `tauri-critical` only. Verify its output hash, metafile build identity, logical entry point, browser publication, Tauri resource copy, and package inventory.
+Teach profile preparation/publication and verification to treat `lib/backend/scanoss-service-feature.cjs` as a required `backend-scanoss` output for `tauri-critical` only. Verify its output hash, metafile build identity, logical entry point, exact non-external importer-to-proxy edge, seven-package runtime inventory, 318 feature-only inputs, browser publication, Tauri resource copy, and package inventory. Re-attest both the copied transaction staging directory and the installed target before committing the directory transaction; persist a recoverable `validation-pending` marker across crashes and rollback failures.
+
+This local attestation detects stale, corrupt, mismatched, partially copied, or unvalidated build output. It does not replace release signing or claim to resist the same trusted OS user consistently rewriting source, output, metadata, and the installed application.
 
 Run focused tests again and require GREEN:
 
@@ -175,7 +192,7 @@ node --test scripts/test/tauri-frontend-profile.test.mjs scripts/test/verify-tau
 **Step 5: Commit the build slice before production generation**
 
 ```powershell
-git add -- app/applications/browser/esbuild.mjs app/applications/browser/tauri-profile.json app/applications/browser/tauri-src/backend app/scripts/tauri-frontend-profile.mjs app/scripts/verify-tauri-profile.mjs app/scripts/test/tauri-frontend-profile.test.mjs app/scripts/test/verify-tauri-profile.test.mjs
+git add -- app/applications/browser/esbuild.mjs app/applications/browser/tauri-profile.json app/applications/browser/tauri-src/backend app/applications/browser/tauri-src/esbuild-metadata.mjs app/scripts/tauri-backend-feature-attestation.mjs app/scripts/tauri-frontend-profile.mjs app/scripts/verify-tauri-profile.mjs app/scripts/test/tauri-frontend-profile.test.mjs app/scripts/test/verify-tauri-profile.test.mjs
 git commit -m "perf: split Tauri ScanOSS backend"
 git status --short
 ```

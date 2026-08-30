@@ -56,15 +56,20 @@ This has the simplest startup graph but removes an existing desktop capability a
 The Tauri profile gains one deferred backend descriptor for:
 
 - package: `@theia/scanoss`;
+- importer: `@theia/scanoss/lib/node/scanoss-backend-module`;
 - module: `@theia/scanoss/lib/node/scanoss-service-impl`;
 - proxy: `tauri-src/backend/scanoss-service-proxy.ts`;
 - feature entry: `tauri-src/backend/scanoss-service-feature.ts`;
 - output: `lib/backend/scanoss-service-feature.cjs`;
-- action: `scanoss`.
+- action: `scanoss`;
+- required runtime packages: `@grpc/grpc-js`, `adm-zip`, `iconv-lite`, `protobufjs`, `scanoss`, `tar`, and `tr46`;
+- exclusive input count: `318`.
 
 The backend alias plugin resolves the relative `./scanoss-service-impl` request only when the importer is the exact installed `@theia/scanoss/lib/node/scanoss-backend-module.js`. Every other importer and the full profile remain unaliased.
 
-The feature build inherits the production Node bundle options but excludes main-only copy, patch, and Theia orchestration plugins. Metadata audit plugins remain active. The main build and feature build are published under one build identity.
+The feature build inherits the production Node bundle options but excludes main-only copy, patch, and Theia orchestration plugins. Metadata audit plugins remain active. The main build and feature build are published under one build identity. Publication attests the copied staging directory and the installed target against the exact alias edge, output hashes, runtime-package inventory, and 318-input ownership contract. A persisted `validation-pending` transaction state restores the previous target, or restores absence on a first install, if validation or recovery is interrupted.
+
+This attestation detects stale, corrupt, mismatched, partially copied, or unvalidated local build outputs. It is not a code-signing boundary against the same trusted OS user consistently rewriting source, output, metadata, and the installed application; release signing remains a separate packaging responsibility.
 
 ### Proxy lifecycle
 
@@ -90,6 +95,8 @@ After the split, the verifier must prove:
 
 - the exact upstream ScanOSS implementation and its exclusive graph are absent from `lib/backend/main.js`;
 - the feature output is metadata-attested and contains the real implementation and SDK graph;
+- the importer has exactly one non-external static `./scanoss-service-impl` edge resolved to the proxy;
+- the feature has all seven declared runtime packages and exactly 318 feature-only service inputs;
 - the feature output is included in browser and packaged Tauri inventories;
 - the full profile still contains the unchanged eager implementation.
 
