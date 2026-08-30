@@ -181,15 +181,13 @@ impl<S> SamplerState<S> {
 }
 
 pub struct PerformanceSampler {
-    state: Mutex<SamplerState<System>>,
+    state: Mutex<Option<SamplerState<System>>>,
 }
 
 impl Default for PerformanceSampler {
     fn default() -> Self {
-        let mut system = System::new();
-        system.refresh_cpu_list(CpuRefreshKind::nothing());
         Self {
-            state: Mutex::new(SamplerState::new(system)),
+            state: Mutex::new(None),
         }
     }
 }
@@ -200,7 +198,16 @@ impl PerformanceSampler {
         root_pid: u32,
         backend_pid: Option<u32>,
     ) -> Result<PerformanceSnapshot, String> {
-        snapshot_from_source(&self.state, root_pid, backend_pid)
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "performance sampler mutex is poisoned".to_string())?;
+        let state = state.get_or_insert_with(|| {
+            let mut system = System::new();
+            system.refresh_cpu_list(CpuRefreshKind::nothing());
+            SamplerState::new(system)
+        });
+        snapshot_from_state(state, root_pid, backend_pid)
     }
 }
 
@@ -214,6 +221,7 @@ pub fn ride_performance_snapshot(
     )
 }
 
+#[cfg(test)]
 fn snapshot_from_source<S: ProcessSource>(
     state: &Mutex<SamplerState<S>>,
     root_pid: u32,
@@ -222,6 +230,14 @@ fn snapshot_from_source<S: ProcessSource>(
     let mut state = state
         .lock()
         .map_err(|_| "performance sampler mutex is poisoned".to_string())?;
+    snapshot_from_state(&mut state, root_pid, backend_pid)
+}
+
+fn snapshot_from_state<S: ProcessSource>(
+    state: &mut SamplerState<S>,
+    root_pid: u32,
+    backend_pid: Option<u32>,
+) -> Result<PerformanceSnapshot, String> {
     let SamplerState { source, scratch } = &mut *state;
     scratch.clear();
 
@@ -993,6 +1009,20 @@ mod tests {
         assert!((before..=after).contains(&snapshot.sampled_at_ms));
         assert_eq!(snapshot.main.process_count, 1);
         assert!(snapshot.total.process_count >= 1);
+    }
+
+    #[test]
+    fn default_sampler_defers_sysinfo_initialization_until_the_first_snapshot() {
+        let sampler = PerformanceSampler::default();
+        assert!(
+            sampler.state.lock().expect("sampler mutex").is_none(),
+            "AppState construction must not refresh the host process inventory"
+        );
+
+        sampler
+            .snapshot(std::process::id(), None)
+            .expect("first lazy snapshot");
+        assert!(sampler.state.lock().expect("sampler mutex").is_some());
     }
 
     #[test]
