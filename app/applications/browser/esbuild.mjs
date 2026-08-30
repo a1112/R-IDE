@@ -17,7 +17,6 @@ import {
 import {
     createTauriBrowserBuildPlans,
 } from './tauri-src/esbuild-deferred.mjs';
-import { createTauriBackendBuildPlans } from './tauri-src/backend/esbuild-backend-deferred.mjs';
 import { createProfileMetadataPlugin } from './tauri-src/esbuild-metadata.mjs';
 import { createWindowsCaCertsFallbackPlugin } from './tauri-src/windows-ca-certs-fallback.mjs';
 
@@ -249,9 +248,6 @@ browserOptions.plugins.push(
 const browserBuildPlans = profileManifest
     ? createTauriBrowserBuildPlans(browserOptions, profileManifest, __dirname)
     : { main: browserOptions, classic: [] };
-const backendBuildPlans = profileManifest
-    ? createTauriBackendBuildPlans(nodeOptions, profileManifest, __dirname)
-    : { main: nodeOptions, features: [] };
 const browserContexts = [];
 const browserTargets = [
     { target: 'frontend-main', options: browserBuildPlans.main },
@@ -263,50 +259,27 @@ const browserTargets = [
 for (const { target, options } of browserTargets) {
     browserContexts.push(await esbuild.context(withProfileMetadata(options, target)));
 }
-const nodeContext = await esbuild.context(withProfileMetadata(backendBuildPlans.main, 'backend'));
-const backendFeatureContexts = await Promise.all(backendBuildPlans.features.map(({ action, options }) =>
-    esbuild.context(withProfileMetadata(options, `backend-${action}`))
-));
+const nodeContext = await esbuild.context(withProfileMetadata(nodeOptions, 'backend'));
 const codexSdkRuntimeContext = await esbuild.context(createCodexSdkRuntimeOptions());
 
 if (watch) {
     await Promise.all([
         ...browserContexts.map(context => context.watch()),
         nodeContext.watch(),
-        ...backendFeatureContexts.map(context => context.watch()),
         codexSdkRuntimeContext.watch(),
     ]);
 } else {
-    let buildError;
     try {
         for (const browserContext of browserContexts) {
             await browserContext.rebuild();
+            await browserContext.dispose();
         }
         await nodeContext.rebuild();
-        for (const backendFeatureContext of backendFeatureContexts) {
-            await backendFeatureContext.rebuild();
-        }
+        await nodeContext.dispose();
         await codexSdkRuntimeContext.rebuild();
+        await codexSdkRuntimeContext.dispose();
     } catch (error) {
-        buildError = error;
-    } finally {
-        const disposalResults = await Promise.allSettled([
-            ...browserContexts.map(context => context.dispose()),
-            nodeContext.dispose(),
-            ...backendFeatureContexts.map(context => context.dispose()),
-            codexSdkRuntimeContext.dispose(),
-        ]);
-        const disposalErrors = disposalResults
-            .filter(result => result.status === 'rejected')
-            .map(result => result.reason);
-        if (buildError || disposalErrors.length > 0) {
-            if (buildError) {
-                console.error(buildError);
-            }
-            for (const error of disposalErrors) {
-                console.error(error);
-            }
-            process.exitCode = 1;
-        }
+        console.error(error);
+        process.exit(1);
     }
 }
