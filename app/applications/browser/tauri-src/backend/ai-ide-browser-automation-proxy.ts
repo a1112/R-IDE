@@ -44,22 +44,7 @@ export class BrowserAutomationImpl implements BrowserAutomation {
     }
 
     async close(): Promise<void> {
-        const delegate = this.delegate;
-        if (delegate) {
-            await delegate.close();
-            return;
-        }
-        const activation = this.activation;
-        if (!activation) {
-            return;
-        }
-        let activatingDelegate: BrowserAutomationDelegate;
-        try {
-            activatingDelegate = await activation;
-        } catch {
-            return;
-        }
-        await activatingDelegate.close();
+        await this.delegate?.close();
     }
 
     async queryDom(selector?: string): Promise<string> {
