@@ -15,7 +15,6 @@
 
 const fs = require('fs');
 const path = require('path');
-const zlib = require('zlib');
 const {
   assertRequiredRegularFiles,
   copyRegularTree,
@@ -32,45 +31,6 @@ const requiredFiles = [
   'bundle.js',
   'bundle.css',
 ];
-
-const BROTLI_MINIMUM_BYTES = 1024;
-const BROTLI_STARTUP_ASSETS = new Set(['bundle.js']);
-
-function createBrotliSidecars(rootDirectory) {
-  const candidates = [];
-  const pending = [rootDirectory];
-  while (pending.length > 0) {
-    const directory = pending.pop();
-    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
-      const absolute = path.join(directory, entry.name);
-      if (entry.isDirectory()) {
-        pending.push(absolute);
-      } else if (entry.isFile()) {
-        const relative = path.relative(rootDirectory, absolute).replaceAll(path.sep, '/');
-        if (BROTLI_STARTUP_ASSETS.has(relative)) {
-          candidates.push(absolute);
-        }
-      }
-    }
-  }
-
-  for (const candidate of candidates) {
-    const input = fs.readFileSync(candidate);
-    if (input.length < BROTLI_MINIMUM_BYTES) {
-      continue;
-    }
-    const compressed = zlib.brotliCompressSync(input, {
-      params: {
-        [zlib.constants.BROTLI_PARAM_MODE]: zlib.constants.BROTLI_MODE_TEXT,
-        [zlib.constants.BROTLI_PARAM_QUALITY]: 5,
-        [zlib.constants.BROTLI_PARAM_SIZE_HINT]: input.length,
-      },
-    });
-    if (compressed.length < input.length) {
-      fs.writeFileSync(`${candidate}.br`, compressed);
-    }
-  }
-}
 
 const frontendBootstrap = `(() => {
   'use strict';
@@ -328,7 +288,6 @@ function copyFrontendResources(options = {}) {
     fs.writeFileSync(htmlPath, rewriteDesktopHtml(fs.readFileSync(htmlPath, 'utf8')));
     fs.writeFileSync(path.join(stagingDirectory, 'ride-bootstrap.js'), frontendBootstrap);
     fs.writeFileSync(path.join(stagingDirectory, 'ride-after-bundle.js'), afterBundleScript);
-    createBrotliSidecars(stagingDirectory);
   });
 
   publishDirectoryAtomic(resolvedTauriFrontendDir, stagingDirectory => {
@@ -361,6 +320,5 @@ if (require.main === module) {
 }
 
 module.exports = {
-  createBrotliSidecars,
   copyFrontendResources,
 };

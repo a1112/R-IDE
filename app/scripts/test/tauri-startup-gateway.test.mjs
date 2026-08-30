@@ -4,7 +4,6 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import vm from 'node:vm';
-import { brotliDecompressSync } from 'node:zlib';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
@@ -34,11 +33,8 @@ function createGeneratedFrontend() {
 <html lang="en"><head><meta charset="UTF-8">
   <script>if (document.head) { document.head.dataset.favicon = 'unused'; }</script>
 </head><body><script type="module" src="./bundle.js" charset="utf-8"></script></body></html>`);
-  fs.writeFileSync(
-    path.join(sourceDirectory, 'bundle.js'),
-    `window.__rideBundleEvaluations = 1;\n/* ${'compressible '.repeat(1024)} */`,
-  );
-  fs.writeFileSync(path.join(sourceDirectory, 'bundle.css'), `body { color: inherit; }\n${'.ride { color: inherit; }\n'.repeat(256)}`);
+  fs.writeFileSync(path.join(sourceDirectory, 'bundle.js'), 'window.__rideBundleEvaluations = 1;');
+  fs.writeFileSync(path.join(sourceDirectory, 'bundle.css'), 'body { color: inherit; }');
 
   const generator = require(path.join(tauriDirectory, 'copy-frontend.js'));
   assert.equal(
@@ -257,11 +253,6 @@ test('generates one gateway document while retaining the explicit legacy fronten
   assert.match(bridge, /localeId/);
   assert.match(bridge, /ride_locale/);
   assert.equal(afterBundle.trim(), 'window.__rideStartup?.markBundleLoaded();');
-  const originalBundle = fs.readFileSync(path.join(generated.gatewayDirectory, 'bundle.js'));
-  const bundleSidecar = fs.readFileSync(path.join(generated.gatewayDirectory, 'bundle.js.br'));
-  assert.ok(bundleSidecar.length < originalBundle.length, 'bundle.js Brotli sidecar must reduce bytes');
-  assert.deepEqual(brotliDecompressSync(bundleSidecar), originalBundle);
-  assert.equal(fs.existsSync(path.join(generated.gatewayDirectory, 'bundle.css.br')), false);
 
   const gatewayOutput = [html, bridge, afterBundle].join('\n');
   assert.doesNotMatch(gatewayOutput, /127\.0\.0\.1:3000/);
