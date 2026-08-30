@@ -55,8 +55,23 @@ test('minimal critical build keeps Codex feature code out of the initial bundle 
         'editor.worker': path.join(directory, 'editor-worker.mjs'),
         'plugin-worker': path.join(directory, 'plugin-worker.mjs'),
     };
+    const dateFnsImporters = [
+        path.join(browserDirectory, 'node_modules', '@theia', 'ai-chat-ui', 'lib', 'browser', 'chat-date-utils.js'),
+        path.join(browserDirectory, 'node_modules', '@theia', 'ai-ide', 'lib', 'browser', 'ai-configuration', 'token-usage-configuration-widget.js'),
+    ];
+    const relativeImport = file => {
+        const nativeRelative = path.relative(directory, file);
+        if (path.isAbsolute(nativeRelative)) {
+            return nativeRelative.replaceAll('\\', '/');
+        }
+        const relative = nativeRelative.replaceAll('\\', '/');
+        return relative.startsWith('.') ? relative : `./${relative}`;
+    };
     await Promise.all([
-        fs.writeFile(entryPoints.bundle, "import 'theia-ide-codex-ext/lib/browser/ride-codex-frontend-module';\n"),
+        fs.writeFile(entryPoints.bundle, [
+            "import 'theia-ide-codex-ext/lib/browser/ride-codex-frontend-module';",
+            ...dateFnsImporters.map(file => `import ${JSON.stringify(relativeImport(file))};`),
+        ].join('\n')),
         fs.writeFile(entryPoints['secondary-window'], 'export {};\n'),
         fs.writeFile(entryPoints['editor.worker'], 'export {};\n'),
         fs.writeFile(entryPoints['plugin-worker'], 'export {};\n'),

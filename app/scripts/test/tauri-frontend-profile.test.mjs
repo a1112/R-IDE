@@ -41,6 +41,370 @@ const esbuild = require('esbuild');
 const properLockfile = require('proper-lockfile');
 const appDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
+test('Tauri preview profile replaces only the eager frontend module with a lazy Markdown proxy', () => {
+    const browserDirectory = path.join(appDirectory, 'applications', 'browser');
+    const profile = JSON.parse(fs.readFileSync(path.join(browserDirectory, 'tauri-profile.json'), 'utf8'));
+    const preview = profile.featureGroups['preview-getting-started'];
+    assert.deepEqual(preview.deferredFrontendModules, [{
+        package: '@theia/preview',
+        module: '@theia/preview/lib/browser/preview-frontend-module',
+        proxy: 'tauri-src/preview-proxy-frontend-module.ts',
+        entry: 'tauri-src/preview-markdown-feature.ts',
+        action: 'markdown-preview',
+    }]);
+    assert.ok(preview.blockedRoots.some(root => root.name === '@theia/preview'));
+
+    const proxy = fs.readFileSync(path.join(browserDirectory, 'tauri-src', 'preview-proxy-frontend-module.ts'), 'utf8');
+    const feature = fs.readFileSync(path.join(browserDirectory, 'tauri-src', 'preview-markdown-feature.ts'), 'utf8');
+    assert.match(proxy, /import\(['"]\.\/preview-markdown-feature['"]\)/);
+    assert.doesNotMatch(proxy, /from ['"]@theia\/preview\/lib\/browser\/markdown/);
+    assert.doesNotMatch(proxy, /import\s*\{[^}]*MarkdownPreviewHandler/);
+    assert.match(feature, /MarkdownPreviewHandler/);
+    assert.match(feature, /createChild\(\)/);
+});
+
+test('lazy Markdown preview proxy preserves bindings and shares retryable disposable activation', async t => {
+    const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-preview-proxy-'));
+    t.after(() => fs.promises.rm(directory, { recursive: true, force: true }));
+    const browserDirectory = path.join(appDirectory, 'applications', 'browser');
+    const sourceDirectory = path.join(browserDirectory, 'tauri-src');
+    const proxyBundle = path.join(directory, 'preview-proxy.cjs');
+    const featureBundle = path.join(directory, 'preview-feature.cjs');
+    const runtimeEntry = path.join(directory, 'preview-runtime-entry.ts');
+    const featureEntry = path.join(directory, 'preview-feature-entry.ts');
+    const browserShim = path.join(directory, 'browser-shim.cjs');
+    const toolbarShim = path.join(directory, 'toolbar-shim.cjs');
+    const contributionShim = path.join(directory, 'preview-contribution-shim.cjs');
+    const widgetShim = path.join(directory, 'preview-widget-shim.cjs');
+    const normalizerShim = path.join(directory, 'preview-link-normalizer-shim.cjs');
+    await Promise.all([
+        fs.promises.writeFile(browserShim, String.raw`
+            exports.FrontendApplicationContribution = Symbol.for('ride.test.FrontendApplicationContribution');
+            exports.OpenHandler = Symbol.for('ride.test.OpenHandler');
+            exports.OpenerService = Symbol.for('ride.test.OpenerService');
+            exports.WidgetFactory = Symbol.for('ride.test.WidgetFactory');
+        `),
+        fs.promises.writeFile(toolbarShim, "exports.TabBarToolbarContribution = Symbol.for('ride.test.TabBarToolbarContribution');\n"),
+        fs.promises.writeFile(contributionShim, 'exports.PreviewContribution = class PreviewContribution {};\n'),
+        fs.promises.writeFile(widgetShim, String.raw`
+            exports.PreviewWidget = class PreviewWidget {};
+            exports.PreviewWidgetOptions = Symbol.for('ride.test.PreviewWidgetOptions');
+        `),
+        fs.promises.writeFile(normalizerShim, 'exports.PreviewLinkNormalizer = class PreviewLinkNormalizer {};\n'),
+        fs.promises.writeFile(runtimeEntry, `
+            export { default as frontendModule, RideLazyMarkdownPreviewHandler } from ${JSON.stringify(path.join(sourceDirectory, 'preview-proxy-frontend-module.ts'))};
+            export { FrontendApplicationContribution, OpenHandler, WidgetFactory } from '@theia/core/lib/browser';
+            export { TabBarToolbarContribution } from '@theia/core/lib/browser/shell/tab-bar-toolbar';
+            export { CommandContribution, MenuContribution } from '@theia/core/lib/common';
+            export { PreviewContribution } from '@theia/preview/lib/browser/preview-contribution';
+            export { PreviewHandler, PreviewHandlerProvider } from '@theia/preview/lib/browser/preview-handler';
+            export { PreviewLinkNormalizer } from '@theia/preview/lib/browser/preview-link-normalizer';
+            export { PreviewWidget } from '@theia/preview/lib/browser/preview-widget';
+            export { PreviewPreferenceContribution, PreviewPreferences } from '@theia/preview/lib/common/preview-preferences';
+        `),
+        fs.promises.writeFile(featureEntry, `
+            export { createMarkdownPreviewHandler } from ${JSON.stringify(path.join(sourceDirectory, 'preview-markdown-feature.ts'))};
+            export { OpenerService } from '@theia/core/lib/browser';
+            export { PreviewLinkNormalizer } from '@theia/preview/lib/browser/preview-link-normalizer';
+        `),
+    ]);
+    const runtimeAliases = {
+        '@theia/core/lib/browser/shell/tab-bar-toolbar': toolbarShim,
+        '@theia/core/lib/browser': browserShim,
+        '@theia/preview/lib/browser/preview-contribution': contributionShim,
+        '@theia/preview/lib/browser/preview-widget': widgetShim,
+        '@theia/preview/lib/browser/preview-link-normalizer': normalizerShim,
+        '@theia/preview/lib/browser/markdown/markdown-preview-handler': require.resolve(
+            '@theia/preview/lib/browser/markdown/markdown-preview-handler',
+            { paths: [browserDirectory] },
+        ),
+    };
+    const markdownDependencyShimPlugin = {
+        name: 'markdown-dependency-shims',
+        setup(build) {
+            build.onResolve({ filter: /^\.\.\/preview-link-normalizer$/ }, () => ({ path: normalizerShim }));
+        },
+    };
+    const emptyCssPlugin = {
+        name: 'empty-css-for-node-smoke',
+        setup(build) {
+            build.onResolve({ filter: /\.css$/ }, args => ({ path: args.path, namespace: 'empty-css' }));
+            build.onLoad({ filter: /.*/, namespace: 'empty-css' }, () => ({ contents: '', loader: 'js' }));
+        },
+    };
+    await esbuild.build({
+        entryPoints: [runtimeEntry],
+        outfile: proxyBundle,
+        bundle: true,
+        platform: 'node',
+        format: 'cjs',
+        target: 'node22',
+        packages: 'external',
+        alias: runtimeAliases,
+        plugins: [emptyCssPlugin],
+        logLevel: 'silent',
+    });
+    await esbuild.build({
+        entryPoints: [featureEntry],
+        outfile: featureBundle,
+        bundle: true,
+        platform: 'node',
+        format: 'cjs',
+        target: 'node22',
+        packages: 'external',
+        alias: runtimeAliases,
+        plugins: [markdownDependencyShimPlugin],
+        logLevel: 'silent',
+    });
+
+    const smokeScript = String.raw`
+        const assert = require('node:assert/strict');
+        const Module = require('node:module');
+        const originalLoad = Module._load;
+        let highlightEvaluations = 0;
+        let timerStarts = 0;
+        let networkStarts = 0;
+        Module._load = function(request, parent, isMain) {
+            if (request === 'highlight.js') highlightEvaluations++;
+            return originalLoad.call(this, request, parent, isMain);
+        };
+        require.extensions['.css'] = () => undefined;
+        globalThis.Element = class Element {
+            constructor() {
+                this.classList = { add: () => undefined, remove: () => undefined, contains: () => false };
+                this.style = {};
+            }
+            appendChild() { return this; }
+            removeChild() { return this; }
+            addEventListener() { }
+            removeEventListener() { }
+            setAttribute() { }
+            getAttribute() { return null; }
+        };
+        globalThis.Element.prototype.matches = () => false;
+        globalThis.HTMLElement = globalThis.Element;
+        globalThis.Event = class Event {};
+        globalThis.DragEvent = class DragEvent extends globalThis.Event {};
+        globalThis.document = {
+            createElement: () => new globalThis.Element(),
+            createTextNode: () => new globalThis.Element(),
+            documentElement: new globalThis.Element(),
+            body: new globalThis.Element(),
+            head: new globalThis.Element(),
+            queryCommandSupported: () => false,
+            addEventListener: () => undefined,
+            removeEventListener: () => undefined,
+        };
+        globalThis.window = globalThis;
+        globalThis.localStorage = { getItem: () => null, setItem: () => undefined };
+        globalThis.setInterval = () => { timerStarts++; throw new Error('unexpected timer'); };
+        globalThis.fetch = () => { networkStarts++; throw new Error('unexpected network'); };
+
+        const bundled = require(process.argv[1]);
+        const { Container } = require('@theia/core/shared/inversify');
+        const URI = require('@theia/core/lib/common/uri').default;
+        const { ContributionProvider } = require('@theia/core/lib/common/contribution-provider');
+        const {
+            CommandContribution, FrontendApplicationContribution, MenuContribution, OpenHandler,
+            PreviewContribution, PreviewHandler, PreviewHandlerProvider, PreviewLinkNormalizer,
+            PreviewPreferenceContribution, PreviewPreferences, PreviewWidget,
+            TabBarToolbarContribution, WidgetFactory
+        } = bundled;
+        const frontendModule = bundled.frontendModule.default ?? bundled.frontendModule;
+        const container = new Container();
+        container.load(frontendModule);
+        for (const identifier of [
+            PreviewHandlerProvider, PreviewHandler, PreviewLinkNormalizer, PreviewWidget, WidgetFactory,
+            PreviewContribution, PreviewPreferenceContribution, PreviewPreferences,
+            CommandContribution, MenuContribution, OpenHandler, FrontendApplicationContribution,
+            TabBarToolbarContribution
+        ]) assert.equal(container.isBound(identifier), true, String(identifier));
+        assert.equal(container.isBoundNamed(ContributionProvider, PreviewHandler), true);
+        const boundProxy = container.get(bundled.RideLazyMarkdownPreviewHandler);
+        assert.equal(boundProxy.canHandle(new URI('file:///README.MD')), 500);
+        assert.equal(boundProxy.canHandle(new URI('file:///README.txt')), 0);
+        assert.equal(boundProxy.canHandle(new URI('untitled:///README.md')), 0);
+        assert.equal(highlightEvaluations, 0);
+        assert.equal(timerStarts, 0);
+        assert.equal(networkStarts, 0);
+
+        const deferred = () => {
+            let resolve;
+            let reject;
+            const promise = new Promise((done, fail) => { resolve = done; reject = fail; });
+            return { promise, resolve, reject };
+        };
+        const render = deferred();
+        let loads = 0;
+        let creations = 0;
+        let renderCalls = 0;
+        let delegateDisposals = 0;
+        const fragment = {};
+        const sourceLine = {};
+        const delegate = {
+            canHandle: () => 500,
+            renderContent: () => { renderCalls++; return render.promise; },
+            findElementForFragment: () => fragment,
+            findElementForSourceLine: () => sourceLine,
+            getSourceLineForOffset: () => 73,
+            dispose: () => delegateDisposals++,
+        };
+        const lazy = new bundled.RideLazyMarkdownPreviewHandler(container, async () => {
+            loads++;
+            return { createMarkdownPreviewHandler: () => { creations++; return delegate; } };
+        });
+        const content = {};
+        assert.equal(lazy.findElementForFragment(content, '#before'), undefined);
+        assert.equal(lazy.findElementForSourceLine(content, 1), undefined);
+        assert.equal(lazy.getSourceLineForOffset(content, 1), undefined);
+        const firstRender = lazy.renderContent({ content: 'one', originUri: new URI('file:///one.md') });
+        const secondRender = lazy.renderContent({ content: 'two', originUri: new URI('file:///two.md') });
+        (async () => {
+            await new Promise(resolve => setImmediate(resolve));
+            assert.equal(loads, 1);
+            assert.equal(creations, 1);
+            assert.equal(renderCalls, 2);
+            render.resolve(content);
+            assert.deepEqual(await Promise.all([firstRender, secondRender]), [content, content]);
+            assert.equal(lazy.findElementForFragment(content, '#fragment'), fragment);
+            assert.equal(lazy.findElementForSourceLine(content, 12), sourceLine);
+            assert.equal(lazy.getSourceLineForOffset(content, 24), 73);
+
+            let retryLoads = 0;
+            const retry = new bundled.RideLazyMarkdownPreviewHandler(container, async () => {
+                retryLoads++;
+                if (retryLoads === 1) throw new Error('preview chunk unavailable');
+                return { createMarkdownPreviewHandler: () => ({ canHandle: () => 500, renderContent: () => content }) };
+            });
+            await assert.rejects(retry.renderContent({ content: '', originUri: new URI('file:///retry.md') }), /chunk unavailable/);
+            assert.equal(await retry.renderContent({ content: '', originUri: new URI('file:///retry.md') }), content);
+            assert.equal(retryLoads, 2);
+
+            const lateLoad = deferred();
+            let lateCreations = 0;
+            const late = new bundled.RideLazyMarkdownPreviewHandler(container, () => lateLoad.promise);
+            const lateRender = late.renderContent({ content: '', originUri: new URI('file:///late.md') });
+            late.dispose();
+            lateLoad.resolve({ createMarkdownPreviewHandler: () => { lateCreations++; return delegate; } });
+            await assert.rejects(lateRender, /disposed/i);
+            assert.equal(lateCreations, 0);
+
+            lazy.dispose();
+            lazy.dispose();
+            assert.equal(delegateDisposals, 1);
+            await assert.rejects(lazy.renderContent({ content: '', originUri: new URI('file:///disposed.md') }), /disposed/i);
+
+            const feature = require(process.argv[2]);
+            const opener = {};
+            const normalizer = {};
+            const parent = new Container();
+            parent.bind(feature.OpenerService).toConstantValue(opener);
+            parent.bind(feature.PreviewLinkNormalizer).toConstantValue(normalizer);
+            const real = feature.createMarkdownPreviewHandler(parent);
+            assert.strictEqual(real.openerService, opener);
+            assert.strictEqual(real.linkNormalizer, normalizer);
+            assert.equal(highlightEvaluations, 1);
+            assert.equal(timerStarts, 0);
+            assert.equal(networkStarts, 0);
+        })().then(
+            () => process.exit(0),
+            error => { console.error(error); process.exit(1); },
+        );
+    `;
+    execFileSync(process.execPath, ['--input-type=commonjs', '--eval', smokeScript, proxyBundle, featureBundle], {
+        cwd: browserDirectory,
+        env: { ...process.env, NODE_PATH: path.join(browserDirectory, 'node_modules') },
+        stdio: 'pipe',
+        timeout: 60_000,
+    });
+});
+
+test('highlight.js belongs to one dynamically reached Markdown feature output', async t => {
+    const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-preview-split-'));
+    t.after(() => fs.promises.rm(directory, { recursive: true, force: true }));
+    const browserDirectory = path.join(appDirectory, 'applications', 'browser');
+    const entry = path.join(directory, 'entry.ts');
+    const proxy = path.join(browserDirectory, 'tauri-src', 'preview-proxy-frontend-module.ts');
+    await fs.promises.writeFile(entry, `import frontendModule from ${JSON.stringify(proxy)};\nexport default frontendModule;\n`);
+    const selectiveExternalPlugin = {
+        name: 'preview-highlight-ownership',
+        setup(build) {
+            build.onResolve({ filter: /\.css$/ }, args => ({ path: args.path, namespace: 'empty-css' }));
+            build.onLoad({ filter: /.*/, namespace: 'empty-css' }, () => ({ contents: '', loader: 'js' }));
+            build.onResolve({ filter: /^[^./]/ }, args => {
+                if (args.kind === 'entry-point' || path.isAbsolute(args.path)) {
+                    return undefined;
+                }
+                if (args.path === 'highlight.js'
+                    || args.path === '@theia/preview/lib/browser/markdown/markdown-preview-handler') {
+                    return undefined;
+                }
+                return { path: args.path, external: true };
+            });
+        },
+    };
+    const result = await esbuild.build({
+        entryPoints: { bundle: entry },
+        outdir: path.join(directory, 'out'),
+        absWorkingDir: browserDirectory,
+        bundle: true,
+        splitting: true,
+        format: 'esm',
+        platform: 'browser',
+        target: 'es2022',
+        chunkNames: 'chunks/[name]-[hash]',
+        alias: {
+            'highlight.js': require.resolve('highlight.js', { paths: [browserDirectory] }),
+        },
+        metafile: true,
+        write: false,
+        plugins: [selectiveExternalPlugin],
+        logLevel: 'silent',
+    });
+
+    const outputs = new Map(Object.entries(result.metafile.outputs).map(([name, detail]) => [name.replaceAll('\\', '/'), detail]));
+    const entryOutput = [...outputs].find(([, detail]) => detail.entryPoint?.replaceAll('\\', '/') === entry.replaceAll('\\', '/'))?.[0];
+    assert.ok(entryOutput, 'main preview proxy output must exist');
+    const resolveOutputImport = (from, imported) => {
+        const direct = imported.path.replaceAll('\\', '/');
+        if (outputs.has(direct)) {
+            return direct;
+        }
+        return path.posix.normalize(path.posix.join(path.posix.dirname(from), direct));
+    };
+    const reachable = includeDynamic => {
+        const visited = new Set();
+        const pending = [entryOutput];
+        while (pending.length > 0) {
+            const output = pending.pop();
+            if (visited.has(output)) {
+                continue;
+            }
+            visited.add(output);
+            for (const imported of outputs.get(output)?.imports ?? []) {
+                if (!includeDynamic && imported.kind !== 'import-statement') {
+                    continue;
+                }
+                const candidate = resolveOutputImport(output, imported);
+                if (outputs.has(candidate)) {
+                    pending.push(candidate);
+                }
+            }
+        }
+        return visited;
+    };
+    const staticOutputs = reachable(false);
+    const allOutputs = reachable(true);
+    const highlightOutputs = [...outputs].filter(([, detail]) =>
+        Object.keys(detail.inputs ?? {}).some(input => /(?:^|\/)highlight\.js\//.test(input.replaceAll('\\', '/')))
+    );
+    assert.equal(highlightOutputs.length, 1);
+    const [highlightOutput, highlightDetail] = highlightOutputs[0];
+    assert.equal(staticOutputs.has(highlightOutput), false);
+    assert.equal(allOutputs.has(highlightOutput), true);
+    assert.match(highlightDetail.entryPoint?.replaceAll('\\', '/') ?? '', /tauri-src\/preview-markdown-feature\.ts$/);
+});
+
 function manifest(name, dependencies = {}, extra = {}) {
     return {
         name,
@@ -438,13 +802,13 @@ test('rejects ambiguous or non-canonical deferred frontend module declarations',
     })), /deferred frontend module.*duplicated/i);
 });
 
-test('tracked profile defers only secondary-window and records every other group gate failure', async () => {
+test('tracked profile defers Codex, Markdown preview, and secondary-window while recording every other gate failure', async () => {
     const browserDirectory = path.join(appDirectory, 'applications', 'browser');
     const profile = JSON.parse(await fs.promises.readFile(path.join(browserDirectory, 'tauri-profile.json'), 'utf8'));
     const deferredGroups = Object.entries(profile.featureGroups)
         .filter(([, group]) => (group.deferredFrontendModules?.length ?? 0) > 0);
 
-    assert.deepEqual(deferredGroups.map(([name]) => name), ['ai', 'secondary-window']);
+    assert.deepEqual(deferredGroups.map(([name]) => name), ['ai', 'preview-getting-started', 'secondary-window']);
     assert.deepEqual(profile.featureGroups.ai.deferredFrontendModules, [{
         package: 'theia-ide-codex-ext',
         module: 'theia-ide-codex-ext/lib/browser/ride-codex-frontend-module',
@@ -459,9 +823,16 @@ test('tracked profile defers only secondary-window and records every other group
         entry: 'tauri-src/secondary-window-feature.ts',
         action: 'extract-widget',
     }]);
+    assert.deepEqual(profile.featureGroups['preview-getting-started'].deferredFrontendModules, [{
+        package: '@theia/preview',
+        module: '@theia/preview/lib/browser/preview-frontend-module',
+        proxy: 'tauri-src/preview-proxy-frontend-module.ts',
+        entry: 'tauri-src/preview-markdown-feature.ts',
+        action: 'markdown-preview',
+    }]);
     for (const [name, group] of Object.entries(profile.featureGroups)) {
         assert.deepEqual(group.deferredRoots, [], `${name} must not silently omit package roots`);
-        if (name !== 'secondary-window' && name !== 'ai') {
+        if (!['secondary-window', 'preview-getting-started', 'ai'].includes(name)) {
             assert.match(group.deferBlockedReason, /adapter|backend|smoke|inventory|startup|provider|rebind|widget/i);
         }
     }

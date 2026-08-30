@@ -118,9 +118,18 @@
       "blockedRoots": [
         { "name": "@theia/editor-preview", "reason": "The hosted-plugin extension has a required dependency on editor preview services." },
         { "name": "@theia/getting-started", "reason": "The R-IDE product extension directly requires getting-started contributions." },
-        { "name": "@theia/preview", "reason": "The required getting-started extension depends on preview services." }
+        { "name": "@theia/preview", "reason": "The required getting-started extension depends on preview services; only its heavy Markdown renderer is deferred." }
       ],
-      "deferBlockedReason": "Backend modules, widget factories, open handlers, toolbar providers, and startup-layout hooks lack explicit deferred adapters."
+      "deferredFrontendModules": [
+        {
+          "package": "@theia/preview",
+          "module": "@theia/preview/lib/browser/preview-frontend-module",
+          "proxy": "tauri-src/preview-proxy-frontend-module.ts",
+          "entry": "tauri-src/preview-markdown-feature.ts",
+          "action": "markdown-preview"
+        }
+      ],
+      "deferBlockedReason": "Preview preferences, widget factories, open handlers, toolbar providers, CSS, and startup bindings remain eager; only heavy Markdown rendering and syntax highlighting are deferred."
     },
     "secondary-window": {
       "deferredRoots": [],

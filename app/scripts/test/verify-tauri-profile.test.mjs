@@ -17,6 +17,20 @@ import { createProfileMetadataPlugin } from '../../applications/browser/tauri-sr
 
 const require = createRequire(import.meta.url);
 
+test('repository Tauri profile declares the exact deferred Markdown preview descriptor', () => {
+  const appDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+  const profile = JSON.parse(fs.readFileSync(path.join(appDirectory, 'applications', 'browser', 'tauri-profile.json'), 'utf8'));
+  const preview = profile.featureGroups['preview-getting-started'];
+  assert.deepEqual(preview.deferredFrontendModules, [{
+    package: '@theia/preview',
+    module: '@theia/preview/lib/browser/preview-frontend-module',
+    proxy: 'tauri-src/preview-proxy-frontend-module.ts',
+    entry: 'tauri-src/preview-markdown-feature.ts',
+    action: 'markdown-preview',
+  }]);
+  assert.match(preview.deferBlockedReason, /markdown/i);
+});
+
 function canonicalJson(value) {
   if (value === null || typeof value === 'boolean' || typeof value === 'string' || typeof value === 'number') {
     return JSON.stringify(value);

@@ -110,12 +110,14 @@ function harness(): Harness {
     };
 }
 
-function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (error: unknown) => void } {
     let resolve!: (value: T) => void;
-    const promise = new Promise<T>(done => {
+    let reject!: (error: unknown) => void;
+    const promise = new Promise<T>((done, fail) => {
         resolve = done;
+        reject = fail;
     });
-    return { promise, resolve };
+    return { promise, resolve, reject };
 }
 
 function feature(
@@ -428,6 +430,28 @@ test('a failed activation reports the error and remains retryable', async () => 
 
     assert.equal(attempts, 2);
     assert.deepEqual(errors, ['Failed to activate deferred feature "retryable": chunk unavailable']);
+});
+
+test('concurrent callers share one failed load and the next activation retries once', async () => {
+    const { loader } = harness();
+    const firstLoad = deferred<RideDeferredFeatureModule>();
+    let loadCalls = 0;
+    const descriptor = feature('shared-retryable', loader, () => {
+        loadCalls++;
+        return loadCalls === 1
+            ? firstLoad.promise
+            : Promise.resolve({ contributionTypes: [] });
+    });
+
+    const first = loader.activate(descriptor);
+    const concurrent = loader.activate(descriptor);
+    assert.strictEqual(concurrent, first);
+    firstLoad.reject(new Error('shared chunk failure'));
+    await assert.rejects(first, /shared chunk failure/);
+    await assert.rejects(concurrent, /shared chunk failure/);
+
+    await loader.activate(descriptor);
+    assert.equal(loadCalls, 2);
 });
 
 test('a synchronously thrown load failure is removed from the activation cache', async () => {
