@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import type { BrowserAutomation, BrowserAutomationClient, LaunchResult } from '@theia/ai-ide/lib/common/browser-automation-protocol';
-import { Container, injectable } from '@theia/core/shared/inversify';
+import { Container, injectable, unmanaged } from '@theia/core/shared/inversify';
 
 interface BrowserAutomationDelegate extends BrowserAutomation {
     dispose(): void;
@@ -16,26 +16,116 @@ interface BrowserAutomationFeature {
 
 const browserAutomationFeatureModule = './ai-ide-browser-automation-feature.cjs';
 
+async function loadBrowserAutomationFeature(): Promise<BrowserAutomationFeature> {
+    const featureRequest = browserAutomationFeatureModule;
+    return import(featureRequest) as Promise<BrowserAutomationFeature>;
+}
+
+class BrowserAutomationDisposedError extends Error {
+    constructor() {
+        super('Browser automation proxy is disposed.');
+    }
+}
+
+function disposedError(): Error {
+    return new BrowserAutomationDisposedError();
+}
+
+function activationError(): Error {
+    // Build paths from dynamic import or construction failures are deliberately
+    // omitted. Operation errors from the real upstream delegate are forwarded
+    // unchanged after activation succeeds.
+    return new Error('Failed to activate browser automation runtime.');
+}
+
 @injectable()
 export class BrowserAutomationImpl implements BrowserAutomationDelegate {
-    protected readonly parentContainer = new Container();
     protected delegate: BrowserAutomationDelegate | undefined;
+    protected activation: Promise<BrowserAutomationDelegate> | undefined;
     protected client: BrowserAutomationClient | undefined;
+    protected disposed = false;
 
-    protected async activate(): Promise<BrowserAutomationDelegate> {
-        if (this.delegate) {
-            return this.delegate;
+    constructor(
+        @unmanaged() protected readonly loadFeature: () => Promise<BrowserAutomationFeature> = loadBrowserAutomationFeature,
+        @unmanaged() protected readonly parentContainer: Container = new Container(),
+    ) { }
+
+    protected activate(): Promise<BrowserAutomationDelegate> {
+        if (this.disposed) {
+            return Promise.reject(disposedError());
         }
-        const featureRequest = browserAutomationFeatureModule;
-        const feature = await import(featureRequest) as BrowserAutomationFeature;
-        const delegate = feature.createBrowserAutomation(this.parentContainer);
-        delegate.setClient(this.client);
-        this.delegate = delegate;
-        return delegate;
+        if (this.delegate) {
+            return Promise.resolve(this.delegate);
+        }
+        if (this.activation) {
+            return this.activation;
+        }
+        const activation = this.createDelegate();
+        this.activation = activation;
+        void activation.then(
+            () => {
+                if (this.activation === activation) {
+                    this.activation = undefined;
+                }
+            },
+            () => {
+                if (this.activation === activation) {
+                    this.activation = undefined;
+                }
+            },
+        );
+        return activation;
+    }
+
+    protected async createDelegate(): Promise<BrowserAutomationDelegate> {
+        let candidate: BrowserAutomationDelegate | undefined;
+        try {
+            const feature = await this.loadFeature();
+            if (this.disposed) {
+                throw disposedError();
+            }
+            candidate = feature.createBrowserAutomation(this.parentContainer);
+            if (this.disposed) {
+                const stale = candidate;
+                candidate = undefined;
+                stale.dispose();
+                throw disposedError();
+            }
+            candidate.setClient(this.client);
+            if (this.disposed) {
+                const stale = candidate;
+                candidate = undefined;
+                stale.dispose();
+                throw disposedError();
+            }
+            this.delegate = candidate;
+            return candidate;
+        } catch (error) {
+            if (candidate && candidate !== this.delegate) {
+                try {
+                    candidate.dispose();
+                } catch {
+                    // Activation failed before ownership was published. Keep the
+                    // public failure deterministic and free of local diagnostics.
+                }
+            }
+            if (this.disposed || error instanceof BrowserAutomationDisposedError) {
+                throw disposedError();
+            }
+            throw activationError();
+        }
+    }
+
+    protected ensureActive(): void {
+        if (this.disposed) {
+            throw disposedError();
+        }
     }
 
     async launch(remoteDebuggingPort: number): Promise<LaunchResult | undefined> {
-        return (await this.activate()).launch(remoteDebuggingPort);
+        const delegate = await this.activate();
+        this.ensureActive();
+        return delegate.launch(remoteDebuggingPort);
     }
 
     async isRunning(): Promise<boolean> {
@@ -43,7 +133,9 @@ export class BrowserAutomationImpl implements BrowserAutomationDelegate {
     }
 
     async queryDom(selector?: string): Promise<string> {
-        return (await this.activate()).queryDom(selector);
+        const delegate = await this.activate();
+        this.ensureActive();
+        return delegate.queryDom(selector);
     }
 
     async close(): Promise<void> {
@@ -51,8 +143,13 @@ export class BrowserAutomationImpl implements BrowserAutomationDelegate {
     }
 
     dispose(): void {
-        this.delegate?.dispose();
+        if (this.disposed) {
+            return;
+        }
+        this.disposed = true;
+        const delegate = this.delegate;
         this.delegate = undefined;
+        delegate?.dispose();
     }
 
     setClient(client: BrowserAutomationClient | undefined): void {
