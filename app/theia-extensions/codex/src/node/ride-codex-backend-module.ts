@@ -22,42 +22,16 @@ import {
 } from '../common/ride-codex-protocol';
 import { RideCodexAppServerHost } from './ride-codex-app-server-host';
 import { RideCodexAuthBroker } from './ride-codex-auth-broker';
-import { RideCodexAppServerDiagnostics } from './ride-codex-diagnostics';
-import { RideCodexRuntimeResolver } from './ride-codex-runtime-resolver';
 import { RideCodexThreadCoordinator } from './ride-codex-thread-coordinator';
 import { RideCodexTurnCoordinator } from './ride-codex-turn-coordinator';
 import { RideCodexApprovalBroker } from './ride-codex-approval-broker';
-import {
-    createRideCodexPackagedSmokeResolver,
-    createRideCodexPackagedSmokeSpawn,
-    isRideCodexPackagedSmokeEnvironment
-} from './ride-codex-packaged-smoke';
+import { bindRideCodexBackendServices } from './ride-codex-backend-bindings';
 
-export function RIDE_CODEX_0_144_APPROVAL_POLICY(kind: 'command' | 'file-change'): boolean {
-    return kind === 'command' || kind === 'file-change';
-}
+export { RIDE_CODEX_0_144_APPROVAL_POLICY } from './ride-codex-backend-bindings';
 
 export default new ContainerModule(bind => {
-    bind(RideCodexRuntimeResolver).toSelf().inSingletonScope();
-    bind(RideCodexAppServerDiagnostics).toSelf().inSingletonScope();
-    bind(RideCodexAppServerHost).toDynamicValue(context => {
-        const environment = process.env;
-        const packagedSmoke = isRideCodexPackagedSmokeEnvironment(environment);
-        return new RideCodexAppServerHost({
-            resolver: createRideCodexPackagedSmokeResolver(
-                context.container.get(RideCodexRuntimeResolver),
-                environment
-            ),
-            spawn: createRideCodexPackagedSmokeSpawn(environment),
-            diagnostics: context.container.get(RideCodexAppServerDiagnostics),
-            ...(packagedSmoke ? { idleTimeoutMs: 250, shutdownGraceMs: 500 } : {})
-        });
-    }).inSingletonScope();
+    bindRideCodexBackendServices(bind);
     bind(BackendApplicationContribution).toService(RideCodexAppServerHost);
-    bind(RideCodexAuthBroker).toDynamicValue(context => new RideCodexAuthBroker({
-        host: context.container.get(RideCodexAppServerHost),
-        diagnostics: context.container.get(RideCodexAppServerDiagnostics)
-    })).inSingletonScope();
     bind(RideCodexAuthService).toService(RideCodexAuthBroker);
     bind(BackendApplicationContribution).toService(RideCodexAuthBroker);
     bind(ConnectionHandler).toDynamicValue(context =>
@@ -68,9 +42,6 @@ export default new ContainerModule(bind => {
             return broker;
         })
     ).inSingletonScope();
-    bind(RideCodexThreadCoordinator).toDynamicValue(context => new RideCodexThreadCoordinator({
-        host: context.container.get(RideCodexAppServerHost)
-    })).inSingletonScope();
     bind(RideCodexConversationsService).toService(RideCodexThreadCoordinator);
     bind(BackendApplicationContribution).toService(RideCodexThreadCoordinator);
     bind(ConnectionHandler).toDynamicValue(context =>
@@ -81,9 +52,6 @@ export default new ContainerModule(bind => {
             return coordinator;
         })
     ).inSingletonScope();
-    bind(RideCodexTurnCoordinator).toDynamicValue(context => new RideCodexTurnCoordinator({
-        host: context.container.get(RideCodexAppServerHost)
-    })).inSingletonScope();
     bind(BackendApplicationContribution).toService(RideCodexTurnCoordinator);
     bind(ConnectionHandler).toDynamicValue(context =>
         new JsonRpcConnectionHandler<RideCodexTurnClient>(RideCodexTurnsServicePath, client => {
@@ -93,10 +61,6 @@ export default new ContainerModule(bind => {
             return session;
         })
     ).inSingletonScope();
-    bind(RideCodexApprovalBroker).toDynamicValue(context => new RideCodexApprovalBroker({
-        host: context.container.get(RideCodexAppServerHost),
-        allowAcceptForSession: RIDE_CODEX_0_144_APPROVAL_POLICY
-    })).inSingletonScope();
     bind(BackendApplicationContribution).toService(RideCodexApprovalBroker);
     bind(ConnectionHandler).toDynamicValue(context =>
         new JsonRpcConnectionHandler<RideCodexApprovalClient>(RideCodexApprovalsServicePath, client => {

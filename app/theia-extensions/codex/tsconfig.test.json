@@ -17,6 +17,8 @@
         "src/browser/ride-codex-event-reducer.ts",
         "src/browser/ride-codex-renderers.tsx",
         "src/node/ride-codex-approval-broker.ts",
+        "src/node/ride-codex-backend-bindings.ts",
+        "src/node/ride-codex-deferred-runtime.ts",
         "src/node/ride-codex-jsonl-*.ts",
         "src/node/ride-codex-turn-coordinator.ts",
         "src/node/ride-codex-launch-spec.ts",
