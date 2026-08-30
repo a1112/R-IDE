@@ -1627,12 +1627,6 @@ test('backend build plans isolate the exact BrowserAutomation implementation and
         format: 'cjs',
         metafile: true,
         logLevel: 'silent',
-        tsconfigRaw: {
-            compilerOptions: {
-                experimentalDecorators: true,
-                emitDecoratorMetadata: true,
-            },
-        },
         plugins: [
             {
                 name: '@theia/esbuild-plugin',
