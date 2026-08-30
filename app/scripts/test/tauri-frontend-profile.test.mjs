@@ -843,7 +843,7 @@ test('rejects ambiguous, unsafe, or non-CJS deferred backend edge declarations',
         '@theia/scanoss-alternate': manifest('@theia/scanoss-alternate'),
     };
     const input = deferredBackendModules => fixture({
-        roots: ['product', '@theia/scanoss'],
+        roots: ['product', '@theia/scanoss', '@theia/scanoss-alternate'],
         packages,
         featureGroups: {
             ai: {
@@ -914,6 +914,21 @@ test('rejects ambiguous, unsafe, or non-CJS deferred backend edge declarations',
         /deferred backend.*(?:edge|duplicated)/i,
         'duplicate exact importer-to-module edge must be rejected',
     );
+
+    for (const field of ['proxy', 'entry']) {
+        const portableCaseAlias = SCANOSS_BACKEND_DESCRIPTOR[field].replace(
+            /scanoss-service/,
+            'SCANOSS-SERVICE',
+        );
+        assert.throws(
+            () => resolveProfile(input([
+                SCANOSS_BACKEND_DESCRIPTOR,
+                { ...alternate, [field]: portableCaseAlias },
+            ])),
+            new RegExp(`deferred backend ${field}.*duplicated`, 'i'),
+            `portable case alias for ${field} must be rejected`,
+        );
+    }
 });
 
 test('profile preparation rejects missing deferred backend proxy and feature entry files', async t => {
@@ -940,6 +955,45 @@ test('profile preparation rejects missing deferred backend proxy and feature ent
     await assert.doesNotReject(module.validateDeferredBackendModuleFiles({
         ai: { deferredBackendModules: [SCANOSS_BACKEND_DESCRIPTOR] },
     }, browserDirectory));
+});
+
+test('profile preparation rejects physical aliases for deferred backend proxy and entry files', async t => {
+    const module = await import('../tauri-frontend-profile.mjs');
+    for (const field of ['proxy', 'entry']) {
+        const browserDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), `ride-backend-profile-${field}-alias-`));
+        t.after(() => fs.promises.rm(browserDirectory, { recursive: true, force: true }));
+        const alternate = {
+            ...SCANOSS_BACKEND_DESCRIPTOR,
+            package: '@theia/scanoss-alternate',
+            importer: '@theia/scanoss-alternate/lib/node/alternate-backend-module',
+            module: '@theia/scanoss-alternate/lib/node/alternate-service-impl',
+            proxy: 'tauri-src/backend/alternate-proxy.ts',
+            entry: 'tauri-src/backend/alternate-feature.ts',
+            output: 'lib/backend/alternate-feature.cjs',
+            action: 'scanoss-alternate',
+        };
+        for (const source of [SCANOSS_BACKEND_DESCRIPTOR.proxy, SCANOSS_BACKEND_DESCRIPTOR.entry]) {
+            const candidate = path.join(browserDirectory, source);
+            await fs.promises.mkdir(path.dirname(candidate), { recursive: true });
+            await fs.promises.writeFile(candidate, 'export {};\n');
+        }
+        const otherField = field === 'proxy' ? 'entry' : 'proxy';
+        const otherCandidate = path.join(browserDirectory, alternate[otherField]);
+        await fs.promises.mkdir(path.dirname(otherCandidate), { recursive: true });
+        await fs.promises.writeFile(otherCandidate, 'export {};\n');
+        await fs.promises.link(
+            path.join(browserDirectory, SCANOSS_BACKEND_DESCRIPTOR[field]),
+            path.join(browserDirectory, alternate[field]),
+        );
+
+        await assert.rejects(
+            module.validateDeferredBackendModuleFiles({
+                ai: { deferredBackendModules: [SCANOSS_BACKEND_DESCRIPTOR, alternate] },
+            }, browserDirectory),
+            new RegExp(`(?:physical|same file|alias|duplicate).*${field}|${field}.*(?:physical|same file|alias|duplicate)`, 'i'),
+            `physical ${field} alias must be rejected`,
+        );
+    }
 });
 
 test('rejects ambiguous or non-canonical deferred frontend module declarations', () => {
@@ -1969,6 +2023,38 @@ test('backend build plans split only the exact ScanOSS service edge and attest b
             ] } },
         }, directory), new RegExp(`duplicate.*${field}|${field}.*duplicated`, 'i'));
     }
+
+    for (const field of ['proxy', 'entry']) {
+        const portableCaseAlias = SCANOSS_BACKEND_DESCRIPTOR[field].replace(
+            /scanoss-service/,
+            'SCANOSS-SERVICE',
+        );
+        assert.throws(() => deferredBuild.createTauriBackendBuildPlans(options, {
+            ...criticalManifest,
+            featureGroups: { ai: { deferredBackendModules: [
+                SCANOSS_BACKEND_DESCRIPTOR,
+                { ...alternateDescriptor, [field]: portableCaseAlias },
+            ] } },
+        }, directory), new RegExp(`duplicate.*${field}|${field}.*duplicated`, 'i'));
+    }
+
+    const physicalAliasPaths = {
+        proxy: 'tauri-src/backend/physical-alias-proxy.ts',
+        entry: 'tauri-src/backend/physical-alias-feature.ts',
+    };
+    await Promise.all(Object.entries(physicalAliasPaths).map(([field, alias]) => fs.promises.link(
+        path.join(directory, SCANOSS_BACKEND_DESCRIPTOR[field]),
+        path.join(directory, alias),
+    )));
+    for (const field of ['proxy', 'entry']) {
+        assert.throws(() => deferredBuild.createTauriBackendBuildPlans(options, {
+            ...criticalManifest,
+            featureGroups: { ai: { deferredBackendModules: [
+                SCANOSS_BACKEND_DESCRIPTOR,
+                { ...alternateDescriptor, [field]: physicalAliasPaths[field] },
+            ] } },
+        }, directory), new RegExp(`(?:physical|same file|alias|duplicate).*${field}|${field}.*(?:physical|same file|alias|duplicate)`, 'i'));
+    }
 });
 
 test('real esbuild keeps non-approved relative and bare ScanOSS implementation edges unaliased', async t => {
@@ -2729,6 +2815,90 @@ test('directory transaction replaces a target and removes its recovery artifacts
     assert.equal(fs.existsSync(plan.markerPath), false);
 });
 
+test('directory transaction validates the installed target exactly once before commit', async t => {
+    const parentDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-transaction-validate-ok-'));
+    t.after(() => fs.promises.rm(parentDirectory, { recursive: true, force: true }));
+    const plan = createDirectoryTransactionPlan(parentDirectory, 'lib', 'validate-success');
+    await writeSentinel(plan.targetDirectory, 'old');
+    await writeSentinel(plan.temporaryDirectory, 'new');
+    let validationCalls = 0;
+
+    await replaceDirectoryTransactional(plan, {
+        validateInstalled: async installedDirectory => {
+            validationCalls += 1;
+            assert.equal(path.resolve(installedDirectory), path.resolve(plan.targetDirectory));
+            assert.equal(await fs.promises.readFile(path.join(installedDirectory, 'sentinel.txt'), 'utf8'), 'new');
+        },
+    });
+
+    assert.equal(validationCalls, 1);
+    assert.equal(await fs.promises.readFile(path.join(plan.targetDirectory, 'sentinel.txt'), 'utf8'), 'new');
+    assert.deepEqual(await transactionArtifacts(plan), []);
+});
+
+test('directory transaction rolls back post-install validation failure to the exact prior state', async t => {
+    for (const hadTarget of [true, false]) {
+        const parentDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), `ride-transaction-validate-${hadTarget ? 'restore' : 'empty'}-`));
+        t.after(() => fs.promises.rm(parentDirectory, { recursive: true, force: true }));
+        const plan = createDirectoryTransactionPlan(parentDirectory, 'lib', hadTarget ? 'restore-old' : 'restore-empty');
+        if (hadTarget) {
+            await writeSentinel(plan.targetDirectory, 'old');
+        }
+        await writeSentinel(plan.temporaryDirectory, 'new');
+        let validationCalls = 0;
+
+        await assert.rejects(replaceDirectoryTransactional(plan, {
+            validateInstalled: async () => {
+                validationCalls += 1;
+                throw new Error('installed validation failed');
+            },
+        }), /installed validation failed/);
+
+        assert.equal(validationCalls, 1);
+        if (hadTarget) {
+            assert.equal(await fs.promises.readFile(path.join(plan.targetDirectory, 'sentinel.txt'), 'utf8'), 'old');
+        } else {
+            assert.equal(fs.existsSync(plan.targetDirectory), false);
+        }
+        assert.equal(fs.existsSync(plan.backupDirectory), false);
+        assert.equal((await transactionArtifacts(plan)).some(name => name.includes('-installed-')), false);
+        assert.deepEqual(await transactionArtifacts(plan), []);
+    }
+});
+
+test('directory transaction aggregates post-install validation and rollback failures without an installed marker', async t => {
+    const parentDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-transaction-validate-rollback-error-'));
+    t.after(() => fs.promises.rm(parentDirectory, { recursive: true, force: true }));
+    const plan = createDirectoryTransactionPlan(parentDirectory, 'lib', 'validation-rollback-fails');
+    await writeSentinel(plan.targetDirectory, 'old');
+    await writeSentinel(plan.temporaryDirectory, 'new');
+    const filesystem = {
+        ...fs.promises,
+        rename: async (source, destination) => {
+            if (path.resolve(source) === path.resolve(plan.backupDirectory)
+                && path.resolve(destination) === path.resolve(plan.targetDirectory)) {
+                throw Object.assign(new Error('validation rollback failed'), { code: 'EACCES' });
+            }
+            return fs.promises.rename(source, destination);
+        },
+    };
+
+    await assert.rejects(replaceDirectoryTransactional(plan, {
+        filesystem,
+        validateInstalled: async () => { throw new Error('installed validation failed'); },
+    }), error => {
+        assert.ok(error instanceof AggregateError);
+        assert.deepEqual(error.errors.map(item => item.message), [
+            'installed validation failed',
+            'validation rollback failed',
+        ]);
+        return true;
+    });
+    assert.equal(fs.existsSync(plan.targetDirectory), false);
+    assert.equal(await fs.promises.readFile(path.join(plan.backupDirectory, 'sentinel.txt'), 'utf8'), 'old');
+    assert.equal((await transactionArtifacts(plan)).some(name => name.includes('-installed-')), false);
+});
+
 test('directory transaction restores original bytes when install rename fails', async t => {
     const parentDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-transaction-rollback-'));
     t.after(() => fs.promises.rm(parentDirectory, { recursive: true, force: true }));
@@ -3312,6 +3482,27 @@ test('publish re-attests copied deferred backend artifacts before atomic install
             record.metafile.inputs[importer].imports[0].original = './unrelated-service-impl';
             await fs.promises.writeFile(file, JSON.stringify(record));
         }, /alias|import.*record|exact.*edge/i],
+        ['external copied exact alias edge', async temporaryLib => {
+            const file = path.join(temporaryLib, 'metadata', 'backend.json');
+            const record = JSON.parse(await fs.promises.readFile(file, 'utf8'));
+            const importer = `node_modules/${SCANOSS_BACKEND_DESCRIPTOR.importer}.js`;
+            record.metafile.inputs[importer].imports[0].external = true;
+            await fs.promises.writeFile(file, JSON.stringify(record));
+        }, /external|exact.*edge/i],
+        ['non-static copied exact alias edge', async temporaryLib => {
+            const file = path.join(temporaryLib, 'metadata', 'backend.json');
+            const record = JSON.parse(await fs.promises.readFile(file, 'utf8'));
+            const importer = `node_modules/${SCANOSS_BACKEND_DESCRIPTOR.importer}.js`;
+            record.metafile.inputs[importer].imports[0].kind = 'dynamic-import';
+            await fs.promises.writeFile(file, JSON.stringify(record));
+        }, /kind|static.*import|exact.*edge/i],
+        ['unrelated copied proxy input', async temporaryLib => {
+            const file = path.join(temporaryLib, 'metadata', 'backend.json');
+            const record = JSON.parse(await fs.promises.readFile(file, 'utf8'));
+            const importer = `node_modules/${SCANOSS_BACKEND_DESCRIPTOR.importer}.js`;
+            record.metafile.inputs[importer].imports[0].path = 'node_modules/unrelated/scanoss-service-proxy.js';
+            await fs.promises.writeFile(file, JSON.stringify(record));
+        }, /alias|resolved.*proxy|import.*record|exact.*edge/i],
         ['missing copied runtime inventory', async temporaryLib => {
             const file = path.join(temporaryLib, 'metadata', 'backend-scanoss.json');
             const record = JSON.parse(await fs.promises.readFile(file, 'utf8'));
@@ -3331,36 +3522,89 @@ test('publish re-attests copied deferred backend artifacts before atomic install
     ];
 
     for (const [index, [name, mutate, pattern]] of mutations.entries()) {
-        const browserDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), `ride-publish-attestation-${index}-`));
-        t.after(() => fs.promises.rm(browserDirectory, { recursive: true, force: true }));
-        const manifest = profileBuildManifest({ buildId: `scanoss-copy-${index}` });
-        manifest.featureGroups = { ai: { deferredBackendModules: [SCANOSS_BACKEND_DESCRIPTOR] } };
-        manifest.digest = canonicalDigest({
-            schema: 'ride.tauri-frontend-profile@2',
-            profile: manifest.profile,
-            roots: manifest.roots,
-            extensions: manifest.extensions,
-            packages: manifest.packages,
-            featureGroups: manifest.featureGroups,
-        });
-        const sourceDirectory = await createPublishSource(browserDirectory, manifest, 'source-main');
-        const { featureBytes } = await writeDeferredBackendAttestation(sourceDirectory, manifest);
-        await writeSentinel(path.join(browserDirectory, 'lib'), 'previous-complete-build');
+        await t.test(name, async subtest => {
+            const browserDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), `ride-publish-attestation-${index}-`));
+            subtest.after(() => fs.promises.rm(browserDirectory, { recursive: true, force: true }));
+            const manifest = profileBuildManifest({ buildId: `scanoss-copy-${index}` });
+            manifest.featureGroups = { ai: { deferredBackendModules: [SCANOSS_BACKEND_DESCRIPTOR] } };
+            manifest.digest = canonicalDigest({
+                schema: 'ride.tauri-frontend-profile@2',
+                profile: manifest.profile,
+                roots: manifest.roots,
+                extensions: manifest.extensions,
+                packages: manifest.packages,
+                featureGroups: manifest.featureGroups,
+            });
+            const sourceDirectory = await createPublishSource(browserDirectory, manifest, 'source-main');
+            const { featureBytes } = await writeDeferredBackendAttestation(sourceDirectory, manifest);
+            await writeSentinel(path.join(browserDirectory, 'lib'), 'previous-complete-build');
 
-        await assert.rejects(publishProfileBuild({
-            browserDirectory,
-            expectedProfile: manifest.profile,
-            buildId: manifest.buildId,
-            sourceDirectory,
-            sourceIdentity: async () => manifest.sourceIdentity,
-            copyTree: async (source, destination) => {
-                await fs.promises.cp(source, destination, { recursive: true });
-                await mutate(destination);
-            },
-        }), pattern, name);
-        assert.equal(await fs.promises.readFile(path.join(browserDirectory, 'lib', 'sentinel.txt'), 'utf8'), 'previous-complete-build');
-        assert.equal(await fs.promises.readFile(path.join(sourceDirectory, SCANOSS_BACKEND_DESCRIPTOR.output), 'utf8'), featureBytes);
+            await assert.rejects(publishProfileBuild({
+                browserDirectory,
+                expectedProfile: manifest.profile,
+                buildId: manifest.buildId,
+                sourceDirectory,
+                sourceIdentity: async () => manifest.sourceIdentity,
+                copyTree: async (source, destination) => {
+                    await fs.promises.cp(source, destination, { recursive: true });
+                    await mutate(destination);
+                },
+            }), pattern, name);
+            assert.equal(await fs.promises.readFile(path.join(browserDirectory, 'lib', 'sentinel.txt'), 'utf8'), 'previous-complete-build');
+            assert.equal(await fs.promises.readFile(path.join(sourceDirectory, SCANOSS_BACKEND_DESCRIPTOR.output), 'utf8'), featureBytes);
+        });
     }
+});
+
+test('publish re-attests the installed lib and rolls back a post-copy mutation', async t => {
+    const browserDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-publish-installed-attestation-'));
+    t.after(() => fs.promises.rm(browserDirectory, { recursive: true, force: true }));
+    const manifest = profileBuildManifest({ buildId: 'scanoss-installed-mutation' });
+    manifest.featureGroups = { ai: { deferredBackendModules: [SCANOSS_BACKEND_DESCRIPTOR] } };
+    manifest.digest = canonicalDigest({
+        schema: 'ride.tauri-frontend-profile@2',
+        profile: manifest.profile,
+        roots: manifest.roots,
+        extensions: manifest.extensions,
+        packages: manifest.packages,
+        featureGroups: manifest.featureGroups,
+    });
+    const sourceDirectory = await createPublishSource(browserDirectory, manifest, 'source-main');
+    const { featureBytes } = await writeDeferredBackendAttestation(sourceDirectory, manifest);
+    await writeSentinel(path.join(browserDirectory, 'lib'), 'previous-complete-build');
+    let installedMutations = 0;
+    const targetLib = path.join(browserDirectory, 'lib');
+    const filesystem = {
+        ...fs.promises,
+        rename: async (source, destination) => {
+            await fs.promises.rename(source, destination);
+            if (path.resolve(destination) === path.resolve(targetLib)
+                && path.basename(source).startsWith('.lib.tmp-')) {
+                installedMutations += 1;
+                await fs.promises.writeFile(
+                    path.join(destination, 'backend', 'scanoss-service-feature.cjs'),
+                    'mutated-after-pre-install-attestation',
+                );
+            }
+        },
+    };
+
+    await assert.rejects(publishProfileBuild({
+        browserDirectory,
+        expectedProfile: manifest.profile,
+        buildId: manifest.buildId,
+        sourceDirectory,
+        sourceIdentity: async () => manifest.sourceIdentity,
+        transactionOptions: { filesystem },
+    }), /hash|attest|installed validation/i);
+
+    assert.equal(installedMutations, 1);
+    assert.equal(await fs.promises.readFile(path.join(targetLib, 'sentinel.txt'), 'utf8'), 'previous-complete-build');
+    assert.equal(await fs.promises.readFile(path.join(sourceDirectory, SCANOSS_BACKEND_DESCRIPTOR.output), 'utf8'), featureBytes);
+    assert.equal(fs.existsSync(sourceDirectory), true);
+    const installedMarkers = (await fs.promises.readdir(browserDirectory))
+        .filter(name => name.startsWith('.lib.transaction-') && name.includes('-installed-'));
+    assert.deepEqual(installedMarkers, []);
 });
 
 test('publish rejects profile mismatch, stale commit, and corrupt digest without replacing lib', async t => {

@@ -15,6 +15,10 @@ function normalize(candidate) {
     return candidate.replaceAll('\\', '/').replace(/^\.\//, '');
 }
 
+function portableRelativePathIdentity(candidate) {
+    return normalize(candidate).toLowerCase();
+}
+
 function canonicalPath(candidate, prefix) {
     return typeof candidate === 'string'
         && candidate.startsWith(prefix)
@@ -109,8 +113,8 @@ export function deferredBackendDescriptors(manifest) {
             ['edge', `${descriptor.importer}\0${descriptor.module}`],
             ['package', descriptor.package],
             ['module', descriptor.module],
-            ['proxy', descriptor.proxy],
-            ['entry', descriptor.entry],
+            ['proxy', portableRelativePathIdentity(descriptor.proxy)],
+            ['entry', portableRelativePathIdentity(descriptor.entry)],
             ['output', descriptor.output],
             ['action', descriptor.action],
         ]) {
@@ -122,6 +126,73 @@ export function deferredBackendDescriptors(manifest) {
         }
     }
     return records;
+}
+
+function insideDirectory(baseDirectory, candidate) {
+    const relative = path.relative(path.resolve(baseDirectory), path.resolve(candidate));
+    return Boolean(relative)
+        && relative !== '..'
+        && !relative.startsWith(`..${path.sep}`)
+        && !path.isAbsolute(relative);
+}
+
+function nativeRealpath(candidate) {
+    return fs.realpathSync.native?.(candidate) ?? fs.realpathSync(candidate);
+}
+
+function physicalFileIdentities(candidate) {
+    const realpath = nativeRealpath(candidate);
+    const stat = fs.statSync(candidate, { bigint: true });
+    const identities = [`realpath:${process.platform === 'win32' ? realpath.toLowerCase() : realpath}`];
+    if (stat.dev !== 0n || stat.ino !== 0n) {
+        identities.push(`file:${stat.dev}:${stat.ino}`);
+    }
+    return identities;
+}
+
+export function assertDeferredBackendSourceIdentities(descriptorRecords, browserDirectory) {
+    const resolvedBrowserDirectory = path.resolve(browserDirectory);
+    const logicalInventories = new Map([
+        ['proxy', new Set()],
+        ['entry', new Set()],
+    ]);
+    const physicalInventories = new Map([
+        ['proxy', new Map()],
+        ['entry', new Map()],
+    ]);
+    for (const { groupName, descriptor } of descriptorRecords) {
+        for (const field of ['proxy', 'entry']) {
+            const source = descriptor?.[field];
+            const label = `Deferred backend ${field} for ${groupName}/${descriptor?.action ?? '<unknown>'}`;
+            const logicalIdentity = portableRelativePathIdentity(source ?? '');
+            if (logicalInventories.get(field).has(logicalIdentity)) {
+                throw new Error(`Deferred backend ${field} is duplicated: ${source}.`);
+            }
+            logicalInventories.get(field).add(logicalIdentity);
+            const candidate = path.resolve(resolvedBrowserDirectory, source ?? '');
+            if (!insideDirectory(resolvedBrowserDirectory, candidate)) {
+                throw new Error(`${label} must stay inside the browser application: ${source}.`);
+            }
+            let stat;
+            try {
+                stat = fs.lstatSync(candidate);
+            } catch (error) {
+                throw new Error(`${label} is missing: ${source} (${error.message}).`);
+            }
+            if (stat.isSymbolicLink() || !stat.isFile()) {
+                throw new Error(`${label} must be a regular file: ${source}.`);
+            }
+            for (const identity of physicalFileIdentities(candidate)) {
+                const existing = physicalInventories.get(field).get(identity);
+                if (existing) {
+                    throw new Error(
+                        `Deferred backend ${field} physical identity is duplicated: ${existing} and ${source}.`,
+                    );
+                }
+                physicalInventories.get(field).set(identity, source);
+            }
+        }
+    }
 }
 
 function absoluteMetadataPath(candidate) {
@@ -318,6 +389,13 @@ export function attestDeferredBackendFeatures({ manifest, libDirectory } = {}) {
         const proxyRecords = imports.filter(imported => normalize(imported?.path ?? '') === descriptor.proxy);
         if (requestRecords.length !== 1 || proxyRecords.length !== 1 || requestRecords[0] !== proxyRecords[0]) {
             throw new Error(`${label} exact alias edge must have exactly one import record with original ${expectedRequest} resolved to ${descriptor.proxy}.`);
+        }
+        const aliasRecord = requestRecords[0];
+        if (aliasRecord.external === true) {
+            throw new Error(`${label} exact alias edge must not be external.`);
+        }
+        if (aliasRecord.kind !== 'require-call') {
+            throw new Error(`${label} exact alias edge has unsupported static import kind ${aliasRecord.kind ?? '<missing>'}.`);
         }
         if (!mainInputs.includes(descriptor.proxy) || !Object.hasOwn(backendRecord.metafile.inputs, descriptor.proxy)) {
             throw new Error(`${label} proxy is missing from backend main.`);

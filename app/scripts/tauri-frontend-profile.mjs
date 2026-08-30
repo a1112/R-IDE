@@ -5,6 +5,7 @@ import { execFileSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import {
+    assertDeferredBackendSourceIdentities,
     attestDeferredBackendFeatures,
     deferredBackendDescriptors as validateAttestedBackendDescriptors,
 } from './tauri-backend-feature-attestation.mjs';
@@ -350,8 +351,8 @@ function normalizedFeatureGroups(featureGroups, browserDependencies) {
                 ['edge', `${entry.importer}\0${entry.module}`, classifiedBackendEdges],
                 ['package', entry.package, classifiedBackendPackages],
                 ['module', entry.module, classifiedBackendModules],
-                ['proxy', entry.proxy, classifiedBackendProxies],
-                ['entry', entry.entry, classifiedBackendEntries],
+                ['proxy', entry.proxy.toLowerCase(), classifiedBackendProxies],
+                ['entry', entry.entry.toLowerCase(), classifiedBackendEntries],
                 ['action', entry.action, classifiedBackendActions],
                 ['output', entry.output, classifiedBackendOutputs],
             ]) {
@@ -725,24 +726,13 @@ function assertProfilePath(browserDirectory, candidate) {
 }
 
 export async function validateDeferredBackendModuleFiles(featureGroups, browserDirectory) {
-    const resolvedBrowserDirectory = path.resolve(browserDirectory);
-    for (const [groupName, group] of Object.entries(featureGroups ?? {}).sort(([left], [right]) => compareText(left, right))) {
-        for (const descriptor of group.deferredBackendModules ?? []) {
-            for (const [field, label] of [['proxy', 'proxy'], ['entry', 'entry']]) {
-                const candidate = path.resolve(resolvedBrowserDirectory, descriptor[field]);
-                assertProfilePath(resolvedBrowserDirectory, candidate);
-                let stat;
-                try {
-                    stat = await fs.promises.lstat(candidate);
-                } catch (error) {
-                    throw new Error(`Deferred backend ${label} for ${groupName}/${descriptor.action} is missing: ${descriptor[field]} (${error.message}).`);
-                }
-                if (stat.isSymbolicLink() || !stat.isFile()) {
-                    throw new Error(`Deferred backend ${label} for ${groupName}/${descriptor.action} must be a regular file: ${descriptor[field]}.`);
-                }
-            }
-        }
-    }
+    const descriptorRecords = Object.entries(featureGroups ?? {})
+        .sort(([left], [right]) => compareText(left, right))
+        .flatMap(([groupName, group]) => (group.deferredBackendModules ?? []).map(descriptor => ({
+            groupName,
+            descriptor,
+        })));
+    assertDeferredBackendSourceIdentities(descriptorRecords, browserDirectory);
 }
 
 function assertPathSegment(value, label) {
@@ -1124,6 +1114,9 @@ export async function replaceDirectoryTransactional(plan, options = {}) {
         }
     }
     const { filesystem, retry } = filesystemOptions(options);
+    if (options.validateInstalled !== undefined && typeof options.validateInstalled !== 'function') {
+        throw new Error('Directory transaction installed validation callback must be a function.');
+    }
     await recoverDirectoryTransactions({ parentDirectory: plan.parentDirectory, targetName: plan.targetName }, options);
     if (!await assertRegularDirectoryIfPresent(plan.temporaryDirectory, filesystem)) {
         throw new Error(`Directory transaction source is missing: ${plan.temporaryDirectory}`);
@@ -1151,6 +1144,29 @@ export async function replaceDirectoryTransactional(plan, options = {}) {
             throw new AggregateError([installError, rollbackError], 'Directory install and rollback both failed.');
         }
         throw installError;
+    }
+    if (options.validateInstalled) {
+        try {
+            await options.validateInstalled(plan.targetDirectory);
+        } catch (validationError) {
+            try {
+                await retryRemove(filesystem, plan.targetDirectory, retry);
+                if (targetExists) {
+                    await retryRename(filesystem, plan.backupDirectory, plan.targetDirectory, retry);
+                    await writeTransactionMarker(plan, 'rolled-back', options);
+                }
+                await removeTransactionMarkerFiles(plan, filesystem, retry);
+            } catch (rollbackError) {
+                const rollbackErrors = rollbackError instanceof AggregateError
+                    ? rollbackError.errors
+                    : [rollbackError];
+                throw new AggregateError(
+                    [validationError, ...rollbackErrors],
+                    'Directory installed validation and rollback both failed.',
+                );
+            }
+            throw validationError;
+        }
     }
     await writeTransactionMarker(plan, 'installed', options);
     await retryRemove(filesystem, plan.backupDirectory, retry);
@@ -1779,7 +1795,17 @@ export async function publishProfileBuild({
         });
         lock.assertHealthy();
         transactionStarted = true;
-        await replaceDirectoryTransactional(plan, transactionOptions);
+        const additionalInstalledValidation = transactionOptions.validateInstalled;
+        await replaceDirectoryTransactional(plan, {
+            ...transactionOptions,
+            validateInstalled: async installedDirectory => {
+                await additionalInstalledValidation?.(installedDirectory);
+                attestDeferredBackendFeatures({
+                    manifest,
+                    libDirectory: installedDirectory,
+                });
+            },
+        });
         lock.assertHealthy();
         await retryRemove(fs.promises, expectedSource, {});
         result = { profile: manifest.profile, buildId: manifest.buildId, digest: manifest.digest, destinationLib };

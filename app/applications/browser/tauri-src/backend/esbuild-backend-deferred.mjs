@@ -15,6 +15,10 @@ function normalize(candidate) {
     return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
 }
 
+function portableRelativePathIdentity(candidate) {
+    return candidate.replaceAll('\\', '/').toLowerCase();
+}
+
 function assertInside(baseDirectory, candidate, label) {
     const relative = path.relative(path.resolve(baseDirectory), path.resolve(candidate));
     if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
@@ -93,6 +97,33 @@ function resolveDescriptor(descriptor, baseDirectory) {
     };
 }
 
+function physicalFileIdentities(candidate) {
+    const realpath = fs.realpathSync.native?.(candidate) ?? fs.realpathSync(candidate);
+    const stat = fs.statSync(candidate, { bigint: true });
+    const identities = [`realpath:${normalize(realpath)}`];
+    if (stat.dev !== 0n || stat.ino !== 0n) {
+        identities.push(`file:${stat.dev}:${stat.ino}`);
+    }
+    return identities;
+}
+
+function assertDistinctDescriptorSourceFiles(descriptors) {
+    for (const field of ['proxy', 'entry']) {
+        const identities = new Map();
+        for (const descriptor of descriptors) {
+            for (const identity of physicalFileIdentities(descriptor[`${field}Path`])) {
+                const existing = identities.get(identity);
+                if (existing) {
+                    throw new Error(
+                        `Deferred backend ${field} physical identity is duplicated: ${existing[field]} and ${descriptor[field]}.`,
+                    );
+                }
+                identities.set(identity, descriptor);
+            }
+        }
+    }
+}
+
 function mainOutputPaths(nodeOptions, baseDirectory) {
     if (nodeOptions.outfile) {
         return new Set([normalize(path.resolve(baseDirectory, nodeOptions.outfile))]);
@@ -147,14 +178,16 @@ export function createTauriBackendBuildPlans(nodeOptions, profileManifest, baseD
     for (const field of ['proxy', 'entry']) {
         const values = new Set();
         for (const descriptor of rawDescriptors) {
-            if (values.has(descriptor[field])) {
+            const identity = portableRelativePathIdentity(descriptor[field]);
+            if (values.has(identity)) {
                 throw new Error(`Deferred backend ${field} is duplicated: ${descriptor[field]}.`);
             }
-            values.add(descriptor[field]);
+            values.add(identity);
         }
     }
     const descriptors = rawDescriptors
         .map(descriptor => resolveDescriptor(descriptor, baseDirectory));
+    assertDistinctDescriptorSourceFiles(descriptors);
     if (descriptors.length === 0) {
         return { main: nodeOptions, features: [] };
     }

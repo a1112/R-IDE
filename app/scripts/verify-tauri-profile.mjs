@@ -7,6 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { canonicalDigest, PROFILE_SCHEMA } from './tauri-frontend-profile.mjs';
 import {
+  assertDeferredBackendSourceIdentities,
   assertPortableMetadataRecord,
   attestDeferredBackendFeatures,
   deferredBackendDescriptors as validateDeferredBackendDescriptors,
@@ -343,10 +344,7 @@ function verifyDeferredBackendExclusion(manifest, backendRecord) {
 }
 
 function verifyDeferredBackendSources(descriptorRecords, browserDirectory) {
-  for (const { groupName, descriptor } of descriptorRecords) {
-    assertRegularOutput(browserDirectory, descriptor.proxy, `Deferred backend proxy ${groupName}/${descriptor.action}`);
-    assertRegularOutput(browserDirectory, descriptor.entry, `Deferred backend entry ${groupName}/${descriptor.action}`);
-  }
+  assertDeferredBackendSourceIdentities(descriptorRecords, browserDirectory);
 }
 
 function countBundledPlugins(pluginsDirectory) {
@@ -439,6 +437,7 @@ export function verifyTauriProfileInventory({
 
   const metadataDirectory = path.join(resolvedBrowserDirectory, 'lib', 'metadata');
   const backendDescriptors = deferredBackendDescriptors(manifest);
+  verifyDeferredBackendSources(backendDescriptors, resolvedBrowserDirectory);
   const metadataTargets = [
     ...REQUIRED_METADATA,
     ...backendDescriptors.map(({ descriptor }) => `backend-${descriptor.action}`),
@@ -494,7 +493,6 @@ export function verifyTauriProfileInventory({
   let deferredBackendFeatures = [];
   if (manifest.profile === 'tauri-critical') {
     verifyDeferredBackendExclusion(manifest, metadataRecords.backend);
-    verifyDeferredBackendSources(backendDescriptors, resolvedBrowserDirectory);
     deferredBackendFeatures = attestDeferredBackendFeatures({
       manifest,
       libDirectory: path.join(resolvedBrowserDirectory, 'lib'),

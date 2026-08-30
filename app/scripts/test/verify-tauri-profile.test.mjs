@@ -13,6 +13,7 @@ import {
   parseTauriProfileArguments,
   verifyTauriProfileInventory,
 } from '../verify-tauri-profile.mjs';
+import { deferredBackendDescriptors } from '../tauri-backend-feature-attestation.mjs';
 import { createProfileMetadataPlugin } from '../../applications/browser/tauri-src/esbuild-metadata.mjs';
 
 const require = createRequire(import.meta.url);
@@ -335,6 +336,16 @@ test('verifies the attested ScanOSS backend feature inventory and rejects bounda
     }]);
 
     const importerImports = fixture.records.backend.metafile.inputs[importer].imports;
+    importerImports[0].external = true;
+    writeJson(path.join(fixture.browserDirectory, 'lib', 'metadata', 'backend.json'), fixture.records.backend);
+    assert.throws(() => verifyTauriProfileInventory(fixture), /exact.*edge|external/i);
+    delete importerImports[0].external;
+
+    importerImports[0].kind = 'dynamic-import';
+    writeJson(path.join(fixture.browserDirectory, 'lib', 'metadata', 'backend.json'), fixture.records.backend);
+    assert.throws(() => verifyTauriProfileInventory(fixture), /exact.*edge|kind|static.*import/i);
+    importerImports[0].kind = 'require-call';
+
     importerImports[0].original = './unrelated-service-impl';
     writeJson(path.join(fixture.browserDirectory, 'lib', 'metadata', 'backend.json'), fixture.records.backend);
     assert.throws(() => verifyTauriProfileInventory(fixture), /exact.*edge|original|import.*record/i);
@@ -432,6 +443,77 @@ test('verifier rejects duplicate deferred backend proxy and entry identities', (
       fixture.manifest.featureGroups.deferred.deferredBackendModules = [SCANOSS_BACKEND_DESCRIPTOR, alternate];
       publishManifest(fixture);
       assert.throws(() => verifyTauriProfileInventory(fixture), new RegExp(`duplicate.*${field}|${field}.*duplicated`, 'i'));
+    } finally {
+      fs.rmSync(fixture.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test('shared descriptor validation rejects portable case aliases for proxy and entry identities', () => {
+  const alternate = {
+    ...SCANOSS_BACKEND_DESCRIPTOR,
+    package: '@theia/scanoss-alternate',
+    importer: '@theia/scanoss-alternate/lib/node/alternate-backend-module',
+    module: '@theia/scanoss-alternate/lib/node/alternate-service-impl',
+    proxy: 'tauri-src/backend/alternate-proxy.ts',
+    entry: 'tauri-src/backend/alternate-feature.ts',
+    output: 'lib/backend/alternate-feature.cjs',
+    action: 'scanoss-alternate',
+  };
+  for (const field of ['proxy', 'entry']) {
+    const portableCaseAlias = SCANOSS_BACKEND_DESCRIPTOR[field].replace(
+      /scanoss-service/,
+      'SCANOSS-SERVICE',
+    );
+    assert.throws(() => deferredBackendDescriptors({
+      profile: 'tauri-critical',
+      featureGroups: {
+        ai: { deferredBackendModules: [
+          SCANOSS_BACKEND_DESCRIPTOR,
+          { ...alternate, [field]: portableCaseAlias },
+        ] },
+      },
+    }), new RegExp(`duplicate.*${field}|${field}.*duplicated`, 'i'));
+  }
+});
+
+test('verifier rejects physical aliases for deferred backend proxy and entry files before metadata publication', () => {
+  for (const field of ['proxy', 'entry']) {
+    const fixture = createFixture();
+    try {
+      const alternate = {
+        ...SCANOSS_BACKEND_DESCRIPTOR,
+        package: '@theia/scanoss-alternate',
+        importer: '@theia/scanoss-alternate/lib/node/alternate-backend-module',
+        module: '@theia/scanoss-alternate/lib/node/alternate-service-impl',
+        proxy: 'tauri-src/backend/alternate-proxy.ts',
+        entry: 'tauri-src/backend/alternate-feature.ts',
+        output: 'lib/backend/alternate-feature.cjs',
+        action: 'scanoss-alternate',
+      };
+      for (const source of [SCANOSS_BACKEND_DESCRIPTOR.proxy, SCANOSS_BACKEND_DESCRIPTOR.entry]) {
+        const candidate = path.join(fixture.browserDirectory, source);
+        fs.mkdirSync(path.dirname(candidate), { recursive: true });
+        fs.writeFileSync(candidate, 'export {};\n');
+      }
+      const otherField = field === 'proxy' ? 'entry' : 'proxy';
+      const otherCandidate = path.join(fixture.browserDirectory, alternate[otherField]);
+      fs.mkdirSync(path.dirname(otherCandidate), { recursive: true });
+      fs.writeFileSync(otherCandidate, 'export {};\n');
+      fs.linkSync(
+        path.join(fixture.browserDirectory, SCANOSS_BACKEND_DESCRIPTOR[field]),
+        path.join(fixture.browserDirectory, alternate[field]),
+      );
+      fixture.manifest.featureGroups.deferred.deferredBackendModules = [
+        SCANOSS_BACKEND_DESCRIPTOR,
+        alternate,
+      ];
+      publishManifest(fixture);
+
+      assert.throws(
+        () => verifyTauriProfileInventory(fixture),
+        new RegExp(`(?:physical|same file|alias|duplicate).*${field}|${field}.*(?:physical|same file|alias|duplicate)`, 'i'),
+      );
     } finally {
       fs.rmSync(fixture.root, { recursive: true, force: true });
     }
