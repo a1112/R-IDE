@@ -10,7 +10,8 @@
 use ride_tauri::sidecar::{race_backend_publication_with_exit, BackendReadinessPublisher};
 use ride_tauri::startup::{
     present_startup_window, GatewayCapabilitySpec, RuntimePathMode, RuntimePaths,
-    StartupCoordinator, StartupVisibilityDeadline, GATEWAY_CAPABILITY_PERMISSIONS,
+    StartupCoordinator, StartupVisibilityDeadline, StartupWindowCreatedGate,
+    GATEWAY_CAPABILITY_PERMISSIONS,
 };
 use ride_tauri::startup_gateway::{BackendPhase, GatewayError, GatewayLimits, StartupGateway};
 use ride_tauri::startup_metrics::{
@@ -366,7 +367,14 @@ async fn backend_readiness_publishes_private_generation_without_navigation() {
         ));
     }
 
-    let legacy = BackendReadinessPublisher::legacy();
+    let legacy = BackendReadinessPublisher::legacy(StartupWindowCreatedGate::default());
+    assert!(tokio::time::timeout(
+        Duration::from_millis(100),
+        legacy.backend_ready_after_window(private, || true),
+    )
+    .await
+    .expect("legacy readiness must not wait for the gateway-only publication gate")
+    .expect("legacy readiness publication"));
     let legacy_navigations = Arc::new(Mutex::new(Vec::new()));
     let first_legacy_navigation = Arc::clone(&legacy_navigations);
     assert!(legacy

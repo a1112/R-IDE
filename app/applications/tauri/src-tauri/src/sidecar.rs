@@ -12,7 +12,7 @@ use crate::startup::{
     BackendLaunchPlan, BackendProcessTree, BackendReadinessPolicy, BackendSpawnPlan,
     BackendSpawnStrategy, BackendStartToken, BackendStartupAction, BackendStartupEvent,
     BackendStartupState, BackendTransport, PreparedBackendProcessTree, RuntimePathMode,
-    RuntimePaths, StartupWindowCreatedGate,
+    RuntimePaths, StartupWindowCreatedGate, StartupWindowCreatedOutcome,
 };
 use crate::startup_gateway::{BackendGeneration, GatewayState};
 use crate::startup_metrics::StartupMilestone;
@@ -100,6 +100,7 @@ where
 pub enum BackendReadinessPublisher {
     Legacy {
         navigation_dispatched: Arc<AtomicBool>,
+        window_created: StartupWindowCreatedGate,
     },
     Gateway {
         state: GatewayState,
@@ -110,9 +111,10 @@ pub enum BackendReadinessPublisher {
 }
 
 impl BackendReadinessPublisher {
-    pub fn legacy() -> Self {
+    pub fn legacy(window_created: StartupWindowCreatedGate) -> Self {
         Self::Legacy {
             navigation_dispatched: Arc::new(AtomicBool::new(false)),
+            window_created,
         }
     }
 
@@ -139,6 +141,14 @@ impl BackendReadinessPublisher {
         }
     }
 
+    pub fn window_created_gate(&self) -> StartupWindowCreatedGate {
+        match self {
+            Self::Legacy { window_created, .. } | Self::Gateway { window_created, .. } => {
+                window_created.clone()
+            }
+        }
+    }
+
     pub async fn backend_ready(&self, backend_addr: SocketAddr) -> Result<(), String> {
         self.backend_ready_after_window(backend_addr, || true)
             .await
@@ -161,7 +171,11 @@ impl BackendReadinessPublisher {
                 window_created,
                 ..
             } => {
-                window_created.wait().await;
+                if window_created.wait().await != StartupWindowCreatedOutcome::Created {
+                    return Err(
+                        "Main window creation stopped before backend readiness publication".into(),
+                    );
+                }
                 state
                     .backend_ready_if_current(*generation, backend_addr, before_publish)
                     .await
@@ -180,6 +194,7 @@ impl BackendReadinessPublisher {
             Self::Gateway { .. } => return Ok(false),
             Self::Legacy {
                 navigation_dispatched,
+                ..
             } => navigation_dispatched,
         };
         if navigation_dispatched
@@ -2344,6 +2359,11 @@ async fn start_backend_direct_process(
             )),
         };
     }
+    schedule_backend_priority_restore(
+        app_handle,
+        backend_tree.clone(),
+        publisher.window_created_gate(),
+    );
     log::info!("Backend direct-pipe process started with pid {pid}");
     let mut startup_state = BackendStartupState::spawned(pid, BACKEND_PORT);
 
@@ -2749,6 +2769,34 @@ fn record_backend_spawned_before_window(app_handle: &AppHandle) {
             log::warn!("Failed to record overlapped backend spawn: {error}");
         }
     }
+}
+
+fn schedule_backend_priority_restore(
+    app_handle: &AppHandle,
+    tree: BackendProcessTree,
+    window_created: StartupWindowCreatedGate,
+) {
+    if !tree.priority_restore_pending() {
+        return;
+    }
+
+    let app_handle = app_handle.clone();
+    tauri::async_runtime::spawn(async move {
+        let created = window_created.wait().await == StartupWindowCreatedOutcome::Created;
+        let still_owned = created
+            && app_handle
+                .try_state::<crate::AppState>()
+                .is_some_and(|state| {
+                    let ownership = state
+                        .backend_ownership
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    ownership.owns_active_tree(&tree)
+                });
+        tree.complete_priority_handoff(still_owned, |diagnostic| {
+            log::warn!("Failed to restore the owned backend root priority: {diagnostic}");
+        });
+    });
 }
 
 fn record_backend_listening(app_handle: &AppHandle) {
