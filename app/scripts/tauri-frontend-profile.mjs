@@ -1937,10 +1937,30 @@ export async function publishProfileBuild({
     return result;
 }
 
+export async function discardProfileBuild({
+    browserDirectory,
+    buildId,
+    ...options
+} = {}) {
+    const resolvedBrowserDirectory = path.resolve(browserDirectory);
+    assertPathSegment(buildId, 'Tauri profile build id');
+    const targetDirectory = canonicalBuildSource(resolvedBrowserDirectory, buildId);
+    const { filesystem, retry } = filesystemOptions(options);
+    const state = await pathState(targetDirectory, filesystem);
+    if (!state.exists) {
+        return { buildId, removed: false, targetDirectory };
+    }
+    if (state.stat.isSymbolicLink() || !state.stat.isDirectory()) {
+        throw new Error(`Refusing to discard non-directory Tauri profile build: ${targetDirectory}`);
+    }
+    await retryRemove(filesystem, targetDirectory, retry);
+    return { buildId, removed: true, targetDirectory };
+}
+
 export function parseProfileCliArguments(argv, environment = process.env) {
     const [command, ...tokens] = argv;
-    if (command !== 'prepare' && command !== 'publish') {
-        throw new Error('Usage: node tauri-frontend-profile.mjs <prepare|publish> --profile <name> --build-id <id> [--source-dir <path>]');
+    if (command !== 'prepare' && command !== 'publish' && command !== 'discard') {
+        throw new Error('Usage: node tauri-frontend-profile.mjs <prepare|publish|discard> --build-id <id> [--profile <name>] [--source-dir <path>]');
     }
     const values = new Map();
     for (let index = 0; index < tokens.length; index += 2) {
@@ -1952,7 +1972,9 @@ export function parseProfileCliArguments(argv, environment = process.env) {
         }
         values.set(option, value);
     }
-    const profileName = values.get('--profile') ?? environment.RIDE_TAURI_FRONTEND_PROFILE ?? 'tauri-critical';
+    const profileName = command === 'discard'
+        ? values.get('--profile')
+        : values.get('--profile') ?? environment.RIDE_TAURI_FRONTEND_PROFILE ?? 'tauri-critical';
     const buildId = values.get('--build-id');
     if (!buildId) {
         throw new Error('Tauri profile CLI requires --build-id.');
@@ -1964,6 +1986,9 @@ export function parseProfileCliArguments(argv, environment = process.env) {
     }
     if (command === 'prepare' && sourceDirectory) {
         throw new Error('Tauri profile prepare does not accept --source-dir.');
+    }
+    if (command === 'discard' && (profileName || sourceDirectory)) {
+        throw new Error('Tauri profile discard accepts only --build-id.');
     }
     return { command, profileName, buildId, sourceDirectory };
 }
@@ -1985,6 +2010,10 @@ async function runCli() {
         });
         process.stdout.write(`Published ${result.profile} build ${result.buildId} frontend and backend bundles.\n`);
         return;
+    }
+    if (command === 'discard') {
+        const result = await discardProfileBuild({ browserDirectory, buildId });
+        process.stdout.write(`${result.removed ? 'Discarded' : 'No isolated directory for'} Tauri profile build ${result.buildId}.\n`);
     }
 }
 

@@ -12,6 +12,7 @@ import {
     acquirePublishLock,
     canonicalDigest,
     createDirectoryTransactionPlan,
+    discardProfileBuild,
     findPackageManifest,
     generateProfileTarget,
     publishProfileBuild,
@@ -4279,10 +4280,47 @@ test('CLI requires and preserves profile build identity arguments', () => {
         buildId: 'cli-full',
         sourceDirectory: 'C:\\builds\\cli-full',
     });
+    assert.deepEqual(parseProfileCliArguments([
+        'discard', '--build-id', 'cli-failed',
+    ], {}), {
+        command: 'discard',
+        profileName: undefined,
+        buildId: 'cli-failed',
+        sourceDirectory: undefined,
+    });
     assert.throws(() => parseProfileCliArguments(['publish', '--profile', 'full'], {}), /--build-id/i);
     assert.throws(() => parseProfileCliArguments([
         'publish', '--profile', 'full', '--build-id', 'cli-full',
     ], {}), /--source-dir/i);
+});
+
+test('discards only the canonical isolated profile build directory', async t => {
+    const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-profile-discard-'));
+    t.after(() => fs.promises.rm(root, { recursive: true, force: true }));
+    const browserDirectory = path.join(root, 'applications', 'browser');
+    const buildDirectory = path.join(browserDirectory, '.ride-tauri-profile', 'builds', 'failed-build');
+    const siblingDirectory = path.join(browserDirectory, '.ride-tauri-profile', 'builds', 'keep-build');
+    await fs.promises.mkdir(buildDirectory, { recursive: true });
+    await fs.promises.mkdir(siblingDirectory, { recursive: true });
+    await fs.promises.writeFile(path.join(buildDirectory, 'partial.js'), 'partial');
+    await fs.promises.writeFile(path.join(siblingDirectory, 'keep.js'), 'keep');
+
+    assert.deepEqual(await discardProfileBuild({ browserDirectory, buildId: 'failed-build' }), {
+        buildId: 'failed-build',
+        removed: true,
+        targetDirectory: buildDirectory,
+    });
+    assert.equal(fs.existsSync(buildDirectory), false);
+    assert.equal(fs.existsSync(siblingDirectory), true);
+    assert.deepEqual(await discardProfileBuild({ browserDirectory, buildId: 'failed-build' }), {
+        buildId: 'failed-build',
+        removed: false,
+        targetDirectory: buildDirectory,
+    });
+    await assert.rejects(
+        discardProfileBuild({ browserDirectory, buildId: '..' }),
+        /build id is not canonical/i,
+    );
 });
 
 test('generates an isolated target without writing tracked package.json or src-gen', async t => {

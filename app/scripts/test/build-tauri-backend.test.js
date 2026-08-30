@@ -122,6 +122,57 @@ test('returns status 1 when a build step is terminated by a signal', () => {
   }
 });
 
+test('discards the exact isolated profile build after a failed build step', () => {
+  const { runBuild } = require(helperPath);
+  const calls = [];
+  const fakeSpawn = (command, args, options) => {
+    calls.push({ command, args, options });
+    return { status: calls.length === 1 ? 7 : 0 };
+  };
+
+  const previousExitCode = process.exitCode;
+  try {
+    process.exitCode = undefined;
+    assert.equal(runBuild('win32', fakeSpawn, 'tauri-critical', {}, {
+      buildIdFactory: () => 'failed-unit-build',
+    }), 7);
+    assert.equal(calls.length, 2);
+    assert.equal(calls[1].command, process.execPath);
+    assert.deepEqual(calls[1].args.slice(-3), ['discard', '--build-id', 'failed-unit-build']);
+    assert.equal(calls[1].options.cwd, browserDirectory);
+    assert.equal(calls[1].options.shell, false);
+  } finally {
+    process.exitCode = previousExitCode;
+  }
+});
+
+test('does not mask the original build failure when discard cannot start', () => {
+  const { runBuild } = require(helperPath);
+  const previousExitCode = process.exitCode;
+  const previousWarn = console.warn;
+  const warnings = [];
+  let calls = 0;
+  try {
+    process.exitCode = undefined;
+    console.warn = message => warnings.push(message);
+    const status = runBuild('win32', () => {
+      calls++;
+      if (calls === 1) {
+        return { status: 9 };
+      }
+      throw new Error('discard launcher unavailable');
+    }, 'tauri-critical', {}, { buildIdFactory: () => 'failed-cleanup-build' });
+    assert.equal(status, 9);
+    assert.equal(process.exitCode, 9);
+    assert.deepEqual(warnings, [
+      'Unable to discard failed Tauri profile build failed-cleanup-build: discard launcher unavailable',
+    ]);
+  } finally {
+    console.warn = previousWarn;
+    process.exitCode = previousExitCode;
+  }
+});
+
 test('declares the exact browser-root inventory for every feature group', () => {
   const browserManifest = JSON.parse(fs.readFileSync(path.join(browserDirectory, 'package.json'), 'utf8'));
   const profile = JSON.parse(fs.readFileSync(path.join(browserDirectory, 'tauri-profile.json'), 'utf8'));

@@ -100,8 +100,40 @@ function createSpawnInvocation(step, platform) {
   return { command: comspec, args: ['/d', '/s', '/c', commandLine] };
 }
 
-function runBuild(platform = process.platform, spawn = spawnSync, profile, environment = process.env) {
-  for (const step of createBuildPlan(platform, profile, environment)) {
+function discardFailedBuild(plan, platform, spawn) {
+  const buildId = plan[0]?.env?.RIDE_TAURI_BUILD_ID;
+  if (!buildId) {
+    return;
+  }
+  const step = {
+    command: process.execPath,
+    args: createNodeArgs(profileScript, 'discard', '--build-id', buildId),
+    cwd: browserDirectory,
+    env: plan[0].env,
+    shell: false,
+  };
+  const invocation = createSpawnInvocation(step, platform);
+  let result;
+  try {
+    result = spawn(invocation.command, invocation.args, {
+      cwd: step.cwd,
+      env: step.env,
+      shell: step.shell,
+      stdio: 'inherit',
+    });
+  } catch (error) {
+    console.warn(`Unable to discard failed Tauri profile build ${buildId}: ${error.message}`);
+    return;
+  }
+  if (result.error || result.status !== 0) {
+    const reason = result.error?.message ?? `exit status ${result.status ?? 'unknown'}`;
+    console.warn(`Unable to discard failed Tauri profile build ${buildId}: ${reason}`);
+  }
+}
+
+function runBuild(platform = process.platform, spawn = spawnSync, profile, environment = process.env, options = {}) {
+  const plan = createBuildPlan(platform, profile, environment, options);
+  for (const step of plan) {
     const invocation = createSpawnInvocation(step, platform);
     const result = spawn(invocation.command, invocation.args, {
       cwd: step.cwd,
@@ -111,9 +143,11 @@ function runBuild(platform = process.platform, spawn = spawnSync, profile, envir
     });
 
     if (result.error) {
+      discardFailedBuild(plan, platform, spawn);
       throw result.error;
     }
     if (result.status !== 0) {
+      discardFailedBuild(plan, platform, spawn);
       process.exitCode = result.status ?? 1;
       return result.status ?? 1;
     }
@@ -135,5 +169,6 @@ module.exports = {
   profileDirectory,
   createBuildPlan,
   createSpawnInvocation,
+  discardFailedBuild,
   runBuild,
 };
