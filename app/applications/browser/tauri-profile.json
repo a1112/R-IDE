@@ -97,6 +97,17 @@
           "action": "codex-activate"
         }
       ],
+      "deferredBackendModules": [
+        {
+          "package": "@theia/scanoss",
+          "importer": "@theia/scanoss/lib/node/scanoss-backend-module",
+          "module": "@theia/scanoss/lib/node/scanoss-service-impl",
+          "proxy": "tauri-src/backend/scanoss-service-proxy.ts",
+          "entry": "tauri-src/backend/scanoss-service-feature.ts",
+          "output": "lib/backend/scanoss-service-feature.cjs",
+          "action": "scanoss"
+        }
+      ],
       "deferBlockedReason": "The group fails the explicit-adapter and isolated-backend gates; no complete real-action smoke and initial-entry inventory exists."
     },
     "collaboration": {

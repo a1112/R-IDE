@@ -17,6 +17,16 @@ import { createProfileMetadataPlugin } from '../../applications/browser/tauri-sr
 
 const require = createRequire(import.meta.url);
 
+const SCANOSS_BACKEND_DESCRIPTOR = Object.freeze({
+  package: '@theia/scanoss',
+  importer: '@theia/scanoss/lib/node/scanoss-backend-module',
+  module: '@theia/scanoss/lib/node/scanoss-service-impl',
+  proxy: 'tauri-src/backend/scanoss-service-proxy.ts',
+  entry: 'tauri-src/backend/scanoss-service-feature.ts',
+  output: 'lib/backend/scanoss-service-feature.cjs',
+  action: 'scanoss',
+});
+
 test('repository Tauri profile declares the exact deferred Markdown preview descriptor', () => {
   const appDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
   const profile = JSON.parse(fs.readFileSync(path.join(appDirectory, 'applications', 'browser', 'tauri-profile.json'), 'utf8'));
@@ -29,6 +39,12 @@ test('repository Tauri profile declares the exact deferred Markdown preview desc
     action: 'markdown-preview',
   }]);
   assert.match(preview.deferBlockedReason, /markdown/i);
+});
+
+test('repository Tauri profile declares the exact deferred ScanOSS backend edge', () => {
+  const appDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+  const profile = JSON.parse(fs.readFileSync(path.join(appDirectory, 'applications', 'browser', 'tauri-profile.json'), 'utf8'));
+  assert.deepEqual(profile.featureGroups.ai.deferredBackendModules, [SCANOSS_BACKEND_DESCRIPTOR]);
 });
 
 function canonicalJson(value) {
@@ -231,6 +247,112 @@ test('verifies critical profile inventory, workers, plugin hosts, VS Code init, 
   }
 });
 
+test('verifies the attested ScanOSS backend feature inventory and rejects boundary leaks', () => {
+  const fixture = createFixture();
+  const implementation = `node_modules/${SCANOSS_BACKEND_DESCRIPTOR.module}.js`;
+  const featureInputs = [
+    SCANOSS_BACKEND_DESCRIPTOR.entry,
+    implementation,
+    'node_modules/scanoss/index.js',
+    'node_modules/@grpc/grpc-js/build/src/index.js',
+    'node_modules/protobufjs/index.js',
+    'node_modules/google-protobuf/google-protobuf.js',
+    'node_modules/tar/index.js',
+    'node_modules/adm-zip/adm-zip.js',
+    'node_modules/iconv-lite/lib/index.js',
+    'node_modules/tr46/index.js',
+  ];
+  try {
+    fixture.manifest.featureGroups.deferred.deferredBackendModules = [SCANOSS_BACKEND_DESCRIPTOR];
+    for (const source of [SCANOSS_BACKEND_DESCRIPTOR.proxy, SCANOSS_BACKEND_DESCRIPTOR.entry]) {
+      const file = path.join(fixture.browserDirectory, source);
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, 'export {};\n');
+    }
+    const backendMain = fixture.records.backend.metafile.outputs['lib/backend/main.js'];
+    const importer = `node_modules/${SCANOSS_BACKEND_DESCRIPTOR.importer}.js`;
+    fixture.records.backend.metafile.inputs[importer] = { bytes: 1, imports: [] };
+    backendMain.inputs[importer] = { bytesInOutput: 1 };
+    fixture.records.backend.metafile.inputs[SCANOSS_BACKEND_DESCRIPTOR.proxy] = { bytes: 1, imports: [] };
+    backendMain.inputs[SCANOSS_BACKEND_DESCRIPTOR.proxy] = { bytesInOutput: 1 };
+    fixture.records['backend-scanoss'] = metadata(
+      fixture.manifest,
+      'backend-scanoss',
+      featureInputs,
+      [{
+        path: SCANOSS_BACKEND_DESCRIPTOR.output,
+        entryPoint: SCANOSS_BACKEND_DESCRIPTOR.entry,
+        additionalInputs: featureInputs.slice(1),
+      }],
+    );
+    const featureOutput = path.join(fixture.browserDirectory, SCANOSS_BACKEND_DESCRIPTOR.output);
+    fs.mkdirSync(path.dirname(featureOutput), { recursive: true });
+    fs.writeFileSync(featureOutput, 'scanoss-feature');
+    fixture.records['backend-scanoss'].outputHashes[SCANOSS_BACKEND_DESCRIPTOR.output] = crypto
+      .createHash('sha256')
+      .update('scanoss-feature')
+      .digest('hex');
+    publishManifest(fixture);
+
+    const report = verifyTauriProfileInventory(fixture);
+    assert.deepEqual(report.metadataTargets, [
+      'frontend-main',
+      'frontend-secondary-window',
+      'frontend-editor.worker',
+      'frontend-plugin-worker',
+      'backend',
+      'backend-scanoss',
+    ]);
+    assert.deepEqual(report.deferredBackendFeatures, [{
+      action: 'scanoss',
+      output: SCANOSS_BACKEND_DESCRIPTOR.output,
+    }]);
+
+    fixture.records.backend.metafile.inputs[implementation] = { bytes: 1, imports: [] };
+    backendMain.inputs[implementation] = { bytesInOutput: 1 };
+    writeJson(path.join(fixture.browserDirectory, 'lib', 'metadata', 'backend.json'), fixture.records.backend);
+    assert.throws(() => verifyTauriProfileInventory(fixture), /ScanOSS|deferred backend implementation.*backend main/i);
+
+    delete fixture.records.backend.metafile.inputs[implementation];
+    delete backendMain.inputs[implementation];
+    backendMain.imports.push({ path: SCANOSS_BACKEND_DESCRIPTOR.output, kind: 'require-call' });
+    writeJson(path.join(fixture.browserDirectory, 'lib', 'metadata', 'backend.json'), fixture.records.backend);
+    assert.throws(() => verifyTauriProfileInventory(fixture), /deferred backend feature.*statically imported/i);
+
+    backendMain.imports = [];
+    writeJson(path.join(fixture.browserDirectory, 'lib', 'metadata', 'backend.json'), fixture.records.backend);
+    delete fixture.records['backend-scanoss'].metafile.inputs[implementation];
+    delete fixture.records['backend-scanoss'].metafile.outputs[SCANOSS_BACKEND_DESCRIPTOR.output].inputs[implementation];
+    writeJson(
+      path.join(fixture.browserDirectory, 'lib', 'metadata', 'backend-scanoss.json'),
+      fixture.records['backend-scanoss'],
+    );
+    assert.throws(() => verifyTauriProfileInventory(fixture), /deferred backend feature.*real implementation/i);
+
+    fixture.records['backend-scanoss'].metafile.inputs[implementation] = { bytes: 1, imports: [] };
+    fixture.records['backend-scanoss'].metafile.outputs[SCANOSS_BACKEND_DESCRIPTOR.output].inputs[implementation] = { bytesInOutput: 1 };
+    writeJson(
+      path.join(fixture.browserDirectory, 'lib', 'metadata', 'backend-scanoss.json'),
+      fixture.records['backend-scanoss'],
+    );
+    fs.rmSync(path.join(fixture.browserDirectory, SCANOSS_BACKEND_DESCRIPTOR.proxy));
+    assert.throws(() => verifyTauriProfileInventory(fixture), /deferred backend proxy.*missing/i);
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('rejects deferred backend descriptors installed in a full profile', () => {
+  const fixture = createFixture('full');
+  try {
+    fixture.manifest.featureGroups.deferred.deferredBackendModules = [SCANOSS_BACKEND_DESCRIPTOR];
+    publishManifest(fixture);
+    assert.throws(() => verifyTauriProfileInventory(fixture), /full profile.*deferred backend/i);
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test('rejects a missing deferred chunk and a deferred-only backend package', () => {
   const fixture = createFixture();
   try {
@@ -392,7 +514,8 @@ test('profile builds emit named esbuild metadata and expose the verifier command
   assert.match(metadataSource, /schema:\s*'ride\.esbuild-metafile@1'/);
   assert.match(esbuildSource, /target:\s*'frontend-main'/);
   assert.match(esbuildSource, /`frontend-\$\{targetName\}`/);
-  assert.match(esbuildSource, /withProfileMetadata\(nodeOptions, 'backend'\)/);
+  assert.match(esbuildSource, /withProfileMetadata\(backendBuildPlans\.main, 'backend'\)/);
+  assert.match(esbuildSource, /withProfileMetadata\(options, `backend-\$\{action\}`\)/);
   assert.match(metadataSource, /lib', 'metadata'/);
   assert.match(metadataSource, /metafile:\s*result\.metafile/);
   const bundlerGeneratorSource = fs.readFileSync(

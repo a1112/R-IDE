@@ -17,6 +17,11 @@ import {
 import {
     createTauriBrowserBuildPlans,
 } from './tauri-src/esbuild-deferred.mjs';
+import {
+    createTauriBackendBuildPlans,
+    createTauriBuildContexts,
+    runTauriBuildContexts,
+} from './tauri-src/backend/esbuild-backend-deferred.mjs';
 import { createProfileMetadataPlugin } from './tauri-src/esbuild-metadata.mjs';
 import { createWindowsCaCertsFallbackPlugin } from './tauri-src/windows-ca-certs-fallback.mjs';
 
@@ -248,7 +253,9 @@ browserOptions.plugins.push(
 const browserBuildPlans = profileManifest
     ? createTauriBrowserBuildPlans(browserOptions, profileManifest, __dirname)
     : { main: browserOptions, classic: [] };
-const browserContexts = [];
+const backendBuildPlans = profileManifest
+    ? createTauriBackendBuildPlans(nodeOptions, profileManifest, __dirname)
+    : { main: nodeOptions, features: [] };
 const browserTargets = [
     { target: 'frontend-main', options: browserBuildPlans.main },
     ...browserBuildPlans.classic.map(options => {
@@ -256,30 +263,33 @@ const browserTargets = [
         return { target: `frontend-${targetName}`, options };
     }),
 ];
-for (const { target, options } of browserTargets) {
-    browserContexts.push(await esbuild.context(withProfileMetadata(options, target)));
-}
-const nodeContext = await esbuild.context(withProfileMetadata(nodeOptions, 'backend'));
-const codexSdkRuntimeContext = await esbuild.context(createCodexSdkRuntimeOptions());
 
-if (watch) {
-    await Promise.all([
-        ...browserContexts.map(context => context.watch()),
-        nodeContext.watch(),
-        codexSdkRuntimeContext.watch(),
-    ]);
-} else {
-    try {
-        for (const browserContext of browserContexts) {
-            await browserContext.rebuild();
-            await browserContext.dispose();
-        }
-        await nodeContext.rebuild();
-        await nodeContext.dispose();
-        await codexSdkRuntimeContext.rebuild();
-        await codexSdkRuntimeContext.dispose();
-    } catch (error) {
-        console.error(error);
-        process.exit(1);
+try {
+    const contextOptions = [
+        ...browserTargets.map(({ target, options }) => withProfileMetadata(options, target)),
+        withProfileMetadata(backendBuildPlans.main, 'backend'),
+        ...backendBuildPlans.features.map(({ action, options }) =>
+            withProfileMetadata(options, `backend-${action}`)),
+        createCodexSdkRuntimeOptions(),
+    ];
+    const buildContexts = await createTauriBuildContexts(
+        contextOptions, options => esbuild.context(options));
+    const dispose = await runTauriBuildContexts(buildContexts, { watch });
+    if (watch) {
+        const shutdown = async signal => {
+            try {
+                await dispose();
+            } catch (error) {
+                console.error(error);
+                process.exitCode = 1;
+                return;
+            }
+            process.exitCode = signal === 'SIGINT' ? 130 : 143;
+        };
+        process.once('SIGINT', () => void shutdown('SIGINT'));
+        process.once('SIGTERM', () => void shutdown('SIGTERM'));
     }
+} catch (error) {
+    console.error(error);
+    process.exitCode = 1;
 }
