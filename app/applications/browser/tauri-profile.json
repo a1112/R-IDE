@@ -112,7 +112,7 @@
             "google-auth-library",
             "node-fetch"
           ],
-          "exclusiveInputCount": 113
+          "exclusiveInputCount": 151
         },
         {
           "package": "@theia/ai-huggingface",
@@ -127,7 +127,7 @@
             "@huggingface/jinja",
             "@huggingface/tasks"
           ],
-          "exclusiveInputCount": 162
+          "exclusiveInputCount": 200
         },
         {
           "package": "@theia/scanoss",

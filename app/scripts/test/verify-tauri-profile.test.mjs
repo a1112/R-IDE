@@ -32,7 +32,7 @@ const GOOGLE_BACKEND_DESCRIPTOR = Object.freeze({
     'google-auth-library',
     'node-fetch',
   ]),
-  exclusiveInputCount: 113,
+  exclusiveInputCount: 151,
 });
 
 const HUGGINGFACE_BACKEND_DESCRIPTOR = Object.freeze({
@@ -48,7 +48,7 @@ const HUGGINGFACE_BACKEND_DESCRIPTOR = Object.freeze({
     '@huggingface/jinja',
     '@huggingface/tasks',
   ]),
-  exclusiveInputCount: 162,
+  exclusiveInputCount: 200,
 });
 
 const SCANOSS_BACKEND_DESCRIPTOR = Object.freeze({
