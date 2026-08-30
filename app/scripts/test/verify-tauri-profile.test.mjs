@@ -143,7 +143,8 @@ function metadata(manifest, target, inputs, outputs) {
 }
 
 function deferredBackendRelativeRequest(descriptor = SCANOSS_BACKEND_DESCRIPTOR) {
-  return descriptor.request;
+  const relative = path.posix.relative(path.posix.dirname(descriptor.importer), descriptor.module);
+  return relative.startsWith('.') ? relative : `./${relative}`;
 }
 
 function deferredBackendFeatureInputs(descriptor = SCANOSS_BACKEND_DESCRIPTOR) {
@@ -436,64 +437,6 @@ test('verifies the attested ScanOSS backend feature inventory and rejects bounda
     );
     fs.rmSync(path.join(fixture.browserDirectory, SCANOSS_BACKEND_DESCRIPTOR.proxy));
     assert.throws(() => verifyTauriProfileInventory(fixture), /deferred backend proxy.*missing/i);
-  } finally {
-    fs.rmSync(fixture.root, { recursive: true, force: true });
-  }
-});
-
-test('critical verifier accepts an attested generated backend replacement without the original contribution in main', () => {
-  const fixture = createFixture();
-  const descriptor = CODEX_BACKEND_DESCRIPTOR;
-  try {
-    fixture.manifest.extensions.push(descriptor.package);
-    fixture.manifest.featureGroups.deferred.deferredBackendModules = [descriptor];
-    writeJson(path.join(fixture.root, 'node_modules', descriptor.package, 'package.json'), {
-      name: descriptor.package,
-      version: '1.0.0',
-      theiaExtensions: [{ backend: 'lib/node/ride-codex-backend-module' }],
-    });
-    for (const source of [descriptor.proxy, descriptor.entry]) {
-      const file = path.join(fixture.browserDirectory, source);
-      fs.mkdirSync(path.dirname(file), { recursive: true });
-      fs.writeFileSync(file, 'export {};\n');
-    }
-    const importer = `${descriptor.importer}.js`;
-    fixture.records.backend.metafile.inputs[importer] = {
-      bytes: 1,
-      imports: [{
-        path: descriptor.proxy,
-        original: descriptor.request,
-        kind: 'require-call',
-      }],
-    };
-    fixture.records.backend.metafile.inputs[descriptor.proxy] = { bytes: 1, imports: [] };
-    const backendMain = fixture.records.backend.metafile.outputs['lib/backend/main.js'];
-    backendMain.inputs[importer] = { bytesInOutput: 1 };
-    backendMain.inputs[descriptor.proxy] = { bytesInOutput: 1 };
-
-    const featureInputs = deferredBackendFeatureInputs(descriptor);
-    const featureTarget = `backend-${descriptor.action}`;
-    fixture.records[featureTarget] = metadata(fixture.manifest, featureTarget, featureInputs, [{
-      path: descriptor.output,
-      entryPoint: descriptor.entry,
-      additionalInputs: featureInputs,
-    }]);
-    const output = path.join(fixture.browserDirectory, descriptor.output);
-    fs.mkdirSync(path.dirname(output), { recursive: true });
-    fs.writeFileSync(output, 'codex-feature');
-    fixture.records[featureTarget].outputHashes[descriptor.output] = crypto
-      .createHash('sha256')
-      .update('codex-feature')
-      .digest('hex');
-    publishManifest(fixture);
-
-    const report = verifyTauriProfileInventory(fixture);
-    assert.deepEqual(report.deferredBackendFeatures.map(feature => feature.action), ['codex-backend']);
-    assert.equal(
-      Object.keys(fixture.records.backend.metafile.inputs)
-        .some(input => input === `node_modules/${descriptor.module}.js`),
-      false,
-    );
   } finally {
     fs.rmSync(fixture.root, { recursive: true, force: true });
   }

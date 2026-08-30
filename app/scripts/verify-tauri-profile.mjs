@@ -135,15 +135,7 @@ function loadExtensionContributions(browserDirectory, packageName) {
   return packageManifest.theiaExtensions;
 }
 
-function verifyExtensionTargets(
-  browserDirectory,
-  expectedPackages,
-  frontendInputs,
-  backendInputs,
-  label,
-  deferredFrontendModules,
-  deferredBackendModules,
-) {
+function verifyExtensionTargets(browserDirectory, expectedPackages, frontendInputs, backendInputs, label, deferredModules) {
   const missing = [];
   for (const packageName of expectedPackages) {
     const contributions = loadExtensionContributions(browserDirectory, packageName);
@@ -152,12 +144,9 @@ function verifyExtensionTargets(
       frontendFields
         .filter(field => typeof contribution[field] === 'string')
         .map(field => contribution[field])
-    ).filter(contribution => !deferredFrontendModules.has(`${packageName}/${contribution}`));
+    ).filter(contribution => !deferredModules.has(`${packageName}/${contribution}`));
     const needsFrontend = frontendContributions.length > 0;
-    const needsBackend = contributions.some(contribution =>
-      typeof contribution.backend === 'string'
-      && !deferredBackendModules.has(`${packageName}/${contribution.backend}`)
-    );
+    const needsBackend = contributions.some(contribution => typeof contribution.backend === 'string');
     if (needsFrontend && !frontendInputs.some(input => pathContainsPackage(input, packageName))) {
       missing.push(`${packageName} (frontend-main)`);
     }
@@ -167,7 +156,7 @@ function verifyExtensionTargets(
     for (const contribution of contributions) {
       for (const field of frontendFields) {
         if (typeof contribution[field] === 'string') {
-          if (deferredFrontendModules.has(`${packageName}/${contribution[field]}`)) {
+          if (deferredModules.has(`${packageName}/${contribution[field]}`)) {
             continue;
           }
           const expected = contribution[field].endsWith('.js') ? contribution[field] : `${contribution[field]}.js`;
@@ -177,9 +166,6 @@ function verifyExtensionTargets(
         }
       }
       if (typeof contribution.backend === 'string') {
-        if (deferredBackendModules.has(`${packageName}/${contribution.backend}`)) {
-          continue;
-        }
         const expected = contribution.backend.endsWith('.js') ? contribution.backend : `${contribution.backend}.js`;
         if (!backendInputs.some(input => pathContainsPackage(input, packageName) && hasPathSuffix(input, expected))) {
           missing.push(`${packageName}/${contribution.backend} (backend)`);
@@ -478,15 +464,9 @@ export function verifyTauriProfileInventory({
   verifyFrontendVsCodeInit(resolvedBrowserDirectory);
 
   const expectedPackages = manifest.extensions;
-  const deferredFrontendModules = manifest.profile === 'tauri-critical'
+  const deferredModules = manifest.profile === 'tauri-critical'
     ? new Set(Object.values(manifest.featureGroups)
       .flatMap(group => group.deferredFrontendModules ?? [])
-      .map(feature => feature.module)
-      .filter(module => typeof module === 'string' && module))
-    : new Set();
-  const deferredBackendModules = manifest.profile === 'tauri-critical'
-    ? new Set(Object.values(manifest.featureGroups)
-      .flatMap(group => group.deferredBackendModules ?? [])
       .map(feature => feature.module)
       .filter(module => typeof module === 'string' && module))
     : new Set();
@@ -498,8 +478,7 @@ export function verifyTauriProfileInventory({
     frontendInputs,
     backendInputs,
     `${manifest.profile} profile`,
-    deferredFrontendModules,
-    deferredBackendModules,
+    deferredModules,
   );
   if (manifest.profile === 'full') {
     verifyFullRootInventory(manifest, resolvedBrowserDirectory);
