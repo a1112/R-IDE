@@ -1600,7 +1600,7 @@ test('backend build plans isolate the exact BrowserAutomation implementation and
         ),
         writeModule(
             '@theia/core/shared/inversify/index.js',
-            "exports.injectable = () => value => value; exports.Container = class { createChild() { return this; } bind() { return { toSelf() { return { inSingletonScope() {} }; } }; } get(Type) { return new Type(); } };\n",
+            "exports.injectable = () => value => value; exports.unmanaged = () => () => {}; exports.Container = class { createChild() { return this; } bind() { return { toSelf() { return { inSingletonScope() {} }; } }; } get(Type) { return new Type(); } };\n",
             { path: '@theia/core', name: '@theia/core', main: 'shared/inversify/index.js' },
         ),
         writeModule(
@@ -1627,6 +1627,12 @@ test('backend build plans isolate the exact BrowserAutomation implementation and
         format: 'cjs',
         metafile: true,
         logLevel: 'silent',
+        tsconfigRaw: {
+            compilerOptions: {
+                experimentalDecorators: true,
+                emitDecoratorMetadata: true,
+            },
+        },
         plugins: [
             {
                 name: '@theia/esbuild-plugin',
