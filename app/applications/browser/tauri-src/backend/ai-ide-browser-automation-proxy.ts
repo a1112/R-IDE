@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import type { BrowserAutomation, BrowserAutomationClient, LaunchResult } from '@theia/ai-ide/lib/common/browser-automation-protocol';
-import { Container, injectable, unmanaged } from '@theia/core/shared/inversify';
+import { Container, injectable } from '@theia/core/shared/inversify';
 
 interface BrowserAutomationDelegate extends BrowserAutomation {
     dispose(): void;
@@ -40,15 +40,12 @@ function activationError(): Error {
 
 @injectable()
 export class BrowserAutomationImpl implements BrowserAutomationDelegate {
+    protected readonly loadFeature = loadBrowserAutomationFeature;
+    protected readonly parentContainer = new Container();
     protected delegate: BrowserAutomationDelegate | undefined;
     protected activation: Promise<BrowserAutomationDelegate> | undefined;
     protected client: BrowserAutomationClient | undefined;
     protected disposed = false;
-
-    constructor(
-        @unmanaged() protected readonly loadFeature: () => Promise<BrowserAutomationFeature> = loadBrowserAutomationFeature,
-        @unmanaged() protected readonly parentContainer: Container = new Container(),
-    ) { }
 
     protected activate(): Promise<BrowserAutomationDelegate> {
         if (this.disposed) {

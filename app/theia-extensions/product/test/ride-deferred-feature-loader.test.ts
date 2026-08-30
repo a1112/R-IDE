@@ -141,10 +141,7 @@ interface BrowserAutomationTestFeature {
 interface BrowserAutomationTestProxy extends BrowserAutomationTestDelegate {
 }
 
-type BrowserAutomationTestProxyConstructor = new (
-    loadFeature?: () => Promise<BrowserAutomationTestFeature>,
-    parentContainer?: Container,
-) => BrowserAutomationTestProxy;
+type BrowserAutomationTestProxyConstructor = new () => BrowserAutomationTestProxy;
 
 interface CompiledBrowserAutomationModules {
     readonly Proxy: BrowserAutomationTestProxyConstructor;
@@ -216,6 +213,17 @@ function automationDelegate(overrides: Partial<BrowserAutomationTestDelegate> = 
     };
 }
 
+function browserAutomationProxy(
+    Proxy: BrowserAutomationTestProxyConstructor,
+    loadFeature: () => Promise<BrowserAutomationTestFeature>,
+): BrowserAutomationTestProxy {
+    const proxy = new Proxy();
+    (proxy as unknown as {
+        loadFeature: () => Promise<BrowserAutomationTestFeature>;
+    }).loadFeature = loadFeature;
+    return proxy;
+}
+
 test('compiled browser automation proxy stays cold until launch or queryDom and forwards the client', async () => {
     const { Proxy } = compileBrowserAutomationModules();
     const container = new Container();
@@ -249,7 +257,7 @@ test('compiled browser automation proxy stays cold until launch or queryDom and 
             events.push('set-client');
         },
     });
-    const proxy = new Proxy(async () => {
+    const proxy = browserAutomationProxy(Proxy, async () => {
         loads++;
         return {
             createBrowserAutomation: () => {
@@ -281,7 +289,7 @@ test('compiled browser automation proxy shares one concurrent activation and del
     const calls: string[] = [];
     let loads = 0;
     let factories = 0;
-    const proxy = new Proxy(() => {
+    const proxy = browserAutomationProxy(Proxy, () => {
         loads++;
         return loaded.promise;
     });
@@ -314,7 +322,7 @@ test('compiled browser automation proxy shares one concurrent activation and del
 test('compiled browser automation proxy clears failed load and construction activations for one retry', async () => {
     const { Proxy } = compileBrowserAutomationModules();
     let loadAttempts = 0;
-    const loadFailure = new Proxy(async () => {
+    const loadFailure = browserAutomationProxy(Proxy, async () => {
         loadAttempts++;
         if (loadAttempts === 1) {
             throw new Error('Cannot load D:\\private-build\\browser-automation-feature.cjs');
@@ -331,7 +339,7 @@ test('compiled browser automation proxy clears failed load and construction acti
     assert.equal(loadAttempts, 2);
 
     let constructionAttempts = 0;
-    const constructionFailure = new Proxy(async () => ({
+    const constructionFailure = browserAutomationProxy(Proxy, async () => ({
         createBrowserAutomation: () => {
             constructionAttempts++;
             if (constructionAttempts === 1) {
@@ -350,7 +358,7 @@ test('compiled browser automation proxy disposal is idempotent and prevents late
     const loaded = deferred<BrowserAutomationTestFeature>();
     let pendingLoads = 0;
     let pendingFactories = 0;
-    const pending = new Proxy(() => {
+    const pending = browserAutomationProxy(Proxy, () => {
         pendingLoads++;
         return loaded.promise;
     });
@@ -371,7 +379,7 @@ test('compiled browser automation proxy disposal is idempotent and prevents late
 
     let delegateDisposals = 0;
     let successfulLoads = 0;
-    const active = new Proxy(async () => {
+    const active = browserAutomationProxy(Proxy, async () => {
         successfulLoads++;
         return {
             createBrowserAutomation: () => automationDelegate({
@@ -390,7 +398,7 @@ test('compiled browser automation proxy disposal is idempotent and prevents late
 test('compiled browser automation proxy preserves real delegate operation errors', async () => {
     const { Proxy } = compileBrowserAutomationModules();
     const upstream = new Error('upstream launch failed');
-    const proxy = new Proxy(async () => ({
+    const proxy = browserAutomationProxy(Proxy, async () => ({
         createBrowserAutomation: () => automationDelegate({
             launch: async () => {
                 throw upstream;
