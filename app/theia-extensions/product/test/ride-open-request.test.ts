@@ -2257,7 +2257,7 @@ test('frontend contribution start schedules initialization without returning its
     context.contribution.onStop();
 });
 
-test('frontend initialization overlaps native listening with shell attachment but defers opening', async () => {
+test('frontend initialization waits for attached shell before reporting, restoring, and listening', async () => {
     const storage = new MemoryStorage();
     storage.setItem(RIDE_OPEN_REQUEST_STATE_KEY, JSON.stringify(stateEnvelope('31', {
         id: '31',
@@ -2280,23 +2280,20 @@ test('frontend initialization overlaps native listening with shell attachment bu
     assert.deepEqual(applicationState.reachedStates, ['attached_shell']);
     assert.deepEqual(context.milestones, []);
     assert.deepEqual(context.openers.opened, []);
-    assert.equal(context.native.registrations, 1);
-    assert.equal(context.native.frontendReadyNotifications, 0);
-    assert.deepEqual(context.events, ['listen']);
+    assert.equal(context.native.registrations, 0);
 
     applicationState.attach();
     await flushLifecycle();
     assert.deepEqual(context.events, [
-        'listen',
         'milestone:frontend_shell_attached',
+        'listen',
         'open:/project/attached.R',
         'milestone:target_file_opened'
     ]);
-    assert.equal(context.native.frontendReadyNotifications, 1);
     assert.equal(context.native.registrations, 1);
 });
 
-test('attached-shell rejection is reported and releases the early native listener', async () => {
+test('attached-shell rejection is reported without restoring, listening, or leaking initialization', async () => {
     const applicationState = new FakeApplicationStateService(false);
     const context = createContribution(
         '/project',
@@ -2310,8 +2307,7 @@ test('attached-shell rejection is reported and releases the early native listene
     applicationState.reject(new Error('shell attachment failed'));
     await flushLifecycle();
 
-    assert.equal(context.native.registrations, 1);
-    assert.equal(context.native.unlistenCalls, 1);
+    assert.equal(context.native.registrations, 0);
     assert.deepEqual(context.milestones, []);
     assert.equal(context.openers.opened.length, 0);
     assert.match(context.messages.errors[0], /shell attachment failed/);
@@ -2357,32 +2353,8 @@ test('disposing before shell attachment cancels deferred initialization', async 
     await flushLifecycle();
 
     assert.deepEqual(context.milestones, []);
-    assert.equal(context.native.registrations, 1);
-    assert.equal(context.native.unlistenCalls, 1);
+    assert.equal(context.native.registrations, 0);
     assert.equal(context.openers.opened.length, 0);
-});
-
-test('native requests received while the shell is attaching remain queued until it is ready', async () => {
-    const applicationState = new FakeApplicationStateService(false);
-    const context = createContribution(
-        '/project', new MemoryStorage(), () => undefined, async () => undefined, applicationState
-    );
-
-    context.contribution.onStart();
-    await flushLifecycle();
-    context.native.emit({
-        id: '32', source: 'initial', workspace: '/project', files: ['/project/queued.R']
-    });
-    await flushLifecycle();
-
-    assert.equal(context.openers.opened.length, 0);
-    assert.deepEqual(context.milestones, []);
-
-    applicationState.attach();
-    await flushLifecycle();
-
-    assert.equal(context.openers.opened.length, 1);
-    assert.deepEqual(context.milestones, ['frontend_shell_attached', 'target_file_opened']);
 });
 
 test('frontend lifecycle restores and registers once, then unlistens once on cleanup', async () => {

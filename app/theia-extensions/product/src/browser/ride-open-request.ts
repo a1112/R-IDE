@@ -153,7 +153,6 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
     protected dispatchingPendingTargets = false;
     protected pluginFallbackTimer: unknown | undefined;
     protected pluginActivation: Promise<boolean> | undefined;
-    protected nativeOpenRequestPreparation: Promise<void> = Promise.resolve();
     protected readonly pluginWillStart: Promise<ObservedPluginPromise>;
     protected readonly pluginDidStart: Promise<ObservedPluginPromise>;
 
@@ -184,11 +183,7 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
             return;
         }
         this.started = true;
-        this.nativeOpenRequestPreparation = this.prepareNativeOpenRequests();
-        this.initializeAfterShellAttached().catch(error => {
-            this.dispose();
-            this.reportInitializationFailure(error);
-        });
+        this.initializeAfterShellAttached().catch(error => this.reportInitializationFailure(error));
     }
 
     protected async initializeAfterShellAttached(): Promise<void> {
@@ -196,11 +191,6 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
         if (this.disposed) {
             return;
         }
-        const frontendReadyNotification = this.nativeOpenRequestPreparation.then(async () => {
-            if (!this.disposed && this.unlisten) {
-                await this.nativeChrome.notifyFrontendReady();
-            }
-        });
         await this.reportStartupMilestone('frontend_shell_attached');
         if (this.disposed) {
             return;
@@ -209,7 +199,17 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
         if (this.disposed) {
             return;
         }
-        await frontendReadyNotification;
+        try {
+            const unlisten = await this.nativeChrome.listenForOpenRequests(request => this.enqueueAfterInitialization(request));
+            if (this.disposed) {
+                unlisten();
+            } else {
+                this.unlisten = unlisten;
+                await this.nativeChrome.notifyFrontendReady();
+            }
+        } catch (error) {
+            await this.messageService.error(`R-IDE could not listen for file-open requests: ${errorMessage(error)}`);
+        }
         if (this.disposed) {
             return;
         }
@@ -227,22 +227,6 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
             if (!this.disposed && !this.acceptedOpenRequest) {
                 this.schedulePluginFallback();
             }
-        }
-    }
-
-    protected async prepareNativeOpenRequests(): Promise<void> {
-        try {
-            const unlisten = await this.nativeChrome.listenForOpenRequests(request => this.enqueueAfterInitialization(request));
-            if (this.disposed) {
-                unlisten();
-            } else {
-                this.unlisten = unlisten;
-            }
-        } catch (error) {
-            await this.reportErrorSafely(
-                `R-IDE could not listen for file-open requests: ${errorMessage(error)}`,
-                '[R-IDE] Failed to report file-open listener initialization failure.'
-            );
         }
     }
 
