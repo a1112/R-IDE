@@ -52,7 +52,7 @@ const SCANOSS_BACKEND_DESCRIPTOR = Object.freeze({
     'tar',
     'tr46',
   ]),
-  exclusiveInputCount: 318,
+  exclusiveInputCount: 471,
 });
 
 test('repository Tauri profile declares the exact deferred Markdown preview descriptor', () => {
@@ -399,14 +399,14 @@ test('verifies the attested ScanOSS backend feature inventory and rejects bounda
     delete fixture.records['backend-scanoss'].metafile.inputs[filler];
     delete fixture.records['backend-scanoss'].metafile.outputs[SCANOSS_BACKEND_DESCRIPTOR.output].inputs[filler];
     writeJson(path.join(fixture.browserDirectory, 'lib', 'metadata', 'backend-scanoss.json'), fixture.records['backend-scanoss']);
-    assert.throws(() => verifyTauriProfileInventory(fixture), /exclusive.*318|input count/i);
+    assert.throws(() => verifyTauriProfileInventory(fixture), /exclusive.*471|input count/i);
     fixture.records['backend-scanoss'].metafile.inputs[filler] = { bytes: 1, imports: [] };
     fixture.records['backend-scanoss'].metafile.outputs[SCANOSS_BACKEND_DESCRIPTOR.output].inputs[filler] = { bytesInOutput: 1 };
     backendMain.inputs[filler] = { bytesInOutput: 1 };
     fixture.records.backend.metafile.inputs[filler] = { bytes: 1, imports: [] };
     writeJson(path.join(fixture.browserDirectory, 'lib', 'metadata', 'backend.json'), fixture.records.backend);
     writeJson(path.join(fixture.browserDirectory, 'lib', 'metadata', 'backend-scanoss.json'), fixture.records['backend-scanoss']);
-    assert.throws(() => verifyTauriProfileInventory(fixture), /overlap|exclusive.*318/i);
+    assert.throws(() => verifyTauriProfileInventory(fixture), /overlap|exclusive.*471/i);
     delete backendMain.inputs[filler];
     delete fixture.records.backend.metafile.inputs[filler];
     writeJson(path.join(fixture.browserDirectory, 'lib', 'metadata', 'backend.json'), fixture.records.backend);

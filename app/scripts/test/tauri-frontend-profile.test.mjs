@@ -77,7 +77,7 @@ const SCANOSS_BACKEND_DESCRIPTOR = Object.freeze({
         'tar',
         'tr46',
     ]),
-    exclusiveInputCount: 318,
+    exclusiveInputCount: 471,
 });
 
 test('Tauri preview profile replaces only the eager frontend module with a lazy Markdown proxy', () => {
