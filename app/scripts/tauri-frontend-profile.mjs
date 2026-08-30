@@ -4,6 +4,10 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
+import {
+    attestDeferredBackendFeatures,
+    deferredBackendDescriptors as validateAttestedBackendDescriptors,
+} from './tauri-backend-feature-attestation.mjs';
 
 const require = createRequire(import.meta.url);
 const semver = require('semver');
@@ -145,6 +149,8 @@ function normalizedFeatureGroups(featureGroups, browserDependencies) {
     const classifiedBackendEdges = new Set();
     const classifiedBackendPackages = new Set();
     const classifiedBackendModules = new Set();
+    const classifiedBackendProxies = new Set();
+    const classifiedBackendEntries = new Set();
     const classifiedBackendActions = new Set();
     const classifiedBackendOutputs = new Set();
     for (const groupName of Object.keys(featureGroups).sort(compareText)) {
@@ -273,7 +279,17 @@ function normalizedFeatureGroups(featureGroups, browserDependencies) {
             const fields = entry && typeof entry === 'object' && !Array.isArray(entry)
                 ? Object.keys(entry).sort(compareText)
                 : [];
-            const expectedFields = ['action', 'entry', 'importer', 'module', 'output', 'package', 'proxy'].sort(compareText);
+            const expectedFields = [
+                'action',
+                'entry',
+                'exclusiveInputCount',
+                'importer',
+                'module',
+                'output',
+                'package',
+                'proxy',
+                'runtimePackages',
+            ].sort(compareText);
             if (fields.join('\0') !== expectedFields.join('\0')) {
                 throw new Error(`Feature group "${groupName}" has an invalid deferred backend module entry.`);
             }
@@ -311,10 +327,31 @@ function normalizedFeatureGroups(featureGroups, browserDependencies) {
             if (typeof entry.action !== 'string' || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(entry.action)) {
                 throw new Error(`Deferred backend module action in group "${groupName}" must be canonical.`);
             }
+            if (!Array.isArray(entry.runtimePackages)) {
+                throw new Error(`Deferred backend runtime packages in group "${groupName}" must be an array.`);
+            }
+            const canonicalRuntimePackage = candidate => (
+                typeof candidate === 'string'
+                && /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/.test(candidate)
+            );
+            if (entry.runtimePackages.some(candidate => !canonicalRuntimePackage(candidate))) {
+                throw new Error(`Deferred backend runtime package in group "${groupName}" must be canonical.`);
+            }
+            if (new Set(entry.runtimePackages).size !== entry.runtimePackages.length) {
+                throw new Error(`Deferred backend runtime packages in group "${groupName}" must be unique and contain no duplicates.`);
+            }
+            if ([...entry.runtimePackages].sort(compareText).join('\0') !== entry.runtimePackages.join('\0')) {
+                throw new Error(`Deferred backend runtime packages in group "${groupName}" must be sorted.`);
+            }
+            if (!Number.isSafeInteger(entry.exclusiveInputCount) || entry.exclusiveInputCount <= 0) {
+                throw new Error(`Deferred backend exclusive input count in group "${groupName}" must be a positive integer.`);
+            }
             for (const [kind, identity, inventory] of [
                 ['edge', `${entry.importer}\0${entry.module}`, classifiedBackendEdges],
                 ['package', entry.package, classifiedBackendPackages],
                 ['module', entry.module, classifiedBackendModules],
+                ['proxy', entry.proxy, classifiedBackendProxies],
+                ['entry', entry.entry, classifiedBackendEntries],
                 ['action', entry.action, classifiedBackendActions],
                 ['output', entry.output, classifiedBackendOutputs],
             ]) {
@@ -331,6 +368,8 @@ function normalizedFeatureGroups(featureGroups, browserDependencies) {
                 entry: entry.entry,
                 output: entry.output,
                 action: entry.action,
+                runtimePackages: [...entry.runtimePackages],
+                exclusiveInputCount: entry.exclusiveInputCount,
             };
         }).sort((left, right) => compareText(left.module, right.module));
         const normalizedGroup = {
@@ -1559,6 +1598,7 @@ function validateProfileBuildManifest(manifestText, { expectedProfile, buildId, 
     if (manifest.profile === 'full' && manifestDeferredBackendModules(manifest).length > 0) {
         throw new Error('Full profile must not install deferred backend descriptors.');
     }
+    validateAttestedBackendDescriptors(manifest);
     if (!/^[0-9a-f]{64}$/.test(manifest.digest ?? '')) {
         throw new Error('Tauri profile digest is not canonical.');
     }
@@ -1733,6 +1773,10 @@ export async function publishProfileBuild({
             await fs.promises.mkdir(path.join(plan.temporaryDirectory, output), { recursive: true });
             await fs.promises.writeFile(path.join(plan.temporaryDirectory, output, PROFILE_MANIFEST_NAME), manifestText);
         }
+        attestDeferredBackendFeatures({
+            manifest,
+            libDirectory: plan.temporaryDirectory,
+        });
         lock.assertHealthy();
         transactionStarted = true;
         await replaceDirectoryTransactional(plan, transactionOptions);

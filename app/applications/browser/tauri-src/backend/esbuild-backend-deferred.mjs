@@ -143,7 +143,17 @@ function featureBuildOptions(nodeOptions, descriptor) {
 }
 
 export function createTauriBackendBuildPlans(nodeOptions, profileManifest, baseDirectory) {
-    const descriptors = deferredBackendModules(profileManifest)
+    const rawDescriptors = deferredBackendModules(profileManifest);
+    for (const field of ['proxy', 'entry']) {
+        const values = new Set();
+        for (const descriptor of rawDescriptors) {
+            if (values.has(descriptor[field])) {
+                throw new Error(`Deferred backend ${field} is duplicated: ${descriptor[field]}.`);
+            }
+            values.add(descriptor[field]);
+        }
+    }
+    const descriptors = rawDescriptors
         .map(descriptor => resolveDescriptor(descriptor, baseDirectory));
     if (descriptors.length === 0) {
         return { main: nodeOptions, features: [] };
@@ -179,6 +189,13 @@ async function collectContextDisposalErrors(contexts) {
     return results
         .filter(result => result.status === 'rejected')
         .map(result => result.reason);
+}
+
+function operationAndDisposalError(operationError, disposalError, message) {
+    const disposalErrors = disposalError instanceof AggregateError
+        ? disposalError.errors
+        : [disposalError];
+    return new AggregateError([operationError, ...disposalErrors], message);
 }
 
 export async function createTauriBuildContexts(contextOptions, createContext) {
@@ -217,7 +234,11 @@ export async function runTauriBuildContexts(contexts, { watch = false } = {}) {
             try {
                 await dispose();
             } catch (disposeError) {
-                throw new AggregateError([error, disposeError], 'Tauri watch startup and context disposal failed.');
+                throw operationAndDisposalError(
+                    error,
+                    disposeError,
+                    'Tauri watch startup and context disposal failed.',
+                );
             }
             throw error;
         }
@@ -236,7 +257,11 @@ export async function runTauriBuildContexts(contexts, { watch = false } = {}) {
         await dispose();
     } catch (disposeError) {
         if (buildError) {
-            throw new AggregateError([buildError, disposeError], 'Tauri build and context disposal failed.');
+            throw operationAndDisposalError(
+                buildError,
+                disposeError,
+                'Tauri build and context disposal failed.',
+            );
         }
         throw disposeError;
     }

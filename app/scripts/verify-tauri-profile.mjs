@@ -6,6 +6,11 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { canonicalDigest, PROFILE_SCHEMA } from './tauri-frontend-profile.mjs';
+import {
+  assertPortableMetadataRecord,
+  attestDeferredBackendFeatures,
+  deferredBackendDescriptors as validateDeferredBackendDescriptors,
+} from './tauri-backend-feature-attestation.mjs';
 import { SMOKE_SCENARIOS, SMOKE_SCENARIO_REQUIREMENTS } from './tauri-packaged-smoke-contract.mjs';
 
 const METADATA_SCHEMA = 'ride.esbuild-metafile@1';
@@ -28,66 +33,8 @@ function hasPathSuffix(candidate, expected) {
     && expectedParts.every((part, index) => part === actualParts[actualParts.length - expectedParts.length + index]);
 }
 
-function isCanonicalPath(candidate, prefix) {
-  return typeof candidate === 'string'
-    && candidate.startsWith(prefix)
-    && !candidate.includes('\\')
-    && candidate.split('/').every(segment => segment && segment !== '.' && segment !== '..');
-}
-
 function deferredBackendDescriptors(manifest) {
-  const descriptors = Object.entries(manifest.featureGroups)
-    .sort(([left], [right]) => left.localeCompare(right))
-    .flatMap(([groupName, group]) => (group.deferredBackendModules ?? []).map(descriptor => ({
-      groupName,
-      descriptor,
-    })))
-    .sort((left, right) => String(left.descriptor?.action).localeCompare(String(right.descriptor?.action)));
-  if (manifest.profile === 'full') {
-    if (descriptors.length > 0) {
-      throw new Error('Full profile must not install deferred backend descriptors.');
-    }
-    return [];
-  }
-  const edges = new Set();
-  const packages = new Set();
-  const modules = new Set();
-  const actions = new Set();
-  const outputs = new Set();
-  for (const { groupName, descriptor } of descriptors) {
-    const fields = descriptor && typeof descriptor === 'object' && !Array.isArray(descriptor)
-      ? Object.keys(descriptor).sort()
-      : [];
-    const expectedFields = ['action', 'entry', 'importer', 'module', 'output', 'package', 'proxy'].sort();
-    const canonicalModule = candidate => (
-      typeof descriptor?.package === 'string'
-      && isCanonicalPath(candidate, `${descriptor.package}/`)
-    );
-    if (fields.join('\0') !== expectedFields.join('\0')
-      || typeof descriptor.package !== 'string' || !descriptor.package
-      || !canonicalModule(descriptor.importer)
-      || !canonicalModule(descriptor.module)
-      || !isCanonicalPath(descriptor.proxy, 'tauri-src/backend/')
-      || !isCanonicalPath(descriptor.entry, 'tauri-src/backend/')
-      || !isCanonicalPath(descriptor.output, 'lib/backend/') || !descriptor.output.endsWith('.cjs')
-      || typeof descriptor.action !== 'string'
-      || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(descriptor.action)) {
-      throw new Error(`Deferred backend descriptor is invalid for ${groupName}.`);
-    }
-    for (const [kind, value, inventory] of [
-      ['edge', `${descriptor.importer}\0${descriptor.module}`, edges],
-      ['package', descriptor.package, packages],
-      ['module', descriptor.module, modules],
-      ['action', descriptor.action, actions],
-      ['output', descriptor.output, outputs],
-    ]) {
-      if (inventory.has(value)) {
-        throw new Error(`Deferred backend ${kind} is duplicated: ${value.replace('\0', ' -> ')}.`);
-      }
-      inventory.add(value);
-    }
-  }
-  return descriptors;
+  return validateDeferredBackendDescriptors(manifest);
 }
 
 function readJson(file, label) {
@@ -146,6 +93,7 @@ function readMetadata(metadataDirectory, name, manifest) {
   if (!record.outputHashes || typeof record.outputHashes !== 'object' || Array.isArray(record.outputHashes)) {
     throw new Error(`Tauri ${name} metadata does not contain output hashes.`);
   }
+  assertPortableMetadataRecord(record, `Tauri ${name} metadata`);
   return record;
 }
 
@@ -394,60 +342,11 @@ function verifyDeferredBackendExclusion(manifest, backendRecord) {
   }
 }
 
-function hasModuleInput(inputs, moduleRequest) {
-  return inputs.some(input => (
-    hasPathSuffix(input, moduleRequest)
-    || hasPathSuffix(input, `${moduleRequest}.js`)
-  ));
-}
-
-function verifyDeferredBackendFeatures(
-  descriptorRecords,
-  backendRecord,
-  backendMainInputs,
-  metadataRecords,
-  browserDirectory,
-) {
-  const backendMainOutput = outputBySuffix(backendRecord.metafile, 'lib/backend/main.js');
-  const backendMainImports = backendMainOutput?.[1]?.imports ?? [];
-  const report = [];
+function verifyDeferredBackendSources(descriptorRecords, browserDirectory) {
   for (const { groupName, descriptor } of descriptorRecords) {
     assertRegularOutput(browserDirectory, descriptor.proxy, `Deferred backend proxy ${groupName}/${descriptor.action}`);
     assertRegularOutput(browserDirectory, descriptor.entry, `Deferred backend entry ${groupName}/${descriptor.action}`);
-    if (!backendMainInputs.some(input => hasPathSuffix(input, descriptor.proxy))) {
-      throw new Error(`Deferred backend proxy for ${groupName}/${descriptor.action} is missing from backend main.`);
-    }
-    if (!hasModuleInput(backendMainInputs, descriptor.importer)) {
-      throw new Error(`Deferred backend importer ${descriptor.importer} is missing from backend main.`);
-    }
-    if (hasModuleInput(backendMainInputs, descriptor.module)) {
-      throw new Error(`Deferred backend implementation ${descriptor.module} is present in backend main.`);
-    }
-    if (backendMainImports.some(imported => (
-      typeof imported.path === 'string' && hasPathSuffix(imported.path, descriptor.output)
-    ))) {
-      throw new Error(`Deferred backend feature ${descriptor.output} is statically imported by backend main.`);
-    }
-
-    const target = `backend-${descriptor.action}`;
-    const record = metadataRecords[target];
-    const [outputPath, detail] = requireOutput(
-      record,
-      descriptor.output,
-      `Deferred backend feature ${groupName}/${descriptor.action}`,
-      browserDirectory,
-      descriptor.entry,
-    );
-    if (normalize(outputPath) !== normalize(descriptor.output)) {
-      throw new Error(`Deferred backend feature ${groupName}/${descriptor.action} has the wrong output path: ${outputPath}.`);
-    }
-    const featureInputs = Object.keys(detail.inputs);
-    if (!hasModuleInput(featureInputs, descriptor.module)) {
-      throw new Error(`Deferred backend feature ${groupName}/${descriptor.action} does not include its real implementation ${descriptor.module}.`);
-    }
-    report.push({ action: descriptor.action, output: normalize(outputPath) });
   }
-  return report;
 }
 
 function countBundledPlugins(pluginsDirectory) {
@@ -595,13 +494,11 @@ export function verifyTauriProfileInventory({
   let deferredBackendFeatures = [];
   if (manifest.profile === 'tauri-critical') {
     verifyDeferredBackendExclusion(manifest, metadataRecords.backend);
-    deferredBackendFeatures = verifyDeferredBackendFeatures(
-      backendDescriptors,
-      metadataRecords.backend,
-      backendInputs,
-      metadataRecords,
-      resolvedBrowserDirectory,
-    );
+    verifyDeferredBackendSources(backendDescriptors, resolvedBrowserDirectory);
+    deferredBackendFeatures = attestDeferredBackendFeatures({
+      manifest,
+      libDirectory: path.join(resolvedBrowserDirectory, 'lib'),
+    });
   }
   const pluginCount = countBundledPlugins(resolvedPluginsDirectory);
   if (pluginCount === 0) {

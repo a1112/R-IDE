@@ -25,6 +25,16 @@ const SCANOSS_BACKEND_DESCRIPTOR = Object.freeze({
   entry: 'tauri-src/backend/scanoss-service-feature.ts',
   output: 'lib/backend/scanoss-service-feature.cjs',
   action: 'scanoss',
+  runtimePackages: Object.freeze([
+    '@grpc/grpc-js',
+    'adm-zip',
+    'iconv-lite',
+    'protobufjs',
+    'scanoss',
+    'tar',
+    'tr46',
+  ]),
+  exclusiveInputCount: 318,
 });
 
 test('repository Tauri profile declares the exact deferred Markdown preview descriptor', () => {
@@ -112,6 +122,22 @@ function metadata(manifest, target, inputs, outputs) {
       ])),
     },
   };
+}
+
+function deferredBackendRelativeRequest(descriptor = SCANOSS_BACKEND_DESCRIPTOR) {
+  const relative = path.posix.relative(path.posix.dirname(descriptor.importer), descriptor.module);
+  return relative.startsWith('.') ? relative : `./${relative}`;
+}
+
+function deferredBackendFeatureInputs(descriptor = SCANOSS_BACKEND_DESCRIPTOR) {
+  const exclusive = [
+    `node_modules/${descriptor.module}.js`,
+    ...descriptor.runtimePackages.map(packageName => `node_modules/${packageName}/index.js`),
+  ];
+  while (exclusive.length < descriptor.exclusiveInputCount) {
+    exclusive.push(`node_modules/scanoss-fixture-exclusive-${exclusive.length}/index.js`);
+  }
+  return [descriptor.entry, ...exclusive];
 }
 
 function createFixture(profile = 'tauri-critical') {
@@ -250,18 +276,7 @@ test('verifies critical profile inventory, workers, plugin hosts, VS Code init, 
 test('verifies the attested ScanOSS backend feature inventory and rejects boundary leaks', () => {
   const fixture = createFixture();
   const implementation = `node_modules/${SCANOSS_BACKEND_DESCRIPTOR.module}.js`;
-  const featureInputs = [
-    SCANOSS_BACKEND_DESCRIPTOR.entry,
-    implementation,
-    'node_modules/scanoss/index.js',
-    'node_modules/@grpc/grpc-js/build/src/index.js',
-    'node_modules/protobufjs/index.js',
-    'node_modules/google-protobuf/google-protobuf.js',
-    'node_modules/tar/index.js',
-    'node_modules/adm-zip/adm-zip.js',
-    'node_modules/iconv-lite/lib/index.js',
-    'node_modules/tr46/index.js',
-  ];
+  const featureInputs = deferredBackendFeatureInputs();
   try {
     fixture.manifest.featureGroups.deferred.deferredBackendModules = [SCANOSS_BACKEND_DESCRIPTOR];
     for (const source of [SCANOSS_BACKEND_DESCRIPTOR.proxy, SCANOSS_BACKEND_DESCRIPTOR.entry]) {
@@ -271,10 +286,21 @@ test('verifies the attested ScanOSS backend feature inventory and rejects bounda
     }
     const backendMain = fixture.records.backend.metafile.outputs['lib/backend/main.js'];
     const importer = `node_modules/${SCANOSS_BACKEND_DESCRIPTOR.importer}.js`;
-    fixture.records.backend.metafile.inputs[importer] = { bytes: 1, imports: [] };
+    fixture.records.backend.metafile.inputs[importer] = {
+      bytes: 1,
+      imports: [{
+        path: SCANOSS_BACKEND_DESCRIPTOR.proxy,
+        original: deferredBackendRelativeRequest(),
+        kind: 'require-call',
+      }],
+    };
     backendMain.inputs[importer] = { bytesInOutput: 1 };
     fixture.records.backend.metafile.inputs[SCANOSS_BACKEND_DESCRIPTOR.proxy] = { bytes: 1, imports: [] };
     backendMain.inputs[SCANOSS_BACKEND_DESCRIPTOR.proxy] = { bytesInOutput: 1 };
+    const sharedRuntime = 'node_modules/iconv-lite/index.js';
+    fixture.records.backend.metafile.inputs[sharedRuntime] = { bytes: 1, imports: [] };
+    backendMain.inputs[sharedRuntime] = { bytesInOutput: 1 };
+    featureInputs.push('node_modules/scanoss-fixture-exclusive-compensation/index.js');
     fixture.records['backend-scanoss'] = metadata(
       fixture.manifest,
       'backend-scanoss',
@@ -308,6 +334,52 @@ test('verifies the attested ScanOSS backend feature inventory and rejects bounda
       output: SCANOSS_BACKEND_DESCRIPTOR.output,
     }]);
 
+    const importerImports = fixture.records.backend.metafile.inputs[importer].imports;
+    importerImports[0].original = './unrelated-service-impl';
+    writeJson(path.join(fixture.browserDirectory, 'lib', 'metadata', 'backend.json'), fixture.records.backend);
+    assert.throws(() => verifyTauriProfileInventory(fixture), /exact.*edge|original|import.*record/i);
+
+    importerImports[0].original = deferredBackendRelativeRequest();
+    importerImports[0].path = SCANOSS_BACKEND_DESCRIPTOR.module;
+    fixture.records.backend.metafile.inputs['node_modules/unrelated/importer.js'] = {
+      bytes: 1,
+      imports: [{ path: SCANOSS_BACKEND_DESCRIPTOR.proxy, original: './unrelated', kind: 'require-call' }],
+    };
+    writeJson(path.join(fixture.browserDirectory, 'lib', 'metadata', 'backend.json'), fixture.records.backend);
+    assert.throws(() => verifyTauriProfileInventory(fixture), /exact.*edge|resolved.*proxy|import.*record/i);
+
+    delete fixture.records.backend.metafile.inputs['node_modules/unrelated/importer.js'];
+    importerImports[0].path = SCANOSS_BACKEND_DESCRIPTOR.proxy;
+    importerImports.push({ ...importerImports[0] });
+    writeJson(path.join(fixture.browserDirectory, 'lib', 'metadata', 'backend.json'), fixture.records.backend);
+    assert.throws(() => verifyTauriProfileInventory(fixture), /exactly one|unique.*import|duplicate.*edge/i);
+    importerImports.pop();
+    writeJson(path.join(fixture.browserDirectory, 'lib', 'metadata', 'backend.json'), fixture.records.backend);
+
+    const missingRuntime = 'node_modules/tr46/index.js';
+    delete fixture.records['backend-scanoss'].metafile.inputs[missingRuntime];
+    delete fixture.records['backend-scanoss'].metafile.outputs[SCANOSS_BACKEND_DESCRIPTOR.output].inputs[missingRuntime];
+    writeJson(path.join(fixture.browserDirectory, 'lib', 'metadata', 'backend-scanoss.json'), fixture.records['backend-scanoss']);
+    assert.throws(() => verifyTauriProfileInventory(fixture), /runtime.*tr46|tr46.*missing/i);
+    fixture.records['backend-scanoss'].metafile.inputs[missingRuntime] = { bytes: 1, imports: [] };
+    fixture.records['backend-scanoss'].metafile.outputs[SCANOSS_BACKEND_DESCRIPTOR.output].inputs[missingRuntime] = { bytesInOutput: 1 };
+
+    const filler = featureInputs.find(input => input.includes('scanoss-fixture-exclusive-'));
+    delete fixture.records['backend-scanoss'].metafile.inputs[filler];
+    delete fixture.records['backend-scanoss'].metafile.outputs[SCANOSS_BACKEND_DESCRIPTOR.output].inputs[filler];
+    writeJson(path.join(fixture.browserDirectory, 'lib', 'metadata', 'backend-scanoss.json'), fixture.records['backend-scanoss']);
+    assert.throws(() => verifyTauriProfileInventory(fixture), /exclusive.*318|input count/i);
+    fixture.records['backend-scanoss'].metafile.inputs[filler] = { bytes: 1, imports: [] };
+    fixture.records['backend-scanoss'].metafile.outputs[SCANOSS_BACKEND_DESCRIPTOR.output].inputs[filler] = { bytesInOutput: 1 };
+    backendMain.inputs[filler] = { bytesInOutput: 1 };
+    fixture.records.backend.metafile.inputs[filler] = { bytes: 1, imports: [] };
+    writeJson(path.join(fixture.browserDirectory, 'lib', 'metadata', 'backend.json'), fixture.records.backend);
+    writeJson(path.join(fixture.browserDirectory, 'lib', 'metadata', 'backend-scanoss.json'), fixture.records['backend-scanoss']);
+    assert.throws(() => verifyTauriProfileInventory(fixture), /overlap|exclusive.*318/i);
+    delete backendMain.inputs[filler];
+    delete fixture.records.backend.metafile.inputs[filler];
+    writeJson(path.join(fixture.browserDirectory, 'lib', 'metadata', 'backend.json'), fixture.records.backend);
+
     fixture.records.backend.metafile.inputs[implementation] = { bytes: 1, imports: [] };
     backendMain.inputs[implementation] = { bytesInOutput: 1 };
     writeJson(path.join(fixture.browserDirectory, 'lib', 'metadata', 'backend.json'), fixture.records.backend);
@@ -340,6 +412,79 @@ test('verifies the attested ScanOSS backend feature inventory and rejects bounda
   } finally {
     fs.rmSync(fixture.root, { recursive: true, force: true });
   }
+});
+
+test('verifier rejects duplicate deferred backend proxy and entry identities', () => {
+  for (const field of ['proxy', 'entry']) {
+    const fixture = createFixture();
+    try {
+      const alternate = {
+        ...SCANOSS_BACKEND_DESCRIPTOR,
+        package: '@theia/scanoss-alternate',
+        importer: '@theia/scanoss-alternate/lib/node/alternate-backend-module',
+        module: '@theia/scanoss-alternate/lib/node/alternate-service-impl',
+        proxy: 'tauri-src/backend/alternate-proxy.ts',
+        entry: 'tauri-src/backend/alternate-feature.ts',
+        output: 'lib/backend/alternate-feature.cjs',
+        action: 'scanoss-alternate',
+        [field]: SCANOSS_BACKEND_DESCRIPTOR[field],
+      };
+      fixture.manifest.featureGroups.deferred.deferredBackendModules = [SCANOSS_BACKEND_DESCRIPTOR, alternate];
+      publishManifest(fixture);
+      assert.throws(() => verifyTauriProfileInventory(fixture), new RegExp(`duplicate.*${field}|${field}.*duplicated`, 'i'));
+    } finally {
+      fs.rmSync(fixture.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test('verifier rejects absolute and namespaced absolute paths in metadata', () => {
+  const candidates = [
+    'L:/R-IDE-builds/dependency-store/browser-node_modules/keytar/build/Release/keytar.node',
+    String.raw`\\nas\dependency-store\browser-node_modules\keytar\build\Release\keytar.node`,
+    'file:///L:/R-IDE-builds/dependency-store/browser-node_modules/keytar/build/Release/keytar.node',
+    String.raw`node-file:L:\R-IDE-builds\dependency-store\browser-node_modules\keytar\build\Release\keytar.node`,
+  ];
+  for (const candidate of candidates) {
+    const fixture = createFixture();
+    try {
+      fixture.records.backend.metafile.inputs[candidate] = { bytes: 1, imports: [] };
+      fixture.records.backend.metafile.outputs['lib/backend/main.js'].inputs[candidate] = { bytesInOutput: 1 };
+      writeJson(path.join(fixture.browserDirectory, 'lib', 'metadata', 'backend.json'), fixture.records.backend);
+      assert.throws(() => verifyTauriProfileInventory(fixture), /absolute|portable|metadata path/i, candidate);
+    } finally {
+      fs.rmSync(fixture.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test('metadata portability accepts esbuild relative requests with a doubled separator', async () => {
+  const { assertPortableMetadataRecord } = await import('../tauri-backend-feature-attestation.mjs');
+  const record = {
+    outputHashes: { 'lib/backend/feature.cjs': '0'.repeat(64) },
+    metafile: {
+      inputs: {
+        'node_modules/whatwg-url/lib/URL.js': {
+          bytes: 1,
+          imports: [{
+            path: 'node_modules/whatwg-url/lib/URL-impl.js',
+            original: './/URL-impl.js',
+            kind: 'require-call',
+          }],
+        },
+      },
+      outputs: {
+        'lib/backend/feature.cjs': {
+          bytes: 1,
+          entryPoint: 'node_modules/whatwg-url/lib/URL.js',
+          inputs: { 'node_modules/whatwg-url/lib/URL.js': { bytesInOutput: 1 } },
+          imports: [],
+          exports: [],
+        },
+      },
+    },
+  };
+  assert.doesNotThrow(() => assertPortableMetadataRecord(record));
 });
 
 test('rejects deferred backend descriptors installed in a full profile', () => {
@@ -517,12 +662,81 @@ test('profile builds emit named esbuild metadata and expose the verifier command
   assert.match(esbuildSource, /withProfileMetadata\(backendBuildPlans\.main, 'backend'\)/);
   assert.match(esbuildSource, /withProfileMetadata\(options, `backend-\$\{action\}`\)/);
   assert.match(metadataSource, /lib', 'metadata'/);
-  assert.match(metadataSource, /metafile:\s*result\.metafile/);
+  assert.match(metadataSource, /const metafile\s*=\s*logicalizeMetafilePaths\(result\.metafile/);
+  assert.match(metadataSource, /outputHashes:\s*outputHashes\(baseDirectory, metafile\)/);
   const bundlerGeneratorSource = fs.readFileSync(
     require.resolve('@theia/application-manager/lib/generator/bundler-generator.js'),
     'utf8',
   );
   assert.match(bundlerGeneratorSource, /const sourcemap = production \? false : 'linked'/);
+});
+
+test('metadata logicalization rewrites Windows, UNC, and namespaced paths with graph consistency', async () => {
+  const module = await import('../../applications/browser/tauri-src/esbuild-metadata.mjs');
+  assert.equal(typeof module.logicalizeMetafilePaths, 'function');
+  const baseDirectory = String.raw`D:\Project\R-IDE\app\applications\browser`;
+  const localEntry = String.raw`D:\Project\R-IDE\app\applications\browser\src-gen\backend\main.js`;
+  const nativeInput = String.raw`L:\R-IDE-builds\dependency-store\browser-node_modules\drivelist\build\Release\drivelist.node`;
+  const nodeFileInput = `node-file:${nativeInput}`;
+  const uncInput = String.raw`\\nas\dependency-store\browser-node_modules\keytar\build\Release\keytar.node`;
+  const fileInput = 'file:///L:/R-IDE-builds/dependency-store/browser-node_modules/@parcel/watcher-win32-x64/watcher.node';
+  const rawInputs = [localEntry, nativeInput, nodeFileInput, uncInput, fileInput];
+  const metafile = {
+    inputs: Object.fromEntries(rawInputs.map(input => [input, {
+      bytes: 1,
+      imports: input === localEntry ? [
+        { path: nodeFileInput, original: nativeInput, kind: 'require-call' },
+        { path: fileInput, original: uncInput, kind: 'file-loader' },
+      ] : [],
+    }])),
+    outputs: {
+      'lib/backend/main.js': {
+        bytes: 1,
+        entryPoint: localEntry,
+        inputs: Object.fromEntries(rawInputs.map(input => [input, { bytesInOutput: 1 }])),
+        imports: [{ path: nodeFileInput, original: nativeInput, kind: 'require-call' }],
+        exports: [],
+      },
+    },
+  };
+
+  const logical = module.logicalizeMetafilePaths(metafile, { baseDirectory });
+  assert.deepEqual(Object.keys(logical.inputs).sort(), [
+    'file:node_modules/@parcel/watcher-win32-x64/watcher.node',
+    'node-file:node_modules/drivelist/build/Release/drivelist.node',
+    'node_modules/drivelist/build/Release/drivelist.node',
+    'node_modules/keytar/build/Release/keytar.node',
+    'src-gen/backend/main.js',
+  ].sort());
+  const output = logical.outputs['lib/backend/main.js'];
+  assert.equal(output.entryPoint, 'src-gen/backend/main.js');
+  assert.deepEqual(Object.keys(output.inputs).sort(), Object.keys(logical.inputs).sort());
+  assert.deepEqual(output.imports, [{
+    path: 'node-file:node_modules/drivelist/build/Release/drivelist.node',
+    original: 'node_modules/drivelist/build/Release/drivelist.node',
+    kind: 'require-call',
+  }]);
+  assert.deepEqual(logical.inputs['src-gen/backend/main.js'].imports, [
+    {
+      path: 'node-file:node_modules/drivelist/build/Release/drivelist.node',
+      original: 'node_modules/drivelist/build/Release/drivelist.node',
+      kind: 'require-call',
+    },
+    {
+      path: 'file:node_modules/@parcel/watcher-win32-x64/watcher.node',
+      original: 'node_modules/keytar/build/Release/keytar.node',
+      kind: 'file-loader',
+    },
+  ]);
+  assert.doesNotMatch(JSON.stringify(logical), /(?:[A-Za-z]:[\\/]|\\\\)/);
+
+  assert.throws(() => module.logicalizeMetafilePaths({
+    inputs: {
+      'L:/one/browser-node_modules/colliding/index.js': { bytes: 1, imports: [] },
+      'M:/two/browser-node_modules/colliding/index.js': { bytes: 1, imports: [] },
+    },
+    outputs: {},
+  }, { baseDirectory }), /collision/i);
 });
 
 test('browser owns the exact installed date-fns bridge dependency and narrow exports', () => {

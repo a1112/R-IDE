@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -50,6 +51,16 @@ const SCANOSS_BACKEND_DESCRIPTOR = Object.freeze({
     entry: 'tauri-src/backend/scanoss-service-feature.ts',
     output: 'lib/backend/scanoss-service-feature.cjs',
     action: 'scanoss',
+    runtimePackages: Object.freeze([
+        '@grpc/grpc-js',
+        'adm-zip',
+        'iconv-lite',
+        'protobufjs',
+        'scanoss',
+        'tar',
+        'tr46',
+    ]),
+    exclusiveInputCount: 318,
 });
 
 test('Tauri preview profile replaces only the eager frontend module with a lazy Markdown proxy', () => {
@@ -829,6 +840,7 @@ test('rejects ambiguous, unsafe, or non-CJS deferred backend edge declarations',
     const packages = {
         product: manifest('product'),
         '@theia/scanoss': manifest('@theia/scanoss'),
+        '@theia/scanoss-alternate': manifest('@theia/scanoss-alternate'),
     };
     const input = deferredBackendModules => fixture({
         roots: ['product', '@theia/scanoss'],
@@ -843,8 +855,9 @@ test('rejects ambiguous, unsafe, or non-CJS deferred backend edge declarations',
     });
     const alternate = {
         ...SCANOSS_BACKEND_DESCRIPTOR,
-        importer: '@theia/scanoss/lib/node/alternate-backend-module',
-        module: '@theia/scanoss/lib/node/alternate-service-impl',
+        package: '@theia/scanoss-alternate',
+        importer: '@theia/scanoss-alternate/lib/node/alternate-backend-module',
+        module: '@theia/scanoss-alternate/lib/node/alternate-service-impl',
         proxy: 'tauri-src/backend/alternate-proxy.ts',
         entry: 'tauri-src/backend/alternate-feature.ts',
         output: 'lib/backend/alternate-feature.cjs',
@@ -861,6 +874,12 @@ test('rejects ambiguous, unsafe, or non-CJS deferred backend edge declarations',
         ['output', 'lib/backend/scanoss-service-feature.js', /deferred backend module output.*CJS/i],
         ['output', '../scanoss-service-feature.cjs', /deferred backend module output.*CJS/i],
         ['action', 'ScanOSS', /deferred backend module action.*canonical/i],
+        ['runtimePackages', 'scanoss', /runtime packages.*array/i],
+        ['runtimePackages', ['scanoss', 'scanoss'], /runtime packages.*(?:duplicate|unique)/i],
+        ['runtimePackages', ['scanoss/lib/index'], /runtime package.*canonical/i],
+        ['runtimePackages', ['scanoss', '@grpc/grpc-js'], /runtime packages.*sorted/i],
+        ['exclusiveInputCount', 0, /exclusive input count.*positive integer/i],
+        ['exclusiveInputCount', 318.5, /exclusive input count.*positive integer/i],
     ]) {
         assert.throws(
             () => resolveProfile(input([{ ...SCANOSS_BACKEND_DESCRIPTOR, [field]: value }])),
@@ -869,11 +888,22 @@ test('rejects ambiguous, unsafe, or non-CJS deferred backend edge declarations',
         );
     }
 
-    for (const field of ['package', 'module', 'output', 'action']) {
+    for (const field of ['package', 'module', 'proxy', 'entry', 'output', 'action']) {
+        let duplicate = { ...alternate, [field]: SCANOSS_BACKEND_DESCRIPTOR[field] };
+        if (field === 'package' || field === 'module') {
+            duplicate = {
+                ...duplicate,
+                package: SCANOSS_BACKEND_DESCRIPTOR.package,
+                importer: '@theia/scanoss/lib/node/alternate-backend-module',
+                module: field === 'module'
+                    ? SCANOSS_BACKEND_DESCRIPTOR.module
+                    : '@theia/scanoss/lib/node/alternate-service-impl',
+            };
+        }
         assert.throws(
             () => resolveProfile(input([
                 SCANOSS_BACKEND_DESCRIPTOR,
-                { ...alternate, [field]: SCANOSS_BACKEND_DESCRIPTOR[field] },
+                duplicate,
             ])),
             /deferred backend.*duplicated/i,
             `duplicate ${field} must be rejected`,
@@ -1702,7 +1732,7 @@ test('backend build plans split only the exact ScanOSS service edge and attest b
         ),
         writeModule(
             '@theia/scanoss/lib/node/scanoss-service-impl.js',
-            "const runtime = require('scanoss'); exports.RIDE_REAL_SCANOSS_IMPL_MARKER = true; exports.ScanOSSServiceImpl = class ScanOSSServiceImpl { constructor() { this.runtime = runtime; } async scanContent() { return { type: 'success', results: [] }; } };\n",
+            "const runtime = require('scanoss'); exports.RIDE_REAL_SCANOSS_IMPL_MARKER = true; exports.ScanOSSServiceImpl = class ScanOSSServiceImpl { constructor() { this.runtime = runtime; } async scanContent(content, apiKey) { return { type: 'success', results: [{ content, apiKey, runtimeCount: runtime.runtime.length }] }; } };\n",
         ),
         writeModule(
             '@theia/scanoss/lib/common/scanoss-service.js',
@@ -1857,6 +1887,19 @@ test('backend build plans split only the exact ScanOSS service edge and attest b
     assert.doesNotMatch(mainSource, /@injectable|@inject|@preDestroy/);
     execFileSync(process.execPath, ['--check', mainOutput], { stdio: 'pipe' });
     execFileSync(process.execPath, ['--eval', 'require(process.argv[1])', mainOutput], { stdio: 'pipe' });
+    const activation = JSON.parse(execFileSync(process.execPath, [
+        '--eval',
+        "const { ScanOSSServiceImpl } = require(process.argv[1]); new ScanOSSServiceImpl().scanContent('fixture-content', 'fixture-key').then(value => process.stdout.write(JSON.stringify(value)), error => { console.error(error); process.exitCode = 1; });",
+        mainOutput,
+    ], { cwd: path.dirname(mainOutput), encoding: 'utf8' }));
+    assert.deepEqual(activation, {
+        type: 'success',
+        results: [{
+            content: 'fixture-content',
+            apiKey: 'fixture-key',
+            runtimeCount: runtimePackages.length - 1,
+        }],
+    });
 
     const mainMetadata = JSON.parse(await fs.promises.readFile(path.join(directory, 'lib', 'metadata', 'backend.json'), 'utf8'));
     const featureMetadata = JSON.parse(await fs.promises.readFile(path.join(directory, 'lib', 'metadata', 'backend-scanoss.json'), 'utf8'));
@@ -1899,6 +1942,33 @@ test('backend build plans split only the exact ScanOSS service edge and attest b
             output: '../escape.cjs',
         }] } },
     }, directory), /outside|escape|inside/i);
+
+    const alternateProxy = path.join(directory, 'tauri-src', 'backend', 'alternate-proxy.ts');
+    const alternateEntry = path.join(directory, 'tauri-src', 'backend', 'alternate-feature.ts');
+    await fs.promises.writeFile(alternateProxy, 'export class ScanOSSServiceImpl {}\n');
+    await fs.promises.writeFile(alternateEntry, 'export const createScanOSSService = () => ({});\n');
+    await writeModule(
+        '@theia/scanoss/lib/node/alternate-service-impl.js',
+        'exports.ScanOSSServiceImpl = class ScanOSSServiceImpl {};\n',
+    );
+    const alternateDescriptor = {
+        ...SCANOSS_BACKEND_DESCRIPTOR,
+        importer: '@theia/scanoss/lib/node/other-backend-module',
+        module: '@theia/scanoss/lib/node/alternate-service-impl',
+        proxy: 'tauri-src/backend/alternate-proxy.ts',
+        entry: 'tauri-src/backend/alternate-feature.ts',
+        output: 'lib/backend/alternate-feature.cjs',
+        action: 'scanoss-alternate',
+    };
+    for (const field of ['proxy', 'entry']) {
+        assert.throws(() => deferredBuild.createTauriBackendBuildPlans(options, {
+            ...criticalManifest,
+            featureGroups: { ai: { deferredBackendModules: [
+                SCANOSS_BACKEND_DESCRIPTOR,
+                { ...alternateDescriptor, [field]: SCANOSS_BACKEND_DESCRIPTOR[field] },
+            ] } },
+        }, directory), new RegExp(`duplicate.*${field}|${field}.*duplicated`, 'i'));
+    }
 });
 
 test('real esbuild keeps non-approved relative and bare ScanOSS implementation edges unaliased', async t => {
@@ -2114,6 +2184,74 @@ test('backend context runner watches or rebuilds and disposes every context exac
     assert.match(source, /createTauriBuildContexts/);
     assert.match(source, /withProfileMetadata\(options,\s*`backend-\$\{action\}`\)/);
     assert.match(source, /runTauriBuildContexts/);
+});
+
+test('backend context runner aggregates operation and disposal failures without double-dispose', async () => {
+    const plannerPath = path.join(
+        appDirectory,
+        'applications',
+        'browser',
+        'tauri-src',
+        'backend',
+        'esbuild-backend-deferred.mjs',
+    );
+    const { runTauriBuildContexts } = await import(pathToFileURL(plannerPath));
+
+    for (const watch of [false, true]) {
+        const operationError = new Error(`${watch ? 'watch' : 'rebuild'} failed`);
+        const disposalError = new Error(`${watch ? 'watch' : 'rebuild'} disposal failed`);
+        const calls = Array.from({ length: 3 }, () => ({ operation: 0, dispose: 0 }));
+        const contexts = calls.map((record, index) => ({
+            async rebuild() {
+                record.operation += 1;
+                if (!watch && index === 1) {
+                    throw operationError;
+                }
+            },
+            async watch() {
+                record.operation += 1;
+                if (watch && index === 1) {
+                    throw operationError;
+                }
+            },
+            async dispose() {
+                record.dispose += 1;
+                if (index === 0) {
+                    throw disposalError;
+                }
+            },
+        }));
+
+        let failure;
+        try {
+            await runTauriBuildContexts(contexts, { watch });
+        } catch (error) {
+            failure = error;
+        }
+        assert.ok(failure instanceof AggregateError);
+        assert.deepEqual(failure.errors, [operationError, disposalError]);
+        assert.deepEqual(calls.map(record => record.dispose), [1, 1, 1]);
+    }
+
+    const disposalError = new Error('cached disposal failed');
+    let disposeCalls = 0;
+    const dispose = await runTauriBuildContexts([{
+        async watch() {},
+        async dispose() {
+            disposeCalls += 1;
+            throw disposalError;
+        },
+    }], { watch: true });
+    const first = dispose();
+    const second = dispose();
+    assert.equal(first, second);
+    await assert.rejects(first, error => (
+        error instanceof AggregateError
+        && error.errors.length === 1
+        && error.errors[0] === disposalError
+    ));
+    await assert.rejects(second);
+    assert.equal(disposeCalls, 1);
 });
 
 test('esbuild routes every browser, backend feature, and Codex context through failure-safe creation', async () => {
@@ -2920,6 +3058,96 @@ async function createPublishSource(browserDirectory, manifest, marker = manifest
     return sourceDirectory;
 }
 
+function deferredBackendExclusiveInputs(descriptor = SCANOSS_BACKEND_DESCRIPTOR) {
+    const inputs = [
+        `node_modules/${descriptor.module}.js`,
+        ...descriptor.runtimePackages.map(packageName => `node_modules/${packageName}/index.js`),
+    ];
+    while (inputs.length < descriptor.exclusiveInputCount) {
+        inputs.push(`node_modules/scanoss-fixture-exclusive-${inputs.length}/index.js`);
+    }
+    return inputs;
+}
+
+function deferredBackendRelativeRequest(descriptor = SCANOSS_BACKEND_DESCRIPTOR) {
+    const relative = path.posix.relative(path.posix.dirname(descriptor.importer), descriptor.module);
+    return relative.startsWith('.') ? relative : `./${relative}`;
+}
+
+async function writeDeferredBackendAttestation(sourceDirectory, manifest, descriptor = SCANOSS_BACKEND_DESCRIPTOR) {
+    const sourceLib = path.join(sourceDirectory, 'lib');
+    const mainOutput = path.join(sourceLib, 'backend', 'main.js');
+    const featureOutput = path.join(sourceDirectory, descriptor.output);
+    const featureBytes = 'attested-scanoss-feature';
+    await fs.promises.mkdir(path.dirname(featureOutput), { recursive: true });
+    await fs.promises.writeFile(featureOutput, featureBytes);
+
+    const importer = `node_modules/${descriptor.importer}.js`;
+    const mainInputs = [
+        'src-gen/backend/main.js',
+        importer,
+        descriptor.proxy,
+    ];
+    const exclusiveInputs = deferredBackendExclusiveInputs(descriptor);
+    const featureInputs = [descriptor.entry, ...exclusiveInputs];
+    const identity = target => ({
+        schema: 'ride.esbuild-metafile@1',
+        profile: manifest.profile,
+        buildId: manifest.buildId,
+        digest: manifest.digest,
+        target,
+    });
+    const mainRecord = {
+        ...identity('backend'),
+        outputHashes: {
+            'lib/backend/main.js': crypto.createHash('sha256').update(await fs.promises.readFile(mainOutput)).digest('hex'),
+        },
+        metafile: {
+            inputs: Object.fromEntries(mainInputs.map(input => [input, {
+                bytes: 1,
+                imports: input === importer ? [{
+                    path: descriptor.proxy,
+                    original: deferredBackendRelativeRequest(descriptor),
+                    kind: 'require-call',
+                }] : [],
+            }])),
+            outputs: {
+                'lib/backend/main.js': {
+                    bytes: 1,
+                    entryPoint: 'src-gen/backend/main.js',
+                    inputs: Object.fromEntries(mainInputs.map(input => [input, { bytesInOutput: 1 }])),
+                    imports: [],
+                    exports: [],
+                },
+            },
+        },
+    };
+    const featureRecord = {
+        ...identity(`backend-${descriptor.action}`),
+        outputHashes: {
+            [descriptor.output]: crypto.createHash('sha256').update(featureBytes).digest('hex'),
+        },
+        metafile: {
+            inputs: Object.fromEntries(featureInputs.map(input => [input, { bytes: 1, imports: [] }])),
+            outputs: {
+                [descriptor.output]: {
+                    bytes: featureBytes.length,
+                    entryPoint: descriptor.entry,
+                    inputs: Object.fromEntries(featureInputs.map(input => [input, { bytesInOutput: 1 }])),
+                    imports: [],
+                    exports: ['createScanOSSService'],
+                },
+            },
+        },
+    };
+    await fs.promises.mkdir(path.join(sourceLib, 'metadata'), { recursive: true });
+    await Promise.all([
+        fs.promises.writeFile(path.join(sourceLib, 'metadata', 'backend.json'), `${JSON.stringify(mainRecord, null, 2)}\n`),
+        fs.promises.writeFile(path.join(sourceLib, 'metadata', `backend-${descriptor.action}.json`), `${JSON.stringify(featureRecord, null, 2)}\n`),
+    ]);
+    return { mainRecord, featureRecord, featureBytes, exclusiveInputs };
+}
+
 test('publish validates identity and writes byte-identical manifests before cleaning its build', async t => {
     const browserDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-publish-ok-'));
     t.after(() => fs.promises.rm(browserDirectory, { recursive: true, force: true }));
@@ -2972,9 +3200,7 @@ test('publish requires and preserves the attested ScanOSS backend feature only f
         sourceIdentity: async () => manifest.sourceIdentity,
     }), /deferred backend output.*missing/i);
 
-    const featureSource = path.join(sourceDirectory, SCANOSS_BACKEND_DESCRIPTOR.output);
-    await fs.promises.mkdir(path.dirname(featureSource), { recursive: true });
-    await fs.promises.writeFile(featureSource, 'attested-scanoss-feature');
+    await writeDeferredBackendAttestation(sourceDirectory, manifest);
     await publishProfileBuild({
         browserDirectory,
         expectedProfile: manifest.profile,
@@ -3010,6 +3236,131 @@ test('publish requires and preserves the attested ScanOSS backend feature only f
         sourceDirectory,
         sourceIdentity: async () => full.sourceIdentity,
     }), /full profile.*deferred backend/i);
+});
+
+test('publish re-attests copied deferred backend artifacts before atomic installation', async t => {
+    const mutations = [
+        ['corrupt copied output', async temporaryLib => {
+            await fs.promises.writeFile(path.join(temporaryLib, 'backend', 'scanoss-service-feature.cjs'), 'arbitrary-string-output');
+        }, /hash|attest/i],
+        ['malformed copied metadata', async temporaryLib => {
+            await fs.promises.writeFile(path.join(temporaryLib, 'metadata', 'backend-scanoss.json'), '{');
+        }, /metadata.*malformed/i],
+        ['missing copied metadata', async temporaryLib => {
+            await fs.promises.rm(path.join(temporaryLib, 'metadata', 'backend-scanoss.json'));
+        }, /metadata.*missing/i],
+        ['stale copied build identity', async temporaryLib => {
+            const file = path.join(temporaryLib, 'metadata', 'backend-scanoss.json');
+            const record = JSON.parse(await fs.promises.readFile(file, 'utf8'));
+            record.buildId = 'stale-build';
+            await fs.promises.writeFile(file, JSON.stringify(record));
+        }, /identity/i],
+        ['wrong copied metadata schema', async temporaryLib => {
+            const file = path.join(temporaryLib, 'metadata', 'backend-scanoss.json');
+            const record = JSON.parse(await fs.promises.readFile(file, 'utf8'));
+            record.schema = 'arbitrary-schema';
+            await fs.promises.writeFile(file, JSON.stringify(record));
+        }, /identity|schema/i],
+        ['wrong copied metadata profile', async temporaryLib => {
+            const file = path.join(temporaryLib, 'metadata', 'backend-scanoss.json');
+            const record = JSON.parse(await fs.promises.readFile(file, 'utf8'));
+            record.profile = 'full';
+            await fs.promises.writeFile(file, JSON.stringify(record));
+        }, /identity|profile/i],
+        ['wrong copied metadata digest', async temporaryLib => {
+            const file = path.join(temporaryLib, 'metadata', 'backend-scanoss.json');
+            const record = JSON.parse(await fs.promises.readFile(file, 'utf8'));
+            record.digest = '0'.repeat(64);
+            await fs.promises.writeFile(file, JSON.stringify(record));
+        }, /identity|digest/i],
+        ['wrong copied metadata target', async temporaryLib => {
+            const file = path.join(temporaryLib, 'metadata', 'backend-scanoss.json');
+            const record = JSON.parse(await fs.promises.readFile(file, 'utf8'));
+            record.target = 'backend-arbitrary';
+            await fs.promises.writeFile(file, JSON.stringify(record));
+        }, /identity|target/i],
+        ['arbitrary copied output inventory', async temporaryLib => {
+            const file = path.join(temporaryLib, 'metadata', 'backend-scanoss.json');
+            const record = JSON.parse(await fs.promises.readFile(file, 'utf8'));
+            const detail = record.metafile.outputs[SCANOSS_BACKEND_DESCRIPTOR.output];
+            record.metafile.outputs = { 'lib/backend/arbitrary.cjs': detail };
+            record.outputHashes = { 'lib/backend/arbitrary.cjs': '0'.repeat(64) };
+            await fs.promises.writeFile(file, JSON.stringify(record));
+        }, /output/i],
+        ['wrong copied feature entry', async temporaryLib => {
+            const file = path.join(temporaryLib, 'metadata', 'backend-scanoss.json');
+            const record = JSON.parse(await fs.promises.readFile(file, 'utf8'));
+            record.metafile.outputs[SCANOSS_BACKEND_DESCRIPTOR.output].entryPoint = 'tauri-src/backend/wrong-feature.ts';
+            await fs.promises.writeFile(file, JSON.stringify(record));
+        }, /entry/i],
+        ['missing copied feature entry', async temporaryLib => {
+            const file = path.join(temporaryLib, 'metadata', 'backend-scanoss.json');
+            const record = JSON.parse(await fs.promises.readFile(file, 'utf8'));
+            delete record.metafile.outputs[SCANOSS_BACKEND_DESCRIPTOR.output].entryPoint;
+            await fs.promises.writeFile(file, JSON.stringify(record));
+        }, /entry/i],
+        ['missing copied feature hash', async temporaryLib => {
+            const file = path.join(temporaryLib, 'metadata', 'backend-scanoss.json');
+            const record = JSON.parse(await fs.promises.readFile(file, 'utf8'));
+            delete record.outputHashes[SCANOSS_BACKEND_DESCRIPTOR.output];
+            await fs.promises.writeFile(file, JSON.stringify(record));
+        }, /hash/i],
+        ['wrong copied exact alias edge', async temporaryLib => {
+            const file = path.join(temporaryLib, 'metadata', 'backend.json');
+            const record = JSON.parse(await fs.promises.readFile(file, 'utf8'));
+            const importer = `node_modules/${SCANOSS_BACKEND_DESCRIPTOR.importer}.js`;
+            record.metafile.inputs[importer].imports[0].original = './unrelated-service-impl';
+            await fs.promises.writeFile(file, JSON.stringify(record));
+        }, /alias|import.*record|exact.*edge/i],
+        ['missing copied runtime inventory', async temporaryLib => {
+            const file = path.join(temporaryLib, 'metadata', 'backend-scanoss.json');
+            const record = JSON.parse(await fs.promises.readFile(file, 'utf8'));
+            const runtime = 'node_modules/tr46/index.js';
+            delete record.metafile.inputs[runtime];
+            delete record.metafile.outputs[SCANOSS_BACKEND_DESCRIPTOR.output].inputs[runtime];
+            await fs.promises.writeFile(file, JSON.stringify(record));
+        }, /runtime|tr46/i],
+        ['absolute copied metadata path', async temporaryLib => {
+            const file = path.join(temporaryLib, 'metadata', 'backend.json');
+            const record = JSON.parse(await fs.promises.readFile(file, 'utf8'));
+            const absolute = String.raw`node-file:L:\R-IDE-builds\dependency-store\browser-node_modules\keytar\keytar.node`;
+            record.metafile.inputs[absolute] = { bytes: 1, imports: [] };
+            record.metafile.outputs['lib/backend/main.js'].inputs[absolute] = { bytesInOutput: 1 };
+            await fs.promises.writeFile(file, JSON.stringify(record));
+        }, /absolute|portable|metadata path/i],
+    ];
+
+    for (const [index, [name, mutate, pattern]] of mutations.entries()) {
+        const browserDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), `ride-publish-attestation-${index}-`));
+        t.after(() => fs.promises.rm(browserDirectory, { recursive: true, force: true }));
+        const manifest = profileBuildManifest({ buildId: `scanoss-copy-${index}` });
+        manifest.featureGroups = { ai: { deferredBackendModules: [SCANOSS_BACKEND_DESCRIPTOR] } };
+        manifest.digest = canonicalDigest({
+            schema: 'ride.tauri-frontend-profile@2',
+            profile: manifest.profile,
+            roots: manifest.roots,
+            extensions: manifest.extensions,
+            packages: manifest.packages,
+            featureGroups: manifest.featureGroups,
+        });
+        const sourceDirectory = await createPublishSource(browserDirectory, manifest, 'source-main');
+        const { featureBytes } = await writeDeferredBackendAttestation(sourceDirectory, manifest);
+        await writeSentinel(path.join(browserDirectory, 'lib'), 'previous-complete-build');
+
+        await assert.rejects(publishProfileBuild({
+            browserDirectory,
+            expectedProfile: manifest.profile,
+            buildId: manifest.buildId,
+            sourceDirectory,
+            sourceIdentity: async () => manifest.sourceIdentity,
+            copyTree: async (source, destination) => {
+                await fs.promises.cp(source, destination, { recursive: true });
+                await mutate(destination);
+            },
+        }), pattern, name);
+        assert.equal(await fs.promises.readFile(path.join(browserDirectory, 'lib', 'sentinel.txt'), 'utf8'), 'previous-complete-build');
+        assert.equal(await fs.promises.readFile(path.join(sourceDirectory, SCANOSS_BACKEND_DESCRIPTOR.output), 'utf8'), featureBytes);
+    }
 });
 
 test('publish rejects profile mismatch, stale commit, and corrupt digest without replacing lib', async t => {
