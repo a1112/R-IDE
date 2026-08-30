@@ -130,7 +130,7 @@
           "runtimePackages": [
             "theia-ide-codex-ext"
           ],
-          "exclusiveInputCount": 1
+          "exclusiveInputCount": 22
         }
       ],
       "deferBlockedReason": "The group fails the explicit-adapter and isolated-backend gates; no complete real-action smoke and initial-entry inventory exists."

@@ -49,7 +49,7 @@ const CODEX_BACKEND_DESCRIPTOR = Object.freeze({
   output: 'lib/backend/codex-backend-feature.cjs',
   action: 'codex-backend',
   runtimePackages: Object.freeze(['theia-ide-codex-ext']),
-  exclusiveInputCount: 1,
+  exclusiveInputCount: 22,
 });
 
 test('repository Tauri profile declares the exact deferred Markdown preview descriptor', () => {
