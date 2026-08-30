@@ -481,9 +481,15 @@ test('deferred aliases intercept only exact escaped module requests', () => {
     }, path.resolve('generated-target'));
     assert.deepEqual(plans.main.alias, { existing: 'preserved' });
     let resolver;
-    plans.main.plugins[0].setup({ onResolve(filter, callback) { resolver = { filter, callback }; } });
+    const aliasPlugin = plans.main.plugins.find(plugin => plugin.name === 'ride-tauri-deferred-frontend-alias');
+    assert.ok(aliasPlugin);
+    aliasPlugin.setup({ onResolve(filter, callback) { resolver = { filter, callback }; } });
     assert.equal(resolver.filter.filter.test('theia-ide-codex-ext/lib/browser/ride-codex-frontend-module'), true);
     assert.equal(resolver.filter.filter.test('@scope/feature.with+symbols'), true);
+    assert.equal(resolver.filter.filter.test('date-fns'), true);
+    assert.equal(resolver.filter.filter.test('date-fns/locale'), true);
+    assert.equal(resolver.filter.filter.test('date-fns/format'), false);
+    assert.equal(resolver.filter.filter.test('date-fns/locale/en-US'), false);
     assert.equal(resolver.filter.filter.test('theia-ide-codex-ext/lib/browser/ride-codex-frontend-module/extra'), false);
     assert.equal(resolver.filter.filter.test('@scope/featureXwithsymbols'), false);
     assert.deepEqual(resolver.callback({ path: 'theia-ide-codex-ext/lib/browser/ride-codex-frontend-module' }), {
@@ -491,6 +497,204 @@ test('deferred aliases intercept only exact escaped module requests', () => {
     });
     assert.equal(resolver.callback({ path: 'theia-ide-codex-ext/lib/browser/ride-codex-frontend-module/extra' }), undefined);
     assert.equal(resolver.callback({ path: 'unlisted/module' }), undefined);
+    assert.deepEqual(resolver.callback({ path: 'date-fns' }), {
+        path: path.resolve('generated-target', 'tauri-src/date-fns-bridge.ts'),
+    });
+    assert.deepEqual(resolver.callback({ path: 'date-fns/locale' }), {
+        path: path.resolve('generated-target', 'tauri-src/date-fns-locales-bridge.ts'),
+    });
+    assert.equal(resolver.callback({ path: 'date-fns/format' }), undefined);
+    assert.equal(resolver.callback({ path: 'date-fns/locale/en-US' }), undefined);
+});
+
+test('Tauri critical aliases reject duplicate bare requests deterministically', () => {
+    const options = {
+        entryPoints: {
+            bundle: 'bundle.js',
+            'secondary-window': 'secondary-window.js',
+            'editor.worker': 'editor-worker.js',
+            'plugin-worker': 'plugin-worker.js',
+        },
+        outdir: 'lib/frontend',
+    };
+    const manifest = {
+        profile: 'tauri-critical',
+        featureGroups: {
+            invalid: {
+                deferredFrontendModules: [{
+                    module: 'date-fns',
+                    proxy: 'tauri-src/duplicate-date-fns.ts',
+                }],
+            },
+        },
+    };
+
+    assert.throws(
+        () => createTauriBrowserBuildPlans(options, manifest, path.resolve('generated-target')),
+        error => {
+            assert.match(error.message, /duplicate exact frontend alias request "date-fns"/i);
+            assert.match(error.message, /built-in date-fns bridge/i);
+            assert.match(error.message, /feature group "invalid"/i);
+            assert.match(error.message, /module "date-fns"/i);
+            assert.match(error.message, /proxy "tauri-src\/duplicate-date-fns\.ts"/i);
+            return true;
+        },
+    );
+});
+
+test('Tauri date bridges expose pinned symbols, narrow inputs, and every emitted desktop locale', async t => {
+    const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-date-fns-bridge-'));
+    t.after(() => fs.promises.rm(directory, { recursive: true, force: true }));
+    const browserDirectory = path.join(appDirectory, 'applications', 'browser');
+    const outdir = path.join(directory, 'dist');
+    const entryPoint = path.join(directory, 'frontend-entry.mjs');
+    const bridgePath = path.join(browserDirectory, 'tauri-src', 'date-fns-bridge.ts').replaceAll('\\', '/');
+    const localesPath = path.join(browserDirectory, 'tauri-src', 'date-fns-locales-bridge.ts').replaceAll('\\', '/');
+    await Promise.all([
+        fs.promises.writeFile(path.join(directory, 'package.json'), '{"type":"module"}\n'),
+        fs.promises.writeFile(entryPoint, `
+            import * as bridge from ${JSON.stringify(bridgePath)};
+            import * as locales from ${JSON.stringify(localesPath)};
+            export { bridge };
+            export { locales };
+            export const localeLookup = { en: locales['en'], 'zh-cn': locales['zh-cn'] };
+        `),
+    ]);
+    const result = await esbuild.build({
+        entryPoints: { bundle: entryPoint },
+        outdir,
+        bundle: true,
+        format: 'esm',
+        platform: 'node',
+        target: 'node22',
+        metafile: true,
+        logLevel: 'silent',
+    });
+    const built = await import(`${pathToFileURL(path.join(outdir, 'bundle.js')).href}?contract=${Date.now()}`);
+
+    assert.equal(typeof built.bridge.formatDistance, 'function');
+    assert.equal(typeof built.bridge.formatDistanceToNow, 'function');
+    assert.ok(built.locales.enUS);
+    assert.ok(built.locales.zhCN);
+    assert.equal(built.localeLookup.en, built.locales.enUS);
+    assert.equal(built.localeLookup['zh-cn'], built.locales.zhCN);
+
+    const copyFrontendSource = await fs.promises.readFile(
+        path.join(appDirectory, 'applications', 'tauri', 'copy-frontend.js'),
+        'utf8',
+    );
+    const localeAssignments = [...copyFrontendSource.matchAll(
+        /localStorage\.setItem\(\s*['"]localeId['"]\s*,([\s\S]*?)\);/g,
+    )];
+    assert.ok(localeAssignments.length > 0, 'copy-frontend.js must expose its localeId values to the bridge contract');
+    const emittedLocales = [...new Set(localeAssignments.flatMap(assignment =>
+        [...assignment[1].matchAll(/['"]([^'"]+)['"]/g)].map(match => match[1])
+    ))].sort();
+    assert.deepEqual(emittedLocales, ['en', 'zh-cn']);
+    for (const locale of emittedLocales) {
+        assert.ok(built.locales[locale], `date-fns locale bridge must export desktop locale ${locale}`);
+    }
+
+    const inputs = Object.keys(result.metafile.inputs).map(input => input.replaceAll('\\', '/'));
+    assert.equal(inputs.some(input => input.endsWith('/date-fns/index.cjs')), false);
+    assert.equal(inputs.some(input => input.endsWith('/date-fns/locale.cjs')), false);
+    assert.ok(inputs.some(input => /\/date-fns\/formatDistance\.(?:c?js)$/.test(input)));
+    assert.ok(inputs.some(input => /\/date-fns\/formatDistanceToNow\.(?:c?js)$/.test(input)));
+    assert.ok(inputs.some(input => /\/date-fns\/locale\/en-US\.(?:c?js)$/.test(input)));
+    assert.ok(inputs.some(input => /\/date-fns\/locale\/zh-CN\.(?:c?js)$/.test(input)));
+});
+
+test('Tauri frontend build audits every broad date-fns importer, including dynamic inputs', async t => {
+    const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-date-fns-importers-'));
+    t.after(() => fs.promises.rm(directory, { recursive: true, force: true }));
+    const browserDirectory = path.join(appDirectory, 'applications', 'browser');
+    const outdir = path.join(directory, 'dist');
+    const entryPoints = {
+        bundle: path.join(directory, 'frontend-entry.mjs'),
+        'secondary-window': path.join(directory, 'secondary-window.mjs'),
+        'editor.worker': path.join(directory, 'editor-worker.mjs'),
+        'plugin-worker': path.join(directory, 'plugin-worker.mjs'),
+    };
+    const pinnedSources = [
+        path.join(browserDirectory, 'node_modules', '@theia', 'ai-chat-ui', 'lib', 'browser', 'chat-date-utils.js'),
+        path.join(browserDirectory, 'node_modules', '@theia', 'ai-ide', 'lib', 'browser', 'ai-configuration', 'token-usage-configuration-widget.js'),
+    ];
+    const relativeImport = file => {
+        const nativeRelative = path.relative(directory, file);
+        if (path.isAbsolute(nativeRelative)) {
+            return nativeRelative.replaceAll('\\', '/');
+        }
+        const relative = nativeRelative.replaceAll('\\', '/');
+        return relative.startsWith('.') ? relative : `./${relative}`;
+    };
+    await Promise.all([
+        fs.promises.writeFile(entryPoints.bundle, pinnedSources.map(file => `import ${JSON.stringify(relativeImport(file))};`).join('\n')),
+        fs.promises.writeFile(entryPoints['secondary-window'], 'export {};\n'),
+        fs.promises.writeFile(entryPoints['editor.worker'], 'export {};\n'),
+        fs.promises.writeFile(entryPoints['plugin-worker'], 'export {};\n'),
+    ]);
+    await fs.promises.mkdir(outdir, { recursive: true });
+    await fs.promises.writeFile(
+        path.join(outdir, 'index.html'),
+        '<script type="text/javascript" src="./bundle.js" charset="utf-8"></script>',
+    );
+    const plans = createTauriBrowserBuildPlans({
+        entryPoints,
+        outdir,
+        bundle: true,
+        packages: 'external',
+        platform: 'node',
+        target: 'node22',
+        metafile: true,
+        logLevel: 'silent',
+    }, { profile: 'tauri-critical', featureGroups: {} }, browserDirectory);
+    const contractPlugin = plans.main.plugins.find(plugin => plugin.name === 'ride-tauri-date-fns-import-contract');
+    assert.ok(contractPlugin, 'tauri-critical must audit the complete frontend-main metafile');
+    let audit;
+    contractPlugin.setup({ onEnd(callback) { audit = callback; } });
+    assert.equal(typeof audit, 'function');
+
+    const result = await esbuild.build(plans.main);
+    const rows = Object.entries(result.metafile.inputs).flatMap(([input, detail]) =>
+        (detail.imports ?? [])
+            .filter(record => record.original === 'date-fns' || record.original === 'date-fns/locale')
+            .map(record => ({
+                importer: input.replaceAll('\\', '/').slice(input.replaceAll('\\', '/').lastIndexOf('/node_modules/') + 14),
+                request: record.original,
+            })),
+    ).sort((left, right) => `${left.importer}\0${left.request}`.localeCompare(`${right.importer}\0${right.request}`));
+    assert.deepEqual(rows, [{
+        importer: '@theia/ai-chat-ui/lib/browser/chat-date-utils.js',
+        request: 'date-fns',
+    }, {
+        importer: '@theia/ai-chat-ui/lib/browser/chat-date-utils.js',
+        request: 'date-fns/locale',
+    }, {
+        importer: '@theia/ai-ide/lib/browser/ai-configuration/token-usage-configuration-widget.js',
+        request: 'date-fns',
+    }]);
+
+    const unexpected = structuredClone(result.metafile);
+    const futureInput = 'node_modules/@theia/future/lib/browser/lazy-date.js';
+    unexpected.inputs[futureInput] = {
+        bytes: 1,
+        imports: [{
+            path: 'tauri-src/date-fns-bridge.ts',
+            original: 'date-fns',
+            kind: 'require-call',
+        }],
+    };
+    unexpected.outputs['lib/frontend/chunks/future-date.js'] = {
+        bytes: 1,
+        entryPoint: futureInput,
+        inputs: { [futureInput]: { bytesInOutput: 1 } },
+        imports: [],
+        exports: [],
+    };
+    assert.throws(
+        () => audit({ errors: [], metafile: unexpected }),
+        /unexpected date-fns importer.*@theia\/future.*date-fns/i,
+    );
 });
 
 test('Tauri browser build splits only the ESM main entry and keeps classic worker names intact', () => {
@@ -540,6 +744,7 @@ test('Tauri browser build splits only the ESM main entry and keeps classic worke
 
     const full = createTauriBrowserBuildPlans(options, { ...criticalManifest, profile: 'full' }, path.resolve('full-target'));
     assert.deepEqual(full.main.alias ?? {}, {});
+    assert.equal(full.main.plugins.some(plugin => plugin.name === 'ride-tauri-deferred-frontend-alias'), false);
 });
 
 test('dedupe keeps a logical Theia package path when the profile uses a junction', async t => {

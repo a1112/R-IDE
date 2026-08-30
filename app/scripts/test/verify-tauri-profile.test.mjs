@@ -388,6 +388,72 @@ test('profile builds emit named esbuild metadata and expose the verifier command
   assert.match(bundlerGeneratorSource, /const sourcemap = production \? false : 'linked'/);
 });
 
+test('browser owns the exact installed date-fns bridge dependency and narrow exports', () => {
+  const appDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+  const browserDirectory = path.join(appDirectory, 'applications', 'browser');
+  const browserManifest = JSON.parse(fs.readFileSync(path.join(browserDirectory, 'package.json'), 'utf8'));
+  assert.equal(browserManifest.dependencies?.['date-fns'], '4.4.0');
+
+  const browserRequire = createRequire(path.join(browserDirectory, 'package.json'));
+  const requests = [
+    'date-fns/formatDistance',
+    'date-fns/formatDistanceToNow',
+    'date-fns/locale/en-US',
+    'date-fns/locale/zh-CN',
+  ];
+  const resolved = requests.map(request => browserRequire.resolve(request));
+  assert.equal(resolved.every(file => fs.statSync(file).isFile()), true);
+  const installedManifest = JSON.parse(fs.readFileSync(path.join(path.dirname(resolved[0]), 'package.json'), 'utf8'));
+  assert.equal(installedManifest.version, '4.4.0');
+  for (const request of requests) {
+    assert.ok(installedManifest.exports?.[`./${request.slice('date-fns/'.length)}`], `${request} must be exported`);
+  }
+
+  const lockfile = fs.readFileSync(path.join(appDirectory, 'yarn.lock'), 'utf8');
+  const lockEntry = lockfile.match(/^date-fns@4\.4\.0, date-fns@\^4\.1\.0, date-fns@\^4\.4\.0:\r?\n(?: {2}.*\r?\n)+/m)?.[0];
+  assert.ok(lockEntry, 'yarn.lock must include the exact browser date-fns selector');
+  assert.match(lockEntry, /^ {2}version "4\.4\.0"$/m);
+  assert.match(lockEntry, /date-fns-4\.4\.0\.tgz#806539edf45c616b2b76b5f78b88c56ed3c7e036/);
+  assert.match(lockEntry, /sha512-\+1UMbeh68lH1SegH83CGWwpb6OHHbpSgr3\+s5Eww5M4CAgswBpoWS0AjTOfEJ33HiYKz1hdj\/KTFprzXHmq\/6w==/);
+});
+
+test('date-fns importer audit uses the complete metafile and rejects property bypasses', async t => {
+  const appDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+  const browserDirectory = path.join(appDirectory, 'applications', 'browser');
+  const deferredBuild = await import('../../applications/browser/tauri-src/esbuild-deferred.mjs');
+  assert.equal(typeof deferredBuild.auditDateFnsBridgeContract, 'function');
+  const inputs = {
+    'node_modules/@theia/ai-chat-ui/lib/browser/chat-date-utils.js': {
+      imports: [
+        { original: 'date-fns', path: 'tauri-src/date-fns-bridge.ts', kind: 'require-call' },
+        { original: 'date-fns/locale', path: 'tauri-src/date-fns-locales-bridge.ts', kind: 'require-call' },
+      ],
+    },
+    'node_modules/@theia/ai-ide/lib/browser/ai-configuration/token-usage-configuration-widget.js': {
+      imports: [{ original: 'date-fns', path: 'tauri-src/date-fns-bridge.ts', kind: 'require-call' }],
+    },
+  };
+  assert.doesNotThrow(() => deferredBuild.auditDateFnsBridgeContract({ inputs }, browserDirectory));
+
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'ride-date-fns-source-contract-'));
+  t.after(() => fs.rmSync(fixture, { recursive: true, force: true }));
+  for (const input of Object.keys(inputs)) {
+    const source = fs.readFileSync(path.join(browserDirectory, input), 'utf8');
+    const destination = path.join(fixture, input);
+    fs.mkdirSync(path.dirname(destination), { recursive: true });
+    fs.writeFileSync(destination, source);
+  }
+  const chatSource = path.join(fixture, 'node_modules/@theia/ai-chat-ui/lib/browser/chat-date-utils.js');
+  fs.writeFileSync(
+    chatSource,
+    fs.readFileSync(chatSource, 'utf8').replace('date_fns_1.formatDistance', "date_fns_1['formatDistance']"),
+  );
+  assert.throws(
+    () => deferredBuild.auditDateFnsBridgeContract({ inputs }, fixture),
+    /bracket notation.*formatDistance/i,
+  );
+});
+
 test('metadata plugin atomically hashes successful outputs and removes stale records after failure', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ride-metadata-plugin-'));
   try {

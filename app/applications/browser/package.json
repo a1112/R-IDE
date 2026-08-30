@@ -126,6 +126,7 @@
     "@theia/variable-resolver": "1.73.0-next.2",
     "@theia/vsx-registry": "1.73.0-next.2",
     "@theia/workspace": "1.73.0-next.2",
+    "date-fns": "4.4.0",
     "fs-extra": "^9.1.0",
     "theia-ide-codex-ext": "1.72.100",
     "theia-ide-product-ext": "1.72.100"
