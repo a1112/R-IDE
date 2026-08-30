@@ -43,6 +43,39 @@ const esbuild = require('esbuild');
 const properLockfile = require('proper-lockfile');
 const appDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
+const GOOGLE_BACKEND_DESCRIPTOR = Object.freeze({
+    package: '@theia/ai-google',
+    importer: '@theia/ai-google/lib/node/google-backend-module',
+    module: '@theia/ai-google/lib/node/google-language-models-manager-impl',
+    proxy: 'tauri-src/backend/google-language-models-manager-proxy.ts',
+    entry: 'tauri-src/backend/google-language-models-manager-feature.ts',
+    output: 'lib/backend/google-language-models-manager-feature.cjs',
+    action: 'google-language-models',
+    runtimePackages: Object.freeze([
+        '@google/genai',
+        'gaxios',
+        'google-auth-library',
+        'node-fetch',
+    ]),
+    exclusiveInputCount: 151,
+});
+
+const HUGGINGFACE_BACKEND_DESCRIPTOR = Object.freeze({
+    package: '@theia/ai-huggingface',
+    importer: '@theia/ai-huggingface/lib/node/huggingface-backend-module',
+    module: '@theia/ai-huggingface/lib/node/huggingface-language-models-manager-impl',
+    proxy: 'tauri-src/backend/huggingface-language-models-manager-proxy.ts',
+    entry: 'tauri-src/backend/huggingface-language-models-manager-feature.ts',
+    output: 'lib/backend/huggingface-language-models-manager-feature.cjs',
+    action: 'huggingface-language-models',
+    runtimePackages: Object.freeze([
+        '@huggingface/inference',
+        '@huggingface/jinja',
+        '@huggingface/tasks',
+    ]),
+    exclusiveInputCount: 200,
+});
+
 const SCANOSS_BACKEND_DESCRIPTOR = Object.freeze({
     package: '@theia/scanoss',
     importer: '@theia/scanoss/lib/node/scanoss-backend-module',
@@ -85,14 +118,17 @@ test('Tauri preview profile replaces only the eager frontend module with a lazy 
     assert.match(feature, /createChild\(\)/);
 });
 
-test('Tauri AI profile declares the exact deferred ScanOSS service edge', () => {
+test('Tauri AI profile declares the exact deferred backend edges', () => {
     const browserDirectory = path.join(appDirectory, 'applications', 'browser');
     const profile = JSON.parse(fs.readFileSync(path.join(browserDirectory, 'tauri-profile.json'), 'utf8'));
 
-    assert.deepEqual(profile.featureGroups.ai.deferredBackendModules, [SCANOSS_BACKEND_DESCRIPTOR]);
-    for (const field of ['proxy', 'entry']) {
-        const source = path.join(browserDirectory, SCANOSS_BACKEND_DESCRIPTOR[field]);
-        assert.equal(fs.statSync(source).isFile(), true, `${field} must be a regular source file`);
+    const expected = [GOOGLE_BACKEND_DESCRIPTOR, HUGGINGFACE_BACKEND_DESCRIPTOR, SCANOSS_BACKEND_DESCRIPTOR];
+    assert.deepEqual(profile.featureGroups.ai.deferredBackendModules, expected);
+    for (const descriptor of expected) {
+        for (const field of ['proxy', 'entry']) {
+            const source = path.join(browserDirectory, descriptor[field]);
+            assert.equal(fs.statSync(source).isFile(), true, `${descriptor.action} ${field} must be a regular source file`);
+        }
     }
 });
 
