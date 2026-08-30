@@ -835,25 +835,43 @@ async function retryUnlink(filesystem, candidate, retry) {
     });
 }
 
-const transactionStates = new Map([
+const transactionStatesV2 = new Map([
     ['prepared', 1],
     ['backed-up', 2],
     ['installed', 3],
     ['rolled-back', 4],
 ]);
 
-function transactionMarker(plan, state) {
-    return {
-        schema: 'ride.directory-transaction@2',
+const transactionStatesV3 = new Map([
+    ['prepared', 1],
+    ['backed-up', 2],
+    ['validation-pending', 3],
+    ['installed', 4],
+    ['rolled-back', 5],
+]);
+
+function transactionStatesForSchema(schemaVersion) {
+    return schemaVersion === 3 ? transactionStatesV3 : transactionStatesV2;
+}
+
+function transactionMarker(plan, state, { schemaVersion, restore } = {}) {
+    const states = transactionStatesForSchema(schemaVersion);
+    const marker = {
+        schema: `ride.directory-transaction@${schemaVersion}`,
         targetName: plan.targetName,
         transactionId: plan.transactionId,
         state,
-        sequence: transactionStates.get(state),
+        sequence: states.get(state),
     };
+    if (state === 'validation-pending') {
+        marker.restore = restore;
+    }
+    return marker;
 }
 
-function transactionStateMarkerPath(plan, state, nonce) {
-    const sequence = String(transactionStates.get(state)).padStart(2, '0');
+function transactionStateMarkerPath(plan, marker, nonce) {
+    const sequence = String(marker.sequence).padStart(2, '0');
+    const { state } = marker;
     return `${plan.markerPrefix}${sequence}-${state}-${nonce}.json`;
 }
 
@@ -877,17 +895,30 @@ async function syncParentDirectory(parentDirectory, filesystem, platform) {
     }
 }
 
-async function writeTransactionMarker(plan, state, options) {
+async function writeTransactionMarker(plan, state, options, details = {}) {
     const { filesystem, retry } = filesystemOptions(options);
+    const schemaVersion = details.schemaVersion
+        ?? (typeof options.validateInstalled === 'function' ? 3 : 2);
+    const states = transactionStatesForSchema(schemaVersion);
+    if (!states.has(state)) {
+        throw new Error(`Directory transaction state ${state} is not valid for marker schema v${schemaVersion}.`);
+    }
+    if (state === 'validation-pending' && !['backup', 'absent'].includes(details.restore)) {
+        throw new Error('Directory transaction validation-pending marker requires an exact restore intent.');
+    }
+    const marker = transactionMarker(plan, state, {
+        schemaVersion,
+        restore: details.restore,
+    });
     const createMarkerNonce = options.createMarkerNonce ?? (() => crypto.randomBytes(6).toString('hex'));
     const nonce = createMarkerNonce();
     assertPathSegment(nonce, 'Directory transaction marker nonce');
     const temporaryMarker = transactionTempMarkerPath(plan, nonce);
-    const stateMarker = transactionStateMarkerPath(plan, state, nonce);
+    const stateMarker = transactionStateMarkerPath(plan, marker, nonce);
     for (const candidate of [temporaryMarker, stateMarker]) {
         assertProfilePath(plan.parentDirectory, candidate);
     }
-    const data = Buffer.from(`${JSON.stringify(transactionMarker(plan, state))}\n`);
+    const data = Buffer.from(`${JSON.stringify(marker)}\n`);
     let handle;
     let writeError;
     try {
@@ -939,17 +970,29 @@ function parseTransactionMarker(text, plan, expected = undefined) {
     } catch (error) {
         throw new Error(`Malformed directory transaction marker ${plan.markerPath}: ${error.message}`);
     }
-    const legacy = marker?.schema === 'ride.directory-transaction@1';
+    const schemaVersion = marker?.schema === 'ride.directory-transaction@1'
+        ? 1
+        : marker?.schema === 'ride.directory-transaction@2'
+            ? 2
+            : marker?.schema === 'ride.directory-transaction@3'
+                ? 3
+                : undefined;
+    const legacy = schemaVersion === 1;
+    const validationPending = schemaVersion === 3 && marker?.state === 'validation-pending';
     const exactKeys = legacy
         ? ['schema', 'state', 'targetName', 'transactionId']
-        : ['schema', 'sequence', 'state', 'targetName', 'transactionId'];
+        : validationPending
+            ? ['restore', 'schema', 'sequence', 'state', 'targetName', 'transactionId']
+            : ['schema', 'sequence', 'state', 'targetName', 'transactionId'];
+    const transactionStates = transactionStatesForSchema(schemaVersion);
     if (!marker || typeof marker !== 'object' || Array.isArray(marker)
         || Object.keys(marker).sort(compareText).join('\0') !== exactKeys.join('\0')
-        || (!legacy && marker.schema !== 'ride.directory-transaction@2')
+        || schemaVersion === undefined
         || marker.targetName !== plan.targetName
         || marker.transactionId !== plan.transactionId
         || !transactionStates.has(marker.state)
         || (!legacy && marker.sequence !== transactionStates.get(marker.state))
+        || (validationPending && !['backup', 'absent'].includes(marker.restore))
         || (expected && (marker.state !== expected.state || marker.sequence !== expected.sequence))) {
         throw new Error(`Invalid directory transaction marker ${plan.markerPath}.`);
     }
@@ -962,6 +1005,44 @@ async function assertRegularDirectoryIfPresent(candidate, filesystem) {
         throw new Error(`Directory transaction path is not a regular directory: ${candidate}`);
     }
     return state.exists;
+}
+
+async function rollbackValidationPendingDirectory(plan, restore, options) {
+    const { filesystem, retry } = filesystemOptions(options);
+    let targetExists = await assertRegularDirectoryIfPresent(plan.targetDirectory, filesystem);
+    let backupExists = await assertRegularDirectoryIfPresent(plan.backupDirectory, filesystem);
+    let temporaryExists = await assertRegularDirectoryIfPresent(plan.temporaryDirectory, filesystem);
+    if (restore === 'absent') {
+        if (backupExists) {
+            throw new Error(`Cannot safely recover validation-pending directory transaction ${plan.transactionId}.`);
+        }
+        if (targetExists) {
+            await retryRemove(filesystem, plan.targetDirectory, retry);
+        }
+        await retryRemove(filesystem, plan.temporaryDirectory, retry);
+        return undefined;
+    }
+    if (restore !== 'backup') {
+        throw new Error(`Invalid validation-pending restore intent for directory transaction ${plan.transactionId}.`);
+    }
+    if (backupExists) {
+        if (targetExists) {
+            if (temporaryExists) {
+                throw new Error(`Cannot safely recover validation-pending directory transaction ${plan.transactionId}.`);
+            }
+            await retryRename(filesystem, plan.targetDirectory, plan.temporaryDirectory, retry);
+            targetExists = false;
+            temporaryExists = true;
+        }
+        await retryRename(filesystem, plan.backupDirectory, plan.targetDirectory, retry);
+        targetExists = true;
+        backupExists = false;
+    } else if (!(targetExists && temporaryExists)) {
+        throw new Error(`Cannot safely recover validation-pending directory transaction ${plan.transactionId}.`);
+    }
+    const rollbackMarker = await writeTransactionMarker(plan, 'rolled-back', options, { schemaVersion: 3 });
+    await retryRemove(filesystem, plan.temporaryDirectory, retry);
+    return rollbackMarker;
 }
 
 export async function recoverDirectoryTransactions({ parentDirectory, targetName }, options = {}) {
@@ -980,7 +1061,7 @@ export async function recoverDirectoryTransactions({ parentDirectory, targetName
     const escapedTarget = targetName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const prefix = `.${targetName}.transaction-`;
     const statePattern = new RegExp(
-        `^\\.${escapedTarget}\\.transaction-(.+)\\.(\\d{2})-(prepared|backed-up|installed|rolled-back)-([A-Za-z0-9][A-Za-z0-9._-]{0,127})\\.json$`,
+        `^\\.${escapedTarget}\\.transaction-(.+)\\.(\\d{2})-(prepared|backed-up|validation-pending|installed|rolled-back)-([A-Za-z0-9][A-Za-z0-9._-]{0,127})\\.json$`,
     );
     const temporaryPattern = new RegExp(
         `^\\.${escapedTarget}\\.transaction-(.+)\\.marker-tmp-([A-Za-z0-9][A-Za-z0-9._-]{0,127})$`,
@@ -1045,7 +1126,7 @@ export async function recoverDirectoryTransactions({ parentDirectory, targetName
                 const marker = parseTransactionMarker(await filesystem.readFile(legacyPath, 'utf8'), plan);
                 complete.push({
                     path: legacyPath,
-                    sequence: transactionStates.get(marker.state),
+                    sequence: transactionStatesV2.get(marker.state),
                     state: marker.state,
                     marker,
                 });
@@ -1069,6 +1150,7 @@ export async function recoverDirectoryTransactions({ parentDirectory, targetName
             }
         }
         const marker = complete.at(-1).marker;
+        let additionalMarkerPath;
         let targetExists = await assertRegularDirectoryIfPresent(plan.targetDirectory, filesystem);
         let backupExists = await assertRegularDirectoryIfPresent(plan.backupDirectory, filesystem);
         await assertRegularDirectoryIfPresent(plan.temporaryDirectory, filesystem);
@@ -1086,6 +1168,8 @@ export async function recoverDirectoryTransactions({ parentDirectory, targetName
             if (!targetExists || backupExists) {
                 throw new Error(`Cannot safely recover rolled-back directory transaction ${transactionId}.`);
             }
+        } else if (marker.state === 'validation-pending') {
+            additionalMarkerPath = await rollbackValidationPendingDirectory(plan, marker.restore, options);
         } else if (backupExists) {
             if (targetExists) {
                 await retryRemove(filesystem, plan.targetDirectory, retry);
@@ -1099,6 +1183,7 @@ export async function recoverDirectoryTransactions({ parentDirectory, targetName
             ...group.stateFiles.map(record => record.path),
             ...group.temporaryFiles,
             ...group.legacyFiles,
+            ...(additionalMarkerPath ? [additionalMarkerPath] : []),
         ].sort(compareText);
         for (const markerPath of markerPaths) {
             await retryUnlink(filesystem, markerPath, retry);
@@ -1130,6 +1215,11 @@ export async function replaceDirectoryTransactional(plan, options = {}) {
         await retryRename(filesystem, plan.targetDirectory, plan.backupDirectory, retry);
         await writeTransactionMarker(plan, 'backed-up', options);
     }
+    if (options.validateInstalled) {
+        await writeTransactionMarker(plan, 'validation-pending', options, {
+            restore: targetExists ? 'backup' : 'absent',
+        });
+    }
     try {
         await retryRename(filesystem, plan.temporaryDirectory, plan.targetDirectory, retry);
     } catch (installError) {
@@ -1150,11 +1240,11 @@ export async function replaceDirectoryTransactional(plan, options = {}) {
             await options.validateInstalled(plan.targetDirectory);
         } catch (validationError) {
             try {
-                await retryRemove(filesystem, plan.targetDirectory, retry);
-                if (targetExists) {
-                    await retryRename(filesystem, plan.backupDirectory, plan.targetDirectory, retry);
-                    await writeTransactionMarker(plan, 'rolled-back', options);
-                }
+                await rollbackValidationPendingDirectory(
+                    plan,
+                    targetExists ? 'backup' : 'absent',
+                    options,
+                );
                 await removeTransactionMarkerFiles(plan, filesystem, retry);
             } catch (rollbackError) {
                 const rollbackErrors = rollbackError instanceof AggregateError

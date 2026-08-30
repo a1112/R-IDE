@@ -2795,6 +2795,24 @@ async function writeTransactionStateFixture(plan, state, nonce, contents) {
     await fs.promises.writeFile(transactionStatePath(plan, state, nonce), marker);
 }
 
+async function writeValidationPendingFixture(plan, restore, nonce = 'validationpending') {
+    const state = 'validation-pending';
+    const sequence = 3;
+    const markerPath = path.join(
+        plan.parentDirectory,
+        `.${plan.targetName}.transaction-${plan.transactionId}.${String(sequence).padStart(2, '0')}-${state}-${nonce}.json`,
+    );
+    await fs.promises.writeFile(markerPath, `${JSON.stringify({
+        schema: 'ride.directory-transaction@3',
+        targetName: plan.targetName,
+        transactionId: plan.transactionId,
+        state,
+        sequence,
+        restore,
+    })}\n`);
+    return markerPath;
+}
+
 async function transactionArtifacts(plan) {
     return (await fs.promises.readdir(plan.parentDirectory))
         .filter(name => name.startsWith(`.${plan.targetName}.transaction-${plan.transactionId}.`))
@@ -2897,6 +2915,149 @@ test('directory transaction aggregates post-install validation and rollback fail
     assert.equal(fs.existsSync(plan.targetDirectory), false);
     assert.equal(await fs.promises.readFile(path.join(plan.backupDirectory, 'sentinel.txt'), 'utf8'), 'old');
     assert.equal((await transactionArtifacts(plan)).some(name => name.includes('-installed-')), false);
+    assert.ok((await transactionArtifacts(plan)).some(name => name.includes('-validation-pending-')));
+
+    await recoverDirectoryTransactions({ parentDirectory, targetName: 'lib' });
+    assert.equal(await fs.promises.readFile(path.join(plan.targetDirectory, 'sentinel.txt'), 'utf8'), 'old');
+    assert.equal(fs.existsSync(plan.backupDirectory), false);
+    assert.equal(fs.existsSync(plan.temporaryDirectory), false);
+    assert.deepEqual(await transactionArtifacts(plan), []);
+});
+
+test('validation-pending first install recovers after its initial unvalidated target removal fails', async t => {
+    const parentDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-validation-pending-first-install-'));
+    t.after(() => fs.promises.rm(parentDirectory, { recursive: true, force: true }));
+    const plan = createDirectoryTransactionPlan(parentDirectory, 'lib', 'first-install-removal-fails');
+    await writeSentinel(plan.temporaryDirectory, 'unvalidated-new');
+    let failedRemoval = false;
+    const filesystem = {
+        ...fs.promises,
+        rm: async (candidate, options) => {
+            if (!failedRemoval && path.resolve(candidate) === path.resolve(plan.targetDirectory)) {
+                failedRemoval = true;
+                throw Object.assign(new Error('initial unvalidated target removal failed'), { code: 'EIO' });
+            }
+            return fs.promises.rm(candidate, options);
+        },
+    };
+
+    await assert.rejects(replaceDirectoryTransactional(plan, {
+        filesystem,
+        validateInstalled: async () => { throw new Error('installed validation failed'); },
+    }), error => {
+        assert.ok(error instanceof AggregateError);
+        assert.deepEqual(error.errors.map(item => item.message), [
+            'installed validation failed',
+            'initial unvalidated target removal failed',
+        ]);
+        return true;
+    });
+    assert.equal(await fs.promises.readFile(path.join(plan.targetDirectory, 'sentinel.txt'), 'utf8'), 'unvalidated-new');
+    const pendingMarkerName = (await transactionArtifacts(plan)).find(name => name.includes('-validation-pending-'));
+    assert.ok(pendingMarkerName, 'validation-pending marker must survive failed rollback');
+    const pendingMarker = JSON.parse(await fs.promises.readFile(path.join(parentDirectory, pendingMarkerName), 'utf8'));
+    assert.equal(pendingMarker.restore, 'absent');
+
+    await recoverDirectoryTransactions({ parentDirectory, targetName: 'lib' });
+
+    assert.equal(fs.existsSync(plan.targetDirectory), false);
+    assert.equal(fs.existsSync(plan.temporaryDirectory), false);
+    assert.deepEqual(await transactionArtifacts(plan), []);
+});
+
+test('recovery restores a backup after a validation-pending install crashes before validation', async t => {
+    const parentDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-validation-pending-backup-crash-'));
+    t.after(() => fs.promises.rm(parentDirectory, { recursive: true, force: true }));
+    const plan = createDirectoryTransactionPlan(parentDirectory, 'lib', 'pending-backup-crash');
+    await writeSentinel(plan.targetDirectory, 'validated-old');
+    await writeSentinel(plan.temporaryDirectory, 'unvalidated-new');
+    await fs.promises.rename(plan.targetDirectory, plan.backupDirectory);
+    await writeValidationPendingFixture(plan, 'backup');
+    await fs.promises.rename(plan.temporaryDirectory, plan.targetDirectory);
+
+    await recoverDirectoryTransactions({ parentDirectory, targetName: 'lib' });
+
+    assert.equal(await fs.promises.readFile(path.join(plan.targetDirectory, 'sentinel.txt'), 'utf8'), 'validated-old');
+    assert.equal(fs.existsSync(plan.backupDirectory), false);
+    assert.equal(fs.existsSync(plan.temporaryDirectory), false);
+    assert.deepEqual(await transactionArtifacts(plan), []);
+});
+
+test('recovery removes a first validation-pending install after a crash before validation', async t => {
+    const parentDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-validation-pending-absent-crash-'));
+    t.after(() => fs.promises.rm(parentDirectory, { recursive: true, force: true }));
+    const plan = createDirectoryTransactionPlan(parentDirectory, 'lib', 'pending-absent-crash');
+    await writeSentinel(plan.temporaryDirectory, 'unvalidated-new');
+    await writeValidationPendingFixture(plan, 'absent');
+    await fs.promises.rename(plan.temporaryDirectory, plan.targetDirectory);
+
+    await recoverDirectoryTransactions({ parentDirectory, targetName: 'lib' });
+
+    assert.equal(fs.existsSync(plan.targetDirectory), false);
+    assert.equal(fs.existsSync(plan.backupDirectory), false);
+    assert.equal(fs.existsSync(plan.temporaryDirectory), false);
+    assert.deepEqual(await transactionArtifacts(plan), []);
+});
+
+test('validation-pending recovery retains its marker across a failed retry and succeeds later', async t => {
+    const parentDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-validation-pending-retry-'));
+    t.after(() => fs.promises.rm(parentDirectory, { recursive: true, force: true }));
+    const plan = createDirectoryTransactionPlan(parentDirectory, 'lib', 'pending-recovery-retry');
+    await writeSentinel(plan.temporaryDirectory, 'unvalidated-new');
+    await writeValidationPendingFixture(plan, 'absent');
+    await fs.promises.rename(plan.temporaryDirectory, plan.targetDirectory);
+    const filesystem = {
+        ...fs.promises,
+        rm: async (candidate, options) => {
+            if (path.resolve(candidate) === path.resolve(plan.targetDirectory)) {
+                throw Object.assign(new Error('recovery removal failed'), { code: 'EIO' });
+            }
+            return fs.promises.rm(candidate, options);
+        },
+    };
+
+    await assert.rejects(
+        recoverDirectoryTransactions({ parentDirectory, targetName: 'lib' }, { filesystem }),
+        /recovery removal failed/,
+    );
+    assert.equal(await fs.promises.readFile(path.join(plan.targetDirectory, 'sentinel.txt'), 'utf8'), 'unvalidated-new');
+    assert.ok((await transactionArtifacts(plan)).some(name => name.includes('-validation-pending-')));
+
+    await recoverDirectoryTransactions({ parentDirectory, targetName: 'lib' });
+    assert.equal(fs.existsSync(plan.targetDirectory), false);
+    assert.deepEqual(await transactionArtifacts(plan), []);
+});
+
+test('validated install persists validation-pending before rename and leaves no pending marker on success', async t => {
+    const parentDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-validation-pending-success-'));
+    t.after(() => fs.promises.rm(parentDirectory, { recursive: true, force: true }));
+    const plan = createDirectoryTransactionPlan(parentDirectory, 'lib', 'pending-success');
+    await writeSentinel(plan.targetDirectory, 'validated-old');
+    await writeSentinel(plan.temporaryDirectory, 'new');
+    let pendingObservedBeforeRename = 0;
+    const filesystem = {
+        ...fs.promises,
+        rename: async (source, destination) => {
+            if (path.resolve(source) === path.resolve(plan.temporaryDirectory)
+                && path.resolve(destination) === path.resolve(plan.targetDirectory)) {
+                const pendingName = (await transactionArtifacts(plan)).find(name => name.includes('-validation-pending-'));
+                assert.ok(pendingName, 'validation-pending must be durable before install rename');
+                const marker = JSON.parse(await fs.promises.readFile(path.join(parentDirectory, pendingName), 'utf8'));
+                assert.equal(marker.restore, 'backup');
+                pendingObservedBeforeRename += 1;
+            }
+            return fs.promises.rename(source, destination);
+        },
+    };
+
+    await replaceDirectoryTransactional(plan, {
+        filesystem,
+        validateInstalled: async () => {},
+    });
+
+    assert.equal(pendingObservedBeforeRename, 1);
+    assert.equal(await fs.promises.readFile(path.join(plan.targetDirectory, 'sentinel.txt'), 'utf8'), 'new');
+    assert.deepEqual(await transactionArtifacts(plan), []);
 });
 
 test('directory transaction restores original bytes when install rename fails', async t => {
