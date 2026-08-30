@@ -695,8 +695,6 @@ pub fn run() {
                 pending_startup_launch.complete(),
             )
             .map_err(|error| std::io::Error::other(error.to_string()))?;
-            let mut window_creation =
-                startup::StartupWindowCreationGuard::new(launch.window_created_gate());
             let presentation = startup::present_startup_window(
                 visibility_deadline,
                 || -> Result<tauri::WebviewWindow, Box<dyn std::error::Error>> {
@@ -719,9 +717,7 @@ pub fn run() {
                                 window_created_gate.clone(),
                             )
                         }
-                        None => sidecar::BackendReadinessPublisher::legacy(
-                            window_created_gate.clone(),
-                        ),
+                        None => sidecar::BackendReadinessPublisher::legacy(),
                     };
                     if !launch.dispatch_initial_navigation(|url| main_window_config.url = url) {
                         return Err(std::io::Error::other(
@@ -851,7 +847,7 @@ pub fn run() {
                         &app.state::<AppState>().startup_metrics,
                         RustStartupCheckpoint::WindowBuilt,
                     );
-                    window_creation.mark_created();
+                    launch.mark_window_created();
                     Ok(window)
                 },
                 |window| {

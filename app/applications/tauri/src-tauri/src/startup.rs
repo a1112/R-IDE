@@ -11,7 +11,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -67,87 +67,23 @@ pub struct StartupWindowCreatedGate {
 
 #[derive(Default)]
 struct StartupWindowCreatedGateInner {
-    outcome: AtomicU8,
+    created: AtomicBool,
     notify: tokio::sync::Notify,
-}
-
-const WINDOW_CREATION_PENDING: u8 = 0;
-const WINDOW_CREATION_CREATED: u8 = 1;
-const WINDOW_CREATION_CANCELLED: u8 = 2;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StartupWindowCreatedOutcome {
-    Created,
-    Cancelled,
 }
 
 impl StartupWindowCreatedGate {
     pub fn mark_created(&self) {
-        self.resolve(WINDOW_CREATION_CREATED);
+        self.inner.created.store(true, Ordering::Release);
+        self.inner.notify.notify_waiters();
     }
 
-    pub fn cancel(&self) {
-        self.resolve(WINDOW_CREATION_CANCELLED);
-    }
-
-    fn resolve(&self, outcome: u8) {
-        if self
-            .inner
-            .outcome
-            .compare_exchange(
-                WINDOW_CREATION_PENDING,
-                outcome,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-        {
-            self.inner.notify.notify_waiters();
-        }
-    }
-
-    pub async fn wait(&self) -> StartupWindowCreatedOutcome {
+    pub async fn wait(&self) {
         loop {
             let notified = self.inner.notify.notified();
-            tokio::pin!(notified);
-            // `notify_waiters` does not retain a permit, so register before checking
-            // the atomic outcome to close the check-to-await lost-wakeup window.
-            notified.as_mut().enable();
-            match self.inner.outcome.load(Ordering::Acquire) {
-                WINDOW_CREATION_CREATED => return StartupWindowCreatedOutcome::Created,
-                WINDOW_CREATION_CANCELLED => return StartupWindowCreatedOutcome::Cancelled,
-                _ => notified.as_mut().await,
+            if self.inner.created.load(Ordering::Acquire) {
+                return;
             }
-        }
-    }
-}
-
-pub struct StartupWindowCreationGuard {
-    gate: StartupWindowCreatedGate,
-    resolved: bool,
-}
-
-impl StartupWindowCreationGuard {
-    pub fn new(gate: StartupWindowCreatedGate) -> Self {
-        Self {
-            gate,
-            resolved: false,
-        }
-    }
-
-    pub fn mark_created(&mut self) {
-        if !self.resolved {
-            self.gate.mark_created();
-            self.resolved = true;
-        }
-    }
-}
-
-impl Drop for StartupWindowCreationGuard {
-    fn drop(&mut self) {
-        if !self.resolved {
-            self.gate.cancel();
-            self.resolved = true;
+            notified.await;
         }
     }
 }
@@ -1268,213 +1204,6 @@ impl BackendStartupState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BackendPriorityClass {
-    BelowNormal,
-    Normal,
-}
-
-pub trait BackendPriorityApi: Send + Sync {
-    fn is_supported(&self) -> bool {
-        true
-    }
-
-    fn set_owned_root_priority(&self, priority: BackendPriorityClass) -> Result<(), String>;
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct NoopBackendPriorityApi;
-
-impl BackendPriorityApi for NoopBackendPriorityApi {
-    fn is_supported(&self) -> bool {
-        false
-    }
-
-    fn set_owned_root_priority(&self, _priority: BackendPriorityClass) -> Result<(), String> {
-        Ok(())
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BackendPriorityHandoffState {
-    Pending,
-    Lowering,
-    BelowNormal,
-    Restoring,
-    CancelRequested,
-    Finished,
-}
-
-pub struct BackendPriorityHandoff<Api> {
-    api: Api,
-    state: Mutex<BackendPriorityHandoffState>,
-}
-
-impl<Api> fmt::Debug for BackendPriorityHandoff<Api> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("BackendPriorityHandoff")
-            .field(
-                "state",
-                &*self
-                    .state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-            )
-            .finish_non_exhaustive()
-    }
-}
-
-impl<Api: BackendPriorityApi> BackendPriorityHandoff<Api> {
-    pub fn new(api: Api) -> Self {
-        Self {
-            api,
-            state: Mutex::new(BackendPriorityHandoffState::Pending),
-        }
-    }
-
-    pub fn lower_owned_root(&self) -> Result<bool, String> {
-        {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if *state != BackendPriorityHandoffState::Pending {
-                return Ok(false);
-            }
-            if !self.api.is_supported() {
-                *state = BackendPriorityHandoffState::Finished;
-                return Ok(false);
-            }
-            *state = BackendPriorityHandoffState::Lowering;
-        }
-
-        let result = self
-            .api
-            .set_owned_root_priority(BackendPriorityClass::BelowNormal);
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match result {
-            Ok(()) if *state == BackendPriorityHandoffState::Lowering => {
-                *state = BackendPriorityHandoffState::BelowNormal;
-                Ok(true)
-            }
-            Ok(()) => {
-                *state = BackendPriorityHandoffState::Finished;
-                Ok(false)
-            }
-            Err(error) => {
-                *state = BackendPriorityHandoffState::Finished;
-                Err(error)
-            }
-        }
-    }
-
-    pub fn restore_owned_root_once(&self) -> Result<bool, String> {
-        {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if *state != BackendPriorityHandoffState::BelowNormal {
-                return Ok(false);
-            }
-            *state = BackendPriorityHandoffState::Restoring;
-        }
-
-        let result = self
-            .api
-            .set_owned_root_priority(BackendPriorityClass::Normal);
-        *self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            BackendPriorityHandoffState::Finished;
-        result.map(|()| true)
-    }
-
-    pub fn cancel(&self) -> bool {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match *state {
-            BackendPriorityHandoffState::Pending | BackendPriorityHandoffState::BelowNormal => {
-                *state = BackendPriorityHandoffState::Finished;
-                true
-            }
-            BackendPriorityHandoffState::Lowering => {
-                *state = BackendPriorityHandoffState::CancelRequested;
-                true
-            }
-            BackendPriorityHandoffState::Restoring => {
-                *state = BackendPriorityHandoffState::Finished;
-                false
-            }
-            BackendPriorityHandoffState::CancelRequested
-            | BackendPriorityHandoffState::Finished => false,
-        }
-    }
-
-    pub fn restore_pending(&self) -> bool {
-        *self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            == BackendPriorityHandoffState::BelowNormal
-    }
-}
-
-fn bounded_backend_priority_diagnostic(error: &str) -> String {
-    const MAX_CHARS: usize = 256;
-    error
-        .chars()
-        .map(|character| {
-            if character.is_control() {
-                ' '
-            } else {
-                character
-            }
-        })
-        .take(MAX_CHARS)
-        .collect()
-}
-
-pub fn begin_backend_priority_handoff<Api: BackendPriorityApi>(
-    handoff: &BackendPriorityHandoff<Api>,
-    report: impl FnOnce(&str),
-) -> bool {
-    match handoff.lower_owned_root() {
-        Ok(lowered) => lowered,
-        Err(error) => {
-            let diagnostic = bounded_backend_priority_diagnostic(&error);
-            report(&diagnostic);
-            false
-        }
-    }
-}
-
-pub fn complete_backend_priority_handoff<Api: BackendPriorityApi>(
-    handoff: &BackendPriorityHandoff<Api>,
-    still_owned: bool,
-    report: impl FnOnce(&str),
-) -> bool {
-    if !still_owned {
-        handoff.cancel();
-        return false;
-    }
-    match handoff.restore_owned_root_once() {
-        Ok(restored) => restored,
-        Err(error) => {
-            let diagnostic = bounded_backend_priority_diagnostic(&error);
-            report(&diagnostic);
-            false
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BackendStartToken(u64);
 
 #[derive(Clone, Debug)]
@@ -1496,12 +1225,10 @@ impl BackendProcessTree {
     }
 
     pub(crate) fn terminate_and_confirm(&self, bound: Duration) -> Result<(), String> {
-        self.cancel_priority_handoff();
         self.platform.terminate_and_confirm(self.root_pid, bound)
     }
 
     pub(crate) fn force_terminate_for_exit(&self, bound: Duration) -> Result<(), String> {
-        self.cancel_priority_handoff();
         self.platform.force_terminate_for_exit(self.root_pid, bound)
     }
 
@@ -1511,22 +1238,6 @@ impl BackendProcessTree {
 
     pub(crate) fn same_owner(&self, other: &Self) -> bool {
         std::sync::Arc::ptr_eq(&self.platform, &other.platform)
-    }
-
-    pub(crate) fn priority_restore_pending(&self) -> bool {
-        self.platform.priority.restore_pending()
-    }
-
-    pub(crate) fn complete_priority_handoff(
-        &self,
-        still_owned: bool,
-        report: impl FnOnce(&str),
-    ) -> bool {
-        complete_backend_priority_handoff(&self.platform.priority, still_owned, report)
-    }
-
-    pub(crate) fn cancel_priority_handoff(&self) {
-        self.platform.priority.cancel();
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -1637,7 +1348,6 @@ fn claim_spawned_pty_backend_session_scope(root_pid: u32) -> Result<BackendProce
         PlatformBackendProcessTree {
             pgids: vec![root_pid_i32],
             session_id: Some(root_pid_i32),
-            priority: BackendPriorityHandoff::new(NoopBackendPriorityApi),
         },
     ))
 }
@@ -1665,33 +1375,6 @@ impl Drop for OwnedWindowsHandle {
 
 #[cfg(windows)]
 #[derive(Debug)]
-struct WindowsBackendPriorityApi {
-    root_process: Arc<OwnedWindowsHandle>,
-}
-
-#[cfg(windows)]
-impl BackendPriorityApi for WindowsBackendPriorityApi {
-    fn set_owned_root_priority(&self, priority: BackendPriorityClass) -> Result<(), String> {
-        use windows_sys::Win32::System::Threading::{
-            SetPriorityClass, BELOW_NORMAL_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS,
-        };
-
-        let priority_class = match priority {
-            BackendPriorityClass::BelowNormal => BELOW_NORMAL_PRIORITY_CLASS,
-            BackendPriorityClass::Normal => NORMAL_PRIORITY_CLASS,
-        };
-        if unsafe { SetPriorityClass(self.root_process.0, priority_class) } == 0 {
-            return Err(format!(
-                "Failed to set the owned backend root priority to {priority:?}: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        Ok(())
-    }
-}
-
-#[cfg(windows)]
-#[derive(Debug)]
 struct PreparedPlatformBackendProcessTree {
     job: OwnedWindowsHandle,
 }
@@ -1701,8 +1384,7 @@ struct PreparedPlatformBackendProcessTree {
 struct PlatformBackendProcessTree {
     job: OwnedWindowsHandle,
     #[allow(dead_code)]
-    root_process: Arc<OwnedWindowsHandle>,
-    priority: BackendPriorityHandoff<WindowsBackendPriorityApi>,
+    root_process: OwnedWindowsHandle,
 }
 
 #[cfg(windows)]
@@ -1781,20 +1463,12 @@ impl PreparedPlatformBackendProcessTree {
                 std::io::Error::last_os_error()
             ));
         }
-        let root_process = Arc::new(OwnedWindowsHandle(duplicate));
-        let priority = BackendPriorityHandoff::new(WindowsBackendPriorityApi {
-            root_process: Arc::clone(&root_process),
-        });
-        begin_backend_priority_handoff(&priority, |diagnostic| {
-            log::warn!("Failed to lower the owned backend root priority: {diagnostic}");
-        });
         resume_suspended_process(root_pid)?;
         Ok(BackendProcessTree::new(
             root_pid,
             PlatformBackendProcessTree {
                 job: self.job,
-                root_process,
-                priority,
+                root_process: OwnedWindowsHandle(duplicate),
             },
         ))
     }
@@ -1990,7 +1664,6 @@ struct PreparedPlatformBackendProcessTree;
 struct PlatformBackendProcessTree {
     pgids: Vec<libc::pid_t>,
     session_id: Option<libc::pid_t>,
-    priority: BackendPriorityHandoff<NoopBackendPriorityApi>,
 }
 
 #[cfg(unix)]
@@ -2008,7 +1681,6 @@ impl PreparedPlatformBackendProcessTree {
             PlatformBackendProcessTree {
                 pgids: vec![pgid],
                 session_id: None,
-                priority: BackendPriorityHandoff::new(NoopBackendPriorityApi),
             },
         ))
     }
@@ -2396,14 +2068,6 @@ impl BackendOwnershipState {
 
     pub fn owns_active(&self, pid: u32) -> bool {
         !self.stopping && !self.root_exited && self.pid == Some(pid)
-    }
-
-    pub(crate) fn owns_active_tree(&self, tree: &BackendProcessTree) -> bool {
-        self.owns_active(tree.root_pid())
-            && self
-                .tree
-                .as_ref()
-                .is_some_and(|owned| owned.same_owner(tree))
     }
 
     pub fn is_stopping(&self) -> bool {
