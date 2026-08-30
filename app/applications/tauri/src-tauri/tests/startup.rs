@@ -16,10 +16,25 @@ use ride_tauri::startup::{
     BackendSpawnPlan, BackendSpawnStrategy, BackendStartupAction, BackendStartupEvent,
     BackendStartupState, BackendTransport, RuntimePathMode, RuntimePaths, RuntimePathsCache,
 };
+use ride_tauri::{main_window_composition, DesktopPlatform, MainWindowComposition};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+
+#[test]
+fn main_window_composition_is_opaque_only_on_windows() {
+    assert_eq!(
+        main_window_composition(DesktopPlatform::Windows),
+        MainWindowComposition {
+            transparent: false,
+            background: [30, 30, 30, 255],
+            native_corner_preference: true,
+        }
+    );
+    assert!(main_window_composition(DesktopPlatform::MacOs).transparent);
+    assert!(main_window_composition(DesktopPlatform::Linux).transparent);
+}
 
 #[test]
 fn process_group_enumeration_is_strict_and_never_drops_malformed_rows() {

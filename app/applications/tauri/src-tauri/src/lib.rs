@@ -36,6 +36,47 @@ pub const GATEWAY_BIND_CLEANUP_GRACE: std::time::Duration = std::time::Duration:
 pub const WINDOW_PRESENTATION_BUDGET: std::time::Duration = std::time::Duration::from_millis(200);
 static NEXT_SECONDARY_WINDOW_ID: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DesktopPlatform {
+    Windows,
+    MacOs,
+    Linux,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MainWindowComposition {
+    pub transparent: bool,
+    pub background: [u8; 4],
+    pub native_corner_preference: bool,
+}
+
+pub const fn main_window_composition(platform: DesktopPlatform) -> MainWindowComposition {
+    match platform {
+        DesktopPlatform::Windows => MainWindowComposition {
+            transparent: false,
+            background: [30, 30, 30, 255],
+            native_corner_preference: true,
+        },
+        DesktopPlatform::MacOs | DesktopPlatform::Linux => MainWindowComposition {
+            transparent: true,
+            background: [0, 0, 0, 0],
+            native_corner_preference: false,
+        },
+    }
+}
+
+#[cfg(windows)]
+fn apply_windows_main_window_composition(config: &mut tauri::utils::config::WindowConfig) {
+    let composition = main_window_composition(DesktopPlatform::Windows);
+    config.transparent = composition.transparent;
+    config.background_color = Some(tauri::utils::config::Color(
+        composition.background[0],
+        composition.background[1],
+        composition.background[2],
+        composition.background[3],
+    ));
+}
+
 #[derive(Clone, Copy)]
 enum RustStartupCheckpoint {
     RuntimePathsResolved,
@@ -618,6 +659,8 @@ pub fn run() {
         eprintln!("Failed to start R-IDE: missing main window configuration");
         return;
     };
+    #[cfg(windows)]
+    apply_windows_main_window_composition(&mut main_window_config);
     let runtime_paths = match sidecar::resolve_runtime_paths_before_app(context.package_info()) {
         Ok(paths) => paths,
         Err(error) => {

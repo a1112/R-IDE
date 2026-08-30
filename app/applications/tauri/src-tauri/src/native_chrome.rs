@@ -260,11 +260,52 @@ pub fn configure_native_window(window: &WebviewWindow) {
         log::warn!("Failed to disable native window decorations: {error}");
     }
 
+    #[cfg(windows)]
+    configure_windows_window(window);
+
     #[cfg(target_os = "macos")]
     configure_macos_window(window);
 
     #[cfg(all(not(mobile), target_os = "macos"))]
     apply_macos_vibrancy(window);
+}
+
+#[cfg(windows)]
+fn configure_windows_window(window: &WebviewWindow) {
+    if !crate::main_window_composition(crate::DesktopPlatform::Windows).native_corner_preference {
+        return;
+    }
+
+    if let Err(error) = apply_windows_corner_preference(window) {
+        log::warn!("Failed to apply Windows DWM corner preference: {error}");
+    }
+}
+
+#[cfg(windows)]
+fn apply_windows_corner_preference(window: &WebviewWindow) -> Result<(), String> {
+    use std::mem::size_of_val;
+    use windows_sys::Win32::Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+    };
+
+    let hwnd = window
+        .hwnd()
+        .map_err(|error| format!("native window handle is unavailable: {error}"))?;
+    let preference = DWMWCP_ROUND;
+    let result = unsafe {
+        DwmSetWindowAttribute(
+            hwnd.0,
+            DWMWA_WINDOW_CORNER_PREFERENCE as u32,
+            std::ptr::from_ref(&preference).cast::<std::ffi::c_void>(),
+            size_of_val(&preference) as u32,
+        )
+    };
+
+    if result < 0 {
+        Err(format!("HRESULT 0x{:08X}", result as u32))
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(target_os = "macos")]
