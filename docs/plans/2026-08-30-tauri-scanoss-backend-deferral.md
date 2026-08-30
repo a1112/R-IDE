@@ -2,7 +2,7 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Remove the analyzer-proven 1,641,883-byte ScanOSS implementation slice from the Tauri initial backend bundle without changing the ScanOSS RPC contract, full-profile behavior, packaged inventory, or release safety gates.
+**Goal:** Remove the analyzer-proven 1,640,399-byte ScanOSS service-implementation slice from the Tauri initial backend bundle without changing the ScanOSS RPC contract, full-profile behavior, packaged inventory, or release safety gates.
 
 **Architecture:** Keep the upstream `@theia/scanoss` backend module eager, but alias its exact relative service-implementation import to a lightweight proxy only in the `tauri-critical` backend build. The proxy obtains Theia's root container through function-form Inversify metadata, dynamically imports an attested sibling CommonJS feature on first `scanContent`, and resolves the untouched upstream implementation in a child container. Analyzer evidence and build metadata prove the ownership boundary; a five-run packaged A/B campaign decides whether implementation commits are retained or reverted.
 
@@ -75,8 +75,8 @@ npm run analyze:tauri-backend-bundle
 Expected on the unchanged restored backend:
 
 - `evidence.scanoss.present` is `true`;
-- `exclusiveBytes` is `1,641,883`;
-- `exclusiveInputCount` is `322`;
+- `exclusiveBytes` is `1,640,399`;
+- `exclusiveInputCount` is `318`;
 - browser-automation evidence remains `852,417` bytes;
 - the report contains no workspace path or command line.
 

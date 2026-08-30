@@ -6,7 +6,7 @@
 
 The first backend experiment isolated browser automation from the Tauri initial bundle. It removed about 0.88 MB from `main.js`, but its first formal five-run campaign regressed backend spawn-to-listening by 22 ms and target-file opening by 90 ms. That implementation was therefore reverted in full. The analyzer and corrected ownership evidence remain.
 
-The restored Tauri backend is 16,425,994 bytes. Removing only the generated-server edge to `@theia/scanoss/lib/node/scanoss-backend-module.js` makes 1,641,883 bytes across 322 inputs unreachable. The largest exclusive owners are:
+The restored Tauri backend is 16,425,994 bytes. Removing the generated-server edge to `@theia/scanoss/lib/node/scanoss-backend-module.js` makes 1,641,883 bytes across 322 inputs unreachable. The selected service-proxy boundary is narrower: cutting only the exact backend-module-to-`scanoss-service-impl.js` edge makes 1,640,399 bytes across 318 inputs unreachable. The remaining 1,484 bytes across four inputs are the backend module, common index, preferences, and service contract that this design intentionally keeps eager. The largest service-edge-exclusive owners are:
 
 - `iconv-lite`: 492,294 bytes;
 - `@grpc/grpc-js`: 272,368 bytes;
