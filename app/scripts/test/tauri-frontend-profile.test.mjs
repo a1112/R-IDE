@@ -75,7 +75,7 @@ const CODEX_BACKEND_DESCRIPTOR = Object.freeze({
     output: 'lib/backend/codex-backend-feature.cjs',
     action: 'codex-backend',
     runtimePackages: Object.freeze(['theia-ide-codex-ext']),
-    exclusiveInputCount: 22,
+    exclusiveInputCount: 1,
 });
 
 test('Tauri preview profile replaces only the eager frontend module with a lazy Markdown proxy', () => {
