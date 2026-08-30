@@ -15,8 +15,8 @@ use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Empty, Full, StreamBody};
 use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper::header::{
-    CACHE_CONTROL, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HOST, LOCATION, ORIGIN,
-    SET_COOKIE, TRANSFER_ENCODING, UPGRADE,
+    ACCEPT_ENCODING, CACHE_CONTROL, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE,
+    COOKIE, HOST, LOCATION, ORIGIN, SET_COOKIE, TRANSFER_ENCODING, UPGRADE, VARY,
 };
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -755,9 +755,15 @@ struct BoundStaticFile {
 }
 
 #[derive(Clone)]
-struct StaticAsset {
+struct StaticAssetFile {
     relative_components: Vec<OsString>,
     binding: BoundStaticFile,
+}
+
+#[derive(Clone)]
+struct StaticAsset {
+    identity: StaticAssetFile,
+    brotli: Option<StaticAssetFile>,
     content_type: &'static str,
     cache_control: &'static str,
 }
@@ -2021,12 +2027,22 @@ impl StaticGatewayService {
                 .record_or_warn(StartupMilestone::FrontendRequestStarted);
         }
         let asset = asset.clone();
+        let use_brotli = asset.brotli.is_some() && accepts_brotli(request.headers());
+        let representation = if use_brotli {
+            asset
+                .brotli
+                .clone()
+                .expect("Brotli representation was checked")
+        } else {
+            asset.identity.clone()
+        };
         let frontend_root = self.frontend_root.clone();
         let opened = tokio::task::spawn_blocking(move || {
-            reopen_bound_static_file(frontend_root.as_ref(), &asset).map(|file| (file, asset))
+            reopen_bound_static_file(frontend_root.as_ref(), &representation)
+                .map(|file| (file, representation))
         })
         .await;
-        let (file, asset) = match opened {
+        let (file, representation) = match opened {
             Ok(Ok(opened)) => opened,
             Ok(Err(_)) => return not_found(),
             Err(_) => {
@@ -2034,12 +2050,18 @@ impl StaticGatewayService {
                 return not_found();
             }
         };
-        let response = Response::builder()
+        let mut response = Response::builder()
             .status(StatusCode::OK)
             .header(CONTENT_TYPE, asset.content_type)
-            .header(CONTENT_LENGTH, asset.binding.content_length)
+            .header(CONTENT_LENGTH, representation.binding.content_length)
             .header(CACHE_CONTROL, asset.cache_control)
             .header("x-content-type-options", "nosniff");
+        if asset.brotli.is_some() {
+            response = response.header(VARY, ACCEPT_ENCODING.as_str());
+        }
+        if use_brotli {
+            response = response.header(CONTENT_ENCODING, "br");
+        }
 
         if request.method() == Method::HEAD {
             drop(file);
@@ -2049,9 +2071,45 @@ impl StaticGatewayService {
         }
         let file = File::from_std(file);
         response
-            .body(stream_static_file(file, asset.binding.content_length))
+            .body(stream_static_file(
+                file,
+                representation.binding.content_length,
+            ))
             .expect("fixed static response must be valid")
     }
+}
+
+fn accepts_brotli(headers: &HeaderMap) -> bool {
+    headers.get_all(ACCEPT_ENCODING).iter().any(|value| {
+        let Ok(value) = value.to_str() else {
+            return false;
+        };
+        value.split(',').any(|entry| {
+            let mut fields = entry.split(';');
+            let Some(coding) = fields.next() else {
+                return false;
+            };
+            if !coding.trim().eq_ignore_ascii_case("br") {
+                return false;
+            }
+            let mut quality = 1.0_f32;
+            for parameter in fields {
+                let Some((name, value)) = parameter.trim().split_once('=') else {
+                    return false;
+                };
+                if name.trim().eq_ignore_ascii_case("q") {
+                    let Ok(parsed) = value.trim().parse::<f32>() else {
+                        return false;
+                    };
+                    if !(0.0..=1.0).contains(&parsed) {
+                        return false;
+                    }
+                    quality = parsed;
+                }
+            }
+            quality > 0.0
+        })
+    })
 }
 
 fn request_attempts_upgrade(headers: &HeaderMap) -> bool {
@@ -2147,6 +2205,16 @@ fn build_static_inventory(
             let binding =
                 capture_bound_static_file(&canonical_root, &relative_components, root_identity)
                     .map_err(|_| GatewayError::FrontendUnavailable)?;
+            let identity = StaticAssetFile {
+                relative_components,
+                binding,
+            };
+            let brotli = capture_brotli_sidecar(
+                &canonical_root,
+                &canonical_path,
+                root_identity,
+                identity.binding.content_length,
+            )?;
             cancellation.check()?;
             let url_path = path_to_url_path(relative)?;
             let normalized =
@@ -2159,8 +2227,8 @@ fn build_static_inventory(
             assets.insert(
                 normalized,
                 StaticAsset {
-                    relative_components,
-                    binding,
+                    identity,
+                    brotli,
                     content_type,
                     cache_control,
                 },
@@ -2179,6 +2247,43 @@ fn build_static_inventory(
         canonical_root,
         assets,
     })
+}
+
+fn capture_brotli_sidecar(
+    root: &Path,
+    original: &Path,
+    root_identity: StaticFileIdentity,
+    original_length: u64,
+) -> Result<Option<StaticAssetFile>, GatewayError> {
+    let mut sidecar_name = original.as_os_str().to_os_string();
+    sidecar_name.push(".br");
+    let sidecar = PathBuf::from(sidecar_name);
+    let metadata = match std_fs::symlink_metadata(&sidecar) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(GatewayError::FrontendUnavailable),
+    };
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Ok(None);
+    }
+    let canonical =
+        std_fs::canonicalize(&sidecar).map_err(|_| GatewayError::FrontendUnavailable)?;
+    if !canonical.starts_with(root) {
+        return Ok(None);
+    }
+    let relative = canonical
+        .strip_prefix(root)
+        .map_err(|_| GatewayError::FrontendUnavailable)?;
+    let relative_components = relative_path_components(relative)?;
+    let binding = capture_bound_static_file(root, &relative_components, root_identity)
+        .map_err(|_| GatewayError::FrontendUnavailable)?;
+    if binding.content_length >= original_length {
+        return Ok(None);
+    }
+    Ok(Some(StaticAssetFile {
+        relative_components,
+        binding,
+    }))
 }
 
 fn relative_path_components(relative: &Path) -> Result<Vec<OsString>, GatewayError> {
@@ -2221,7 +2326,7 @@ fn capture_bound_static_file(
     })
 }
 
-fn reopen_bound_static_file(root: &Path, asset: &StaticAsset) -> io::Result<std_fs::File> {
+fn reopen_bound_static_file(root: &Path, asset: &StaticAssetFile) -> io::Result<std_fs::File> {
     let opened = platform_open_static_file(root, &asset.relative_components)?;
     if opened.root_identity != asset.binding.root_identity
         || opened.parent_identities != asset.binding.parent_identities

@@ -13,7 +13,8 @@ use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Empty, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::header::{
-    CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HOST, LOCATION, ORIGIN, SET_COOKIE,
+    ACCEPT_ENCODING, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HOST,
+    LOCATION, ORIGIN, SET_COOKIE, VARY,
 };
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -820,6 +821,53 @@ async fn authenticated_index_and_assets_are_available_before_backend_readiness()
     .await;
     assert_eq!(hashed.status(), StatusCode::OK);
     assert_eq!(hashed.headers().get(CACHE_CONTROL).unwrap(), "no-cache");
+    gateway.shutdown().await;
+}
+
+#[tokio::test]
+async fn static_assets_negotiate_bound_brotli_sidecars_without_changing_content_type() {
+    let frontend = TemporaryFrontend::new();
+    fs::write(frontend.root.join("bundle.js.br"), b"brotli-sidecar").unwrap();
+    let gateway = bind_gateway(&frontend).await;
+    let cookie = bootstrap_session(&gateway).await;
+
+    let compressed = send_request(
+        &gateway,
+        Method::GET,
+        "/bundle.js",
+        &[
+            (COOKIE.as_str(), &cookie),
+            (ACCEPT_ENCODING.as_str(), "gzip, br"),
+        ],
+    )
+    .await;
+    assert_eq!(compressed.status(), StatusCode::OK);
+    assert_eq!(compressed.headers().get(CONTENT_ENCODING).unwrap(), "br");
+    assert_eq!(compressed.headers().get(VARY).unwrap(), "accept-encoding");
+    assert_eq!(
+        compressed.headers().get(CONTENT_TYPE).unwrap(),
+        "text/javascript; charset=utf-8"
+    );
+    assert_eq!(compressed.headers().get(CONTENT_LENGTH).unwrap(), "14");
+    assert_eq!(
+        response_bytes(compressed).await,
+        Bytes::from_static(b"brotli-sidecar")
+    );
+
+    for accept_encoding in [None, Some("br;q=0, gzip"), Some("gzip")] {
+        let mut headers = vec![(COOKIE.as_str(), cookie.as_str())];
+        if let Some(value) = accept_encoding {
+            headers.push((ACCEPT_ENCODING.as_str(), value));
+        }
+        let identity = send_request(&gateway, Method::GET, "/bundle.js", &headers).await;
+        assert_eq!(identity.status(), StatusCode::OK);
+        assert_eq!(identity.headers().get(CONTENT_ENCODING), None);
+        assert_eq!(identity.headers().get(VARY).unwrap(), "accept-encoding");
+        assert_eq!(
+            response_bytes(identity).await,
+            Bytes::from_static(b"globalThis.ride = true;")
+        );
+    }
     gateway.shutdown().await;
 }
 
