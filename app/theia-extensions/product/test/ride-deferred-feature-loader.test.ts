@@ -331,8 +331,10 @@ test('compiled browser automation proxy clears failed load and construction acti
     });
 
     await assert.rejects(loadFailure.launch(9444), error => {
+        assert.ok(error instanceof Error);
         assert.match(String(error), /failed to activate browser automation runtime/i);
         assert.doesNotMatch(String(error), /private-build/i);
+        assert.equal(error.stack, 'Error: Failed to activate browser automation runtime.');
         return true;
     });
     assert.deepEqual(await loadFailure.launch(9444), { remoteDebuggingPort: 9444 });
@@ -348,9 +350,45 @@ test('compiled browser automation proxy clears failed load and construction acti
             return automationDelegate();
         },
     }));
-    await assert.rejects(constructionFailure.queryDom(), /failed to activate browser automation runtime/i);
+    await assert.rejects(constructionFailure.queryDom(), error => {
+        assert.ok(error instanceof Error);
+        assert.match(String(error), /failed to activate browser automation runtime/i);
+        assert.equal(error.stack, 'Error: Failed to activate browser automation runtime.');
+        return true;
+    });
     assert.equal(await constructionFailure.queryDom(), '<html></html>');
     assert.equal(constructionAttempts, 2);
+});
+
+test('compiled browser automation proxy is disposed by its real connection container during pending activation', async () => {
+    const { Proxy } = compileBrowserAutomationModules();
+    const loaded = deferred<BrowserAutomationTestFeature>();
+    let factories = 0;
+    let launches = 0;
+    const container = new Container();
+    container.bind(Proxy).toSelf().inSingletonScope();
+    const proxy = container.get(Proxy);
+    (proxy as unknown as {
+        loadFeature: () => Promise<BrowserAutomationTestFeature>;
+    }).loadFeature = () => loaded.promise;
+
+    const activation = proxy.launch(9554);
+    await container.unbindAllAsync();
+    loaded.resolve({
+        createBrowserAutomation: () => {
+            factories++;
+            return automationDelegate({
+                launch: async port => {
+                    launches++;
+                    return { remoteDebuggingPort: port };
+                },
+            });
+        },
+    });
+
+    await assert.rejects(activation, /disposed/i);
+    assert.equal(factories, 0);
+    assert.equal(launches, 0);
 });
 
 test('compiled browser automation proxy disposal is idempotent and prevents late resurrection', async () => {
