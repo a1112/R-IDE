@@ -14,6 +14,9 @@ const SERVER_INPUT = 'src-gen/backend/server.js';
 const AI_ROOT = 'node_modules/@theia/ai-ide';
 const AI_BACKEND = `${AI_ROOT}/lib/node/backend-module.js`;
 const BROWSER_AUTOMATION = `${AI_ROOT}/lib/node/app-tester-agent/browser-automation-impl.js`;
+const THEIA_SCANOSS_ROOT = 'node_modules/@theia/scanoss';
+const SCANOSS_BACKEND = `${THEIA_SCANOSS_ROOT}/lib/node/scanoss-backend-module.js`;
+const SCANOSS_SERVICE = `${THEIA_SCANOSS_ROOT}/lib/node/scanoss-service-impl.js`;
 const PUPPETEER_ROOT = `${AI_ROOT}/node_modules/puppeteer-core`;
 const PUPPETEER = `${PUPPETEER_ROOT}/lib/index.js`;
 const QUICKJS_ROOT = '../../../node_modules/@tootallnate/quickjs-emscripten';
@@ -48,6 +51,8 @@ function createMetafile() {
         [SERVER_INPUT]: { bytesInOutput: 200 },
         [AI_BACKEND]: { bytesInOutput: 300 },
         [BROWSER_AUTOMATION]: { bytesInOutput: 400 },
+        [SCANOSS_BACKEND]: { bytesInOutput: 275 },
+        [SCANOSS_SERVICE]: { bytesInOutput: 350 },
         [PUPPETEER]: { bytesInOutput: 500 },
         [QUICKJS]: { bytesInOutput: 600 },
         [BIDI]: { bytesInOutput: 700 },
@@ -66,12 +71,14 @@ function createMetafile() {
             ]),
             [SERVER_INPUT]: inputRecord([
                 importRecord(AI_BACKEND),
-                importRecord(SCANOSS),
+                importRecord(SCANOSS_BACKEND),
                 importRecord(SHARED_V1),
                 importRecord(SHARED_V2)
             ]),
             [AI_BACKEND]: inputRecord([importRecord(BROWSER_AUTOMATION)]),
             [BROWSER_AUTOMATION]: inputRecord([importRecord(PUPPETEER)]),
+            [SCANOSS_BACKEND]: inputRecord([importRecord(SCANOSS_SERVICE)]),
+            [SCANOSS_SERVICE]: inputRecord([importRecord(SCANOSS)]),
             [PUPPETEER]: inputRecord([
                 importRecord(QUICKJS),
                 importRecord(BIDI),
@@ -131,6 +138,7 @@ function createMetafile() {
 function createPackageManifests() {
     return [
         { root: AI_ROOT, name: '@theia/ai-ide', version: '1.73.0-next.2' },
+        { root: THEIA_SCANOSS_ROOT, name: '@theia/scanoss', version: '1.73.0-next.2' },
         { root: PUPPETEER_ROOT, name: 'puppeteer-core', version: '25.2.1' },
         { root: QUICKJS_ROOT, name: '@tootallnate/quickjs-emscripten', version: '0.23.0' },
         { root: BIDI_ROOT, name: 'chromium-bidi', version: '16.0.1' },
@@ -139,6 +147,87 @@ function createPackageManifests() {
         { root: SHARED_V1_ROOT, name: 'shared', version: '1.0.0' },
         { root: SHARED_V2_ROOT, name: 'shared', version: '2.0.0' }
     ];
+}
+
+function reverseRecordEntries(record) {
+    return Object.fromEntries(Object.entries(record).reverse());
+}
+
+function createReverseOrderedMetafile() {
+    const metafile = createMetafile();
+    metafile.inputs = reverseRecordEntries(metafile.inputs);
+    for (const input of Object.values(metafile.inputs)) {
+        input.imports = [...input.imports].reverse();
+    }
+    for (const output of Object.values(metafile.outputs)) {
+        output.inputs = reverseRecordEntries(output.inputs);
+    }
+    metafile.outputs = reverseRecordEntries(metafile.outputs);
+    return metafile;
+}
+
+function expectedBrowserAutomationEvidence() {
+    return {
+        source: AI_BACKEND,
+        target: BROWSER_AUTOMATION,
+        present: true,
+        reachableRuntimeBytes: 2_600,
+        reachableRuntimePackages: [
+            {
+                name: '@tootallnate/quickjs-emscripten',
+                bytes: 600,
+                copies: ['@tootallnate/quickjs-emscripten@0.23.0#1']
+            },
+            {
+                name: 'chromium-bidi',
+                bytes: 700,
+                copies: ['chromium-bidi@16.0.1#1']
+            },
+            {
+                name: 'esprima',
+                bytes: 800,
+                copies: ['esprima@4.0.1#1']
+            },
+            {
+                name: 'puppeteer-core',
+                bytes: 500,
+                copies: ['puppeteer-core@25.2.1#1']
+            }
+        ],
+        exclusiveBytes: 1_600,
+        exclusiveInputCount: 3,
+        exclusiveRuntimeBytes: 1_200,
+        exclusivePackages: [
+            {
+                name: '@theia/ai-ide',
+                bytes: 400,
+                copies: [{ id: '@theia/ai-ide@1.73.0-next.2#1', bytes: 400 }]
+            },
+            {
+                name: 'chromium-bidi',
+                bytes: 700,
+                copies: [{ id: 'chromium-bidi@16.0.1#1', bytes: 700 }]
+            },
+            {
+                name: 'puppeteer-core',
+                bytes: 500,
+                copies: [{ id: 'puppeteer-core@25.2.1#1', bytes: 500 }]
+            }
+        ],
+        sharedRuntimeBytes: 1_400,
+        sharedRuntimePackages: [
+            {
+                name: '@tootallnate/quickjs-emscripten',
+                bytes: 600,
+                copies: ['@tootallnate/quickjs-emscripten@0.23.0#1']
+            },
+            {
+                name: 'esprima',
+                bytes: 800,
+                copies: ['esprima@4.0.1#1']
+            }
+        ]
+    };
 }
 
 function analyze(metadata = createMetafile(), packageManifests = createPackageManifests()) {
@@ -183,8 +272,8 @@ test('reports ownership from only the backend main output', () => {
                 path: MAIN_OUTPUT,
                 entryPoint: MAIN_ENTRY,
                 bytes: 5_000,
-                inputBytes: 3_649,
-                inputCount: 11
+                inputBytes: 4_274,
+                inputCount: 13
             }
         }
     );
@@ -198,41 +287,85 @@ test('reports ownership from only the backend main output', () => {
     assert.equal(Object.isFrozen(report.packageCopies), true);
 });
 
+test('reports deterministic ScanOSS ownership from the exact service edge', () => {
+    const report = analyze();
+    const evidence = report.evidence.scanoss;
+
+    assert.deepEqual(evidence, {
+        source: SCANOSS_BACKEND,
+        target: SCANOSS_SERVICE,
+        present: true,
+        exclusiveBytes: 375,
+        exclusiveInputCount: 2,
+        exclusivePackages: [
+            {
+                name: '@theia/scanoss',
+                bytes: 350,
+                copies: [{ id: '@theia/scanoss@1.73.0-next.2#1', bytes: 350 }]
+            },
+            {
+                name: 'scanoss',
+                bytes: 25,
+                copies: [{ id: 'scanoss@0.15.7#1', bytes: 25 }]
+            }
+        ]
+    });
+    assert.equal(Object.isFrozen(evidence), true);
+    assert.equal(Object.isFrozen(evidence.exclusivePackages), true);
+    assert.equal(Object.isFrozen(evidence.exclusivePackages[0].copies), true);
+});
+
+test('does not claim edge-cut ownership when the target remains reachable from another importer', () => {
+    const metafile = createMetafile();
+    metafile.inputs[SERVER_INPUT].imports.push(importRecord(SCANOSS_SERVICE));
+
+    const report = analyze(metafile);
+
+    assert.deepEqual(report.evidence.scanoss, {
+        source: SCANOSS_BACKEND,
+        target: SCANOSS_SERVICE,
+        present: true,
+        exclusiveBytes: 0,
+        exclusiveInputCount: 0,
+        exclusivePackages: []
+    });
+    assert.equal(report.evidence.browserAutomation.exclusiveBytes, 1_600);
+});
+
+test('reports zero ScanOSS ownership when the exact edge is absent', () => {
+    const metafile = createMetafile();
+    metafile.inputs[SCANOSS_BACKEND].imports = [];
+
+    const report = analyze(metafile);
+
+    assert.deepEqual(report.evidence.scanoss, {
+        source: SCANOSS_BACKEND,
+        target: SCANOSS_SERVICE,
+        present: false,
+        exclusiveBytes: 0,
+        exclusiveInputCount: 0,
+        exclusivePackages: []
+    });
+});
+
 test('reports edge-cut ownership without charging runtime packages used by another importer', () => {
     const report = analyze();
     const evidence = report.evidence.browserAutomation;
+    const expected = expectedBrowserAutomationEvidence();
 
-    assert.deepEqual(
-        {
-            present: evidence.present,
-            exclusiveBytes: evidence.exclusiveBytes,
-            exclusiveInputCount: evidence.exclusiveInputCount,
-            exclusiveRuntimeBytes: evidence.exclusiveRuntimeBytes,
-            sharedRuntimeBytes: evidence.sharedRuntimeBytes
-        },
-        {
-            present: true,
-            exclusiveBytes: 1_600,
-            exclusiveInputCount: 3,
-            exclusiveRuntimeBytes: 1_200,
-            sharedRuntimeBytes: 1_400
-        }
-    );
-    assert.deepEqual(
-        evidence.exclusivePackages.map(candidate => [candidate.name, candidate.bytes]),
-        [
-            ['@theia/ai-ide', 400],
-            ['chromium-bidi', 700],
-            ['puppeteer-core', 500]
-        ]
-    );
-    assert.deepEqual(
-        evidence.sharedRuntimePackages.map(candidate => [candidate.name, candidate.bytes]),
-        [
-            ['@tootallnate/quickjs-emscripten', 600],
-            ['esprima', 800]
-        ]
-    );
+    assert.deepEqual(evidence, expected);
+    assert.equal(JSON.stringify(evidence), JSON.stringify(expected));
+});
+
+test('serializes complete browser automation evidence independently of insertion order', () => {
+    const baseline = analyze().evidence.browserAutomation;
+    const reversed = analyze(
+        createReverseOrderedMetafile(),
+        createPackageManifests().reverse()
+    ).evidence.browserAutomation;
+
+    assert.deepEqual(reversed, baseline);
+    assert.equal(JSON.stringify(reversed), JSON.stringify(baseline));
 });
 
 test('reports package versions, duplicate logical copies, and shortest importer chains', () => {
@@ -309,6 +442,10 @@ test('rejects cyclic package ancestry and malformed records', () => {
     malformed.outputs[MAIN_OUTPUT].inputs['node_modules/@broken'] = { bytesInOutput: 1 };
     malformed.inputs['node_modules/@broken'] = inputRecord();
     assert.throws(() => analyze(malformed), /malformed package path/i);
+
+    const malformedImport = createMetafile();
+    malformedImport.inputs[SCANOSS_BACKEND].imports[0] = { path: SCANOSS_SERVICE };
+    assert.throws(() => analyze(malformedImport), /kind.*non-empty string/i);
 });
 
 test('rejects duplicate logical inputs and unsafe byte counts', () => {
@@ -319,6 +456,15 @@ test('rejects duplicate logical inputs and unsafe byte counts', () => {
     const unsafe = createMetafile();
     unsafe.outputs[MAIN_OUTPUT].inputs[PUPPETEER].bytesInOutput = Number.MAX_SAFE_INTEGER + 1;
     assert.throws(() => analyze(unsafe), /safe integer/i);
+
+    const overflow = createMetafile();
+    overflow.outputs[MAIN_OUTPUT].inputs[PUPPETEER].bytesInOutput = Number.MAX_SAFE_INTEGER;
+    assert.throws(() => analyze(overflow), /exceeds the safe integer range/i);
+
+    const escaping = createMetafile();
+    escaping.outputs['../lib/backend/main.js'] = escaping.outputs[MAIN_OUTPUT];
+    delete escaping.outputs[MAIN_OUTPUT];
+    assert.throws(() => analyze(escaping), /escapes the metadata root/i);
 });
 
 test('report never exposes absolute paths or metadata command lines', () => {

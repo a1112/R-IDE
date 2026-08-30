@@ -7,6 +7,8 @@ const REPORT_VERSION = 1;
 const MAIN_ENTRY = 'src-gen/backend/main.js';
 const BROWSER_AUTOMATION_SOURCE = 'node_modules/@theia/ai-ide/lib/node/backend-module.js';
 const BROWSER_AUTOMATION_TARGET = 'node_modules/@theia/ai-ide/lib/node/app-tester-agent/browser-automation-impl.js';
+const SCANOSS_SOURCE = 'node_modules/@theia/scanoss/lib/node/scanoss-backend-module.js';
+const SCANOSS_TARGET = 'node_modules/@theia/scanoss/lib/node/scanoss-service-impl.js';
 const BROWSER_AUTOMATION_RUNTIME_PACKAGES = Object.freeze([
     '@tootallnate/quickjs-emscripten',
     'chromium-bidi',
@@ -65,6 +67,14 @@ function normalizeLogicalPath(value, label, { allowAbsolute = false, allowParent
     const normalized = path.posix.normalize(slashPath).replace(/^\.\//, '');
     if (normalized === '.' || (!allowParent && (normalized === '..' || normalized.startsWith('../')))) {
         throw new TypeError(`${label} escapes the metadata root`);
+    }
+    return normalized;
+}
+
+function requireNormalizedLogicalInputPath(value, label) {
+    const normalized = normalizeLogicalPath(value, label);
+    if (normalized !== value) {
+        throw new TypeError(`${label} must be normalized`);
     }
     return normalized;
 }
@@ -316,6 +326,74 @@ function deepFreeze(value) {
     return value;
 }
 
+function analyzeEdgeCut({
+    source: rawSource,
+    target: rawTarget,
+    label,
+    prepared,
+    adjacency,
+    reachable,
+    inputPackages,
+    copiesByRoot,
+    packageCopies
+}) {
+    const source = requireNormalizedLogicalInputPath(rawSource, `${label} source`);
+    const target = requireNormalizedLogicalInputPath(rawTarget, `${label} target`);
+    const present = adjacency.get(source)?.includes(target) === true;
+    const cutReachable = present
+        ? reachableInputs(adjacency, source, target)
+        : reachable;
+    const exclusiveInputs = present
+        ? [...reachable].filter(inputPath => !cutReachable.has(inputPath)).sort(compareText)
+        : [];
+    let exclusiveBytes = 0;
+    const exclusiveBytesByName = new Map();
+    const exclusiveBytesByCopy = new Map();
+    for (const inputPath of exclusiveInputs) {
+        const bytes = prepared.outputInputs.get(inputPath).bytes;
+        exclusiveBytes = addByteCounts(exclusiveBytes, bytes, `${label} exclusive bytes`);
+        const descriptor = inputPackages.get(inputPath);
+        if (!descriptor) {
+            continue;
+        }
+        const copy = copiesByRoot.get(descriptor.root);
+        exclusiveBytesByName.set(
+            copy.name,
+            addByteCounts(
+                exclusiveBytesByName.get(copy.name) ?? 0,
+                bytes,
+                `${label} exclusive package ${copy.name} bytes`
+            )
+        );
+        exclusiveBytesByCopy.set(
+            copy.id,
+            addByteCounts(
+                exclusiveBytesByCopy.get(copy.id) ?? 0,
+                bytes,
+                `${label} exclusive package copy ${copy.id} bytes`
+            )
+        );
+    }
+    const exclusivePackages = [...exclusiveBytesByName.entries()]
+        .sort(([left], [right]) => compareText(left, right))
+        .map(([name, bytes]) => ({
+            name,
+            bytes,
+            copies: packageCopies
+                .filter(copy => copy.name === name && exclusiveBytesByCopy.has(copy.id))
+                .map(copy => ({ id: copy.id, bytes: exclusiveBytesByCopy.get(copy.id) }))
+        }));
+
+    return deepFreeze({
+        source,
+        target,
+        present,
+        exclusiveBytes,
+        exclusiveInputCount: exclusiveInputs.length,
+        exclusivePackages
+    });
+}
+
 export function analyzeBackendInitialBundle(metadata, { packageManifests = [] } = {}) {
     const prepared = prepareAnalysis(metadata);
     const manifests = normalizePackageManifests(packageManifests);
@@ -438,50 +516,25 @@ export function analyzeBackendInitialBundle(metadata, { packageManifests = [] } 
         (total, packageRecord) => addByteCounts(total, packageRecord.bytes, 'browser automation runtime bytes'),
         0
     );
-    const browserAutomationPresent = adjacency.get(BROWSER_AUTOMATION_SOURCE)?.includes(BROWSER_AUTOMATION_TARGET) === true;
-    const cutReachable = browserAutomationPresent
-        ? reachableInputs(adjacency, BROWSER_AUTOMATION_SOURCE, BROWSER_AUTOMATION_TARGET)
-        : new Set(distance.keys());
-    const exclusiveInputs = browserAutomationPresent
-        ? [...distance.keys()].filter(inputPath => !cutReachable.has(inputPath))
-        : [];
-    let browserAutomationExclusiveBytes = 0;
-    const exclusiveBytesByName = new Map();
-    const exclusiveBytesByCopy = new Map();
-    for (const inputPath of exclusiveInputs) {
-        const bytes = prepared.outputInputs.get(inputPath).bytes;
-        browserAutomationExclusiveBytes = addByteCounts(
-            browserAutomationExclusiveBytes,
-            bytes,
-            'browser automation exclusive bytes'
-        );
-        const descriptor = inputPackages.get(inputPath);
-        if (!descriptor) {
-            continue;
-        }
-        const copy = copiesByRoot.get(descriptor.root);
-        exclusiveBytesByName.set(
-            copy.name,
-            addByteCounts(exclusiveBytesByName.get(copy.name) ?? 0, bytes, `exclusive package ${copy.name} bytes`)
-        );
-        exclusiveBytesByCopy.set(
-            copy.id,
-            addByteCounts(exclusiveBytesByCopy.get(copy.id) ?? 0, bytes, `exclusive package copy ${copy.id} bytes`)
-        );
-    }
-    const browserAutomationExclusivePackages = [...exclusiveBytesByName.entries()]
-        .sort(([left], [right]) => compareText(left, right))
-        .map(([name, bytes]) => ({
-            name,
-            bytes,
-            copies: packageCopies
-                .filter(copy => copy.name === name && exclusiveBytesByCopy.has(copy.id))
-                .map(copy => ({ id: copy.id, bytes: exclusiveBytesByCopy.get(copy.id) }))
-        }));
+    const reachable = new Set(distance.keys());
+    const browserAutomationEdgeCut = analyzeEdgeCut({
+        source: BROWSER_AUTOMATION_SOURCE,
+        target: BROWSER_AUTOMATION_TARGET,
+        label: 'browser automation',
+        prepared,
+        adjacency,
+        reachable,
+        inputPackages,
+        copiesByRoot,
+        packageCopies
+    });
+    const browserAutomationExclusiveBytesByName = new Map(
+        browserAutomationEdgeCut.exclusivePackages.map(packageRecord => [packageRecord.name, packageRecord.bytes])
+    );
     const browserAutomationExclusiveRuntimeBytes = BROWSER_AUTOMATION_RUNTIME_PACKAGES.reduce(
         (total, name) => addByteCounts(
             total,
-            exclusiveBytesByName.get(name) ?? 0,
+            browserAutomationExclusiveBytesByName.get(name) ?? 0,
             'browser automation exclusive runtime bytes'
         ),
         0
@@ -489,12 +542,23 @@ export function analyzeBackendInitialBundle(metadata, { packageManifests = [] } 
     const browserAutomationSharedRuntimePackages = browserAutomationRuntimePackages
         .map(packageRecord => ({
             name: packageRecord.name,
-            bytes: packageRecord.bytes - (exclusiveBytesByName.get(packageRecord.name) ?? 0),
+            bytes: packageRecord.bytes - (browserAutomationExclusiveBytesByName.get(packageRecord.name) ?? 0),
             copies: packageRecord.copies
         }))
         .filter(packageRecord => packageRecord.bytes > 0);
     const browserAutomationSharedRuntimeBytes = browserAutomationRuntimeBytes
         - browserAutomationExclusiveRuntimeBytes;
+    const scanossEdgeCut = analyzeEdgeCut({
+        source: SCANOSS_SOURCE,
+        target: SCANOSS_TARGET,
+        label: 'ScanOSS',
+        prepared,
+        adjacency,
+        reachable,
+        inputPackages,
+        copiesByRoot,
+        packageCopies
+    });
 
     return deepFreeze({
         schema: REPORT_SCHEMA,
@@ -511,18 +575,19 @@ export function analyzeBackendInitialBundle(metadata, { packageManifests = [] } 
         duplicates,
         evidence: {
             browserAutomation: {
-                source: BROWSER_AUTOMATION_SOURCE,
-                target: BROWSER_AUTOMATION_TARGET,
-                present: browserAutomationPresent,
+                source: browserAutomationEdgeCut.source,
+                target: browserAutomationEdgeCut.target,
+                present: browserAutomationEdgeCut.present,
                 reachableRuntimeBytes: browserAutomationRuntimeBytes,
                 reachableRuntimePackages: browserAutomationRuntimePackages,
-                exclusiveBytes: browserAutomationExclusiveBytes,
-                exclusiveInputCount: exclusiveInputs.length,
+                exclusiveBytes: browserAutomationEdgeCut.exclusiveBytes,
+                exclusiveInputCount: browserAutomationEdgeCut.exclusiveInputCount,
                 exclusiveRuntimeBytes: browserAutomationExclusiveRuntimeBytes,
-                exclusivePackages: browserAutomationExclusivePackages,
+                exclusivePackages: browserAutomationEdgeCut.exclusivePackages,
                 sharedRuntimeBytes: browserAutomationSharedRuntimeBytes,
                 sharedRuntimePackages: browserAutomationSharedRuntimePackages
-            }
+            },
+            scanoss: scanossEdgeCut
         }
     });
 }
