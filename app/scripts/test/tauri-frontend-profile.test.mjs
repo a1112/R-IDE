@@ -37,7 +37,6 @@ import {
 import { createTheiaModuleDedupePlugin } from '../../applications/browser/ride-esbuild-dedupe.mjs';
 import { createWindowsCaCertsFallbackPlugin } from '../../applications/browser/tauri-src/windows-ca-certs-fallback.mjs';
 import { createProfileMetadataPlugin } from '../../applications/browser/tauri-src/esbuild-metadata.mjs';
-import { deferredBackendDescriptors } from '../tauri-backend-feature-attestation.mjs';
 
 const require = createRequire(import.meta.url);
 const esbuild = require('esbuild');
@@ -47,7 +46,6 @@ const appDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 
 const SCANOSS_BACKEND_DESCRIPTOR = Object.freeze({
     package: '@theia/scanoss',
     importer: '@theia/scanoss/lib/node/scanoss-backend-module',
-    request: './scanoss-service-impl',
     module: '@theia/scanoss/lib/node/scanoss-service-impl',
     proxy: 'tauri-src/backend/scanoss-service-proxy.ts',
     entry: 'tauri-src/backend/scanoss-service-feature.ts',
@@ -843,10 +841,9 @@ test('rejects ambiguous, unsafe, or non-CJS deferred backend edge declarations',
         product: manifest('product'),
         '@theia/scanoss': manifest('@theia/scanoss'),
         '@theia/scanoss-alternate': manifest('@theia/scanoss-alternate'),
-        'theia-ide-codex-ext': manifest('theia-ide-codex-ext'),
     };
     const input = deferredBackendModules => fixture({
-        roots: ['product', '@theia/scanoss', '@theia/scanoss-alternate', 'theia-ide-codex-ext'],
+        roots: ['product', '@theia/scanoss', '@theia/scanoss-alternate'],
         packages,
         featureGroups: {
             ai: {
@@ -860,35 +857,17 @@ test('rejects ambiguous, unsafe, or non-CJS deferred backend edge declarations',
         ...SCANOSS_BACKEND_DESCRIPTOR,
         package: '@theia/scanoss-alternate',
         importer: '@theia/scanoss-alternate/lib/node/alternate-backend-module',
-        request: './alternate-service-impl',
         module: '@theia/scanoss-alternate/lib/node/alternate-service-impl',
         proxy: 'tauri-src/backend/alternate-proxy.ts',
         entry: 'tauri-src/backend/alternate-feature.ts',
         output: 'lib/backend/alternate-feature.cjs',
         action: 'scanoss-alternate',
     };
-    const generated = {
-        package: 'theia-ide-codex-ext',
-        importer: 'src-gen/backend/server',
-        request: 'theia-ide-codex-ext/lib/node/ride-codex-backend-module',
-        module: 'theia-ide-codex-ext/lib/node/ride-codex-backend-module',
-        proxy: 'tauri-src/backend/codex-backend-proxy.ts',
-        entry: 'tauri-src/backend/codex-backend-feature.ts',
-        output: 'lib/backend/codex-backend-feature.cjs',
-        action: 'codex-backend',
-        runtimePackages: ['theia-ide-codex-ext'],
-        exclusiveInputCount: 1,
-    };
-
-    const resolvedGenerated = resolveProfile(input([generated]));
-    assert.deepEqual(resolvedGenerated.featureGroups.ai.deferredBackendModules, [generated]);
 
     for (const [field, value, pattern] of [
         ['package', 'missing', /unknown deferred backend package "missing"/i],
         ['importer', '../scanoss-backend-module', /deferred backend importer.*canonical/i],
         ['importer', '@theia/scanoss\\lib\\node\\scanoss-backend-module', /deferred backend importer.*canonical/i],
-        ['request', './other-service-impl', /deferred backend request.*exact/i],
-        ['request', '.\\scanoss-service-impl', /deferred backend request.*exact/i],
         ['module', '../scanoss-service-impl', /deferred backend module.*canonical module request/i],
         ['proxy', '../scanoss-service-proxy.ts', /deferred backend module proxy.*canonical/i],
         ['entry', 'tauri-src/backend/../scanoss-service-feature.ts', /deferred backend module entry.*canonical/i],
@@ -909,19 +888,6 @@ test('rejects ambiguous, unsafe, or non-CJS deferred backend edge declarations',
         );
     }
 
-    for (const [field, value] of [
-        ['importer', 'src-gen/backend/../server'],
-        ['importer', 'src-gen\\backend\\server'],
-        ['request', './ride-codex-backend-module'],
-        ['request', 'theia-ide-codex-ext/lib/node/other-backend-module'],
-    ]) {
-        assert.throws(
-            () => resolveProfile(input([{ ...generated, [field]: value }])),
-            new RegExp(`deferred backend ${field}.*(?:canonical|exact)`, 'i'),
-            `generated importer ${field}=${value} must be rejected`,
-        );
-    }
-
     for (const field of ['package', 'module', 'proxy', 'entry', 'output', 'action']) {
         let duplicate = { ...alternate, [field]: SCANOSS_BACKEND_DESCRIPTOR[field] };
         if (field === 'package' || field === 'module') {
@@ -932,9 +898,6 @@ test('rejects ambiguous, unsafe, or non-CJS deferred backend edge declarations',
                 module: field === 'module'
                     ? SCANOSS_BACKEND_DESCRIPTOR.module
                     : '@theia/scanoss/lib/node/alternate-service-impl',
-                request: field === 'module'
-                    ? SCANOSS_BACKEND_DESCRIPTOR.request
-                    : './alternate-service-impl',
             };
         }
         assert.throws(
@@ -1760,83 +1723,6 @@ test('secondary-window proxy splits from the initial bundle and executes the rea
         env: { ...process.env, NODE_PATH: path.join(appDirectory, 'node_modules') },
         stdio: 'pipe',
     });
-});
-
-test('backend build plans resolve and alias an exact generated server edge', async t => {
-    const plannerPath = path.join(
-        appDirectory,
-        'applications',
-        'browser',
-        'tauri-src',
-        'backend',
-        'esbuild-backend-deferred.mjs',
-    );
-    const { createTauriBackendBuildPlans } = await import(pathToFileURL(plannerPath));
-    const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-generated-backend-edge-'));
-    t.after(() => fs.promises.rm(directory, { recursive: true, force: true }));
-    const write = async (relativePath, source = 'module.exports = {};\n') => {
-        const file = path.join(directory, ...relativePath.split('/'));
-        await fs.promises.mkdir(path.dirname(file), { recursive: true });
-        await fs.promises.writeFile(file, source);
-        return file;
-    };
-    const importer = await write(
-        'src-gen/backend/server.js',
-        "module.exports = require('theia-ide-codex-ext/lib/node/ride-codex-backend-module');\n",
-    );
-    await Promise.all([
-        write('node_modules/theia-ide-codex-ext/lib/node/ride-codex-backend-module.js'),
-        write('tauri-src/backend/codex-backend-proxy.ts', 'export default {};\n'),
-        write('tauri-src/backend/codex-backend-feature.ts', 'export const feature = true;\n'),
-    ]);
-    const descriptor = {
-        package: 'theia-ide-codex-ext',
-        importer: 'src-gen/backend/server',
-        request: 'theia-ide-codex-ext/lib/node/ride-codex-backend-module',
-        module: 'theia-ide-codex-ext/lib/node/ride-codex-backend-module',
-        proxy: 'tauri-src/backend/codex-backend-proxy.ts',
-        entry: 'tauri-src/backend/codex-backend-feature.ts',
-        output: 'lib/backend/codex-backend-feature.cjs',
-        action: 'codex-backend',
-        runtimePackages: ['theia-ide-codex-ext'],
-        exclusiveInputCount: 1,
-    };
-    const plans = createTauriBackendBuildPlans({
-        entryPoints: { main: importer },
-        outdir: path.join(directory, 'lib', 'backend'),
-        plugins: [],
-    }, {
-        profile: 'tauri-critical',
-        featureGroups: { ai: { deferredBackendModules: [descriptor] } },
-    }, directory);
-    const aliasPlugin = plans.main.plugins.find(plugin => plugin.name === 'ride-tauri-deferred-backend-alias');
-    let resolver;
-    aliasPlugin.setup({ onResolve(options, callback) { resolver = { options, callback }; } });
-    assert.equal(resolver.options.filter.test(descriptor.request), true);
-    assert.deepEqual(await resolver.callback({
-        path: descriptor.request,
-        importer,
-        kind: 'require-call',
-    }), { path: path.join(directory, descriptor.proxy) });
-    assert.equal(await resolver.callback({
-        path: descriptor.request,
-        importer: path.join(directory, 'src-gen', 'backend', 'other.js'),
-        kind: 'require-call',
-    }), undefined);
-});
-
-test('deferred backend attestation rejects incomplete package edges with a contract error', () => {
-    assert.throws(() => deferredBackendDescriptors({
-        profile: 'tauri-critical',
-        featureGroups: {
-            ai: {
-                deferredBackendModules: [{
-                    ...SCANOSS_BACKEND_DESCRIPTOR,
-                    module: undefined,
-                }],
-            },
-        },
-    }), /deferred backend descriptor is invalid/i);
 });
 
 test('backend build plans split only the exact ScanOSS service edge and attest both outputs', async t => {

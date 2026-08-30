@@ -289,7 +289,6 @@ function normalizedFeatureGroups(featureGroups, browserDependencies) {
                 'output',
                 'package',
                 'proxy',
-                'request',
                 'runtimePackages',
             ].sort(compareText);
             if (fields.join('\0') !== expectedFields.join('\0')) {
@@ -298,31 +297,17 @@ function normalizedFeatureGroups(featureGroups, browserDependencies) {
             if (!Object.hasOwn(browserDependencies, entry.package)) {
                 throw new Error(`Unknown deferred backend package "${entry.package}" in group "${groupName}".`);
             }
-            const isCanonicalPackageModule = candidate => (
+            const isCanonicalModuleRequest = candidate => (
                 typeof candidate === 'string'
                 && candidate.startsWith(`${entry.package}/`)
                 && !candidate.includes('\\')
                 && candidate.split('/').every(segment => segment && segment !== '.' && segment !== '..')
             );
-            const isCanonicalGeneratedImporter = candidate => (
-                typeof candidate === 'string'
-                && candidate.startsWith('src-gen/backend/')
-                && !candidate.includes('\\')
-                && candidate.split('/').every(segment => segment && segment !== '.' && segment !== '..')
-            );
-            const packageImporter = isCanonicalPackageModule(entry.importer);
-            if (!packageImporter && !isCanonicalGeneratedImporter(entry.importer)) {
+            if (!isCanonicalModuleRequest(entry.importer)) {
                 throw new Error(`Deferred backend importer in group "${groupName}" must use a canonical module request.`);
             }
-            if (!isCanonicalPackageModule(entry.module)) {
+            if (!isCanonicalModuleRequest(entry.module)) {
                 throw new Error(`Deferred backend module in group "${groupName}" must use a canonical module request.`);
-            }
-            const relativeRequest = path.posix.relative(path.posix.dirname(entry.importer), entry.module);
-            const expectedRequest = packageImporter
-                ? (relativeRequest.startsWith('.') ? relativeRequest : `./${relativeRequest}`)
-                : entry.module;
-            if (entry.request !== expectedRequest) {
-                throw new Error(`Deferred backend request in group "${groupName}" must match the exact implementation edge.`);
             }
             for (const field of ['proxy', 'entry']) {
                 const candidate = entry[field];
@@ -363,7 +348,7 @@ function normalizedFeatureGroups(featureGroups, browserDependencies) {
                 throw new Error(`Deferred backend exclusive input count in group "${groupName}" must be a positive integer.`);
             }
             for (const [kind, identity, inventory] of [
-                ['edge', `${entry.importer}\0${entry.request}`, classifiedBackendEdges],
+                ['edge', `${entry.importer}\0${entry.module}`, classifiedBackendEdges],
                 ['package', entry.package, classifiedBackendPackages],
                 ['module', entry.module, classifiedBackendModules],
                 ['proxy', entry.proxy.toLowerCase(), classifiedBackendProxies],
@@ -379,7 +364,6 @@ function normalizedFeatureGroups(featureGroups, browserDependencies) {
             return {
                 package: entry.package,
                 importer: entry.importer,
-                request: entry.request,
                 module: entry.module,
                 proxy: entry.proxy,
                 entry: entry.entry,

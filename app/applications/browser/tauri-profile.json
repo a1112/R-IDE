@@ -101,7 +101,6 @@
         {
           "package": "@theia/scanoss",
           "importer": "@theia/scanoss/lib/node/scanoss-backend-module",
-          "request": "./scanoss-service-impl",
           "module": "@theia/scanoss/lib/node/scanoss-service-impl",
           "proxy": "tauri-src/backend/scanoss-service-proxy.ts",
           "entry": "tauri-src/backend/scanoss-service-feature.ts",
