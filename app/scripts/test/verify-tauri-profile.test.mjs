@@ -18,6 +18,23 @@ import { createProfileMetadataPlugin } from '../../applications/browser/tauri-sr
 
 const require = createRequire(import.meta.url);
 
+const BROWSER_AUTOMATION_BACKEND_DESCRIPTOR = Object.freeze({
+  package: '@theia/ai-ide',
+  importer: '@theia/ai-ide/lib/node/backend-module',
+  module: '@theia/ai-ide/lib/node/app-tester-agent/browser-automation-impl',
+  proxy: 'tauri-src/backend/ai-ide-browser-automation-proxy.ts',
+  entry: 'tauri-src/backend/ai-ide-browser-automation-feature.ts',
+  output: 'lib/backend/ai-ide-browser-automation-feature.cjs',
+  action: 'browser-automation',
+  runtimePackages: Object.freeze([
+    '@tootallnate/quickjs-emscripten',
+    'chromium-bidi',
+    'esprima',
+    'puppeteer-core',
+  ]),
+  exclusiveInputCount: 451,
+});
+
 const SCANOSS_BACKEND_DESCRIPTOR = Object.freeze({
   package: '@theia/scanoss',
   importer: '@theia/scanoss/lib/node/scanoss-backend-module',
@@ -52,10 +69,13 @@ test('repository Tauri profile declares the exact deferred Markdown preview desc
   assert.match(preview.deferBlockedReason, /markdown/i);
 });
 
-test('repository Tauri profile declares the exact deferred ScanOSS backend edge', () => {
+test('repository Tauri profile declares the exact deferred backend edges', () => {
   const appDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
   const profile = JSON.parse(fs.readFileSync(path.join(appDirectory, 'applications', 'browser', 'tauri-profile.json'), 'utf8'));
-  assert.deepEqual(profile.featureGroups.ai.deferredBackendModules, [SCANOSS_BACKEND_DESCRIPTOR]);
+  assert.deepEqual(profile.featureGroups.ai.deferredBackendModules, [
+    BROWSER_AUTOMATION_BACKEND_DESCRIPTOR,
+    SCANOSS_BACKEND_DESCRIPTOR,
+  ]);
 });
 
 function canonicalJson(value) {

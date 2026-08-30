@@ -43,6 +43,23 @@ const esbuild = require('esbuild');
 const properLockfile = require('proper-lockfile');
 const appDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
+const BROWSER_AUTOMATION_BACKEND_DESCRIPTOR = Object.freeze({
+    package: '@theia/ai-ide',
+    importer: '@theia/ai-ide/lib/node/backend-module',
+    module: '@theia/ai-ide/lib/node/app-tester-agent/browser-automation-impl',
+    proxy: 'tauri-src/backend/ai-ide-browser-automation-proxy.ts',
+    entry: 'tauri-src/backend/ai-ide-browser-automation-feature.ts',
+    output: 'lib/backend/ai-ide-browser-automation-feature.cjs',
+    action: 'browser-automation',
+    runtimePackages: Object.freeze([
+        '@tootallnate/quickjs-emscripten',
+        'chromium-bidi',
+        'esprima',
+        'puppeteer-core',
+    ]),
+    exclusiveInputCount: 451,
+});
+
 const SCANOSS_BACKEND_DESCRIPTOR = Object.freeze({
     package: '@theia/scanoss',
     importer: '@theia/scanoss/lib/node/scanoss-backend-module',
@@ -85,14 +102,17 @@ test('Tauri preview profile replaces only the eager frontend module with a lazy 
     assert.match(feature, /createChild\(\)/);
 });
 
-test('Tauri AI profile declares the exact deferred ScanOSS service edge', () => {
+test('Tauri AI profile declares the exact deferred backend edges', () => {
     const browserDirectory = path.join(appDirectory, 'applications', 'browser');
     const profile = JSON.parse(fs.readFileSync(path.join(browserDirectory, 'tauri-profile.json'), 'utf8'));
 
-    assert.deepEqual(profile.featureGroups.ai.deferredBackendModules, [SCANOSS_BACKEND_DESCRIPTOR]);
-    for (const field of ['proxy', 'entry']) {
-        const source = path.join(browserDirectory, SCANOSS_BACKEND_DESCRIPTOR[field]);
-        assert.equal(fs.statSync(source).isFile(), true, `${field} must be a regular source file`);
+    const expected = [BROWSER_AUTOMATION_BACKEND_DESCRIPTOR, SCANOSS_BACKEND_DESCRIPTOR];
+    assert.deepEqual(profile.featureGroups.ai.deferredBackendModules, expected);
+    for (const descriptor of expected) {
+        for (const field of ['proxy', 'entry']) {
+            const source = path.join(browserDirectory, descriptor[field]);
+            assert.equal(fs.statSync(source).isFile(), true, `${descriptor.action} ${field} must be a regular source file`);
+        }
     }
 });
 
