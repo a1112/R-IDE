@@ -1627,7 +1627,19 @@ test('backend build plans isolate the exact BrowserAutomation implementation and
         format: 'cjs',
         metafile: true,
         logLevel: 'silent',
-        plugins: [],
+        plugins: [
+            {
+                name: '@theia/esbuild-plugin',
+                setup(build) {
+                    if (!build.initialOptions.outdir) {
+                        throw new Error('The `outdir` option is required.');
+                    }
+                },
+            },
+            { name: 'plugin:copy', setup() {} },
+            { name: 'ride-tauri-backend-patches', setup() {} },
+            { name: 'ride-tauri-profile-audit', setup() {} },
+        ],
     };
     const criticalManifest = {
         profile: 'tauri-critical',
@@ -1638,6 +1650,10 @@ test('backend build plans isolate the exact BrowserAutomation implementation and
     assert.equal(plans.features[0].action, 'browser-automation');
     assert.equal(plans.features[0].options.outfile, path.join(directory, BROWSER_AUTOMATION_BACKEND_DESCRIPTOR.output));
     assert.equal(plans.features[0].options.plugins.some(plugin => plugin.name === 'ride-tauri-deferred-backend-alias'), false);
+    for (const mainOnlyPlugin of ['@theia/esbuild-plugin', 'plugin:copy', 'ride-tauri-backend-patches']) {
+        assert.equal(plans.features[0].options.plugins.some(plugin => plugin.name === mainOnlyPlugin), false);
+    }
+    assert.ok(plans.features[0].options.plugins.some(plugin => plugin.name === 'ride-tauri-profile-audit'));
     const aliasPlugin = plans.main.plugins.find(plugin => plugin.name === 'ride-tauri-deferred-backend-alias');
     assert.ok(aliasPlugin);
     let resolver;

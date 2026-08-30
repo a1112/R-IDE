@@ -3,6 +3,12 @@
 
 import path from 'node:path';
 
+const BACKEND_MAIN_ONLY_PLUGINS = new Set([
+    '@theia/esbuild-plugin',
+    'plugin:copy',
+    'ride-tauri-backend-patches',
+]);
+
 function normalize(candidate) {
     return candidate.replaceAll('\\', '/').replace(/^\.\//, '');
 }
@@ -59,6 +65,7 @@ function featureBuildOptions(nodeOptions, descriptor, baseDirectory) {
         entryPoints: _entryPoints,
         outdir: _outdir,
         outfile: _outfile,
+        plugins = [],
         ...sharedOptions
     } = nodeOptions;
     return {
@@ -68,6 +75,7 @@ function featureBuildOptions(nodeOptions, descriptor, baseDirectory) {
         format: 'cjs',
         platform: 'node',
         splitting: false,
+        plugins: plugins.filter(plugin => !BACKEND_MAIN_ONLY_PLUGINS.has(plugin.name)),
     };
 }
 
