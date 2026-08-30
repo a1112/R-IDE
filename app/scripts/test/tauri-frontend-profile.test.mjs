@@ -65,19 +65,6 @@ const SCANOSS_BACKEND_DESCRIPTOR = Object.freeze({
     exclusiveInputCount: 318,
 });
 
-const CODEX_BACKEND_DESCRIPTOR = Object.freeze({
-    package: 'theia-ide-codex-ext',
-    importer: 'src-gen/backend/server',
-    request: 'theia-ide-codex-ext/lib/node/ride-codex-backend-module',
-    module: 'theia-ide-codex-ext/lib/node/ride-codex-backend-module',
-    proxy: 'tauri-src/backend/codex-backend-proxy.ts',
-    entry: 'tauri-src/backend/codex-backend-feature.ts',
-    output: 'lib/backend/codex-backend-feature.cjs',
-    action: 'codex-backend',
-    runtimePackages: Object.freeze(['theia-ide-codex-ext']),
-    exclusiveInputCount: 1,
-});
-
 test('Tauri preview profile replaces only the eager frontend module with a lazy Markdown proxy', () => {
     const browserDirectory = path.join(appDirectory, 'applications', 'browser');
     const profile = JSON.parse(fs.readFileSync(path.join(browserDirectory, 'tauri-profile.json'), 'utf8'));
@@ -100,14 +87,11 @@ test('Tauri preview profile replaces only the eager frontend module with a lazy 
     assert.match(feature, /createChild\(\)/);
 });
 
-test('Tauri AI profile declares the exact deferred ScanOSS and Codex backend edges', () => {
+test('Tauri AI profile declares the exact deferred ScanOSS service edge', () => {
     const browserDirectory = path.join(appDirectory, 'applications', 'browser');
     const profile = JSON.parse(fs.readFileSync(path.join(browserDirectory, 'tauri-profile.json'), 'utf8'));
 
-    assert.deepEqual(profile.featureGroups.ai.deferredBackendModules, [
-        SCANOSS_BACKEND_DESCRIPTOR,
-        CODEX_BACKEND_DESCRIPTOR,
-    ]);
+    assert.deepEqual(profile.featureGroups.ai.deferredBackendModules, [SCANOSS_BACKEND_DESCRIPTOR]);
     for (const field of ['proxy', 'entry']) {
         const source = path.join(browserDirectory, SCANOSS_BACKEND_DESCRIPTOR[field]);
         assert.equal(fs.statSync(source).isFile(), true, `${field} must be a regular source file`);
@@ -1839,84 +1823,6 @@ test('backend build plans resolve and alias an exact generated server edge', asy
         importer: path.join(directory, 'src-gen', 'backend', 'other.js'),
         kind: 'require-call',
     }), undefined);
-});
-
-test('Tauri Codex backend proxy stays inactive until the first RPC target is requested', async t => {
-    const browserDirectory = path.join(appDirectory, 'applications', 'browser');
-    const proxy = path.join(browserDirectory, 'tauri-src', 'backend', 'codex-backend-proxy.ts');
-    const feature = path.join(browserDirectory, 'tauri-src', 'backend', 'codex-backend-feature.ts');
-    assert.equal(fs.statSync(proxy).isFile(), true);
-    assert.equal(fs.statSync(feature).isFile(), true);
-
-    const testTarget = path.join(browserDirectory, 'target');
-    await fs.promises.mkdir(testTarget, { recursive: true });
-    const directory = await fs.promises.mkdtemp(path.join(testTarget, 'ride-codex-backend-proxy-'));
-    t.after(() => fs.promises.rm(directory, { recursive: true, force: true }));
-    const output = path.join(directory, 'codex-backend-proxy.cjs');
-    await esbuild.build({
-        entryPoints: [proxy],
-        outfile: output,
-        bundle: true,
-        platform: 'node',
-        format: 'cjs',
-        target: 'node22',
-        external: ['@theia/*', 'theia-ide-codex-ext/*'],
-        logLevel: 'silent',
-    });
-    await fs.promises.writeFile(path.join(directory, 'codex-backend-feature.cjs'), String.raw`
-        globalThis.__rideCodexDeferredProbe.evaluations += 1;
-        exports.createRideCodexDeferredRuntime = rootContainer => {
-            globalThis.__rideCodexDeferredProbe.roots.push(rootContainer);
-            const runtime = {
-                connectAuth: client => ({ kind: 'auth', client }),
-                connectConversations: client => ({ kind: 'conversations', client }),
-                connectTurns: client => ({ kind: 'turns', client }),
-                connectApprovals: client => ({ kind: 'approvals', client }),
-                onStop: () => {
-                    globalThis.__rideCodexDeferredProbe.stops += 1;
-                    return Promise.resolve();
-                },
-            };
-            globalThis.__rideCodexDeferredProbe.runtimes.push(runtime);
-            return runtime;
-        };
-    `);
-    const probe = { evaluations: 0, roots: [], runtimes: [], stops: 0 };
-    globalThis.__rideCodexDeferredProbe = probe;
-    t.after(() => { delete globalThis.__rideCodexDeferredProbe; });
-    const bundleRequire = createRequire(output);
-    const proxyModule = bundleRequire(output);
-    const { Container } = bundleRequire('@theia/core/shared/inversify');
-    const { BackendApplicationContribution, RootContainer } = bundleRequire('@theia/core/lib/node/backend-application');
-    const { ConnectionHandler } = bundleRequire('@theia/core/lib/common/messaging/handler');
-    const container = new Container();
-    container.bind(RootContainer).toConstantValue(container);
-    container.load(proxyModule.default);
-    assert.equal(probe.evaluations, 0);
-
-    const handlers = container.getAll(ConnectionHandler);
-    assert.deepEqual(handlers.map(handler => handler.path).sort(), [
-        '/services/ride-codex-approvals',
-        '/services/ride-codex-auth',
-        '/services/ride-codex-conversations',
-        '/services/ride-codex-turns',
-    ]);
-    const client = { onDidCloseConnection: () => ({ dispose() {} }) };
-    const auth = handlers.find(handler => handler.path === '/services/ride-codex-auth').targetFactory(client);
-    const conversations = handlers.find(handler => handler.path === '/services/ride-codex-conversations').targetFactory(client);
-    assert.equal(auth.kind, 'auth');
-    assert.equal(conversations.kind, 'conversations');
-    assert.equal(probe.evaluations, 1);
-    assert.equal(probe.runtimes.length, 1);
-    assert.deepEqual(probe.roots, [container]);
-
-    const owner = container.getAll(BackendApplicationContribution)
-        .find(contribution => contribution.constructor.name === 'RideCodexDeferredBackend');
-    assert.ok(owner);
-    const firstStop = owner.onStop();
-    assert.equal(owner.onStop(), firstStop);
-    await firstStop;
-    assert.equal(probe.stops, 1);
 });
 
 test('deferred backend attestation rejects incomplete package edges with a contract error', () => {

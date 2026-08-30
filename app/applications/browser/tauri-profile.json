@@ -117,20 +117,6 @@
             "tr46"
           ],
           "exclusiveInputCount": 318
-        },
-        {
-          "package": "theia-ide-codex-ext",
-          "importer": "src-gen/backend/server",
-          "request": "theia-ide-codex-ext/lib/node/ride-codex-backend-module",
-          "module": "theia-ide-codex-ext/lib/node/ride-codex-backend-module",
-          "proxy": "tauri-src/backend/codex-backend-proxy.ts",
-          "entry": "tauri-src/backend/codex-backend-feature.ts",
-          "output": "lib/backend/codex-backend-feature.cjs",
-          "action": "codex-backend",
-          "runtimePackages": [
-            "theia-ide-codex-ext"
-          ],
-          "exclusiveInputCount": 1
         }
       ],
       "deferBlockedReason": "The group fails the explicit-adapter and isolated-backend gates; no complete real-action smoke and initial-entry inventory exists."
