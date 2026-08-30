@@ -5,7 +5,11 @@
  ********************************************************************************/
 
 import assert from 'node:assert/strict';
-import { test } from 'node:test';
+import fs from 'node:fs';
+import { createRequire } from 'node:module';
+import path from 'node:path';
+import { after, test } from 'node:test';
+import ts from 'typescript';
 import type { FrontendApplication } from '@theia/core/lib/browser';
 import type { KeybindingRegistry } from '@theia/core/lib/browser/keybinding';
 import type { TabBarToolbarRegistry } from '@theia/core/lib/browser/shell/tab-bar-toolbar';
@@ -15,6 +19,7 @@ import type { Command, CommandHandler } from '@theia/core/lib/common/command';
 import type { Disposable } from '@theia/core/lib/common/disposable';
 import type { MenuModelRegistry } from '@theia/core/lib/common/menu';
 import type { MessageService } from '@theia/core/lib/common/message-service';
+import { RootContainer } from '@theia/core/lib/node/backend-application';
 import { Container, ContainerModule } from '@theia/core/shared/inversify';
 import {
     bindRideDeferredFeatureLoader,
@@ -119,6 +124,539 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reje
     });
     return { promise, resolve, reject };
 }
+
+type ScanOSSTestResult =
+    | { readonly type: 'clean' }
+    | { readonly type: 'error'; readonly message: string }
+    | { readonly type: 'match'; readonly matched: string; readonly url: string; readonly raw: unknown };
+
+interface ScanOSSTestDelegate {
+    scanContent(content: string, apiKey?: string): Promise<ScanOSSTestResult>;
+}
+
+interface ScanOSSTestFeature {
+    createScanOSSService(rootContainer: Container, ensureActive: () => void): ScanOSSTestDelegate;
+}
+
+interface ScanOSSTestProxy extends ScanOSSTestDelegate {
+    dispose(): void;
+}
+
+interface ScanOSSUpstreamTestDelegate extends ScanOSSTestDelegate {
+    doScanContent(content: string, apiKey?: string): Promise<ScanOSSTestResult>;
+}
+
+type ScanOSSTestProxyConstructor = new () => ScanOSSTestProxy;
+type ScanOSSUpstreamTestConstructor = new () => ScanOSSUpstreamTestDelegate;
+
+interface CompiledScanOSSModules {
+    readonly Proxy: ScanOSSTestProxyConstructor;
+    readonly initialRequests: readonly string[];
+    readonly proxyOutputText: string;
+    readonly loadFeatureModule: () => ScanOSSTestFeature;
+    readonly loadUpstreamLoggerIdentifier: () => symbol;
+    readonly loadUpstreamConstructor: () => ScanOSSUpstreamTestConstructor;
+}
+
+type CommonJSLoad = (request: string, parent: unknown, isMain: boolean) => unknown;
+
+const commonJSModule = createRequire(__filename)('node:module') as { _load: CommonJSLoad };
+const scanOSSUnavailableResult: ScanOSSTestResult = {
+    type: 'error',
+    message: 'ScanOSS runtime is unavailable.'
+};
+let compiledScanOSSDirectory: string | undefined;
+let compiledScanOSSModules: CompiledScanOSSModules | undefined;
+
+function observeCommonJSLoads<T>(action: () => T): { readonly value: T; readonly requests: readonly string[] } {
+    const requests: string[] = [];
+    const originalLoad = commonJSModule._load;
+    commonJSModule._load = function (this: unknown, request: string, parent: unknown, isMain: boolean): unknown {
+        requests.push(request);
+        return Reflect.apply(originalLoad, this, [request, parent, isMain]);
+    };
+    try {
+        return { value: action(), requests };
+    } finally {
+        commonJSModule._load = originalLoad;
+    }
+}
+
+function compileScanOSSModules(): CompiledScanOSSModules {
+    if (compiledScanOSSModules) {
+        return compiledScanOSSModules;
+    }
+    const appDirectory = path.resolve(__dirname, '..', '..', '..', '..', '..');
+    const sourceDirectory = path.join(appDirectory, 'applications', 'browser', 'tauri-src', 'backend');
+    const outputRoot = path.resolve(__dirname, '..');
+    compiledScanOSSDirectory = fs.mkdtempSync(path.join(outputRoot, 'scanoss-lifecycle-'));
+    const transpile = (sourceName: string, outputName: string): string => {
+        const sourceFile = path.join(sourceDirectory, sourceName);
+        const result = ts.transpileModule(fs.readFileSync(sourceFile, 'utf8'), {
+            fileName: sourceFile,
+            reportDiagnostics: true,
+            compilerOptions: {
+                module: ts.ModuleKind.CommonJS,
+                target: ts.ScriptTarget.ES2022,
+                experimentalDecorators: true,
+                emitDecoratorMetadata: true,
+                esModuleInterop: true
+            }
+        });
+        const errors = (result.diagnostics ?? []).filter(diagnostic => diagnostic.category === ts.DiagnosticCategory.Error);
+        if (errors.length > 0) {
+            throw new Error(`Unable to compile ${sourceName}: ${errors.map(error => error.messageText).join(', ')}`);
+        }
+        const output = path.join(compiledScanOSSDirectory!, outputName);
+        fs.writeFileSync(output, result.outputText);
+        return output;
+    };
+    const proxyOutput = transpile('scanoss-service-proxy.ts', 'proxy.cjs');
+    const featureOutput = transpile('scanoss-service-feature.ts', 'feature.cjs');
+    const runtimeRequire = createRequire(path.join(compiledScanOSSDirectory, 'runtime.cjs'));
+    const loaded = observeCommonJSLoads(() => runtimeRequire(proxyOutput) as {
+        ScanOSSServiceImpl: ScanOSSTestProxyConstructor;
+    });
+    compiledScanOSSModules = {
+        Proxy: loaded.value.ScanOSSServiceImpl,
+        initialRequests: loaded.requests,
+        proxyOutputText: fs.readFileSync(proxyOutput, 'utf8'),
+        loadFeatureModule: () => runtimeRequire(featureOutput) as ScanOSSTestFeature,
+        loadUpstreamLoggerIdentifier: () => {
+            const implementation = runtimeRequire.resolve('@theia/scanoss/lib/node/scanoss-service-impl');
+            return (createRequire(implementation)('@theia/core') as { ILogger: symbol }).ILogger;
+        },
+        loadUpstreamConstructor: () => (runtimeRequire('@theia/scanoss/lib/node/scanoss-service-impl') as {
+            ScanOSSServiceImpl: ScanOSSUpstreamTestConstructor;
+        }).ScanOSSServiceImpl
+    };
+    return compiledScanOSSModules;
+}
+
+after(() => {
+    if (compiledScanOSSDirectory) {
+        fs.rmSync(compiledScanOSSDirectory, { recursive: true, force: true });
+    }
+});
+
+function assertNoScanOSSRuntimeLoads(requests: readonly string[]): void {
+    const forbidden = requests.filter(request => {
+        const normalized = request.replace(/\\/g, '/');
+        return normalized === 'scanoss'
+            || normalized.startsWith('scanoss/')
+            || normalized === '@grpc/grpc-js'
+            || normalized.startsWith('@grpc/grpc-js/')
+            || normalized === 'protobufjs'
+            || normalized.startsWith('protobufjs/')
+            || normalized.includes('/node_modules/scanoss/')
+            || normalized.includes('/node_modules/@grpc/grpc-js/')
+            || normalized.includes('/node_modules/protobufjs/')
+            || normalized.includes('@theia/scanoss/lib/node/scanoss-service-impl');
+    });
+    assert.deepEqual(forbidden, []);
+}
+
+function createScanOSSProxy(
+    Proxy: ScanOSSTestProxyConstructor,
+    loadFeature: () => Promise<ScanOSSTestFeature>,
+    rootContainer: Container = new Container()
+): { readonly proxy: ScanOSSTestProxy; readonly connectionContainer: Container; readonly rootContainer: Container } {
+    rootContainer.bind(RootContainer).toConstantValue(rootContainer);
+    const connectionContainer = rootContainer.createChild();
+    connectionContainer.bind(Proxy).toSelf().inSingletonScope();
+    const proxy = connectionContainer.get(Proxy);
+    (proxy as unknown as { loadFeature: () => Promise<ScanOSSTestFeature> }).loadFeature = loadFeature;
+    return { proxy, connectionContainer, rootContainer };
+}
+
+function scanOSSDelegate(
+    scanContent: (content: string, apiKey?: string) => Promise<ScanOSSTestResult> = async () => ({ type: 'clean' })
+): ScanOSSTestDelegate {
+    return { scanContent };
+}
+
+function bindScanOSSLogger(rootContainer: Container, loggerIdentifier: symbol, onResolve: () => void = () => undefined): void {
+    rootContainer.bind<unknown>(loggerIdentifier).toDynamicValue(() => {
+        onResolve();
+        return { debug: () => undefined };
+    }).whenTargetNamed('scanoss:ScanOSSServiceImpl');
+}
+
+test('compiled ScanOSS proxy construction does not load the deferred runtime', () => {
+    const compiled = compileScanOSSModules();
+    assertNoScanOSSRuntimeLoads(compiled.initialRequests);
+    const constructed = observeCommonJSLoads(() => createScanOSSProxy(
+        compiled.Proxy,
+        async () => ({ createScanOSSService: () => scanOSSDelegate() })
+    ));
+    assert.ok(constructed.value.proxy);
+    assertNoScanOSSRuntimeLoads(constructed.requests);
+});
+
+test('compiled ScanOSS proxy receives RootContainer through function-form Inversify metadata', () => {
+    const { Proxy } = compileScanOSSModules();
+    const rootContainer = new Container();
+    const { proxy } = createScanOSSProxy(
+        Proxy,
+        async () => ({ createScanOSSService: () => scanOSSDelegate() }),
+        rootContainer
+    );
+    assert.strictEqual(
+        (proxy as unknown as { rootContainer: Container }).rootContainer,
+        rootContainer
+    );
+});
+
+test('compiled ScanOSS feature creates one child and one real singleton delegate', () => {
+    const compiled = compileScanOSSModules();
+    const feature = compiled.loadFeatureModule();
+    const Upstream = compiled.loadUpstreamConstructor();
+    const rootContainer = new Container();
+    let loggerResolutions = 0;
+    bindScanOSSLogger(rootContainer, compiled.loadUpstreamLoggerIdentifier(), () => loggerResolutions++);
+    const originalCreateChild = rootContainer.createChild.bind(rootContainer);
+    let childCreations = 0;
+    let createdChild: Container | undefined;
+    (rootContainer as unknown as { createChild(): Container }).createChild = () => {
+        childCreations++;
+        const child = originalCreateChild();
+        createdChild = child;
+        return child;
+    };
+
+    const delegate = feature.createScanOSSService(rootContainer, () => undefined);
+
+    assert.equal(childCreations, 1);
+    assert.ok(createdChild);
+    assert.ok(delegate instanceof Upstream);
+    assert.strictEqual(createdChild.get(Upstream), delegate);
+    assert.equal(loggerResolutions, 1);
+});
+
+test('compiled ScanOSS proxy shares one concurrent first-use activation and delegate', async () => {
+    const { Proxy } = compileScanOSSModules();
+    const calls: Array<[string, string | undefined]> = [];
+    const delegate = scanOSSDelegate(async (content, apiKey) => {
+        calls.push([content, apiKey]);
+        return { type: 'clean' };
+    });
+    let loads = 0;
+    let factories = 0;
+    const { proxy } = createScanOSSProxy(Proxy, async () => {
+        loads++;
+        await Promise.resolve();
+        return {
+            createScanOSSService: () => {
+                factories++;
+                return delegate;
+            }
+        };
+    });
+
+    const results = await Promise.all([
+        proxy.scanContent('first-content', 'first-key'),
+        proxy.scanContent('second-content', undefined)
+    ]);
+
+    assert.deepEqual(results, [{ type: 'clean' }, { type: 'clean' }]);
+    assert.equal(loads, 1);
+    assert.equal(factories, 1);
+    assert.deepEqual(calls, [
+        ['first-content', 'first-key'],
+        ['second-content', undefined]
+    ]);
+});
+
+test('compiled ScanOSS proxy preserves real upstream sequencing, arguments, results, and errors', async () => {
+    const compiled = compileScanOSSModules();
+    const feature = compiled.loadFeatureModule();
+    const Upstream = compiled.loadUpstreamConstructor();
+    const prototype = Upstream.prototype;
+    const originalDoScanContent = prototype.doScanContent;
+    const firstEntered = deferred<void>();
+    const releaseFirst = deferred<void>();
+    const calls: Array<{ phase: 'start' | 'end'; content: string; apiKey: string | undefined }> = [];
+    const firstResult: ScanOSSTestResult = { type: 'clean' };
+    const upstreamError = new Error('untouched upstream failure');
+    const rootContainer = new Container();
+    let loggerResolutions = 0;
+    bindScanOSSLogger(rootContainer, compiled.loadUpstreamLoggerIdentifier(), () => loggerResolutions++);
+    const { proxy } = createScanOSSProxy(compiled.Proxy, async () => feature, rootContainer);
+    const originalCreateChild = rootContainer.createChild.bind(rootContainer);
+    let childCreations = 0;
+    (rootContainer as unknown as { createChild(): Container }).createChild = () => {
+        childCreations++;
+        return originalCreateChild();
+    };
+    const operations: Promise<ScanOSSTestResult>[] = [];
+
+    prototype.doScanContent = async (content: string, apiKey?: string) => {
+        calls.push({ phase: 'start', content, apiKey });
+        if (content === 'first-source') {
+            firstEntered.resolve(undefined);
+            await releaseFirst.promise;
+        }
+        calls.push({ phase: 'end', content, apiKey });
+        if (content === 'second-source') {
+            throw upstreamError;
+        }
+        return firstResult;
+    };
+    try {
+        const first = proxy.scanContent('first-source', 'first-api-key');
+        const second = proxy.scanContent('second-source', undefined);
+        operations.push(first, second);
+        const both = Promise.allSettled(operations);
+        await Promise.race([
+            firstEntered.promise,
+            both.then(() => {
+                throw new Error('The real upstream delegate was not reached.');
+            })
+        ]);
+        assert.deepEqual(calls, [{
+            phase: 'start',
+            content: 'first-source',
+            apiKey: 'first-api-key'
+        }]);
+        releaseFirst.resolve(undefined);
+        assert.strictEqual(await first, firstResult);
+        await assert.rejects(second, error => error === upstreamError);
+        assert.deepEqual(calls, [
+            { phase: 'start', content: 'first-source', apiKey: 'first-api-key' },
+            { phase: 'end', content: 'first-source', apiKey: 'first-api-key' },
+            { phase: 'start', content: 'second-source', apiKey: undefined },
+            { phase: 'end', content: 'second-source', apiKey: undefined }
+        ]);
+        assert.equal(childCreations, 1);
+        assert.equal(loggerResolutions, 1);
+    } finally {
+        releaseFirst.resolve(undefined);
+        await Promise.allSettled(operations);
+        prototype.doScanContent = originalDoScanContent;
+    }
+});
+
+test('compiled ScanOSS proxy converts a load failure to the fixed result and retries later', async () => {
+    const { Proxy } = compileScanOSSModules();
+    const success: ScanOSSTestResult = { type: 'clean' };
+    let attempts = 0;
+    const { proxy } = createScanOSSProxy(Proxy, async () => {
+        attempts++;
+        if (attempts === 1) {
+            throw new Error('Cannot load D:\\private-build\\scanoss-service-feature.cjs');
+        }
+        return { createScanOSSService: () => scanOSSDelegate(async () => success) };
+    });
+
+    assert.deepEqual(await proxy.scanContent('private source', 'private key'), scanOSSUnavailableResult);
+    assert.strictEqual(await proxy.scanContent('retry source', 'retry key'), success);
+    assert.equal(attempts, 2);
+});
+
+test('compiled ScanOSS proxy converts child construction failure to the fixed result and retries later', async () => {
+    const compiled = compileScanOSSModules();
+    const feature = compiled.loadFeatureModule();
+    const rootContainer = new Container();
+    const delegate = scanOSSDelegate();
+    const { proxy } = createScanOSSProxy(compiled.Proxy, async () => feature, rootContainer);
+    let childAttempts = 0;
+    let singletonScope = false;
+    let bound: unknown;
+    (rootContainer as unknown as { createChild(): Container }).createChild = () => {
+        childAttempts++;
+        if (childAttempts === 1) {
+            return {
+                bind: () => {
+                    throw new Error('D:\\private-build\\child-binding-failure');
+                }
+            } as unknown as Container;
+        }
+        return {
+            bind: (identifier: unknown) => {
+                bound = identifier;
+                return {
+                    toSelf: () => ({
+                        inSingletonScope: () => {
+                            singletonScope = true;
+                        }
+                    })
+                };
+            },
+            get: (identifier: unknown) => {
+                assert.strictEqual(identifier, bound);
+                return delegate;
+            }
+        } as unknown as Container;
+    };
+
+    assert.deepEqual(await proxy.scanContent('first source'), scanOSSUnavailableResult);
+    assert.deepEqual(await proxy.scanContent('second source'), { type: 'clean' });
+    assert.equal(childAttempts, 2);
+    assert.equal(singletonScope, true);
+});
+
+test('compiled ScanOSS proxy shares a private failed activation and exposes no diagnostics', async () => {
+    const { Proxy } = compileScanOSSModules();
+    const sourceSecret = 'PRIVATE_SOURCE_5f7f6f';
+    const apiKeySecret = 'PRIVATE_API_KEY_6e8e7e';
+    const environmentSecret = 'PRIVATE_ENV_7d9d8d';
+    const pathSecret = 'D:\\private-build\\scanoss-runtime.cjs';
+    const previousEnvironment = process.env.R_IDE_SCANOSS_PRIVATE_TEST;
+    process.env.R_IDE_SCANOSS_PRIVATE_TEST = environmentSecret;
+    const consoleMethods = ['error', 'warn', 'log', 'debug'] as const;
+    type ConsoleMethod = typeof consoleMethods[number];
+    const mutableConsole = console as unknown as Record<ConsoleMethod, (...args: unknown[]) => void>;
+    const originals = {} as Record<ConsoleMethod, (...args: unknown[]) => void>;
+    const logs: string[] = [];
+    for (const method of consoleMethods) {
+        originals[method] = mutableConsole[method];
+        mutableConsole[method] = (...args: unknown[]) => logs.push(args.map(String).join(' '));
+    }
+    let attempts = 0;
+    const { proxy } = createScanOSSProxy(Proxy, async () => {
+        attempts++;
+        await Promise.resolve();
+        if (attempts === 1) {
+            const error = new Error(`${sourceSecret} ${apiKeySecret} ${environmentSecret} ${pathSecret}`);
+            error.stack = `Error: private activation failure\n    at ${pathSecret}:42:7`;
+            throw error;
+        }
+        return { createScanOSSService: () => scanOSSDelegate() };
+    });
+
+    try {
+        const [first, concurrent] = await Promise.all([
+            proxy.scanContent(sourceSecret, apiKeySecret),
+            proxy.scanContent(sourceSecret, apiKeySecret)
+        ]);
+        assert.strictEqual(first, concurrent);
+        assert.deepEqual(first, scanOSSUnavailableResult);
+        assert.equal(attempts, 1);
+        assert.deepEqual(logs, []);
+        const publicOutput = JSON.stringify(first) + logs.join('\n');
+        for (const secret of [sourceSecret, apiKeySecret, environmentSecret, pathSecret]) {
+            assert.equal(publicOutput.includes(secret), false);
+        }
+        assert.deepEqual(await proxy.scanContent('later source', 'later key'), { type: 'clean' });
+        assert.equal(attempts, 2);
+    } finally {
+        for (const method of consoleMethods) {
+            mutableConsole[method] = originals[method];
+        }
+        if (previousEnvironment === undefined) {
+            delete process.env.R_IDE_SCANOSS_PRIVATE_TEST;
+        } else {
+            process.env.R_IDE_SCANOSS_PRIVATE_TEST = previousEnvironment;
+        }
+    }
+});
+
+test('compiled ScanOSS proxy preDestroy blocks a late feature from constructing or resurrecting', async () => {
+    const { Proxy } = compileScanOSSModules();
+    const loaded = deferred<ScanOSSTestFeature>();
+    let loads = 0;
+    let factories = 0;
+    const created = createScanOSSProxy(Proxy, () => {
+        loads++;
+        return loaded.promise;
+    });
+    const activation = created.proxy.scanContent('pending source', 'pending key');
+    try {
+        await Promise.resolve();
+        await created.connectionContainer.unbindAllAsync();
+        loaded.resolve({
+            createScanOSSService: () => {
+                factories++;
+                return scanOSSDelegate();
+            }
+        });
+        assert.deepEqual(await activation, scanOSSUnavailableResult);
+        assert.deepEqual(await created.proxy.scanContent('after disposal'), scanOSSUnavailableResult);
+        assert.equal(loads, 1);
+        assert.equal(factories, 0);
+    } finally {
+        loaded.resolve({ createScanOSSService: () => scanOSSDelegate() });
+        await Promise.allSettled([activation]);
+    }
+});
+
+test('compiled ScanOSS proxy checks disposal before child creation and delegate construction', async () => {
+    const compiled = compileScanOSSModules();
+    const feature = compiled.loadFeatureModule();
+    const beforeChildRoot = new Container();
+    let childCreations = 0;
+    let beforeChild!: ReturnType<typeof createScanOSSProxy>;
+    beforeChild = createScanOSSProxy(compiled.Proxy, async () => ({
+        createScanOSSService: (rootContainer, ensureActive) => {
+            beforeChild.proxy.dispose();
+            return feature.createScanOSSService(rootContainer, ensureActive);
+        }
+    }), beforeChildRoot);
+    (beforeChildRoot as unknown as { createChild(): Container }).createChild = () => {
+        childCreations++;
+        return {
+            bind: () => ({
+                toSelf: () => ({ inSingletonScope: () => undefined })
+            }),
+            get: () => scanOSSDelegate()
+        } as unknown as Container;
+    };
+
+    assert.deepEqual(await beforeChild.proxy.scanContent('dispose before child'), scanOSSUnavailableResult);
+    assert.equal(childCreations, 0);
+
+    const beforeConstructionRoot = new Container();
+    let delegateConstructions = 0;
+    let beforeConstruction!: ReturnType<typeof createScanOSSProxy>;
+    beforeConstruction = createScanOSSProxy(compiled.Proxy, async () => feature, beforeConstructionRoot);
+    (beforeConstructionRoot as unknown as { createChild(): Container }).createChild = () => {
+        beforeConstruction.proxy.dispose();
+        return {
+            bind: () => ({
+                toSelf: () => ({ inSingletonScope: () => undefined })
+            }),
+            get: () => {
+                delegateConstructions++;
+                return scanOSSDelegate();
+            }
+        } as unknown as Container;
+    };
+
+    assert.deepEqual(await beforeConstruction.proxy.scanContent('dispose before construction'), scanOSSUnavailableResult);
+    assert.equal(delegateConstructions, 0);
+});
+
+test('compiled ScanOSS proxy disposal is idempotent, drops its delegate, and calls no invented disposal hook', async () => {
+    const { Proxy } = compileScanOSSModules();
+    let loads = 0;
+    let delegateDisposals = 0;
+    const delegate = {
+        scanContent: async (): Promise<ScanOSSTestResult> => ({ type: 'clean' }),
+        dispose: () => delegateDisposals++
+    };
+    const { proxy } = createScanOSSProxy(Proxy, async () => {
+        loads++;
+        return { createScanOSSService: () => delegate };
+    });
+
+    assert.deepEqual(await proxy.scanContent('activate once'), { type: 'clean' });
+    proxy.dispose();
+    proxy.dispose();
+
+    assert.equal(delegateDisposals, 0);
+    assert.equal((proxy as unknown as { delegate: unknown }).delegate, undefined);
+    assert.deepEqual(await proxy.scanContent('must not resurrect'), scanOSSUnavailableResult);
+    assert.equal(loads, 1);
+});
+
+test('compiled ScanOSS proxy keeps the sibling feature request nonliteral', () => {
+    const { proxyOutputText } = compileScanOSSModules();
+    assert.match(proxyOutputText, /featureRequest/);
+    assert.doesNotMatch(
+        proxyOutputText,
+        /require\(\s*['"]\.\/scanoss-service-feature\.cjs['"]\s*\)/
+    );
+});
 
 function feature(
     id: string,
