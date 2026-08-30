@@ -36,6 +36,14 @@ function moduleInput(input, request) {
     return candidate === `node_modules/${request}` || candidate === `node_modules/${request}.js`;
 }
 
+function importerInput(input, request) {
+    if (!request.startsWith('src-gen/backend/')) {
+        return moduleInput(input, request);
+    }
+    const candidate = normalize(input);
+    return candidate === request || candidate === `${request}.js`;
+}
+
 function packageInput(input, packageName) {
     return `/${normalize(input)}/`.includes(`/node_modules/${packageName}/`);
 }
@@ -83,6 +91,7 @@ export function deferredBackendDescriptors(manifest) {
         'output',
         'package',
         'proxy',
+        'request',
         'runtimePackages',
     ];
     for (const { groupName, descriptor } of records) {
@@ -90,10 +99,21 @@ export function deferredBackendDescriptors(manifest) {
             typeof descriptor?.package === 'string'
             && canonicalPath(candidate, `${descriptor.package}/`)
         );
+        const packageImporter = canonicalModule(descriptor?.importer);
+        const generatedImporter = canonicalPath(descriptor?.importer, 'src-gen/backend/');
+        const implementationModule = canonicalModule(descriptor?.module);
+        let expectedRequest;
+        if (packageImporter && implementationModule) {
+            const relativeRequest = path.posix.relative(path.posix.dirname(descriptor.importer), descriptor.module);
+            expectedRequest = relativeRequest.startsWith('.') ? relativeRequest : `./${relativeRequest}`;
+        } else if (generatedImporter && implementationModule) {
+            expectedRequest = descriptor.module;
+        }
         if (!exactFields(descriptor, expectedFields)
             || !canonicalPackageName(descriptor.package)
-            || !canonicalModule(descriptor.importer)
-            || !canonicalModule(descriptor.module)
+            || (!packageImporter && !generatedImporter)
+            || !implementationModule
+            || descriptor.request !== expectedRequest
             || !canonicalPath(descriptor.proxy, 'tauri-src/backend/')
             || !canonicalPath(descriptor.entry, 'tauri-src/backend/')
             || !canonicalPath(descriptor.output, 'lib/backend/')
@@ -110,7 +130,7 @@ export function deferredBackendDescriptors(manifest) {
             throw new Error(`Deferred backend descriptor is invalid for ${groupName}.`);
         }
         for (const [kind, identity] of [
-            ['edge', `${descriptor.importer}\0${descriptor.module}`],
+            ['edge', `${descriptor.importer}\0${descriptor.request}`],
             ['package', descriptor.package],
             ['module', descriptor.module],
             ['proxy', portableRelativePathIdentity(descriptor.proxy)],
@@ -351,11 +371,6 @@ function verifyOutput(record, output, entry, libDirectory, label, { onlyOutput =
     return detail;
 }
 
-function relativeModuleRequest(descriptor) {
-    const relative = path.posix.relative(path.posix.dirname(descriptor.importer), descriptor.module);
-    return relative.startsWith('.') ? relative : `./${relative}`;
-}
-
 export function attestDeferredBackendFeatures({ manifest, libDirectory } = {}) {
     const descriptors = deferredBackendDescriptors(manifest);
     if (descriptors.length === 0) {
@@ -375,7 +390,7 @@ export function attestDeferredBackendFeatures({ manifest, libDirectory } = {}) {
 
     for (const { groupName, descriptor } of descriptors) {
         const label = `Deferred backend feature ${groupName}/${descriptor.action}`;
-        const importerInputs = mainInputs.filter(input => moduleInput(input, descriptor.importer));
+        const importerInputs = mainInputs.filter(input => importerInput(input, descriptor.importer));
         if (importerInputs.length !== 1) {
             throw new Error(`${label} requires exactly one importer input for ${descriptor.importer}.`);
         }
@@ -384,7 +399,7 @@ export function attestDeferredBackendFeatures({ manifest, libDirectory } = {}) {
         if (!Array.isArray(imports)) {
             throw new Error(`${label} importer has no import records.`);
         }
-        const expectedRequest = relativeModuleRequest(descriptor);
+        const expectedRequest = descriptor.request;
         const requestRecords = imports.filter(imported => imported?.original === expectedRequest);
         const proxyRecords = imports.filter(imported => normalize(imported?.path ?? '') === descriptor.proxy);
         if (requestRecords.length !== 1 || proxyRecords.length !== 1 || requestRecords[0] !== proxyRecords[0]) {

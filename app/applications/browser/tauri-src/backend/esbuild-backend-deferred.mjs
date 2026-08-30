@@ -31,6 +31,14 @@ function moduleFile(baseDirectory, request) {
     return path.extname(candidate) ? candidate : `${candidate}.js`;
 }
 
+function importerFile(baseDirectory, request) {
+    if (!request.startsWith('src-gen/backend/')) {
+        return moduleFile(baseDirectory, request);
+    }
+    const candidate = path.resolve(baseDirectory, ...request.split('/'));
+    return path.extname(candidate) ? candidate : `${candidate}.js`;
+}
+
 function assertRegularFile(candidate, label) {
     let stat;
     try {
@@ -53,11 +61,6 @@ function deferredBackendModules(profileManifest) {
             .sort((left, right) => left.action.localeCompare(right.action)));
 }
 
-function relativeModuleRequest(descriptor) {
-    const relative = path.posix.relative(path.posix.dirname(descriptor.importer), descriptor.module);
-    return relative.startsWith('.') ? relative : `./${relative}`;
-}
-
 function escapeRegex(candidate) {
     return candidate.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -66,7 +69,7 @@ function resolveDescriptor(descriptor, baseDirectory) {
     const proxy = path.resolve(baseDirectory, descriptor.proxy);
     const entry = path.resolve(baseDirectory, descriptor.entry);
     const output = path.resolve(baseDirectory, descriptor.output);
-    const importer = moduleFile(baseDirectory, descriptor.importer);
+    const importer = importerFile(baseDirectory, descriptor.importer);
     const implementation = moduleFile(baseDirectory, descriptor.module);
     for (const [candidate, label] of [
         [proxy, 'Deferred backend proxy'],
@@ -93,7 +96,7 @@ function resolveDescriptor(descriptor, baseDirectory) {
         outputPath: output,
         importerPath: importer,
         implementationPath: implementation,
-        request: relativeModuleRequest(descriptor),
+        request: descriptor.request,
     };
 }
 
