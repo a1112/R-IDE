@@ -70,6 +70,7 @@
     "verify:tauri-profile": "node scripts/verify-tauri-profile.mjs",
     "check:tauri-performance": "node scripts/check-tauri-performance.mjs --baseline applications/tauri/perf/baselines/pre-optimization-windows-x64-d034943.json --min-startup-gain 30 --min-memory-gain 10",
     "analyze:tauri-startup-bundle": "node scripts/analyze-tauri-initial-bundle.mjs --metadata applications/browser/lib/metadata/frontend-main.json",
+    "analyze:tauri-backend-bundle": "node scripts/analyze-tauri-backend-initial-bundle.mjs --metadata applications/browser/lib/metadata/backend.json",
     "electron": "yarn --cwd applications/electron",
     "electron-next": "yarn --cwd applications/electron-next",
     "browser": "yarn --cwd applications/browser",
