@@ -33,6 +33,7 @@ import {
   parseLinuxProcStatIdentity,
   parseMacOsProcessEnvironments,
   parsePosixProcessTable,
+  parseStartupDiagnosticReport,
   parseStartupReport,
   parseWindowsProcessTable,
   planProcessCleanup,
@@ -68,6 +69,7 @@ test('measurement module exports the reviewed reusable surface only', async () =
     'parseLinuxProcStatIdentity',
     'parseMacOsProcessEnvironments',
     'parsePosixProcessTable',
+    'parseStartupDiagnosticReport',
     'parseStartupReport',
     'parseWindowsProcessTable',
     'planProcessCleanup',
@@ -486,6 +488,145 @@ test('startup report parser accepts v2 parallel branches without using key order
     /backend_listening.*backend_spawned.*timestamp/i,
   );
   assert.throws(() => parseStartupReport('{'), /valid JSON/);
+});
+
+const startupDiagnosticPhases = {
+  frontend_initialization_started: 100,
+  attached_shell_resolved: 110,
+  workspace_ready: 120,
+  native_listener_installed: 130,
+  initial_request_selected: 140,
+  target_open_started: 150,
+  target_model_resolved: 160,
+  target_widget_activated: 170,
+  target_milestone_requested: 180,
+};
+
+function startupDiagnosticReport(overrides = {}) {
+  const target = currentRustTarget();
+  return {
+    schema: 'ride.startup-critical-path-diagnostics',
+    version: 1,
+    platform: target.platform,
+    arch: target.arch,
+    pid: 7331,
+    phases: { ...startupDiagnosticPhases },
+    ...overrides,
+  };
+}
+
+test('startup critical-path diagnostic parser accepts only the exact path-free schema', () => {
+  const parsed = parseStartupDiagnosticReport(
+    JSON.stringify(startupDiagnosticReport()),
+    { expectedPid: 7331, phase: 'target' },
+  );
+  assert.deepEqual(parsed.phases, startupDiagnosticPhases);
+  assert.deepEqual(Object.keys(parsed).sort(), [
+    'arch', 'phases', 'pid', 'platform', 'schema', 'version',
+  ]);
+
+  for (const [label, mutate, expected] of [
+    ['unknown top-level field', report => { report.outputPath = '/private/path'; }, /unexpected diagnostic report field outputPath/i],
+    ['missing phases', report => { delete report.phases; }, /missing.*phases|must contain phases/i],
+    ['unknown phase', report => { report.phases.injected = 181; }, /unexpected diagnostic phase (?:field )?injected/i],
+    ['missing predecessor', report => { delete report.phases.workspace_ready; }, /native_listener_installed.*workspace_ready/i],
+    ['decreasing timestamp', report => { report.phases.target_model_resolved = 149; }, /target_model_resolved.*target_open_started.*timestamp/i],
+    ['wrong pid', report => { report.pid = 7442; }, /pid 7442 does not match expected 7331/i],
+    ['arbitrary metadata', report => { report.phases.target_open_started = { elapsed: 150 }; }, /target_open_started.*non-negative safe integer/i],
+  ]) {
+    const report = startupDiagnosticReport();
+    mutate(report);
+    assert.throws(
+      () => parseStartupDiagnosticReport(JSON.stringify(report), {
+        expectedPid: 7331,
+        phase: 'target',
+      }),
+      expected,
+      label,
+    );
+  }
+});
+
+test('startup critical-path diagnostic parser rejects target and architecture mismatches', () => {
+  const target = currentRustTarget();
+  const otherPlatform = target.platform === 'windows' ? 'linux' : 'windows';
+  const otherArch = target.arch === 'x86_64' ? 'aarch64' : 'x86_64';
+  assert.throws(
+    () => parseStartupDiagnosticReport(JSON.stringify(startupDiagnosticReport({
+      platform: otherPlatform,
+    })), { expectedPid: 7331 }),
+    /platform.*does not match expected/i,
+  );
+  assert.throws(
+    () => parseStartupDiagnosticReport(JSON.stringify(startupDiagnosticReport({
+      arch: otherArch,
+    })), { expectedPid: 7331 }),
+    /architecture.*does not match expected/i,
+  );
+});
+
+test('startup critical-path diagnostic environment replaces inherited private output', () => {
+  const prepared = filterSpawnEnvironment({
+    PATH: '/fixture/bin',
+    RIDE_STARTUP_DIAGNOSTIC_REPORT: '/stale/private.json',
+  }, '/fixture/startup.json', undefined, '/owned/diagnostic.json');
+  assert.equal(
+    prepared.environment.RIDE_STARTUP_DIAGNOSTIC_REPORT,
+    '/owned/diagnostic.json',
+  );
+
+  const disabled = filterSpawnEnvironment({
+    RIDE_STARTUP_DIAGNOSTIC_REPORT: '/stale/private.json',
+  }, '/fixture/startup.json');
+  assert.equal(Object.hasOwn(disabled.environment, 'RIDE_STARTUP_DIAGNOSTIC_REPORT'), false);
+});
+
+test('startup critical-path diagnostic is bound to the measured root after final startup', async () => {
+  const events = [];
+  const diagnostic = startupDiagnosticReport();
+  const result = await measureOnce({
+    executable: '/fixture/R-IDE',
+    codeFile: '/fixture/startup.R',
+    reportPath: '/fixture/startup.json',
+    diagnosticPath: '/fixture/private-diagnostic.json',
+    idleMs: 0,
+    timeoutMs: 1_000,
+    pollMs: 1,
+    cwd: '/fixture',
+  }, {
+    createRunId: () => '7f7df1aa-a324-4fd4-b11c-4cc260a94d8f',
+    launch: options => {
+      events.push(`launch:${options.diagnosticPath}`);
+      return { pid: 7331 };
+    },
+    capture: async () => ({ pid: 7331, pgid: 7331, creationTime: 'root-start' }),
+    startMonitor: () => ({ stop: async () => [] }),
+    waitForReport: async (_reportPath, options) => {
+      events.push(`startup:${options.phase}`);
+      return {
+        ...(options.phase === 'final'
+          ? startupReport(finalMilestones)
+          : startupReport(targetMilestones)),
+        pid: 7331,
+      };
+    },
+    waitForDiagnostics: async (diagnosticPath, options) => {
+      events.push(`diagnostic:${diagnosticPath}:${options.expectedPid}`);
+      return diagnostic;
+    },
+    delay: async () => undefined,
+    sample: () => ({ processCount: 1, rssBytes: 1, processes: [] }),
+    terminate: async () => events.push('terminate'),
+  });
+
+  assert.equal(result.startupDiagnostics, diagnostic);
+  assert.deepEqual(events, [
+    'launch:/fixture/private-diagnostic.json',
+    'startup:target',
+    'startup:final',
+    'diagnostic:/fixture/private-diagnostic.json:7331',
+    'terminate',
+  ]);
 });
 
 test('startup report parser preserves v1 and v2 roots and accepts complete v3 mode phases', () => {
