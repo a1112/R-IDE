@@ -21,7 +21,9 @@ import {
     RideOpenRequestContribution,
     RideDeferredWorkScheduler,
     RidePluginDeploymentScheduler,
-    RideStartupMilestone
+    RideStartupDiagnosticPhase,
+    RideStartupMilestone,
+    reportRideStartupDiagnostic
 } from '../src/browser/ride-open-request';
 
 const LEGACY_PENDING_KEY = 'r-ide.open-request.pending.v1';
@@ -379,7 +381,9 @@ function createContribution(
     nativeChrome?: FakeNativeChrome,
     deferredWorkScheduler?: RideDeferredWorkScheduler,
     startHostedPluginResolution: () => void = () => undefined,
-    onActivate: (id: string) => void | Promise<void> = () => undefined
+    onActivate: (id: string) => void | Promise<void> = () => undefined,
+    reportStartupDiagnostic: (phase: RideStartupDiagnosticPhase) => Promise<void>
+        = async () => undefined
 ): {
     contribution: TestRideOpenRequestContribution;
     workspace: FakeWorkspaceService;
@@ -389,6 +393,7 @@ function createContribution(
     native: FakeNativeChrome;
     storage: MemoryStorage;
     milestones: RideStartupMilestone[];
+    diagnostics: RideStartupDiagnosticPhase[];
     applicationState: FakeApplicationStateService;
     hostedPlugins: FakeHostedPluginSupport | Promise<FakeHostedPluginSupport>;
     events: string[];
@@ -403,6 +408,7 @@ function createContribution(
     const shell = new FakeShell(onActivate);
     const native = nativeChrome ?? new FakeNativeChrome(() => events.push('listen'));
     const milestones: RideStartupMilestone[] = [];
+    const diagnostics: RideStartupDiagnosticPhase[] = [];
     const effectiveDeferredWorkScheduler = deferredWorkScheduler ?? new FakeDeferredWorkScheduler();
     const contribution = new TestRideOpenRequestContribution(
         workspace as never,
@@ -420,7 +426,11 @@ function createContribution(
         },
         startHostedPluginResolution,
         pluginDeployment,
-        effectiveDeferredWorkScheduler
+        effectiveDeferredWorkScheduler,
+        async phase => {
+            diagnostics.push(phase);
+            await reportStartupDiagnostic(phase);
+        }
     );
     return {
         contribution,
@@ -431,11 +441,120 @@ function createContribution(
         native,
         storage,
         milestones,
+        diagnostics,
         applicationState,
         hostedPlugins,
         events
     };
 }
+
+test('restored native target reports the closed startup diagnostic sequence', async () => {
+    const storage = new MemoryStorage();
+    storage.setItem(RIDE_OPEN_REQUEST_STATE_KEY, JSON.stringify(stateEnvelope('70', {
+        id: '70', source: 'initial', workspace: '/project', files: ['/project/startup.R']
+    })));
+    const context = createContribution('/project', storage);
+
+    context.contribution.onStart();
+    await flushLifecycle();
+
+    assert.deepEqual(context.diagnostics, [
+        'frontend_initialization_started',
+        'attached_shell_resolved',
+        'workspace_ready',
+        'native_listener_installed',
+        'initial_request_selected',
+        'target_open_started',
+        'target_model_resolved',
+        'target_widget_activated',
+        'target_milestone_requested'
+    ]);
+    assert.deepEqual(context.shell.activated, ['editor-1']);
+    assert.deepEqual(context.milestones, ['frontend_shell_attached', 'target_file_opened']);
+});
+
+test('empty startup stops diagnostics after native listener installation', async () => {
+    const context = createContribution('/project');
+    context.contribution.onStart();
+    await flushLifecycle();
+
+    assert.deepEqual(context.diagnostics, [
+        'frontend_initialization_started',
+        'attached_shell_resolved',
+        'workspace_ready',
+        'native_listener_installed'
+    ]);
+});
+
+test('first native target reports the same closed startup diagnostic sequence', async () => {
+    const context = createContribution('/project');
+    context.contribution.onStart();
+    await flushLifecycle();
+
+    context.native.emit({
+        id: '72', source: 'initial', workspace: '/project', files: ['/project/native.R']
+    });
+    await flushRequestChain();
+
+    assert.deepEqual(context.diagnostics, [
+        'frontend_initialization_started',
+        'attached_shell_resolved',
+        'workspace_ready',
+        'native_listener_installed',
+        'initial_request_selected',
+        'target_open_started',
+        'target_model_resolved',
+        'target_widget_activated',
+        'target_milestone_requested'
+    ]);
+});
+
+test('browser mode startup diagnostic adapter is inert', async () => {
+    await assert.doesNotReject(
+        reportRideStartupDiagnostic('frontend_initialization_started')
+    );
+});
+
+test('diagnostic rejection cannot block restored target opening', async () => {
+    const storage = new MemoryStorage();
+    storage.setItem(RIDE_OPEN_REQUEST_STATE_KEY, JSON.stringify(stateEnvelope('71', {
+        id: '71', source: 'initial', workspace: '/project', files: ['/project/startup.R']
+    })));
+    const warnings: unknown[][] = [];
+    const originalWarn = console.warn;
+    console.warn = (...values: unknown[]) => warnings.push(values);
+    try {
+        const context = createContribution(
+            '/project', storage, undefined, undefined, undefined, undefined, undefined,
+            undefined, undefined, undefined, undefined,
+            async () => { throw new Error('diagnostics unavailable'); }
+        );
+
+        context.contribution.onStart();
+        await flushLifecycle();
+
+        assert.equal(context.openers.opened.length, 1);
+        assert.equal(context.shell.activated.length, 1);
+        assert.equal(warnings.length, 9);
+    } finally {
+        console.warn = originalWarn;
+    }
+});
+
+test('disposal suppresses diagnostic checkpoints reached later', async () => {
+    const applicationState = new FakeApplicationStateService(false);
+    const context = createContribution(
+        '/project', undefined, undefined, undefined, applicationState
+    );
+
+    context.contribution.onStart();
+    await Promise.resolve();
+    context.contribution.dispose();
+    applicationState.attach();
+    await flushLifecycle();
+
+    assert.deepEqual(context.diagnostics, ['frontend_initialization_started']);
+});
 
 test('target startup yields before resolving and deploying plugins in canonical order', async () => {
     const events: string[] = [];
