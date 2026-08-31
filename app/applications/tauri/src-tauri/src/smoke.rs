@@ -116,16 +116,13 @@ impl SmokeAction {
             action => Self::ALL
                 .iter()
                 .position(|candidate| *candidate == action)
-                .map_or_else(
-                    || {
-                        Self::CODEX_ALL
-                            .iter()
-                            .position(|candidate| *candidate == action)
-                            .map(|index| Self::ALL.len() + 1 + index)
-                            .expect("all smoke actions have a canonical index")
-                    },
-                    |index| index,
-                ),
+                .unwrap_or_else(|| {
+                    Self::CODEX_ALL
+                        .iter()
+                        .position(|candidate| *candidate == action)
+                        .map(|index| Self::ALL.len() + 1 + index)
+                        .expect("all smoke actions have a canonical index")
+                }),
         }
     }
 }
