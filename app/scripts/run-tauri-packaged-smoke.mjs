@@ -1089,7 +1089,7 @@ export function parsePackagedSmokeArguments(argv) {
     parsed[key] = key === 'timeoutMs' ? Number(value) : value;
   }
   if (!SMOKE_SCENARIOS.includes(parsed.scenario)) {
-    throw new Error('scenario must be critical-file, critical-empty, full-file, or backend-retry');
+    throw new Error('scenario must be critical-file, critical-empty, full-file, backend-retry, or codex');
   }
   parsed.timeoutMs = strictTimeout(parsed.timeoutMs, 'timeout-ms');
   if (parsed.bundleRoot !== undefined && parsed.executable !== undefined) {

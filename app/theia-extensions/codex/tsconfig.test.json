@@ -1,0 +1,26 @@
+{
+    "extends": "./tsconfig.json",
+    "compilerOptions": {
+        "composite": false,
+        "rootDir": ".",
+        "outDir": "test/dist",
+        "declaration": false,
+        "declarationMap": false
+    },
+    "include": [
+        "src/common/ride-codex-methods.ts",
+        "src/common/ride-codex-approvals.ts",
+        "src/common/ride-codex-protocol.ts",
+        "src/common/ride-codex-events.ts",
+        "src/browser/ride-codex-approval-dialog.tsx",
+        "src/browser/ride-codex-error-mapper.ts",
+        "src/browser/ride-codex-event-reducer.ts",
+        "src/browser/ride-codex-renderers.tsx",
+        "src/node/ride-codex-approval-broker.ts",
+        "src/node/ride-codex-jsonl-*.ts",
+        "src/node/ride-codex-turn-coordinator.ts",
+        "src/node/ride-codex-launch-spec.ts",
+        "src/node/ride-codex-runtime-*.ts",
+        "test/**/*.ts"
+    ]
+}

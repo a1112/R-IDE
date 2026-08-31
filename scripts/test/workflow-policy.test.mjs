@@ -75,6 +75,10 @@ test('quality CI continuously exercises packaged smoke lifecycle safety', () => 
     'app/scripts/test/generate-packaged-smoke-plugin.test.mjs',
     'app/scripts/test/measure-tauri-startup.test.mjs',
     'app/scripts/test/run-tauri-packaged-smoke.test.mjs',
+    'app/scripts/test/tauri-packaged-smoke-contract.test.mjs',
+    'app/scripts/test/verify-codex-packaging.test.mjs',
+    'app/scripts/test/codex-packaged-smoke.test.mjs',
+    'app/scripts/test/codex-warm-activation.test.mjs',
   ]) {
     assert.match(policyStep, new RegExp(testFile.replaceAll('.', '\\.').replaceAll('/', '\\/')));
   }
@@ -122,7 +126,7 @@ test('packaged Tauri builds preserve the complete plugin dependency graph', () =
   assert.match(buildHelper, /RIDE_TAURI_BUILD_ID:\s*buildId/);
   assert.match(buildHelper, /profileDirectory\s*=\s*path\.join\(browserDirectory,\s*['"]\.ride-tauri-profile['"]\)/);
   assert.match(buildHelper, /buildDirectory\s*=\s*path\.join\(profileDirectory,\s*['"]builds['"],\s*buildId\)/);
-  const prepareIndex = buildHelper.indexOf("args: [profileScript, 'prepare'");
+  const prepareIndex = buildHelper.indexOf("profileScript, 'prepare'");
   const rebuildIndex = buildHelper.indexOf("'rebuild:browser'");
   const theiaBuildIndex = buildHelper.indexOf("'build', '--app-target=browser'");
   const publishIndex = buildHelper.indexOf("'publish',", theiaBuildIndex);
@@ -215,6 +219,8 @@ test('Windows critical packaged smoke is an explicit manual interaction after pa
   assert.match(smokeBlock, /if:\s*runner\.os\s*==\s*['"]Windows['"]\s*&&\s*github\.event_name\s*==\s*['"]workflow_dispatch['"]\s*&&\s*inputs\.run_windows_packaged_smoke/);
   assert.match(smokeBlock, /npm run smoke:tauri-packaged -- --scenario critical-file/);
   assert.match(smokeBlock, /smoke-diagnostics\/critical-file\.json/);
+  assert.match(smokeBlock, /npm run smoke:tauri-packaged -- --scenario codex/);
+  assert.match(smokeBlock, /smoke-diagnostics\/codex\.json/);
 
   const diagnosticsBlock = packageJob.text.slice(diagnosticsIndex);
   assert.match(diagnosticsBlock, /if:\s*failure\(\)[^\n]*runner\.os\s*==\s*['"]Windows['"]/);
@@ -275,12 +281,14 @@ test('non-Windows package jobs validate smoke contracts without claiming interac
 
 test('Tauri verification builds and inventories full fallback before the critical profile', () => {
   const workflow = readTauriWorkflow();
+  const codexBuild = workflow.indexOf('- name: Build Codex extension');
   const fullBuild = workflow.indexOf('- name: Build full-profile fallback backend');
   const fullVerify = workflow.indexOf('- name: Verify full-profile inventory');
   const criticalBuild = workflow.indexOf('- name: Build critical-profile backend');
   const criticalVerify = workflow.indexOf('- name: Verify critical-profile inventory');
   const nativeBuild = workflow.indexOf('- name: Build Tauri debug application');
-  assert.ok(fullBuild >= 0, 'full fallback build is required');
+  assert.ok(codexBuild >= 0, 'Codex extension build is required for the full fallback profile');
+  assert.ok(fullBuild > codexBuild, 'full fallback build must follow the Codex extension build');
   assert.ok(fullVerify > fullBuild, 'full fallback inventory must follow its build');
   assert.ok(criticalBuild > fullVerify, 'critical profile must be rebuilt after full fallback verification');
   assert.ok(criticalVerify > criticalBuild, 'critical inventory must follow its build');

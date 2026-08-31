@@ -61,7 +61,6 @@
     "@theia/ai-chat-ui": "1.73.0-next.2",
     "@theia/ai-claude-code": "1.73.0-next.2",
     "@theia/ai-code-completion": "1.73.0-next.2",
-    "@theia/ai-codex": "1.73.0-next.2",
     "@theia/ai-copilot": "1.73.0-next.2",
     "@theia/ai-core": "1.73.0-next.2",
     "@theia/ai-core-ui": "1.73.0-next.2",
@@ -127,7 +126,9 @@
     "@theia/variable-resolver": "1.73.0-next.2",
     "@theia/vsx-registry": "1.73.0-next.2",
     "@theia/workspace": "1.73.0-next.2",
+    "date-fns": "4.4.0",
     "fs-extra": "^9.1.0",
+    "theia-ide-codex-ext": "1.72.100",
     "theia-ide-product-ext": "1.72.100"
   },
   "devDependencies": {

@@ -4,6 +4,11 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
+import {
+    assertDeferredBackendSourceIdentities,
+    attestDeferredBackendFeatures,
+    deferredBackendDescriptors as validateAttestedBackendDescriptors,
+} from './tauri-backend-feature-attestation.mjs';
 
 const require = createRequire(import.meta.url);
 const semver = require('semver');
@@ -142,6 +147,13 @@ function normalizedFeatureGroups(featureGroups, browserDependencies) {
     const result = {};
     const classifiedRoots = new Map();
     const classifiedFrontendModules = new Set();
+    const classifiedBackendEdges = new Set();
+    const classifiedBackendPackages = new Set();
+    const classifiedBackendModules = new Set();
+    const classifiedBackendProxies = new Set();
+    const classifiedBackendEntries = new Set();
+    const classifiedBackendActions = new Set();
+    const classifiedBackendOutputs = new Set();
     for (const groupName of Object.keys(featureGroups).sort(compareText)) {
         const value = featureGroups[groupName];
         if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -151,6 +163,7 @@ function normalizedFeatureGroups(featureGroups, browserDependencies) {
             key !== 'deferredRoots'
             && key !== 'blockedRoots'
             && key !== 'deferredFrontendModules'
+            && key !== 'deferredBackendModules'
             && key !== 'deferBlockedReason'
         ));
         if (unexpectedFields.length > 0) {
@@ -159,6 +172,7 @@ function normalizedFeatureGroups(featureGroups, browserDependencies) {
         const deferredRoots = value.deferredRoots;
         const blockedRoots = value.blockedRoots;
         const deferredFrontendModules = value.deferredFrontendModules;
+        const deferredBackendModules = value.deferredBackendModules;
         if (!Array.isArray(deferredRoots) || deferredRoots.some(root => typeof root !== 'string' || !root)) {
             throw new Error(`Feature group "${groupName}" must contain exact deferredRoots package names.`);
         }
@@ -167,6 +181,9 @@ function normalizedFeatureGroups(featureGroups, browserDependencies) {
         }
         if (deferredFrontendModules !== undefined && !Array.isArray(deferredFrontendModules)) {
             throw new Error(`Feature group "${groupName}" deferredFrontendModules must be an array.`);
+        }
+        if (deferredBackendModules !== undefined && !Array.isArray(deferredBackendModules)) {
+            throw new Error(`Feature group "${groupName}" deferredBackendModules must be an array.`);
         }
         if (value.deferBlockedReason !== undefined
             && (typeof value.deferBlockedReason !== 'string'
@@ -259,12 +276,112 @@ function normalizedFeatureGroups(featureGroups, browserDependencies) {
                 action: entry.action,
             };
         }).sort((left, right) => compareText(left.module, right.module));
+        const normalizedBackendModules = (deferredBackendModules ?? []).map(entry => {
+            const fields = entry && typeof entry === 'object' && !Array.isArray(entry)
+                ? Object.keys(entry).sort(compareText)
+                : [];
+            const expectedFields = [
+                'action',
+                'entry',
+                'exclusiveInputCount',
+                'importer',
+                'module',
+                'output',
+                'package',
+                'proxy',
+                'runtimePackages',
+            ].sort(compareText);
+            if (fields.join('\0') !== expectedFields.join('\0')) {
+                throw new Error(`Feature group "${groupName}" has an invalid deferred backend module entry.`);
+            }
+            if (!Object.hasOwn(browserDependencies, entry.package)) {
+                throw new Error(`Unknown deferred backend package "${entry.package}" in group "${groupName}".`);
+            }
+            const isCanonicalModuleRequest = candidate => (
+                typeof candidate === 'string'
+                && candidate.startsWith(`${entry.package}/`)
+                && !candidate.includes('\\')
+                && candidate.split('/').every(segment => segment && segment !== '.' && segment !== '..')
+            );
+            if (!isCanonicalModuleRequest(entry.importer)) {
+                throw new Error(`Deferred backend importer in group "${groupName}" must use a canonical module request.`);
+            }
+            if (!isCanonicalModuleRequest(entry.module)) {
+                throw new Error(`Deferred backend module in group "${groupName}" must use a canonical module request.`);
+            }
+            for (const field of ['proxy', 'entry']) {
+                const candidate = entry[field];
+                if (typeof candidate !== 'string'
+                    || !candidate.startsWith('tauri-src/backend/')
+                    || candidate.includes('\\')
+                    || candidate.split('/').some(segment => !segment || segment === '.' || segment === '..')) {
+                    throw new Error(`Deferred backend module ${field} in group "${groupName}" must use a canonical tauri-src/backend path.`);
+                }
+            }
+            if (typeof entry.output !== 'string'
+                || !entry.output.startsWith('lib/backend/')
+                || !entry.output.endsWith('.cjs')
+                || entry.output.includes('\\')
+                || entry.output.split('/').some(segment => !segment || segment === '.' || segment === '..')) {
+                throw new Error(`Deferred backend module output in group "${groupName}" must use a canonical lib/backend CJS path.`);
+            }
+            if (typeof entry.action !== 'string' || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(entry.action)) {
+                throw new Error(`Deferred backend module action in group "${groupName}" must be canonical.`);
+            }
+            if (!Array.isArray(entry.runtimePackages)) {
+                throw new Error(`Deferred backend runtime packages in group "${groupName}" must be an array.`);
+            }
+            const canonicalRuntimePackage = candidate => (
+                typeof candidate === 'string'
+                && /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/.test(candidate)
+            );
+            if (entry.runtimePackages.some(candidate => !canonicalRuntimePackage(candidate))) {
+                throw new Error(`Deferred backend runtime package in group "${groupName}" must be canonical.`);
+            }
+            if (new Set(entry.runtimePackages).size !== entry.runtimePackages.length) {
+                throw new Error(`Deferred backend runtime packages in group "${groupName}" must be unique and contain no duplicates.`);
+            }
+            if ([...entry.runtimePackages].sort(compareText).join('\0') !== entry.runtimePackages.join('\0')) {
+                throw new Error(`Deferred backend runtime packages in group "${groupName}" must be sorted.`);
+            }
+            if (!Number.isSafeInteger(entry.exclusiveInputCount) || entry.exclusiveInputCount <= 0) {
+                throw new Error(`Deferred backend exclusive input count in group "${groupName}" must be a positive integer.`);
+            }
+            for (const [kind, identity, inventory] of [
+                ['edge', `${entry.importer}\0${entry.module}`, classifiedBackendEdges],
+                ['package', entry.package, classifiedBackendPackages],
+                ['module', entry.module, classifiedBackendModules],
+                ['proxy', entry.proxy.toLowerCase(), classifiedBackendProxies],
+                ['entry', entry.entry.toLowerCase(), classifiedBackendEntries],
+                ['action', entry.action, classifiedBackendActions],
+                ['output', entry.output, classifiedBackendOutputs],
+            ]) {
+                if (inventory.has(identity)) {
+                    throw new Error(`Deferred backend ${kind} "${identity.replace('\0', ' -> ')}" is duplicated.`);
+                }
+                inventory.add(identity);
+            }
+            return {
+                package: entry.package,
+                importer: entry.importer,
+                module: entry.module,
+                proxy: entry.proxy,
+                entry: entry.entry,
+                output: entry.output,
+                action: entry.action,
+                runtimePackages: [...entry.runtimePackages],
+                exclusiveInputCount: entry.exclusiveInputCount,
+            };
+        }).sort((left, right) => compareText(left.module, right.module));
         const normalizedGroup = {
             deferredRoots: [...deferredRoots].sort(compareText),
             blockedRoots: normalizedBlocked.sort((left, right) => compareText(left.name, right.name)),
         };
         if (deferredFrontendModules !== undefined) {
             normalizedGroup.deferredFrontendModules = normalizedFrontendModules;
+        }
+        if (deferredBackendModules !== undefined) {
+            normalizedGroup.deferredBackendModules = normalizedBackendModules;
         }
         if (value.deferBlockedReason !== undefined) {
             normalizedGroup.deferBlockedReason = value.deferBlockedReason;
@@ -544,12 +661,20 @@ export function resolveProfile({
                 throw new Error(`Deferred frontend package "${deferredModule.package}" from group "${groupName}" must remain in the critical closure.`);
             }
         }
+        for (const deferredModule of group.deferredBackendModules ?? []) {
+            if (!criticalClosure.requestNames.has(deferredModule.package)) {
+                throw new Error(`Deferred backend package "${deferredModule.package}" from group "${groupName}" must remain in the critical closure.`);
+            }
+        }
         resolvedFeatureGroups[groupName] = {
             deferredRoots: group.deferredRoots,
             blockedRoots,
         };
         if (group.deferredFrontendModules !== undefined) {
             resolvedFeatureGroups[groupName].deferredFrontendModules = group.deferredFrontendModules;
+        }
+        if (profileName === 'tauri-critical' && group.deferredBackendModules !== undefined) {
+            resolvedFeatureGroups[groupName].deferredBackendModules = group.deferredBackendModules;
         }
         if (group.deferBlockedReason !== undefined) {
             resolvedFeatureGroups[groupName].deferBlockedReason = group.deferBlockedReason;
@@ -598,6 +723,16 @@ function assertProfilePath(browserDirectory, candidate) {
     if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
         throw new Error('Profile path must stay inside the browser application directory.');
     }
+}
+
+export async function validateDeferredBackendModuleFiles(featureGroups, browserDirectory) {
+    const descriptorRecords = Object.entries(featureGroups ?? {})
+        .sort(([left], [right]) => compareText(left, right))
+        .flatMap(([groupName, group]) => (group.deferredBackendModules ?? []).map(descriptor => ({
+            groupName,
+            descriptor,
+        })));
+    assertDeferredBackendSourceIdentities(descriptorRecords, browserDirectory);
 }
 
 function assertPathSegment(value, label) {
@@ -700,25 +835,43 @@ async function retryUnlink(filesystem, candidate, retry) {
     });
 }
 
-const transactionStates = new Map([
+const transactionStatesV2 = new Map([
     ['prepared', 1],
     ['backed-up', 2],
     ['installed', 3],
     ['rolled-back', 4],
 ]);
 
-function transactionMarker(plan, state) {
-    return {
-        schema: 'ride.directory-transaction@2',
+const transactionStatesV3 = new Map([
+    ['prepared', 1],
+    ['backed-up', 2],
+    ['validation-pending', 3],
+    ['installed', 4],
+    ['rolled-back', 5],
+]);
+
+function transactionStatesForSchema(schemaVersion) {
+    return schemaVersion === 3 ? transactionStatesV3 : transactionStatesV2;
+}
+
+function transactionMarker(plan, state, { schemaVersion, restore } = {}) {
+    const states = transactionStatesForSchema(schemaVersion);
+    const marker = {
+        schema: `ride.directory-transaction@${schemaVersion}`,
         targetName: plan.targetName,
         transactionId: plan.transactionId,
         state,
-        sequence: transactionStates.get(state),
+        sequence: states.get(state),
     };
+    if (state === 'validation-pending') {
+        marker.restore = restore;
+    }
+    return marker;
 }
 
-function transactionStateMarkerPath(plan, state, nonce) {
-    const sequence = String(transactionStates.get(state)).padStart(2, '0');
+function transactionStateMarkerPath(plan, marker, nonce) {
+    const sequence = String(marker.sequence).padStart(2, '0');
+    const { state } = marker;
     return `${plan.markerPrefix}${sequence}-${state}-${nonce}.json`;
 }
 
@@ -742,17 +895,30 @@ async function syncParentDirectory(parentDirectory, filesystem, platform) {
     }
 }
 
-async function writeTransactionMarker(plan, state, options) {
+async function writeTransactionMarker(plan, state, options, details = {}) {
     const { filesystem, retry } = filesystemOptions(options);
+    const schemaVersion = details.schemaVersion
+        ?? (typeof options.validateInstalled === 'function' ? 3 : 2);
+    const states = transactionStatesForSchema(schemaVersion);
+    if (!states.has(state)) {
+        throw new Error(`Directory transaction state ${state} is not valid for marker schema v${schemaVersion}.`);
+    }
+    if (state === 'validation-pending' && !['backup', 'absent'].includes(details.restore)) {
+        throw new Error('Directory transaction validation-pending marker requires an exact restore intent.');
+    }
+    const marker = transactionMarker(plan, state, {
+        schemaVersion,
+        restore: details.restore,
+    });
     const createMarkerNonce = options.createMarkerNonce ?? (() => crypto.randomBytes(6).toString('hex'));
     const nonce = createMarkerNonce();
     assertPathSegment(nonce, 'Directory transaction marker nonce');
     const temporaryMarker = transactionTempMarkerPath(plan, nonce);
-    const stateMarker = transactionStateMarkerPath(plan, state, nonce);
+    const stateMarker = transactionStateMarkerPath(plan, marker, nonce);
     for (const candidate of [temporaryMarker, stateMarker]) {
         assertProfilePath(plan.parentDirectory, candidate);
     }
-    const data = Buffer.from(`${JSON.stringify(transactionMarker(plan, state))}\n`);
+    const data = Buffer.from(`${JSON.stringify(marker)}\n`);
     let handle;
     let writeError;
     try {
@@ -804,17 +970,29 @@ function parseTransactionMarker(text, plan, expected = undefined) {
     } catch (error) {
         throw new Error(`Malformed directory transaction marker ${plan.markerPath}: ${error.message}`);
     }
-    const legacy = marker?.schema === 'ride.directory-transaction@1';
+    const schemaVersion = marker?.schema === 'ride.directory-transaction@1'
+        ? 1
+        : marker?.schema === 'ride.directory-transaction@2'
+            ? 2
+            : marker?.schema === 'ride.directory-transaction@3'
+                ? 3
+                : undefined;
+    const legacy = schemaVersion === 1;
+    const validationPending = schemaVersion === 3 && marker?.state === 'validation-pending';
     const exactKeys = legacy
         ? ['schema', 'state', 'targetName', 'transactionId']
-        : ['schema', 'sequence', 'state', 'targetName', 'transactionId'];
+        : validationPending
+            ? ['restore', 'schema', 'sequence', 'state', 'targetName', 'transactionId']
+            : ['schema', 'sequence', 'state', 'targetName', 'transactionId'];
+    const transactionStates = transactionStatesForSchema(schemaVersion);
     if (!marker || typeof marker !== 'object' || Array.isArray(marker)
         || Object.keys(marker).sort(compareText).join('\0') !== exactKeys.join('\0')
-        || (!legacy && marker.schema !== 'ride.directory-transaction@2')
+        || schemaVersion === undefined
         || marker.targetName !== plan.targetName
         || marker.transactionId !== plan.transactionId
         || !transactionStates.has(marker.state)
         || (!legacy && marker.sequence !== transactionStates.get(marker.state))
+        || (validationPending && !['backup', 'absent'].includes(marker.restore))
         || (expected && (marker.state !== expected.state || marker.sequence !== expected.sequence))) {
         throw new Error(`Invalid directory transaction marker ${plan.markerPath}.`);
     }
@@ -827,6 +1005,44 @@ async function assertRegularDirectoryIfPresent(candidate, filesystem) {
         throw new Error(`Directory transaction path is not a regular directory: ${candidate}`);
     }
     return state.exists;
+}
+
+async function rollbackValidationPendingDirectory(plan, restore, options) {
+    const { filesystem, retry } = filesystemOptions(options);
+    let targetExists = await assertRegularDirectoryIfPresent(plan.targetDirectory, filesystem);
+    let backupExists = await assertRegularDirectoryIfPresent(plan.backupDirectory, filesystem);
+    let temporaryExists = await assertRegularDirectoryIfPresent(plan.temporaryDirectory, filesystem);
+    if (restore === 'absent') {
+        if (backupExists) {
+            throw new Error(`Cannot safely recover validation-pending directory transaction ${plan.transactionId}.`);
+        }
+        if (targetExists) {
+            await retryRemove(filesystem, plan.targetDirectory, retry);
+        }
+        await retryRemove(filesystem, plan.temporaryDirectory, retry);
+        return undefined;
+    }
+    if (restore !== 'backup') {
+        throw new Error(`Invalid validation-pending restore intent for directory transaction ${plan.transactionId}.`);
+    }
+    if (backupExists) {
+        if (targetExists) {
+            if (temporaryExists) {
+                throw new Error(`Cannot safely recover validation-pending directory transaction ${plan.transactionId}.`);
+            }
+            await retryRename(filesystem, plan.targetDirectory, plan.temporaryDirectory, retry);
+            targetExists = false;
+            temporaryExists = true;
+        }
+        await retryRename(filesystem, plan.backupDirectory, plan.targetDirectory, retry);
+        targetExists = true;
+        backupExists = false;
+    } else if (!(targetExists && temporaryExists)) {
+        throw new Error(`Cannot safely recover validation-pending directory transaction ${plan.transactionId}.`);
+    }
+    const rollbackMarker = await writeTransactionMarker(plan, 'rolled-back', options, { schemaVersion: 3 });
+    await retryRemove(filesystem, plan.temporaryDirectory, retry);
+    return rollbackMarker;
 }
 
 export async function recoverDirectoryTransactions({ parentDirectory, targetName }, options = {}) {
@@ -845,7 +1061,7 @@ export async function recoverDirectoryTransactions({ parentDirectory, targetName
     const escapedTarget = targetName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const prefix = `.${targetName}.transaction-`;
     const statePattern = new RegExp(
-        `^\\.${escapedTarget}\\.transaction-(.+)\\.(\\d{2})-(prepared|backed-up|installed|rolled-back)-([A-Za-z0-9][A-Za-z0-9._-]{0,127})\\.json$`,
+        `^\\.${escapedTarget}\\.transaction-(.+)\\.(\\d{2})-(prepared|backed-up|validation-pending|installed|rolled-back)-([A-Za-z0-9][A-Za-z0-9._-]{0,127})\\.json$`,
     );
     const temporaryPattern = new RegExp(
         `^\\.${escapedTarget}\\.transaction-(.+)\\.marker-tmp-([A-Za-z0-9][A-Za-z0-9._-]{0,127})$`,
@@ -910,7 +1126,7 @@ export async function recoverDirectoryTransactions({ parentDirectory, targetName
                 const marker = parseTransactionMarker(await filesystem.readFile(legacyPath, 'utf8'), plan);
                 complete.push({
                     path: legacyPath,
-                    sequence: transactionStates.get(marker.state),
+                    sequence: transactionStatesV2.get(marker.state),
                     state: marker.state,
                     marker,
                 });
@@ -934,6 +1150,7 @@ export async function recoverDirectoryTransactions({ parentDirectory, targetName
             }
         }
         const marker = complete.at(-1).marker;
+        let additionalMarkerPath;
         let targetExists = await assertRegularDirectoryIfPresent(plan.targetDirectory, filesystem);
         let backupExists = await assertRegularDirectoryIfPresent(plan.backupDirectory, filesystem);
         await assertRegularDirectoryIfPresent(plan.temporaryDirectory, filesystem);
@@ -951,6 +1168,8 @@ export async function recoverDirectoryTransactions({ parentDirectory, targetName
             if (!targetExists || backupExists) {
                 throw new Error(`Cannot safely recover rolled-back directory transaction ${transactionId}.`);
             }
+        } else if (marker.state === 'validation-pending') {
+            additionalMarkerPath = await rollbackValidationPendingDirectory(plan, marker.restore, options);
         } else if (backupExists) {
             if (targetExists) {
                 await retryRemove(filesystem, plan.targetDirectory, retry);
@@ -964,6 +1183,7 @@ export async function recoverDirectoryTransactions({ parentDirectory, targetName
             ...group.stateFiles.map(record => record.path),
             ...group.temporaryFiles,
             ...group.legacyFiles,
+            ...(additionalMarkerPath ? [additionalMarkerPath] : []),
         ].sort(compareText);
         for (const markerPath of markerPaths) {
             await retryUnlink(filesystem, markerPath, retry);
@@ -979,6 +1199,9 @@ export async function replaceDirectoryTransactional(plan, options = {}) {
         }
     }
     const { filesystem, retry } = filesystemOptions(options);
+    if (options.validateInstalled !== undefined && typeof options.validateInstalled !== 'function') {
+        throw new Error('Directory transaction installed validation callback must be a function.');
+    }
     await recoverDirectoryTransactions({ parentDirectory: plan.parentDirectory, targetName: plan.targetName }, options);
     if (!await assertRegularDirectoryIfPresent(plan.temporaryDirectory, filesystem)) {
         throw new Error(`Directory transaction source is missing: ${plan.temporaryDirectory}`);
@@ -991,6 +1214,11 @@ export async function replaceDirectoryTransactional(plan, options = {}) {
     if (targetExists) {
         await retryRename(filesystem, plan.targetDirectory, plan.backupDirectory, retry);
         await writeTransactionMarker(plan, 'backed-up', options);
+    }
+    if (options.validateInstalled) {
+        await writeTransactionMarker(plan, 'validation-pending', options, {
+            restore: targetExists ? 'backup' : 'absent',
+        });
     }
     try {
         await retryRename(filesystem, plan.temporaryDirectory, plan.targetDirectory, retry);
@@ -1006,6 +1234,29 @@ export async function replaceDirectoryTransactional(plan, options = {}) {
             throw new AggregateError([installError, rollbackError], 'Directory install and rollback both failed.');
         }
         throw installError;
+    }
+    if (options.validateInstalled) {
+        try {
+            await options.validateInstalled(plan.targetDirectory);
+        } catch (validationError) {
+            try {
+                await rollbackValidationPendingDirectory(
+                    plan,
+                    targetExists ? 'backup' : 'absent',
+                    options,
+                );
+                await removeTransactionMarkerFiles(plan, filesystem, retry);
+            } catch (rollbackError) {
+                const rollbackErrors = rollbackError instanceof AggregateError
+                    ? rollbackError.errors
+                    : [rollbackError];
+                throw new AggregateError(
+                    [validationError, ...rollbackErrors],
+                    'Directory installed validation and rollback both failed.',
+                );
+            }
+            throw validationError;
+        }
     }
     await writeTransactionMarker(plan, 'installed', options);
     await retryRemove(filesystem, plan.backupDirectory, retry);
@@ -1151,7 +1402,13 @@ export async function resolveInstalledPackageGraph({
                 'browser manifest',
             );
         }
-        const packageDirectory = await canonicalizePackageDirectory(installed.packageDirectory);
+        // Keep the package-manager's logical path for resolving nested
+        // dependencies. Workspace dependency setups may expose packages
+        // through junctions; using only the canonical path would make Node
+        // walk into a different hoisted dependency tree. The canonical path
+        // remains the stable identity used for graph records and linking.
+        const resolutionDirectory = installed.packageDirectory;
+        const packageDirectory = await canonicalizePackageDirectory(resolutionDirectory);
         if (typeof packageDirectory !== 'string' || !path.isAbsolute(packageDirectory)) {
             throw new Error(`${dependencyPath.join(' -> ')}: installed dependency has no canonical package directory.`);
         }
@@ -1188,6 +1445,7 @@ export async function resolveInstalledPackageGraph({
             nodeId,
             requestName,
             packageDirectory,
+            resolutionDirectory,
             contextIdentity,
             contextSortKey: dependencyPath.join('\0'),
             manifest: installed.manifest,
@@ -1202,7 +1460,7 @@ export async function resolveInstalledPackageGraph({
             const dependencyNode = await load(
                 dependencyName,
                 dependency.spec,
-                record.packageDirectory,
+                record.resolutionDirectory,
                 [...dependencyPath, dependencyName],
                 dependency.optional,
             );
@@ -1288,6 +1546,7 @@ export async function generateProfileTarget({
         validateInstalledManifest(devDependency, browserManifest.devDependencies?.[devDependency], installed.manifest, [devDependency]);
     }
     const resolved = resolveProfile({ profileName, profileConfig, browserManifest, installedGraph });
+    await validateDeferredBackendModuleFiles(resolved.featureGroups, resolvedBrowserDirectory);
     const buildsDirectory = path.join(resolvedBrowserDirectory, PROFILE_DIRECTORY_NAME, 'builds');
     await fs.promises.mkdir(buildsDirectory, { recursive: true });
     await recoverDirectoryTransactions({ parentDirectory: buildsDirectory, targetName: buildId });
@@ -1382,6 +1641,15 @@ function validateStringArray(value, label) {
     }
 }
 
+function manifestDeferredBackendModules(manifest) {
+    return Object.entries(manifest.featureGroups ?? {})
+        .sort(([left], [right]) => compareText(left, right))
+        .flatMap(([groupName, group]) => (group.deferredBackendModules ?? []).map(descriptor => ({
+            groupName,
+            descriptor,
+        })));
+}
+
 function validateProfileBuildManifest(manifestText, { expectedProfile, buildId, identity }) {
     let manifest;
     try {
@@ -1433,6 +1701,10 @@ function validateProfileBuildManifest(manifestText, { expectedProfile, buildId, 
     if (!manifest.featureGroups || typeof manifest.featureGroups !== 'object' || Array.isArray(manifest.featureGroups)) {
         throw new Error('Tauri profile feature groups must be an object.');
     }
+    if (manifest.profile === 'full' && manifestDeferredBackendModules(manifest).length > 0) {
+        throw new Error('Full profile must not install deferred backend descriptors.');
+    }
+    validateAttestedBackendDescriptors(manifest);
     if (!/^[0-9a-f]{64}$/.test(manifest.digest ?? '')) {
         throw new Error('Tauri profile digest is not canonical.');
     }
@@ -1453,6 +1725,22 @@ function validateProfileBuildManifest(manifestText, { expectedProfile, buildId, 
 
 function canonicalBuildSource(browserDirectory, buildId) {
     return path.join(path.resolve(browserDirectory), PROFILE_DIRECTORY_NAME, 'builds', buildId);
+}
+
+async function validateDeferredBackendBuildOutputs(manifest, sourceDirectory) {
+    for (const { groupName, descriptor } of manifestDeferredBackendModules(manifest)) {
+        const candidate = path.resolve(sourceDirectory, descriptor.output ?? '');
+        assertProfilePath(sourceDirectory, candidate);
+        let stat;
+        try {
+            stat = await fs.promises.lstat(candidate);
+        } catch (error) {
+            throw new Error(`Deferred backend output for ${groupName}/${descriptor.action ?? '<missing>'} is missing: ${descriptor.output ?? '<missing>'} (${error.message}).`);
+        }
+        if (stat.isSymbolicLink() || !stat.isFile()) {
+            throw new Error(`Deferred backend output for ${groupName}/${descriptor.action ?? '<missing>'} must be a regular file: ${descriptor.output ?? '<missing>'}.`);
+        }
+    }
 }
 
 async function assertProperPublishLockDirectory(lockDirectory) {
@@ -1552,7 +1840,8 @@ export async function publishProfileBuild({
     const sourceManifest = path.join(expectedSource, PROFILE_MANIFEST_NAME);
     const destinationLib = path.join(resolvedBrowserDirectory, 'lib');
     const initialManifestText = await fs.promises.readFile(sourceManifest);
-    validateProfileBuildManifest(initialManifestText, { expectedProfile, buildId, identity });
+    const initialManifest = validateProfileBuildManifest(initialManifestText, { expectedProfile, buildId, identity });
+    await validateDeferredBackendBuildOutputs(initialManifest, expectedSource);
     const lock = await acquirePublishLock({
         ...lockOptions,
         browserDirectory: resolvedBrowserDirectory,
@@ -1572,6 +1861,7 @@ export async function publishProfileBuild({
             buildId,
             identity: lockedIdentity,
         });
+        await validateDeferredBackendBuildOutputs(manifest, expectedSource);
         if (!manifestText.equals(initialManifestText)) {
             throw new Error('Tauri profile source manifest changed while waiting for the publish lock.');
         }
@@ -1589,9 +1879,23 @@ export async function publishProfileBuild({
             await fs.promises.mkdir(path.join(plan.temporaryDirectory, output), { recursive: true });
             await fs.promises.writeFile(path.join(plan.temporaryDirectory, output, PROFILE_MANIFEST_NAME), manifestText);
         }
+        attestDeferredBackendFeatures({
+            manifest,
+            libDirectory: plan.temporaryDirectory,
+        });
         lock.assertHealthy();
         transactionStarted = true;
-        await replaceDirectoryTransactional(plan, transactionOptions);
+        const additionalInstalledValidation = transactionOptions.validateInstalled;
+        await replaceDirectoryTransactional(plan, {
+            ...transactionOptions,
+            validateInstalled: async installedDirectory => {
+                await additionalInstalledValidation?.(installedDirectory);
+                attestDeferredBackendFeatures({
+                    manifest,
+                    libDirectory: installedDirectory,
+                });
+            },
+        });
         lock.assertHealthy();
         await retryRemove(fs.promises, expectedSource, {});
         result = { profile: manifest.profile, buildId: manifest.buildId, digest: manifest.digest, destinationLib };
@@ -1633,10 +1937,30 @@ export async function publishProfileBuild({
     return result;
 }
 
+export async function discardProfileBuild({
+    browserDirectory,
+    buildId,
+    ...options
+} = {}) {
+    const resolvedBrowserDirectory = path.resolve(browserDirectory);
+    assertPathSegment(buildId, 'Tauri profile build id');
+    const targetDirectory = canonicalBuildSource(resolvedBrowserDirectory, buildId);
+    const { filesystem, retry } = filesystemOptions(options);
+    const state = await pathState(targetDirectory, filesystem);
+    if (!state.exists) {
+        return { buildId, removed: false, targetDirectory };
+    }
+    if (state.stat.isSymbolicLink() || !state.stat.isDirectory()) {
+        throw new Error(`Refusing to discard non-directory Tauri profile build: ${targetDirectory}`);
+    }
+    await retryRemove(filesystem, targetDirectory, retry);
+    return { buildId, removed: true, targetDirectory };
+}
+
 export function parseProfileCliArguments(argv, environment = process.env) {
     const [command, ...tokens] = argv;
-    if (command !== 'prepare' && command !== 'publish') {
-        throw new Error('Usage: node tauri-frontend-profile.mjs <prepare|publish> --profile <name> --build-id <id> [--source-dir <path>]');
+    if (command !== 'prepare' && command !== 'publish' && command !== 'discard') {
+        throw new Error('Usage: node tauri-frontend-profile.mjs <prepare|publish|discard> --build-id <id> [--profile <name>] [--source-dir <path>]');
     }
     const values = new Map();
     for (let index = 0; index < tokens.length; index += 2) {
@@ -1648,7 +1972,9 @@ export function parseProfileCliArguments(argv, environment = process.env) {
         }
         values.set(option, value);
     }
-    const profileName = values.get('--profile') ?? environment.RIDE_TAURI_FRONTEND_PROFILE ?? 'tauri-critical';
+    const profileName = command === 'discard'
+        ? values.get('--profile')
+        : values.get('--profile') ?? environment.RIDE_TAURI_FRONTEND_PROFILE ?? 'tauri-critical';
     const buildId = values.get('--build-id');
     if (!buildId) {
         throw new Error('Tauri profile CLI requires --build-id.');
@@ -1660,6 +1986,9 @@ export function parseProfileCliArguments(argv, environment = process.env) {
     }
     if (command === 'prepare' && sourceDirectory) {
         throw new Error('Tauri profile prepare does not accept --source-dir.');
+    }
+    if (command === 'discard' && (profileName || sourceDirectory)) {
+        throw new Error('Tauri profile discard accepts only --build-id.');
     }
     return { command, profileName, buildId, sourceDirectory };
 }
@@ -1681,6 +2010,10 @@ async function runCli() {
         });
         process.stdout.write(`Published ${result.profile} build ${result.buildId} frontend and backend bundles.\n`);
         return;
+    }
+    if (command === 'discard') {
+        const result = await discardProfileBuild({ browserDirectory, buildId });
+        process.stdout.write(`${result.removed ? 'Discarded' : 'No isolated directory for'} Tauri profile build ${result.buildId}.\n`);
     }
 }
 

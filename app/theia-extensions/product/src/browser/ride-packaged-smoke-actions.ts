@@ -10,6 +10,8 @@ import type { Disposable } from '@theia/core/lib/common/disposable';
 import {
     RidePackagedSmokeActionTimeout,
     type RidePackagedSmokeActions,
+    type RideCodexPackagedSmokeDriverLike,
+    type RideCodexSmokeAction,
     type RideSmokePlan
 } from './ride-packaged-smoke';
 import type { RideOpenRequestObservation } from './ride-open-request';
@@ -162,6 +164,7 @@ export interface RidePackagedSmokeActionServices {
     readonly applicationShell?: ApplicationShellLike;
     readonly openRequests?: OpenRequestsLike;
     readonly startupDocument?: StartupDocumentLike;
+    readonly codexSmoke?: RideCodexPackagedSmokeDriverLike;
     readonly backendIsWindows?: boolean;
     readonly pollIntervalMs?: number;
     readonly pollTimeoutMs?: number;
@@ -470,6 +473,38 @@ export class RidePackagedSmokeActionService implements RidePackagedSmokeActions,
         }, plan.actionTimeoutMs);
     }
 
+    codexInactive(plan: RideSmokePlan): Promise<void> {
+        return this.runCodexAction('codex-inactive', plan);
+    }
+
+    codexActivate(plan: RideSmokePlan): Promise<void> {
+        return this.runCodexAction('codex-activate', plan);
+    }
+
+    codexStream(plan: RideSmokePlan): Promise<void> {
+        return this.runCodexAction('codex-stream', plan);
+    }
+
+    codexCommandApproval(plan: RideSmokePlan): Promise<void> {
+        return this.runCodexAction('codex-command-approval', plan);
+    }
+
+    codexFileApproval(plan: RideSmokePlan): Promise<void> {
+        return this.runCodexAction('codex-file-approval', plan);
+    }
+
+    codexInterrupt(plan: RideSmokePlan): Promise<void> {
+        return this.runCodexAction('codex-interrupt', plan);
+    }
+
+    codexRecover(plan: RideSmokePlan): Promise<void> {
+        return this.runCodexAction('codex-recover', plan);
+    }
+
+    codexIdleExit(plan: RideSmokePlan): Promise<void> {
+        return this.runCodexAction('codex-idle-exit', plan);
+    }
+
     waitForSecondFile(plan: RideSmokePlan): Promise<void> {
         return this.runAction(plan, async run => {
             const expectedFile = this.resolveSecondFile(plan);
@@ -692,6 +727,14 @@ export class RidePackagedSmokeActionService implements RidePackagedSmokeActions,
 
     protected effectiveTimeout(actionTimeoutMs: number): number {
         return Math.max(1, Math.min(this.pollTimeoutMs, actionTimeoutMs));
+    }
+
+    protected runCodexAction(action: RideCodexSmokeAction, plan: RideSmokePlan): Promise<void> {
+        return this.runAction(plan, async run => {
+            const driver = this.requireService(this.services.codexSmoke);
+            await run.wait(driver.run(action, plan));
+            run.assertActive();
+        }, plan.actionTimeoutMs);
     }
 
     protected requireService<T>(service: T | undefined): T {

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -11,6 +12,7 @@ import {
     acquirePublishLock,
     canonicalDigest,
     createDirectoryTransactionPlan,
+    discardProfileBuild,
     findPackageManifest,
     generateProfileTarget,
     publishProfileBuild,
@@ -33,11 +35,409 @@ import {
     createTauriBrowserBuildPlans,
     ensureModuleScript
 } from '../../applications/browser/tauri-src/esbuild-deferred.mjs';
+import { createTheiaModuleDedupePlugin } from '../../applications/browser/ride-esbuild-dedupe.mjs';
+import { createWindowsCaCertsFallbackPlugin } from '../../applications/browser/tauri-src/windows-ca-certs-fallback.mjs';
+import { createProfileMetadataPlugin } from '../../applications/browser/tauri-src/esbuild-metadata.mjs';
 
 const require = createRequire(import.meta.url);
 const esbuild = require('esbuild');
 const properLockfile = require('proper-lockfile');
 const appDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+
+const SCANOSS_BACKEND_DESCRIPTOR = Object.freeze({
+    package: '@theia/scanoss',
+    importer: '@theia/scanoss/lib/node/scanoss-backend-module',
+    module: '@theia/scanoss/lib/node/scanoss-service-impl',
+    proxy: 'tauri-src/backend/scanoss-service-proxy.ts',
+    entry: 'tauri-src/backend/scanoss-service-feature.ts',
+    output: 'lib/backend/scanoss-service-feature.cjs',
+    action: 'scanoss',
+    runtimePackages: Object.freeze([
+        '@grpc/grpc-js',
+        'adm-zip',
+        'iconv-lite',
+        'protobufjs',
+        'scanoss',
+        'tar',
+        'tr46',
+    ]),
+    exclusiveInputCount: 318,
+});
+
+test('Tauri preview profile replaces only the eager frontend module with a lazy Markdown proxy', () => {
+    const browserDirectory = path.join(appDirectory, 'applications', 'browser');
+    const profile = JSON.parse(fs.readFileSync(path.join(browserDirectory, 'tauri-profile.json'), 'utf8'));
+    const preview = profile.featureGroups['preview-getting-started'];
+    assert.deepEqual(preview.deferredFrontendModules, [{
+        package: '@theia/preview',
+        module: '@theia/preview/lib/browser/preview-frontend-module',
+        proxy: 'tauri-src/preview-proxy-frontend-module.ts',
+        entry: 'tauri-src/preview-markdown-feature.ts',
+        action: 'markdown-preview',
+    }]);
+    assert.ok(preview.blockedRoots.some(root => root.name === '@theia/preview'));
+
+    const proxy = fs.readFileSync(path.join(browserDirectory, 'tauri-src', 'preview-proxy-frontend-module.ts'), 'utf8');
+    const feature = fs.readFileSync(path.join(browserDirectory, 'tauri-src', 'preview-markdown-feature.ts'), 'utf8');
+    assert.match(proxy, /import\(['"]\.\/preview-markdown-feature['"]\)/);
+    assert.doesNotMatch(proxy, /from ['"]@theia\/preview\/lib\/browser\/markdown/);
+    assert.doesNotMatch(proxy, /import\s*\{[^}]*MarkdownPreviewHandler/);
+    assert.match(feature, /MarkdownPreviewHandler/);
+    assert.match(feature, /createChild\(\)/);
+});
+
+test('Tauri AI profile declares the exact deferred ScanOSS service edge', () => {
+    const browserDirectory = path.join(appDirectory, 'applications', 'browser');
+    const profile = JSON.parse(fs.readFileSync(path.join(browserDirectory, 'tauri-profile.json'), 'utf8'));
+
+    assert.deepEqual(profile.featureGroups.ai.deferredBackendModules, [SCANOSS_BACKEND_DESCRIPTOR]);
+    for (const field of ['proxy', 'entry']) {
+        const source = path.join(browserDirectory, SCANOSS_BACKEND_DESCRIPTOR[field]);
+        assert.equal(fs.statSync(source).isFile(), true, `${field} must be a regular source file`);
+    }
+});
+
+test('lazy Markdown preview proxy preserves bindings and shares retryable disposable activation', async t => {
+    const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-preview-proxy-'));
+    t.after(() => fs.promises.rm(directory, { recursive: true, force: true }));
+    const browserDirectory = path.join(appDirectory, 'applications', 'browser');
+    const sourceDirectory = path.join(browserDirectory, 'tauri-src');
+    const proxyBundle = path.join(directory, 'preview-proxy.cjs');
+    const featureBundle = path.join(directory, 'preview-feature.cjs');
+    const runtimeEntry = path.join(directory, 'preview-runtime-entry.ts');
+    const featureEntry = path.join(directory, 'preview-feature-entry.ts');
+    const browserShim = path.join(directory, 'browser-shim.cjs');
+    const toolbarShim = path.join(directory, 'toolbar-shim.cjs');
+    const contributionShim = path.join(directory, 'preview-contribution-shim.cjs');
+    const widgetShim = path.join(directory, 'preview-widget-shim.cjs');
+    const normalizerShim = path.join(directory, 'preview-link-normalizer-shim.cjs');
+    await Promise.all([
+        fs.promises.writeFile(browserShim, String.raw`
+            exports.FrontendApplicationContribution = Symbol.for('ride.test.FrontendApplicationContribution');
+            exports.OpenHandler = Symbol.for('ride.test.OpenHandler');
+            exports.OpenerService = Symbol.for('ride.test.OpenerService');
+            exports.WidgetFactory = Symbol.for('ride.test.WidgetFactory');
+        `),
+        fs.promises.writeFile(toolbarShim, "exports.TabBarToolbarContribution = Symbol.for('ride.test.TabBarToolbarContribution');\n"),
+        fs.promises.writeFile(contributionShim, 'exports.PreviewContribution = class PreviewContribution {};\n'),
+        fs.promises.writeFile(widgetShim, String.raw`
+            exports.PreviewWidget = class PreviewWidget {};
+            exports.PreviewWidgetOptions = Symbol.for('ride.test.PreviewWidgetOptions');
+        `),
+        fs.promises.writeFile(normalizerShim, 'exports.PreviewLinkNormalizer = class PreviewLinkNormalizer {};\n'),
+        fs.promises.writeFile(runtimeEntry, `
+            export { default as frontendModule, RideLazyMarkdownPreviewHandler } from ${JSON.stringify(path.join(sourceDirectory, 'preview-proxy-frontend-module.ts'))};
+            export { FrontendApplicationContribution, OpenHandler, WidgetFactory } from '@theia/core/lib/browser';
+            export { TabBarToolbarContribution } from '@theia/core/lib/browser/shell/tab-bar-toolbar';
+            export { CommandContribution, MenuContribution } from '@theia/core/lib/common';
+            export { PreviewContribution } from '@theia/preview/lib/browser/preview-contribution';
+            export { PreviewHandler, PreviewHandlerProvider } from '@theia/preview/lib/browser/preview-handler';
+            export { PreviewLinkNormalizer } from '@theia/preview/lib/browser/preview-link-normalizer';
+            export { PreviewWidget } from '@theia/preview/lib/browser/preview-widget';
+            export { PreviewPreferenceContribution, PreviewPreferences } from '@theia/preview/lib/common/preview-preferences';
+        `),
+        fs.promises.writeFile(featureEntry, `
+            export { createMarkdownPreviewHandler } from ${JSON.stringify(path.join(sourceDirectory, 'preview-markdown-feature.ts'))};
+            export { OpenerService } from '@theia/core/lib/browser';
+            export { PreviewLinkNormalizer } from '@theia/preview/lib/browser/preview-link-normalizer';
+        `),
+    ]);
+    const runtimeAliases = {
+        '@theia/core/lib/browser/shell/tab-bar-toolbar': toolbarShim,
+        '@theia/core/lib/browser': browserShim,
+        '@theia/preview/lib/browser/preview-contribution': contributionShim,
+        '@theia/preview/lib/browser/preview-widget': widgetShim,
+        '@theia/preview/lib/browser/preview-link-normalizer': normalizerShim,
+        '@theia/preview/lib/browser/markdown/markdown-preview-handler': require.resolve(
+            '@theia/preview/lib/browser/markdown/markdown-preview-handler',
+            { paths: [browserDirectory] },
+        ),
+    };
+    const markdownDependencyShimPlugin = {
+        name: 'markdown-dependency-shims',
+        setup(build) {
+            build.onResolve({ filter: /^\.\.\/preview-link-normalizer$/ }, () => ({ path: normalizerShim }));
+        },
+    };
+    const emptyCssPlugin = {
+        name: 'empty-css-for-node-smoke',
+        setup(build) {
+            build.onResolve({ filter: /\.css$/ }, args => ({ path: args.path, namespace: 'empty-css' }));
+            build.onLoad({ filter: /.*/, namespace: 'empty-css' }, () => ({ contents: '', loader: 'js' }));
+        },
+    };
+    await esbuild.build({
+        entryPoints: [runtimeEntry],
+        outfile: proxyBundle,
+        bundle: true,
+        platform: 'node',
+        format: 'cjs',
+        target: 'node22',
+        packages: 'external',
+        alias: runtimeAliases,
+        plugins: [emptyCssPlugin],
+        logLevel: 'silent',
+    });
+    await esbuild.build({
+        entryPoints: [featureEntry],
+        outfile: featureBundle,
+        bundle: true,
+        platform: 'node',
+        format: 'cjs',
+        target: 'node22',
+        packages: 'external',
+        alias: runtimeAliases,
+        plugins: [markdownDependencyShimPlugin],
+        logLevel: 'silent',
+    });
+
+    const smokeScript = String.raw`
+        const assert = require('node:assert/strict');
+        const Module = require('node:module');
+        const originalLoad = Module._load;
+        let highlightEvaluations = 0;
+        let timerStarts = 0;
+        let networkStarts = 0;
+        Module._load = function(request, parent, isMain) {
+            if (request === 'highlight.js') highlightEvaluations++;
+            return originalLoad.call(this, request, parent, isMain);
+        };
+        require.extensions['.css'] = () => undefined;
+        globalThis.Element = class Element {
+            constructor() {
+                this.classList = { add: () => undefined, remove: () => undefined, contains: () => false };
+                this.style = {};
+            }
+            appendChild() { return this; }
+            removeChild() { return this; }
+            addEventListener() { }
+            removeEventListener() { }
+            setAttribute() { }
+            getAttribute() { return null; }
+        };
+        globalThis.Element.prototype.matches = () => false;
+        globalThis.HTMLElement = globalThis.Element;
+        globalThis.Event = class Event {};
+        globalThis.DragEvent = class DragEvent extends globalThis.Event {};
+        globalThis.document = {
+            createElement: () => new globalThis.Element(),
+            createTextNode: () => new globalThis.Element(),
+            documentElement: new globalThis.Element(),
+            body: new globalThis.Element(),
+            head: new globalThis.Element(),
+            queryCommandSupported: () => false,
+            addEventListener: () => undefined,
+            removeEventListener: () => undefined,
+        };
+        globalThis.window = globalThis;
+        globalThis.localStorage = { getItem: () => null, setItem: () => undefined };
+        globalThis.setInterval = () => { timerStarts++; throw new Error('unexpected timer'); };
+        globalThis.fetch = () => { networkStarts++; throw new Error('unexpected network'); };
+
+        const bundled = require(process.argv[1]);
+        const { Container } = require('@theia/core/shared/inversify');
+        const URI = require('@theia/core/lib/common/uri').default;
+        const { ContributionProvider } = require('@theia/core/lib/common/contribution-provider');
+        const {
+            CommandContribution, FrontendApplicationContribution, MenuContribution, OpenHandler,
+            PreviewContribution, PreviewHandler, PreviewHandlerProvider, PreviewLinkNormalizer,
+            PreviewPreferenceContribution, PreviewPreferences, PreviewWidget,
+            TabBarToolbarContribution, WidgetFactory
+        } = bundled;
+        const frontendModule = bundled.frontendModule.default ?? bundled.frontendModule;
+        const container = new Container();
+        container.load(frontendModule);
+        for (const identifier of [
+            PreviewHandlerProvider, PreviewHandler, PreviewLinkNormalizer, PreviewWidget, WidgetFactory,
+            PreviewContribution, PreviewPreferenceContribution, PreviewPreferences,
+            CommandContribution, MenuContribution, OpenHandler, FrontendApplicationContribution,
+            TabBarToolbarContribution
+        ]) assert.equal(container.isBound(identifier), true, String(identifier));
+        assert.equal(container.isBoundNamed(ContributionProvider, PreviewHandler), true);
+        const boundProxy = container.get(bundled.RideLazyMarkdownPreviewHandler);
+        assert.equal(boundProxy.canHandle(new URI('file:///README.MD')), 500);
+        assert.equal(boundProxy.canHandle(new URI('file:///README.txt')), 0);
+        assert.equal(boundProxy.canHandle(new URI('untitled:///README.md')), 0);
+        assert.equal(highlightEvaluations, 0);
+        assert.equal(timerStarts, 0);
+        assert.equal(networkStarts, 0);
+
+        const deferred = () => {
+            let resolve;
+            let reject;
+            const promise = new Promise((done, fail) => { resolve = done; reject = fail; });
+            return { promise, resolve, reject };
+        };
+        const render = deferred();
+        let loads = 0;
+        let creations = 0;
+        let renderCalls = 0;
+        let delegateDisposals = 0;
+        const fragment = {};
+        const sourceLine = {};
+        const delegate = {
+            canHandle: () => 500,
+            renderContent: () => { renderCalls++; return render.promise; },
+            findElementForFragment: () => fragment,
+            findElementForSourceLine: () => sourceLine,
+            getSourceLineForOffset: () => 73,
+            dispose: () => delegateDisposals++,
+        };
+        const lazy = new bundled.RideLazyMarkdownPreviewHandler(container, async () => {
+            loads++;
+            return { createMarkdownPreviewHandler: () => { creations++; return delegate; } };
+        });
+        const content = {};
+        assert.equal(lazy.findElementForFragment(content, '#before'), undefined);
+        assert.equal(lazy.findElementForSourceLine(content, 1), undefined);
+        assert.equal(lazy.getSourceLineForOffset(content, 1), undefined);
+        const firstRender = lazy.renderContent({ content: 'one', originUri: new URI('file:///one.md') });
+        const secondRender = lazy.renderContent({ content: 'two', originUri: new URI('file:///two.md') });
+        (async () => {
+            await new Promise(resolve => setImmediate(resolve));
+            assert.equal(loads, 1);
+            assert.equal(creations, 1);
+            assert.equal(renderCalls, 2);
+            render.resolve(content);
+            assert.deepEqual(await Promise.all([firstRender, secondRender]), [content, content]);
+            assert.equal(lazy.findElementForFragment(content, '#fragment'), fragment);
+            assert.equal(lazy.findElementForSourceLine(content, 12), sourceLine);
+            assert.equal(lazy.getSourceLineForOffset(content, 24), 73);
+
+            let retryLoads = 0;
+            const retry = new bundled.RideLazyMarkdownPreviewHandler(container, async () => {
+                retryLoads++;
+                if (retryLoads === 1) throw new Error('preview chunk unavailable');
+                return { createMarkdownPreviewHandler: () => ({ canHandle: () => 500, renderContent: () => content }) };
+            });
+            await assert.rejects(retry.renderContent({ content: '', originUri: new URI('file:///retry.md') }), /chunk unavailable/);
+            assert.equal(await retry.renderContent({ content: '', originUri: new URI('file:///retry.md') }), content);
+            assert.equal(retryLoads, 2);
+
+            const lateLoad = deferred();
+            let lateCreations = 0;
+            const late = new bundled.RideLazyMarkdownPreviewHandler(container, () => lateLoad.promise);
+            const lateRender = late.renderContent({ content: '', originUri: new URI('file:///late.md') });
+            late.dispose();
+            lateLoad.resolve({ createMarkdownPreviewHandler: () => { lateCreations++; return delegate; } });
+            await assert.rejects(lateRender, /disposed/i);
+            assert.equal(lateCreations, 0);
+
+            lazy.dispose();
+            lazy.dispose();
+            assert.equal(delegateDisposals, 1);
+            await assert.rejects(lazy.renderContent({ content: '', originUri: new URI('file:///disposed.md') }), /disposed/i);
+
+            const feature = require(process.argv[2]);
+            const opener = {};
+            const normalizer = {};
+            const parent = new Container();
+            parent.bind(feature.OpenerService).toConstantValue(opener);
+            parent.bind(feature.PreviewLinkNormalizer).toConstantValue(normalizer);
+            const real = feature.createMarkdownPreviewHandler(parent);
+            assert.strictEqual(real.openerService, opener);
+            assert.strictEqual(real.linkNormalizer, normalizer);
+            assert.equal(highlightEvaluations, 1);
+            assert.equal(timerStarts, 0);
+            assert.equal(networkStarts, 0);
+        })().then(
+            () => process.exit(0),
+            error => { console.error(error); process.exit(1); },
+        );
+    `;
+    execFileSync(process.execPath, ['--input-type=commonjs', '--eval', smokeScript, proxyBundle, featureBundle], {
+        cwd: browserDirectory,
+        env: { ...process.env, NODE_PATH: path.join(browserDirectory, 'node_modules') },
+        stdio: 'pipe',
+        timeout: 60_000,
+    });
+});
+
+test('highlight.js belongs to one dynamically reached Markdown feature output', async t => {
+    const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-preview-split-'));
+    t.after(() => fs.promises.rm(directory, { recursive: true, force: true }));
+    const browserDirectory = path.join(appDirectory, 'applications', 'browser');
+    const entry = path.join(directory, 'entry.ts');
+    const proxy = path.join(browserDirectory, 'tauri-src', 'preview-proxy-frontend-module.ts');
+    await fs.promises.writeFile(entry, `import frontendModule from ${JSON.stringify(proxy)};\nexport default frontendModule;\n`);
+    const selectiveExternalPlugin = {
+        name: 'preview-highlight-ownership',
+        setup(build) {
+            build.onResolve({ filter: /\.css$/ }, args => ({ path: args.path, namespace: 'empty-css' }));
+            build.onLoad({ filter: /.*/, namespace: 'empty-css' }, () => ({ contents: '', loader: 'js' }));
+            build.onResolve({ filter: /^[^./]/ }, args => {
+                if (args.kind === 'entry-point' || path.isAbsolute(args.path)) {
+                    return undefined;
+                }
+                if (args.path === 'highlight.js'
+                    || args.path === '@theia/preview/lib/browser/markdown/markdown-preview-handler') {
+                    return undefined;
+                }
+                return { path: args.path, external: true };
+            });
+        },
+    };
+    const result = await esbuild.build({
+        entryPoints: { bundle: entry },
+        outdir: path.join(directory, 'out'),
+        absWorkingDir: browserDirectory,
+        bundle: true,
+        splitting: true,
+        format: 'esm',
+        platform: 'browser',
+        target: 'es2022',
+        chunkNames: 'chunks/[name]-[hash]',
+        alias: {
+            'highlight.js': require.resolve('highlight.js', { paths: [browserDirectory] }),
+        },
+        metafile: true,
+        write: false,
+        plugins: [selectiveExternalPlugin],
+        logLevel: 'silent',
+    });
+
+    const outputs = new Map(Object.entries(result.metafile.outputs).map(([name, detail]) => [name.replaceAll('\\', '/'), detail]));
+    const entryOutput = [...outputs].find(([, detail]) => detail.entryPoint?.replaceAll('\\', '/') === entry.replaceAll('\\', '/'))?.[0];
+    assert.ok(entryOutput, 'main preview proxy output must exist');
+    const resolveOutputImport = (from, imported) => {
+        const direct = imported.path.replaceAll('\\', '/');
+        if (outputs.has(direct)) {
+            return direct;
+        }
+        return path.posix.normalize(path.posix.join(path.posix.dirname(from), direct));
+    };
+    const reachable = includeDynamic => {
+        const visited = new Set();
+        const pending = [entryOutput];
+        while (pending.length > 0) {
+            const output = pending.pop();
+            if (visited.has(output)) {
+                continue;
+            }
+            visited.add(output);
+            for (const imported of outputs.get(output)?.imports ?? []) {
+                if (!includeDynamic && imported.kind !== 'import-statement') {
+                    continue;
+                }
+                const candidate = resolveOutputImport(output, imported);
+                if (outputs.has(candidate)) {
+                    pending.push(candidate);
+                }
+            }
+        }
+        return visited;
+    };
+    const staticOutputs = reachable(false);
+    const allOutputs = reachable(true);
+    const highlightOutputs = [...outputs].filter(([, detail]) =>
+        Object.keys(detail.inputs ?? {}).some(input => /(?:^|\/)highlight\.js\//.test(input.replaceAll('\\', '/')))
+    );
+    assert.equal(highlightOutputs.length, 1);
+    const [highlightOutput, highlightDetail] = highlightOutputs[0];
+    assert.equal(staticOutputs.has(highlightOutput), false);
+    assert.equal(allOutputs.has(highlightOutput), true);
+    assert.match(highlightDetail.entryPoint?.replaceAll('\\', '/') ?? '', /tauri-src\/preview-markdown-feature\.ts$/);
+});
 
 function manifest(name, dependencies = {}, extra = {}) {
     return {
@@ -405,6 +805,198 @@ test('emits an explicit deferred frontend module contract without treating its p
     assert.ok(result.extensions.includes('secondary-window'));
 });
 
+test('emits a canonical exact-importer backend contract only for tauri-critical', () => {
+    const packages = {
+        product: manifest('product'),
+        '@theia/scanoss': manifest('@theia/scanoss'),
+    };
+    const featureGroups = {
+        ai: {
+            deferredRoots: [],
+            blockedRoots: [{
+                name: '@theia/scanoss',
+                reason: 'Only the ScanOSS service implementation is deferred.',
+            }],
+            deferredBackendModules: [SCANOSS_BACKEND_DESCRIPTOR],
+        },
+    };
+    const criticalInput = fixture({
+        roots: ['product', '@theia/scanoss'],
+        packages,
+        featureGroups,
+    });
+
+    const critical = resolveProfile(criticalInput);
+    assert.deepEqual(critical.featureGroups.ai.deferredBackendModules, [SCANOSS_BACKEND_DESCRIPTOR]);
+    assert.ok(critical.extensions.includes('@theia/scanoss'));
+
+    const full = resolveProfile({
+        ...criticalInput,
+        profileName: 'full',
+    });
+    assert.equal(Object.hasOwn(full.featureGroups.ai, 'deferredBackendModules'), false);
+});
+
+test('rejects ambiguous, unsafe, or non-CJS deferred backend edge declarations', () => {
+    const packages = {
+        product: manifest('product'),
+        '@theia/scanoss': manifest('@theia/scanoss'),
+        '@theia/scanoss-alternate': manifest('@theia/scanoss-alternate'),
+    };
+    const input = deferredBackendModules => fixture({
+        roots: ['product', '@theia/scanoss', '@theia/scanoss-alternate'],
+        packages,
+        featureGroups: {
+            ai: {
+                deferredRoots: [],
+                blockedRoots: [],
+                deferredBackendModules,
+            },
+        },
+    });
+    const alternate = {
+        ...SCANOSS_BACKEND_DESCRIPTOR,
+        package: '@theia/scanoss-alternate',
+        importer: '@theia/scanoss-alternate/lib/node/alternate-backend-module',
+        module: '@theia/scanoss-alternate/lib/node/alternate-service-impl',
+        proxy: 'tauri-src/backend/alternate-proxy.ts',
+        entry: 'tauri-src/backend/alternate-feature.ts',
+        output: 'lib/backend/alternate-feature.cjs',
+        action: 'scanoss-alternate',
+    };
+
+    for (const [field, value, pattern] of [
+        ['package', 'missing', /unknown deferred backend package "missing"/i],
+        ['importer', '../scanoss-backend-module', /deferred backend importer.*canonical/i],
+        ['importer', '@theia/scanoss\\lib\\node\\scanoss-backend-module', /deferred backend importer.*canonical/i],
+        ['module', '../scanoss-service-impl', /deferred backend module.*canonical module request/i],
+        ['proxy', '../scanoss-service-proxy.ts', /deferred backend module proxy.*canonical/i],
+        ['entry', 'tauri-src/backend/../scanoss-service-feature.ts', /deferred backend module entry.*canonical/i],
+        ['output', 'lib/backend/scanoss-service-feature.js', /deferred backend module output.*CJS/i],
+        ['output', '../scanoss-service-feature.cjs', /deferred backend module output.*CJS/i],
+        ['action', 'ScanOSS', /deferred backend module action.*canonical/i],
+        ['runtimePackages', 'scanoss', /runtime packages.*array/i],
+        ['runtimePackages', ['scanoss', 'scanoss'], /runtime packages.*(?:duplicate|unique)/i],
+        ['runtimePackages', ['scanoss/lib/index'], /runtime package.*canonical/i],
+        ['runtimePackages', ['scanoss', '@grpc/grpc-js'], /runtime packages.*sorted/i],
+        ['exclusiveInputCount', 0, /exclusive input count.*positive integer/i],
+        ['exclusiveInputCount', 318.5, /exclusive input count.*positive integer/i],
+    ]) {
+        assert.throws(
+            () => resolveProfile(input([{ ...SCANOSS_BACKEND_DESCRIPTOR, [field]: value }])),
+            pattern,
+            `${field}=${value} must be rejected`,
+        );
+    }
+
+    for (const field of ['package', 'module', 'proxy', 'entry', 'output', 'action']) {
+        let duplicate = { ...alternate, [field]: SCANOSS_BACKEND_DESCRIPTOR[field] };
+        if (field === 'package' || field === 'module') {
+            duplicate = {
+                ...duplicate,
+                package: SCANOSS_BACKEND_DESCRIPTOR.package,
+                importer: '@theia/scanoss/lib/node/alternate-backend-module',
+                module: field === 'module'
+                    ? SCANOSS_BACKEND_DESCRIPTOR.module
+                    : '@theia/scanoss/lib/node/alternate-service-impl',
+            };
+        }
+        assert.throws(
+            () => resolveProfile(input([
+                SCANOSS_BACKEND_DESCRIPTOR,
+                duplicate,
+            ])),
+            /deferred backend.*duplicated/i,
+            `duplicate ${field} must be rejected`,
+        );
+    }
+    assert.throws(
+        () => resolveProfile(input([SCANOSS_BACKEND_DESCRIPTOR, { ...SCANOSS_BACKEND_DESCRIPTOR }])),
+        /deferred backend.*(?:edge|duplicated)/i,
+        'duplicate exact importer-to-module edge must be rejected',
+    );
+
+    for (const field of ['proxy', 'entry']) {
+        const portableCaseAlias = SCANOSS_BACKEND_DESCRIPTOR[field].replace(
+            /scanoss-service/,
+            'SCANOSS-SERVICE',
+        );
+        assert.throws(
+            () => resolveProfile(input([
+                SCANOSS_BACKEND_DESCRIPTOR,
+                { ...alternate, [field]: portableCaseAlias },
+            ])),
+            new RegExp(`deferred backend ${field}.*duplicated`, 'i'),
+            `portable case alias for ${field} must be rejected`,
+        );
+    }
+});
+
+test('profile preparation rejects missing deferred backend proxy and feature entry files', async t => {
+    const module = await import('../tauri-frontend-profile.mjs');
+    assert.equal(typeof module.validateDeferredBackendModuleFiles, 'function');
+    const browserDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-backend-profile-source-'));
+    t.after(() => fs.promises.rm(browserDirectory, { recursive: true, force: true }));
+
+    await assert.rejects(
+        module.validateDeferredBackendModuleFiles({
+            ai: { deferredBackendModules: [SCANOSS_BACKEND_DESCRIPTOR] },
+        }, browserDirectory),
+        /deferred backend proxy.*missing/i,
+    );
+    await fs.promises.mkdir(path.join(browserDirectory, 'tauri-src', 'backend'), { recursive: true });
+    await fs.promises.writeFile(path.join(browserDirectory, SCANOSS_BACKEND_DESCRIPTOR.proxy), 'export {};\n');
+    await assert.rejects(
+        module.validateDeferredBackendModuleFiles({
+            ai: { deferredBackendModules: [SCANOSS_BACKEND_DESCRIPTOR] },
+        }, browserDirectory),
+        /deferred backend entry.*missing/i,
+    );
+    await fs.promises.writeFile(path.join(browserDirectory, SCANOSS_BACKEND_DESCRIPTOR.entry), 'export {};\n');
+    await assert.doesNotReject(module.validateDeferredBackendModuleFiles({
+        ai: { deferredBackendModules: [SCANOSS_BACKEND_DESCRIPTOR] },
+    }, browserDirectory));
+});
+
+test('profile preparation rejects physical aliases for deferred backend proxy and entry files', async t => {
+    const module = await import('../tauri-frontend-profile.mjs');
+    for (const field of ['proxy', 'entry']) {
+        const browserDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), `ride-backend-profile-${field}-alias-`));
+        t.after(() => fs.promises.rm(browserDirectory, { recursive: true, force: true }));
+        const alternate = {
+            ...SCANOSS_BACKEND_DESCRIPTOR,
+            package: '@theia/scanoss-alternate',
+            importer: '@theia/scanoss-alternate/lib/node/alternate-backend-module',
+            module: '@theia/scanoss-alternate/lib/node/alternate-service-impl',
+            proxy: 'tauri-src/backend/alternate-proxy.ts',
+            entry: 'tauri-src/backend/alternate-feature.ts',
+            output: 'lib/backend/alternate-feature.cjs',
+            action: 'scanoss-alternate',
+        };
+        for (const source of [SCANOSS_BACKEND_DESCRIPTOR.proxy, SCANOSS_BACKEND_DESCRIPTOR.entry]) {
+            const candidate = path.join(browserDirectory, source);
+            await fs.promises.mkdir(path.dirname(candidate), { recursive: true });
+            await fs.promises.writeFile(candidate, 'export {};\n');
+        }
+        const otherField = field === 'proxy' ? 'entry' : 'proxy';
+        const otherCandidate = path.join(browserDirectory, alternate[otherField]);
+        await fs.promises.mkdir(path.dirname(otherCandidate), { recursive: true });
+        await fs.promises.writeFile(otherCandidate, 'export {};\n');
+        await fs.promises.link(
+            path.join(browserDirectory, SCANOSS_BACKEND_DESCRIPTOR[field]),
+            path.join(browserDirectory, alternate[field]),
+        );
+
+        await assert.rejects(
+            module.validateDeferredBackendModuleFiles({
+                ai: { deferredBackendModules: [SCANOSS_BACKEND_DESCRIPTOR, alternate] },
+            }, browserDirectory),
+            new RegExp(`(?:physical|same file|alias|duplicate).*${field}|${field}.*(?:physical|same file|alias|duplicate)`, 'i'),
+            `physical ${field} alias must be rejected`,
+        );
+    }
+});
+
 test('rejects ambiguous or non-canonical deferred frontend module declarations', () => {
     const packages = {
         product: manifest('product'),
@@ -436,13 +1028,20 @@ test('rejects ambiguous or non-canonical deferred frontend module declarations',
     })), /deferred frontend module.*duplicated/i);
 });
 
-test('tracked profile defers only secondary-window and records every other group gate failure', async () => {
+test('tracked profile defers Codex, Markdown preview, and secondary-window while recording every other gate failure', async () => {
     const browserDirectory = path.join(appDirectory, 'applications', 'browser');
     const profile = JSON.parse(await fs.promises.readFile(path.join(browserDirectory, 'tauri-profile.json'), 'utf8'));
     const deferredGroups = Object.entries(profile.featureGroups)
         .filter(([, group]) => (group.deferredFrontendModules?.length ?? 0) > 0);
 
-    assert.deepEqual(deferredGroups.map(([name]) => name), ['secondary-window']);
+    assert.deepEqual(deferredGroups.map(([name]) => name), ['ai', 'preview-getting-started', 'secondary-window']);
+    assert.deepEqual(profile.featureGroups.ai.deferredFrontendModules, [{
+        package: 'theia-ide-codex-ext',
+        module: 'theia-ide-codex-ext/lib/browser/ride-codex-frontend-module',
+        proxy: 'tauri-src/codex-proxy-frontend-module.ts',
+        entry: 'tauri-src/codex-feature.ts',
+        action: 'codex-activate',
+    }]);
     assert.deepEqual(profile.featureGroups['secondary-window'].deferredFrontendModules, [{
         package: '@theia/secondary-window',
         module: '@theia/secondary-window/lib/browser/secondary-window-frontend-module',
@@ -450,12 +1049,249 @@ test('tracked profile defers only secondary-window and records every other group
         entry: 'tauri-src/secondary-window-feature.ts',
         action: 'extract-widget',
     }]);
+    assert.deepEqual(profile.featureGroups['preview-getting-started'].deferredFrontendModules, [{
+        package: '@theia/preview',
+        module: '@theia/preview/lib/browser/preview-frontend-module',
+        proxy: 'tauri-src/preview-proxy-frontend-module.ts',
+        entry: 'tauri-src/preview-markdown-feature.ts',
+        action: 'markdown-preview',
+    }]);
     for (const [name, group] of Object.entries(profile.featureGroups)) {
         assert.deepEqual(group.deferredRoots, [], `${name} must not silently omit package roots`);
-        if (name !== 'secondary-window') {
+        if (!['secondary-window', 'preview-getting-started', 'ai'].includes(name)) {
             assert.match(group.deferBlockedReason, /adapter|backend|smoke|inventory|startup|provider|rebind|widget/i);
         }
     }
+});
+
+test('deferred aliases intercept only exact escaped module requests', () => {
+    const aliases = {
+        'theia-ide-codex-ext/lib/browser/ride-codex-frontend-module': 'tauri-src/codex-proxy-frontend-module.ts',
+        '@scope/feature.with+symbols': 'tauri-src/symbol-proxy.ts',
+    };
+    const plans = createTauriBrowserBuildPlans({
+        entryPoints: { bundle: 'bundle.js', 'secondary-window': 'secondary-window.js', 'editor.worker': 'worker.js', 'plugin-worker': 'plugin.js' },
+        outdir: 'lib/frontend', plugins: [], alias: { existing: 'preserved' },
+    }, {
+        profile: 'tauri-critical',
+        featureGroups: { ai: { deferredFrontendModules: Object.entries(aliases).map(([module, proxy]) => ({ module, proxy })) }, },
+    }, path.resolve('generated-target'));
+    assert.deepEqual(plans.main.alias, { existing: 'preserved' });
+    let resolver;
+    const aliasPlugin = plans.main.plugins.find(plugin => plugin.name === 'ride-tauri-deferred-frontend-alias');
+    assert.ok(aliasPlugin);
+    aliasPlugin.setup({ onResolve(filter, callback) { resolver = { filter, callback }; } });
+    assert.equal(resolver.filter.filter.test('theia-ide-codex-ext/lib/browser/ride-codex-frontend-module'), true);
+    assert.equal(resolver.filter.filter.test('@scope/feature.with+symbols'), true);
+    assert.equal(resolver.filter.filter.test('date-fns'), true);
+    assert.equal(resolver.filter.filter.test('date-fns/locale'), true);
+    assert.equal(resolver.filter.filter.test('date-fns/format'), false);
+    assert.equal(resolver.filter.filter.test('date-fns/locale/en-US'), false);
+    assert.equal(resolver.filter.filter.test('theia-ide-codex-ext/lib/browser/ride-codex-frontend-module/extra'), false);
+    assert.equal(resolver.filter.filter.test('@scope/featureXwithsymbols'), false);
+    assert.deepEqual(resolver.callback({ path: 'theia-ide-codex-ext/lib/browser/ride-codex-frontend-module' }), {
+        path: path.resolve('generated-target', 'tauri-src/codex-proxy-frontend-module.ts'),
+    });
+    assert.equal(resolver.callback({ path: 'theia-ide-codex-ext/lib/browser/ride-codex-frontend-module/extra' }), undefined);
+    assert.equal(resolver.callback({ path: 'unlisted/module' }), undefined);
+    assert.deepEqual(resolver.callback({ path: 'date-fns' }), {
+        path: path.resolve('generated-target', 'tauri-src/date-fns-bridge.ts'),
+    });
+    assert.deepEqual(resolver.callback({ path: 'date-fns/locale' }), {
+        path: path.resolve('generated-target', 'tauri-src/date-fns-locales-bridge.ts'),
+    });
+    assert.equal(resolver.callback({ path: 'date-fns/format' }), undefined);
+    assert.equal(resolver.callback({ path: 'date-fns/locale/en-US' }), undefined);
+});
+
+test('Tauri critical aliases reject duplicate bare requests deterministically', () => {
+    const options = {
+        entryPoints: {
+            bundle: 'bundle.js',
+            'secondary-window': 'secondary-window.js',
+            'editor.worker': 'editor-worker.js',
+            'plugin-worker': 'plugin-worker.js',
+        },
+        outdir: 'lib/frontend',
+    };
+    const manifest = {
+        profile: 'tauri-critical',
+        featureGroups: {
+            invalid: {
+                deferredFrontendModules: [{
+                    module: 'date-fns',
+                    proxy: 'tauri-src/duplicate-date-fns.ts',
+                }],
+            },
+        },
+    };
+
+    assert.throws(
+        () => createTauriBrowserBuildPlans(options, manifest, path.resolve('generated-target')),
+        error => {
+            assert.match(error.message, /duplicate exact frontend alias request "date-fns"/i);
+            assert.match(error.message, /built-in date-fns bridge/i);
+            assert.match(error.message, /feature group "invalid"/i);
+            assert.match(error.message, /module "date-fns"/i);
+            assert.match(error.message, /proxy "tauri-src\/duplicate-date-fns\.ts"/i);
+            return true;
+        },
+    );
+});
+
+test('Tauri date bridges expose pinned symbols, narrow inputs, and every emitted desktop locale', async t => {
+    const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-date-fns-bridge-'));
+    t.after(() => fs.promises.rm(directory, { recursive: true, force: true }));
+    const browserDirectory = path.join(appDirectory, 'applications', 'browser');
+    const outdir = path.join(directory, 'dist');
+    const entryPoint = path.join(directory, 'frontend-entry.mjs');
+    const bridgePath = path.join(browserDirectory, 'tauri-src', 'date-fns-bridge.ts').replaceAll('\\', '/');
+    const localesPath = path.join(browserDirectory, 'tauri-src', 'date-fns-locales-bridge.ts').replaceAll('\\', '/');
+    await Promise.all([
+        fs.promises.writeFile(path.join(directory, 'package.json'), '{"type":"module"}\n'),
+        fs.promises.writeFile(entryPoint, `
+            import * as bridge from ${JSON.stringify(bridgePath)};
+            import * as locales from ${JSON.stringify(localesPath)};
+            export { bridge };
+            export { locales };
+            export const localeLookup = { en: locales['en'], 'zh-cn': locales['zh-cn'] };
+        `),
+    ]);
+    const result = await esbuild.build({
+        entryPoints: { bundle: entryPoint },
+        outdir,
+        bundle: true,
+        format: 'esm',
+        platform: 'node',
+        target: 'node22',
+        metafile: true,
+        logLevel: 'silent',
+    });
+    const built = await import(`${pathToFileURL(path.join(outdir, 'bundle.js')).href}?contract=${Date.now()}`);
+
+    assert.equal(typeof built.bridge.formatDistance, 'function');
+    assert.equal(typeof built.bridge.formatDistanceToNow, 'function');
+    assert.ok(built.locales.enUS);
+    assert.ok(built.locales.zhCN);
+    assert.equal(built.localeLookup.en, built.locales.enUS);
+    assert.equal(built.localeLookup['zh-cn'], built.locales.zhCN);
+
+    const copyFrontendSource = await fs.promises.readFile(
+        path.join(appDirectory, 'applications', 'tauri', 'copy-frontend.js'),
+        'utf8',
+    );
+    const localeAssignments = [...copyFrontendSource.matchAll(
+        /localStorage\.setItem\(\s*['"]localeId['"]\s*,([\s\S]*?)\);/g,
+    )];
+    assert.ok(localeAssignments.length > 0, 'copy-frontend.js must expose its localeId values to the bridge contract');
+    const emittedLocales = [...new Set(localeAssignments.flatMap(assignment =>
+        [...assignment[1].matchAll(/['"]([^'"]+)['"]/g)].map(match => match[1])
+    ))].sort();
+    assert.deepEqual(emittedLocales, ['en', 'zh-cn']);
+    for (const locale of emittedLocales) {
+        assert.ok(built.locales[locale], `date-fns locale bridge must export desktop locale ${locale}`);
+    }
+
+    const inputs = Object.keys(result.metafile.inputs).map(input => input.replaceAll('\\', '/'));
+    assert.equal(inputs.some(input => input.endsWith('/date-fns/index.cjs')), false);
+    assert.equal(inputs.some(input => input.endsWith('/date-fns/locale.cjs')), false);
+    assert.ok(inputs.some(input => /\/date-fns\/formatDistance\.(?:c?js)$/.test(input)));
+    assert.ok(inputs.some(input => /\/date-fns\/formatDistanceToNow\.(?:c?js)$/.test(input)));
+    assert.ok(inputs.some(input => /\/date-fns\/locale\/en-US\.(?:c?js)$/.test(input)));
+    assert.ok(inputs.some(input => /\/date-fns\/locale\/zh-CN\.(?:c?js)$/.test(input)));
+});
+
+test('Tauri frontend build audits every broad date-fns importer, including dynamic inputs', async t => {
+    const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-date-fns-importers-'));
+    t.after(() => fs.promises.rm(directory, { recursive: true, force: true }));
+    const browserDirectory = path.join(appDirectory, 'applications', 'browser');
+    const outdir = path.join(directory, 'dist');
+    const entryPoints = {
+        bundle: path.join(directory, 'frontend-entry.mjs'),
+        'secondary-window': path.join(directory, 'secondary-window.mjs'),
+        'editor.worker': path.join(directory, 'editor-worker.mjs'),
+        'plugin-worker': path.join(directory, 'plugin-worker.mjs'),
+    };
+    const pinnedSources = [
+        path.join(browserDirectory, 'node_modules', '@theia', 'ai-chat-ui', 'lib', 'browser', 'chat-date-utils.js'),
+        path.join(browserDirectory, 'node_modules', '@theia', 'ai-ide', 'lib', 'browser', 'ai-configuration', 'token-usage-configuration-widget.js'),
+    ];
+    const relativeImport = file => {
+        const nativeRelative = path.relative(directory, file);
+        if (path.isAbsolute(nativeRelative)) {
+            return nativeRelative.replaceAll('\\', '/');
+        }
+        const relative = nativeRelative.replaceAll('\\', '/');
+        return relative.startsWith('.') ? relative : `./${relative}`;
+    };
+    await Promise.all([
+        fs.promises.writeFile(entryPoints.bundle, pinnedSources.map(file => `import ${JSON.stringify(relativeImport(file))};`).join('\n')),
+        fs.promises.writeFile(entryPoints['secondary-window'], 'export {};\n'),
+        fs.promises.writeFile(entryPoints['editor.worker'], 'export {};\n'),
+        fs.promises.writeFile(entryPoints['plugin-worker'], 'export {};\n'),
+    ]);
+    await fs.promises.mkdir(outdir, { recursive: true });
+    await fs.promises.writeFile(
+        path.join(outdir, 'index.html'),
+        '<script type="text/javascript" src="./bundle.js" charset="utf-8"></script>',
+    );
+    const plans = createTauriBrowserBuildPlans({
+        entryPoints,
+        outdir,
+        bundle: true,
+        packages: 'external',
+        platform: 'node',
+        target: 'node22',
+        metafile: true,
+        logLevel: 'silent',
+    }, { profile: 'tauri-critical', featureGroups: {} }, browserDirectory);
+    const contractPlugin = plans.main.plugins.find(plugin => plugin.name === 'ride-tauri-date-fns-import-contract');
+    assert.ok(contractPlugin, 'tauri-critical must audit the complete frontend-main metafile');
+    let audit;
+    contractPlugin.setup({ onEnd(callback) { audit = callback; } });
+    assert.equal(typeof audit, 'function');
+
+    const result = await esbuild.build(plans.main);
+    const rows = Object.entries(result.metafile.inputs).flatMap(([input, detail]) =>
+        (detail.imports ?? [])
+            .filter(record => record.original === 'date-fns' || record.original === 'date-fns/locale')
+            .map(record => ({
+                importer: input.replaceAll('\\', '/').slice(input.replaceAll('\\', '/').lastIndexOf('/node_modules/') + 14),
+                request: record.original,
+            })),
+    ).sort((left, right) => `${left.importer}\0${left.request}`.localeCompare(`${right.importer}\0${right.request}`));
+    assert.deepEqual(rows, [{
+        importer: '@theia/ai-chat-ui/lib/browser/chat-date-utils.js',
+        request: 'date-fns',
+    }, {
+        importer: '@theia/ai-chat-ui/lib/browser/chat-date-utils.js',
+        request: 'date-fns/locale',
+    }, {
+        importer: '@theia/ai-ide/lib/browser/ai-configuration/token-usage-configuration-widget.js',
+        request: 'date-fns',
+    }]);
+
+    const unexpected = structuredClone(result.metafile);
+    const futureInput = 'node_modules/@theia/future/lib/browser/lazy-date.js';
+    unexpected.inputs[futureInput] = {
+        bytes: 1,
+        imports: [{
+            path: 'tauri-src/date-fns-bridge.ts',
+            original: 'date-fns',
+            kind: 'require-call',
+        }],
+    };
+    unexpected.outputs['lib/frontend/chunks/future-date.js'] = {
+        bytes: 1,
+        entryPoint: futureInput,
+        inputs: { [futureInput]: { bytesInOutput: 1 } },
+        imports: [],
+        exports: [],
+    };
+    assert.throws(
+        () => audit({ errors: [], metafile: unexpected }),
+        /unexpected date-fns importer.*@theia\/future.*date-fns/i,
+    );
 });
 
 test('Tauri browser build splits only the ESM main entry and keeps classic worker names intact', () => {
@@ -489,23 +1325,105 @@ test('Tauri browser build splits only the ESM main entry and keeps classic worke
     assert.equal(plans.main.format, 'esm');
     assert.equal(plans.main.splitting, true);
     assert.equal(plans.main.chunkNames, 'chunks/[name]-[hash]');
+    assert.equal(plans.main.preserveSymlinks, true);
     assert.equal(plans.main.plugins[0].name, 'ride-tauri-deferred-frontend-alias');
-    assert.equal(
-        plans.main.alias['@theia/secondary-window/lib/browser/secondary-window-frontend-module'],
-        path.resolve('generated-target', 'tauri-src/secondary-window-proxy-frontend-module.ts')
-    );
+    assert.equal(plans.main.alias, undefined);
     assert.deepEqual(plans.classic.map(plan => ({
         entries: Object.keys(plan.entryPoints),
         format: plan.format,
         splitting: plan.splitting,
+        preserveSymlinks: plan.preserveSymlinks,
     })), [
-        { entries: ['secondary-window'], format: 'iife', splitting: false },
-        { entries: ['editor.worker'], format: 'iife', splitting: false },
-        { entries: ['plugin-worker'], format: 'iife', splitting: false },
+        { entries: ['secondary-window'], format: 'iife', splitting: false, preserveSymlinks: true },
+        { entries: ['editor.worker'], format: 'iife', splitting: false, preserveSymlinks: true },
+        { entries: ['plugin-worker'], format: 'iife', splitting: false, preserveSymlinks: true },
     ]);
 
     const full = createTauriBrowserBuildPlans(options, { ...criticalManifest, profile: 'full' }, path.resolve('full-target'));
     assert.deepEqual(full.main.alias ?? {}, {});
+    assert.equal(full.main.plugins.some(plugin => plugin.name === 'ride-tauri-deferred-frontend-alias'), false);
+});
+
+test('dedupe keeps a logical Theia package path when the profile uses a junction', async t => {
+    const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-dedupe-junction-'));
+    t.after(() => fs.promises.rm(directory, { recursive: true, force: true }));
+    const profileRoot = path.join(directory, 'profile', 'build');
+    const storePackage = path.join(directory, 'store', '@theia', 'junction-fixture');
+    const logicalPackage = path.join(directory, 'node_modules', '@theia', 'junction-fixture');
+    await fs.promises.mkdir(path.join(storePackage, 'lib'), { recursive: true });
+    await fs.promises.mkdir(profileRoot, { recursive: true });
+    await fs.promises.mkdir(path.dirname(logicalPackage), { recursive: true });
+    await fs.promises.writeFile(path.join(directory, 'package.json'), '{}\n');
+    await fs.promises.writeFile(path.join(profileRoot, 'package.json'), '{}\n');
+    await fs.promises.writeFile(path.join(storePackage, 'package.json'), JSON.stringify({
+        name: '@theia/junction-fixture',
+        version: '1.0.0',
+        main: 'lib/index.js',
+    }));
+    await fs.promises.writeFile(path.join(storePackage, 'lib', 'index.js'), 'export {};\n');
+    await fs.promises.symlink(storePackage, logicalPackage, process.platform === 'win32' ? 'junction' : 'dir');
+
+    const plugin = createTheiaModuleDedupePlugin(profileRoot);
+    let resolver;
+    plugin.setup({
+        onResolve(_options, callback) {
+            resolver = callback;
+        },
+    });
+    const request = '@theia/junction-fixture/lib/index.js';
+    const result = resolver({ path: request });
+    assert.equal(result.path, path.join(logicalPackage, 'lib', 'index.js'));
+
+    const trailingSlashResult = resolver({ path: '@theia/junction-fixture/lib/' });
+    assert.equal(trailingSlashResult.path, path.join(logicalPackage, 'lib', 'index.js'));
+
+    const repeatedSlashResult = resolver({ path: '@theia/junction-fixture/lib//index.js' });
+    assert.equal(repeatedSlashResult.path, path.join(logicalPackage, 'lib', 'index.js'));
+});
+
+test('Windows CA fallback only intercepts a missing native binding', async t => {
+    const plugin = createWindowsCaCertsFallbackPlugin({
+        applicationRoot: path.resolve('generated-target'),
+        platform: 'win32',
+        nativePath: path.resolve('generated-target', 'missing', 'crypt32.node'),
+    });
+    let resolve;
+    let load;
+    plugin.setup({
+        onResolve(_options, callback) {
+            resolve = callback;
+        },
+        onLoad(_options, callback) {
+            load = callback;
+        },
+    });
+    assert.deepEqual(resolve({ path: '@vscode/windows-ca-certs' }), {
+        path: 'ride-windows-ca-certs-fallback',
+        namespace: 'ride-windows-ca-certs-fallback',
+    });
+    const loaded = await load({ path: 'ride-windows-ca-certs-fallback' });
+    assert.equal(loaded.loader, 'js');
+    assert.match(loaded.contents, /class Crypt32/);
+    assert.match(loaded.contents, /next\(\)\s*\{\s*return undefined/);
+
+    const nativePath = path.join(await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-native-binding-')), 'crypt32.node');
+    t.after(() => fs.promises.rm(path.dirname(nativePath), { recursive: true, force: true }));
+    await fs.promises.writeFile(nativePath, 'native fixture');
+    const nativePlugin = createWindowsCaCertsFallbackPlugin({
+        applicationRoot: path.resolve('generated-target'),
+        platform: 'win32',
+        nativePath,
+    });
+    let registered = false;
+    nativePlugin.setup({
+        onResolve() {
+            registered = true;
+        },
+        onLoad() {
+            registered = true;
+        },
+    });
+    assert.equal(registered, false);
 });
 
 test('generated frontend HTML uses one external module script in build and watch mode', async t => {
@@ -808,6 +1726,709 @@ test('secondary-window proxy splits from the initial bundle and executes the rea
     });
 });
 
+test('backend build plans split only the exact ScanOSS service edge and attest both outputs', async t => {
+    const plannerPath = path.join(
+        appDirectory,
+        'applications',
+        'browser',
+        'tauri-src',
+        'backend',
+        'esbuild-backend-deferred.mjs',
+    );
+    assert.equal(fs.existsSync(plannerPath), true, 'deferred backend planner must exist');
+    const deferredBuild = await import(pathToFileURL(plannerPath));
+    assert.equal(typeof deferredBuild.createTauriBackendBuildPlans, 'function');
+    const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-scanoss-backend-deferred-'));
+    t.after(() => fs.promises.rm(directory, { recursive: true, force: true }));
+
+    const sourceDirectory = path.join(appDirectory, 'applications', 'browser', 'tauri-src', 'backend');
+    const fixtureSourceDirectory = path.join(directory, 'tauri-src', 'backend');
+    await fs.promises.mkdir(fixtureSourceDirectory, { recursive: true });
+    await Promise.all([
+        fs.promises.copyFile(
+            path.join(sourceDirectory, 'scanoss-service-proxy.ts'),
+            path.join(fixtureSourceDirectory, 'scanoss-service-proxy.ts'),
+        ),
+        fs.promises.copyFile(
+            path.join(sourceDirectory, 'scanoss-service-feature.ts'),
+            path.join(fixtureSourceDirectory, 'scanoss-service-feature.ts'),
+        ),
+    ]);
+
+    const writeModule = async (relativePath, source) => {
+        const file = path.join(directory, 'node_modules', ...relativePath.split('/'));
+        await fs.promises.mkdir(path.dirname(file), { recursive: true });
+        await fs.promises.writeFile(file, source);
+    };
+    const writePackage = async (name, source, main = 'index.js') => {
+        const packageDirectory = path.join(directory, 'node_modules', ...name.split('/'));
+        await fs.promises.mkdir(packageDirectory, { recursive: true });
+        await fs.promises.writeFile(path.join(packageDirectory, 'package.json'), JSON.stringify({
+            name,
+            version: '1.0.0',
+            main,
+        }));
+        await fs.promises.mkdir(path.dirname(path.join(packageDirectory, main)), { recursive: true });
+        await fs.promises.writeFile(path.join(packageDirectory, main), source);
+    };
+    await fs.promises.writeFile(
+        path.join(directory, 'main.js'),
+        [
+            "const { Container } = require('@theia/core/shared/inversify');",
+            "const { RootContainer } = require('@theia/core/lib/node/backend-application');",
+            "const { ScanOSSServiceImpl } = require('@theia/scanoss/lib/node/scanoss-backend-module');",
+            'const rootContainer = new Container();',
+            'rootContainer.bind(RootContainer).toConstantValue(rootContainer);',
+            'rootContainer.bind(ScanOSSServiceImpl).toSelf().inSingletonScope();',
+            'const scanOSSService = rootContainer.get(ScanOSSServiceImpl);',
+            'module.exports = { ScanOSSServiceImpl, scanOSSService };',
+            '',
+        ].join('\n'),
+    );
+    await writePackage('@theia/scanoss', 'module.exports = {};\n');
+    await Promise.all([
+        writeModule(
+            '@theia/scanoss/lib/node/scanoss-backend-module.js',
+            "module.exports = require('./scanoss-service-impl');\n",
+        ),
+        writeModule(
+            '@theia/scanoss/lib/node/other-backend-module.js',
+            "module.exports = require('./scanoss-service-impl');\n",
+        ),
+        writeModule(
+            '@theia/scanoss/lib/node/scanoss-service-impl.js',
+            "const runtime = require('scanoss'); exports.RIDE_REAL_SCANOSS_IMPL_MARKER = true; exports.ScanOSSServiceImpl = class ScanOSSServiceImpl { constructor() { this.runtime = runtime; } async scanContent(content, apiKey) { return { type: 'success', results: [{ content, apiKey, runtimeCount: runtime.runtime.length }] }; } };\n",
+        ),
+        writeModule(
+            '@theia/scanoss/lib/common/scanoss-service.js',
+            "exports.ScanOSSService = Symbol.for('scanoss-service');\n",
+        ),
+        writePackage(
+            '@theia/core',
+            [
+                'const propertyInjections = new WeakMap();',
+                'const preDestroyMethods = new WeakMap();',
+                'exports.injectable = () => value => value;',
+                'exports.inject = serviceIdentifier => (target, propertyKey) => {',
+                '    const injections = propertyInjections.get(target) ?? [];',
+                '    injections.push({ serviceIdentifier, propertyKey });',
+                '    propertyInjections.set(target, injections);',
+                '};',
+                'exports.preDestroy = () => (target, propertyKey) => {',
+                '    preDestroyMethods.set(target, propertyKey);',
+                '};',
+                'exports.Container = class Container {',
+                '    constructor(parent) {',
+                '        this.parent = parent;',
+                '        this.bindings = new Map();',
+                '    }',
+                '    createChild() {',
+                '        return new exports.Container(this);',
+                '    }',
+                '    bind(serviceIdentifier) {',
+                '        const binding = { serviceIdentifier };',
+                '        this.bindings.set(serviceIdentifier, binding);',
+                '        return {',
+                '            toConstantValue: value => {',
+                '                binding.constant = true;',
+                '                binding.value = value;',
+                '            },',
+                '            toSelf: () => {',
+                '                binding.implementation = serviceIdentifier;',
+                '                return {',
+                '                    inSingletonScope: () => { binding.singleton = true; },',
+                '                };',
+                '            },',
+                '        };',
+                '    }',
+                '    get(serviceIdentifier) {',
+                '        const binding = this.bindings.get(serviceIdentifier);',
+                '        if (!binding) {',
+                '            if (this.parent) {',
+                '                return this.parent.get(serviceIdentifier);',
+                '            }',
+                "            throw new Error('Missing fixture binding.');",
+                '        }',
+                '        if (binding.constant) {',
+                '            return binding.value;',
+                '        }',
+                "        if (binding.singleton && Object.hasOwn(binding, 'instance')) {",
+                '            return binding.instance;',
+                '        }',
+                '        const instance = new binding.implementation();',
+                '        for (const injection of propertyInjections.get(binding.implementation.prototype) ?? []) {',
+                '            instance[injection.propertyKey] = this.get(injection.serviceIdentifier);',
+                '        }',
+                '        if (binding.singleton) {',
+                '            binding.instance = instance;',
+                '        }',
+                '        return instance;',
+                '    }',
+                '};',
+                '',
+            ].join('\n'),
+            'shared/inversify/index.js',
+        ),
+        writeModule(
+            '@theia/core/lib/node/backend-application.js',
+            "exports.RootContainer = Symbol.for('theia.RootContainer');\n",
+        ),
+    ]);
+    const runtimePackages = [
+        'scanoss',
+        '@grpc/grpc-js',
+        '@grpc/proto-loader',
+        'protobufjs',
+        'google-protobuf',
+        'tar',
+        'adm-zip',
+        'iconv-lite',
+        'tr46',
+        'whatwg-url',
+        'long',
+        'sax',
+        'minipass',
+    ];
+    const scanossRuntime = runtimePackages
+        .filter(name => name !== 'scanoss')
+        .map(name => `require(${JSON.stringify(name)})`)
+        .join(', ');
+    await writePackage('scanoss', `exports.runtime = [${scanossRuntime}];\n`);
+    await Promise.all(runtimePackages
+        .filter(name => name !== 'scanoss')
+        .map(name => writePackage(name, `exports.marker = ${JSON.stringify(name)};\n`)));
+
+    const plugins = [
+        { name: '@theia/esbuild-plugin', setup() {} },
+        { name: 'plugin:copy', setup() {} },
+        { name: 'ride-tauri-backend-patches', setup() {} },
+        { name: 'ride-tauri-profile-audit', setup() {} },
+        { name: 'ride-tauri-module-dedupe', setup() {} },
+        { name: 'ride-windows-ca-certs-fallback', setup() {} },
+    ];
+    const options = {
+        entryPoints: { main: path.join(directory, 'main.js') },
+        outdir: path.join(directory, 'lib', 'backend'),
+        bundle: true,
+        platform: 'node',
+        format: 'cjs',
+        target: 'node22',
+        loader: { '.node': 'file' },
+        external: ['node:fs'],
+        metafile: true,
+        logLevel: 'silent',
+        plugins,
+    };
+    const criticalManifest = {
+        profile: 'tauri-critical',
+        buildId: 'scanoss-build',
+        digest: 'a'.repeat(64),
+        featureGroups: { ai: { deferredBackendModules: [SCANOSS_BACKEND_DESCRIPTOR] } },
+    };
+    const plans = deferredBuild.createTauriBackendBuildPlans(options, criticalManifest, directory);
+    assert.equal(plans.features.length, 1);
+    assert.equal(plans.features[0].action, 'scanoss');
+    assert.equal(plans.features[0].options.outfile, path.join(directory, SCANOSS_BACKEND_DESCRIPTOR.output));
+    assert.deepEqual(plans.features[0].options.loader, options.loader);
+    assert.deepEqual(plans.features[0].options.external, options.external);
+    assert.equal(plans.features[0].options.target, options.target);
+    assert.equal(plans.features[0].options.format, 'cjs');
+    assert.equal(plans.features[0].options.platform, 'node');
+    assert.equal(plans.features[0].options.plugins.some(plugin => plugin.name === 'ride-tauri-deferred-backend-alias'), false);
+    for (const mainOnlyPlugin of ['@theia/esbuild-plugin', 'plugin:copy', 'ride-tauri-backend-patches']) {
+        assert.equal(plans.features[0].options.plugins.some(plugin => plugin.name === mainOnlyPlugin), false);
+    }
+    for (const retainedPlugin of ['ride-tauri-profile-audit', 'ride-tauri-module-dedupe', 'ride-windows-ca-certs-fallback']) {
+        assert.equal(plans.features[0].options.plugins.some(plugin => plugin.name === retainedPlugin), true);
+    }
+
+    const aliasPlugin = plans.main.plugins.find(plugin => plugin.name === 'ride-tauri-deferred-backend-alias');
+    assert.ok(aliasPlugin);
+    let resolver;
+    aliasPlugin.setup({ onResolve(options, callback) { resolver = { options, callback }; } });
+    assert.ok(resolver.options.filter.test('./scanoss-service-impl'));
+    const exactImporter = path.join(
+        directory,
+        'node_modules',
+        '@theia',
+        'scanoss',
+        'lib',
+        'node',
+        'scanoss-backend-module.js',
+    );
+    assert.deepEqual(await resolver.callback({
+        path: './scanoss-service-impl',
+        importer: exactImporter,
+        resolveDir: path.dirname(exactImporter),
+        kind: 'require-call',
+    }), { path: path.join(directory, SCANOSS_BACKEND_DESCRIPTOR.proxy) });
+    assert.equal(await resolver.callback({
+        path: './scanoss-service-impl',
+        importer: path.join(path.dirname(exactImporter), 'other-backend-module.js'),
+        resolveDir: path.dirname(exactImporter),
+        kind: 'require-call',
+    }), undefined);
+    assert.equal(await resolver.callback({
+        path: SCANOSS_BACKEND_DESCRIPTOR.module,
+        importer: exactImporter,
+        resolveDir: path.dirname(exactImporter),
+        kind: 'require-call',
+    }), undefined);
+
+    const withMetadata = (buildOptions, target) => ({
+        ...buildOptions,
+        plugins: [
+            ...(buildOptions.plugins ?? []),
+            createProfileMetadataPlugin({
+                target,
+                profileManifest: criticalManifest,
+                baseDirectory: directory,
+            }),
+        ],
+    });
+    const [mainResult, featureResult] = await Promise.all([
+        esbuild.build(withMetadata(plans.main, 'backend')),
+        esbuild.build(withMetadata(plans.features[0].options, 'backend-scanoss')),
+    ]);
+    const normalize = candidate => candidate.replaceAll('\\', '/');
+    const owns = (inputs, suffix) => inputs.some(input => {
+        const candidate = normalize(input);
+        return candidate === suffix.replace(/^\//, '') || candidate.endsWith(suffix);
+    });
+    const mainInputs = Object.keys(mainResult.metafile.inputs);
+    const featureInputs = Object.keys(featureResult.metafile.inputs);
+    assert.equal(owns(mainInputs, '/tauri-src/backend/scanoss-service-proxy.ts'), true);
+    assert.equal(owns(mainInputs, '/scanoss-service-impl.js'), false);
+    assert.equal(owns(featureInputs, '/scanoss-service-impl.js'), true);
+    assert.equal(owns(featureInputs, '/tauri-src/backend/scanoss-service-proxy.ts'), false);
+    for (const runtime of runtimePackages) {
+        const packagePath = `/node_modules/${runtime}/`;
+        assert.equal(mainInputs.some(input => `/${normalize(input)}/`.includes(packagePath)), false, `${runtime} leaked into main`);
+        assert.equal(featureInputs.some(input => `/${normalize(input)}/`.includes(packagePath)), true, `${runtime} missing from feature`);
+    }
+    const mainOutputImports = Object.values(mainResult.metafile.outputs).flatMap(output => output.imports ?? []);
+    assert.equal(mainOutputImports.some(record => record.path.includes('scanoss-service-feature')), false);
+
+    const mainOutput = path.join(directory, 'lib', 'backend', 'main.js');
+    const mainSource = await fs.promises.readFile(mainOutput, 'utf8');
+    const featureSource = await fs.promises.readFile(path.join(directory, SCANOSS_BACKEND_DESCRIPTOR.output), 'utf8');
+    assert.doesNotMatch(mainSource, /RIDE_REAL_SCANOSS_IMPL_MARKER/);
+    assert.match(featureSource, /RIDE_REAL_SCANOSS_IMPL_MARKER/);
+    assert.doesNotMatch(mainSource, /@injectable|@inject|@preDestroy/);
+    execFileSync(process.execPath, ['--check', mainOutput], { stdio: 'pipe' });
+    execFileSync(process.execPath, ['--eval', 'require(process.argv[1])', mainOutput], { stdio: 'pipe' });
+    const activation = JSON.parse(execFileSync(process.execPath, [
+        '--eval',
+        "const { scanOSSService } = require(process.argv[1]); scanOSSService.scanContent('fixture-content', 'fixture-key').then(value => process.stdout.write(JSON.stringify(value)), error => { console.error(error); process.exitCode = 1; });",
+        mainOutput,
+    ], { cwd: path.dirname(mainOutput), encoding: 'utf8' }));
+    assert.deepEqual(activation, {
+        type: 'success',
+        results: [{
+            content: 'fixture-content',
+            apiKey: 'fixture-key',
+            runtimeCount: runtimePackages.length - 1,
+        }],
+    });
+
+    const mainMetadata = JSON.parse(await fs.promises.readFile(path.join(directory, 'lib', 'metadata', 'backend.json'), 'utf8'));
+    const featureMetadata = JSON.parse(await fs.promises.readFile(path.join(directory, 'lib', 'metadata', 'backend-scanoss.json'), 'utf8'));
+    assert.equal(mainMetadata.buildId, criticalManifest.buildId);
+    assert.equal(featureMetadata.buildId, criticalManifest.buildId);
+    assert.equal(mainMetadata.profile, criticalManifest.profile);
+    assert.equal(featureMetadata.profile, criticalManifest.profile);
+    assert.match(mainMetadata.outputHashes['lib/backend/main.js'], /^[0-9a-f]{64}$/);
+    assert.match(featureMetadata.outputHashes[SCANOSS_BACKEND_DESCRIPTOR.output], /^[0-9a-f]{64}$/);
+    assert.equal(
+        Object.values(featureMetadata.metafile.outputs)[0].entryPoint.replaceAll('\\', '/').endsWith(SCANOSS_BACKEND_DESCRIPTOR.entry),
+        true,
+    );
+
+    const fullPlans = deferredBuild.createTauriBackendBuildPlans(options, {
+        ...criticalManifest,
+        profile: 'full',
+        featureGroups: { ai: {} },
+    }, directory);
+    assert.equal(fullPlans.features.length, 0);
+    assert.equal(fullPlans.main.plugins.some(plugin => plugin.name === 'ride-tauri-deferred-backend-alias'), false);
+    const fullOutputDirectory = path.join(directory, 'full');
+    const fullResult = await esbuild.build({ ...fullPlans.main, outdir: fullOutputDirectory });
+    const fullInputs = Object.keys(fullResult.metafile.inputs);
+    assert.equal(owns(fullInputs, '/scanoss-service-impl.js'), true);
+    assert.equal(fullInputs.some(input => `/${normalize(input)}/`.includes('/node_modules/scanoss/')), true);
+    assert.equal(fs.existsSync(path.join(fullOutputDirectory, 'scanoss-service-feature.cjs')), false);
+
+    assert.throws(() => deferredBuild.createTauriBackendBuildPlans(options, {
+        ...criticalManifest,
+        featureGroups: { ai: { deferredBackendModules: [{
+            ...SCANOSS_BACKEND_DESCRIPTOR,
+            output: 'lib/backend/main.js',
+        }] } },
+    }, directory), /output.*collides/i);
+    assert.throws(() => deferredBuild.createTauriBackendBuildPlans(options, {
+        ...criticalManifest,
+        featureGroups: { ai: { deferredBackendModules: [{
+            ...SCANOSS_BACKEND_DESCRIPTOR,
+            output: '../escape.cjs',
+        }] } },
+    }, directory), /outside|escape|inside/i);
+
+    const alternateProxy = path.join(directory, 'tauri-src', 'backend', 'alternate-proxy.ts');
+    const alternateEntry = path.join(directory, 'tauri-src', 'backend', 'alternate-feature.ts');
+    await fs.promises.writeFile(alternateProxy, 'export class ScanOSSServiceImpl {}\n');
+    await fs.promises.writeFile(alternateEntry, 'export const createScanOSSService = () => ({});\n');
+    await writeModule(
+        '@theia/scanoss/lib/node/alternate-service-impl.js',
+        'exports.ScanOSSServiceImpl = class ScanOSSServiceImpl {};\n',
+    );
+    const alternateDescriptor = {
+        ...SCANOSS_BACKEND_DESCRIPTOR,
+        importer: '@theia/scanoss/lib/node/other-backend-module',
+        module: '@theia/scanoss/lib/node/alternate-service-impl',
+        proxy: 'tauri-src/backend/alternate-proxy.ts',
+        entry: 'tauri-src/backend/alternate-feature.ts',
+        output: 'lib/backend/alternate-feature.cjs',
+        action: 'scanoss-alternate',
+    };
+    for (const field of ['proxy', 'entry']) {
+        assert.throws(() => deferredBuild.createTauriBackendBuildPlans(options, {
+            ...criticalManifest,
+            featureGroups: { ai: { deferredBackendModules: [
+                SCANOSS_BACKEND_DESCRIPTOR,
+                { ...alternateDescriptor, [field]: SCANOSS_BACKEND_DESCRIPTOR[field] },
+            ] } },
+        }, directory), new RegExp(`duplicate.*${field}|${field}.*duplicated`, 'i'));
+    }
+
+    for (const field of ['proxy', 'entry']) {
+        const portableCaseAlias = SCANOSS_BACKEND_DESCRIPTOR[field].replace(
+            /scanoss-service/,
+            'SCANOSS-SERVICE',
+        );
+        assert.throws(() => deferredBuild.createTauriBackendBuildPlans(options, {
+            ...criticalManifest,
+            featureGroups: { ai: { deferredBackendModules: [
+                SCANOSS_BACKEND_DESCRIPTOR,
+                { ...alternateDescriptor, [field]: portableCaseAlias },
+            ] } },
+        }, directory), new RegExp(`duplicate.*${field}|${field}.*duplicated`, 'i'));
+    }
+
+    const physicalAliasPaths = {
+        proxy: 'tauri-src/backend/physical-alias-proxy.ts',
+        entry: 'tauri-src/backend/physical-alias-feature.ts',
+    };
+    await Promise.all(Object.entries(physicalAliasPaths).map(([field, alias]) => fs.promises.link(
+        path.join(directory, SCANOSS_BACKEND_DESCRIPTOR[field]),
+        path.join(directory, alias),
+    )));
+    for (const field of ['proxy', 'entry']) {
+        assert.throws(() => deferredBuild.createTauriBackendBuildPlans(options, {
+            ...criticalManifest,
+            featureGroups: { ai: { deferredBackendModules: [
+                SCANOSS_BACKEND_DESCRIPTOR,
+                { ...alternateDescriptor, [field]: physicalAliasPaths[field] },
+            ] } },
+        }, directory), new RegExp(`(?:physical|same file|alias|duplicate).*${field}|${field}.*(?:physical|same file|alias|duplicate)`, 'i'));
+    }
+});
+
+test('real esbuild keeps non-approved relative and bare ScanOSS implementation edges unaliased', async t => {
+    const plannerPath = path.join(
+        appDirectory,
+        'applications',
+        'browser',
+        'tauri-src',
+        'backend',
+        'esbuild-backend-deferred.mjs',
+    );
+    const { createTauriBackendBuildPlans } = await import(pathToFileURL(plannerPath));
+    const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-scanoss-negative-edges-'));
+    t.after(() => fs.promises.rm(directory, { recursive: true, force: true }));
+
+    const writeFixture = async (relativePath, source) => {
+        const file = path.join(directory, ...relativePath.split('/'));
+        await fs.promises.mkdir(path.dirname(file), { recursive: true });
+        await fs.promises.writeFile(file, source);
+    };
+    await Promise.all([
+        writeFixture('node_modules/@theia/scanoss/package.json', JSON.stringify({
+            name: '@theia/scanoss',
+            version: '1.0.0',
+            main: 'index.js',
+        })),
+        writeFixture('node_modules/@theia/scanoss/index.js', 'module.exports = {};\n'),
+        writeFixture(
+            'node_modules/@theia/scanoss/lib/node/scanoss-backend-module.js',
+            "module.exports = require('./scanoss-service-impl');\n",
+        ),
+        writeFixture(
+            'node_modules/@theia/scanoss/lib/node/other-backend-module.js',
+            "module.exports = require('./scanoss-service-impl');\n",
+        ),
+        writeFixture(
+            'node_modules/@theia/scanoss/lib/node/scanoss-service-impl.js',
+            "exports.RIDE_REAL_SCANOSS_IMPL_MARKER = 'real';\n",
+        ),
+        writeFixture(
+            'tauri-src/backend/negative-scanoss-proxy.ts',
+            "export const RIDE_PROXY_SCANOSS_IMPL_MARKER = 'proxy';\n",
+        ),
+        writeFixture(
+            'tauri-src/backend/negative-scanoss-feature.ts',
+            "export const RIDE_NEGATIVE_SCANOSS_FEATURE_MARKER = 'feature';\n",
+        ),
+    ]);
+
+    const descriptor = {
+        ...SCANOSS_BACKEND_DESCRIPTOR,
+        proxy: 'tauri-src/backend/negative-scanoss-proxy.ts',
+        entry: 'tauri-src/backend/negative-scanoss-feature.ts',
+        output: 'lib/backend/negative-scanoss-feature.cjs',
+    };
+    const manifest = {
+        profile: 'tauri-critical',
+        featureGroups: { ai: { deferredBackendModules: [descriptor] } },
+    };
+    const buildEdge = async (name, request) => {
+        const entry = path.join(directory, `${name}.js`);
+        await fs.promises.writeFile(entry, `module.exports = require(${JSON.stringify(request)});\n`);
+        const options = {
+            entryPoints: { [name]: entry },
+            outdir: path.join(directory, 'lib', name),
+            bundle: true,
+            platform: 'node',
+            format: 'cjs',
+            target: 'node22',
+            metafile: true,
+            write: false,
+            logLevel: 'silent',
+            plugins: [],
+        };
+        const plans = createTauriBackendBuildPlans(options, manifest, directory);
+        return esbuild.build(plans.main);
+    };
+    const assertRealImplementation = result => {
+        const source = result.outputFiles.map(file => file.text).join('\n');
+        const inputs = Object.keys(result.metafile.inputs).map(input => input.replaceAll('\\', '/'));
+        assert.match(source, /RIDE_REAL_SCANOSS_IMPL_MARKER/);
+        assert.doesNotMatch(source, /RIDE_PROXY_SCANOSS_IMPL_MARKER/);
+        assert.equal(inputs.some(input => input.endsWith('/scanoss-service-impl.js')), true);
+        assert.equal(inputs.some(input => input.endsWith('/negative-scanoss-proxy.ts')), false);
+    };
+
+    const otherImporter = await buildEdge(
+        'other-importer',
+        '@theia/scanoss/lib/node/other-backend-module',
+    );
+    assertRealImplementation(otherImporter);
+
+    const bareImplementation = await buildEdge(
+        'bare-implementation',
+        '@theia/scanoss/lib/node/scanoss-service-impl',
+    );
+    assertRealImplementation(bareImplementation);
+});
+
+test('backend context creation disposes partial success once and aggregates cleanup failures', async () => {
+    const plannerPath = path.join(
+        appDirectory,
+        'applications',
+        'browser',
+        'tauri-src',
+        'backend',
+        'esbuild-backend-deferred.mjs',
+    );
+    const { createTauriBuildContexts } = await import(pathToFileURL(plannerPath));
+    assert.equal(typeof createTauriBuildContexts, 'function');
+
+    const creationError = new Error('backend-scanoss context creation failed');
+    const disposalError = new Error('frontend-classic context disposal failed');
+    const created = [];
+    const createContext = async name => {
+        if (name === 'backend-scanoss') {
+            throw creationError;
+        }
+        const context = {
+            name,
+            disposeCalls: 0,
+            async dispose() {
+                this.disposeCalls += 1;
+                if (this.disposeCalls > 1) {
+                    throw new Error(`${name} was disposed more than once`);
+                }
+                if (name === 'frontend-classic') {
+                    throw disposalError;
+                }
+            },
+        };
+        created.push(context);
+        return context;
+    };
+
+    let failure;
+    try {
+        await createTauriBuildContexts([
+            'frontend-main',
+            'frontend-classic',
+            'backend',
+            'backend-scanoss',
+            'codex-sdk-runtime',
+        ], createContext);
+    } catch (error) {
+        failure = error;
+    }
+    assert.ok(failure instanceof AggregateError);
+    assert.deepEqual(failure.errors, [creationError, disposalError]);
+    assert.deepEqual(created.map(context => context.name), [
+        'frontend-main',
+        'frontend-classic',
+        'backend',
+    ]);
+    assert.deepEqual(created.map(context => context.disposeCalls), [1, 1, 1]);
+});
+
+test('backend context runner watches or rebuilds and disposes every context exactly once', async () => {
+    const plannerPath = path.join(
+        appDirectory,
+        'applications',
+        'browser',
+        'tauri-src',
+        'backend',
+        'esbuild-backend-deferred.mjs',
+    );
+    assert.equal(fs.existsSync(plannerPath), true, 'deferred backend planner must exist');
+    const { createTauriBuildContexts, runTauriBuildContexts } = await import(pathToFileURL(plannerPath));
+    assert.equal(typeof createTauriBuildContexts, 'function');
+    assert.equal(typeof runTauriBuildContexts, 'function');
+    const context = () => {
+        const calls = { watch: 0, rebuild: 0, dispose: 0 };
+        return {
+            calls,
+            watch: async () => { calls.watch += 1; },
+            rebuild: async () => { calls.rebuild += 1; },
+            dispose: async () => { calls.dispose += 1; },
+        };
+    };
+
+    let oneShotCreations = 0;
+    const oneShot = await createTauriBuildContexts(['frontend', 'backend', 'codex'], async () => {
+        oneShotCreations += 1;
+        return context();
+    });
+    assert.equal(oneShotCreations, 3);
+    const oneShotDispose = await runTauriBuildContexts(oneShot, { watch: false });
+    assert.equal(typeof oneShotDispose, 'function');
+    assert.deepEqual(oneShot.map(item => item.calls), [
+        { watch: 0, rebuild: 1, dispose: 1 },
+        { watch: 0, rebuild: 1, dispose: 1 },
+        { watch: 0, rebuild: 1, dispose: 1 },
+    ]);
+    await oneShotDispose();
+    assert.deepEqual(oneShot.map(item => item.calls.dispose), [1, 1, 1]);
+
+    let watchCreations = 0;
+    const watched = await createTauriBuildContexts(['frontend', 'backend'], async () => {
+        watchCreations += 1;
+        return context();
+    });
+    assert.equal(watchCreations, 2);
+    const watchDispose = await runTauriBuildContexts(watched, { watch: true });
+    assert.deepEqual(watched.map(item => item.calls), [
+        { watch: 1, rebuild: 0, dispose: 0 },
+        { watch: 1, rebuild: 0, dispose: 0 },
+    ]);
+    await Promise.all([watchDispose(), watchDispose()]);
+    assert.deepEqual(watched.map(item => item.calls.dispose), [1, 1]);
+
+    const source = await fs.promises.readFile(path.join(appDirectory, 'applications', 'browser', 'esbuild.mjs'), 'utf8');
+    assert.match(source, /createTauriBackendBuildPlans/);
+    assert.match(source, /createTauriBuildContexts/);
+    assert.match(source, /withProfileMetadata\(options,\s*`backend-\$\{action\}`\)/);
+    assert.match(source, /runTauriBuildContexts/);
+});
+
+test('backend context runner aggregates operation and disposal failures without double-dispose', async () => {
+    const plannerPath = path.join(
+        appDirectory,
+        'applications',
+        'browser',
+        'tauri-src',
+        'backend',
+        'esbuild-backend-deferred.mjs',
+    );
+    const { runTauriBuildContexts } = await import(pathToFileURL(plannerPath));
+
+    for (const watch of [false, true]) {
+        const operationError = new Error(`${watch ? 'watch' : 'rebuild'} failed`);
+        const disposalError = new Error(`${watch ? 'watch' : 'rebuild'} disposal failed`);
+        const calls = Array.from({ length: 3 }, () => ({ operation: 0, dispose: 0 }));
+        const contexts = calls.map((record, index) => ({
+            async rebuild() {
+                record.operation += 1;
+                if (!watch && index === 1) {
+                    throw operationError;
+                }
+            },
+            async watch() {
+                record.operation += 1;
+                if (watch && index === 1) {
+                    throw operationError;
+                }
+            },
+            async dispose() {
+                record.dispose += 1;
+                if (index === 0) {
+                    throw disposalError;
+                }
+            },
+        }));
+
+        let failure;
+        try {
+            await runTauriBuildContexts(contexts, { watch });
+        } catch (error) {
+            failure = error;
+        }
+        assert.ok(failure instanceof AggregateError);
+        assert.deepEqual(failure.errors, [operationError, disposalError]);
+        assert.deepEqual(calls.map(record => record.dispose), [1, 1, 1]);
+    }
+
+    const disposalError = new Error('cached disposal failed');
+    let disposeCalls = 0;
+    const dispose = await runTauriBuildContexts([{
+        async watch() {},
+        async dispose() {
+            disposeCalls += 1;
+            throw disposalError;
+        },
+    }], { watch: true });
+    const first = dispose();
+    const second = dispose();
+    assert.equal(first, second);
+    await assert.rejects(first, error => (
+        error instanceof AggregateError
+        && error.errors.length === 1
+        && error.errors[0] === disposalError
+    ));
+    await assert.rejects(second);
+    assert.equal(disposeCalls, 1);
+});
+
+test('esbuild routes every browser, backend feature, and Codex context through failure-safe creation', async () => {
+    const source = await fs.promises.readFile(path.join(appDirectory, 'applications', 'browser', 'esbuild.mjs'), 'utf8');
+    const contextOptions = source.match(/const contextOptions\s*=\s*\[([\s\S]*?)\n\s*\];/)?.[1];
+    assert.ok(contextOptions, 'contextOptions must be assembled before context creation');
+    assert.match(contextOptions, /\.\.\.browserTargets\.map\(\(\{\s*target,\s*options\s*\}\)\s*=>\s*withProfileMetadata\(options,\s*target\)\)/s);
+    assert.match(contextOptions, /withProfileMetadata\(backendBuildPlans\.main,\s*['"]backend['"]\)/);
+    assert.match(contextOptions, /\.\.\.backendBuildPlans\.features\.map\(\(\{\s*action,\s*options\s*\}\)\s*=>\s*withProfileMetadata\(options,\s*`backend-\$\{action\}`\)\)/s);
+    assert.match(contextOptions, /createCodexSdkRuntimeOptions\(\)/);
+    assert.match(source, /createTauriBuildContexts\(\s*contextOptions,\s*options\s*=>\s*esbuild\.context\(options\)\)/s);
+    assert.doesNotMatch(source, /await\s+esbuild\.context\(/);
+    assert.doesNotMatch(source, /Promise\.all\(backendBuildPlans\.features\.map/);
+});
+
 test('rejects blocked roots that lack critical-closure evidence or a reason', () => {
     const packages = {
         product: manifest('product'),
@@ -1044,6 +2665,47 @@ test('records multiple runtime identities while retaining Theia extensions below
     ]);
 });
 
+test('resolves package dependencies from the logical path after canonicalizing junction identities', async () => {
+    const browserDirectory = path.resolve('browser-app');
+    const logicalProductDirectory = path.resolve('logical-packages', 'product');
+    const canonicalProductDirectory = path.resolve('canonical-packages', 'product');
+    const logicalDependencyDirectory = path.resolve('logical-packages', 'dependency');
+    const canonicalDependencyDirectory = path.resolve('canonical-packages', 'dependency');
+    const graph = await resolveInstalledPackageGraph({
+        browserManifest: { dependencies: { product: '^1.0.0' } },
+        roots: ['product'],
+        browserDirectory,
+        canonicalizePackageDirectory: async directory => directory === logicalProductDirectory
+            ? canonicalProductDirectory
+            : canonicalDependencyDirectory,
+        resolver: async (requestName, fromDirectory) => {
+            if (requestName === 'product') {
+                return {
+                    requestName,
+                    packageDirectory: logicalProductDirectory,
+                    manifest: manifest('product', { dependency: '^1.0.0' }),
+                };
+            }
+            assert.equal(requestName, 'dependency');
+            assert.equal(fromDirectory, logicalProductDirectory);
+            return {
+                requestName,
+                packageDirectory: logicalDependencyDirectory,
+                manifest: manifest('dependency'),
+            };
+        },
+    });
+
+    assert.equal(
+        [...graph.records.values()].find(record => record.requestName === 'product').packageDirectory,
+        canonicalProductDirectory,
+    );
+    assert.equal(
+        [...graph.records.values()].find(record => record.requestName === 'dependency').packageDirectory,
+        canonicalDependencyDirectory,
+    );
+});
+
 test('traverses same-version packages at different installation locations and unions their extension closures', async t => {
     const installedRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-install-context-'));
     t.after(() => fs.promises.rm(installedRoot, { recursive: true, force: true }));
@@ -1209,6 +2871,24 @@ async function writeTransactionStateFixture(plan, state, nonce, contents) {
     await fs.promises.writeFile(transactionStatePath(plan, state, nonce), marker);
 }
 
+async function writeValidationPendingFixture(plan, restore, nonce = 'validationpending') {
+    const state = 'validation-pending';
+    const sequence = 3;
+    const markerPath = path.join(
+        plan.parentDirectory,
+        `.${plan.targetName}.transaction-${plan.transactionId}.${String(sequence).padStart(2, '0')}-${state}-${nonce}.json`,
+    );
+    await fs.promises.writeFile(markerPath, `${JSON.stringify({
+        schema: 'ride.directory-transaction@3',
+        targetName: plan.targetName,
+        transactionId: plan.transactionId,
+        state,
+        sequence,
+        restore,
+    })}\n`);
+    return markerPath;
+}
+
 async function transactionArtifacts(plan) {
     return (await fs.promises.readdir(plan.parentDirectory))
         .filter(name => name.startsWith(`.${plan.targetName}.transaction-${plan.transactionId}.`))
@@ -1227,6 +2907,233 @@ test('directory transaction replaces a target and removes its recovery artifacts
     assert.equal(await fs.promises.readFile(path.join(plan.targetDirectory, 'sentinel.txt'), 'utf8'), 'new');
     assert.equal(fs.existsSync(plan.backupDirectory), false);
     assert.equal(fs.existsSync(plan.markerPath), false);
+});
+
+test('directory transaction validates the installed target exactly once before commit', async t => {
+    const parentDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-transaction-validate-ok-'));
+    t.after(() => fs.promises.rm(parentDirectory, { recursive: true, force: true }));
+    const plan = createDirectoryTransactionPlan(parentDirectory, 'lib', 'validate-success');
+    await writeSentinel(plan.targetDirectory, 'old');
+    await writeSentinel(plan.temporaryDirectory, 'new');
+    let validationCalls = 0;
+
+    await replaceDirectoryTransactional(plan, {
+        validateInstalled: async installedDirectory => {
+            validationCalls += 1;
+            assert.equal(path.resolve(installedDirectory), path.resolve(plan.targetDirectory));
+            assert.equal(await fs.promises.readFile(path.join(installedDirectory, 'sentinel.txt'), 'utf8'), 'new');
+        },
+    });
+
+    assert.equal(validationCalls, 1);
+    assert.equal(await fs.promises.readFile(path.join(plan.targetDirectory, 'sentinel.txt'), 'utf8'), 'new');
+    assert.deepEqual(await transactionArtifacts(plan), []);
+});
+
+test('directory transaction rolls back post-install validation failure to the exact prior state', async t => {
+    for (const hadTarget of [true, false]) {
+        const parentDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), `ride-transaction-validate-${hadTarget ? 'restore' : 'empty'}-`));
+        t.after(() => fs.promises.rm(parentDirectory, { recursive: true, force: true }));
+        const plan = createDirectoryTransactionPlan(parentDirectory, 'lib', hadTarget ? 'restore-old' : 'restore-empty');
+        if (hadTarget) {
+            await writeSentinel(plan.targetDirectory, 'old');
+        }
+        await writeSentinel(plan.temporaryDirectory, 'new');
+        let validationCalls = 0;
+
+        await assert.rejects(replaceDirectoryTransactional(plan, {
+            validateInstalled: async () => {
+                validationCalls += 1;
+                throw new Error('installed validation failed');
+            },
+        }), /installed validation failed/);
+
+        assert.equal(validationCalls, 1);
+        if (hadTarget) {
+            assert.equal(await fs.promises.readFile(path.join(plan.targetDirectory, 'sentinel.txt'), 'utf8'), 'old');
+        } else {
+            assert.equal(fs.existsSync(plan.targetDirectory), false);
+        }
+        assert.equal(fs.existsSync(plan.backupDirectory), false);
+        assert.equal((await transactionArtifacts(plan)).some(name => name.includes('-installed-')), false);
+        assert.deepEqual(await transactionArtifacts(plan), []);
+    }
+});
+
+test('directory transaction aggregates post-install validation and rollback failures without an installed marker', async t => {
+    const parentDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-transaction-validate-rollback-error-'));
+    t.after(() => fs.promises.rm(parentDirectory, { recursive: true, force: true }));
+    const plan = createDirectoryTransactionPlan(parentDirectory, 'lib', 'validation-rollback-fails');
+    await writeSentinel(plan.targetDirectory, 'old');
+    await writeSentinel(plan.temporaryDirectory, 'new');
+    const filesystem = {
+        ...fs.promises,
+        rename: async (source, destination) => {
+            if (path.resolve(source) === path.resolve(plan.backupDirectory)
+                && path.resolve(destination) === path.resolve(plan.targetDirectory)) {
+                throw Object.assign(new Error('validation rollback failed'), { code: 'EACCES' });
+            }
+            return fs.promises.rename(source, destination);
+        },
+    };
+
+    await assert.rejects(replaceDirectoryTransactional(plan, {
+        filesystem,
+        validateInstalled: async () => { throw new Error('installed validation failed'); },
+    }), error => {
+        assert.ok(error instanceof AggregateError);
+        assert.deepEqual(error.errors.map(item => item.message), [
+            'installed validation failed',
+            'validation rollback failed',
+        ]);
+        return true;
+    });
+    assert.equal(fs.existsSync(plan.targetDirectory), false);
+    assert.equal(await fs.promises.readFile(path.join(plan.backupDirectory, 'sentinel.txt'), 'utf8'), 'old');
+    assert.equal((await transactionArtifacts(plan)).some(name => name.includes('-installed-')), false);
+    assert.ok((await transactionArtifacts(plan)).some(name => name.includes('-validation-pending-')));
+
+    await recoverDirectoryTransactions({ parentDirectory, targetName: 'lib' });
+    assert.equal(await fs.promises.readFile(path.join(plan.targetDirectory, 'sentinel.txt'), 'utf8'), 'old');
+    assert.equal(fs.existsSync(plan.backupDirectory), false);
+    assert.equal(fs.existsSync(plan.temporaryDirectory), false);
+    assert.deepEqual(await transactionArtifacts(plan), []);
+});
+
+test('validation-pending first install recovers after its initial unvalidated target removal fails', async t => {
+    const parentDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-validation-pending-first-install-'));
+    t.after(() => fs.promises.rm(parentDirectory, { recursive: true, force: true }));
+    const plan = createDirectoryTransactionPlan(parentDirectory, 'lib', 'first-install-removal-fails');
+    await writeSentinel(plan.temporaryDirectory, 'unvalidated-new');
+    let failedRemoval = false;
+    const filesystem = {
+        ...fs.promises,
+        rm: async (candidate, options) => {
+            if (!failedRemoval && path.resolve(candidate) === path.resolve(plan.targetDirectory)) {
+                failedRemoval = true;
+                throw Object.assign(new Error('initial unvalidated target removal failed'), { code: 'EIO' });
+            }
+            return fs.promises.rm(candidate, options);
+        },
+    };
+
+    await assert.rejects(replaceDirectoryTransactional(plan, {
+        filesystem,
+        validateInstalled: async () => { throw new Error('installed validation failed'); },
+    }), error => {
+        assert.ok(error instanceof AggregateError);
+        assert.deepEqual(error.errors.map(item => item.message), [
+            'installed validation failed',
+            'initial unvalidated target removal failed',
+        ]);
+        return true;
+    });
+    assert.equal(await fs.promises.readFile(path.join(plan.targetDirectory, 'sentinel.txt'), 'utf8'), 'unvalidated-new');
+    const pendingMarkerName = (await transactionArtifacts(plan)).find(name => name.includes('-validation-pending-'));
+    assert.ok(pendingMarkerName, 'validation-pending marker must survive failed rollback');
+    const pendingMarker = JSON.parse(await fs.promises.readFile(path.join(parentDirectory, pendingMarkerName), 'utf8'));
+    assert.equal(pendingMarker.restore, 'absent');
+
+    await recoverDirectoryTransactions({ parentDirectory, targetName: 'lib' });
+
+    assert.equal(fs.existsSync(plan.targetDirectory), false);
+    assert.equal(fs.existsSync(plan.temporaryDirectory), false);
+    assert.deepEqual(await transactionArtifacts(plan), []);
+});
+
+test('recovery restores a backup after a validation-pending install crashes before validation', async t => {
+    const parentDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-validation-pending-backup-crash-'));
+    t.after(() => fs.promises.rm(parentDirectory, { recursive: true, force: true }));
+    const plan = createDirectoryTransactionPlan(parentDirectory, 'lib', 'pending-backup-crash');
+    await writeSentinel(plan.targetDirectory, 'validated-old');
+    await writeSentinel(plan.temporaryDirectory, 'unvalidated-new');
+    await fs.promises.rename(plan.targetDirectory, plan.backupDirectory);
+    await writeValidationPendingFixture(plan, 'backup');
+    await fs.promises.rename(plan.temporaryDirectory, plan.targetDirectory);
+
+    await recoverDirectoryTransactions({ parentDirectory, targetName: 'lib' });
+
+    assert.equal(await fs.promises.readFile(path.join(plan.targetDirectory, 'sentinel.txt'), 'utf8'), 'validated-old');
+    assert.equal(fs.existsSync(plan.backupDirectory), false);
+    assert.equal(fs.existsSync(plan.temporaryDirectory), false);
+    assert.deepEqual(await transactionArtifacts(plan), []);
+});
+
+test('recovery removes a first validation-pending install after a crash before validation', async t => {
+    const parentDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-validation-pending-absent-crash-'));
+    t.after(() => fs.promises.rm(parentDirectory, { recursive: true, force: true }));
+    const plan = createDirectoryTransactionPlan(parentDirectory, 'lib', 'pending-absent-crash');
+    await writeSentinel(plan.temporaryDirectory, 'unvalidated-new');
+    await writeValidationPendingFixture(plan, 'absent');
+    await fs.promises.rename(plan.temporaryDirectory, plan.targetDirectory);
+
+    await recoverDirectoryTransactions({ parentDirectory, targetName: 'lib' });
+
+    assert.equal(fs.existsSync(plan.targetDirectory), false);
+    assert.equal(fs.existsSync(plan.backupDirectory), false);
+    assert.equal(fs.existsSync(plan.temporaryDirectory), false);
+    assert.deepEqual(await transactionArtifacts(plan), []);
+});
+
+test('validation-pending recovery retains its marker across a failed retry and succeeds later', async t => {
+    const parentDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-validation-pending-retry-'));
+    t.after(() => fs.promises.rm(parentDirectory, { recursive: true, force: true }));
+    const plan = createDirectoryTransactionPlan(parentDirectory, 'lib', 'pending-recovery-retry');
+    await writeSentinel(plan.temporaryDirectory, 'unvalidated-new');
+    await writeValidationPendingFixture(plan, 'absent');
+    await fs.promises.rename(plan.temporaryDirectory, plan.targetDirectory);
+    const filesystem = {
+        ...fs.promises,
+        rm: async (candidate, options) => {
+            if (path.resolve(candidate) === path.resolve(plan.targetDirectory)) {
+                throw Object.assign(new Error('recovery removal failed'), { code: 'EIO' });
+            }
+            return fs.promises.rm(candidate, options);
+        },
+    };
+
+    await assert.rejects(
+        recoverDirectoryTransactions({ parentDirectory, targetName: 'lib' }, { filesystem }),
+        /recovery removal failed/,
+    );
+    assert.equal(await fs.promises.readFile(path.join(plan.targetDirectory, 'sentinel.txt'), 'utf8'), 'unvalidated-new');
+    assert.ok((await transactionArtifacts(plan)).some(name => name.includes('-validation-pending-')));
+
+    await recoverDirectoryTransactions({ parentDirectory, targetName: 'lib' });
+    assert.equal(fs.existsSync(plan.targetDirectory), false);
+    assert.deepEqual(await transactionArtifacts(plan), []);
+});
+
+test('validated install persists validation-pending before rename and leaves no pending marker on success', async t => {
+    const parentDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-validation-pending-success-'));
+    t.after(() => fs.promises.rm(parentDirectory, { recursive: true, force: true }));
+    const plan = createDirectoryTransactionPlan(parentDirectory, 'lib', 'pending-success');
+    await writeSentinel(plan.targetDirectory, 'validated-old');
+    await writeSentinel(plan.temporaryDirectory, 'new');
+    let pendingObservedBeforeRename = 0;
+    const filesystem = {
+        ...fs.promises,
+        rename: async (source, destination) => {
+            if (path.resolve(source) === path.resolve(plan.temporaryDirectory)
+                && path.resolve(destination) === path.resolve(plan.targetDirectory)) {
+                const pendingName = (await transactionArtifacts(plan)).find(name => name.includes('-validation-pending-'));
+                assert.ok(pendingName, 'validation-pending must be durable before install rename');
+                const marker = JSON.parse(await fs.promises.readFile(path.join(parentDirectory, pendingName), 'utf8'));
+                assert.equal(marker.restore, 'backup');
+                pendingObservedBeforeRename += 1;
+            }
+            return fs.promises.rename(source, destination);
+        },
+    };
+
+    await replaceDirectoryTransactional(plan, {
+        filesystem,
+        validateInstalled: async () => {},
+    });
+
+    assert.equal(pendingObservedBeforeRename, 1);
+    assert.equal(await fs.promises.readFile(path.join(plan.targetDirectory, 'sentinel.txt'), 'utf8'), 'new');
+    assert.deepEqual(await transactionArtifacts(plan), []);
 });
 
 test('directory transaction restores original bytes when install rename fails', async t => {
@@ -1558,6 +3465,96 @@ async function createPublishSource(browserDirectory, manifest, marker = manifest
     return sourceDirectory;
 }
 
+function deferredBackendExclusiveInputs(descriptor = SCANOSS_BACKEND_DESCRIPTOR) {
+    const inputs = [
+        `node_modules/${descriptor.module}.js`,
+        ...descriptor.runtimePackages.map(packageName => `node_modules/${packageName}/index.js`),
+    ];
+    while (inputs.length < descriptor.exclusiveInputCount) {
+        inputs.push(`node_modules/scanoss-fixture-exclusive-${inputs.length}/index.js`);
+    }
+    return inputs;
+}
+
+function deferredBackendRelativeRequest(descriptor = SCANOSS_BACKEND_DESCRIPTOR) {
+    const relative = path.posix.relative(path.posix.dirname(descriptor.importer), descriptor.module);
+    return relative.startsWith('.') ? relative : `./${relative}`;
+}
+
+async function writeDeferredBackendAttestation(sourceDirectory, manifest, descriptor = SCANOSS_BACKEND_DESCRIPTOR) {
+    const sourceLib = path.join(sourceDirectory, 'lib');
+    const mainOutput = path.join(sourceLib, 'backend', 'main.js');
+    const featureOutput = path.join(sourceDirectory, descriptor.output);
+    const featureBytes = 'attested-scanoss-feature';
+    await fs.promises.mkdir(path.dirname(featureOutput), { recursive: true });
+    await fs.promises.writeFile(featureOutput, featureBytes);
+
+    const importer = `node_modules/${descriptor.importer}.js`;
+    const mainInputs = [
+        'src-gen/backend/main.js',
+        importer,
+        descriptor.proxy,
+    ];
+    const exclusiveInputs = deferredBackendExclusiveInputs(descriptor);
+    const featureInputs = [descriptor.entry, ...exclusiveInputs];
+    const identity = target => ({
+        schema: 'ride.esbuild-metafile@1',
+        profile: manifest.profile,
+        buildId: manifest.buildId,
+        digest: manifest.digest,
+        target,
+    });
+    const mainRecord = {
+        ...identity('backend'),
+        outputHashes: {
+            'lib/backend/main.js': crypto.createHash('sha256').update(await fs.promises.readFile(mainOutput)).digest('hex'),
+        },
+        metafile: {
+            inputs: Object.fromEntries(mainInputs.map(input => [input, {
+                bytes: 1,
+                imports: input === importer ? [{
+                    path: descriptor.proxy,
+                    original: deferredBackendRelativeRequest(descriptor),
+                    kind: 'require-call',
+                }] : [],
+            }])),
+            outputs: {
+                'lib/backend/main.js': {
+                    bytes: 1,
+                    entryPoint: 'src-gen/backend/main.js',
+                    inputs: Object.fromEntries(mainInputs.map(input => [input, { bytesInOutput: 1 }])),
+                    imports: [],
+                    exports: [],
+                },
+            },
+        },
+    };
+    const featureRecord = {
+        ...identity(`backend-${descriptor.action}`),
+        outputHashes: {
+            [descriptor.output]: crypto.createHash('sha256').update(featureBytes).digest('hex'),
+        },
+        metafile: {
+            inputs: Object.fromEntries(featureInputs.map(input => [input, { bytes: 1, imports: [] }])),
+            outputs: {
+                [descriptor.output]: {
+                    bytes: featureBytes.length,
+                    entryPoint: descriptor.entry,
+                    inputs: Object.fromEntries(featureInputs.map(input => [input, { bytesInOutput: 1 }])),
+                    imports: [],
+                    exports: ['createScanOSSService'],
+                },
+            },
+        },
+    };
+    await fs.promises.mkdir(path.join(sourceLib, 'metadata'), { recursive: true });
+    await Promise.all([
+        fs.promises.writeFile(path.join(sourceLib, 'metadata', 'backend.json'), `${JSON.stringify(mainRecord, null, 2)}\n`),
+        fs.promises.writeFile(path.join(sourceLib, 'metadata', `backend-${descriptor.action}.json`), `${JSON.stringify(featureRecord, null, 2)}\n`),
+    ]);
+    return { mainRecord, featureRecord, featureBytes, exclusiveInputs };
+}
+
 test('publish validates identity and writes byte-identical manifests before cleaning its build', async t => {
     const browserDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-publish-ok-'));
     t.after(() => fs.promises.rm(browserDirectory, { recursive: true, force: true }));
@@ -1584,6 +3581,267 @@ test('publish validates identity and writes byte-identical manifests before clea
     assert.equal(copies[0].equals(copies[2]), true);
     assert.equal(JSON.parse(copies[0]).commit, manifest.commit);
     assert.equal(fs.existsSync(sourceDirectory), false);
+});
+
+test('publish requires and preserves the attested ScanOSS backend feature only for tauri-critical', async t => {
+    const browserDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-publish-scanoss-'));
+    t.after(() => fs.promises.rm(browserDirectory, { recursive: true, force: true }));
+    const manifest = profileBuildManifest({ buildId: 'scanoss-publish' });
+    manifest.featureGroups = {
+        ai: { deferredBackendModules: [SCANOSS_BACKEND_DESCRIPTOR] },
+    };
+    manifest.digest = canonicalDigest({
+        schema: 'ride.tauri-frontend-profile@2',
+        profile: manifest.profile,
+        roots: manifest.roots,
+        extensions: manifest.extensions,
+        packages: manifest.packages,
+        featureGroups: manifest.featureGroups,
+    });
+    let sourceDirectory = await createPublishSource(browserDirectory, manifest);
+    await assert.rejects(publishProfileBuild({
+        browserDirectory,
+        expectedProfile: manifest.profile,
+        buildId: manifest.buildId,
+        sourceDirectory,
+        sourceIdentity: async () => manifest.sourceIdentity,
+    }), /deferred backend output.*missing/i);
+
+    await writeDeferredBackendAttestation(sourceDirectory, manifest);
+    await publishProfileBuild({
+        browserDirectory,
+        expectedProfile: manifest.profile,
+        buildId: manifest.buildId,
+        sourceDirectory,
+        sourceIdentity: async () => manifest.sourceIdentity,
+    });
+    assert.equal(
+        await fs.promises.readFile(path.join(browserDirectory, SCANOSS_BACKEND_DESCRIPTOR.output), 'utf8'),
+        'attested-scanoss-feature',
+    );
+
+    const full = profileBuildManifest({ profile: 'full', buildId: 'full-with-scanoss' });
+    full.featureGroups = {
+        ai: { deferredBackendModules: [SCANOSS_BACKEND_DESCRIPTOR] },
+    };
+    full.digest = canonicalDigest({
+        schema: 'ride.tauri-frontend-profile@2',
+        profile: full.profile,
+        roots: full.roots,
+        extensions: full.extensions,
+        packages: full.packages,
+        featureGroups: full.featureGroups,
+    });
+    sourceDirectory = await createPublishSource(browserDirectory, full);
+    const fullFeature = path.join(sourceDirectory, SCANOSS_BACKEND_DESCRIPTOR.output);
+    await fs.promises.mkdir(path.dirname(fullFeature), { recursive: true });
+    await fs.promises.writeFile(fullFeature, 'must-not-publish');
+    await assert.rejects(publishProfileBuild({
+        browserDirectory,
+        expectedProfile: full.profile,
+        buildId: full.buildId,
+        sourceDirectory,
+        sourceIdentity: async () => full.sourceIdentity,
+    }), /full profile.*deferred backend/i);
+});
+
+test('publish re-attests copied deferred backend artifacts before atomic installation', async t => {
+    const mutations = [
+        ['corrupt copied output', async temporaryLib => {
+            await fs.promises.writeFile(path.join(temporaryLib, 'backend', 'scanoss-service-feature.cjs'), 'arbitrary-string-output');
+        }, /hash|attest/i],
+        ['malformed copied metadata', async temporaryLib => {
+            await fs.promises.writeFile(path.join(temporaryLib, 'metadata', 'backend-scanoss.json'), '{');
+        }, /metadata.*malformed/i],
+        ['missing copied metadata', async temporaryLib => {
+            await fs.promises.rm(path.join(temporaryLib, 'metadata', 'backend-scanoss.json'));
+        }, /metadata.*missing/i],
+        ['stale copied build identity', async temporaryLib => {
+            const file = path.join(temporaryLib, 'metadata', 'backend-scanoss.json');
+            const record = JSON.parse(await fs.promises.readFile(file, 'utf8'));
+            record.buildId = 'stale-build';
+            await fs.promises.writeFile(file, JSON.stringify(record));
+        }, /identity/i],
+        ['wrong copied metadata schema', async temporaryLib => {
+            const file = path.join(temporaryLib, 'metadata', 'backend-scanoss.json');
+            const record = JSON.parse(await fs.promises.readFile(file, 'utf8'));
+            record.schema = 'arbitrary-schema';
+            await fs.promises.writeFile(file, JSON.stringify(record));
+        }, /identity|schema/i],
+        ['wrong copied metadata profile', async temporaryLib => {
+            const file = path.join(temporaryLib, 'metadata', 'backend-scanoss.json');
+            const record = JSON.parse(await fs.promises.readFile(file, 'utf8'));
+            record.profile = 'full';
+            await fs.promises.writeFile(file, JSON.stringify(record));
+        }, /identity|profile/i],
+        ['wrong copied metadata digest', async temporaryLib => {
+            const file = path.join(temporaryLib, 'metadata', 'backend-scanoss.json');
+            const record = JSON.parse(await fs.promises.readFile(file, 'utf8'));
+            record.digest = '0'.repeat(64);
+            await fs.promises.writeFile(file, JSON.stringify(record));
+        }, /identity|digest/i],
+        ['wrong copied metadata target', async temporaryLib => {
+            const file = path.join(temporaryLib, 'metadata', 'backend-scanoss.json');
+            const record = JSON.parse(await fs.promises.readFile(file, 'utf8'));
+            record.target = 'backend-arbitrary';
+            await fs.promises.writeFile(file, JSON.stringify(record));
+        }, /identity|target/i],
+        ['arbitrary copied output inventory', async temporaryLib => {
+            const file = path.join(temporaryLib, 'metadata', 'backend-scanoss.json');
+            const record = JSON.parse(await fs.promises.readFile(file, 'utf8'));
+            const detail = record.metafile.outputs[SCANOSS_BACKEND_DESCRIPTOR.output];
+            record.metafile.outputs = { 'lib/backend/arbitrary.cjs': detail };
+            record.outputHashes = { 'lib/backend/arbitrary.cjs': '0'.repeat(64) };
+            await fs.promises.writeFile(file, JSON.stringify(record));
+        }, /output/i],
+        ['wrong copied feature entry', async temporaryLib => {
+            const file = path.join(temporaryLib, 'metadata', 'backend-scanoss.json');
+            const record = JSON.parse(await fs.promises.readFile(file, 'utf8'));
+            record.metafile.outputs[SCANOSS_BACKEND_DESCRIPTOR.output].entryPoint = 'tauri-src/backend/wrong-feature.ts';
+            await fs.promises.writeFile(file, JSON.stringify(record));
+        }, /entry/i],
+        ['missing copied feature entry', async temporaryLib => {
+            const file = path.join(temporaryLib, 'metadata', 'backend-scanoss.json');
+            const record = JSON.parse(await fs.promises.readFile(file, 'utf8'));
+            delete record.metafile.outputs[SCANOSS_BACKEND_DESCRIPTOR.output].entryPoint;
+            await fs.promises.writeFile(file, JSON.stringify(record));
+        }, /entry/i],
+        ['missing copied feature hash', async temporaryLib => {
+            const file = path.join(temporaryLib, 'metadata', 'backend-scanoss.json');
+            const record = JSON.parse(await fs.promises.readFile(file, 'utf8'));
+            delete record.outputHashes[SCANOSS_BACKEND_DESCRIPTOR.output];
+            await fs.promises.writeFile(file, JSON.stringify(record));
+        }, /hash/i],
+        ['wrong copied exact alias edge', async temporaryLib => {
+            const file = path.join(temporaryLib, 'metadata', 'backend.json');
+            const record = JSON.parse(await fs.promises.readFile(file, 'utf8'));
+            const importer = `node_modules/${SCANOSS_BACKEND_DESCRIPTOR.importer}.js`;
+            record.metafile.inputs[importer].imports[0].original = './unrelated-service-impl';
+            await fs.promises.writeFile(file, JSON.stringify(record));
+        }, /alias|import.*record|exact.*edge/i],
+        ['external copied exact alias edge', async temporaryLib => {
+            const file = path.join(temporaryLib, 'metadata', 'backend.json');
+            const record = JSON.parse(await fs.promises.readFile(file, 'utf8'));
+            const importer = `node_modules/${SCANOSS_BACKEND_DESCRIPTOR.importer}.js`;
+            record.metafile.inputs[importer].imports[0].external = true;
+            await fs.promises.writeFile(file, JSON.stringify(record));
+        }, /external|exact.*edge/i],
+        ['non-static copied exact alias edge', async temporaryLib => {
+            const file = path.join(temporaryLib, 'metadata', 'backend.json');
+            const record = JSON.parse(await fs.promises.readFile(file, 'utf8'));
+            const importer = `node_modules/${SCANOSS_BACKEND_DESCRIPTOR.importer}.js`;
+            record.metafile.inputs[importer].imports[0].kind = 'dynamic-import';
+            await fs.promises.writeFile(file, JSON.stringify(record));
+        }, /kind|static.*import|exact.*edge/i],
+        ['unrelated copied proxy input', async temporaryLib => {
+            const file = path.join(temporaryLib, 'metadata', 'backend.json');
+            const record = JSON.parse(await fs.promises.readFile(file, 'utf8'));
+            const importer = `node_modules/${SCANOSS_BACKEND_DESCRIPTOR.importer}.js`;
+            record.metafile.inputs[importer].imports[0].path = 'node_modules/unrelated/scanoss-service-proxy.js';
+            await fs.promises.writeFile(file, JSON.stringify(record));
+        }, /alias|resolved.*proxy|import.*record|exact.*edge/i],
+        ['missing copied runtime inventory', async temporaryLib => {
+            const file = path.join(temporaryLib, 'metadata', 'backend-scanoss.json');
+            const record = JSON.parse(await fs.promises.readFile(file, 'utf8'));
+            const runtime = 'node_modules/tr46/index.js';
+            delete record.metafile.inputs[runtime];
+            delete record.metafile.outputs[SCANOSS_BACKEND_DESCRIPTOR.output].inputs[runtime];
+            await fs.promises.writeFile(file, JSON.stringify(record));
+        }, /runtime|tr46/i],
+        ['absolute copied metadata path', async temporaryLib => {
+            const file = path.join(temporaryLib, 'metadata', 'backend.json');
+            const record = JSON.parse(await fs.promises.readFile(file, 'utf8'));
+            const absolute = String.raw`node-file:L:\R-IDE-builds\dependency-store\browser-node_modules\keytar\keytar.node`;
+            record.metafile.inputs[absolute] = { bytes: 1, imports: [] };
+            record.metafile.outputs['lib/backend/main.js'].inputs[absolute] = { bytesInOutput: 1 };
+            await fs.promises.writeFile(file, JSON.stringify(record));
+        }, /absolute|portable|metadata path/i],
+    ];
+
+    for (const [index, [name, mutate, pattern]] of mutations.entries()) {
+        await t.test(name, async subtest => {
+            const browserDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), `ride-publish-attestation-${index}-`));
+            subtest.after(() => fs.promises.rm(browserDirectory, { recursive: true, force: true }));
+            const manifest = profileBuildManifest({ buildId: `scanoss-copy-${index}` });
+            manifest.featureGroups = { ai: { deferredBackendModules: [SCANOSS_BACKEND_DESCRIPTOR] } };
+            manifest.digest = canonicalDigest({
+                schema: 'ride.tauri-frontend-profile@2',
+                profile: manifest.profile,
+                roots: manifest.roots,
+                extensions: manifest.extensions,
+                packages: manifest.packages,
+                featureGroups: manifest.featureGroups,
+            });
+            const sourceDirectory = await createPublishSource(browserDirectory, manifest, 'source-main');
+            const { featureBytes } = await writeDeferredBackendAttestation(sourceDirectory, manifest);
+            await writeSentinel(path.join(browserDirectory, 'lib'), 'previous-complete-build');
+
+            await assert.rejects(publishProfileBuild({
+                browserDirectory,
+                expectedProfile: manifest.profile,
+                buildId: manifest.buildId,
+                sourceDirectory,
+                sourceIdentity: async () => manifest.sourceIdentity,
+                copyTree: async (source, destination) => {
+                    await fs.promises.cp(source, destination, { recursive: true });
+                    await mutate(destination);
+                },
+            }), pattern, name);
+            assert.equal(await fs.promises.readFile(path.join(browserDirectory, 'lib', 'sentinel.txt'), 'utf8'), 'previous-complete-build');
+            assert.equal(await fs.promises.readFile(path.join(sourceDirectory, SCANOSS_BACKEND_DESCRIPTOR.output), 'utf8'), featureBytes);
+        });
+    }
+});
+
+test('publish re-attests the installed lib and rolls back a post-copy mutation', async t => {
+    const browserDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-publish-installed-attestation-'));
+    t.after(() => fs.promises.rm(browserDirectory, { recursive: true, force: true }));
+    const manifest = profileBuildManifest({ buildId: 'scanoss-installed-mutation' });
+    manifest.featureGroups = { ai: { deferredBackendModules: [SCANOSS_BACKEND_DESCRIPTOR] } };
+    manifest.digest = canonicalDigest({
+        schema: 'ride.tauri-frontend-profile@2',
+        profile: manifest.profile,
+        roots: manifest.roots,
+        extensions: manifest.extensions,
+        packages: manifest.packages,
+        featureGroups: manifest.featureGroups,
+    });
+    const sourceDirectory = await createPublishSource(browserDirectory, manifest, 'source-main');
+    const { featureBytes } = await writeDeferredBackendAttestation(sourceDirectory, manifest);
+    await writeSentinel(path.join(browserDirectory, 'lib'), 'previous-complete-build');
+    let installedMutations = 0;
+    const targetLib = path.join(browserDirectory, 'lib');
+    const filesystem = {
+        ...fs.promises,
+        rename: async (source, destination) => {
+            await fs.promises.rename(source, destination);
+            if (path.resolve(destination) === path.resolve(targetLib)
+                && path.basename(source).startsWith('.lib.tmp-')) {
+                installedMutations += 1;
+                await fs.promises.writeFile(
+                    path.join(destination, 'backend', 'scanoss-service-feature.cjs'),
+                    'mutated-after-pre-install-attestation',
+                );
+            }
+        },
+    };
+
+    await assert.rejects(publishProfileBuild({
+        browserDirectory,
+        expectedProfile: manifest.profile,
+        buildId: manifest.buildId,
+        sourceDirectory,
+        sourceIdentity: async () => manifest.sourceIdentity,
+        transactionOptions: { filesystem },
+    }), /hash|attest|installed validation/i);
+
+    assert.equal(installedMutations, 1);
+    assert.equal(await fs.promises.readFile(path.join(targetLib, 'sentinel.txt'), 'utf8'), 'previous-complete-build');
+    assert.equal(await fs.promises.readFile(path.join(sourceDirectory, SCANOSS_BACKEND_DESCRIPTOR.output), 'utf8'), featureBytes);
+    assert.equal(fs.existsSync(sourceDirectory), true);
+    const installedMarkers = (await fs.promises.readdir(browserDirectory))
+        .filter(name => name.startsWith('.lib.transaction-') && name.includes('-installed-'));
+    assert.deepEqual(installedMarkers, []);
 });
 
 test('publish rejects profile mismatch, stale commit, and corrupt digest without replacing lib', async t => {
@@ -2022,10 +4280,47 @@ test('CLI requires and preserves profile build identity arguments', () => {
         buildId: 'cli-full',
         sourceDirectory: 'C:\\builds\\cli-full',
     });
+    assert.deepEqual(parseProfileCliArguments([
+        'discard', '--build-id', 'cli-failed',
+    ], {}), {
+        command: 'discard',
+        profileName: undefined,
+        buildId: 'cli-failed',
+        sourceDirectory: undefined,
+    });
     assert.throws(() => parseProfileCliArguments(['publish', '--profile', 'full'], {}), /--build-id/i);
     assert.throws(() => parseProfileCliArguments([
         'publish', '--profile', 'full', '--build-id', 'cli-full',
     ], {}), /--source-dir/i);
+});
+
+test('discards only the canonical isolated profile build directory', async t => {
+    const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-profile-discard-'));
+    t.after(() => fs.promises.rm(root, { recursive: true, force: true }));
+    const browserDirectory = path.join(root, 'applications', 'browser');
+    const buildDirectory = path.join(browserDirectory, '.ride-tauri-profile', 'builds', 'failed-build');
+    const siblingDirectory = path.join(browserDirectory, '.ride-tauri-profile', 'builds', 'keep-build');
+    await fs.promises.mkdir(buildDirectory, { recursive: true });
+    await fs.promises.mkdir(siblingDirectory, { recursive: true });
+    await fs.promises.writeFile(path.join(buildDirectory, 'partial.js'), 'partial');
+    await fs.promises.writeFile(path.join(siblingDirectory, 'keep.js'), 'keep');
+
+    assert.deepEqual(await discardProfileBuild({ browserDirectory, buildId: 'failed-build' }), {
+        buildId: 'failed-build',
+        removed: true,
+        targetDirectory: buildDirectory,
+    });
+    assert.equal(fs.existsSync(buildDirectory), false);
+    assert.equal(fs.existsSync(siblingDirectory), true);
+    assert.deepEqual(await discardProfileBuild({ browserDirectory, buildId: 'failed-build' }), {
+        buildId: 'failed-build',
+        removed: false,
+        targetDirectory: buildDirectory,
+    });
+    await assert.rejects(
+        discardProfileBuild({ browserDirectory, buildId: '..' }),
+        /build id is not canonical/i,
+    );
 });
 
 test('generates an isolated target without writing tracked package.json or src-gen', async t => {

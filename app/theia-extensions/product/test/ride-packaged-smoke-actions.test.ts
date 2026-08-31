@@ -12,7 +12,11 @@ import {
     RidePackagedSmokeActions,
     RidePackagedSmokeContribution
 } from '../src/browser/ride-packaged-smoke';
-import type { RideSmokeAction, RideSmokePlan } from '../src/browser/ride-packaged-smoke';
+import type {
+    RideCodexPackagedSmokeDriverLike,
+    RideSmokeAction,
+    RideSmokePlan
+} from '../src/browser/ride-packaged-smoke';
 import { bindRidePackagedSmokeContribution } from '../src/browser/ride-packaged-smoke-bindings';
 import { RIDE_SMOKE_PACKAGED_PLUGIN } from '../src/browser/ride-packaged-plugin-inventory';
 import {
@@ -1417,11 +1421,62 @@ test('smoke action clicks the real startup Retry control and waits for the exist
     assert.equal(clicks, 1);
 });
 
+test('Codex smoke actions delegate the complete ordered contract to the lazy driver', async () => {
+    const calls: string[] = [];
+    const driver: RideCodexPackagedSmokeDriverLike = {
+        run: async (action, smokePlan) => {
+            calls.push(`${action}:${smokePlan.scenario}`);
+        }
+    };
+    const service = new RidePackagedSmokeActionService(workspaceServices({ codexSmoke: driver }));
+    const smokePlan = plan({
+        scenario: 'codex',
+        profile: 'tauri-critical',
+        files: Object.freeze([]),
+        actions: Object.freeze([
+            'codex-inactive',
+            'codex-activate',
+            'codex-stream',
+            'codex-command-approval',
+            'codex-file-approval',
+            'codex-interrupt',
+            'codex-recover',
+            'codex-idle-exit'
+        ])
+    });
+
+    await service.codexInactive(smokePlan);
+    await service.codexActivate(smokePlan);
+    await service.codexStream(smokePlan);
+    await service.codexCommandApproval(smokePlan);
+    await service.codexFileApproval(smokePlan);
+    await service.codexInterrupt(smokePlan);
+    await service.codexRecover(smokePlan);
+    await service.codexIdleExit(smokePlan);
+
+    assert.deepEqual(calls, [
+        'codex-inactive:codex',
+        'codex-activate:codex',
+        'codex-stream:codex',
+        'codex-command-approval:codex',
+        'codex-file-approval:codex',
+        'codex-interrupt:codex',
+        'codex-recover:codex',
+        'codex-idle-exit:codex'
+    ]);
+});
+
 test('smoke action Task 5 methods fail safely when their production services are unavailable', async () => {
     const actions = new RidePackagedSmokeActionService(workspaceServices());
     await assert.rejects(actions.packagedPluginCommand(plan()), /Smoke action unavailable\./);
     await assert.rejects(actions.secondaryWindow(plan()), /Smoke action unavailable\./);
     await assert.rejects(actions.backendRetry(plan()), /Smoke action unavailable\./);
+    await assert.rejects(actions.codexActivate(plan({
+        scenario: 'codex',
+        profile: 'tauri-critical',
+        files: Object.freeze([]),
+        actions: Object.freeze(['codex-activate'])
+    })), /Smoke action unavailable\./);
     await assert.rejects(actions.waitForSecondFile(plan({ files: Object.freeze(['startup.R', 'forwarded.R']) })), /Smoke action unavailable\./);
 });
 

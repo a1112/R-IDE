@@ -1621,10 +1621,10 @@ index 388697a..dec36d4 100644
      }
  }
 diff --git a/theia-extensions/product/src/browser/theia-ide-frontend-module.ts b/theia-extensions/product/src/browser/theia-ide-frontend-module.ts
-index d3c3ed3..eb5cbe1 100644
+index d3c3ed3..20bd124 100644
 --- a/theia-extensions/product/src/browser/theia-ide-frontend-module.ts
 +++ b/theia-extensions/product/src/browser/theia-ide-frontend-module.ts
-@@ -9,41 +9,73 @@
+@@ -9,41 +9,77 @@
  
  import '../../src/browser/style/index.css';
  
@@ -1655,7 +1655,10 @@ index d3c3ed3..eb5cbe1 100644
 +import { RideWorkbenchContribution } from './ride-workbench-contribution';
 +import { bindRidePerformanceContribution } from './ride-performance-contribution';
 +import { bindRideDeferredFeatureLoader } from './ride-deferred-feature-loader';
-+import { bindRidePackagedSmokeContribution } from './ride-packaged-smoke-bindings';
++import {
++    bindRidePackagedSmokeContribution
++} from './ride-packaged-smoke-bindings';
++import { RideCodexPackagedSmokeDriver } from './ride-packaged-smoke';
 +import { bindRideTerminalFrontendContribution } from './ride-terminal-frontend-contribution';
  
  export default new ContainerModule((bind, _unbind, isBound, rebind) => {
@@ -1692,7 +1695,8 @@ index d3c3ed3..eb5cbe1 100644
 +
 +    bindRidePackagedSmokeContribution(bind, {
 +        applicationState: FrontendApplicationStateService,
-+        contribution: FrontendApplicationContribution
++        contribution: FrontendApplicationContribution,
++        codexSmoke: RideCodexPackagedSmokeDriver
 +    });
 +
 +    bindRideDeferredFeatureLoader(bind, {

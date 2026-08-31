@@ -29,6 +29,10 @@ pub struct PerformanceSnapshot {
     pub main: UsageGroup,
     pub backend: UsageGroup,
     pub plugin_host: UsageGroup,
+    pub codex_agent: UsageGroup,
+    pub codex_app_server: UsageGroup,
+    pub codex_sdk: UsageGroup,
+    pub codex_commands: UsageGroup,
     pub other: UsageGroup,
 }
 
@@ -52,6 +56,12 @@ enum ProcessSampleState {
 struct ProcessTopology {
     pid: u32,
     parent_pid: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CodexChannel {
+    AppServer,
+    Sdk,
 }
 
 trait ProcessSource {
@@ -171,15 +181,13 @@ impl<S> SamplerState<S> {
 }
 
 pub struct PerformanceSampler {
-    state: Mutex<SamplerState<System>>,
+    state: Mutex<Option<SamplerState<System>>>,
 }
 
 impl Default for PerformanceSampler {
     fn default() -> Self {
-        let mut system = System::new();
-        system.refresh_cpu_list(CpuRefreshKind::nothing());
         Self {
-            state: Mutex::new(SamplerState::new(system)),
+            state: Mutex::new(None),
         }
     }
 }
@@ -190,7 +198,16 @@ impl PerformanceSampler {
         root_pid: u32,
         backend_pid: Option<u32>,
     ) -> Result<PerformanceSnapshot, String> {
-        snapshot_from_source(&self.state, root_pid, backend_pid)
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "performance sampler mutex is poisoned".to_string())?;
+        let state = state.get_or_insert_with(|| {
+            let mut system = System::new();
+            system.refresh_cpu_list(CpuRefreshKind::nothing());
+            SamplerState::new(system)
+        });
+        snapshot_from_state(state, root_pid, backend_pid)
     }
 }
 
@@ -204,6 +221,7 @@ pub fn ride_performance_snapshot(
     )
 }
 
+#[cfg(test)]
 fn snapshot_from_source<S: ProcessSource>(
     state: &Mutex<SamplerState<S>>,
     root_pid: u32,
@@ -212,6 +230,14 @@ fn snapshot_from_source<S: ProcessSource>(
     let mut state = state
         .lock()
         .map_err(|_| "performance sampler mutex is poisoned".to_string())?;
+    snapshot_from_state(&mut state, root_pid, backend_pid)
+}
+
+fn snapshot_from_state<S: ProcessSource>(
+    state: &mut SamplerState<S>,
+    root_pid: u32,
+    backend_pid: Option<u32>,
+) -> Result<PerformanceSnapshot, String> {
     let SamplerState { source, scratch } = &mut *state;
     scratch.clear();
 
@@ -334,36 +360,59 @@ fn aggregate_snapshot(
         main: UsageGroup::default(),
         backend: UsageGroup::default(),
         plugin_host: UsageGroup::default(),
+        codex_agent: UsageGroup::default(),
+        codex_app_server: UsageGroup::default(),
+        codex_sdk: UsageGroup::default(),
+        codex_commands: UsageGroup::default(),
         other: UsageGroup::default(),
     };
     if !samples_by_pid.contains_key(&root_pid) {
         return snapshot;
     }
 
-    let mut pending = VecDeque::from([root_pid]);
+    let codex_roots = samples_by_pid
+        .values()
+        .filter_map(|sample| codex_channel(sample).map(|channel| (sample.pid, channel)))
+        .collect::<HashMap<_, _>>();
+    let mut pending = VecDeque::from([(root_pid, None)]);
     let mut visited = HashSet::new();
-    while let Some(pid) = pending.pop_front() {
+    while let Some((pid, inherited_codex_channel)) = pending.pop_front() {
         if !visited.insert(pid) {
             continue;
         }
         let Some(sample) = samples_by_pid.get(&pid) else {
             continue;
         };
+        let codex_channel = codex_roots.get(&pid).copied().or(inherited_codex_channel);
 
         add_sample(&mut snapshot.total, sample);
-        let group = if pid == root_pid {
-            &mut snapshot.main
+        if pid == root_pid {
+            add_sample(&mut snapshot.main, sample);
         } else if Some(pid) == backend_pid {
-            &mut snapshot.backend
+            add_sample(&mut snapshot.backend, sample);
         } else if is_plugin_host(sample) {
-            &mut snapshot.plugin_host
+            add_sample(&mut snapshot.plugin_host, sample);
+        } else if let Some(channel) = codex_channel {
+            add_sample(&mut snapshot.codex_agent, sample);
+            if codex_roots.contains_key(&pid) || is_codex_resource_helper(sample) {
+                match channel {
+                    CodexChannel::AppServer => add_sample(&mut snapshot.codex_app_server, sample),
+                    CodexChannel::Sdk => add_sample(&mut snapshot.codex_sdk, sample),
+                }
+            } else {
+                add_sample(&mut snapshot.codex_commands, sample);
+            }
         } else {
-            &mut snapshot.other
-        };
-        add_sample(group, sample);
+            add_sample(&mut snapshot.other, sample);
+        }
 
         if let Some(children) = children_by_parent.get(&pid) {
-            pending.extend(children);
+            pending.extend(
+                children
+                    .iter()
+                    .copied()
+                    .map(|child_pid| (child_pid, codex_channel)),
+            );
         }
     }
 
@@ -371,6 +420,10 @@ fn aggregate_snapshot(
     normalize_cpu(&mut snapshot.main, logical_cpu_count);
     normalize_cpu(&mut snapshot.backend, logical_cpu_count);
     normalize_cpu(&mut snapshot.plugin_host, logical_cpu_count);
+    normalize_cpu(&mut snapshot.codex_agent, logical_cpu_count);
+    normalize_cpu(&mut snapshot.codex_app_server, logical_cpu_count);
+    normalize_cpu(&mut snapshot.codex_sdk, logical_cpu_count);
+    normalize_cpu(&mut snapshot.codex_commands, logical_cpu_count);
     normalize_cpu(&mut snapshot.other, logical_cpu_count);
     snapshot
 }
@@ -389,6 +442,56 @@ fn normalize_cpu(group: &mut UsageGroup, logical_cpu_count: usize) {
     } else {
         (group.cpu_percent / logical_cpu_count as f32).clamp(0.0, 100.0)
     };
+}
+
+fn executable_basename(value: &str) -> &str {
+    value.rsplit(['\\', '/']).next().unwrap_or(value)
+}
+
+fn has_exact_executable_name(sample: &ProcessSample, expected: &str) -> bool {
+    [sample.executable.as_str(), sample.name.as_str()]
+        .iter()
+        .any(|value| executable_basename(value).eq_ignore_ascii_case(expected))
+}
+
+fn has_command_token(command_line: &str, expected: &str) -> bool {
+    command_line
+        .split(|character: char| {
+            character.is_ascii_whitespace() || character == '"' || character == '\''
+        })
+        .any(|token| token.eq_ignore_ascii_case(expected))
+}
+
+fn codex_channel(sample: &ProcessSample) -> Option<CodexChannel> {
+    if !has_exact_executable_name(sample, "codex")
+        && !has_exact_executable_name(sample, "codex.exe")
+    {
+        return None;
+    }
+    if has_command_token(&sample.command_line, "app-server") {
+        Some(CodexChannel::AppServer)
+    } else if has_command_token(&sample.command_line, "exec") {
+        Some(CodexChannel::Sdk)
+    } else {
+        None
+    }
+}
+
+fn is_codex_resource_helper(sample: &ProcessSample) -> bool {
+    [
+        "codex-sandbox",
+        "codex-sandbox.exe",
+        "codex-linux-sandbox",
+        "codex-linux-sandbox.exe",
+        "codex-macos-sandbox",
+        "codex-macos-sandbox.exe",
+        "codex-windows-sandbox",
+        "codex-windows-sandbox.exe",
+        "codex-resource-helper",
+        "codex-resource-helper.exe",
+    ]
+    .iter()
+    .any(|name| has_exact_executable_name(sample, name))
 }
 
 fn is_plugin_host(sample: &ProcessSample) -> bool {
@@ -502,6 +605,45 @@ mod tests {
 
     fn topology(pid: u32, parent_pid: Option<u32>) -> ProcessTopology {
         ProcessTopology { pid, parent_pid }
+    }
+
+    fn codex_root(
+        pid: u32,
+        parent_pid: Option<u32>,
+        mode: &str,
+        memory_bytes: u64,
+    ) -> ProcessSample {
+        let mut process = sample(pid, parent_pid, 1.0, memory_bytes, "codex.exe");
+        process.executable = r"C:\Program Files\Codex\codex.exe".into();
+        process.name = "codex.exe".into();
+        process.command_line = format!("codex.exe {mode} --stdio");
+        process
+    }
+
+    fn codex_resource_helper(
+        pid: u32,
+        parent_pid: Option<u32>,
+        memory_bytes: u64,
+    ) -> ProcessSample {
+        let mut process = sample(pid, parent_pid, 1.0, memory_bytes, "codex-sandbox.exe");
+        process.executable = r"C:\Program Files\Codex\codex-sandbox.exe".into();
+        process.name = "codex-sandbox.exe".into();
+        process.command_line = "codex-sandbox.exe --resource-root C:\\codex".into();
+        process
+    }
+
+    fn codex_tree() -> Vec<ProcessSample> {
+        vec![
+            sample(10, None, 1.0, 10, "ride-tauri"),
+            sample(20, Some(10), 1.0, 20, "node backend"),
+            sample(30, Some(20), 1.0, 30, "node plugin-host"),
+            codex_root(40, Some(20), "app-server", 40),
+            sample(41, Some(40), 1.0, 41, "bash -lc command"),
+            codex_resource_helper(42, Some(40), 42),
+            codex_root(50, Some(20), "exec", 50),
+            sample(51, Some(50), 1.0, 51, "powershell command"),
+            sample(60, Some(10), 1.0, 60, "C:\\tools\\codex-helper.exe"),
+        ]
     }
 
     struct StagedProcessSource {
@@ -867,6 +1009,20 @@ mod tests {
     }
 
     #[test]
+    fn default_sampler_defers_sysinfo_initialization_until_the_first_snapshot() {
+        let sampler = PerformanceSampler::default();
+        assert!(
+            sampler.state.lock().expect("sampler mutex").is_none(),
+            "AppState construction must not refresh the host process inventory"
+        );
+
+        sampler
+            .snapshot(std::process::id(), None)
+            .expect("first lazy snapshot");
+        assert!(sampler.state.lock().expect("sampler mutex").is_some());
+    }
+
+    #[test]
     fn poisoned_sampler_mutex_returns_a_clear_error() {
         let sampler = PerformanceSampler::default();
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1083,6 +1239,105 @@ mod tests {
     }
 
     #[test]
+    fn codex_groups_partition_agent_usage_without_changing_total() {
+        let snapshot = aggregate_snapshot(&codex_tree(), 10, Some(20), 1, 1);
+
+        assert_eq!(snapshot.codex_agent.process_count, 5);
+        assert_eq!(snapshot.codex_app_server.process_count, 2);
+        assert_eq!(snapshot.codex_sdk.process_count, 1);
+        assert_eq!(snapshot.codex_commands.process_count, 2);
+        assert_eq!(snapshot.codex_agent.memory_bytes, 40 + 41 + 42 + 50 + 51);
+        assert_eq!(
+            snapshot.codex_agent.memory_bytes,
+            snapshot.codex_app_server.memory_bytes
+                + snapshot.codex_sdk.memory_bytes
+                + snapshot.codex_commands.memory_bytes
+        );
+        assert_eq!(
+            snapshot.total.memory_bytes,
+            snapshot.main.memory_bytes
+                + snapshot.backend.memory_bytes
+                + snapshot.plugin_host.memory_bytes
+                + snapshot.codex_agent.memory_bytes
+                + snapshot.other.memory_bytes
+        );
+        assert_eq!(snapshot.total.process_count, 9);
+    }
+
+    #[test]
+    fn codex_matching_requires_exact_root_identity_and_preserves_role_precedence() {
+        let mut backend = codex_root(20, Some(10), "exec", 20);
+        backend.command_line = "codex.exe exec".into();
+        let mut plugin_host = codex_root(30, Some(10), "app-server", 30);
+        plugin_host.name = "plugin-host-worker".into();
+        let mut prefixed_binary = sample(40, Some(10), 1.0, 40, "my-codex.exe");
+        prefixed_binary.executable = r"C:\tools\my-codex.exe".into();
+        prefixed_binary.command_line = "my-codex.exe app-server".into();
+        let mut helper_like_binary = sample(50, Some(10), 1.0, 50, "codex-helper.exe");
+        helper_like_binary.executable = r"C:\tools\codex-helper.exe".into();
+        helper_like_binary.command_line = "codex-helper.exe exec".into();
+
+        let snapshot = aggregate_snapshot(
+            &[
+                sample(10, None, 1.0, 10, "ride-tauri"),
+                backend,
+                plugin_host,
+                prefixed_binary,
+                helper_like_binary,
+            ],
+            10,
+            Some(20),
+            1,
+            1,
+        );
+
+        assert_eq!(snapshot.codex_agent, UsageGroup::default());
+        assert_eq!(snapshot.backend.process_count, 1);
+        assert_eq!(snapshot.plugin_host.process_count, 1);
+        assert_eq!(snapshot.other.process_count, 2);
+        assert_eq!(snapshot.total.process_count, 5);
+    }
+
+    #[test]
+    fn conflicting_codex_root_pid_and_descendants_are_excluded_before_attribution() {
+        let mut conflicting = codex_root(40, Some(10), "app-server", 40);
+        conflicting.parent_pid = Some(99);
+        let rows = vec![
+            sample(10, None, 1.0, 10, "ride-tauri"),
+            codex_root(40, Some(10), "app-server", 20),
+            conflicting,
+            sample(41, Some(40), 1.0, 41, "bash command"),
+        ];
+
+        let snapshot = aggregate_snapshot(&rows, 10, None, 1, 1);
+
+        assert_eq!(snapshot.codex_agent, UsageGroup::default());
+        assert_eq!(snapshot.total.process_count, 1);
+        assert_eq!(snapshot.total.memory_bytes, 10);
+    }
+
+    #[test]
+    fn saturated_codex_cpu_is_clamped_without_double_counting_totals() {
+        let mut root = codex_root(20, Some(10), "exec", 20);
+        root.cpu_percent = 400.0;
+        let mut command = sample(21, Some(20), 1.0, 21, "bash command");
+        command.cpu_percent = 400.0;
+        let snapshot = aggregate_snapshot(
+            &[sample(10, None, 400.0, 10, "ride-tauri"), root, command],
+            10,
+            None,
+            1,
+            1,
+        );
+
+        assert_eq!(snapshot.total.cpu_percent, 100.0);
+        assert_eq!(snapshot.codex_agent.cpu_percent, 100.0);
+        assert_eq!(snapshot.codex_sdk.cpu_percent, 100.0);
+        assert_eq!(snapshot.codex_commands.cpu_percent, 100.0);
+        assert_eq!(snapshot.total.memory_bytes, 51);
+    }
+
+    #[test]
     fn serializes_public_fields_with_camel_case_names() {
         let snapshot = aggregate_snapshot(
             &[sample(10, None, 4.0, 10, "ride-tauri")],
@@ -1098,6 +1353,11 @@ mod tests {
         assert_eq!(json["total"]["cpuPercent"], 1.0);
         assert_eq!(json["total"]["memoryBytes"], 10);
         assert_eq!(json["total"]["processCount"], 1);
+        assert_eq!(json["codexAgent"]["processCount"], 0);
+        assert_eq!(json["codexAppServer"]["processCount"], 0);
+        assert_eq!(json["codexSdk"]["processCount"], 0);
+        assert_eq!(json["codexCommands"]["processCount"], 0);
         assert!(json.get("sampled_at_ms").is_none());
+        assert!(json.get("codex_agent").is_none());
     }
 }

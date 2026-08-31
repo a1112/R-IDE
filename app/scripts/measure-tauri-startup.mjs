@@ -17,6 +17,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const REPORT_SCHEMA = 'ride.startup-report';
 const REPORT_VERSIONS = new Set([1, 2, 3]);
+const STARTUP_DIAGNOSTIC_SCHEMA = 'ride.startup-critical-path-diagnostics';
+const STARTUP_DIAGNOSTIC_VERSION = 1;
 const MEASUREMENT_SCHEMA = 'ride.startup-measurement';
 const MEASUREMENT_VERSION = 4;
 const DIAGNOSTICS_OWNER_SCHEMA = 'ride.startup-diagnostics-owner';
@@ -144,6 +146,17 @@ const STARTUP_MODES = new Set(Object.keys(MILESTONE_PREDECESSORS));
 const OPTIONAL_FINAL_MILESTONES = new Set(['target_file_opened']);
 const RUST_PLATFORMS = new Set(['windows', 'linux', 'macos']);
 const RUST_ARCHITECTURES = new Set(['x86_64', 'aarch64']);
+const STARTUP_DIAGNOSTIC_PHASES = Object.freeze([
+  'frontend_initialization_started',
+  'attached_shell_resolved',
+  'workspace_ready',
+  'native_listener_installed',
+  'initial_request_selected',
+  'target_open_started',
+  'target_model_resolved',
+  'target_widget_activated',
+  'target_milestone_requested',
+]);
 const NODE_TO_RUST_PLATFORM = {
   win32: 'windows',
   linux: 'linux',
@@ -234,7 +247,7 @@ function requiredCampaignStartupMode(environment) {
   return undefined;
 }
 
-export function filterSpawnEnvironment(sourceEnvironment, reportPath, runId) {
+export function filterSpawnEnvironment(sourceEnvironment, reportPath, runId, diagnosticPath) {
   const environment = {};
   const sensitiveValues = [];
   for (const [key, value] of Object.entries(sourceEnvironment ?? {})) {
@@ -242,6 +255,12 @@ export function filterSpawnEnvironment(sourceEnvironment, reportPath, runId) {
       continue;
     }
     const serialized = String(value);
+    if (key.toUpperCase() === 'RIDE_STARTUP_DIAGNOSTIC_REPORT') {
+      if (serialized) {
+        sensitiveValues.push(serialized);
+      }
+      continue;
+    }
     if (key.toUpperCase() === 'RIDE_STARTUP_RUN_ID' && serialized) {
       sensitiveValues.push(serialized);
     }
@@ -256,6 +275,9 @@ export function filterSpawnEnvironment(sourceEnvironment, reportPath, runId) {
     environment[key] = serialized;
   }
   environment.RIDE_STARTUP_REPORT = reportPath;
+  if (diagnosticPath !== undefined) {
+    environment.RIDE_STARTUP_DIAGNOSTIC_REPORT = String(diagnosticPath);
+  }
   if (runId !== undefined) {
     const verifiedRunId = validateRunId(runId);
     // Ordinary Tauri, backend, and plugin descendants inherit this marker.
@@ -669,6 +691,101 @@ export function parseStartupReport(
         }
       }
     }
+  }
+  return report;
+}
+
+export function parseStartupDiagnosticReport(
+  serialized,
+  {
+    expectedPlatform = currentRustTarget().platform,
+    expectedArch = currentRustTarget().arch,
+    expectedPid,
+    phase = 'incremental',
+  } = {},
+) {
+  let report;
+  try {
+    report = JSON.parse(serialized);
+  } catch (error) {
+    throw new Error(`startup diagnostic report is not valid JSON: ${error.message}`);
+  }
+  assertPlainObject(report, 'startup diagnostic report');
+  const reportKeys = ['schema', 'version', 'platform', 'arch', 'pid', 'phases'];
+  assertExactKeys(report, new Set(reportKeys), 'diagnostic report');
+  assertRequiredKeys(report, reportKeys, 'startup diagnostic report');
+  if (report.schema !== STARTUP_DIAGNOSTIC_SCHEMA
+      || report.version !== STARTUP_DIAGNOSTIC_VERSION) {
+    throw new Error(
+      `unsupported startup diagnostic report schema ${report.schema}@${report.version}`,
+    );
+  }
+  if (!RUST_PLATFORMS.has(report.platform)) {
+    throw new Error(`unsupported startup diagnostic report platform ${report.platform}`);
+  }
+  if (!RUST_ARCHITECTURES.has(report.arch)) {
+    throw new Error(`unsupported startup diagnostic report architecture ${report.arch}`);
+  }
+  if (report.platform !== expectedPlatform) {
+    throw new Error(
+      `startup diagnostic report platform ${report.platform} does not match expected ${expectedPlatform}`,
+    );
+  }
+  if (report.arch !== expectedArch) {
+    throw new Error(
+      `startup diagnostic report architecture ${report.arch} does not match expected ${expectedArch}`,
+    );
+  }
+  if (!Number.isSafeInteger(report.pid) || report.pid <= 0) {
+    throw new Error('startup diagnostic report pid must be a positive safe integer');
+  }
+  if (expectedPid !== undefined) {
+    if (!Number.isSafeInteger(expectedPid) || expectedPid <= 0) {
+      throw new Error('expected startup diagnostic pid must be a positive safe integer');
+    }
+    if (report.pid !== expectedPid) {
+      throw new Error(
+        `startup diagnostic report pid ${report.pid} does not match expected ${expectedPid}`,
+      );
+    }
+  }
+  if (phase !== 'incremental' && phase !== 'target') {
+    throw new Error(`unsupported startup diagnostic report phase ${phase}`);
+  }
+  assertPlainObject(report.phases, 'startup diagnostic phases');
+  assertExactKeys(report.phases, new Set(STARTUP_DIAGNOSTIC_PHASES), 'diagnostic phase');
+
+  let missingPredecessor;
+  let previousTimestamp = -1;
+  for (const diagnosticPhase of STARTUP_DIAGNOSTIC_PHASES) {
+    if (!Object.hasOwn(report.phases, diagnosticPhase)) {
+      missingPredecessor ??= diagnosticPhase;
+      continue;
+    }
+    const elapsed = report.phases[diagnosticPhase];
+    if (!Number.isSafeInteger(elapsed) || elapsed < 0) {
+      throw new Error(
+        `startup diagnostic phase ${diagnosticPhase} must be a non-negative safe integer`,
+      );
+    }
+    if (missingPredecessor !== undefined) {
+      throw new Error(
+        `startup diagnostic phase ${diagnosticPhase} requires predecessor ${missingPredecessor}`,
+      );
+    }
+    const predecessorIndex = STARTUP_DIAGNOSTIC_PHASES.indexOf(diagnosticPhase) - 1;
+    if (elapsed < previousTimestamp) {
+      const predecessor = STARTUP_DIAGNOSTIC_PHASES[predecessorIndex];
+      throw new Error(
+        `startup diagnostic phase ${diagnosticPhase} timestamp precedes predecessor ${predecessor} timestamp`,
+      );
+    }
+    previousTimestamp = elapsed;
+  }
+  if (phase === 'target' && !STARTUP_DIAGNOSTIC_PHASES.every(
+    diagnosticPhase => Object.hasOwn(report.phases, diagnosticPhase),
+  )) {
+    throw new Error('startup diagnostic report must contain the complete target phase prefix');
   }
   return report;
 }
@@ -2264,6 +2381,46 @@ export async function waitForStartupReport(
   throw new Error(`startup report timeout after ${timeoutMs}ms: ${reportPath}`);
 }
 
+async function waitForStartupDiagnosticReport(
+  reportPath,
+  {
+    timeoutMs = 300_000,
+    pollMs = 100,
+    expectedPlatform,
+    expectedArch,
+    expectedPid,
+  } = {},
+) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() <= deadline) {
+    try {
+      const serialized = await fs.promises.readFile(reportPath, 'utf8');
+      const incremental = parseStartupDiagnosticReport(serialized, {
+        expectedPlatform,
+        expectedArch,
+        expectedPid,
+        phase: 'incremental',
+      });
+      if (STARTUP_DIAGNOSTIC_PHASES.every(
+        diagnosticPhase => Object.hasOwn(incremental.phases, diagnosticPhase),
+      )) {
+        return parseStartupDiagnosticReport(serialized, {
+          expectedPlatform,
+          expectedArch,
+          expectedPid,
+          phase: 'target',
+        });
+      }
+    } catch (error) {
+      if (error.code !== 'ENOENT') {
+        throw error;
+      }
+    }
+    await new Promise(resolve => setTimeout(resolve, pollMs));
+  }
+  throw new Error(`startup diagnostic report timeout after ${timeoutMs}ms: ${reportPath}`);
+}
+
 function waitForReadableEnd(stream, timeoutMs = STREAM_SETTLE_TIMEOUT_MS) {
   if (!stream || stream.readableEnded || stream.closed) {
     return Promise.resolve(true);
@@ -2358,6 +2515,7 @@ export async function launchMeasuredProcess({
   executable,
   codeFile,
   reportPath,
+  diagnosticPath,
   stdoutLogPath,
   stderrLogPath,
   cwd,
@@ -2368,6 +2526,7 @@ export async function launchMeasuredProcess({
     sourceEnvironment,
     reportPath,
     validateRunId(runId),
+    diagnosticPath,
   );
   const child = spawn(executable, [codeFile], {
     cwd,
@@ -2987,6 +3146,7 @@ const defaultMeasurementDependencies = {
   capture: captureProcessIdentity,
   startMonitor: (rootIdentity, { child }) => startProcessTreeMonitor(rootIdentity, { child }),
   waitForReport: waitForStartupReport,
+  waitForDiagnostics: waitForStartupDiagnosticReport,
   delay: milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds)),
   sample: (rootIdentity, { platform, runId, trackedProcesses }) => sampleProcessTree(
     rootIdentity,
@@ -3067,7 +3227,20 @@ export async function measureOnce(options, dependencies = defaultMeasurementDepe
         `final startup report pid ${finalStartupReport.pid} does not match spawned root pid ${rootPid}`,
       );
     }
-    return { startupReport: finalStartupReport, metrics };
+    const startupDiagnostics = options.diagnosticPath === undefined
+      ? undefined
+      : await dependencies.waitForDiagnostics(options.diagnosticPath, {
+        timeoutMs: Math.max(0, deadline - now()),
+        pollMs: options.pollMs,
+        expectedPlatform: options.expectedPlatform,
+        expectedArch: options.expectedArch,
+        expectedPid: rootPid,
+      });
+    return {
+      startupReport: finalStartupReport,
+      metrics,
+      ...(startupDiagnostics === undefined ? {} : { startupDiagnostics }),
+    };
   } finally {
     let trackedProcesses = metrics?.processes ?? [];
     try {
@@ -3120,6 +3293,7 @@ function parseArguments(argv) {
       case '--timeout-ms': options.timeoutMs = positiveInteger(value, '--timeout-ms'); break;
       case '--poll-ms': options.pollMs = positiveInteger(value, '--poll-ms'); break;
       case '--output': options.output = path.resolve(value); break;
+      case '--diagnostics-output': options.diagnosticsOutput = path.resolve(value); break;
       case '--profile-manifest': options.profileManifest = path.resolve(value); break;
       default: throw new Error(`unsupported option ${argument}`);
     }
@@ -3588,17 +3762,33 @@ export async function runMeasurementCampaign(
   } = {},
 ) {
   const executable = path.resolve(options.executable);
+  const diagnosticsOutput = options.diagnosticsOutput === undefined
+    ? undefined
+    : path.resolve(options.diagnosticsOutput);
+  if (diagnosticsOutput !== undefined && diagnosticsOutput === path.resolve(options.output)) {
+    throw new Error('diagnostic campaign output must differ from ordinary measurement output');
+  }
   await clearPreviousCampaignArtifacts(options.output);
+  if (diagnosticsOutput !== undefined) {
+    await Promise.all([
+      fs.promises.rm(diagnosticsOutput, { force: true }),
+      fs.promises.rm(failurePathForOutput(diagnosticsOutput), { force: true }),
+    ]);
+  }
   const campaignId = randomUUID();
   const { sensitiveValues } = filterSpawnEnvironment(environment, 'diagnostic-redaction');
   const { build, host } = validateCampaignMetadata(await readMetadata({ options, executable }));
   const requiredStartupMode = requiredCampaignStartupMode(environment);
   const rawRuns = [];
+  const diagnosticRuns = [];
   for (let runIndex = 1; runIndex <= options.runs; runIndex++) {
     let runId;
     const temporary = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ride-startup-run-'));
     const codeFile = path.join(temporary, `startup-${runIndex}.R`);
     const reportPath = path.join(temporary, 'startup-report.json');
+    const diagnosticPath = diagnosticsOutput === undefined
+      ? undefined
+      : path.join(temporary, 'startup-diagnostic.json');
     const stdoutLogPath = path.join(temporary, 'stdout.log');
     const stderrLogPath = path.join(temporary, 'stderr.log');
     try {
@@ -3611,6 +3801,7 @@ export async function runMeasurementCampaign(
         executable,
         codeFile,
         reportPath,
+        ...(diagnosticPath === undefined ? {} : { diagnosticPath }),
         stdoutLogPath,
         stderrLogPath,
         idleMs: options.idleMs,
@@ -3638,12 +3829,28 @@ export async function runMeasurementCampaign(
         throw new Error('measurement campaign reported mixed effective startup modes');
       }
       validateRoleMetrics(measuredRun?.metrics?.roles, `measurement run ${runIndex}`);
-      rawRuns.push(measuredRun);
+      const { startupDiagnostics, ...ordinaryRun } = measuredRun;
+      if (diagnosticsOutput !== undefined) {
+        if (startupDiagnostics === undefined) {
+          throw new Error(`measurement run ${runIndex} did not return startup diagnostics`);
+        }
+        diagnosticRuns.push(parseStartupDiagnosticReport(
+          JSON.stringify(startupDiagnostics),
+          {
+            expectedPlatform: measuredRun.startupReport.platform,
+            expectedArch: measuredRun.startupReport.arch,
+            expectedPid: measuredRun.startupReport.pid,
+            phase: 'target',
+          },
+        ));
+      }
+      rawRuns.push(ordinaryRun);
     } catch (error) {
       const runSensitiveValues = [
         ...sensitiveValues,
         executable,
         ...(runId === undefined ? [] : [runId]),
+        ...(diagnosticPath === undefined ? [] : [diagnosticPath]),
       ];
       const diagnostic = await preserveFailureDiagnostic({
         options,
@@ -3720,7 +3927,55 @@ export async function runMeasurementCampaign(
       },
     },
   };
-  await writeJsonAtomically(options.output, measurement);
+  let diagnosticCampaign;
+  if (diagnosticsOutput !== undefined) {
+    const runs = diagnosticRuns.map(report => ({
+      phases: { ...report.phases },
+      segments: Object.fromEntries(STARTUP_DIAGNOSTIC_PHASES.slice(1).map(
+        (diagnosticPhase, index) => {
+          const predecessor = STARTUP_DIAGNOSTIC_PHASES[index];
+          return [
+            `${predecessor}_to_${diagnosticPhase}`,
+            report.phases[diagnosticPhase] - report.phases[predecessor],
+          ];
+        },
+      )),
+    }));
+    const segmentNames = Object.keys(runs[0].segments);
+    diagnosticCampaign = {
+      schema: 'ride.startup-critical-path-diagnostic-campaign',
+      version: 1,
+      platform: process.platform,
+      arch: process.arch,
+      build,
+      host,
+      runs,
+      median: {
+        phases: Object.fromEntries(STARTUP_DIAGNOSTIC_PHASES.map(diagnosticPhase => [
+          diagnosticPhase,
+          median(runs.map(run => run.phases[diagnosticPhase])),
+        ])),
+        segments: Object.fromEntries(segmentNames.map(segmentName => [
+          segmentName,
+          median(runs.map(run => run.segments[segmentName])),
+        ])),
+      },
+    };
+  }
+  try {
+    if (diagnosticCampaign !== undefined) {
+      await writeJsonAtomically(diagnosticsOutput, diagnosticCampaign);
+    }
+    await writeJsonAtomically(options.output, measurement);
+  } catch (error) {
+    await Promise.all([
+      fs.promises.rm(options.output, { force: true }),
+      ...(diagnosticsOutput === undefined
+        ? []
+        : [fs.promises.rm(diagnosticsOutput, { force: true })]),
+    ]);
+    throw error;
+  }
   await fs.promises.rm(failurePathForOutput(options.output), { force: true });
   return measurement;
 }
@@ -3740,7 +3995,13 @@ function cliSensitivePaths(argv) {
   const sensitivePaths = [defaultBundleRoot];
   for (let index = 0; index < argv.length - 1; index++) {
     const option = argv[index];
-    if (!['--bundle-root', '--executable', '--profile-manifest'].includes(option)) {
+    if (![
+      '--bundle-root',
+      '--diagnostics-output',
+      '--executable',
+      '--output',
+      '--profile-manifest',
+    ].includes(option)) {
       continue;
     }
     const resolved = path.resolve(argv[index + 1]);

@@ -57,10 +57,15 @@ jobs:
           scripts/test/workflow-policy.test.mjs
           scripts/test/desktop-integration-policy.test.mjs
           scripts/test/appimage-integration.test.mjs
+          app/scripts/test/codex-package-wiring.test.mjs
           app/scripts/test/tauri-permissions.test.mjs
           app/scripts/test/generate-packaged-smoke-plugin.test.mjs
           app/scripts/test/measure-tauri-startup.test.mjs
           app/scripts/test/run-tauri-packaged-smoke.test.mjs
+          app/scripts/test/tauri-packaged-smoke-contract.test.mjs
+          app/scripts/test/verify-codex-packaging.test.mjs
+          app/scripts/test/codex-packaged-smoke.test.mjs
+          app/scripts/test/codex-warm-activation.test.mjs
       - name: Install JavaScript dependencies
         working-directory: app
         run: |
@@ -69,10 +74,12 @@ jobs:
       - name: Lint and build browser compatibility targets
         working-directory: app
         run: |
+          npm --workspace theia-ide-codex-ext test
           npm --workspace theia-extensions/product test
           yarn lint
           yarn build:extensions
           yarn browser build
+          node scripts/verify-codex-packaging.mjs --root applications/browser/lib
       - name: Copy browser frontend for Tauri checks
         working-directory: app
         run: npm --workspace applications/tauri run copy:frontend
@@ -248,6 +255,9 @@ jobs:
       - name: Verify the packaged Tauri application
         working-directory: app
         run: npm --workspace applications/tauri run verify
+      - name: Verify packaged Codex artifact inventory
+        working-directory: app
+        run: node scripts/verify-codex-packaging.mjs --root applications/tauri/resources/backend
       - name: Verify critical Tauri profile inventory
         working-directory: app
         run: npm run verify:tauri-profile -- --expected-profile tauri-critical
@@ -263,6 +273,14 @@ jobs:
           $smokeOutput = 'applications/tauri/src-tauri/target/release/bundle/smoke-diagnostics/critical-file.json'
           New-Item -ItemType Directory -Force -Path (Split-Path -Parent $smokeOutput) | Out-Null
           npm run smoke:tauri-packaged -- --scenario critical-file --output $smokeOutput
+      - name: Run packaged Codex interaction smoke on Windows (manual opt-in)
+        if: runner.os == 'Windows' && github.event_name == 'workflow_dispatch' && inputs.run_windows_packaged_smoke
+        working-directory: app
+        shell: pwsh
+        run: |
+          $smokeOutput = 'applications/tauri/src-tauri/target/release/bundle/smoke-diagnostics/codex.json'
+          New-Item -ItemType Directory -Force -Path (Split-Path -Parent $smokeOutput) | Out-Null
+          npm run smoke:tauri-packaged -- --scenario codex --output $smokeOutput
       - name: Upload Windows packaged smoke diagnostics
         if: failure() && runner.os == 'Windows' && github.event_name == 'workflow_dispatch' && inputs.run_windows_packaged_smoke
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f

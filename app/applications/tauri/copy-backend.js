@@ -23,7 +23,7 @@ const {
 
 const sourceDir = path.resolve(__dirname, '../browser/lib/backend');
 const targetDir = path.resolve(__dirname, 'resources/backend');
-const requiredFiles = ['main.js'];
+const requiredFiles = ['main.js', 'codex-sdk-runtime.mjs'];
 
 function nodePtyPlatformTag() {
   return `${process.platform}-${process.arch}`;
@@ -86,6 +86,31 @@ function patchFrontendStaticPath(destinationRoot) {
   console.log('Patched backend static frontend path for R-IDE desktop runtime.');
 }
 
+function assertCodexSdkRuntimeArtifacts(sourceRoot) {
+  const files = [];
+  const pending = [sourceRoot];
+  while (pending.length > 0) {
+    const directory = pending.pop();
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const absolute = path.join(directory, entry.name);
+      if (entry.isDirectory()) {
+        pending.push(absolute);
+      } else if (entry.isFile()) {
+        files.push(path.relative(sourceRoot, absolute).replaceAll(path.sep, '/'));
+      }
+    }
+  }
+
+  const forbidden = files.find(file => (
+    /(?:^|\/)vendor(?:\/|$)/i.test(file)
+    || /(?:^|\/)codex(?:\.exe)?$/i.test(file)
+    || /(?:^|\/)codex-(?:x64|arm64)(?:\/|$)/i.test(file)
+  ));
+  if (forbidden) {
+    throw new Error(`Codex SDK backend output contains a forbidden native/vendor payload: ${forbidden}.`);
+  }
+}
+
 if (!fs.existsSync(sourceDir)) {
   console.error('Theia backend build directory is missing:');
   console.error(`  - ${sourceDir}`);
@@ -101,6 +126,14 @@ try {
   console.error(`  - ${error.message}`);
   console.error('\nBuild the browser backend first from the app workspace:');
   console.error('  yarn --cwd applications/browser build:prod');
+  process.exit(1);
+}
+
+try {
+  assertCodexSdkRuntimeArtifacts(sourceDir);
+} catch (error) {
+  console.error('Codex SDK backend artifact validation failed:');
+  console.error(`  - ${error.message}`);
   process.exit(1);
 }
 

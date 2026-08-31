@@ -8,6 +8,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { FrontendApplicationStateService } from '@theia/core/lib/browser/frontend-application-state';
 import {
+    RIDE_CODEX_SMOKE_ACTIONS,
     RidePackagedSmokeActions,
     RidePackagedSmokeContribution,
     RidePackagedSmokeProtocol,
@@ -31,6 +32,7 @@ const FULL_ACTIONS: readonly RideSmokeAction[] = [
     'second-file-forwarding'
 ];
 const EMPTY_ACTIONS: readonly RideSmokeAction[] = ['terminal-sentinel', 'packaged-plugin-command'];
+const CODEX_ACTIONS: readonly RideSmokeAction[] = RIDE_CODEX_SMOKE_ACTIONS;
 
 interface ProtocolCall {
     readonly method: 'plan' | 'recordStep' | 'complete';
@@ -72,6 +74,15 @@ function backendRetryPlan(): RideSmokePlan {
     return {
         ...smokePlan(['backend-retry']),
         scenario: 'backend-retry',
+        profile: 'tauri-critical',
+        files: []
+    };
+}
+
+function codexPlan(): RideSmokePlan {
+    return {
+        ...smokePlan([...CODEX_ACTIONS]),
+        scenario: 'codex',
         profile: 'tauri-critical',
         files: []
     };
@@ -320,6 +331,14 @@ function actions(
         packagedPluginCommand: action('packaged-plugin-command'),
         secondaryWindow: action('secondary-window'),
         backendRetry: action('backend-retry'),
+        codexInactive: action('codex-inactive'),
+        codexActivate: action('codex-activate'),
+        codexStream: action('codex-stream'),
+        codexCommandApproval: action('codex-command-approval'),
+        codexFileApproval: action('codex-file-approval'),
+        codexInterrupt: action('codex-interrupt'),
+        codexRecover: action('codex-recover'),
+        codexIdleExit: action('codex-idle-exit'),
         prepareSecondFile: () => ({ dispose: () => undefined }),
         waitForSecondFile: action('second-file-forwarding'),
         ...overrides
@@ -469,6 +488,49 @@ test('packaged smoke executes exact plan order and records proof-carrying transi
             diagnostic: null
         }
     });
+});
+
+test('packaged smoke executes the Codex scenario through the explicit eight-step driver contract', async () => {
+    const plan = codexPlan();
+    const protocol = new FakeProtocol(true, {
+        mode: 'active', plan, sessionProof: PROOF, diagnostic: null
+    });
+    const actionCalls: string[] = [];
+
+    new RidePackagedSmokeContribution(
+        immediateState(),
+        protocol,
+        () => actions(actionCalls),
+        { now: (() => { let now = 0; return () => now++; })() }
+    ).onStart();
+    await waitUntil(() => protocol.calls.some(call => call.method === 'complete'),
+        'Codex smoke did not complete');
+
+    assert.deepEqual(actionCalls, CODEX_ACTIONS);
+    assert.equal(protocol.calls.filter(call => call.method === 'recordStep').length, CODEX_ACTIONS.length * 2);
+});
+
+test('packaged smoke preserves the Codex action service receiver', async () => {
+    const plan = codexPlan();
+    const protocol = new FakeProtocol(true, {
+        mode: 'active', plan, sessionProof: PROOF, diagnostic: null
+    });
+    let observedReceiver: RidePackagedSmokeActions | undefined;
+    const smokeActions = actions([], {
+        async codexInactive(this: RidePackagedSmokeActions): Promise<void> {
+            observedReceiver = this;
+        }
+    });
+
+    new RidePackagedSmokeContribution(
+        immediateState(),
+        protocol,
+        () => smokeActions
+    ).onStart();
+    await waitUntil(() => protocol.calls.some(call => call.method === 'complete'),
+        'Codex smoke did not complete');
+
+    assert.equal(observedReceiver, smokeActions);
 });
 
 test('packaged smoke arms second-file observation before started becomes externally visible', async () => {
@@ -834,7 +896,8 @@ test('packaged smoke binds active plans to the exact cross-language scenario mat
         { ...smokePlan([...FULL_ACTIONS]), scenario: 'critical-file', profile: 'tauri-critical' },
         { ...smokePlan([...EMPTY_ACTIONS]), scenario: 'critical-empty', profile: 'tauri-critical', files: [] },
         { ...smokePlan([...FULL_ACTIONS]), scenario: 'full-file', profile: 'full' },
-        backendRetryPlan()
+        backendRetryPlan(),
+        codexPlan()
     ];
     for (const plan of validPlans) {
         let actionResolutions = 0;
@@ -863,7 +926,10 @@ test('packaged smoke binds active plans to the exact cross-language scenario mat
         { ...validPlans[1], actions: [...FULL_ACTIONS] },
         { ...validPlans[2], profile: 'tauri-critical' },
         { ...validPlans[2], files: [] },
-        { ...validPlans[2], actions: [...EMPTY_ACTIONS] }
+        { ...validPlans[2], actions: [...EMPTY_ACTIONS] },
+        { ...validPlans[4], profile: 'full' },
+        { ...validPlans[4], files: ['first.txt', 'second.txt'] },
+        { ...validPlans[4], actions: [...EMPTY_ACTIONS] }
     ];
     for (const plan of mismatches) {
         let actionResolutions = 0;

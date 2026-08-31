@@ -29,7 +29,7 @@
     "build": "npm run copy:frontend && npm run copy:backend && npm run copy:plugins && npm run tauri -- build",
     "build:prod": "npm run copy:frontend && npm run copy:backend && npm run copy:plugins && npm run tauri -- build",
     "verify": "node verify-build.js",
-    "tauri": "tauri"
+    "tauri": "node run-tauri-cli.js"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.1.0"

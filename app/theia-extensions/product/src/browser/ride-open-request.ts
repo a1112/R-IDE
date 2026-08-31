@@ -39,7 +39,19 @@ export type RideStartupMilestone =
     | 'plugins_started'
     | 'plugins_ready';
 
+export type RideStartupDiagnosticPhase =
+    | 'frontend_initialization_started'
+    | 'attached_shell_resolved'
+    | 'workspace_ready'
+    | 'native_listener_installed'
+    | 'initial_request_selected'
+    | 'target_open_started'
+    | 'target_model_resolved'
+    | 'target_widget_activated'
+    | 'target_milestone_requested';
+
 type StartupMilestoneReporter = (milestone: RideStartupMilestone) => Promise<void>;
+type StartupDiagnosticReporter = (phase: RideStartupDiagnosticPhase) => Promise<void>;
 
 export interface RideDeferredWorkScheduler {
     yield(): Promise<void>;
@@ -145,6 +157,8 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
     protected disposed = false;
     protected unlisten: (() => void) | undefined;
     protected requestChain = Promise.resolve();
+    protected diagnosticChain = Promise.resolve();
+    protected readonly scheduledDiagnosticPhases = new Set<RideStartupDiagnosticPhase>();
     protected acceptedOpenRequest = false;
     protected targetFileOpened = false;
     protected pluginObservationStarted = false;
@@ -168,7 +182,8 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
         protected readonly startupMilestoneReporter: StartupMilestoneReporter = reportRideStartupMilestone,
         protected readonly startHostedPluginResolution: () => void = () => undefined,
         protected readonly pluginDeployment?: RidePluginDeploymentScheduler,
-        protected readonly deferredWorkScheduler: RideDeferredWorkScheduler = DEFAULT_RIDE_DEFERRED_WORK_SCHEDULER
+        protected readonly deferredWorkScheduler: RideDeferredWorkScheduler = DEFAULT_RIDE_DEFERRED_WORK_SCHEDULER,
+        protected readonly startupDiagnosticReporter: StartupDiagnosticReporter = reportRideStartupDiagnostic
     ) {
         this.storage = storage ?? window.sessionStorage;
         this.initializationComplete = new Promise(resolve => {
@@ -183,6 +198,7 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
             return;
         }
         this.started = true;
+        this.reportStartupDiagnostic('frontend_initialization_started');
         this.initializeAfterShellAttached().catch(error => this.reportInitializationFailure(error));
     }
 
@@ -191,6 +207,7 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
         if (this.disposed) {
             return;
         }
+        this.reportStartupDiagnostic('attached_shell_resolved');
         await this.reportStartupMilestone('frontend_shell_attached');
         if (this.disposed) {
             return;
@@ -199,12 +216,14 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
         if (this.disposed) {
             return;
         }
+        this.reportStartupDiagnostic('workspace_ready');
         try {
             const unlisten = await this.nativeChrome.listenForOpenRequests(request => this.enqueueAfterInitialization(request));
             if (this.disposed) {
                 unlisten();
             } else {
                 this.unlisten = unlisten;
+                this.reportStartupDiagnostic('native_listener_installed');
                 await this.nativeChrome.notifyFrontendReady();
             }
         } catch (error) {
@@ -348,6 +367,8 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
 
     protected async openFiles(request: RideOpenRequest): Promise<void> {
         this.cancelPluginFallback();
+        this.reportStartupDiagnostic('initial_request_selected');
+        this.reportStartupDiagnostic('target_open_started');
         let targetWidgetId: string | undefined;
         let targetFile: string | undefined;
         let activatedTargetFile: string | undefined;
@@ -371,10 +392,12 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
                 }
             }
             if (targetWidgetId) {
+                this.reportStartupDiagnostic('target_model_resolved');
                 try {
                     await this.shell.activateWidget(targetWidgetId);
                     editableTarget = true;
                     activatedTargetFile = targetFile;
+                    this.reportStartupDiagnostic('target_widget_activated');
                 } catch (error) {
                     await this.reportErrorSafely(
                         `R-IDE could not activate the opened target: ${errorMessage(error)}`,
@@ -386,6 +409,9 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
             }
             if (editableTarget) {
                 this.targetFileOpened = true;
+                if (activatedTargetFile) {
+                    this.reportStartupDiagnostic('target_milestone_requested');
+                }
                 await this.reportStartupMilestone('target_file_opened');
                 this.schedulePluginActivationAfterYield();
                 const observation = activatedTargetFile
@@ -508,6 +534,18 @@ export class RideOpenRequestContribution implements FrontendApplicationContribut
         } catch (error) {
             console.warn(`[R-IDE] Failed to report startup milestone ${milestone}.`, error);
         }
+    }
+
+    protected reportStartupDiagnostic(phase: RideStartupDiagnosticPhase): void {
+        if (this.disposed || this.scheduledDiagnosticPhases.has(phase)) {
+            return;
+        }
+        this.scheduledDiagnosticPhases.add(phase);
+        this.diagnosticChain = this.diagnosticChain
+            .then(() => this.startupDiagnosticReporter(phase))
+            .catch(error => {
+                console.warn(`[R-IDE] Failed to report startup diagnostic ${phase}.`, error);
+            });
     }
 
     protected async readState(): Promise<RideOpenRequestStateRead> {
@@ -842,6 +880,13 @@ export async function reportRideStartupMilestone(milestone: RideStartupMilestone
         return;
     }
     await invoke('ride_record_startup_milestone', { milestone });
+}
+
+export async function reportRideStartupDiagnostic(phase: RideStartupDiagnosticPhase): Promise<void> {
+    if (typeof window !== 'object' || !isTauriRuntime()) {
+        return;
+    }
+    await invoke('ride_record_startup_diagnostic', { phase });
 }
 
 function observePluginPromise(promise: Promise<void>): Promise<ObservedPluginPromise> {

@@ -6,6 +6,12 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { canonicalDigest, PROFILE_SCHEMA } from './tauri-frontend-profile.mjs';
+import {
+  assertDeferredBackendSourceIdentities,
+  assertPortableMetadataRecord,
+  attestDeferredBackendFeatures,
+  deferredBackendDescriptors as validateDeferredBackendDescriptors,
+} from './tauri-backend-feature-attestation.mjs';
 import { SMOKE_SCENARIOS, SMOKE_SCENARIO_REQUIREMENTS } from './tauri-packaged-smoke-contract.mjs';
 
 const METADATA_SCHEMA = 'ride.esbuild-metafile@1';
@@ -26,6 +32,10 @@ function hasPathSuffix(candidate, expected) {
   const expectedParts = normalize(expected).split('/').filter(Boolean);
   return expectedParts.length <= actualParts.length
     && expectedParts.every((part, index) => part === actualParts[actualParts.length - expectedParts.length + index]);
+}
+
+function deferredBackendDescriptors(manifest) {
+  return validateDeferredBackendDescriptors(manifest);
 }
 
 function readJson(file, label) {
@@ -84,6 +94,7 @@ function readMetadata(metadataDirectory, name, manifest) {
   if (!record.outputHashes || typeof record.outputHashes !== 'object' || Array.isArray(record.outputHashes)) {
     throw new Error(`Tauri ${name} metadata does not contain output hashes.`);
   }
+  assertPortableMetadataRecord(record, `Tauri ${name} metadata`);
   return record;
 }
 
@@ -332,6 +343,10 @@ function verifyDeferredBackendExclusion(manifest, backendRecord) {
   }
 }
 
+function verifyDeferredBackendSources(descriptorRecords, browserDirectory) {
+  assertDeferredBackendSourceIdentities(descriptorRecords, browserDirectory);
+}
+
 function countBundledPlugins(pluginsDirectory) {
   if (!fs.existsSync(pluginsDirectory)) {
     throw new Error(`Bundled plugin directory is missing: ${pluginsDirectory}.`);
@@ -421,8 +436,14 @@ export function verifyTauriProfileInventory({
   }
 
   const metadataDirectory = path.join(resolvedBrowserDirectory, 'lib', 'metadata');
+  const backendDescriptors = deferredBackendDescriptors(manifest);
+  verifyDeferredBackendSources(backendDescriptors, resolvedBrowserDirectory);
+  const metadataTargets = [
+    ...REQUIRED_METADATA,
+    ...backendDescriptors.map(({ descriptor }) => `backend-${descriptor.action}`),
+  ];
   const metadataRecords = Object.fromEntries(
-    REQUIRED_METADATA.map(name => [name, readMetadata(metadataDirectory, name, manifest)]),
+    metadataTargets.map(name => [name, readMetadata(metadataDirectory, name, manifest)]),
   );
   for (const [target, record] of Object.entries(metadataRecords)) {
     verifyAllOutputHashes(record, resolvedBrowserDirectory, target);
@@ -469,8 +490,13 @@ export function verifyTauriProfileInventory({
   const deferredChunks = manifest.profile === 'tauri-critical'
     ? verifyDeferredChunks(manifest, metadataRecords['frontend-main'], resolvedBrowserDirectory)
     : [];
+  let deferredBackendFeatures = [];
   if (manifest.profile === 'tauri-critical') {
     verifyDeferredBackendExclusion(manifest, metadataRecords.backend);
+    deferredBackendFeatures = attestDeferredBackendFeatures({
+      manifest,
+      libDirectory: path.join(resolvedBrowserDirectory, 'lib'),
+    });
   }
   const pluginCount = countBundledPlugins(resolvedPluginsDirectory);
   if (pluginCount === 0) {
@@ -482,7 +508,8 @@ export function verifyTauriProfileInventory({
     digest: manifest.digest,
     pluginCount,
     deferredChunks,
-    metadataTargets: REQUIRED_METADATA,
+    deferredBackendFeatures,
+    metadataTargets,
   };
 }
 

@@ -1,8 +1,8 @@
 diff --git a/applications/browser/esbuild.mjs b/applications/browser/esbuild.mjs
-index 29de656..f40ade0 100644
+index 29de656..504a1f2 100644
 --- a/applications/browser/esbuild.mjs
 +++ b/applications/browser/esbuild.mjs
-@@ -1,16 +1,111 @@
+@@ -1,16 +1,231 @@
  /**
 - * This file can be edited to adjust the ESBuild build process.
 - * To reset, delete this file and rerun theia build again.
@@ -24,7 +24,13 @@ index 29de656..f40ade0 100644
 +import {
 +    createTauriBrowserBuildPlans,
 +} from './tauri-src/esbuild-deferred.mjs';
++import {
++    createTauriBackendBuildPlans,
++    createTauriBuildContexts,
++    runTauriBuildContexts,
++} from './tauri-src/backend/esbuild-backend-deferred.mjs';
 +import { createProfileMetadataPlugin } from './tauri-src/esbuild-metadata.mjs';
++import { createWindowsCaCertsFallbackPlugin } from './tauri-src/windows-ca-certs-fallback.mjs';
  
  import esbuild from 'esbuild';
  
@@ -32,6 +38,11 @@ index 29de656..f40ade0 100644
 +const profileManifest = await loadTauriProfileManifest(__dirname);
 +if (profileManifest) {
 +    const allowedPackages = buildAllowedTheiaPackageSet(profileManifest);
++    // Tauri profile packages are linked from an external dependency store. Keep
++    // the logical node_modules path so esbuild can resolve the matching peer
++    // and runtime dependency tree instead of crossing into another workspace.
++    browserOptions.preserveSymlinks = true;
++    nodeOptions.preserveSymlinks = true;
 +    browserOptions.metafile = true;
 +    nodeOptions.metafile = true;
 +    browserOptions.plugins.unshift(createTauriProfileAuditPlugin({
@@ -55,6 +66,111 @@ index 29de656..f40ade0 100644
 +            profileManifest,
 +            baseDirectory: __dirname,
 +        })],
++    };
++}
++
++const codexSdkRuntimeFilename = 'codex-sdk-runtime.mjs';
++
++function codexSdkRuntimeEntry() {
++    const candidates = [
++        path.join(
++            __dirname,
++            'node_modules',
++            'theia-ide-codex-ext',
++            'lib',
++            'node',
++            'ride-codex-sdk-runtime-entry.js',
++        ),
++        path.resolve(
++            __dirname,
++            '..',
++            '..',
++            'theia-extensions',
++            'codex',
++            'lib',
++            'node',
++            'ride-codex-sdk-runtime-entry.js',
++        ),
++    ];
++    const entry = candidates.find(candidate => fs.existsSync(candidate));
++    if (!entry) {
++        throw new Error(`Codex SDK runtime entry is missing: ${candidates.join(', ')}. Build the Codex extension before bundling the browser backend.`);
++    }
++    return entry;
++}
++
++function normalizeBuildPath(candidate) {
++    return candidate.replaceAll('\\', '/');
++}
++
++function isForbiddenCodexSdkPayload(candidate) {
++    const parts = normalizeBuildPath(candidate).toLowerCase().split('/');
++    const basename = parts[parts.length - 1];
++    return parts.includes('vendor')
++        || basename === 'codex'
++        || basename === 'codex.exe'
++        || parts.includes('codex-x64')
++        || parts.includes('codex-arm64');
++}
++
++function isForbiddenCodexSdkInput(candidate) {
++    const parts = normalizeBuildPath(candidate).toLowerCase().split('/');
++    const packageIndex = parts.lastIndexOf('@openai');
++    return parts[packageIndex + 1] === 'codex-sdk'
++        && (parts.includes('vendor') || parts.includes('resource') || parts.includes('resources'));
++}
++
++function createCodexSdkRuntimeGuardPlugin(outputFile) {
++    const expectedOutput = normalizeBuildPath(path.relative(__dirname, outputFile));
++    return {
++        name: 'ride-codex-sdk-runtime-guard',
++        setup(build) {
++            build.onEnd(result => {
++                if (result.errors.length > 0) {
++                    return;
++                }
++                const outputs = Object.keys(result.metafile?.outputs ?? {});
++                const normalizedOutputs = outputs.map(output => normalizeBuildPath(path.relative(
++                    __dirname,
++                    path.resolve(__dirname, output),
++                )));
++                if (!normalizedOutputs.includes(expectedOutput)) {
++                    throw new Error('Codex SDK runtime bundle is missing its expected output: ' + expectedOutput + '.');
++                }
++                const forbiddenOutput = normalizedOutputs.find(isForbiddenCodexSdkPayload);
++                if (forbiddenOutput) {
++                    throw new Error('Codex SDK runtime bundle attempted to emit a native/vendor payload: ' + forbiddenOutput + '.');
++                }
++                const forbiddenInput = Object.keys(result.metafile?.inputs ?? {}).find(isForbiddenCodexSdkInput);
++                if (forbiddenInput) {
++                    throw new Error('Codex SDK runtime bundle resolved a forbidden native/resource input: ' + forbiddenInput + '.');
++                }
++            });
++        },
++    };
++}
++
++
++function createCodexSdkRuntimeOptions() {
++    const outputFile = path.join(__dirname, 'lib', 'backend', codexSdkRuntimeFilename);
++    const {
++        entryPoints: _entryPoints,
++        outdir: _outdir,
++        outfile: _outfile,
++        plugins: _plugins,
++        ...sharedNodeOptions
++    } = nodeOptions;
++    return {
++        ...sharedNodeOptions,
++        entryPoints: { 'codex-sdk-runtime': codexSdkRuntimeEntry() },
++        outfile: outputFile,
++        bundle: true,
++        format: 'esm',
++        platform: 'node',
++        mainFields: ['node', 'module', 'main'],
++        conditions: ['import'],
++        metafile: true,
++        plugins: [createCodexSdkRuntimeGuardPlugin(outputFile)],
 +    };
 +}
 +
@@ -99,8 +215,12 @@ index 29de656..f40ade0 100644
 +// Prevent Inversify service identifiers from being split across duplicate
 +// @theia package copies in the mixed-version workspace. createRequire resolves
 +// upward from an isolated profile target on every supported platform.
-+browserOptions.plugins.push(createTheiaModuleDedupePlugin(__dirname));
-+nodeOptions.plugins.push(createTheiaModuleDedupePlugin(__dirname));
++// Resolve shared Theia requests before the generated Theia plugins. Those
++// plugins can otherwise resolve through the physical dependency junction and
++// reintroduce a second copy of @theia/core into the bundle.
++browserOptions.plugins.unshift(createTheiaModuleDedupePlugin(__dirname));
++nodeOptions.plugins.unshift(createTheiaModuleDedupePlugin(__dirname));
++nodeOptions.plugins.unshift(createWindowsCaCertsFallbackPlugin({ applicationRoot: __dirname }));
 +nodeOptions.plugins.push({
 +    name: 'ride-tauri-backend-patches',
 +    setup(build) {
@@ -117,7 +237,7 @@ index 29de656..f40ade0 100644
  browserOptions.plugins.push(
      copy({
          assets: [{
-@@ -35,22 +130,37 @@ browserOptions.plugins.push(
+@@ -35,22 +250,46 @@ browserOptions.plugins.push(
      }
  );
  
@@ -127,7 +247,9 @@ index 29de656..f40ade0 100644
 +const browserBuildPlans = profileManifest
 +    ? createTauriBrowserBuildPlans(browserOptions, profileManifest, __dirname)
 +    : { main: browserOptions, classic: [] };
-+const browserContexts = [];
++const backendBuildPlans = profileManifest
++    ? createTauriBackendBuildPlans(nodeOptions, profileManifest, __dirname)
++    : { main: nodeOptions, features: [] };
 +const browserTargets = [
 +    { target: 'frontend-main', options: browserBuildPlans.main },
 +    ...browserBuildPlans.classic.map(options => {
@@ -135,35 +257,51 @@ index 29de656..f40ade0 100644
 +        return { target: `frontend-${targetName}`, options };
 +    }),
 +];
-+for (const { target, options } of browserTargets) {
-+    browserContexts.push(await esbuild.context(withProfileMetadata(options, target)));
-+}
-+const nodeContext = await esbuild.context(withProfileMetadata(nodeOptions, 'backend'));
  
- if (watch) {
-     await Promise.all([
+-if (watch) {
+-    await Promise.all([
 -        browserContext.watch(),
-+        ...browserContexts.map(context => context.watch()),
-         nodeContext.watch(),
-     ]);
- } else {
-     try {
+-        nodeContext.watch(),
+-    ]);
+-} else {
+-    try {
 -        await browserContext.rebuild();
 -        await browserContext.dispose();
-+        for (const browserContext of browserContexts) {
-+            await browserContext.rebuild();
-+            await browserContext.dispose();
-+        }
-         await nodeContext.rebuild();
-         await nodeContext.dispose();
+-        await nodeContext.rebuild();
+-        await nodeContext.dispose();
 -    } catch {
-+    } catch (error) {
-+        console.error(error);
-         process.exit(1);
+-        process.exit(1);
++try {
++    const contextOptions = [
++        ...browserTargets.map(({ target, options }) => withProfileMetadata(options, target)),
++        withProfileMetadata(backendBuildPlans.main, 'backend'),
++        ...backendBuildPlans.features.map(({ action, options }) =>
++            withProfileMetadata(options, `backend-${action}`)),
++        createCodexSdkRuntimeOptions(),
++    ];
++    const buildContexts = await createTauriBuildContexts(
++        contextOptions, options => esbuild.context(options));
++    const dispose = await runTauriBuildContexts(buildContexts, { watch });
++    if (watch) {
++        const shutdown = async signal => {
++            try {
++                await dispose();
++            } catch (error) {
++                console.error(error);
++                process.exitCode = 1;
++                return;
++            }
++            process.exitCode = signal === 'SIGINT' ? 130 : 143;
++        };
++        process.once('SIGINT', () => void shutdown('SIGINT'));
++        process.once('SIGTERM', () => void shutdown('SIGTERM'));
      }
++} catch (error) {
++    console.error(error);
++    process.exitCode = 1;
  }
 diff --git a/applications/browser/package.json b/applications/browser/package.json
-index a4f1a7a..05fa56f 100644
+index a4f1a7a..b7ceec0 100644
 --- a/applications/browser/package.json
 +++ b/applications/browser/package.json
 @@ -2,8 +2,8 @@
@@ -199,7 +337,7 @@ index a4f1a7a..05fa56f 100644
            "files.enableTrash": false,
            "security.workspace.trust.enabled": false
          },
-@@ -47,93 +56,94 @@
+@@ -47,93 +56,95 @@
      }
    },
    "dependencies": {
@@ -277,7 +415,6 @@ index a4f1a7a..05fa56f 100644
 +    "@theia/ai-chat-ui": "1.73.0-next.2",
 +    "@theia/ai-claude-code": "1.73.0-next.2",
 +    "@theia/ai-code-completion": "1.73.0-next.2",
-+    "@theia/ai-codex": "1.73.0-next.2",
 +    "@theia/ai-copilot": "1.73.0-next.2",
 +    "@theia/ai-core": "1.73.0-next.2",
 +    "@theia/ai-core-ui": "1.73.0-next.2",
@@ -343,10 +480,12 @@ index a4f1a7a..05fa56f 100644
 +    "@theia/variable-resolver": "1.73.0-next.2",
 +    "@theia/vsx-registry": "1.73.0-next.2",
 +    "@theia/workspace": "1.73.0-next.2",
++    "date-fns": "4.4.0",
      "fs-extra": "^9.1.0",
 -    "react": "^18.3.1",
 -    "react-dom": "^18.3.1",
 -    "theia-ide-product-ext": "1.74.0"
++    "theia-ide-codex-ext": "1.72.100",
 +    "theia-ide-product-ext": "1.72.100"
    },
    "devDependencies": {
