@@ -629,6 +629,129 @@ test('startup critical-path diagnostic is bound to the measured root after final
   ]);
 });
 
+test('startup critical-path diagnostic campaign is independent and derives adjacent segments', async () => {
+  const root = temporaryDirectory('startup-diagnostic-campaign');
+  const executable = path.join(root, 'R-IDE');
+  const output = path.join(root, 'startup-metrics.json');
+  const diagnosticsOutput = path.join(root, 'startup-critical-path.json');
+  const diagnosticsFailure = path.join(root, 'startup-critical-path.failure.json');
+  touch(executable);
+  fs.writeFileSync(diagnosticsOutput, 'STALE-DIAGNOSTICS');
+  fs.writeFileSync(diagnosticsFailure, 'STALE-FAILURE');
+  const diagnosticPaths = [];
+  let run = 0;
+  try {
+    const measurement = await runMeasurementCampaign({
+      executable,
+      output,
+      diagnosticsOutput,
+      runs: 2,
+      idleMs: 0,
+      timeoutMs: 100,
+      pollMs: 1,
+    }, campaignDependencies({
+      measure: async options => {
+        run++;
+        diagnosticPaths.push(options.diagnosticPath);
+        return {
+          startupReport: startupReport(finalMilestones),
+          startupDiagnostics: startupDiagnosticReport({
+            phases: Object.fromEntries(Object.entries(startupDiagnosticPhases)
+              .map(([phase, elapsed]) => [phase, elapsed + ((run - 1) * 20)])),
+          }),
+          metrics: campaignMetrics(),
+        };
+      },
+    }));
+
+    assert.equal(new Set(diagnosticPaths).size, 2);
+    assert.ok(diagnosticPaths.every(candidate => path.basename(candidate) === 'startup-diagnostic.json'));
+    assert.equal(measurement.runs.some(candidate => Object.hasOwn(candidate, 'startupDiagnostics')), false);
+    assert.equal(fs.readFileSync(output, 'utf8').includes('startup-critical-path'), false);
+
+    const companion = JSON.parse(fs.readFileSync(diagnosticsOutput, 'utf8'));
+    assert.deepEqual(Object.keys(companion), [
+      'schema', 'version', 'platform', 'arch', 'build', 'host', 'runs', 'median',
+    ]);
+    assert.equal(companion.schema, 'ride.startup-critical-path-diagnostic-campaign');
+    assert.equal(companion.version, 1);
+    assert.deepEqual(companion.build, fixtureCampaignMetadata.build);
+    assert.deepEqual(companion.host, fixtureCampaignMetadata.host);
+    assert.deepEqual(companion.runs[0].phases, startupDiagnosticPhases);
+    assert.equal(
+      companion.runs[0].segments.frontend_initialization_started_to_attached_shell_resolved,
+      10,
+    );
+    assert.equal(companion.median.phases.frontend_initialization_started, 110);
+    assert.equal(
+      companion.median.segments.frontend_initialization_started_to_attached_shell_resolved,
+      10,
+    );
+    assert.equal(Object.hasOwn(companion.runs[0], 'pid'), false);
+    assert.equal(fs.existsSync(diagnosticsFailure), false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('startup critical-path diagnostic campaign redacts its private per-run path on failure', async () => {
+  const root = temporaryDirectory('startup-diagnostic-failure');
+  const executable = path.join(root, 'R-IDE');
+  const output = path.join(root, 'startup-metrics.json');
+  const diagnosticsOutput = path.join(root, 'startup-critical-path.json');
+  touch(executable);
+  let privatePath;
+  try {
+    await assert.rejects(
+      runMeasurementCampaign({
+        executable,
+        output,
+        diagnosticsOutput,
+        runs: 1,
+        idleMs: 0,
+        timeoutMs: 100,
+        pollMs: 1,
+      }, campaignDependencies({
+        measure: async options => {
+          privatePath = options.diagnosticPath;
+          throw new Error(`diagnostic failed at ${privatePath}`);
+        },
+      })),
+      error => {
+        assert.equal(String(error.message).includes(privatePath), false);
+        return true;
+      },
+    );
+    const failure = fs.readFileSync(path.join(root, 'startup-metrics.failure.json'), 'utf8');
+    assert.equal(failure.includes(privatePath), false);
+    assert.equal(fs.existsSync(diagnosticsOutput), false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('startup critical-path diagnostic CLI option is accepted before executable validation', () => {
+  const root = temporaryDirectory('startup-diagnostic-cli');
+  const script = path.resolve(import.meta.dirname, '..', 'measure-tauri-startup.mjs');
+  const result = spawnSync(process.execPath, [
+    script,
+    '--diagnostics-output', path.join(root, 'diagnostics.json'),
+    '--executable', path.join(root, 'missing-R-IDE'),
+  ], {
+    cwd: root,
+    encoding: 'utf8',
+    timeout: 10_000,
+    maxBuffer: 4 * 1024 * 1024,
+  });
+  try {
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /Tauri executable does not exist/);
+    assert.doesNotMatch(result.stderr, /unsupported option/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('startup report parser preserves v1 and v2 roots and accepts complete v3 mode phases', () => {
   const target = currentRustTarget();
   const v1 = parseStartupReport(JSON.stringify(historicalStartupReportV1()), {
