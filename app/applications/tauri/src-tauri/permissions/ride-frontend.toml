@@ -24,7 +24,7 @@ commands.allow = ["ride_record_startup_diagnostic"]
 [[permission]]
 identifier = "allow-ride-record-startup-milestone"
 description = "Allows the R-IDE frontend to report an allowlisted startup milestone."
-commands.allow = ["ride_record_startup_milestone"]
+commands.allow = ["ride_record_startup_milestone", "ride_record_startup_diagnostic"]
 
 [[permission]]
 identifier = "allow-ride-show-main-menu"

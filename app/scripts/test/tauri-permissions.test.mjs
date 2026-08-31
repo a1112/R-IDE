@@ -110,7 +110,10 @@ test('remote Tauri frontend receives only audited per-command permissions', asyn
 
   assert.deepEqual([...permissions.keys()].sort(), expectedIdentifiers);
   for (const command of commands) {
-    assert.deepEqual(permissions.get(`allow-${command.replaceAll('_', '-')}`), [command]);
+    const allowedCommands = command === 'ride_record_startup_milestone'
+      ? ['ride_record_startup_milestone', 'ride_record_startup_diagnostic']
+      : [command];
+    assert.deepEqual(permissions.get(`allow-${command.replaceAll('_', '-')}`), allowedCommands);
   }
 
   const capability = JSON.parse(await readFile(path.join(tauriDirectory, 'capabilities', 'default.json'), 'utf8'));
