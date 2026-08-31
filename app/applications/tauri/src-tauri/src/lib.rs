@@ -293,6 +293,7 @@ pub struct AppState {
     pub launch_intent_router: launch_intent::LaunchIntentRouter,
     pub performance: performance::PerformanceSampler,
     pub smoke: smoke::SmokeProtocol,
+    pub startup_diagnostics: startup_diagnostics::StartupDiagnostics,
     pub startup_metrics: startup_metrics::StartupMetrics,
     pub startup_mode: Mutex<startup_metrics::StartupMode>,
     pub gateway: Mutex<Option<startup_gateway::StartupGateway>>,
@@ -306,6 +307,7 @@ impl AppState {
     fn new(
         initial_launch_intent: Option<launch_intent::LaunchIntent>,
         smoke: smoke::SmokeProtocol,
+        startup_diagnostics: startup_diagnostics::StartupDiagnostics,
         startup_metrics: startup_metrics::StartupMetrics,
         startup_mode: startup_metrics::StartupMode,
         runtime_paths: startup::RuntimePaths,
@@ -326,6 +328,7 @@ impl AppState {
             ),
             performance: performance::PerformanceSampler::default(),
             smoke,
+            startup_diagnostics,
             startup_metrics,
             startup_mode: Mutex::new(startup_mode),
             gateway: Mutex::new(None),
@@ -602,6 +605,7 @@ pub fn run() {
         }
     };
     let requested_startup_mode = startup_metrics::StartupMode::from_env();
+    let startup_diagnostics = startup_diagnostics::StartupDiagnostics::from_env();
     let startup_metrics = startup_metrics::StartupMetrics::from_env(requested_startup_mode);
     if let Err(error) = initialize_current_startup_metrics(&startup_metrics, requested_startup_mode)
     {
@@ -662,6 +666,7 @@ pub fn run() {
     let state = AppState::new(
         initial_launch_intent,
         smoke,
+        startup_diagnostics,
         startup_metrics,
         requested_startup_mode,
         runtime_paths,
@@ -886,6 +891,7 @@ pub fn run() {
             native_chrome::ride_start_window_drag,
             native_chrome::ride_window_control,
             native_chrome::ride_frontend_ready,
+            native_chrome::ride_record_startup_diagnostic,
             native_chrome::ride_record_startup_milestone,
             performance::ride_performance_snapshot,
             smoke::ride_smoke_plan,
@@ -1185,6 +1191,13 @@ mod tests {
             AppState::new(
                 Some(initial.clone()),
                 smoke::SmokeProtocol::from_environment(&Default::default(), Path::new(".")),
+                startup_diagnostics::StartupDiagnostics::with_clock(
+                    None,
+                    "test",
+                    "test",
+                    1,
+                    Arc::new(TestClock),
+                ),
                 startup_metrics::StartupMetrics::with_clock(
                     None,
                     "test",
@@ -1281,6 +1294,12 @@ mod tests {
     struct TestClock;
 
     impl startup_metrics::ElapsedClock for TestClock {
+        fn elapsed_ms(&self) -> u64 {
+            0
+        }
+    }
+
+    impl startup_diagnostics::DiagnosticElapsedClock for TestClock {
         fn elapsed_ms(&self) -> u64 {
             0
         }

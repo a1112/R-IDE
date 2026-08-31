@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use tauri::menu::{MenuBuilder, SubmenuBuilder};
 use tauri::{AppHandle, Emitter, LogicalPosition, Manager, WebviewWindow};
 
+use crate::startup_diagnostics::{StartupDiagnosticPhase, StartupDiagnostics};
 use crate::startup_metrics::StartupMilestone;
 use crate::AppState;
 
@@ -89,6 +90,19 @@ pub fn ride_record_startup_milestone(
     app.state::<AppState>()
         .startup_metrics
         .record_or_warn(milestone);
+    Ok(())
+}
+
+fn record_startup_diagnostic(diagnostics: &StartupDiagnostics, phase: StartupDiagnosticPhase) {
+    diagnostics.record_or_warn(phase);
+}
+
+#[tauri::command]
+pub fn ride_record_startup_diagnostic(
+    app: AppHandle,
+    phase: StartupDiagnosticPhase,
+) -> Result<(), String> {
+    record_startup_diagnostic(&app.state::<AppState>().startup_diagnostics, phase);
     Ok(())
 }
 
@@ -265,6 +279,100 @@ pub fn configure_native_window(window: &WebviewWindow) {
 
     #[cfg(all(not(mobile), target_os = "macos"))]
     apply_macos_vibrancy(window);
+}
+
+#[cfg(test)]
+mod startup_diagnostic_tests {
+    use super::*;
+    use crate::startup_diagnostics::{
+        DiagnosticElapsedClock, StartupDiagnosticPhase, StartupDiagnosticReport,
+        StartupDiagnosticReportWriter, StartupDiagnostics,
+    };
+    use crate::startup_metrics::{
+        ElapsedClock, StartupMetrics, StartupMode, StartupReport, StartupReportWriter,
+    };
+    use std::io;
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+
+    #[derive(Debug)]
+    struct FixedClock;
+
+    impl DiagnosticElapsedClock for FixedClock {
+        fn elapsed_ms(&self) -> u64 {
+            7
+        }
+    }
+
+    impl ElapsedClock for FixedClock {
+        fn elapsed_ms(&self) -> u64 {
+            7
+        }
+    }
+
+    struct CapturingDiagnosticWriter(mpsc::Sender<serde_json::Value>);
+
+    impl StartupDiagnosticReportWriter for CapturingDiagnosticWriter {
+        fn write(&mut self, report: &StartupDiagnosticReport) -> io::Result<()> {
+            self.0
+                .send(serde_json::to_value(report).map_err(io::Error::other)?)
+                .map_err(|error| io::Error::other(error.to_string()))
+        }
+    }
+
+    struct CapturingStartupWriter(mpsc::Sender<()>);
+
+    impl StartupReportWriter for CapturingStartupWriter {
+        fn write(&mut self, _report: &StartupReport) -> io::Result<()> {
+            self.0
+                .send(())
+                .map_err(|error| io::Error::other(error.to_string()))
+        }
+    }
+
+    #[test]
+    fn startup_diagnostic_helper_is_safe_when_disabled() {
+        let diagnostics =
+            StartupDiagnostics::with_clock(None, "windows", "x86_64", 7, Arc::new(FixedClock));
+        record_startup_diagnostic(
+            &diagnostics,
+            StartupDiagnosticPhase::FrontendInitializationStarted,
+        );
+    }
+
+    #[test]
+    fn startup_diagnostic_helper_records_only_the_companion_report() {
+        let (diagnostic_sender, diagnostic_receiver) = mpsc::channel();
+        let diagnostics = StartupDiagnostics::with_clock_and_writer(
+            "windows",
+            "x86_64",
+            7,
+            Arc::new(FixedClock),
+            Box::new(CapturingDiagnosticWriter(diagnostic_sender)),
+        );
+        let (startup_sender, startup_receiver) = mpsc::channel();
+        let _startup_metrics = StartupMetrics::with_clock_and_writer(
+            "windows",
+            "x86_64",
+            7,
+            StartupMode::RustGateway,
+            Arc::new(FixedClock),
+            Box::new(CapturingStartupWriter(startup_sender)),
+        );
+
+        record_startup_diagnostic(
+            &diagnostics,
+            StartupDiagnosticPhase::FrontendInitializationStarted,
+        );
+
+        let diagnostic = diagnostic_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("diagnostic snapshot");
+        assert_eq!(diagnostic["phases"]["frontend_initialization_started"], 7);
+        assert!(startup_receiver
+            .recv_timeout(Duration::from_millis(20))
+            .is_err());
+    }
 }
 
 #[cfg(target_os = "macos")]

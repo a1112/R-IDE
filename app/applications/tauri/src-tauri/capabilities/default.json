@@ -13,6 +13,7 @@
     "allow-ride-frontend-ready",
     "allow-ride-performance-snapshot",
     "allow-ride-plugin-directories",
+    "allow-ride-record-startup-diagnostic",
     "allow-ride-record-startup-milestone",
     "allow-ride-show-main-menu",
     "allow-ride-smoke-complete",

@@ -39,6 +39,17 @@ export type RideStartupMilestone =
     | 'plugins_started'
     | 'plugins_ready';
 
+export type RideStartupDiagnosticPhase =
+    | 'frontend_initialization_started'
+    | 'attached_shell_resolved'
+    | 'workspace_ready'
+    | 'native_listener_installed'
+    | 'initial_request_selected'
+    | 'target_open_started'
+    | 'target_model_resolved'
+    | 'target_widget_activated'
+    | 'target_milestone_requested';
+
 type StartupMilestoneReporter = (milestone: RideStartupMilestone) => Promise<void>;
 
 export interface RideDeferredWorkScheduler {
@@ -842,6 +853,13 @@ export async function reportRideStartupMilestone(milestone: RideStartupMilestone
         return;
     }
     await invoke('ride_record_startup_milestone', { milestone });
+}
+
+export async function reportRideStartupDiagnostic(phase: RideStartupDiagnosticPhase): Promise<void> {
+    if (typeof window !== 'object' || !isTauriRuntime()) {
+        return;
+    }
+    await invoke('ride_record_startup_diagnostic', { phase });
 }
 
 function observePluginPromise(promise: Promise<void>): Promise<ObservedPluginPromise> {
