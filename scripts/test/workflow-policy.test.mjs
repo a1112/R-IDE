@@ -126,7 +126,7 @@ test('packaged Tauri builds preserve the complete plugin dependency graph', () =
   assert.match(buildHelper, /RIDE_TAURI_BUILD_ID:\s*buildId/);
   assert.match(buildHelper, /profileDirectory\s*=\s*path\.join\(browserDirectory,\s*['"]\.ride-tauri-profile['"]\)/);
   assert.match(buildHelper, /buildDirectory\s*=\s*path\.join\(profileDirectory,\s*['"]builds['"],\s*buildId\)/);
-  const prepareIndex = buildHelper.indexOf("args: [profileScript, 'prepare'");
+  const prepareIndex = buildHelper.indexOf("profileScript, 'prepare'");
   const rebuildIndex = buildHelper.indexOf("'rebuild:browser'");
   const theiaBuildIndex = buildHelper.indexOf("'build', '--app-target=browser'");
   const publishIndex = buildHelper.indexOf("'publish',", theiaBuildIndex);

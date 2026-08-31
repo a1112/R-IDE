@@ -1,4 +1,5 @@
 *.patch -whitespace
+.upstream/patches/*.patch text eol=lf
 
 # Codex App Server fixtures are byte-attested by their compatibility metadata.
 app/theia-extensions/codex/src/common/generated/app-server/** text eol=lf
