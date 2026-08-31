@@ -147,14 +147,13 @@ export class RideCodexAuthBroker {
             const token = this.#beginCallerAuthOperation();
             return this.#readAccountForToken(token, false);
         })();
-        let tracked!: Promise<RideCodexAuthSnapshot>;
-        tracked = operation.finally(() => {
+        const tracked = operation.finally(() => {
             if (this.#activationPromise === tracked) {
                 this.#activationPromise = undefined;
             }
         });
         this.#activationPromise = tracked;
-        void tracked.catch(() => undefined);
+        tracked.catch(() => undefined);
         return tracked;
     }
 
@@ -382,7 +381,7 @@ export class RideCodexAuthBroker {
         this.#leasePromise = operation.finally(() => {
             this.#leasePromise = undefined;
         });
-        void this.#leasePromise.catch(() => undefined);
+        this.#leasePromise.catch(() => undefined);
         return this.#leasePromise;
     }
 
@@ -438,7 +437,7 @@ export class RideCodexAuthBroker {
     #startNotificationAccountRefresh(context: NotificationAccountRefreshContext): void {
         this.#notificationAccountRefreshFlight = context;
         const operation = this.#readAccountForNotification(context);
-        void operation.finally(() => {
+        operation.finally(() => {
             if (this.#notificationAccountRefreshFlight !== context) {
                 return;
             }
@@ -579,7 +578,7 @@ export class RideCodexAuthBroker {
         }
         if (event.state === 'ready') {
             const token = invalidated ? this.#callerAuthOperation : this.#beginCallerAuthOperation();
-            void this.#readAccountForToken(token, false).catch(() => undefined);
+            this.#readAccountForToken(token, false).catch(() => undefined);
             return;
         }
         if (event.state === 'restarting' || event.state === 'stopped'

@@ -305,20 +305,20 @@ export class RideCodexThreadCoordinator {
     async selectThread(threadId: string | null): Promise<void> {
         this.#requireUsable();
         if (threadId === null) {
-            const changed = this.#selectedThreadId !== undefined;
+            const selectionChanged = this.#selectedThreadId !== undefined;
             this.#selectedThreadId = undefined;
             this.#selectionRevision += 1;
-            if (changed) {
+            if (selectionChanged) {
                 this.#publish();
             }
             return;
         }
         const id = requiredStandaloneIdentifier(threadId, 'Codex thread id', MAX_ID_LENGTH);
         if (!this.#threads.has(id)) {
-            const changed = this.#selectedThreadId !== undefined;
+            const selectionChanged = this.#selectedThreadId !== undefined;
             this.#selectedThreadId = undefined;
             this.#selectionRevision += 1;
-            if (changed) {
+            if (selectionChanged) {
                 this.#publish();
             }
             throw new RideCodexConversationsError('thread-unavailable');
@@ -397,22 +397,22 @@ export class RideCodexThreadCoordinator {
             } catch {
                 throw new RideCodexConversationsError('operation-failed');
             }
-            const binding = acquiring.then(lease => {
-                let generation: number;
+            const binding = acquiring.then(acquiredLease => {
+                let leaseGeneration: number;
                 try {
-                    generation = requireGeneration(lease.generation);
+                    leaseGeneration = requireGeneration(acquiredLease.generation);
                 } catch (error) {
-                    releaseLeaseSafely(lease);
+                    releaseLeaseSafely(acquiredLease);
                     throw error;
                 }
-                if (!active.bind(lease, generation)) {
+                if (!active.bind(acquiredLease, leaseGeneration)) {
                     throw new RideCodexConversationsError(
                         this.#disposed ? 'disposed' : 'operation-superseded'
                     );
                 }
-                return Object.freeze({ lease, generation });
+                return Object.freeze({ lease: acquiredLease, generation: leaseGeneration });
             });
-            void binding.catch(() => undefined);
+            binding.catch(() => undefined);
             const { lease, generation } = await Promise.race([binding, active.invalidated]);
             this.#requireOperation(lifecycle, generation);
             const pending = lease.request(method, params);
@@ -444,7 +444,7 @@ export class RideCodexThreadCoordinator {
         const invalidation = new Promise<never>((_resolve, reject) => {
             rejectInvalidated = reject;
         });
-        void invalidation.catch(() => undefined);
+        invalidation.catch(() => undefined);
         const active: ActiveThreadRequest = {
             generation: undefined,
             invalidated: invalidation,
@@ -701,7 +701,7 @@ export class RideCodexThreadCoordinator {
             this.#restartRefreshGeneration = event.generation;
             const generation = event.generation;
             const selectionRevision = this.#selectionRevision;
-            void this.#refreshSelectedThread(selected, generation, selectionRevision);
+            this.#refreshSelectedThread(selected, generation, selectionRevision);
         }
     }
 
@@ -769,11 +769,11 @@ function normalizeModel(value: unknown): RideCodexModel {
     if (!supportedReasoningEfforts.some(option => option.effort === defaultReasoningEffort)) {
         throw new RideCodexConversationsError('invalid-data');
     }
-    const inputModalities = Object.freeze(requireArray(ownValue(record, 'inputModalities'), 4).map(value => {
-        if (value !== 'text' && value !== 'image') {
+    const inputModalities = Object.freeze(requireArray(ownValue(record, 'inputModalities'), 4).map(modality => {
+        if (modality !== 'text' && modality !== 'image') {
             throw new RideCodexConversationsError('invalid-data');
         }
-        return value;
+        return modality;
     }));
     const serviceTiers = Object.freeze(requireArray(ownValue(record, 'serviceTiers'), 32).map(normalizeServiceTier));
     const defaultServiceTier = nullableString(ownValue(record, 'defaultServiceTier'), MAX_MODEL_LENGTH);

@@ -281,12 +281,14 @@ test('non-Windows package jobs validate smoke contracts without claiming interac
 
 test('Tauri verification builds and inventories full fallback before the critical profile', () => {
   const workflow = readTauriWorkflow();
+  const codexBuild = workflow.indexOf('- name: Build Codex extension');
   const fullBuild = workflow.indexOf('- name: Build full-profile fallback backend');
   const fullVerify = workflow.indexOf('- name: Verify full-profile inventory');
   const criticalBuild = workflow.indexOf('- name: Build critical-profile backend');
   const criticalVerify = workflow.indexOf('- name: Verify critical-profile inventory');
   const nativeBuild = workflow.indexOf('- name: Build Tauri debug application');
-  assert.ok(fullBuild >= 0, 'full fallback build is required');
+  assert.ok(codexBuild >= 0, 'Codex extension build is required for the full fallback profile');
+  assert.ok(fullBuild > codexBuild, 'full fallback build must follow the Codex extension build');
   assert.ok(fullVerify > fullBuild, 'full fallback inventory must follow its build');
   assert.ok(criticalBuild > fullVerify, 'critical profile must be rebuilt after full fallback verification');
   assert.ok(criticalVerify > criticalBuild, 'critical inventory must follow its build');

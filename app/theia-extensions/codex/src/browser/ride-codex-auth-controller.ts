@@ -156,7 +156,7 @@ export class RideCodexAuthController implements RideCodexAuthClient {
         const generation = ++this.#activationGeneration;
         const operation = this.#activateOnce(generation);
         this.#activation = operation;
-        void operation.catch(() => undefined);
+        operation.catch(() => undefined);
         return operation;
     }
 

@@ -126,7 +126,6 @@ export class RideCodexBoundedExecRunner implements RideCodexProbeCommandRunner {
             let outputBytes = 0;
             let settled = false;
             let terminalReason: RideCodexProbeFailureReason | undefined;
-            let operationTimer: ReturnType<typeof setTimeout> | undefined;
             let terminationGraceTimer: ReturnType<typeof setTimeout> | undefined;
             let terminationHardTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -253,7 +252,7 @@ export class RideCodexBoundedExecRunner implements RideCodexProbeCommandRunner {
             child.once('error', onError);
             child.once('close', onClose);
             child.once('exit', onExit);
-            operationTimer = setTimeout(() => terminate('timeout'), limits.timeoutMs);
+            const operationTimer = setTimeout(() => terminate('timeout'), limits.timeoutMs);
             limits.signal?.addEventListener('abort', onAbort, { once: true });
             if (limits.signal?.aborted) {
                 onAbort();

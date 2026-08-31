@@ -1271,7 +1271,6 @@ async function settlesWithin(promise: Promise<void>, timeoutMs: number): Promise
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<false>(resolve => {
         timer = setTimeout(() => resolve(false), timeoutMs);
-        timer.unref?.();
     });
     const settled = await Promise.race([promise.then(() => true as const), timeout]);
     if (timer) {

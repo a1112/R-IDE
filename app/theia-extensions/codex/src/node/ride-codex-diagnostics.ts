@@ -369,24 +369,24 @@ function readCredentialAssignment(value: string, start: number): CredentialAssig
 function readCredentialValueEnd(value: string, start: number, authorizationField: boolean): number {
     const quote = value[start] === '"' || value[start] === "'" ? value[start] : undefined;
     if (quote !== undefined) {
-        let index = start + 1;
-        while (index < value.length) {
-            if (value[index] === '\\') {
-                index = Math.min(value.length, index + 2);
-            } else if (value[index] === quote) {
-                return index + 1;
+        let quotedIndex = start + 1;
+        while (quotedIndex < value.length) {
+            if (value[quotedIndex] === '\\') {
+                quotedIndex = Math.min(value.length, quotedIndex + 2);
+            } else if (value[quotedIndex] === quote) {
+                return quotedIndex + 1;
             } else {
-                index += 1;
+                quotedIndex += 1;
             }
         }
         return value.length;
     }
     if (authorizationField) {
-        let index = start;
-        while (index < value.length && value[index] !== '\r' && value[index] !== '\n') {
-            index += 1;
+        let lineIndex = start;
+        while (lineIndex < value.length && value[lineIndex] !== '\r' && value[lineIndex] !== '\n') {
+            lineIndex += 1;
         }
-        return index;
+        return lineIndex;
     }
     let index = start;
     while (index < value.length && !isCredentialValueDelimiter(value[index])) {

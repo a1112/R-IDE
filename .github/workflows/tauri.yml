@@ -75,6 +75,9 @@ jobs:
       - name: Build product extension
         run: npm --workspace theia-extensions/product run build
 
+      - name: Build Codex extension
+        run: npm --workspace theia-extensions/codex run build
+
       - name: Build full-profile fallback backend
         run: npm --workspace applications/browser run build:tauri-backend
         env:

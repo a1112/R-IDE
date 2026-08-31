@@ -331,8 +331,7 @@ export class RideCodexRuntimeResolver {
         }
         if (this.inFlightResolution) {
             const previous = this.inFlightResolution;
-            let queued!: Promise<RideCodexLaunchSpec>;
-            queued = previous.then(
+            const queued = previous.then(
                 () => undefined,
                 () => undefined
             ).then(() => {

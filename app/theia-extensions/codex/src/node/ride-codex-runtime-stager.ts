@@ -979,7 +979,7 @@ export class RideCodexRuntimeArchiveExtractor {
                 firstEntryError ??= error;
             };
             entry.on('error', recordEntryError);
-            void this.processEntry(
+            this.processEntry(
                 header,
                 entry,
                 stagingRoot,

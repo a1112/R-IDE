@@ -150,7 +150,6 @@ export class RideCodexJsonlClient implements RideCodexDisposable {
                 this.pending.delete(id);
                 reject(new Error(`Codex request ${id} timed out after ${timeoutMs} ms`));
             }, timeoutMs);
-            timer.unref?.();
             entry = { resolve, reject, timer };
             this.pending.set(id, entry);
             this.writePayload(payload);
