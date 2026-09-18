@@ -673,7 +673,7 @@ pub fn run() {
     );
 
     let builder = configure_activation_builder(
-        tauri::Builder::default(),
+        tauri::Builder::default().plugin(project_window_chrome::init()),
         tauri_plugin_single_instance::init(|app, args, cwd| {
             let state = app.state::<AppState>();
             let report = state.launch_intent_router.route_forwarded_args(
@@ -1489,3 +1489,5 @@ mod tests {
         assert_eq!(error, "backend ownership mutex is poisoned");
     }
 }
+
+mod project_window_chrome;

@@ -21,7 +21,7 @@ use crate::startup_gateway::{
 };
 use crate::startup_metrics::{StartupMetricError, StartupMetrics, StartupMode, StartupRustPhase};
 
-pub const GATEWAY_CAPABILITY_PERMISSIONS: [&str; 12] = [
+pub const GATEWAY_CAPABILITY_PERMISSIONS: [&str; 21] = [
     "core:event:allow-listen",
     "core:event:allow-unlisten",
     "allow-ride-frontend-ready",
@@ -34,6 +34,15 @@ pub const GATEWAY_CAPABILITY_PERMISSIONS: [&str; 12] = [
     "allow-ride-smoke-record-step",
     "allow-ride-start-window-drag",
     "allow-ride-window-control",
+    "core:window:allow-is-decorated",
+    "core:window:allow-is-resizable",
+    "core:window:allow-is-maximized",
+    "core:window:allow-is-fullscreen",
+    "core:window:allow-is-focused",
+    "core:window:allow-is-maximizable",
+    "core:window:allow-start-dragging",
+    "core:window:allow-internal-toggle-maximize",
+    "core:window:allow-start-resize-dragging",
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
