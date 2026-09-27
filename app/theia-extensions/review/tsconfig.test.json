@@ -1,0 +1,5 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "composite": false, "rootDir": ".", "outDir": "test/dist", "declaration": false, "declarationMap": false },
+  "include": ["src/common/**/*.ts", "src/node/repository-*.ts", "src/node/review-store.ts", "src/node/review-ai.ts", "test/**/*.ts"]
+}

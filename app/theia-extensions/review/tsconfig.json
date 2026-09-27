@@ -1,0 +1,8 @@
+{
+  "extends": "../../configs/base.tsconfig",
+  "compilerOptions": {
+    "rootDir": "src", "outDir": "lib", "baseUrl": ".", "esModuleInterop": true,
+    "paths": { "@theia/*": ["../../applications/browser/node_modules/@theia/*"] }
+  },
+  "include": ["src/**/*.ts", "src/**/*.tsx"]
+}

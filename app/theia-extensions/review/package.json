@@ -1,0 +1,24 @@
+{
+  "private": true,
+  "name": "theia-ide-review-ext",
+  "version": "1.72.100",
+  "description": "Local repository synchronization and snapshot code review",
+  "license": "MIT",
+  "dependencies": {
+    "@theia/core": "1.73.0-next.2",
+    "@theia/editor": "1.73.0-next.2",
+    "@theia/filesystem": "1.73.0-next.2",
+    "@theia/workspace": "1.73.0-next.2",
+    "theia-ide-codex-ext": "1.72.100"
+  },
+  "devDependencies": { "typescript": "~5.9.3", "rimraf": "^2.7.1" },
+  "peerDependencies": { "react": "^18.3.1 || ^19.0.0" },
+  "theiaExtensions": [{ "frontend": "lib/browser/review-frontend-module", "backend": "lib/node/review-backend-module" }],
+  "scripts": {
+    "build": "tsc -b",
+    "test": "rimraf test/dist && tsc -p tsconfig.test.json && node --test test/dist/test/*.test.js",
+    "lint": "eslint --ext ts,tsx src",
+    "update:theia": "ts-node ../../scripts/update-theia-version.ts",
+    "update:next": "ts-node ../../scripts/update-theia-version.ts next"
+  }
+}

@@ -9,6 +9,7 @@ applications/browser/tauri-src/
 docs/codex-runtime.md
 patches/@theia+terminal+1.72.1.patch
 theia-extensions/codex/
+theia-extensions/review/
 theia-extensions/product/src/browser/ride-deferred-feature-loader.ts
 theia-extensions/product/src/browser/ride-native-chrome.ts
 theia-extensions/product/src/browser/ride-open-request-bindings.ts

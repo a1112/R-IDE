@@ -9,6 +9,7 @@
         "@theia/ai-claude-code",
         "@theia/ai-code-completion",
         "theia-ide-codex-ext",
+        "theia-ide-review-ext",
         "@theia/ai-copilot",
         "@theia/ai-core-ui",
         "@theia/ai-editor",

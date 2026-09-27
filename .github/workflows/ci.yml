@@ -75,6 +75,7 @@ jobs:
         working-directory: app
         run: |
           npm --workspace theia-ide-codex-ext test
+          npm --workspace theia-ide-review-ext test
           npm --workspace theia-extensions/product test
           yarn lint
           yarn build:extensions

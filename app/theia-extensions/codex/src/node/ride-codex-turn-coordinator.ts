@@ -97,6 +97,7 @@ export class RideCodexTurnError extends Error {
 }
 
 interface ClientRecord {
+    readonly reviewPolicy?: Readonly<{ threadId: string; cwd: string; outputSchema: unknown }>;
     readonly id: number;
     readonly client: RideCodexTurnClient;
     connected: boolean;
@@ -193,6 +194,7 @@ const SAFE_FAILURE: RideCodexSafeError = Object.freeze({
 });
 
 export class RideCodexTurnCoordinator {
+    readonly #reviewThreads = new Set<string>();
     readonly #host: RideCodexTurnHost;
     readonly #scheduler: RideCodexTurnScheduler;
     readonly #timers: RideCodexTurnTimers;
@@ -262,6 +264,35 @@ export class RideCodexTurnCoordinator {
     }
 
     connectClient(client: RideCodexTurnClient): RideCodexTurnsService {
+        return this.#connectClient(client);
+    }
+
+    /** Backend-only capability; deliberately absent from the frontend RPC service. */
+    connectReadOnlyClient(client: RideCodexTurnClient, policy: Readonly<{
+        threadId: string; cwd: string; outputSchema: unknown;
+    }>): RideCodexTurnsService & { cancelPending(): Promise<void> } {
+        this.#reviewThreads.add(policy.threadId);
+        const session = this.#connectClient(client, Object.freeze({ ...policy }));
+        return Object.freeze({ ...session, cancelPending: async () => {
+            const active = this.#active;
+            if (!active || active.owner.client !== client) {
+                return;
+            }
+            if (active.turnId) {
+                await this.#interruptTurn(active.owner, { threadId: active.threadId, turnId: active.turnId });
+            } else if (active.generation !== undefined) {
+                // A start request may have reached the server without its response. Hold
+                // the shared recovery barrier until the exact process has been replaced.
+                const recovery = this.#beginRecovery(active.threadId, active.generation);
+                this.#finishActive('interrupted');
+                await recovery;
+            } else {
+                this.#finishActive('interrupted');
+            }
+        } });
+    }
+
+    #connectClient(client: RideCodexTurnClient, reviewPolicy?: ClientRecord['reviewPolicy']): RideCodexTurnsService {
         this.#requireUsable();
         this.#requireNoRecovery();
         if (!client || typeof client.turnEvents !== 'function') {
@@ -271,6 +302,7 @@ export class RideCodexTurnCoordinator {
             throw new RideCodexTurnError('operation-failed');
         }
         const record: ClientRecord = {
+            reviewPolicy,
             id: this.#nextClientId++, client, connected: true, inFlight: false,
             inFlightIdentity: undefined, deliveryVersion: 0, pending: [], pendingBytes: 0,
             droppedEvents: 0, droppedBytes: 0
@@ -338,6 +370,9 @@ export class RideCodexTurnCoordinator {
             throw new RideCodexTurnError('turn-active');
         }
         const request = normalizeStartRequest(input);
+        if (owner.reviewPolicy ? request.threadId !== owner.reviewPolicy.threadId : this.#reviewThreads.has(request.threadId)) {
+            throw new RideCodexTurnError('turn-unavailable');
+        }
         const active = this.#newActive(owner, request.threadId);
         this.#active = active;
         try {
@@ -345,6 +380,12 @@ export class RideCodexTurnCoordinator {
             const lease = await Promise.race([acquiring, active.invalidated]);
             const params = Object.freeze({
                 threadId: request.threadId,
+                ...(owner.reviewPolicy ? {
+                    cwd: owner.reviewPolicy.cwd,
+                    approvalPolicy: 'never',
+                    sandboxPolicy: { type: 'readOnly', networkAccess: false },
+                    outputSchema: owner.reviewPolicy.outputSchema
+                } : {}),
                 ...(request.clientMessageId === undefined ? {} : { clientUserMessageId: request.clientMessageId }),
                 input: Object.freeze(request.input.map(toServerInput))
             });
@@ -554,6 +595,10 @@ export class RideCodexTurnCoordinator {
             }
             remainingRecoveryTimeout(this.#timers, startedAt, this.#recoveryTimeoutMs);
             this.#generation = generation;
+            if (this.#reviewThreads.has(threadId)) {
+                // Ephemeral reviews cannot be resumed, especially with default policies.
+                return;
+            }
             acquiring = Promise.resolve(this.#host.acquire('foreground-panel'));
             acquiring.catch(() => undefined);
             lease = await Promise.race([acquiring, stopped]);

@@ -78,6 +78,11 @@ jobs:
       - name: Build Codex extension
         run: npm --workspace theia-extensions/codex run build
 
+      - name: Test and build repository review extension
+        run: |
+          npm --workspace theia-extensions/review test
+          npm --workspace theia-extensions/review run build
+
       - name: Build full-profile fallback backend
         run: npm --workspace applications/browser run build:tauri-backend
         env:

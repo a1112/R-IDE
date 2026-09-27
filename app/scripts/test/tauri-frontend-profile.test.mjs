@@ -397,7 +397,8 @@ test('highlight.js belongs to one dynamically reached Markdown feature output', 
     });
 
     const outputs = new Map(Object.entries(result.metafile.outputs).map(([name, detail]) => [name.replaceAll('\\', '/'), detail]));
-    const entryOutput = [...outputs].find(([, detail]) => detail.entryPoint?.replaceAll('\\', '/') === entry.replaceAll('\\', '/'))?.[0];
+    const entryOutput = [...outputs].find(([, detail]) => detail.entryPoint
+        && path.resolve(browserDirectory, detail.entryPoint) === path.resolve(entry))?.[0];
     assert.ok(entryOutput, 'main preview proxy output must exist');
     const resolveOutputImport = (from, imported) => {
         const direct = imported.path.replaceAll('\\', '/');

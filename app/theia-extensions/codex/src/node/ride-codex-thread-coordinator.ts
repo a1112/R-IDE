@@ -109,6 +109,12 @@ interface ActiveThreadRequest {
 }
 
 export class RideCodexThreadCoordinator {
+    readonly #reviewThreads = new Set<string>();
+
+    /** Keep backend-owned ephemeral reviews out of the writable conversation API. */
+    protectReviewThread(threadId: string): void {
+        this.#reviewThreads.add(threadId);
+    }
     readonly #host: RideCodexThreadHost;
     readonly #pathStyle: 'win32' | 'posix';
     readonly #listeners: RideCodexDisposable[] = [];
@@ -264,6 +270,9 @@ export class RideCodexThreadCoordinator {
         this.#requireUsable();
         const record = requirePlainOptions(request, THREAD_RESUME_KEYS, 'Codex thread-resume request');
         const threadId = requiredIdentifier(record, 'threadId', MAX_ID_LENGTH);
+        if (this.#reviewThreads.has(threadId)) {
+            throw new RideCodexConversationsError('thread-unavailable');
+        }
         const cwd = normalizeWorkspaceCwd(record, this.#pathStyle);
         const model = optionalIdentifier(record, 'model', MAX_MODEL_LENGTH);
         const serviceTier = optionalIdentifier(record, 'serviceTier', MAX_MODEL_LENGTH);

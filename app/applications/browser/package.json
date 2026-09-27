@@ -129,6 +129,7 @@
     "date-fns": "4.4.0",
     "fs-extra": "^9.1.0",
     "theia-ide-codex-ext": "1.72.100",
+    "theia-ide-review-ext": "1.72.100",
     "theia-ide-product-ext": "1.72.100"
   },
   "devDependencies": {
