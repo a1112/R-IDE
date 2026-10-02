@@ -27,6 +27,14 @@ import { createWindowsCaCertsFallbackPlugin } from './tauri-src/windows-ca-certs
 
 import esbuild from 'esbuild';
 
+// The browser renderer and all React hooks must share the React 18 runtime.
+// Some workspace packages installed React 19 as a nested peer dependency.
+browserOptions.alias = {
+    ...(browserOptions.alias ?? {}),
+    react: path.resolve(__dirname, '../../node_modules/react'),
+    'react-dom': path.resolve(__dirname, '../../node_modules/react-dom'),
+};
+
 const profileManifest = await loadTauriProfileManifest(__dirname);
 if (profileManifest) {
     const allowedPackages = buildAllowedTheiaPackageSet(profileManifest);
