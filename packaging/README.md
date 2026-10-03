@@ -6,7 +6,7 @@ Build with Node 24.15.0, Yarn Classic 1.22.22, Python 3.12, Rust 1.94.1 and Visu
 python packaging/build_windows.py
 ```
 
-The Windows CA certificate addon requires Visual Studio's Spectre runtime libraries by default. On a preview build machine without that optional toolchain component, an explicit `--allow-no-spectre-libraries` option keeps `/Qspectre` on the addon compilation and links the installed regular MSVC runtime libraries. `build-info.json` records this limitation; use the default build with Spectre libraries for the hardened release. This option does not install or alter the global compiler.
+The existing Tauri build uses Node's public certificate store when the optional Windows CA certificate addon is unavailable. This preview follows that existing fallback; custom Windows certificate roots and enterprise proxy integration remain unverified. The build does not weaken vendor compiler options or install global compiler components.
 
 Keep the complete payload tree together: `ride-tauri.exe`, `resources/backend` (including Node, node-pty and backend modules), `resources/plugins`, `lib/frontend`, `package.json` and notices. The frontend profile and plugins are verified using the project's existing packaged-smoke protocols. The build skips unused Electron/browser downloads, then builds the actual Tauri frontend and backend.
 

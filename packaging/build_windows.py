@@ -7,14 +7,13 @@ APP=ROOT/'app'
 TAURI=APP/'applications/tauri'
 PAYLOAD=ROOT/'artifacts/payload'
 
-def run(arguments,cwd=APP,extra_environment=None):
+def run(arguments,cwd=APP):
     env={**os.environ,'RUSTUP_TOOLCHAIN':'1.94.1','CARGO_BUILD_JOBS':'4',
          'ELECTRON_SKIP_BINARY_DOWNLOAD':'1','PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD':'1','PUPPETEER_SKIP_DOWNLOAD':'1',
          'PATH':str(NODE.parent)+os.pathsep+os.environ['PATH']}
-    env.update(extra_environment or {})
     subprocess.run([str(item) for item in arguments],cwd=cwd,env=env,check=True)
 
-def install_runtime_dependencies(yarn,allow_no_spectre_libraries):
+def install_runtime_dependencies(yarn):
     # Electron's test driver has an unconditional network install script. It is
     # not part of Tauri; execute only the actual browser/runtime install steps.
     run([NODE,yarn,'install','--frozen-lockfile','--ignore-scripts','--network-timeout','100000'])
@@ -28,17 +27,9 @@ def install_runtime_dependencies(yarn,allow_no_spectre_libraries):
     python=['--python='+os.environ.get('RIDE_BUILD_PYTHON',os.sys.executable)]
     for name in ('drivelist','native-keymap'):
         run([NODE,gyp,'rebuild','-j','4',*python],APP/'node_modules'/name)
-    package=APP/'node_modules/@vscode/windows-ca-certs'
-    if allow_no_spectre_libraries:
-        run([NODE,gyp,'configure',*python],package)
-        configuration=json.loads('\n'.join(line for line in (package/'build/config.gypi').read_text().splitlines() if not line.startswith('#')))
-        # Keep /Qspectre on our addon compilation. This explicitly permitted
-        # preview fallback links the installed regular MSVC runtime libraries.
-        run([configuration['variables']['msbuild_path'],package/'build/binding.sln',
-             '/p:Configuration=Release;Platform=x64','/p:SpectreMitigation=false',
-             '/nodeReuse:false','/m:4','/nologo'],package,{'CL':'/Qspectre'})
-    else:
-        run([NODE,gyp,'rebuild','-j','4',*python],package)
+    # The tracked Tauri build already handles the optional Windows CA addon
+    # through Node's certificate store. Do not weaken vendor compiler settings
+    # or install global Spectre libraries for an unused optional addon.
 
 def required(path):
     if not path.is_file() or path.stat().st_size==0: raise RuntimeError(f'Missing real build output: {path}')
@@ -84,15 +75,13 @@ def main():
     parser.add_argument('--skip-web-build',action='store_true')
     parser.add_argument('--stage-only',action='store_true')
     parser.add_argument('--yarn-cli',type=Path)
-    parser.add_argument('--allow-no-spectre-libraries',action='store_true',
-                        help='Preview only: retain /Qspectre for CA addon, link regular installed MSVC runtime libraries')
     options=parser.parse_args()
     NODE=Path(shutil.which('node')).resolve()
     npm=NODE.parent/'node_modules/npm/bin/npm-cli.js'
     yarn=options.yarn_cli or Path(shutil.which('yarn.cmd')).parent/'node_modules/yarn/bin/yarn.js'
     required(npm); required(yarn)
     if not options.stage_only:
-        if not options.skip_install: install_runtime_dependencies(yarn,options.allow_no_spectre_libraries)
+        if not options.skip_install: install_runtime_dependencies(yarn)
         if not options.skip_web_build:
             run([NODE,yarn,'download:plugins'])
             run([NODE,npm,'run','build:extensions'])
@@ -124,7 +113,7 @@ def main():
               'pluginCount':len(plugins),'nodePtyNativeFiles':[str(item.relative_to(TAURI/'resources/backend')).replace('\\','/') for item in pty],
               'requiredFiles':['resources/backend/runtime/node.exe','resources/backend/main.js','resources/plugins','lib/frontend'],
               'userData':'RIDE_CONFIG_DIR or current-user ~/.ride-tauri; downloaded plugins in ~/.ride',
-               'caAddonBuild':{'spectreCompiler':True,'spectreRuntimeLibraries':not options.allow_no_spectre_libraries},
+               'caCertificates':'Existing Tauri Node.js certificate-store fallback; Windows custom roots unverified',
               'externalCapabilities':['WebView2','User-configured Git/language runtimes/AI services']}
     (PAYLOAD/'build-info.json').write_text(json.dumps(metadata,indent=2)+'\n',encoding='utf-8')
     print(PAYLOAD)
