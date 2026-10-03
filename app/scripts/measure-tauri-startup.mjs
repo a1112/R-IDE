@@ -1902,8 +1902,11 @@ function readProcessTable(
   }
   const COMMAND_TIMEOUT_MS = Math.min(SYNC_COMMAND_TIMEOUT_MS, timeoutMs);
   if (platform === 'win32') {
+    // Prefer installed PowerShell 7 for bounded, noninteractive CIM queries.
+    // Windows PowerShell startup can stall on this host under build load.
+    const modernShell = path.join(process.env.ProgramFiles ?? 'C:\\Program Files', 'PowerShell', '7', 'pwsh.exe');
     const result = spawnSync(
-      'powershell.exe',
+      fs.existsSync(modernShell) ? modernShell : 'powershell.exe',
       [
         '-NoLogo',
         '-NoProfile',

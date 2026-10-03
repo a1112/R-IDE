@@ -13,7 +13,7 @@ This is host acceptance; a clean Windows machine and macOS/Linux remain pending.
 | Backend retry | Complete protocol: one document lifecycle, generation 1 to 2, a different owned Node root, two spawns, ready PID equals new root and zero old-tree processes |
 | Exit | Native window WM_CLOSE exits normally; forced owned-main termination leaves no observed owned descendants |
 | Startup failures | Missing Node, missing backend entry and an owned port-3000 fixture produce specific errors, no Node child and no foreign-process termination |
-| Unit/static checks | 552 Node tests including 9 archive safety tests; 381 Rust tests passed, 1 ignored; Rust format and Python syntax checks pass |
+| Unit/static checks | 554 Node script/packaging tests including 9 archive safety and 2 glob compatibility tests; 275 product-extension tests; 381 Rust tests passed, 1 ignored; source ESLint, Rust format and Python syntax checks pass |
 
 An earlier `critical-file` run timed out before forwarding progress; its logs and
 failure record remain in `artifacts/critical-file-diagnostics-*`. A subsequent
@@ -24,6 +24,9 @@ independent startup report: the fault had been injected at shell attachment,
 before full workbench initialization. A regression test now requires workbench
 `ready` before the native crash step is committed; startup-report validation
 remains mandatory in the final packaged driver.
+The host's Windows PowerShell process query also once timed out during identity
+capture; measurements prefer installed PowerShell 7 while retaining exact PID
+and creation-time ownership checks and the Windows PowerShell fallback.
 One failure-path run passed all three native checks but its temporary WebView2
 folder cleanup raced a final filesystem write. The driver now retries cleanup
 of its validated, owned temporary folder without hiding persistent failures.
@@ -48,6 +51,9 @@ Legacy decompressor code is replaced with a private CommonJS API bridge to
 release. Tar 7.5.21 replaces tar 6; the old SCANOSS ESM import is adapted, while
 the exact feature-graph verification remains enabled. The 318-to-277 exclusive
 input change is explained by 42 tar-6 inputs being replaced by one tar-7 module.
+Brace-expansion 5.0.12 retains its safety checks and named exports; a scoped
+CommonJS compatibility bridge also supplies the callable API used by old
+minimatch and ESLint. Both interfaces and actual legacy file globs are tested.
 Temporary-fixture tests verify ordinary tar/VSIX extraction and reject parent
 traversal, external archive links and pre-existing output junctions. Build-source
 attestation and installed bridge byte comparison prevent stale local caches.
