@@ -30,7 +30,7 @@ def run(arguments,cwd=APP):
 def install_runtime_dependencies(yarn):
     # Electron's test driver has an unconditional network install script. It is
     # not part of Tauri; execute only the actual browser/runtime install steps.
-    run([NODE,yarn,'install','--frozen-lockfile','--ignore-scripts','--network-timeout','100000'])
+    run([NODE,yarn,'install','--frozen-lockfile','--ignore-scripts','--registry','https://registry.npmjs.org','--network-timeout','100000'])
     patch=APP/'node_modules/patch-package/index.js'
     run([NODE,patch,'--patch-dir','node_modules/@theia/cli/patches'])
     run([NODE,patch,'--patch-dir','patches'])

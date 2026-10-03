@@ -1576,7 +1576,19 @@ export async function generateProfileTarget({
             version: browserManifest.version,
             license: browserManifest.license,
             engines: browserManifest.engines,
-            theia: browserManifest.theia,
+            theia: {
+                ...browserManifest.theia,
+                frontend: {
+                    ...browserManifest.theia?.frontend,
+                    config: {
+                        ...browserManifest.theia?.frontend?.config,
+                        // The Rust gateway restarts only its owned backend. A
+                        // browser-style reload destroys the live desktop UI and
+                        // its one-shot native smoke session during recovery.
+                        reloadOnReconnect: false,
+                    },
+                },
+            },
             dependencies,
             devDependencies,
         };

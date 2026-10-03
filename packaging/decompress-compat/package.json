@@ -1,0 +1,10 @@
+{
+  "name": "@ride/decompress-compat",
+  "version": "1.0.0",
+  "private": true,
+  "license": "MIT",
+  "main": "index.cjs",
+  "dependencies": {
+    "@xhmikosr/decompress": "10.2.2"
+  }
+}

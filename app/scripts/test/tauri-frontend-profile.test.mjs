@@ -4342,7 +4342,10 @@ test('generates an isolated target without writing tracked package.json or src-g
         version: '1.0.0',
         dependencies: { product: '^1.0.0', shared: '^1.0.0' },
         devDependencies: { '@theia/cli': '^1.0.0' },
-        theia: { generator: { config: { preloadTemplate: './resources/preload.html' } } },
+        theia: {
+            generator: { config: { preloadTemplate: './resources/preload.html' } },
+            frontend: { config: { applicationName: 'fixture', reloadOnReconnect: true } },
+        },
     }, null, 2));
     await fs.promises.writeFile(path.join(browserDirectory, 'tauri-profile.json'), JSON.stringify({
         schema: 'ride.tauri-frontend-profile@2',
@@ -4385,7 +4388,10 @@ test('generates an isolated target without writing tracked package.json or src-g
     const generatedPackage = JSON.parse(await fs.promises.readFile(path.join(result.targetDirectory, 'package.json'), 'utf8'));
     assert.deepEqual(generatedPackage.dependencies, { shared: '1.2.3', product: '^1.0.0' });
     assert.deepEqual(generatedPackage.devDependencies, { '@theia/cli': '^1.0.0' });
-    assert.deepEqual(generatedPackage.theia, { generator: { config: { preloadTemplate: './resources/preload.html' } } });
+    assert.deepEqual(generatedPackage.theia, {
+        generator: { config: { preloadTemplate: './resources/preload.html' } },
+        frontend: { config: { applicationName: 'fixture', reloadOnReconnect: false } },
+    });
     assert.equal(generatedPackage.scripts, undefined);
     assert.ok(fs.existsSync(path.join(result.targetDirectory, 'esbuild.mjs')));
     assert.ok(fs.existsSync(path.join(result.targetDirectory, 'tauri-esbuild-profile-audit.mjs')));
