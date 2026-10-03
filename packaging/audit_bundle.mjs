@@ -13,6 +13,7 @@ const hash = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
 const packages = new Map();
 const manifests = [];
 let positiveInputs = 0;
+const virtualInputs = [];
 const attestation = JSON.parse(fs.readFileSync(path.join(browser, 'lib/ride-tauri-profile.json'), 'utf8'));
 
 for (const name of fs.readdirSync(path.join(browser, 'lib/metadata')).filter(name => name.endsWith('.json')).sort()) {
@@ -33,6 +34,10 @@ for (const name of fs.readdirSync(path.join(browser, 'lib/metadata')).filter(nam
     for (const [input, contribution] of Object.entries(info.inputs ?? {})) {
       if (!(contribution.bytesInOutput > 0)) continue;
       positiveInputs++;
+      if (/^[a-z][a-z\d-]*:/i.test(input)) {
+        virtualInputs.push({ input, output, bytesInOutput: contribution.bytesInOutput });
+        continue;
+      }
       if (!input.replaceAll('\\', '/').includes('node_modules/')) continue;
       let logicalFile = path.resolve(build, input);
       if (!fs.existsSync(logicalFile) && input.startsWith('node_modules/')) {
@@ -42,7 +47,12 @@ for (const name of fs.readdirSync(path.join(browser, 'lib/metadata')).filter(nam
         const segments = input.slice('node_modules/'.length).split('/');
         const requestName = segments[0].startsWith('@') ? segments.splice(0, 2).join('/') : segments.shift();
         if (!attestation.extensions.includes(requestName)) throw new Error(`Unknown removed build junction: ${input}`);
-        const installed = await resolveInstalledManifest(requestName, browser);
+        let installed = await resolveInstalledManifest(requestName, browser);
+        while (segments[0] === 'node_modules') {
+          segments.shift();
+          const nestedName = segments[0].startsWith('@') ? segments.splice(0, 2).join('/') : segments.shift();
+          installed = await resolveInstalledManifest(nestedName, installed.packageDirectory);
+        }
         logicalFile = path.join(installed.packageDirectory, ...segments);
       }
       if (!fs.existsSync(logicalFile)) throw new Error(`Unable to resolve actual contributed input: ${input}`);
@@ -59,12 +69,14 @@ for (const name of fs.readdirSync(path.join(browser, 'lib/metadata')).filter(nam
       }
       if (!manifest) throw new Error(`Input has no attributable package: ${input}`);
       const { value } = manifest;
-      if (!attestation.packages.some(item => item.packageName === value.name && item.version === value.version)) {
+      const declaredIdentities = attestation.packages.filter(item => item.packageName === value.name);
+      if (declaredIdentities.length && !declaredIdentities.some(item => item.version === value.version)) {
         throw new Error(`Installed input identity differs from build attestation: ${value.name}@${value.version}`);
       }
       const key = value.name + '@' + value.version;
       if (!packages.has(key)) packages.set(key, { name: value.name, version: value.version,
-        private: value.private === true, packageJsonSha256: hash(fs.readFileSync(path.join(manifest.directory, 'package.json'))),
+        private: value.private === true, identityInDeclaredGraph: declaredIdentities.length > 0,
+        packageJsonSha256: hash(fs.readFileSync(path.join(manifest.directory, 'package.json'))),
         inputs: new Map() });
       packages.get(key).inputs.set(input, { file: input, sha256: hash(fs.readFileSync(logicalFile)), output, bytesInOutput: contribution.bytesInOutput });
     }
@@ -93,7 +105,7 @@ for (const item of inventory) {
 }
 const report = { schema: 'ride.bundle-audit@1', auditedAt: new Date().toISOString(), endpoint,
   scope: 'Positive esbuild bytesInOutput only; excludes separately copied plugin/runtime dependencies and private local source',
-  positiveInputs, metadata: manifests, packages: inventory, findings,
+  positiveInputs, virtualInputs, metadata: manifests, packages: inventory, findings,
   privateLocalPackages: inventory.filter(item => item.private).map(({ name, version, packageJsonSha256, inputs }) => ({ name, version, packageJsonSha256, inputs })),
   advisoryResponseSha256: hash(raw) };
 fs.writeFileSync(path.join(root, 'artifacts/bundle-audit-response.json'), raw + '\n');

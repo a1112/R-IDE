@@ -1054,6 +1054,24 @@ test('default log validation rejects sidecar failure text without exposing the t
   }
 });
 
+test('log validation distinguishes forwarded reconnect warnings from native sidecar failures', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ride-smoke-reconnect-logs-'));
+  const stdoutLogPath = path.join(root, 'stdout.log');
+  const stderrLogPath = path.join(root, 'stderr.log');
+  const options = { run: { token: 'secret-value' }, instances: [{ stdoutLogPath, stderrLogPath,
+    logCapture: { persist: async () => undefined } }] };
+  fs.writeFileSync(stdoutLogPath, '');
+  try {
+    fs.writeFileSync(stderrLogPath, '[WARN ride_tauri::sidecar] Backend stderr: root ERROR Failed to load plugins: Error: reconnecting channel\n');
+    await validatePackagedSmokeLogs(options);
+    for (const text of ['[ERROR ride_tauri::sidecar] Failed to start backend: missing Node',
+      '[ERROR ride_tauri::sidecar] Backend process exited before ready', 'sidecar launch failed']) {
+      fs.writeFileSync(stderrLogPath, text + '\n');
+      await assert.rejects(validatePackagedSmokeLogs(options), /Backend sidecar failed/);
+    }
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('successful orchestration removes its real temporary workspace', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ride-smoke-cleanup-'));
   const executable = path.join(root, 'R-IDE.exe');
