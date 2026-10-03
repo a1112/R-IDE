@@ -61,7 +61,7 @@ const SCANOSS_BACKEND_DESCRIPTOR = Object.freeze({
         'tar',
         'tr46',
     ]),
-    exclusiveInputCount: 318,
+    exclusiveInputCount: 277,
 });
 
 test('Tauri preview profile replaces only the eager frontend module with a lazy Markdown proxy', () => {
@@ -880,7 +880,7 @@ test('rejects ambiguous, unsafe, or non-CJS deferred backend edge declarations',
         ['runtimePackages', ['scanoss/lib/index'], /runtime package.*canonical/i],
         ['runtimePackages', ['scanoss', '@grpc/grpc-js'], /runtime packages.*sorted/i],
         ['exclusiveInputCount', 0, /exclusive input count.*positive integer/i],
-        ['exclusiveInputCount', 318.5, /exclusive input count.*positive integer/i],
+        ['exclusiveInputCount', 277.5, /exclusive input count.*positive integer/i],
     ]) {
         assert.throws(
             () => resolveProfile(input([{ ...SCANOSS_BACKEND_DESCRIPTOR, [field]: value }])),
