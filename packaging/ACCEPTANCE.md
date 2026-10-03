@@ -1,42 +1,62 @@
-# Windows preview acceptance — incomplete
+# Windows preview acceptance
 
-The payload is an internal acceptance build, not an approved public release.
+Verified on the current Windows x64 host with temporary working directories,
+isolated `RIDE_CONFIG_DIR` and WebView2 data, and a child PATH without Node.
+This is host acceptance; a clean Windows machine and macOS/Linux remain pending.
 
-Verified on the current Windows x64 machine with an isolated `RIDE_CONFIG_DIR`,
-isolated WebView2 data, temporary working directory and a PATH without Node:
+| Check | Evidence |
+| --- | --- |
+| Production build | Tauri release executable, compiled Theia frontend/backend and four product extensions |
+| Runtime | Bundled Node 24.15.0, actual Node-pty native addon, 70 VS Code plugins |
+| Empty workspace | Existing `critical-empty` protocol: PTY terminal and actual `vscode.git` command |
+| File workspace | Existing `critical-file` protocol: save, terminal, search, SCM, real plugin command, secondary window and second-file forwarding |
+| Backend retry | Complete protocol: one document lifecycle, generation 1 to 2, a different owned Node root, two spawns, ready PID equals new root and zero old-tree processes |
+| Exit | Native window WM_CLOSE exits normally; forced owned-main termination leaves no observed owned descendants |
+| Startup failures | Missing Node, missing backend entry and an owned port-3000 fixture produce specific errors, no Node child and no foreign-process termination |
+| Unit/static checks | 552 Node tests including 9 archive safety tests; 381 Rust tests passed, 1 ignored; Rust format and Python syntax checks pass |
 
-- Production Theia frontend/backend and four product extensions compile.
-- Real native R-IDE window, bundled Node listener on port 3000 and 70 plugins.
-- Existing `critical-empty` and `critical-file` packaged smoke pass: PTY terminal,
-  actual `vscode.git` command, file save, workspace search, SCM, secondary window
-  and second-file forwarding.
-- Normal WM_CLOSE returns 0; forced owned-main termination leaves no observed
-  owned backend or WebView2 descendants.
-- Missing Node, missing backend entry and a port owned by the test fixture are
-  rejected with concrete errors; no backend is started or foreign process killed.
-- Node script suite: 542 passed. Rust suite: 381 passed, 1 ignored.
+An earlier `critical-file` run timed out before forwarding progress; its logs and
+failure record remain in `artifacts/critical-file-diagnostics-*`. A subsequent
+sequential run passed the complete protocol. Run desktop acceptance scenarios
+sequentially because the application is single-instance and owns port 3000.
+One failure-path run passed all three native checks but its temporary WebView2
+folder cleanup raced a final filesystem write. The driver now retries cleanup
+of its validated, owned temporary folder without hiding persistent failures.
 
-Unresolved acceptance failures:
+Dependency security checks use the final esbuild metadata, positive
+`bytesInOutput`, real installed package identities, output SHA-256 checks and
+the npm Bulk Advisory API. The report is included as `bundle-audit.json` with
+the raw response and its digest. At verification, 570 package versions have
+zero high/critical matches and five remaining package-version matches:
 
-1. The existing `backend-retry` packaged smoke times out waiting for its final
-   report after 120 seconds. Logs show the old owned Node root exiting, cleanup,
-   a new bundled Node root listening and the frontend becoming ready again.
-   This evidence does not satisfy the complete retry protocol. The timeout and
-   redacted logs are retained under `artifacts/backend-retry*`.
-2. `yarn audit --groups dependencies --registry https://registry.npmjs.org --json`
-   reports 83 unique advisories in the full workspace dependency tree. Matching
-   actual positive `bytesInOutput` contributions in the production esbuild
-   metadata still finds 39 high/critical advisories. This includes the critical
-   [tar parse/decompression issue](https://github.com/advisories/GHSA-23hp-3jrh-7fpw)
-   and two critical decompress archive traversal issues:
-   [archive links](https://github.com/advisories/GHSA-mp2f-45pm-3cg9) and
-   [symlink chains](https://github.com/advisories/GHSA-hrh2-vp3x-79xf).
-   The unmaintained `decompress` package has no patched release; its maintained
-   fork fixes these in 10.2.2 / 11.1.4. Replacing it and upgrading the affected
-   dependency tree require another source build and full packaged verification.
-   Advisory matching proves included dependency code, not exploit reachability.
+- `@ai-sdk/provider-utils` 2.2.8: [resource consumption, low](https://github.com/advisories/GHSA-866g-f22w-33x8).
+- `ai` 4.3.19: [upload file-type whitelist, low](https://github.com/advisories/GHSA-rwvc-j5jr-mgvh).
+- `uuid` 7.0.3, 8.3.2 and 9.0.1: the same [v3/v5/v6 output-buffer bounds issue, moderate](https://github.com/advisories/GHSA-w5hq-g745-h8pq).
 
-Clean-machine Windows, macOS/Linux, enterprise custom CA/proxy, external AI,
-language toolchains and remote integrations remain unverified. Dependencies of
-optional plugins may need user-configured runtimes. All app data is outside the
-managed installation version directory.
+These remain recorded. Major AI SDK/UUID migrations and exploit reachability
+have not been validated. This is not a zero-advisory claim for all dependencies:
+the report excludes separately copied plugin code, Node's internal dependencies,
+virtual bundler inputs and private local source, all listed in its scope.
+
+Legacy decompressor code is replaced with a private CommonJS API bridge to
+`@xhmikosr/decompress` 11.1.4. Its local version `4.2.2` is not an upstream
+release. Tar 7.5.21 replaces tar 6; the old SCANOSS ESM import is adapted, while
+the exact feature-graph verification remains enabled. The 318-to-277 exclusive
+input change is explained by 42 tar-6 inputs being replaced by one tar-7 module.
+Temporary-fixture tests verify ordinary tar/VSIX extraction and reject parent
+traversal, external archive links and pre-existing output junctions. Build-source
+attestation and installed bridge byte comparison prevent stale local caches.
+
+The backend retry fix preserves the desktop document during socket reconnect;
+browser-only reload behavior remains unchanged. The smoke runner distinguishes
+forwarded plugin reconnect warnings from native sidecar startup failures. Its
+tests still reject missing runtime, pre-ready exit and sidecar launch failure.
+
+Remaining limitations: WebView2 is required; Git, language servers/toolchains,
+external AI and remote integration need user configuration and remain partly
+unverified. The optional Windows CA addon uses the existing Node certificate-store
+fallback; enterprise custom roots/proxies remain unverified. The optional keytar
+credential-store addon is unavailable, so Theia uses its in-memory credentials
+fallback. Preferences and state live outside the managed version directory;
+credential persistence is not established. No original user configuration or
+unowned process was changed by the acceptance drivers.

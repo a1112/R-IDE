@@ -104,6 +104,7 @@ for (const item of inventory) {
   }
 }
 const report = { schema: 'ride.bundle-audit@1', auditedAt: new Date().toISOString(), endpoint,
+  sourceCommit: attestation.commit,
   scope: 'Positive esbuild bytesInOutput only; excludes separately copied plugin/runtime dependencies and private local source',
   positiveInputs, virtualInputs, metadata: manifests, packages: inventory, findings,
   privateLocalPackages: inventory.filter(item => item.private).map(({ name, version, packageJsonSha256, inputs }) => ({ name, version, packageJsonSha256, inputs })),

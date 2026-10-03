@@ -116,6 +116,13 @@ def main():
     required(TAURI/'resources/backend/runtime/node.exe')
     required(TAURI/'resources/backend/main.js')
     required(TAURI/'browser-frontend/index.html')
+    source_commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip()
+    attestation=json.loads((TAURI/'resources/backend/ride-tauri-profile.json').read_text())
+    if attestation['commit']!=source_commit or not attestation['sourceIdentity']['clean']:
+        raise RuntimeError('Bundled backend does not attest the current clean source commit; rebuild the web profile')
+    run([NODE,'--use-env-proxy',ROOT/'packaging/audit_bundle.mjs'])
+    audit=json.loads((ROOT/'artifacts/bundle-audit.json').read_text())
+    if audit['sourceCommit']!=source_commit: raise RuntimeError('Dependency audit belongs to a different source commit')
     pty=list((TAURI/'resources/backend').glob('**/conpty.node'))
     if not pty: raise RuntimeError('Bundled node-pty native addon is missing')
     plugins=list((TAURI/'resources/plugins').glob('*/extension/package.json'))
@@ -133,10 +140,14 @@ def main():
     shutil.copy2(APP/'package.json',PAYLOAD/'package.json')
     shutil.copy2(ROOT/'packaging/README.md',PAYLOAD/'PREVIEW.md')
     shutil.copy2(ROOT/'packaging/ACCEPTANCE.md',PAYLOAD/'ACCEPTANCE.md')
+    shutil.copy2(ROOT/'artifacts/bundle-audit.json',PAYLOAD/'bundle-audit.json')
+    shutil.copy2(ROOT/'artifacts/bundle-audit-response.json',PAYLOAD/'bundle-audit-response.json')
     version=subprocess.check_output([str(PAYLOAD/'resources/backend/runtime/node.exe'),'--version'],text=True).strip()
-    metadata={'productId':'r-ide','sourceCommit':subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip(),
+    metadata={'productId':'r-ide','sourceCommit':source_commit,
               'platform':'windows-x86_64','entrypoint':'ride-tauri.exe','node':licenses(version),
-               'acceptanceStatus':'incomplete-security-and-backend-retry',
+                'acceptanceStatus':'windows-preview-verified-with-documented-limitations',
+                'bundleAudit':{'file':'bundle-audit.json','packageVersions':len(audit['packages']),
+                               'highCritical':0,'remainingFindings':len(audit['findings'])},
               'pluginCount':len(plugins),'nodePtyNativeFiles':[str(item.relative_to(TAURI/'resources/backend')).replace('\\','/') for item in pty],
               'requiredFiles':['resources/backend/runtime/node.exe','resources/backend/main.js','resources/plugins','lib/frontend'],
               'userData':'RIDE_CONFIG_DIR or current-user ~/.ride-tauri; downloaded plugins in ~/.ride',

@@ -2,10 +2,28 @@
 import argparse, ctypes, json, os, shutil, socket, subprocess, tempfile, time
 from pathlib import Path
 import psutil
+from contextlib import contextmanager
 
 ROOT=Path(__file__).resolve().parents[1]
 PAYLOAD=ROOT/'artifacts/payload'
 USER32=ctypes.windll.user32
+
+@contextmanager
+def isolated_directory():
+    directory=tempfile.TemporaryDirectory(prefix='rbox-ride-smoke-')
+    root=Path(directory.name).resolve()
+    if root.parent!=Path(tempfile.gettempdir()).resolve() or not root.name.startswith('rbox-ride-smoke-'):
+        raise RuntimeError('Unexpected owned smoke temporary directory')
+    try: yield str(root)
+    finally:
+        # WebView2 may finish an OS file write just after its owned process exits.
+        # Retry only this validated, newly-created fixture directory; never kill
+        # other browser processes or hide a persistent cleanup failure.
+        for attempt in range(10):
+            try: directory.cleanup(); break
+            except OSError:
+                if attempt==9: raise
+                time.sleep(.5)
 
 def environment(directory):
     result={key:value for key,value in os.environ.items() if not key.upper().startswith(('RIDE_','THEIA_','NODE_','ELECTRON_'))}
@@ -119,7 +137,7 @@ def failure(mode,folder):
 def main():
     parser=argparse.ArgumentParser(); parser.add_argument('--scenario',choices=('critical-empty','critical-file','backend-retry','lifecycle','failures'),default='critical-empty')
     options=parser.parse_args()
-    with tempfile.TemporaryDirectory(prefix='rbox-ride-smoke-') as temporary:
+    with isolated_directory() as temporary:
         folder=Path(temporary)
         try:
             if options.scenario=='lifecycle': result=[probe(mode,folder) for mode in ('normal','forced')]
