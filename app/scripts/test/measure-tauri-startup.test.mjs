@@ -406,7 +406,8 @@ test('every synchronous external command has explicit timeout and buffer bounds'
     return block;
   };
 
-  boundedCall("spawnSync(\n      'powershell.exe'", 'return parseWindowsProcessTable', 'CIM query');
+  const cimQuery = boundedCall('const modernShell =', 'return parseWindowsProcessTable', 'CIM query');
+  assert.match(cimQuery, /spawnSync\(\s*fs\.existsSync\(modernShell\) \? modernShell : 'powershell\.exe'/);
   const psQuery = boundedCall("spawnSync('ps'", 'const posixRows = parsePosixProcessTable', 'ps query');
   assert.match(psQuery, /LANG:\s*'C'/);
   assert.match(psQuery, /LC_ALL:\s*'C'/);
