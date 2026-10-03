@@ -3,6 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
+import { resolveInstalledManifest } from '../app/scripts/tauri-frontend-profile.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const browser = path.join(root, 'app/applications/browser');
@@ -12,11 +13,13 @@ const hash = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
 const packages = new Map();
 const manifests = [];
 let positiveInputs = 0;
+const attestation = JSON.parse(fs.readFileSync(path.join(browser, 'lib/ride-tauri-profile.json'), 'utf8'));
 
 for (const name of fs.readdirSync(path.join(browser, 'lib/metadata')).filter(name => name.endsWith('.json')).sort()) {
   const file = path.join(browser, 'lib/metadata', name);
   const bytes = fs.readFileSync(file);
   const metadata = JSON.parse(bytes);
+  if (metadata.buildId !== attestation.buildId || metadata.digest !== attestation.digest) throw new Error(`Mixed build metadata: ${name}`);
   const build = path.join(browser, '.ride-tauri-profile/builds', metadata.buildId);
   if (!metadata.metafile?.outputs || !metadata.outputHashes) throw new Error(`Missing attested metadata: ${name}`);
   for (const [output, expectedHash] of Object.entries(metadata.outputHashes)) {
@@ -31,7 +34,17 @@ for (const name of fs.readdirSync(path.join(browser, 'lib/metadata')).filter(nam
       if (!(contribution.bytesInOutput > 0)) continue;
       positiveInputs++;
       if (!input.replaceAll('\\', '/').includes('node_modules/')) continue;
-      const logicalFile = path.resolve(build, input);
+      let logicalFile = path.resolve(build, input);
+      if (!fs.existsSync(logicalFile) && input.startsWith('node_modules/')) {
+        // Successful publish removes the generated build and its extension
+        // junctions. Recover only a declared, unique extension junction using
+        // the same installed-manifest resolver used by profile generation.
+        const segments = input.slice('node_modules/'.length).split('/');
+        const requestName = segments[0].startsWith('@') ? segments.splice(0, 2).join('/') : segments.shift();
+        if (!attestation.extensions.includes(requestName)) throw new Error(`Unknown removed build junction: ${input}`);
+        const installed = await resolveInstalledManifest(requestName, browser);
+        logicalFile = path.join(installed.packageDirectory, ...segments);
+      }
       if (!fs.existsSync(logicalFile)) throw new Error(`Unable to resolve actual contributed input: ${input}`);
       // Walk the actual resolved package rather than guessing a version from a lockfile.
       let directory = path.dirname(fs.realpathSync(logicalFile));
@@ -46,6 +59,9 @@ for (const name of fs.readdirSync(path.join(browser, 'lib/metadata')).filter(nam
       }
       if (!manifest) throw new Error(`Input has no attributable package: ${input}`);
       const { value } = manifest;
+      if (!attestation.packages.some(item => item.packageName === value.name && item.version === value.version)) {
+        throw new Error(`Installed input identity differs from build attestation: ${value.name}@${value.version}`);
+      }
       const key = value.name + '@' + value.version;
       if (!packages.has(key)) packages.set(key, { name: value.name, version: value.version,
         private: value.private === true, packageJsonSha256: hash(fs.readFileSync(path.join(manifest.directory, 'package.json'))),

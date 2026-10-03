@@ -39,6 +39,7 @@ def install_runtime_dependencies(yarn):
     patch=APP/'node_modules/patch-package/index.js'
     run([NODE,patch,'--patch-dir','node_modules/@theia/cli/patches'])
     run([NODE,patch,'--patch-dir','patches'])
+    run([NODE,ROOT/'packaging/prepare_runtime.mjs'])
     for package,script in (('node-pty','scripts/prebuild.js'),('node-pty','scripts/post-install.js'),
                            ('@parcel/watcher','scripts/build-from-source.js'),('esbuild','install.js')):
         run([NODE,APP/'node_modules'/package/script],APP/'node_modules'/package)
