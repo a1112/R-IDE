@@ -30,7 +30,12 @@ def run(arguments,cwd=APP):
 def install_runtime_dependencies(yarn):
     # Electron's test driver has an unconditional network install script. It is
     # not part of Tauri; execute only the actual browser/runtime install steps.
-    run([NODE,yarn,'install','--frozen-lockfile','--ignore-scripts','--registry','https://registry.npmjs.org','--network-timeout','100000'])
+    run([NODE,yarn,'install','--force','--frozen-lockfile','--ignore-scripts','--registry','https://registry.npmjs.org','--network-timeout','100000'])
+    # Yarn Classic may consider a changed local file resolution up-to-date until
+    # relinked. Verify its real installed implementation before generating a profile.
+    for name in ('package.json','index.cjs'):
+        if (APP/'node_modules/decompress'/name).read_bytes()!=(ROOT/'packaging/decompress-runtime'/name).read_bytes():
+            raise RuntimeError(f'Installed decompressor bridge differs from source: {name}')
     patch=APP/'node_modules/patch-package/index.js'
     run([NODE,patch,'--patch-dir','node_modules/@theia/cli/patches'])
     run([NODE,patch,'--patch-dir','patches'])
