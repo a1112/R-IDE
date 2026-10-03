@@ -19,6 +19,11 @@ An earlier `critical-file` run timed out before forwarding progress; its logs an
 failure record remain in `artifacts/critical-file-diagnostics-*`. A subsequent
 sequential run passed the complete protocol. Run desktop acceptance scenarios
 sequentially because the application is single-instance and owns port 3000.
+An additional retry run completed the recovery protocol but timed out on the
+independent startup report: the fault had been injected at shell attachment,
+before full workbench initialization. A regression test now requires workbench
+`ready` before the native crash step is committed; startup-report validation
+remains mandatory in the final packaged driver.
 One failure-path run passed all three native checks but its temporary WebView2
 folder cleanup raced a final filesystem write. The driver now retries cleanup
 of its validated, owned temporary folder without hiding persistent failures.

@@ -288,6 +288,15 @@ export class RidePackagedSmokeContribution implements FrontendApplicationContrib
             return;
         }
         const { plan, sessionProof } = parsed.session;
+        if (plan.scenario === 'backend-retry') {
+            // Committing its started step kills the native backend root. Wait
+            // until the initial workbench has finished startup so the recovery
+            // scenario cannot interrupt unrelated initialization/reporting.
+            await this.applicationState.reachedState('ready');
+            if (this.disposed) {
+                return;
+            }
+        }
 
         let smokeActions: RidePackagedSmokeActions;
         try {

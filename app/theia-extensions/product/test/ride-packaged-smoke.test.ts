@@ -356,7 +356,7 @@ function forwardingActions(service: RidePackagedSmokeActionService): RidePackage
 function immediateState(): FrontendApplicationStateService {
     return {
         reachedState: async (state: string) => {
-            assert.equal(state, 'attached_shell');
+            assert.ok(['attached_shell', 'ready'].includes(state));
         }
     } as unknown as FrontendApplicationStateService;
 }
@@ -384,6 +384,30 @@ test('packaged smoke waits for attached_shell before querying the protocol', asy
     shell.resolve();
     await waitUntil(() => protocol.calls.length === 1, 'the smoke plan was not queried after shell attachment');
     assert.deepEqual(protocol.calls, [{ method: 'plan' }]);
+});
+
+test('backend retry waits for full workbench readiness before committing the crash step', async () => {
+    const ready = deferred();
+    const reachedStates: string[] = [];
+    const actionCalls: string[] = [];
+    const protocol = new FakeProtocol(true, {
+        mode: 'active', plan: backendRetryPlan(), sessionProof: PROOF, diagnostic: null
+    });
+    const contribution = new RidePackagedSmokeContribution({
+        reachedState: async (state: string) => {
+            reachedStates.push(state);
+            if (state === 'ready') { await ready.promise; }
+        }
+    } as unknown as FrontendApplicationStateService, protocol, () => actions(actionCalls));
+    contribution.onStart();
+    await waitUntil(() => protocol.calls.length > 0, 'the smoke plan was not requested');
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.deepEqual(reachedStates, ['attached_shell', 'ready']);
+    assert.deepEqual(protocol.calls, [{ method: 'plan' }]);
+    assert.deepEqual(actionCalls, []);
+    ready.resolve();
+    await waitUntil(() => protocol.calls.some(call => call.method === 'complete'), 'retry did not finish after readiness');
+    assert.deepEqual(actionCalls, ['backend-retry']);
 });
 
 test('packaged smoke is inert outside Tauri and never resolves actions', async () => {
