@@ -1,6 +1,6 @@
 {
-  "name": "@ride/decompress-compat",
-  "version": "1.0.0",
+  "name": "decompress",
+  "version": "4.2.2",
   "private": true,
   "license": "MIT",
   "main": "index.cjs",
