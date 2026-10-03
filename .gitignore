@@ -3,6 +3,8 @@
 **/.browser_modules/
 
 # Build outputs
+artifacts/
+__pycache__/
 **/dist/
 **/lib/
 **/src-gen/
