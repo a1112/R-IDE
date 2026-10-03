@@ -121,16 +121,18 @@ def main():
     options=parser.parse_args()
     with tempfile.TemporaryDirectory(prefix='rbox-ride-smoke-') as temporary:
         folder=Path(temporary)
-        if options.scenario=='lifecycle': result=[probe(mode,folder) for mode in ('normal','forced')]
-        elif options.scenario=='failures': result=[failure(mode,folder) for mode in ('missing-node','missing-backend','busy-port')]
-        else:
-            node=PAYLOAD/'resources/backend/runtime/node.exe'
-            command=[str(node),str(ROOT/'app/scripts/run-tauri-packaged-smoke.mjs'),'--executable',str(PAYLOAD/'ride-tauri.exe'),
-                     '--scenario',options.scenario,'--output',str(ROOT/f'artifacts/{options.scenario}.json'),'--timeout-ms','120000']
-            subprocess.run(command,cwd=folder,env=environment(folder),check=True)
-            result={'scenario':options.scenario,'report':f'artifacts/{options.scenario}.json'}
+        try:
+            if options.scenario=='lifecycle': result=[probe(mode,folder) for mode in ('normal','forced')]
+            elif options.scenario=='failures': result=[failure(mode,folder) for mode in ('missing-node','missing-backend','busy-port')]
+            else:
+                node=PAYLOAD/'resources/backend/runtime/node.exe'
+                command=[str(node),str(ROOT/'app/scripts/run-tauri-packaged-smoke.mjs'),'--executable',str(PAYLOAD/'ride-tauri.exe'),
+                         '--scenario',options.scenario,'--output',str(ROOT/f'artifacts/{options.scenario}.json'),'--timeout-ms','120000']
+                subprocess.run(command,cwd=folder,env=environment(folder),check=True)
+                result={'scenario':options.scenario,'report':f'artifacts/{options.scenario}.json'}
+        finally:
+            for file in folder.glob('*.log'): shutil.copy2(file,ROOT/'artifacts'/file.name)
         (ROOT/f'artifacts/{options.scenario}-summary.json').write_text(json.dumps(result,indent=2)+'\n')
-        for file in folder.glob('*.log'): shutil.copy2(file,ROOT/'artifacts'/file.name)
         print(json.dumps(result,indent=2))
 
 if __name__=='__main__': main()

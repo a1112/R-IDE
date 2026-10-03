@@ -1,11 +1,25 @@
 """Build and stage the isolated R-IDE Windows preview with its runtime/resources."""
 import argparse, hashlib, json, os, shutil, subprocess, urllib.request
+from contextlib import contextmanager
 from pathlib import Path
 
 ROOT=Path(__file__).resolve().parents[1]
 APP=ROOT/'app'
 TAURI=APP/'applications/tauri'
 PAYLOAD=ROOT/'artifacts/payload'
+
+@contextmanager
+def preserve_generated_sources():
+    paths=[TAURI/'src-tauri/Cargo.toml',TAURI/'resources/backend/.gitkeep',TAURI/'resources/plugins/.gitkeep',
+           *(TAURI/'src-tauri/gen/schemas').glob('*.json')]
+    originals={path:path.read_bytes() for path in paths if path.is_file()}
+    try: yield
+    finally:
+        # Tauri rewrites tracked schemas and manifest line endings while building.
+        # Restore only the exact files snapshotted before this owned invocation.
+        for path,contents in originals.items():
+            if not path.is_file() or path.read_bytes()!=contents:
+                path.parent.mkdir(parents=True,exist_ok=True); path.write_bytes(contents)
 
 def run(arguments,cwd=APP):
     env={**os.environ,'RUSTUP_TOOLCHAIN':'1.94.1','CARGO_BUILD_JOBS':'4',
@@ -37,7 +51,7 @@ def required(path):
 def copy_tree(source,target):
     if not source.is_dir(): raise RuntimeError(f'Missing resource tree: {source}')
     for item in source.rglob('*'):
-        if item.is_symlink(): raise RuntimeError(f'Resource references a source symlink: {item}')
+        if item.is_symlink() or item.is_junction(): raise RuntimeError(f'Resource references a source link: {item}')
     shutil.copytree(source,target,dirs_exist_ok=True)
 
 def licenses(node_version):
@@ -100,6 +114,11 @@ def main():
     if not pty: raise RuntimeError('Bundled node-pty native addon is missing')
     plugins=list((TAURI/'resources/plugins').glob('*/extension/package.json'))
     if not plugins: raise RuntimeError('Bundled VS Code plugins are missing')
+    if PAYLOAD.exists():
+        expected=ROOT.resolve()/'artifacts/payload'
+        if PAYLOAD.resolve()!=expected or PAYLOAD.is_symlink() or PAYLOAD.is_junction(): raise RuntimeError('Payload path escaped the owned artifacts directory')
+        if json.loads((PAYLOAD/'build-info.json').read_text())['productId']!='r-ide': raise RuntimeError('Refusing to replace a payload without R-IDE ownership metadata')
+        shutil.rmtree(PAYLOAD)
     PAYLOAD.mkdir(parents=True,exist_ok=True)
     shutil.copy2(TAURI/'src-tauri/target/release/ride-tauri.exe',PAYLOAD/'ride-tauri.exe')
     copy_tree(TAURI/'resources/backend',PAYLOAD/'resources/backend')
@@ -107,9 +126,11 @@ def main():
     copy_tree(TAURI/'browser-frontend',PAYLOAD/'lib/frontend')
     shutil.copy2(APP/'package.json',PAYLOAD/'package.json')
     shutil.copy2(ROOT/'packaging/README.md',PAYLOAD/'PREVIEW.md')
+    shutil.copy2(ROOT/'packaging/ACCEPTANCE.md',PAYLOAD/'ACCEPTANCE.md')
     version=subprocess.check_output([str(PAYLOAD/'resources/backend/runtime/node.exe'),'--version'],text=True).strip()
     metadata={'productId':'r-ide','sourceCommit':subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip(),
               'platform':'windows-x86_64','entrypoint':'ride-tauri.exe','node':licenses(version),
+               'acceptanceStatus':'incomplete-security-and-backend-retry',
               'pluginCount':len(plugins),'nodePtyNativeFiles':[str(item.relative_to(TAURI/'resources/backend')).replace('\\','/') for item in pty],
               'requiredFiles':['resources/backend/runtime/node.exe','resources/backend/main.js','resources/plugins','lib/frontend'],
               'userData':'RIDE_CONFIG_DIR or current-user ~/.ride-tauri; downloaded plugins in ~/.ride',
@@ -118,4 +139,5 @@ def main():
     (PAYLOAD/'build-info.json').write_text(json.dumps(metadata,indent=2)+'\n',encoding='utf-8')
     print(PAYLOAD)
 
-if __name__=='__main__': main()
+if __name__=='__main__':
+    with preserve_generated_sources(): main()
