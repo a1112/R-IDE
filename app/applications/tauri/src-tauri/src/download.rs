@@ -955,9 +955,9 @@ async fn replace_completed_download(part_path: &Path, target_path: &Path) -> Res
 }
 
 fn ride_dir() -> Result<PathBuf, String> {
-    dirs::home_dir()
-        .map(|home| home.join(".ride"))
-        .ok_or_else(|| "Could not determine home directory".to_string())
+    let configured = std::env::var_os("RIDE_CONFIG_DIR").map(PathBuf::from);
+    let home = dirs::home_dir();
+    crate::startup::resolve_tauri_config_directory(configured, home)
 }
 
 fn ride_downloads_dir() -> Result<PathBuf, String> {

@@ -51,7 +51,7 @@ pub fn download_list(state: State<AppState>) -> Result<Vec<DownloadTask>, String
     Ok(state.downloads.list())
 }
 
-/// Download and install a single VS Code plugin archive into ~/.ride/plugins.
+/// Download and install a single VS Code plugin archive into the runtime profile.
 #[tauri::command]
 pub async fn download_plugin(
     app: AppHandle,

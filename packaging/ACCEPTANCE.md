@@ -13,7 +13,7 @@ This is host acceptance; a clean Windows machine and macOS/Linux remain pending.
 | Backend retry | Complete protocol: one document lifecycle, generation 1 to 2, a different owned Node root, two spawns, ready PID equals new root and zero old-tree processes |
 | Exit | Native window WM_CLOSE exits normally; forced owned-main termination leaves no observed owned descendants |
 | Startup failures | Missing Node, missing backend entry and an owned port-3000 fixture produce specific errors, no Node child and no foreign-process termination |
-| Unit/static checks | 554 Node script/packaging tests including 9 archive safety and 2 glob compatibility tests; 275 product-extension tests; 381 Rust tests passed, 1 ignored; source ESLint, Rust format and Python syntax checks pass |
+| Unit/static checks | 554 Node script/packaging tests including 9 archive safety and 2 glob compatibility tests; 275 product-extension tests; 384 Rust tests passed, 1 ignored, including shared preview profile path checks; source ESLint, Rust format and Python syntax checks pass |
 
 An earlier `critical-file` run timed out before forwarding progress; its logs and
 failure record remain in `artifacts/critical-file-diagnostics-*`. A subsequent

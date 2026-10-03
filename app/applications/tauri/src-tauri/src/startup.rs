@@ -2117,11 +2117,27 @@ pub enum RuntimePathMode {
 pub fn resolve_tauri_config_directory(
     configured: Option<PathBuf>,
     home: Option<PathBuf>,
-) -> PathBuf {
-    configured.unwrap_or_else(|| {
-        home.unwrap_or_else(|| PathBuf::from("."))
-            .join(".ride-tauri")
-    })
+) -> Result<PathBuf, String> {
+    let directory = match configured {
+        Some(path) if path.as_os_str().is_empty() => {
+            return Err("RIDE_CONFIG_DIR must not be empty".to_string());
+        }
+        Some(path) => path,
+        None => home
+            .filter(|path| !path.as_os_str().is_empty())
+            .ok_or_else(|| {
+                "Could not determine home directory for the preview profile".to_string()
+            })?
+            .join(".ride-tauri-rbox-preview"),
+    };
+    if directory
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err("Preview profile directory must not contain '..' components".to_string());
+    }
+    std::path::absolute(directory)
+        .map_err(|error| format!("Could not resolve the preview profile directory: {error}"))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

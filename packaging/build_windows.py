@@ -150,7 +150,7 @@ def main():
                                'highCritical':0,'remainingFindings':len(audit['findings'])},
               'pluginCount':len(plugins),'nodePtyNativeFiles':[str(item.relative_to(TAURI/'resources/backend')).replace('\\','/') for item in pty],
               'requiredFiles':['resources/backend/runtime/node.exe','resources/backend/main.js','resources/plugins','lib/frontend'],
-              'userData':'RIDE_CONFIG_DIR or current-user ~/.ride-tauri; downloaded plugins in ~/.ride',
+              'userData':'RIDE_CONFIG_DIR or current-user ~/.ride-tauri-rbox-preview; downloads and plugins in that same profile',
                'caCertificates':'Existing Tauri Node.js certificate-store fallback; Windows custom roots unverified',
               'externalCapabilities':['WebView2','User-configured Git/language runtimes/AI services']}
     (PAYLOAD/'build-info.json').write_text(json.dumps(metadata,indent=2)+'\n',encoding='utf-8')

@@ -597,16 +597,38 @@ fn packaged_runtime_paths_derive_from_one_resource_root() {
 
 #[test]
 fn tauri_uses_an_isolated_config_directory_unless_explicitly_overridden() {
-    let home = PathBuf::from("home");
+    let home = std::env::current_dir().unwrap().join("home");
 
     assert_eq!(
-        resolve_tauri_config_directory(None, Some(home.clone())),
-        home.join(".ride-tauri")
+        resolve_tauri_config_directory(None, Some(home.clone())).unwrap(),
+        home.join(".ride-tauri-rbox-preview")
     );
     assert_eq!(
-        resolve_tauri_config_directory(Some(PathBuf::from("explicit-config")), Some(home)),
-        PathBuf::from("explicit-config")
+        resolve_tauri_config_directory(Some(PathBuf::from("explicit-config")), Some(home)).unwrap(),
+        std::env::current_dir().unwrap().join("explicit-config")
     );
+}
+
+#[test]
+fn relative_config_override_is_absolute_before_the_backend_changes_directory() {
+    let configured = PathBuf::from("relative-profile");
+    let actual = resolve_tauri_config_directory(Some(configured.clone()), None).unwrap();
+    assert!(actual.is_absolute());
+    assert_eq!(actual, std::env::current_dir().unwrap().join(configured));
+}
+
+#[test]
+fn absent_home_and_empty_override_never_store_preview_data_in_the_working_directory() {
+    assert!(resolve_tauri_config_directory(None, None).is_err());
+    assert!(resolve_tauri_config_directory(None, Some(PathBuf::new())).is_err());
+    assert!(resolve_tauri_config_directory(Some(PathBuf::new()), None).is_err());
+}
+
+#[test]
+fn parent_components_are_rejected_consistently_before_backend_or_download_startup() {
+    assert!(resolve_tauri_config_directory(Some(PathBuf::from("../profile")), None).is_err());
+    let absolute = std::env::current_dir().unwrap().join("..").join("profile");
+    assert!(resolve_tauri_config_directory(Some(absolute), None).is_err());
 }
 
 #[test]

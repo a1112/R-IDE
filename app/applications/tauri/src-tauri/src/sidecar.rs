@@ -267,7 +267,7 @@ pub(crate) fn resolve_runtime_paths_before_app(
     let config_directory = resolve_tauri_config_directory(
         std::env::var_os("RIDE_CONFIG_DIR").map(PathBuf::from),
         home_dir(),
-    );
+    )?;
     let mode = if let Some(root) = std::env::var_os("RIDE_DEVELOPMENT_ROOT") {
         RuntimePathMode::Development(PathBuf::from(root))
     } else {
