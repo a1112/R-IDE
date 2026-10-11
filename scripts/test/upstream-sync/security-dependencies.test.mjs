@@ -74,7 +74,7 @@ test('workspace manifests pin patched direct dependency versions', () => {
   }
   assert.equal(launcher.dependencies['body-parser'], '^1.20.6');
   assert.equal(updater.dependencies['builder-util-runtime'], '9.7.0');
-  assert.equal(prototype.dependencies.vite, '6.4.3');
+  assert.equal(prototype.dependencies.vite, '6.4.4');
 });
 
 test('Yarn lock does not retain known vulnerable resolved versions', () => {
@@ -154,7 +154,7 @@ test('Yarn lock does not retain known vulnerable resolved versions', () => {
 test('prototype lock uses patched Vite, PostCSS, and nanoid versions', () => {
   const lock = readJson('prototype/package-lock.json');
   const packages = lock.packages ?? {};
-  assert.ok(atLeast(packages['node_modules/vite']?.version, '6.4.3'));
+  assert.ok(atLeast(packages['node_modules/vite']?.version, '6.4.4'));
   assert.ok(atLeast(packages['node_modules/postcss']?.version, '8.5.23'));
   assert.ok(atLeast(packages['node_modules/nanoid']?.version, '3.3.17'));
 });
