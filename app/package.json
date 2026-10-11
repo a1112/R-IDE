@@ -61,6 +61,7 @@
     "permissions:writeable": "ts-node scripts/make-files-writeable.ts plugins",
     "watch": "lerna run --parallel watch",
     "test": "lerna run test",
+    "test:archive-extraction": "node --test scripts/test/archive-extraction.test.mjs",
     "test:sync": "node --test ../scripts/test/upstream-sync/*.test.mjs",
     "check:sync": "node ../scripts/sync-upstream.mjs check",
     "check:rust": "node scripts/check-rust.js",
@@ -109,6 +110,7 @@
     ]
   },
   "resolutions": {
+    "**/decompress": "file:vendor/decompress-compat",
     "**/@electron/node-gyp": "10.2.0-electron.1",
     "@types/puppeteer": "^5.4.7",
     "@yarnpkg/parsers": "3.0.0-rc.44",

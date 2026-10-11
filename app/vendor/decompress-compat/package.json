@@ -1,0 +1,15 @@
+{
+  "name": "@r-ide/decompress-compat",
+  "version": "1.0.0",
+  "private": true,
+  "description": "CommonJS adapter for Theia's asynchronous archive extraction API",
+  "license": "MIT",
+  "main": "index.cjs",
+  "files": ["index.cjs"],
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@xhmikosr/decompress": "11.1.4"
+  }
+}

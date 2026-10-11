@@ -4,12 +4,6 @@ The security update keeps all dependencies with an available compatible fix at
 or above the first patched release. The following alerts cannot currently be
 resolved by a registry version without changing the build architecture:
 
-- `decompress@4.2.1` is a development-only transitive dependency of the Theia
-  tooling. The repository already applies
-  [`app/patches/decompress+4.2.1.patch`](../app/patches/decompress+4.2.1.patch),
-  which rejects archive paths that escape the extraction directory. There is
-  no upstream fixed release, so the Dependabot alerts are tracked as a local
-  patch until `decompress` publishes one.
 - `image-size@0.5.5` has no patched npm release. It is pulled by upstream
   tooling and is not used by the application request/runtime paths.
 - `pkg@5.8.1` has no patched npm release. It is a build-time backend bundler,
@@ -25,3 +19,13 @@ resolved by a registry version without changing the build architecture:
 
 These exceptions should be revisited whenever the upstream package or Tauri
 dependency graph publishes a compatible fixed release.
+
+## Resolved archive extraction exception
+
+`decompress@4.2.1` has been replaced by a
+[CommonJS compatibility adapter](../app/vendor/decompress-compat/README.md)
+backed by the maintained `@xhmikosr/decompress@11.1.4`. The previous local patch
+only fixed path-prefix containment and did not address the symlink-chain bypass
+in [GHSA-hrh2-vp3x-79xf](https://github.com/advisories/GHSA-hrh2-vp3x-79xf).
+The affected Theia consumers include runtime plugin deployment and remote
+dependency extraction as well as development tooling.
